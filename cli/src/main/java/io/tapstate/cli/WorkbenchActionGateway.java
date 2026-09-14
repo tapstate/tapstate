@@ -47,6 +47,14 @@ interface WorkbenchActionGateway {
         return new SourceApplyResult.Unavailable();
     }
 
+    default PipelinePreviewResult previewPipeline(PipelineDraft draft) {
+        return new PipelinePreviewResult.Unavailable();
+    }
+
+    default PipelineCreateResult createPipeline(PipelineCreateRequest request) {
+        return new PipelineCreateResult.Unavailable();
+    }
+
     record ContextOption(String name, boolean suggested) {
         public ContextOption {
             Objects.requireNonNull(name, "name");
@@ -198,6 +206,20 @@ interface WorkbenchActionGateway {
         }
     }
 
+    record PipelineDraft(String sourceId, String id) {
+        public PipelineDraft {
+            Objects.requireNonNull(sourceId, "sourceId");
+            Objects.requireNonNull(id, "id");
+        }
+    }
+
+    record PipelineCreateRequest(String id, String canonicalYaml) {
+        public PipelineCreateRequest {
+            Objects.requireNonNull(id, "id");
+            Objects.requireNonNull(canonicalYaml, "canonicalYaml");
+        }
+    }
+
     record SourceApplyRequest(List<Path> relativePaths) {
         public SourceApplyRequest {
             relativePaths = List.copyOf(relativePaths);
@@ -259,6 +281,47 @@ interface WorkbenchActionGateway {
         }
 
         record Unavailable() implements SourceCreateResult {
+        }
+    }
+
+    sealed interface PipelinePreviewResult {
+        record Ready(String canonicalYaml) implements PipelinePreviewResult {
+            public Ready {
+                Objects.requireNonNull(canonicalYaml, "canonicalYaml");
+            }
+        }
+
+        record Rejected(String message) implements PipelinePreviewResult {
+            public Rejected {
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unavailable() implements PipelinePreviewResult {
+        }
+    }
+
+    sealed interface PipelineCreateResult {
+        record Created(Path relativePath, String canonicalYaml) implements PipelineCreateResult {
+            public Created {
+                Objects.requireNonNull(relativePath, "relativePath");
+                Objects.requireNonNull(canonicalYaml, "canonicalYaml");
+            }
+        }
+
+        record Exists(Path relativePath) implements PipelineCreateResult {
+            public Exists {
+                Objects.requireNonNull(relativePath, "relativePath");
+            }
+        }
+
+        record Rejected(String message) implements PipelineCreateResult {
+            public Rejected {
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unavailable() implements PipelineCreateResult {
         }
     }
 

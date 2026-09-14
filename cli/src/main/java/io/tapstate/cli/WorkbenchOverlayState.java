@@ -12,6 +12,8 @@ sealed interface WorkbenchOverlayState
                 WorkbenchOverlayState.ContextCreate,
                 WorkbenchOverlayState.SourceCreate,
                 WorkbenchOverlayState.SourceYamlEditor,
+                WorkbenchOverlayState.PipelineCreate,
+                WorkbenchOverlayState.PipelineYamlEditor,
                 WorkbenchOverlayState.Confirm,
                 WorkbenchOverlayState.Login,
                 WorkbenchOverlayState.Actions,
@@ -171,6 +173,40 @@ sealed interface WorkbenchOverlayState
         }
     }
 
+    record PipelineCreate(
+            List<String> sourceIds,
+            Stage stage,
+            int selectedIndex,
+            String sourceId,
+            String id,
+            Optional<String> canonicalYaml,
+            boolean pending,
+            Optional<String> message) implements WorkbenchOverlayState {
+        public PipelineCreate {
+            sourceIds = List.copyOf(sourceIds);
+            Objects.requireNonNull(stage, "stage");
+            Objects.requireNonNull(sourceId, "sourceId");
+            Objects.requireNonNull(id, "id");
+            Objects.requireNonNull(canonicalYaml, "canonicalYaml");
+            Objects.requireNonNull(message, "message");
+        }
+
+        enum Stage {
+            SOURCE,
+            ID,
+            PREVIEW
+        }
+    }
+
+    record PipelineYamlEditor(
+            PipelineCreate pipeline,
+            WorkbenchWorkspaceState.Document document) implements WorkbenchOverlayState {
+        public PipelineYamlEditor {
+            Objects.requireNonNull(pipeline, "pipeline");
+            Objects.requireNonNull(document, "document");
+        }
+    }
+
     record Confirm(
             Intent intent,
             String title,
@@ -188,8 +224,8 @@ sealed interface WorkbenchOverlayState
             return new Confirm(intent, title, message, true, previous);
         }
 
-        sealed interface Intent permits Intent.DeleteContext, Intent.CreateSource, Intent.ApplySources,
-                Intent.DiscardChanges, Intent.DiscardSourceYaml {
+        sealed interface Intent permits Intent.DeleteContext, Intent.CreateSource, Intent.CreatePipeline,
+                Intent.ApplySources, Intent.DiscardChanges, Intent.DiscardSourceYaml, Intent.DiscardPipelineYaml {
             record DeleteContext(String contextName) implements Intent {
                 public DeleteContext {
                     Objects.requireNonNull(contextName, "contextName");
@@ -198,6 +234,12 @@ sealed interface WorkbenchOverlayState
 
             record CreateSource(WorkbenchActionGateway.SourceCreateRequest request) implements Intent {
                 public CreateSource {
+                    Objects.requireNonNull(request, "request");
+                }
+            }
+
+            record CreatePipeline(WorkbenchActionGateway.PipelineCreateRequest request) implements Intent {
+                public CreatePipeline {
                     Objects.requireNonNull(request, "request");
                 }
             }
@@ -214,6 +256,12 @@ sealed interface WorkbenchOverlayState
 
             record DiscardSourceYaml(SourceYamlEditor editor) implements Intent {
                 public DiscardSourceYaml {
+                    Objects.requireNonNull(editor, "editor");
+                }
+            }
+
+            record DiscardPipelineYaml(PipelineYamlEditor editor) implements Intent {
+                public DiscardPipelineYaml {
                     Objects.requireNonNull(editor, "editor");
                 }
             }
@@ -279,6 +327,7 @@ sealed interface WorkbenchOverlayState
             CONTEXT("🧭  Context", "Choose or create a context"),
             AUTHENTICATION("🔐  Authentication", "Sign in to the selected server"),
             NEW_SOURCE("✨  New Source", "Create a local source artifact"),
+            NEW_PIPELINE("⚡  New Pipeline", "Create a local pipeline artifact"),
             APPLY_SELECTED_SOURCE("☁️  Apply Selected Source", "Synchronize the selected local source"),
             APPLY_WORKSPACE_SOURCES("☁️  Apply Workspace Sources", "Synchronize all valid local sources"),
             REFRESH("↻  Refresh", "Load the latest workspace snapshot"),

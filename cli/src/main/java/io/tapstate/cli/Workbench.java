@@ -389,6 +389,10 @@ final class Workbench {
                             && source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW) {
                         yield openSourceYamlEditor(source);
                     }
+                    if (runtime.state().overlay().orElse(null) instanceof WorkbenchOverlayState.PipelineCreate pipeline
+                            && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW) {
+                        yield openPipelineYamlEditor(pipeline);
+                    }
                     yield runtime.state().workspaceView().focus() == WorkbenchWorkspaceState.Focus.VIEWER
                             && runtime.state().workspaceView().document().isPresent()
                             ? runtime.updateState(state -> state.withWorkspaceView(state.workspaceView().edit()))
@@ -538,6 +542,8 @@ final class Workbench {
                         case WorkbenchOverlayState.ContextCreate ignored -> true;
                         case WorkbenchOverlayState.SourceCreate ignored -> true;
                         case WorkbenchOverlayState.SourceYamlEditor ignored -> true;
+                        case WorkbenchOverlayState.PipelineCreate ignored -> true;
+                        case WorkbenchOverlayState.PipelineYamlEditor ignored -> true;
                         case WorkbenchOverlayState.Confirm ignored -> true;
                         case WorkbenchOverlayState.Login ignored -> true;
                         case WorkbenchOverlayState.Actions actions -> handleActionsKey(
@@ -552,6 +558,9 @@ final class Workbench {
                 if (overlay instanceof WorkbenchOverlayState.SourceYamlEditor editor) {
                     return requestSourceYamlEditorCancel(editor);
                 }
+                if (overlay instanceof WorkbenchOverlayState.PipelineYamlEditor editor) {
+                    return requestPipelineYamlEditorCancel(editor);
+                }
                 return overlay instanceof WorkbenchOverlayState.Confirm confirm
                         ? cancelConfirm(confirm)
                         : closeOverlay(overlay);
@@ -562,6 +571,8 @@ final class Workbench {
                 case WorkbenchOverlayState.ContextCreate create -> handleContextCreateKey(create, key);
                 case WorkbenchOverlayState.SourceCreate source -> handleSourceCreateKey(source, key);
                 case WorkbenchOverlayState.SourceYamlEditor editor -> handleSourceYamlEditorKey(editor, key);
+                case WorkbenchOverlayState.PipelineCreate pipeline -> handlePipelineCreateKey(pipeline, key);
+                case WorkbenchOverlayState.PipelineYamlEditor editor -> handlePipelineYamlEditorKey(editor, key);
                 case WorkbenchOverlayState.Confirm confirm -> handleConfirmKey(confirm, key);
                 case WorkbenchOverlayState.Login login -> handleLoginKey(login, key);
                 case WorkbenchOverlayState.Actions actions -> handleActionsKey(actions, key);
@@ -587,6 +598,7 @@ final class Workbench {
                 case CONTEXT -> openContextEntry();
                 case AUTHENTICATION -> openAuthEntry();
                 case NEW_SOURCE -> openSourceCreate();
+                case NEW_PIPELINE -> openPipelineCreate();
                 case APPLY_SELECTED_SOURCE -> confirmSourceApply(selectedSourceRequest().orElseThrow());
                 case APPLY_WORKSPACE_SOURCES -> confirmSourceApply(workspaceSourceRequest().orElseThrow());
                 case REFRESH -> {
@@ -677,6 +689,10 @@ final class Workbench {
                     submitSourceCreate(confirm, create);
                     yield true;
                 }
+                case WorkbenchOverlayState.Confirm.Intent.CreatePipeline create -> {
+                    submitPipelineCreate(confirm, create);
+                    yield true;
+                }
                 case WorkbenchOverlayState.Confirm.Intent.ApplySources apply -> {
                     submitSourceApply(confirm, apply);
                     yield true;
@@ -685,6 +701,8 @@ final class Workbench {
                         state.withWorkspaceView(state.workspaceView().cancelEdit()).closeOverlay());
                 case WorkbenchOverlayState.Confirm.Intent.DiscardSourceYaml discard -> runtime.updateState(state ->
                         state.withOverlay(discard.editor().source()));
+                case WorkbenchOverlayState.Confirm.Intent.DiscardPipelineYaml discard -> runtime.updateState(state ->
+                        state.withOverlay(discard.editor().pipeline()));
             };
         }
 
@@ -1140,11 +1158,194 @@ final class Workbench {
             }
         }
 
+        private boolean openPipelineCreate() {
+            List<String> sources = localSourceIds();
+            if (sources.isEmpty()) {
+                restoreActions("Create a local Source before creating a Pipeline");
+                return true;
+            }
+            String source = sources.getFirst();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineCreate(
+                    sources, WorkbenchOverlayState.PipelineCreate.Stage.SOURCE, 0, source,
+                    suggestedPipelineId(source), Optional.empty(), false, Optional.empty())));
+        }
+
+        private List<String> localSourceIds() {
+            return runtime.state().snapshot().stream()
+                    .flatMap(snapshot -> snapshot.workspace().rows().stream())
+                    .filter(Session::isApplicableSource)
+                    .map(row -> row.key().id())
+                    .sorted()
+                    .toList();
+        }
+
+        private static String suggestedPipelineId(String sourceId) {
+            return sourceId.startsWith("src_") ? sourceId.substring(4) + "_pipeline" : sourceId + "_pipeline";
+        }
+
+        private boolean handlePipelineCreateKey(WorkbenchOverlayState.PipelineCreate pipeline, KeyEvent key) {
+            if (pipeline.pending()) {
+                return true;
+            }
+            if (key.isKey(dev.tamboui.tui.event.KeyCode.F4)
+                    && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW) {
+                return openPipelineYamlEditor(pipeline);
+            }
+            if (key.isCancel()) {
+                return pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW
+                        ? updatePipelineCreate(pipeline, WorkbenchOverlayState.PipelineCreate.Stage.ID, 0,
+                                pipeline.sourceId(), pipeline.id(), Optional.empty(), false, Optional.empty())
+                        : runtime.updateState(WorkbenchState::closeOverlay);
+            }
+            if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE && (key.isUp() || key.isDown())) {
+                int index = Math.floorMod(pipeline.selectedIndex() + (key.isUp() ? -1 : 1), pipeline.sourceIds().size());
+                String source = pipeline.sourceIds().get(index);
+                return updatePipelineCreate(pipeline, pipeline.stage(), index, source, suggestedPipelineId(source),
+                        Optional.empty(), false, Optional.empty());
+            }
+            if (key.isDeleteBackward() && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.ID) {
+                return updatePipelineCreate(pipeline, pipeline.stage(), 0, pipeline.sourceId(),
+                        deleteLastCodePoint(pipeline.id()), Optional.empty(), false, Optional.empty());
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                return advancePipelineCreate(pipeline);
+            }
+            if (key.code() == dev.tamboui.tui.event.KeyCode.CHAR
+                    && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.ID) {
+                return updatePipelineCreate(pipeline, pipeline.stage(), 0, pipeline.sourceId(),
+                        pipeline.id() + printableText(key.string()), Optional.empty(), false, Optional.empty());
+            }
+            return true;
+        }
+
+        private boolean advancePipelineCreate(WorkbenchOverlayState.PipelineCreate pipeline) {
+            if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE) {
+                return updatePipelineCreate(pipeline, WorkbenchOverlayState.PipelineCreate.Stage.ID, 0,
+                        pipeline.sourceId(), pipeline.id(), Optional.empty(), false, Optional.empty());
+            }
+            if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.ID) {
+                if (pipeline.id().isBlank()) {
+                    return updatePipelineCreate(pipeline, pipeline.stage(), 0, pipeline.sourceId(), pipeline.id(),
+                            Optional.empty(), false, Optional.of("Pipeline id is required"));
+                }
+                previewPipeline(pipeline);
+                return true;
+            }
+            String yaml = pipeline.canonicalYaml().orElseThrow();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.CreatePipeline(
+                            new WorkbenchActionGateway.PipelineCreateRequest(pipeline.id(), yaml)),
+                    "Create Pipeline", "Create pipeline/" + pipeline.id() + ".tap.yml?", false, Optional.of(pipeline))));
+        }
+
+        private void previewPipeline(WorkbenchOverlayState.PipelineCreate pipeline) {
+            updatePipelineCreate(pipeline, pipeline.stage(), pipeline.selectedIndex(), pipeline.sourceId(), pipeline.id(),
+                    Optional.empty(), true, Optional.empty());
+            actionCoordinator.submit(() -> actionGateway.previewPipeline(
+                            new WorkbenchActionGateway.PipelineDraft(pipeline.sourceId(), pipeline.id())),
+                    failure -> new WorkbenchActionGateway.PipelinePreviewResult.Unavailable(),
+                    result -> completePipelinePreview(pipeline, result));
+        }
+
+        private void completePipelinePreview(WorkbenchOverlayState.PipelineCreate pipeline,
+                WorkbenchActionGateway.PipelinePreviewResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.PipelinePreviewResult.Ready ready -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0, pipeline.sourceId(), pipeline.id(),
+                        Optional.of(ready.canonicalYaml()), false, Optional.empty());
+                case WorkbenchActionGateway.PipelinePreviewResult.Rejected rejected -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.ID, 0, pipeline.sourceId(), pipeline.id(),
+                        Optional.empty(), false, Optional.of(rejected.message()));
+                case WorkbenchActionGateway.PipelinePreviewResult.Unavailable ignored -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.ID, 0, pipeline.sourceId(), pipeline.id(),
+                        Optional.empty(), false, Optional.of("Pipeline preview is unavailable"));
+            }
+        }
+
+        private boolean updatePipelineCreate(WorkbenchOverlayState.PipelineCreate pipeline,
+                WorkbenchOverlayState.PipelineCreate.Stage stage, int selectedIndex, String sourceId, String id,
+                Optional<String> yaml, boolean pending, Optional<String> message) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineCreate(
+                    pipeline.sourceIds(), stage, selectedIndex, sourceId, id, yaml, pending, message)));
+        }
+
+        private boolean openPipelineYamlEditor(WorkbenchOverlayState.PipelineCreate pipeline) {
+            String yaml = pipeline.canonicalYaml().orElse("");
+            if (yaml.isBlank()) {
+                return true;
+            }
+            WorkbenchWorkspaceState.Document document = WorkbenchWorkspaceState.Document
+                    .open(java.nio.file.Path.of("pipeline-draft.tap.yml"), yaml).edit();
+            return runtime.updateState(state -> state.withOverlay(
+                    new WorkbenchOverlayState.PipelineYamlEditor(pipeline, document)));
+        }
+
+        private boolean handlePipelineYamlEditorKey(WorkbenchOverlayState.PipelineYamlEditor editor, KeyEvent key) {
+            if ((key.hasCtrl() && key.isCharIgnoreCase('s')) || key.isKey(dev.tamboui.tui.event.KeyCode.F5)) {
+                return acceptPipelineYamlEditor(editor);
+            }
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineYamlEditor(
+                    editor.pipeline(), editor.document().edit(key))));
+        }
+
+        private boolean requestPipelineYamlEditorCancel(WorkbenchOverlayState.PipelineYamlEditor editor) {
+            if (!editor.document().dirty()) {
+                return runtime.updateState(state -> state.withOverlay(editor.pipeline()));
+            }
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.DiscardPipelineYaml(editor), "Discard changes?",
+                    "Discard Pipeline YAML changes?", false, Optional.of(editor.pipeline()))));
+        }
+
+        private boolean acceptPipelineYamlEditor(WorkbenchOverlayState.PipelineYamlEditor editor) {
+            String yaml = editor.document().content();
+            if (yaml.isBlank()) {
+                return true;
+            }
+            WorkbenchOverlayState.PipelineCreate pipeline = editor.pipeline();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineCreate(
+                    pipeline.sourceIds(), WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0,
+                    pipeline.sourceId(), pipeline.id(), Optional.of(yaml), false, Optional.empty())));
+        }
+
+        private void submitPipelineCreate(WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.CreatePipeline create) {
+            WorkbenchOverlayState.PipelineCreate pipeline = confirm.previous()
+                    .filter(WorkbenchOverlayState.PipelineCreate.class::isInstance)
+                    .map(WorkbenchOverlayState.PipelineCreate.class::cast).orElseThrow();
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.createPipeline(create.request()),
+                    failure -> new WorkbenchActionGateway.PipelineCreateResult.Unavailable(),
+                    result -> completePipelineCreate(pipeline, result));
+        }
+
+        private void completePipelineCreate(WorkbenchOverlayState.PipelineCreate pipeline,
+                WorkbenchActionGateway.PipelineCreateResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.PipelineCreateResult.Created created -> {
+                    runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.WORKSPACE)
+                            .withWorkspaceView(state.workspaceView().open(created.relativePath(), created.canonicalYaml()))
+                            .closeOverlay());
+                    refresh();
+                }
+                case WorkbenchActionGateway.PipelineCreateResult.Exists exists -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0, pipeline.sourceId(), pipeline.id(),
+                        pipeline.canonicalYaml(), false, Optional.of("File already exists: " + exists.relativePath()));
+                case WorkbenchActionGateway.PipelineCreateResult.Rejected rejected -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0, pipeline.sourceId(), pipeline.id(),
+                        pipeline.canonicalYaml(), false, Optional.of(rejected.message()));
+                case WorkbenchActionGateway.PipelineCreateResult.Unavailable ignored -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0, pipeline.sourceId(), pipeline.id(),
+                        pipeline.canonicalYaml(), false, Optional.of("Pipeline creation is unavailable"));
+            }
+        }
+
         private List<WorkbenchOverlayState.Actions.Action> availableActions(WorkbenchState state) {
             List<WorkbenchOverlayState.Actions.Action> actions = new ArrayList<>(List.of(
                     WorkbenchOverlayState.Actions.Action.CONTEXT,
                     WorkbenchOverlayState.Actions.Action.AUTHENTICATION,
-                    WorkbenchOverlayState.Actions.Action.NEW_SOURCE));
+                    WorkbenchOverlayState.Actions.Action.NEW_SOURCE,
+                    WorkbenchOverlayState.Actions.Action.NEW_PIPELINE));
             if (selectedSourceRequest().isPresent()) {
                 actions.add(WorkbenchOverlayState.Actions.Action.APPLY_SELECTED_SOURCE);
             }
@@ -1472,9 +1673,18 @@ final class Workbench {
             if (overlay instanceof WorkbenchOverlayState.SourceCreate source && !source.pending()) {
                 return appendSourceCreateText(source, text);
             }
+            if (overlay instanceof WorkbenchOverlayState.PipelineCreate pipeline && !pipeline.pending()
+                    && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.ID) {
+                return updatePipelineCreate(pipeline, pipeline.stage(), 0, pipeline.sourceId(),
+                        pipeline.id() + printableText(text), Optional.empty(), false, Optional.empty());
+            }
             if (overlay instanceof WorkbenchOverlayState.SourceYamlEditor editor) {
                 return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceYamlEditor(
                         editor.source(), editor.document().insert(text))));
+            }
+            if (overlay instanceof WorkbenchOverlayState.PipelineYamlEditor editor) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineYamlEditor(
+                        editor.pipeline(), editor.document().insert(text))));
             }
             return true;
         }
@@ -1765,6 +1975,8 @@ final class Workbench {
                 case WorkbenchOverlayState.ContextCreate create -> create.previous();
                 case WorkbenchOverlayState.SourceCreate ignored -> Optional.empty();
                 case WorkbenchOverlayState.SourceYamlEditor ignored -> Optional.empty();
+                case WorkbenchOverlayState.PipelineCreate ignored -> Optional.empty();
+                case WorkbenchOverlayState.PipelineYamlEditor ignored -> Optional.empty();
                 case WorkbenchOverlayState.Confirm confirm -> confirm.previous();
                 case WorkbenchOverlayState.Login login -> login.previous();
                 case WorkbenchOverlayState.Actions ignored -> Optional.empty();

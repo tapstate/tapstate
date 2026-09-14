@@ -75,9 +75,19 @@ final class WorkbenchRenderer {
         Optional<WorkbenchOverlayState.SourceYamlEditor> sourceYamlEditor = state.overlay()
                 .filter(WorkbenchOverlayState.SourceYamlEditor.class::isInstance)
                 .map(WorkbenchOverlayState.SourceYamlEditor.class::cast);
+        Optional<WorkbenchOverlayState.PipelineCreate> pipelineCreate = state.overlay()
+                .filter(WorkbenchOverlayState.PipelineCreate.class::isInstance)
+                .map(WorkbenchOverlayState.PipelineCreate.class::cast);
+        Optional<WorkbenchOverlayState.PipelineYamlEditor> pipelineYamlEditor = state.overlay()
+                .filter(WorkbenchOverlayState.PipelineYamlEditor.class::isInstance)
+                .map(WorkbenchOverlayState.PipelineYamlEditor.class::cast);
         ContentLayout content = sourceCreate
                 .map(source -> renderSourceCreatePage(frame, contentArea, source, theme))
                 .or(() -> sourceYamlEditor.map(editor -> renderSourceYamlEditorPage(
+                        frame, contentArea, editor, theme)))
+                .or(() -> pipelineCreate.map(pipeline -> renderPipelineCreatePage(
+                        frame, contentArea, pipeline, theme)))
+                .or(() -> pipelineYamlEditor.map(editor -> renderPipelineYamlEditorPage(
                         frame, contentArea, editor, theme)))
                 .orElseGet(() -> renderContent(frame, contentArea, state, wide, theme));
         FooterLayout footer = renderFooter
@@ -86,6 +96,8 @@ final class WorkbenchRenderer {
         List<OverlayHit> overlayHits = state.overlay()
                 .filter(overlay -> !(overlay instanceof WorkbenchOverlayState.SourceCreate)
                         && !(overlay instanceof WorkbenchOverlayState.SourceYamlEditor))
+                .filter(overlay -> !(overlay instanceof WorkbenchOverlayState.PipelineCreate)
+                        && !(overlay instanceof WorkbenchOverlayState.PipelineYamlEditor))
                 .map(overlay -> renderOverlay(frame,
                         overlay instanceof WorkbenchOverlayState.Actions ? contentArea : area, overlay, theme))
                 .orElseGet(List::of);
@@ -191,6 +203,9 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.SourceCreate source -> source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
                     ? 12 : 9;
             case WorkbenchOverlayState.SourceYamlEditor ignored -> 8;
+            case WorkbenchOverlayState.PipelineCreate pipeline -> pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW
+                    ? 12 : 9;
+            case WorkbenchOverlayState.PipelineYamlEditor ignored -> 8;
             case WorkbenchOverlayState.Confirm ignored -> 4;
             case WorkbenchOverlayState.Login login -> transientLogin(login) ? 7 : 6;
             case WorkbenchOverlayState.Actions actions -> actions.actions().size() + (actions.message().isPresent() ? 2 : 1);
@@ -222,6 +237,9 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.SourceCreate source -> renderSourceCreate(frame, area, box, source, theme);
             case WorkbenchOverlayState.SourceYamlEditor editor -> renderSourceYamlEditor(
                     frame, area, box, editor, theme);
+            case WorkbenchOverlayState.PipelineCreate pipeline -> renderPipelineCreate(frame, area, box, pipeline, theme);
+            case WorkbenchOverlayState.PipelineYamlEditor editor -> renderPipelineYamlEditor(
+                    frame, area, box, editor, theme);
             case WorkbenchOverlayState.Confirm confirm -> renderConfirm(frame, area, box, confirm, theme);
             case WorkbenchOverlayState.Login login -> renderLogin(frame, area, box, login, theme);
             case WorkbenchOverlayState.Actions actions -> renderActions(frame, area, box, actions, theme);
@@ -236,6 +254,8 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.ContextCreate ignored -> "New Context";
             case WorkbenchOverlayState.SourceCreate ignored -> "New Source";
             case WorkbenchOverlayState.SourceYamlEditor ignored -> "Edit YAML";
+            case WorkbenchOverlayState.PipelineCreate ignored -> "New Pipeline";
+            case WorkbenchOverlayState.PipelineYamlEditor ignored -> "Edit YAML";
             case WorkbenchOverlayState.Confirm confirm -> confirm.title();
             case WorkbenchOverlayState.Login login -> "Sign in to " + login.contextName();
             case WorkbenchOverlayState.Actions ignored -> "Actions";
@@ -391,6 +411,36 @@ final class WorkbenchRenderer {
         return List.of();
     }
 
+    private static List<OverlayHit> renderPipelineCreate(
+            Frame frame, Rect area, Rect box, WorkbenchOverlayState.PipelineCreate pipeline, WorkbenchTheme theme) {
+        renderFormField(frame, area, box.x() + 2, box.y() + 1,
+                pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE ? "Source" : "Pipeline id",
+                pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE ? pipeline.sourceId() : pipeline.id(),
+                true, theme);
+        if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE) {
+            int visible = Math.min(4, pipeline.sourceIds().size());
+            for (int index = 0; index < visible; index++) {
+                write(frame, box.x() + 4, box.y() + 3 + index, pipeline.sourceIds().get(index),
+                        index == pipeline.selectedIndex() ? theme.selection() : theme.base(), area);
+            }
+        } else if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW) {
+            String[] lines = pipeline.canonicalYaml().orElse("").split("\\R");
+            for (int index = 0; index < Math.min(7, lines.length); index++) {
+                write(frame, box.x() + 2, box.y() + 2 + index, lines[index], theme.base(), area);
+            }
+        }
+        pipeline.message().ifPresent(message -> write(frame, box.x() + 2, box.y() + box.height() - 2,
+                message, theme.error(), area));
+        return List.of();
+    }
+
+    private static List<OverlayHit> renderPipelineYamlEditor(
+            Frame frame, Rect area, Rect box, WorkbenchOverlayState.PipelineYamlEditor editor, WorkbenchTheme theme) {
+        renderDocument(frame, new Rect(box.x() + 1, box.y() + 1, box.width() - 2, box.height() - 2),
+                editor.document(), theme);
+        return List.of();
+    }
+
     private static ContentLayout renderSourceCreatePage(
             Frame frame,
             Rect area,
@@ -504,6 +554,90 @@ final class WorkbenchRenderer {
             WorkbenchOverlayState.SourceYamlEditor editor,
             WorkbenchTheme theme) {
         String title = " ✎ Edit source/" + editor.source().id() + ".tap.yml"
+                + (editor.document().dirty() ? " *" : "") + " ";
+        Block block = Block.builder()
+                .borderType(BorderType.ROUNDED)
+                .borders(Borders.ALL)
+                .borderStyle(theme.accent())
+                .title(Title.from(Line.from(Span.styled(title, theme.title()))))
+                .build();
+        frame.renderWidget(block, area);
+        renderDocument(frame, block.inner(area), editor.document(), theme);
+        return new ContentLayout(List.of(), Math.max(1, block.inner(area).height()));
+    }
+
+    private static ContentLayout renderPipelineCreatePage(
+            Frame frame,
+            Rect area,
+            WorkbenchOverlayState.PipelineCreate pipeline,
+            WorkbenchTheme theme) {
+        Block block = Block.builder()
+                .borderType(BorderType.ROUNDED)
+                .borders(Borders.ALL)
+                .borderStyle(theme.base())
+                .title(Title.from(Line.from(Span.styled(" ⚡ New Pipeline ", theme.title()))))
+                .build();
+        frame.renderWidget(block, area);
+        Rect inner = block.inner(area);
+        int leftWidth = Math.clamp(inner.width() / 2, 38, 58);
+        Rect formArea = new Rect(inner.x(), inner.y(), leftWidth, inner.height());
+        Rect previewArea = new Rect(inner.x() + leftWidth + 1, inner.y(),
+                Math.max(0, inner.width() - leftWidth - 1), inner.height());
+        int y = formArea.y();
+        write(frame, formArea.x(), y++, "Guided authoring", theme.label().bold(), formArea);
+        y++;
+        renderSourcePageField(frame, formArea, y++, "1", "Source", pipeline.sourceId(),
+                pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE, theme);
+        renderSourcePageField(frame, formArea, y++, "2", "Pipeline id", pipeline.id(),
+                pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.ID, theme);
+        y++;
+        if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE) {
+            int visible = Math.max(1, Math.min(pipeline.sourceIds().size(), formArea.bottom() - y - 2));
+            int first = Math.clamp(pipeline.selectedIndex() - visible / 2, 0,
+                    Math.max(0, pipeline.sourceIds().size() - visible));
+            for (int offset = 0; offset < visible; offset++) {
+                int index = first + offset;
+                write(frame, formArea.x() + 2, y + offset,
+                        pad(pipeline.sourceIds().get(index), formArea.width() - 2),
+                        index == pipeline.selectedIndex() ? theme.selection() : theme.base(), formArea);
+            }
+            write(frame, formArea.x(), formArea.bottom() - 1, "↑↓ choose source", theme.muted(), formArea);
+        } else {
+            String hint = switch (pipeline.stage()) {
+                case ID -> "Choose a stable local identifier.";
+                case PREVIEW -> "F4 edits the complete Pipeline graph.";
+                default -> "";
+            };
+            write(frame, formArea.x(), y, hint, theme.muted(), formArea);
+        }
+        if (previewArea.width() >= 4 && previewArea.height() >= 3) {
+            Block previewBlock = Block.builder()
+                    .borderType(BorderType.ROUNDED)
+                    .borders(Borders.ALL)
+                    .borderStyle(pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW
+                            ? theme.accent() : theme.base())
+                    .title(Title.from(Line.from(Span.styled(" Canonical YAML ", theme.title()))))
+                    .build();
+            frame.renderWidget(previewBlock, previewArea);
+            Rect previewInner = previewBlock.inner(previewArea);
+            String yaml = pipeline.canonicalYaml().orElse(pipeline.pending()
+                    ? "Generating Pipeline preview..." : "Preview will include a default inline View.");
+            String[] lines = yaml.split("\\R");
+            for (int index = 0; index < Math.min(lines.length, previewInner.height()); index++) {
+                write(frame, previewInner.x(), previewInner.y() + index, lines[index], theme.base(), previewInner);
+            }
+        }
+        pipeline.message().ifPresent(message -> write(frame, formArea.x(), formArea.bottom() - 1,
+                message, theme.error(), formArea));
+        return new ContentLayout(List.of(), Math.max(1, formArea.height()));
+    }
+
+    private static ContentLayout renderPipelineYamlEditorPage(
+            Frame frame,
+            Rect area,
+            WorkbenchOverlayState.PipelineYamlEditor editor,
+            WorkbenchTheme theme) {
+        String title = " ✎ Edit pipeline/" + editor.pipeline().id() + ".tap.yml"
                 + (editor.document().dirty() ? " *" : "") + " ";
         Block block = Block.builder()
                 .borderType(BorderType.ROUNDED)
@@ -1473,6 +1607,11 @@ final class WorkbenchRenderer {
                     new FooterHint("↑↓←→", "navigate", Optional.empty()),
                     new FooterHint("Esc", "cancel", Optional.empty()),
                     new FooterHint("F5", "save & close", Optional.of(FooterAction.SAVE_AND_CLOSE)));
+            case WorkbenchOverlayState.PipelineCreate pipeline -> pipelineCreateFooter(pipeline);
+            case WorkbenchOverlayState.PipelineYamlEditor editor -> List.of(
+                    new FooterHint("↑↓←→", "navigate", Optional.empty()),
+                    new FooterHint("Esc", "cancel", Optional.empty()),
+                    new FooterHint("F5", "save & close", Optional.of(FooterAction.SAVE_AND_CLOSE)));
             case WorkbenchOverlayState.Confirm confirm -> confirm.pending()
                     ? List.of(new FooterHint("…", "working", Optional.empty()))
                     : List.of(
@@ -1489,6 +1628,22 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.Help ignored -> List.of(
                     new FooterHint("Esc", "back", Optional.empty()));
         };
+    }
+
+    private static List<FooterHint> pipelineCreateFooter(WorkbenchOverlayState.PipelineCreate pipeline) {
+        List<FooterHint> hints = new ArrayList<>();
+        hints.add(new FooterHint(pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE ? "↑↓" : "type",
+                pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW ? "preview" : "choose",
+                Optional.empty()));
+        if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW) {
+            hints.add(new FooterHint("F4", "edit", Optional.of(FooterAction.EDIT)));
+        }
+        hints.add(new FooterHint("Enter", pipeline.pending() ? "wait"
+                : pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW ? "create" : "next",
+                Optional.empty()));
+        hints.add(new FooterHint("Esc", pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW
+                ? "back" : "cancel", Optional.empty()));
+        return List.copyOf(hints);
     }
 
     private static String tabLabel(WorkbenchState.WorkbenchTab tab) {

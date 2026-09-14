@@ -6,7 +6,10 @@ import io.tapstate.core.dsl.Interpolator;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.schema.SchemaNavigator;
@@ -360,6 +363,33 @@ final class Repl {
             }
 
             @Override
+            public PipelinePreviewResult previewPipeline(PipelineDraft draft) {
+                try {
+                    return new PipelinePreviewResult.Ready(canonicalPipeline(draft));
+                } catch (RuntimeException rejected) {
+                    return new PipelinePreviewResult.Rejected("Pipeline draft is not valid");
+                }
+            }
+
+            @Override
+            public PipelineCreateResult createPipeline(PipelineCreateRequest request) {
+                try {
+                    Path relativePath = Path.of("pipeline", request.id() + ".tap.yml");
+                    Path target = resolveWorkbenchNewFile(relativePath);
+                    try {
+                        Files.writeString(target, request.canonicalYaml(), java.nio.file.StandardOpenOption.CREATE_NEW);
+                    } catch (java.nio.file.FileAlreadyExistsException exists) {
+                        return new PipelineCreateResult.Exists(relativePath);
+                    }
+                    return new PipelineCreateResult.Created(relativePath, request.canonicalYaml());
+                } catch (IllegalArgumentException rejected) {
+                    return new PipelineCreateResult.Rejected("Pipeline draft is not valid");
+                } catch (IOException unavailable) {
+                    return new PipelineCreateResult.Unavailable();
+                }
+            }
+
+            @Override
             public SourceApplyResult applySources(SourceApplyRequest request) {
                 if (!session.isConnected() || !session.isAuthenticated()) {
                     return new SourceApplyResult.Unavailable();
@@ -436,6 +466,12 @@ final class Repl {
         SourceResource source = SourceScaffold.build(catalog, draft.connector(), draft.mode(),
                 SourceScaffold.tableRefs(draft.tables(), mode), draft.id(), draft.config());
         return new CanonicalWriter().write(source);
+    }
+
+    private String canonicalPipeline(WorkbenchActionGateway.PipelineDraft draft) {
+        PipelineResource pipeline = new PipelineResource(draft.id(), null, List.of(draft.sourceId()), null,
+                new ViewBlock.Inline("view", FromRef.regex(".*"), null, null, null), null, null, null);
+        return new CanonicalWriter().write(pipeline);
     }
 
     private static WorkbenchActionGateway.SourceConfigField sourceConfigField(ConfigField field) {
