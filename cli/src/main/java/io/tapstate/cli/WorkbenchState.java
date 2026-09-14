@@ -14,7 +14,8 @@ record WorkbenchState(
         WorkbenchTableState workspaceTable,
         WorkbenchWorkspaceState workspaceView,
         WorkbenchTableState sourcesTable,
-        WorkbenchTableState pipelinesTable) {
+        WorkbenchTableState pipelinesTable,
+        Optional<WorkbenchPipelineStatus> selectedPipelineStatus) {
 
     WorkbenchState {
         Objects.requireNonNull(selectedTab, "selectedTab");
@@ -25,6 +26,7 @@ record WorkbenchState(
         Objects.requireNonNull(workspaceView, "workspaceView");
         Objects.requireNonNull(sourcesTable, "sourcesTable");
         Objects.requireNonNull(pipelinesTable, "pipelinesTable");
+        Objects.requireNonNull(selectedPipelineStatus, "selectedPipelineStatus");
     }
 
     static WorkbenchState initial() {
@@ -36,7 +38,8 @@ record WorkbenchState(
                 WorkbenchTableState.empty(),
                 WorkbenchWorkspaceState.empty(),
                 WorkbenchTableState.empty(),
-                WorkbenchTableState.empty());
+                WorkbenchTableState.empty(),
+                Optional.empty());
     }
 
     WorkbenchState reduce(KeyEvent key) {
@@ -89,7 +92,8 @@ record WorkbenchState(
                 workspaceTable,
                 workspaceView,
                 sourcesTable,
-                pipelinesTable);
+                pipelinesTable,
+                selectedPipelineStatus);
     }
 
     WorkbenchState closeOverlay() {
@@ -101,7 +105,8 @@ record WorkbenchState(
                 workspaceTable,
                 workspaceView,
                 sourcesTable,
-                pipelinesTable);
+                pipelinesTable,
+                selectedPipelineStatus);
     }
 
     WorkbenchState selectRow(WorkbenchTab tab, int index, int visibleRows) {
@@ -135,7 +140,8 @@ record WorkbenchState(
                 contextChanged ? WorkbenchTableState.empty() : workspaceTable,
                 contextChanged ? WorkbenchWorkspaceState.empty() : workspaceView,
                 contextChanged ? WorkbenchTableState.empty() : sourcesTable,
-                contextChanged ? WorkbenchTableState.empty() : pipelinesTable);
+                contextChanged ? WorkbenchTableState.empty() : pipelinesTable,
+                contextChanged ? Optional.empty() : selectedPipelineStatus);
     }
 
     WorkbenchState acceptSnapshot(WorkbenchSnapshot published) {
@@ -158,7 +164,8 @@ record WorkbenchState(
                 workspaceTable.clamp(published.workspace().rows().size()),
                 workspaceView,
                 sourcesTable.clamp(published.sources().rows().size()),
-                pipelinesTable.clamp(published.pipelines().rows().size()));
+                pipelinesTable.clamp(published.pipelines().rows().size()),
+                selectedPipelineStatus);
     }
 
     private WorkbenchState withTable(WorkbenchTab tab, WorkbenchTableState table) {
@@ -177,14 +184,21 @@ record WorkbenchState(
             WorkbenchTableState pipelines) {
         return new WorkbenchState(
                 tab, expectedSnapshot, snapshot, overlay,
-                workspace, workspaceView, sources, pipelines);
+                workspace, workspaceView, sources, pipelines, selectedPipelineStatus);
     }
 
     WorkbenchState withWorkspaceView(WorkbenchWorkspaceState view) {
         Objects.requireNonNull(view, "view");
         return new WorkbenchState(
                 selectedTab, expectedSnapshot, snapshot, overlay,
-                workspaceTable, view, sourcesTable, pipelinesTable);
+                workspaceTable, view, sourcesTable, pipelinesTable, selectedPipelineStatus);
+    }
+
+    WorkbenchState withSelectedPipelineStatus(Optional<WorkbenchPipelineStatus> status) {
+        Objects.requireNonNull(status, "status");
+        return status.equals(selectedPipelineStatus) ? this : new WorkbenchState(
+                selectedTab, expectedSnapshot, snapshot, overlay,
+                workspaceTable, workspaceView, sourcesTable, pipelinesTable, status);
     }
 
     private WorkbenchTableState table(WorkbenchTab tab) {
@@ -373,8 +387,8 @@ record WorkbenchTableState(
 
 enum WorkbenchSortColumn {
     IDENTIFIER("IDENTIFIER"),
-    ALIGNMENT("STATE"),
-    LOCAL("WORKSPACE");
+    ALIGNMENT("SYNC"),
+    LOCAL("LOCAL");
 
     private final String label;
 
@@ -384,5 +398,55 @@ enum WorkbenchSortColumn {
 
     String label() {
         return label;
+    }
+}
+
+/** The most recent on-demand lifecycle state for exactly one selected Pipeline. */
+sealed interface WorkbenchPipelineStatus
+        permits WorkbenchPipelineStatus.Loading,
+                WorkbenchPipelineStatus.Available,
+                WorkbenchPipelineStatus.Rejected,
+                WorkbenchPipelineStatus.Unreachable,
+                WorkbenchPipelineStatus.Unavailable {
+
+    String pipelineId();
+
+    record Loading(String pipelineId) implements WorkbenchPipelineStatus {
+        public Loading {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+        }
+    }
+
+    record Available(
+            String pipelineId,
+            String state,
+            Optional<String> failureCode,
+            Optional<String> failureMessage) implements WorkbenchPipelineStatus {
+        public Available {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(state, "state");
+            Objects.requireNonNull(failureCode, "failureCode");
+            Objects.requireNonNull(failureMessage, "failureMessage");
+        }
+    }
+
+    record Rejected(String pipelineId, String code, String message) implements WorkbenchPipelineStatus {
+        public Rejected {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(code, "code");
+            Objects.requireNonNull(message, "message");
+        }
+    }
+
+    record Unreachable(String pipelineId) implements WorkbenchPipelineStatus {
+        public Unreachable {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+        }
+    }
+
+    record Unavailable(String pipelineId) implements WorkbenchPipelineStatus {
+        public Unavailable {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+        }
     }
 }

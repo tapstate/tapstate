@@ -959,8 +959,20 @@ final class WorkbenchRenderer {
         } else {
             List<WorkbenchArtifactRow> rows = rows(snapshot, state.selectedTab());
             WorkbenchTableState table = table(state, state.selectedTab());
+            boolean pipelineDetail = state.selectedTab() == WorkbenchState.WorkbenchTab.PIPELINES
+                    && selectedPipelineStatus(state).isPresent();
+            Rect tableArea = pipelineDetail
+                    ? new Rect(inner.x(), inner.y(), inner.width(), Math.max(1, inner.height() - 2))
+                    : inner;
+            int tableRows = Math.max(1, tableArea.height() - 1);
+            visibleRows = tableRows;
             rowHits = renderTable(
-                    frame, inner, state.selectedTab(), rows, table, wide, visibleRows, theme);
+                    frame, tableArea, state.selectedTab(), rows, table, wide, tableRows, theme);
+            if (pipelineDetail) {
+                write(frame, inner.x(), inner.bottom() - 2,
+                        pipelineStatusDetail(selectedPipelineStatus(state).orElseThrow()),
+                        pipelineStatusStyle(selectedPipelineStatus(state).orElseThrow(), theme), inner);
+            }
         }
         write(frame, inner.x(), inner.bottom() - 1,
                 notification(state), notificationStyle(state, theme), inner);
@@ -1255,7 +1267,7 @@ final class WorkbenchRenderer {
     private static void renderOverview(
             Frame frame, Rect area, WorkbenchSnapshot snapshot, WorkbenchTheme theme) {
         if (isFirstRun(snapshot)) {
-            renderFirstRunOverview(frame, area, theme);
+            renderFirstRunOverview(frame, area, snapshot, theme);
             return;
         }
         WorkbenchOverviewSnapshot overview = snapshot.overview();
@@ -1298,9 +1310,7 @@ final class WorkbenchRenderer {
     }
 
     private static boolean isFirstRun(WorkbenchSnapshot snapshot) {
-        WorkbenchSessionSnapshot session = snapshot.session();
-        return session.connection() == WorkbenchConnection.NO_CONTEXT
-                && snapshot.workspace().rows().isEmpty()
+        return snapshot.workspace().rows().isEmpty()
                 && snapshot.overview().kinds().stream()
                         .allMatch(count -> count.localCount() == 0 && count.remoteCount().orElse(0) == 0)
                 && isEmpty(snapshot.overview().alignment());
@@ -1315,27 +1325,46 @@ final class WorkbenchRenderer {
                 && counts.unknown() == 0;
     }
 
-    private static void renderFirstRunOverview(Frame frame, Rect area, WorkbenchTheme theme) {
+    private static void renderFirstRunOverview(
+            Frame frame, Rect area, WorkbenchSnapshot snapshot, WorkbenchTheme theme) {
         int x = area.x() + Math.min(4, Math.max(1, area.width() / 16));
         int y = area.y() + 1;
         write(frame, x + 4, y++, "╭────────╮       ╭──────────╮", theme.accent(), area);
         write(frame, x + 4, y++, "│ source │ ───▶  │ pipeline │", theme.accent(), area);
         write(frame, x + 4, y++, "╰────────╯       ╰──────────╯", theme.accent(), area);
-        write(frame, x, y++, "No Pipeline Activity Found", theme.title(), area);
+        WorkbenchSessionSnapshot session = snapshot.session();
+        String heading = switch (session.connection()) {
+            case NO_CONTEXT -> "No workspace selected";
+            case OFFLINE -> "No workspace artifacts found";
+            case CONNECTED -> session.authentication() == WorkbenchAuthentication.SIGNED_OUT
+                    ? "Sign in to continue"
+                    : "No workspace artifacts found";
+        };
+        write(frame, x, y++, heading, theme.title(), area);
         y += 2;
 
         write(frame, x, y++, "💡 How to get started:", theme.label().bold(), area);
-        write(frame, x, y++, "🚀 Run the guided demo workspace:", theme.base().bold(), area);
-        write(frame, x + 3, y++, "> tapstate demo -w demo", theme.success(), area);
-        write(frame, x + 3, y++, "> cd demo && tapstate", theme.success(), area);
+        if (session.connection() == WorkbenchConnection.NO_CONTEXT) {
+            write(frame, x, y++, "🔌 Connect to a Tapstate Server:", theme.base().bold(), area);
+            y = writeKeyInstruction(frame, area, x + 3, y, "c", "create or choose a context", theme);
+            write(frame, x, y++, "🔐 Then sign in:", theme.base().bold(), area);
+            y = writeKeyInstruction(frame, area, x + 3, y, "a", "open the sign-in form", theme);
+        } else if (session.authentication() == WorkbenchAuthentication.SIGNED_OUT) {
+            write(frame, x, y++, "🔐 Sign in to the selected context:", theme.base().bold(), area);
+            y = writeKeyInstruction(frame, area, x + 3, y, "a", "open the sign-in form", theme);
+        } else if (session.connection() == WorkbenchConnection.OFFLINE) {
+            write(frame, x, y++, "🔌 Check the selected Tapstate Server:", theme.base().bold(), area);
+            y = writeKeyInstruction(frame, area, x + 3, y, "c", "choose another context or edit this one", theme);
+            y = writeKeyInstruction(frame, area, x + 3, y, "r", "refresh the connection", theme);
+        }
         y++;
-
-        write(frame, x, y++, "🖥️ Or connect an existing Tapstate Server:", theme.base().bold(), area);
-        y = writeKeyInstruction(frame, area, x + 3, y, "c", "create or choose a context", theme);
-        y = writeKeyInstruction(frame, area, x + 3, y, "a", "sign in when the context is selected", theme);
+        write(frame, x, y++, "✨ Create a local source:", theme.base().bold(), area);
+        y = writeKeyInstruction(frame, area, x + 3, y, "F2", "open Actions and choose New Source", theme);
+        write(frame, x, y++, "🔀 Then create a pipeline from that source:", theme.base().bold(), area);
+        y = writeKeyInstruction(frame, area, x + 3, y, "F2", "open Actions and choose New Pipeline", theme);
         y++;
-
-        write(frame, x, y, "💻 Local *.tap.yml files appear in the Workspace tab.", theme.muted(), area);
+        write(frame, x, y++, "🚀 Or create a demo workspace in another terminal:", theme.base().bold(), area);
+        write(frame, x + 3, y, "> tapstate demo -w demo", theme.success(), area);
     }
 
     private static int writeKeyInstruction(
@@ -1569,6 +1598,34 @@ final class WorkbenchRenderer {
         }
         WorkbenchArtifactRow row = rows.get(Math.clamp(state.pipelinesTable().selectedIndex(), 0, rows.size() - 1));
         return "pipeline".equals(row.key().kind()) ? Optional.of(row) : Optional.empty();
+    }
+
+    private static Optional<WorkbenchPipelineStatus> selectedPipelineStatus(WorkbenchState state) {
+        return selectedPipeline(state).flatMap(row -> state.selectedPipelineStatus()
+                .filter(status -> status.pipelineId().equals(row.key().id())));
+    }
+
+    private static String pipelineStatusDetail(WorkbenchPipelineStatus status) {
+        return switch (status) {
+            case WorkbenchPipelineStatus.Loading ignored -> "Selected Pipeline status: loading...";
+            case WorkbenchPipelineStatus.Available available -> "Selected Pipeline status: " + available.state()
+                    + available.failureMessage().map(message -> " · " + message).orElse("");
+            case WorkbenchPipelineStatus.Rejected rejected -> "Selected Pipeline status unavailable: "
+                    + rejected.code() + " · " + rejected.message();
+            case WorkbenchPipelineStatus.Unreachable ignored -> "Selected Pipeline status unavailable: server unreachable";
+            case WorkbenchPipelineStatus.Unavailable ignored -> "Selected Pipeline status unavailable";
+        };
+    }
+
+    private static Style pipelineStatusStyle(WorkbenchPipelineStatus status, WorkbenchTheme theme) {
+        return switch (status) {
+            case WorkbenchPipelineStatus.Available available -> available.failureCode().isPresent()
+                    ? theme.error() : theme.success();
+            case WorkbenchPipelineStatus.Rejected ignored -> theme.error();
+            case WorkbenchPipelineStatus.Unreachable ignored -> theme.warning();
+            case WorkbenchPipelineStatus.Unavailable ignored -> theme.muted();
+            case WorkbenchPipelineStatus.Loading ignored -> theme.info();
+        };
     }
 
     private static List<FooterHint> workspaceFooter(WorkbenchState state) {

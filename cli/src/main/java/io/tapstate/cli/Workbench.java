@@ -20,6 +20,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * The full-screen terminal owner for a bare CLI launch.
@@ -158,6 +164,7 @@ final class Workbench {
         private final WorkbenchActionGateway actionGateway;
         private final RefreshCoordinator refreshCoordinator;
         private final WorkbenchActionCoordinator actionCoordinator;
+        private final SelectedPipelineStatusCoordinator pipelineStatusCoordinator;
         private final WorkbenchShellPanel shellPanel;
         private volatile WorkbenchSnapshot lastSuccessfulSnapshot;
         private WorkbenchRenderer.RenderLayout layout = WorkbenchRenderer.RenderLayout.forTooSmallFrame();
@@ -185,6 +192,7 @@ final class Workbench {
             this.actionGateway = null;
             this.refreshCoordinator = null;
             this.actionCoordinator = null;
+            this.pipelineStatusCoordinator = null;
             this.shellPanel = null;
         }
 
@@ -219,6 +227,7 @@ final class Workbench {
             this.actionGateway = actionGateway;
             this.refreshCoordinator = new RefreshCoordinator(this::publishRefreshResult);
             this.actionCoordinator = actionGateway == null ? null : new WorkbenchActionCoordinator(runtime);
+            this.pipelineStatusCoordinator = actionGateway == null ? null : new SelectedPipelineStatusCoordinator(runtime);
             this.shellPanel = repl == null ? null : new WorkbenchShellPanel(
                     repl, runtime::requestRender, runtime::runLater);
         }
@@ -1622,6 +1631,7 @@ final class Workbench {
                 WorkbenchActionGateway.PipelineLifecycleResult result) {
             switch (result) {
                 case WorkbenchActionGateway.PipelineLifecycleResult.Changed ignored -> {
+                    clearSelectedPipelineStatus();
                     runtime.updateState(WorkbenchState::closeOverlay);
                     refresh();
                 }
@@ -2227,6 +2237,7 @@ final class Workbench {
             }
             RefreshRequest request = refreshCoordinator.refresh((generation, sequence, token) ->
                     RefreshResult.success(dataSource.load(generation, sequence, token)));
+            clearSelectedPipelineStatus();
             runtime.expectSnapshot(new WorkbenchSnapshot(
                     request.contextGeneration(), request.requestSequence()));
         }
@@ -2240,6 +2251,7 @@ final class Workbench {
         }
 
         void render(Frame frame) {
+            ensureSelectedPipelineStatus();
             if (shellPanel == null || !shellPanel.isOpen() || runtime.state().overlay().isPresent()
                     || frame.area().height() < 24) {
                 layout = WorkbenchRenderer.render(frame, runtime.state());
@@ -2263,6 +2275,9 @@ final class Workbench {
             }
             if (actionCoordinator != null) {
                 actionCoordinator.close();
+            }
+            if (pipelineStatusCoordinator != null) {
+                pipelineStatusCoordinator.close();
             }
             if (refreshCoordinator != null) {
                 refreshCoordinator.close();
@@ -2371,8 +2386,152 @@ final class Workbench {
             return (int) rows.stream().filter(row -> row.alignment() == alignment).count();
         }
 
+        private void ensureSelectedPipelineStatus() {
+            if (pipelineStatusCoordinator == null || actionGateway == null || runtime.state().overlay().isPresent()) {
+                return;
+            }
+            Optional<String> pipelineId = selectedPipelineStatusId();
+            if (pipelineId.isEmpty()) {
+                clearSelectedPipelineStatus();
+                return;
+            }
+            String id = pipelineId.orElseThrow();
+            if (runtime.state().selectedPipelineStatus().map(WorkbenchPipelineStatus::pipelineId)
+                    .filter(id::equals).isPresent()) {
+                return;
+            }
+            runtime.updateState(state -> state.withSelectedPipelineStatus(
+                    Optional.of(new WorkbenchPipelineStatus.Loading(id))));
+            pipelineStatusCoordinator.submit(id,
+                    () -> actionGateway.readPipelineStatus(new WorkbenchActionGateway.PipelineStatusRequest(id)),
+                    result -> completeSelectedPipelineStatus(id, result));
+        }
+
+        private Optional<String> selectedPipelineStatusId() {
+            WorkbenchState state = runtime.state();
+            if (state.selectedTab() != WorkbenchState.WorkbenchTab.PIPELINES || state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            WorkbenchSnapshot snapshot = state.snapshot().orElseThrow();
+            if (!(snapshot.pipelines().remoteState() instanceof WorkbenchRemoteState.Available)) {
+                return Optional.empty();
+            }
+            List<WorkbenchArtifactRow> rows = WorkbenchRenderer.sorted(snapshot.pipelines().rows(), state.pipelinesTable());
+            if (rows.isEmpty()) {
+                return Optional.empty();
+            }
+            WorkbenchArtifactRow selected = rows.get(Math.clamp(
+                    state.pipelinesTable().selectedIndex(), 0, rows.size() - 1));
+            return selected.remote().isEmpty() ? Optional.empty() : Optional.of(selected.key().id());
+        }
+
+        private void completeSelectedPipelineStatus(
+                String pipelineId,
+                WorkbenchActionGateway.PipelineStatusResult result) {
+            if (selectedPipelineStatusId().filter(pipelineId::equals).isEmpty()) {
+                return;
+            }
+            WorkbenchPipelineStatus status = switch (result) {
+                case WorkbenchActionGateway.PipelineStatusResult.Available available ->
+                        new WorkbenchPipelineStatus.Available(
+                                pipelineId, available.state(), available.failureCode(), available.failureMessage());
+                case WorkbenchActionGateway.PipelineStatusResult.Rejected rejected ->
+                        new WorkbenchPipelineStatus.Rejected(pipelineId, rejected.code(), rejected.message());
+                case WorkbenchActionGateway.PipelineStatusResult.Unreachable ignored ->
+                        new WorkbenchPipelineStatus.Unreachable(pipelineId);
+                case WorkbenchActionGateway.PipelineStatusResult.Unavailable ignored ->
+                        new WorkbenchPipelineStatus.Unavailable(pipelineId);
+            };
+            runtime.updateState(state -> state.withSelectedPipelineStatus(Optional.of(status)));
+        }
+
+        private void clearSelectedPipelineStatus() {
+            if (runtime.state().selectedPipelineStatus().isEmpty()) {
+                return;
+            }
+            if (pipelineStatusCoordinator != null) {
+                pipelineStatusCoordinator.cancel();
+            }
+            runtime.updateState(state -> state.withSelectedPipelineStatus(Optional.empty()));
+        }
+
         private int visibleRows() {
             return Math.max(1, layout.visibleRowCapacity());
+        }
+    }
+
+    /** Runs only the latest selected-Pipeline status lookup without interrupting mutation work. */
+    private static final class SelectedPipelineStatusCoordinator implements AutoCloseable {
+
+        private final WorkbenchRuntime runtime;
+        private final ThreadPoolExecutor worker;
+        private Future<?> active;
+        private long sequence;
+        private boolean closed;
+
+        private SelectedPipelineStatusCoordinator(WorkbenchRuntime runtime) {
+            this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.worker = new ThreadPoolExecutor(
+                    1, 1, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1),
+                    task -> {
+                        Thread thread = new Thread(task, "tapstate-pipeline-status");
+                        thread.setDaemon(true);
+                        return thread;
+                    }, new ThreadPoolExecutor.AbortPolicy());
+        }
+
+        synchronized void submit(
+                String pipelineId,
+                Supplier<WorkbenchActionGateway.PipelineStatusResult> read,
+                Consumer<WorkbenchActionGateway.PipelineStatusResult> completion) {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(read, "read");
+            Objects.requireNonNull(completion, "completion");
+            if (closed) {
+                return;
+            }
+            cancelActive();
+            long currentSequence = Math.incrementExact(sequence);
+            active = worker.submit(() -> {
+                WorkbenchActionGateway.PipelineStatusResult result;
+                try {
+                    result = read.get();
+                } catch (RuntimeException failure) {
+                    result = new WorkbenchActionGateway.PipelineStatusResult.Unavailable();
+                }
+                runtime.runLater(() -> complete(currentSequence, result, completion));
+            });
+        }
+
+        synchronized void cancel() {
+            sequence = Math.incrementExact(sequence);
+            cancelActive();
+        }
+
+        private synchronized void complete(
+                long completedSequence,
+                WorkbenchActionGateway.PipelineStatusResult result,
+                Consumer<WorkbenchActionGateway.PipelineStatusResult> completion) {
+            if (closed || completedSequence != sequence) {
+                return;
+            }
+            active = null;
+            completion.accept(result);
+            runtime.requestRender();
+        }
+
+        private void cancelActive() {
+            if (active != null) {
+                active.cancel(true);
+                active = null;
+            }
+        }
+
+        @Override
+        public synchronized void close() {
+            closed = true;
+            cancelActive();
+            worker.shutdownNow();
         }
     }
 }

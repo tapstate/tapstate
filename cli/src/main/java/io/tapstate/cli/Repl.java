@@ -472,6 +472,24 @@ final class Repl {
             }
 
             @Override
+            public PipelineStatusResult readPipelineStatus(PipelineStatusRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineStatusResult.Unavailable();
+                }
+                StatusOutcome outcome = withFailover(() -> controlPlane.status(
+                        session.landingNode(), session.credential(), request.pipelineId()),
+                        value -> value instanceof StatusOutcome.Unreachable);
+                return switch (outcome) {
+                    case StatusOutcome.Found found -> new PipelineStatusResult.Available(
+                            found.pipelineId(), found.state(),
+                            Optional.ofNullable(found.failureCode()), Optional.ofNullable(found.failureMessage()));
+                    case StatusOutcome.Rejected rejected -> new PipelineStatusResult.Rejected(
+                            request.pipelineId(), rejected.code(), rejected.message());
+                    case StatusOutcome.Unreachable ignored -> new PipelineStatusResult.Unreachable();
+                };
+            }
+
+            @Override
             public SourceApplyResult applySources(SourceApplyRequest request) {
                 if (!session.isConnected() || !session.isAuthenticated()) {
                     return new SourceApplyResult.Unavailable();

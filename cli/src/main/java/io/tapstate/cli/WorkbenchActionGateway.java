@@ -63,6 +63,10 @@ interface WorkbenchActionGateway {
         return new PipelineLifecycleResult.Unavailable();
     }
 
+    default PipelineStatusResult readPipelineStatus(PipelineStatusRequest request) {
+        return new PipelineStatusResult.Unavailable();
+    }
+
     record ContextOption(String name, boolean suggested) {
         public ContextOption {
             Objects.requireNonNull(name, "name");
@@ -244,6 +248,12 @@ interface WorkbenchActionGateway {
         }
     }
 
+    record PipelineStatusRequest(String pipelineId) {
+        public PipelineStatusRequest {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+        }
+    }
+
     record SourceApplyRequest(List<Path> relativePaths) {
         public SourceApplyRequest {
             relativePaths = List.copyOf(relativePaths);
@@ -388,6 +398,32 @@ interface WorkbenchActionGateway {
         }
 
         record Unavailable() implements PipelineLifecycleResult {
+        }
+    }
+
+    sealed interface PipelineStatusResult {
+        record Available(String pipelineId, String state, Optional<String> failureCode,
+                         Optional<String> failureMessage) implements PipelineStatusResult {
+            public Available {
+                Objects.requireNonNull(pipelineId, "pipelineId");
+                Objects.requireNonNull(state, "state");
+                Objects.requireNonNull(failureCode, "failureCode");
+                Objects.requireNonNull(failureMessage, "failureMessage");
+            }
+        }
+
+        record Rejected(String pipelineId, String code, String message) implements PipelineStatusResult {
+            public Rejected {
+                Objects.requireNonNull(pipelineId, "pipelineId");
+                Objects.requireNonNull(code, "code");
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unreachable() implements PipelineStatusResult {
+        }
+
+        record Unavailable() implements PipelineStatusResult {
         }
     }
 
