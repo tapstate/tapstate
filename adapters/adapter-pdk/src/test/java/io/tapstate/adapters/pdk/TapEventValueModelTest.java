@@ -614,13 +614,12 @@ class TapEventValueModelTest {
 
         Object decoded = decodedByMongo(stamp);
 
-        // The same decision as the decimal above, with a worse shape: not a loss of precision but a
-        // wrong value, off by a factor of a thousand, and the counter dropped entirely. Left alone the
-        // value is right. Pinned for the same reason - a fix upstream reddens this and nothing else.
+        // A timestamp's time half is seconds since the epoch. Treating it as milliseconds moves this
+        // 2026 value into January 1970 and silently leaves a plausible but wrong instant on the row.
         assertThat(decoded).isInstanceOf(ConvertedValue.class);
         Object instant = ((ConvertedValue) decoded).value();
         assertThat(instant).isInstanceOf(DateTime.class);
-        assertThat(((DateTime) instant).toInstant()).isEqualTo(Instant.ofEpochMilli(1_767_225_600L));
+        assertThat(((DateTime) instant).toInstant()).isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
     }
 
     @Test
