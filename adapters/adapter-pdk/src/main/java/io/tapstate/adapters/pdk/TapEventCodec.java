@@ -1,5 +1,7 @@
 package io.tapstate.adapters.pdk;
 
+import java.lang.reflect.Method;
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
@@ -53,6 +55,20 @@ public final class TapEventCodec {
 
     /** The {@code schema}-map key under which a ddl event's origin ddl travels. */
     private static final String DDL_ORIGIN = "origin";
+    private static final String BSON_DECIMAL128 = "org.bson.types.Decimal128";
+    private static final ClassValue<Decimal128Access> BSON_DECIMAL128_ACCESS = new ClassValue<>() {
+        @Override
+        protected Decimal128Access computeValue(Class<?> type) {
+            try {
+                return new Decimal128Access(type.getMethod("isFinite"), type.getMethod("bigDecimalValue"));
+            } catch (NoSuchMethodException e) {
+                throw new IllegalStateException("mongodb decimal128 has no exact-value accessor", e);
+            }
+        }
+    };
+
+    private record Decimal128Access(Method isFinite, Method bigDecimalValue) {
+    }
 
     private TapEventCodec() {
     }
@@ -107,9 +123,11 @@ public final class TapEventCodec {
      * <p>A row travels in two lanes, and which one a value takes is the connector's answer, not ours.
      * A driver type the connector registered a conversion for takes that conversion and arrives as
      * the portable value the connector chose; everything else — the ordinary Java boxes — arrives as
-     * a bare value, normalized. A row is therefore mixed, which is the contract rather than a gap:
-     * the frozen conversion surface deliberately registers nothing for the ordinary boxes, so putting
-     * them through it would pay a wrapper for a conversion that does not exist.
+     * a bare value, normalized. The one compatibility correction is a MongoDB Decimal128 conversion
+     * that narrows an exact decimal to a double; only that double result is replaced with the source's
+     * exact, portable decimal. A row is therefore mixed, which is the contract rather than a gap: the
+     * frozen conversion surface deliberately registers nothing for the ordinary boxes, so putting them
+     * through it would pay a wrapper for a conversion that does not exist.
      *
      * <p>On the bare lane: a driver hands over whatever box its own client uses — an int column may
      * arrive in any integral box, a real one as a float — while the type namespace a column resolves
@@ -120,9 +138,8 @@ public final class TapEventCodec {
      * <p>Every conversion widens or re-wraps and none of them rounds, so no value changes on the way
      * in. Only a value the target actually holds is converted: a wider integer is left as it came,
      * where narrowing it would hand every reader downstream a different number and report it as a
-     * success. An exact fixed-point number is left alone in every case — routing it through any
-     * binary floating point type drops digits silently, which is the one loss nothing downstream
-     * could detect.
+     * success. An exact fixed-point number stays exact in every case — routing it through any binary
+     * floating point type drops digits silently, which is the one loss nothing downstream could detect.
      */
     private static Map<String, Object> row(
             Map<String, Object> row, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
@@ -130,8 +147,9 @@ public final class TapEventCodec {
     }
 
     /**
-     * The connector's own conversions applied to a row, at any depth, and nothing else — the widths the
-     * type namespace speaks are left exactly as the driver handed them over.
+     * The connector's own conversions applied to a row, at any depth, plus the Decimal128 compatibility
+     * correction described above; the widths the type namespace speaks are left exactly as the driver
+     * handed them over.
      *
      * <p>This is what a read face wants. It reports what the database holds rather than what a pipeline
      * row speaks, so widening an integer there would answer a question nobody asked; but the registered
@@ -265,16 +283,36 @@ public final class TapEventCodec {
         // for bytes declares no equality of its own, so a join key built from a binary column would
         // compare by identity and match nothing, silently. Its tag comes along, because a target of the
         // same kind writes it back, and the way out builds the box again.
-        return new ConvertedValue(portable(converted.getValue()), originType);
+        return new ConvertedValue(portable(value, converted.getValue()), originType);
     }
 
     /**
      * The portable result as a value the rest of the tree can compare. Everything the contract hands over
      * already behaves like one - text, a number, an instant - except its box for bytes, which declares
-     * neither equality nor a hash and would key a join by identity.
+     * neither equality nor a hash and would key a join by identity, and the known Decimal128 result that
+     * has already been narrowed to a double.
      */
-    private static Object portable(Object value) {
+    private static Object portable(Object source, Object value) {
+        if (BSON_DECIMAL128.equals(source.getClass().getName()) && value instanceof Double) {
+            BigDecimal exact = decimal128Value(source);
+            if (exact != null) {
+                return exact;
+            }
+        }
         return value instanceof ByteData bytes ? new Bytes(bytes.getType(), bytes.getValue()) : value;
+    }
+
+    /** The finite decimal value, or null for a Decimal128 special value that has no BigDecimal form. */
+    private static BigDecimal decimal128Value(Object value) {
+        Decimal128Access access = BSON_DECIMAL128_ACCESS.get(value.getClass());
+        try {
+            if (!(Boolean) access.isFinite().invoke(value)) {
+                return null;
+            }
+            return (BigDecimal) access.bigDecimalValue().invoke(value);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot read mongodb decimal128 exactly", e);
+        }
     }
 
     /**

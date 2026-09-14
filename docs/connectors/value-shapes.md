@@ -29,7 +29,7 @@ For MongoDB, the seven types its connector declares a conversion for:
 | `Binary` | base64 - `SGVsbG8gVGFwc3RhdGU=`, the same text `mongosh` prints |
 | `Code`, `Symbol` | the text it holds |
 | regular expression | `/pattern/flags` |
-| `Decimal128` | a number - **see the limit below** |
+| `Decimal128` | the exact decimal value, with all significant digits |
 | BSON timestamp | a timestamp - **see the limit below** |
 
 Everything else - integers, floating point numbers, exact decimals, text, booleans, dates - is
@@ -53,12 +53,8 @@ connector rebuilds from that. Two consequences follow, and both are visible rath
 
 ## Limits worth knowing before you rely on this
 
-Both come from the connector's own conversion, which Tapstate applies as written rather than
-second-guessing:
+The remaining limit comes from the connector's own conversion:
 
-- **`Decimal128` loses precision.** The conversion produces a double, so 34 significant digits become
-  about 15 to 17. A column you keep exact decimals in - money, most often - is affected. Read it
-  through a target that stores it as a decimal and compare before you depend on it.
 - **A BSON timestamp reads as the wrong instant**, not merely a rounded one: the conversion reads the
   seconds field as if it were milliseconds, so a 2026 timestamp reads as January 1970. A BSON
   timestamp is an internal replication type and is rare in application data; an ordinary date column

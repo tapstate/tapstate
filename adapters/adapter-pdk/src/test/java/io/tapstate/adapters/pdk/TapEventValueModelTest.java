@@ -587,24 +587,50 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void anExactDecimalLosesDigitsBecauseTheConnectorsConversionGoesThroughADouble() {
+    void aDecimal128ColumnKeepsEverySignificantDigit() {
         Decimal128 exact = Decimal128.parse("1234567890.123456789012345678901234");
 
+        Object withoutTheRegisteredConversion =
+                insert(row("v", exact), mongoCodecs(Set.of(Decimal128.class))).after().get("v");
         Object decoded = decodedByMongo(exact);
 
-        // Applying the connector's conversion is the decision, and this is what it costs on this
-        // column: 34 significant digits through a double. Left alone the value is exact, so the loss
-        // is this project's to own even though the conversion is not. Pinned rather than tolerated -
-        // the day the upstream conversion is fixed, this case goes red and says so.
+        assertThat(withoutTheRegisteredConversion)
+                .as("the same driver value when no Decimal128 conversion is registered")
+                .isSameAs(exact);
+        // Assert the value rather than a chosen repair representation. The read path may keep the
+        // driver's exact number or carry another exact numeric form, but it must not make a distinct
+        // database value indistinguishable by first narrowing it to a binary floating point number.
+        Object value = decoded instanceof ConvertedValue converted ? converted.value() : decoded;
+        BigDecimal carried = switch (value) {
+            case Decimal128 decimal -> decimal.bigDecimalValue();
+            case BigDecimal decimal -> decimal;
+            case Number number -> new BigDecimal(number.toString());
+            default -> throw new AssertionError("the decimal column arrived as " + value.getClass().getName());
+        };
+        assertThat(carried).isEqualTo(exact.bigDecimalValue());
+    }
+
+    @Test
+    void aDecimal128ConversionThatDoesNotUseADoubleWinsUnchanged() {
+        Decimal128 exact = Decimal128.parse("1234567890.123456789012345678901234");
+        TapCodecsRegistry corrected = new TapCodecsRegistry()
+                .registerToTapValue(Decimal128.class,
+                        (value, tapType) -> new TapStringValue(((Decimal128) value).toString()));
+
+        Object decoded = insert(row("v", exact), corrected).after().get("v");
+
         assertThat(decoded).isInstanceOf(ConvertedValue.class);
-        Object value = ((ConvertedValue) decoded).value();
-        assertThat(value).isInstanceOf(Double.class);
-        assertThat(new java.math.BigDecimal(value.toString())).isNotEqualByComparingTo(exact.bigDecimalValue());
-        // What is missing is a way back: the one the write side runs is keyed on the portable form, and
-        // this connector registers none from a number, so a target of the same kind is handed the double
-        // anyway. The exact value is not on the row to fall back on either - nothing driver-owned
-        // travels, because a second connector could not read it.
-        assertThat(((ConvertedValue) decoded).originType()).isNull();
+        assertThat(((ConvertedValue) decoded).value()).isEqualTo(exact.toString());
+    }
+
+    @Test
+    void aDecimal128SpecialValueKeepsTheConnectorsPortableValue() {
+        Object decoded = decodedByMongo(Decimal128.NaN);
+
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value())
+                .isInstanceOf(Double.class)
+                .matches(value -> ((Double) value).isNaN());
     }
 
     @Test
