@@ -646,6 +646,19 @@ class TapEventValueModelTest {
     }
 
     @Test
+    void aDecimal128TypeWithoutTheRequiredAccessorsCrashesAsAProgrammerError() throws Exception {
+        var decimal = TapEventCodec.class.getDeclaredMethod("decimal128Value", Object.class);
+        decimal.setAccessible(true);
+
+        assertThatThrownBy(() -> decimal.invoke(null, new Object()))
+                .isInstanceOf(InvocationTargetException.class)
+                .cause()
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("mongodb decimal128 has no exact-value accessor")
+                .hasCauseInstanceOf(NoSuchMethodException.class);
+    }
+
+    @Test
     void aTimestampReadsFromEpochSecondsDespiteTheConnectorsMillisecondsConversion() {
         // 2026-01-01T00:00:00Z, as a mongodb timestamp: seconds in the high half, a counter in the low.
         BsonTimestamp stamp = new BsonTimestamp(1_767_225_600, 7);
