@@ -123,6 +123,9 @@ cli.unknown-connector:
 cli.connector-not-official:
   message: "This release installs these connectors: {official}. '{connector}' is in the catalog but is not one of them."
   solution: "Pick one of the connectors listed above. The supported set grows as connectors complete certification, so a connector missing here is not necessarily faulty."
+cli.connector-download-failed:
+  message: "Could not download the published connector '{connector}': {reason}"
+  solution: "Check network access to GitHub Releases, or set TAPSTATE_CONNECTORS_URL to an HTTPS mirror that carries the connector assets, then retry. You can still register a local jar path."
 cli.kind-dir-mismatch:
   message: "Artifact {path} declares kind '{kind}' but sits in a '{dir}' directory."
   solution: "Move it under a '{kind}' directory, or change its declared kind to match."

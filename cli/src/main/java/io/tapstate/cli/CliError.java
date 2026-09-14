@@ -108,6 +108,9 @@ enum CliError implements TapstateErrorCode {
      */
     CONNECTOR_NOT_OFFICIAL("cli.connector-not-official", Set.of("connector", "official")),
 
+    /** A published connector id could not be fetched as a complete jar before registration. */
+    CONNECTOR_DOWNLOAD_FAILED("cli.connector-download-failed", Set.of("connector", Names.REASON)),
+
     /** A workspace artifact sits in a directory whose name does not match its declared kind. */
     KIND_DIR_MISMATCH("cli.kind-dir-mismatch", Set.of("path", "kind", "dir")),
 

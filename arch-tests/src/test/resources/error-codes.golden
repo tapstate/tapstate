@@ -55,6 +55,7 @@ cli.auth-session-unreachable
 cli.auth-usage
 cli.confirmation-needs-a-terminal
 cli.connect-failed
+cli.connector-download-failed
 cli.connector-not-official
 cli.context-already-exists
 cli.context-config-invalid

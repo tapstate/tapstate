@@ -10,9 +10,9 @@ Connector plugin jars distributed as release assets
 Tapstate loads connector plugins as separate, independently licensed artifacts;
 none of them are part of this source tree or of any Tapstate binary. For
 convenience, prebuilt connector jars are published as assets on the
-"connectors-preview" release so the online-runtime quickstart can be run without
-building the connector repositories first. Those jars are shaded and carry their
-own drivers on an isolated class loader:
+"connectors-preview" release for the online-runtime quickstart and explicit CLI
+registration without building the connector repositories first. Those jars are
+shaded and carry their own drivers on an isolated class loader:
 
   * mysql-connector.jar bundles Oracle MySQL Connector/J 8.0, licensed under
     GPL-2.0 with the Universal FOSS Exception. That exception is what permits its
@@ -21,7 +21,15 @@ own drivers on an isolated class loader:
   * mongodb-connector.jar bundles the MongoDB Java driver (Apache-2.0) and other
     Apache-2.0 and BSD licensed components.
 
-Each jar carries the full license text of its bundled dependencies under
-META-INF/. Their licenses govern those jars; they do not alter the Apache-2.0
-license of Tapstate itself.
+  * oracle-connector.jar bundles Oracle Database JDBC, NLS and XML artifacts
+    21.5.0.0, governed by the Oracle Free Use Terms and Conditions.
 
+  * sqlserver-connector.jar bundles Microsoft JDBC Driver for SQL Server 12.2.0,
+    licensed under the MIT License.
+
+The release carries companion copies of the Oracle Free Use Terms and the
+Microsoft MIT License beside the enterprise jars; the other jars carry their
+dependency notices under META-INF/. Those terms govern only the bundled drivers
+and dependencies identified above; they do not alter the Apache-2.0 license of
+Tapstate itself. The Oracle and SQL Server implementations are paid connector
+implementations; their use remains subject to the applicable Tapdata agreement.

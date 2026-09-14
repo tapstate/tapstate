@@ -12,6 +12,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 class NativeImageMetadataTest {
 
     @Test
+    void publishedConnectorDownloadsKeepHttpsEnabledInTheNativeImage() throws IOException {
+        InputStream metadata = NativeImageMetadataTest.class.getResourceAsStream(
+                "/META-INF/native-image/io.tapstate/cli/native-image.properties");
+
+        assertThat(metadata).as("native URL protocol configuration").isNotNull();
+        try (metadata) {
+            assertThat(new String(metadata.readAllBytes(), StandardCharsets.UTF_8))
+                    .contains("--enable-url-protocols=https");
+        }
+    }
+
+    @Test
     void launchOptionsRemainReflectiveInTheNativeImage() throws IOException {
         InputStream metadata = NativeImageMetadataTest.class.getResourceAsStream(
                 "/META-INF/native-image/io.tapstate/cli/reflect-config.json");
