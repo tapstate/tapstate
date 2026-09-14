@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -332,7 +333,16 @@ public final class TapEventCodec {
             if (!(Boolean) access.isFinite().invoke(value)) {
                 return null;
             }
-            return (BigDecimal) access.bigDecimalValue().invoke(value);
+            try {
+                return (BigDecimal) access.bigDecimalValue().invoke(value);
+            } catch (InvocationTargetException e) {
+                // The accessor documents ArithmeticException for Decimal128 forms BigDecimal cannot
+                // represent. Non-finite forms returned above; the remaining form is negative zero.
+                if (e.getCause() instanceof ArithmeticException) {
+                    return null;
+                }
+                throw e;
+            }
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("cannot read mongodb decimal128 exactly", e);
         }

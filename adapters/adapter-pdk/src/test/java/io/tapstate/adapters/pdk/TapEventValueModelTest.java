@@ -636,6 +636,16 @@ class TapEventValueModelTest {
     }
 
     @Test
+    void aDecimal128NegativeZeroKeepsTheConnectorsPortableValue() {
+        Object decoded = decodedByMongo(Decimal128.NEGATIVE_ZERO);
+
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value())
+                .isInstanceOf(Double.class)
+                .isEqualTo(-0.0d);
+    }
+
+    @Test
     void aTimestampReadsFromEpochSecondsDespiteTheConnectorsMillisecondsConversion() {
         // 2026-01-01T00:00:00Z, as a mongodb timestamp: seconds in the high half, a counter in the low.
         BsonTimestamp stamp = new BsonTimestamp(1_767_225_600, 7);
