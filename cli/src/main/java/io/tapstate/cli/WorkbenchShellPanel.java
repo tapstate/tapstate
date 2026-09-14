@@ -375,7 +375,7 @@ final class WorkbenchShellPanel {
                 }
             };
             output.delegate = new ScreenTerminalOutputStream(screen, StandardCharsets.UTF_8, feedback);
-            shellThread = Thread.ofVirtual().name("tapstate-workbench-shell").start(() -> {
+            shellThread = Thread.ofPlatform().daemon().name("tapstate-workbench-shell").start(() -> {
                 try {
                     repl.runEmbeddedShell(terminal);
                     shellExited = true;
