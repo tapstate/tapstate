@@ -222,7 +222,8 @@ final class WorkbenchRenderer {
                 .borders(Borders.ALL)
                 .title(Title.from(Line.from(Span.styled(
                         " " + overlayTitle(overlay) + " ", theme.title()))));
-        if (!(overlay instanceof WorkbenchOverlayState.Actions)) {
+        if (!(overlay instanceof WorkbenchOverlayState.Actions)
+                && !(overlay instanceof WorkbenchOverlayState.Confirm)) {
             blockBuilder.borderStyle(theme.accent());
         }
         Block block = blockBuilder.build();
@@ -919,7 +920,7 @@ final class WorkbenchRenderer {
         write(frame, box.x() + 2, box.y() + 1, "1-4 switch views", theme.base(), area);
         write(frame, box.x() + 2, box.y() + 2, "c context   a authentication", theme.base(), area);
         write(frame, box.x() + 2, box.y() + 3,
-                "r refresh   q quit   Esc close", theme.base(), area);
+                "r refresh   q quit (confirm)   Esc close", theme.base(), area);
         return List.of();
     }
 

@@ -153,6 +153,7 @@ final class Workbench {
     /** The render-thread session for one runner lifecycle. */
     static final class Session implements AutoCloseable {
         private final WorkbenchRuntime runtime;
+        private final TuiRunner ownerRunner;
         private final WorkbenchDataSource dataSource;
         private final WorkbenchActionGateway actionGateway;
         private final RefreshCoordinator refreshCoordinator;
@@ -173,11 +174,13 @@ final class Workbench {
                             runner::dispatch),
                     dataSource,
                     actionGateway,
-                    repl);
+                    repl,
+                    runner);
         }
 
         Session(WorkbenchRuntime runtime) {
             this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.ownerRunner = null;
             this.dataSource = null;
             this.actionGateway = null;
             this.refreshCoordinator = null;
@@ -201,7 +204,17 @@ final class Workbench {
                 WorkbenchDataSource dataSource,
                 WorkbenchActionGateway actionGateway,
                 Repl repl) {
+            this(runtime, dataSource, actionGateway, repl, null);
+        }
+
+        private Session(
+                WorkbenchRuntime runtime,
+                WorkbenchDataSource dataSource,
+                WorkbenchActionGateway actionGateway,
+                Repl repl,
+                TuiRunner ownerRunner) {
             this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.ownerRunner = ownerRunner;
             this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
             this.actionGateway = actionGateway;
             this.refreshCoordinator = new RefreshCoordinator(this::publishRefreshResult);
@@ -253,9 +266,12 @@ final class Workbench {
                     shellPanel.open();
                     return true;
                 }
-                if (key.isCharIgnoreCase('q') || key.isCtrlC()) {
+                if (key.isCtrlC()) {
                     runner.quit();
                     return true;
+                }
+                if (key.isCharIgnoreCase('q')) {
+                    return requestQuit();
                 }
                 if (key.isCharIgnoreCase('r') && refreshCoordinator != null) {
                     refresh();
@@ -391,11 +407,7 @@ final class Workbench {
                     yield true;
                 }
                 case QUIT -> {
-                    if (runner == null) {
-                        yield false;
-                    }
-                    runner.quit();
-                    yield true;
+                    yield requestQuit();
                 }
                 case SHELL -> {
                     if (shellPanel == null) {
@@ -747,6 +759,13 @@ final class Workbench {
                     submitPipelineLifecycle(confirm, lifecycle);
                     yield true;
                 }
+                case WorkbenchOverlayState.Confirm.Intent.Quit ignored -> {
+                    if (ownerRunner == null) {
+                        yield false;
+                    }
+                    ownerRunner.quit();
+                    yield true;
+                }
                 case WorkbenchOverlayState.Confirm.Intent.DiscardChanges ignored -> runtime.updateState(state ->
                         state.withWorkspaceView(state.workspaceView().cancelEdit()).closeOverlay());
                 case WorkbenchOverlayState.Confirm.Intent.DiscardSourceYaml discard -> runtime.updateState(state ->
@@ -766,6 +785,12 @@ final class Workbench {
 
         private boolean cancelConfirm(WorkbenchOverlayState.Confirm confirm) {
             return confirm.pending() ? true : closeOverlay(confirm);
+        }
+
+        private boolean requestQuit() {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    WorkbenchOverlayState.Confirm.Intent.Quit.INSTANCE,
+                    "Confirm Quit", "Quit the TUI?", false, state.overlay())));
         }
 
         private boolean closeOverlay(WorkbenchOverlayState overlay) {

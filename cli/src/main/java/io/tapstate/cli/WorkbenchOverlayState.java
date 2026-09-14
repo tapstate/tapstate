@@ -226,7 +226,7 @@ sealed interface WorkbenchOverlayState
 
         sealed interface Intent permits Intent.DeleteContext, Intent.CreateSource, Intent.CreatePipeline,
                 Intent.ApplySources, Intent.ApplyPipelines, Intent.ChangePipelineLifecycle,
-                Intent.DiscardChanges, Intent.DiscardSourceYaml, Intent.DiscardPipelineYaml {
+                Intent.Quit, Intent.DiscardChanges, Intent.DiscardSourceYaml, Intent.DiscardPipelineYaml {
             record DeleteContext(String contextName) implements Intent {
                 public DeleteContext {
                     Objects.requireNonNull(contextName, "contextName");
@@ -261,6 +261,10 @@ sealed interface WorkbenchOverlayState
                 public ChangePipelineLifecycle {
                     Objects.requireNonNull(request, "request");
                 }
+            }
+
+            enum Quit implements Intent {
+                INSTANCE
             }
 
             enum DiscardChanges implements Intent {
