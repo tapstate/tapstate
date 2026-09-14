@@ -30,15 +30,16 @@ import java.util.function.Function;
  * connector's way back tests it, and "no declared type" and "a type spelled with no characters" must not
  * arrive as the same answer.
  *
- * <p><b>Every boundary that uses a row value <i>as a value</i> unwraps first</b>, through
- * {@link #unwrap} — comparing, keying, rendering, binding into an expression. Nothing warns when one
- * does not, and the way it goes wrong is quiet: a carrier never equals the plain value inside it, so a
- * join between a side that met a conversion and a side that did not simply never matches, and an
- * expression comparing one simply never holds, both without an error. Two carriers do compare by their
- * parts, which makes the failure worse rather than better — a join with conversions on both sides works
- * until the two schemas spell the column differently, and then stops matching for a reason nothing on
- * that path names. Pass-through paths — anything moving a whole row map along — need no unwrapping and
- * must not do it, or the write side loses what it is owed.
+ * <p><b>Every boundary that uses a row value <i>as a value</i> exposes the value first</b> — through
+ * {@link #unwrap} when comparing, keying, rendering or binding into an expression, and through a tracked
+ * proxy when a script reads it. Nothing warns when one does not, and the way it goes wrong is quiet: a
+ * carrier never equals the plain value inside it, so a join between a side that met a conversion and a
+ * side that did not simply never matches, and an expression comparing one simply never holds, both
+ * without an error. Two carriers do compare by their parts, which makes the failure worse rather than
+ * better — a join with conversions on both sides works until the two schemas spell the column
+ * differently, and then stops matching for a reason nothing on that path names. Pass-through paths —
+ * anything moving a whole row map along — preserve the carrier, as does an untouched script slot, or the
+ * write side loses what it is owed.
  */
 public record ConvertedValue(Object value, String originType) implements Serializable {
 

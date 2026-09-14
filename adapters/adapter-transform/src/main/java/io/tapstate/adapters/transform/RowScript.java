@@ -28,10 +28,12 @@ import org.graalvm.polyglot.proxy.ProxyObject;
  * is JS null). The maps are exposed through host-backed proxies, so a field the script leaves untouched
  * keeps its exact Java type on the way out (a BIGINT stays a long, a DOUBLE stays a double), while a
  * value the script writes becomes an ordinary JS value — an integer-valued number narrows to int / long
- * before double, which is the unavoidable ambiguity of JS having one number type. The script mutates the
- * record, returns one, or fans out through {@code ctx.emit}; the output is every emitted record in order,
- * followed by the return value when it is non-null (return null to drop). Unlike filter / map, js sees
- * every event including ddl.
+ * before double, which is the unavoidable ambiguity of JS having one number type. A connector-converted
+ * value is exposed in its portable form while its restoration metadata follows an untouched slot; writing
+ * that slot drops the metadata because the new value did not come from the source conversion. The script
+ * mutates the record, returns one, or fans out through {@code ctx.emit}; the output is every emitted record
+ * in order, followed by the return value when it is non-null (return null to drop). Unlike filter / map, js
+ * sees every event including ddl.
  *
  * <p>A script holds a private GraalVM {@link Context}, reused across events on the single cooperative
  * thread that owns the port; it is not thread-safe and holds no cross-event state of its own (state /
@@ -109,11 +111,11 @@ final class RowScript {
         record.put("op", event.op().symbol());
         record.put("ts", event.ts());
         record.put("src", event.src());
-        // Unwrapped: a guest sees a carrier as an opaque host object, so `after._id === "64f0..."` is
-        // false for every row and the script neither fails nor warns. The carrier does not survive the
-        // round trip - a script rebuilds the whole record, so every value it hands back is a new one.
-        record.put("before", ConvertedValue.unwrapRow(event.before()));
-        record.put("after", ConvertedValue.unwrapRow(event.after()));
+        // The proxy unwraps a converted value for guest reads while retaining its carrier in an untouched
+        // backing slot. Unwrapping the maps here would erase the only metadata a matching target can use
+        // to restore a driver type, even when the script only reads that field.
+        record.put("before", event.before());
+        record.put("after", event.after());
         record.put("schema", event.schema());
         return record;
     }
@@ -241,6 +243,9 @@ final class RowScript {
     // A backing slot is one of: a nested proxy (untouched sub-tree, recurse), a guest Value the script
     // wrote (map by JS shape), or an original host scalar (return as-is, exact Java type preserved).
     private Object fromBacking(Object slot) {
+        if (slot instanceof CarriedSlot carried) {
+            return carried.changed ? fromBacking(carried.exposed) : carried.original;
+        }
         if (slot instanceof GuestObject object) {
             return fromBacking(object);
         }
@@ -254,13 +259,40 @@ final class RowScript {
     }
 
     private static Object wrap(Object value) {
+        return wrap(value, () -> { });
+    }
+
+    private static Object wrap(Object value, Runnable changed) {
+        if (value instanceof ConvertedValue carried) {
+            return new CarriedSlot(carried, changed);
+        }
         if (value instanceof Map<?, ?> map) {
-            return new GuestObject(map);
+            return new GuestObject(map, changed);
         }
         if (value instanceof List<?> list) {
-            return new GuestArray(list);
+            return new GuestArray(list, changed);
         }
         return value;
+    }
+
+    /** A converted value exposed to JS by its portable value, with provenance retained until mutation. */
+    static final class CarriedSlot {
+
+        final ConvertedValue original;
+        final Object exposed;
+        final Runnable enclosingChanged;
+        boolean changed;
+
+        CarriedSlot(ConvertedValue original, Runnable enclosingChanged) {
+            this.original = original;
+            this.enclosingChanged = enclosingChanged;
+            this.exposed = wrap(original.value(), this::markChanged);
+        }
+
+        void markChanged() {
+            changed = true;
+            enclosingChanged.run();
+        }
     }
 
     /**
@@ -272,14 +304,20 @@ final class RowScript {
     static final class GuestObject implements ProxyObject {
 
         final Map<String, Object> backing = new LinkedHashMap<>();
+        final Runnable changed;
 
         GuestObject(Map<?, ?> source) {
-            source.forEach((key, value) -> backing.put(String.valueOf(key), wrap(value)));
+            this(source, () -> { });
+        }
+
+        GuestObject(Map<?, ?> source, Runnable changed) {
+            this.changed = changed;
+            source.forEach((key, value) -> backing.put(String.valueOf(key), wrap(value, changed)));
         }
 
         @Override
         public Object getMember(String key) {
-            return backing.get(key);
+            return exposed(backing.get(key));
         }
 
         @Override
@@ -294,12 +332,18 @@ final class RowScript {
 
         @Override
         public void putMember(String key, Value value) {
+            changed.run();
             backing.put(key, value);
         }
 
         @Override
         public boolean removeMember(String key) {
-            return backing.remove(key) != null;
+            if (!backing.containsKey(key)) {
+                return false;
+            }
+            changed.run();
+            backing.remove(key);
+            return true;
         }
     }
 
@@ -307,20 +351,27 @@ final class RowScript {
     static final class GuestArray implements ProxyArray {
 
         final List<Object> backing = new ArrayList<>();
+        final Runnable changed;
 
         GuestArray(List<?> source) {
+            this(source, () -> { });
+        }
+
+        GuestArray(List<?> source, Runnable changed) {
+            this.changed = changed;
             for (Object value : source) {
-                backing.add(wrap(value));
+                backing.add(wrap(value, changed));
             }
         }
 
         @Override
         public Object get(long index) {
-            return backing.get((int) index);
+            return exposed(backing.get((int) index));
         }
 
         @Override
         public void set(long index, Value value) {
+            changed.run();
             int i = (int) index;
             if (i == backing.size()) {
                 backing.add(value);
@@ -333,6 +384,14 @@ final class RowScript {
         public long getSize() {
             return backing.size();
         }
+    }
+
+    private static Object exposed(Object slot) {
+        Object value = slot;
+        while (value instanceof CarriedSlot carried) {
+            value = carried.exposed;
+        }
+        return value;
     }
 
     /**
