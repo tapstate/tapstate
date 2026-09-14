@@ -71,11 +71,16 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle connector bytes, including the bundled `ojdbc8` driver under the Oracle Free Use
-Terms, are excluded from versioned releases, `connectors-preview`, and quickstart.
-They are retained only as CI artifacts for 7 days. This distribution boundary does not
-establish a license for the upstream enterprise connector repository, which has no
-LICENSE file.
+Oracle and SQL Server connector jars are published as separate assets on the floating
+`connectors-preview` release. They remain outside versioned Tapstate releases and are not
+downloaded by the three-database quickstart unless you explicitly run `register oracle` or
+`register sqlserver`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
+the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
+the MIT License. Those dependency terms govern only the bundled drivers and do not change
+Tapstate's Apache-2.0 license. The Oracle and SQL Server implementations are paid connector
+implementations; their use remains subject to the applicable Tapdata agreement. The upstream
+enterprise connector repository has no LICENSE file;
+publishing these binary assets does not relicense that source repository.
 
 The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
 miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
@@ -285,6 +290,18 @@ The jars are shaded and carry their own drivers on an isolated loader;
 `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
 FOSS Exception (see [`NOTICE`](../NOTICE)).
 
+The same release carries Oracle and SQL Server for an explicit registration. From an
+authenticated CLI session, give `register` the published connector id instead of a local path:
+
+```console
+tapstate(admin@127.0.0.1:8080)> register oracle
+tapstate(admin@127.0.0.1:8080)> register sqlserver
+```
+
+The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to
+the connected server. Set `TAPSTATE_CONNECTORS_URL` to an HTTPS mirror when GitHub Releases
+is not reachable.
+
 ## 5. Author the resources
 
 A workspace is a folder partitioned by resource kind. Create three resources — one read
@@ -487,10 +504,12 @@ requires a context or contacts the server. `auth login` is intentionally unavail
 while a machine token is selected.
 
 - **`register`** uploads a connector jar to the server (content-addressed and
-  idempotent; re-registering the same jar is a no-op). Its paths resolve against the
-  workspace root — `work/` here — which is why the jars beside it are reached as
-  `../mysql-connector.jar`. An absolute path works too, as does naming a directory:
-  `register ..` uploads every `*.jar` under it as one batch.
+  idempotent; re-registering the same jar is a no-op). An exact published connector id,
+  such as `oracle` or `sqlserver`, is downloaded from `connectors-preview` first. Local
+  paths resolve against the workspace root — `work/` here — which is why the jars beside
+  it are reached as `../mysql-connector.jar`. An absolute path works too, as does naming
+  a directory: `register ..` uploads every `*.jar` under it as one batch. An existing
+  local file or directory always wins over a release id with the same name.
 - **`apply`** with no argument applies the whole workspace as one batch. The batch is
   the reference closure — a pipeline and the sources it names must be applied
   together, so apply the workspace, not one file at a time.

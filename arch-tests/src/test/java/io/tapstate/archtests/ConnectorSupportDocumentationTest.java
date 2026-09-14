@@ -19,6 +19,10 @@ class ConnectorSupportDocumentationTest {
     private static final List<Path> DOCUMENTS = List.of(
             Path.of("../docs/quickstart-online.md"),
             Path.of("../deploy/quickstart/connectors/README.md"));
+    private static final List<Path> ENTERPRISE_LICENSE_DOCUMENTS = List.of(
+            Path.of("../NOTICE"),
+            Path.of("../docs/quickstart-online.md"),
+            Path.of("../deploy/quickstart/connectors/README.md"));
     private static final String TABLE_HEADER = "| Database | Connector kind | Certified use |";
     private static final Map<String, String> DATABASE_NAMES = Map.of(
             "mysql", "MySQL", "postgres", "PostgreSQL", "mongodb", "MongoDB",
@@ -57,8 +61,20 @@ class ConnectorSupportDocumentationTest {
                             "16 connector ids", "managed variants", "not been live-verified",
                             "on this server", "outside the supported configuration",
                             "server's actual accepted set", "including any additional ids",
-                            "versioned releases", "`connectors-preview`", "quickstart",
-                            "CI artifacts", "7 days");
+                            "separate assets", "`connectors-preview`", "versioned Tapstate releases",
+                            "register oracle", "register sqlserver", "Oracle Free Use Terms",
+                            "Microsoft JDBC Driver 12.2.0", "no LICENSE file");
+        }
+    }
+
+    @Test
+    void enterpriseDriverTermsDoNotLicenseThePaidConnectorImplementations() throws IOException {
+        for (Path document : ENTERPRISE_LICENSE_DOCUMENTS) {
+            assertThat(Files.readString(document)).as("enterprise license boundary in %s", document)
+                    .containsPattern("paid connector\\s+implementations")
+                    .containsPattern("applicable Tapdata\\s+agreement")
+                    .doesNotContain("Those licenses govern the connector jars",
+                            "Their dependency terms govern those jars");
         }
     }
 
