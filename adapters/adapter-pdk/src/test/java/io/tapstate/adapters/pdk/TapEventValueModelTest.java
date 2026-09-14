@@ -28,6 +28,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import java.lang.reflect.InvocationTargetException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.file.Path;
@@ -39,6 +40,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Pins what a decoded row actually holds, as opposed to which field lands where (that is the golden's
@@ -608,7 +610,7 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void aTimestampReadsAsTheWrongInstantBecauseTheConnectorsConversionTakesSecondsForMillis() {
+    void aTimestampReadsFromEpochSecondsDespiteTheConnectorsMillisecondsConversion() {
         // 2026-01-01T00:00:00Z, as a mongodb timestamp: seconds in the high half, a counter in the low.
         BsonTimestamp stamp = new BsonTimestamp(1_767_225_600, 7);
 
@@ -620,6 +622,48 @@ class TapEventValueModelTest {
         Object instant = ((ConvertedValue) decoded).value();
         assertThat(instant).isInstanceOf(DateTime.class);
         assertThat(((DateTime) instant).toInstant()).isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
+    }
+
+    @Test
+    void anAlreadyCorrectTimestampConversionIsNotAdjustedAgain() {
+        TapCodecsRegistry corrected = new TapCodecsRegistry();
+        corrected.registerToTapValue(BsonTimestamp.class, (value, tapType) -> {
+            long seconds = Integer.toUnsignedLong(((BsonTimestamp) value).getTime());
+            return new TapDateTimeValue(new DateTime(Instant.ofEpochSecond(seconds)));
+        });
+
+        Object decoded = insert(row("v", new BsonTimestamp(1_767_225_600, 7)), corrected).after().get("v");
+
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value())
+                .isInstanceOf(DateTime.class)
+                .extracting(value -> ((DateTime) value).toInstant())
+                .isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
+    }
+
+    @Test
+    void aTimestampConversionToAnotherPortableTypeIsLeftAlone() {
+        TapCodecsRegistry textual = new TapCodecsRegistry();
+        textual.registerToTapValue(BsonTimestamp.class,
+                (value, tapType) -> new TapStringValue("timestamp:" + ((BsonTimestamp) value).getValue()));
+
+        Object decoded = insert(row("v", new BsonTimestamp(1_767_225_600, 7)), textual).after().get("v");
+
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value()).isEqualTo("timestamp:7590176156653977607");
+    }
+
+    @Test
+    void aTimestampTypeWithoutTheRequiredAccessorCrashesAsAProgrammerError() throws Exception {
+        var seconds = TapEventCodec.class.getDeclaredMethod("bsonTimestampSeconds", Object.class);
+        seconds.setAccessible(true);
+
+        assertThatThrownBy(() -> seconds.invoke(null, new Object()))
+                .isInstanceOf(InvocationTargetException.class)
+                .cause()
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("mongodb timestamp has no time accessor")
+                .hasCauseInstanceOf(NoSuchMethodException.class);
     }
 
     @Test
