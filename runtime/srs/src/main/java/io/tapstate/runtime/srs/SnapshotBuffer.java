@@ -75,6 +75,17 @@ public final class SnapshotBuffer {
         return drained;
     }
 
+    /**
+     * Releases every hand-off owned by a pipeline once its capture has stopped and its source vertex has
+     * been cancelled. Live drains deliberately leave their queues attached to protect an append that already
+     * holds one; lifecycle release is the point where both the queues and their coordinate strings can go.
+     * A neighbouring consumer of the same ring is unaffected.
+     */
+    public void release(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        byConsumerRing.keySet().removeIf(key -> key.pipelineId().equals(pipelineId));
+    }
+
     /** The two coordinates that make a buffered row private to one consumer of a shared ring. */
     record BufferKey(String pipelineId, String ringName) {
         BufferKey {

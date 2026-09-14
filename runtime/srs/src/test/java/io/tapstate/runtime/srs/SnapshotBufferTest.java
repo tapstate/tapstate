@@ -185,4 +185,35 @@ class SnapshotBufferTest {
                 .extracting(e -> e.after().get("id"))
                 .containsExactly(2L);
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void releaseReclaimsAllOfOneConsumersQueuesWithoutTouchingItsNeighbour() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String sharedRing = "srs.chain.orders";
+        String otherPipeline = "other_pipeline";
+        Envelope first = row("orders", 1);
+        Envelope second = row("items", 2);
+        Envelope neighbour = row("orders", 3);
+        buffer.append(PIPELINE, sharedRing, first);
+        buffer.append(PIPELINE, "srs.chain.items", second);
+        buffer.append(otherPipeline, sharedRing, neighbour);
+
+        // A normal drain consumes the row but deliberately leaves the empty queue attached. Releasing the
+        // pipeline must reclaim that entry as well as a queue whose row the cancelled job never consumed.
+        assertThat(buffer.drain(PIPELINE, sharedRing)).containsExactly(first);
+        var field = SnapshotBuffer.class.getDeclaredField("byConsumerRing");
+        field.setAccessible(true);
+        ConcurrentMap<SnapshotBuffer.BufferKey, Queue<Envelope>> rings =
+                (ConcurrentMap<SnapshotBuffer.BufferKey, Queue<Envelope>>) field.get(buffer);
+        assertThat(rings).containsKeys(
+                new SnapshotBuffer.BufferKey(PIPELINE, sharedRing),
+                new SnapshotBuffer.BufferKey(PIPELINE, "srs.chain.items"),
+                new SnapshotBuffer.BufferKey(otherPipeline, sharedRing));
+
+        buffer.release(PIPELINE);
+
+        assertThat(rings).containsOnlyKeys(new SnapshotBuffer.BufferKey(otherPipeline, sharedRing));
+        assertThat(buffer.drain(otherPipeline, sharedRing)).containsExactly(neighbour);
+    }
 }

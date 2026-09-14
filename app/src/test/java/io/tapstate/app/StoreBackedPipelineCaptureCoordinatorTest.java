@@ -414,6 +414,56 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
+    void stopReleasesRowsTheCancelledJobDidNotDrainFromThePipelineBuffer() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipeline("p", "orders_src"));
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        AtomicBoolean captureClosed = new AtomicBoolean();
+        CaptureStarter starter = (spec, passthrough) -> {
+            passthrough.accept(Envelope.read(1L, "orders", Map.of("id", 1L), Map.of()));
+            return new CaptureRun(Optional.empty(), false, 1L, Optional.empty(),
+                    Optional.of(() -> captureClosed.set(true)), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()), buffer);
+        coordinator.startCapture("p");
+
+        coordinator.stopCapture("p", false);
+
+        assertThat(captureClosed).as("the producer stopped before its hand-off was released").isTrue();
+        assertThat(buffer.drain("p", SourceCaptureResolution.of(source).ringName())).isEmpty();
+    }
+
+    @Test
+    void stopKeepsTheBufferReachableWhenCaptureRefusesToStop() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipeline("p", "orders_src"));
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        Envelope row = Envelope.read(1L, "orders", Map.of("id", 1L), Map.of());
+        CaptureStarter starter = (spec, passthrough) -> {
+            passthrough.accept(row);
+            return new CaptureRun(Optional.empty(), false, 1L, Optional.empty(),
+                    Optional.of(() -> { throw new IllegalStateException("capture did not stop"); }),
+                    new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()), buffer);
+        coordinator.startCapture("p");
+
+        assertThatThrownBy(() -> coordinator.stopCapture("p", false))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("capture did not stop");
+
+        assertThat(buffer.drain("p", SourceCaptureResolution.of(source).ringName()))
+                .as("a producer that may still append keeps its hand-off attached")
+                .containsExactly(row);
+    }
+
+    @Test
     void multiTableSnapshotProgressAndBufferRoutingStayPerTable() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),

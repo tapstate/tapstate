@@ -254,12 +254,29 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      */
     private RuntimeException closeRuns(List<CaptureRun> runs, String pipelineId, boolean purgeState) {
         RuntimeException firstFailure = null;
+        boolean capturesStopped = true;
         Set<MiningChainId> chains = new LinkedHashSet<>();
         for (CaptureRun run : runs) {
-            firstFailure = runCleanup(run::close, firstFailure);
+            try {
+                run.close();
+            } catch (RuntimeException failure) {
+                capturesStopped = false;
+                if (firstFailure == null) {
+                    firstFailure = failure;
+                } else {
+                    firstFailure.addSuppressed(failure);
+                }
+            }
             // Collected whether or not the close succeeded: a daemon that refused to stop does not make the
             // consumer membership this pipeline holds any less this pipeline's to give back.
             run.chainId().ifPresent(chains::add);
+        }
+        // A live drain cannot detach an empty queue: capture may already hold that queue and append into it
+        // after the drain returns. Lifecycle teardown has no such race once every capture close returned, so
+        // this is where all of the pipeline's queues and their coordinate strings are released. Keep them when
+        // a close failed because that capture may still be appending.
+        if (capturesStopped) {
+            snapshotBuffer.release(pipelineId);
         }
         // Once per chain, never once per run. Two sources reading one connection are one chain with a ring
         // per table, which is what a pipeline over a parent and a child table is; releasing it per run would
