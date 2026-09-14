@@ -102,8 +102,14 @@ public final class ImapJoinStores implements JoinStores {
     }
 
     @Override
-    public void putDimensionRow(String source, String dimensionKey, Map<String, Object> row) {
-        dimension(source).set(dimensionKey, row);
+    public Map<String, Object> putDimensionRow(String source, String dimensionKey,
+            Map<String, Object> row) {
+        // put rather than set, which is the opposite of the fact mirror next door and is bought
+        // deliberately. set neither carries the previous value back nor reads it from the layer behind
+        // the map, and both are exactly what has to happen here: the row a key already held is the row
+        // this write is about to make unreachable, and it is unsayable unless it is asked for. Kept to
+        // this one map - the fact mirror has no such question to ask and still uses set.
+        return dimension(source).put(dimensionKey, row);
     }
 
     @Override

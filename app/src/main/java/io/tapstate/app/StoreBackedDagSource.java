@@ -1761,7 +1761,9 @@ final class StoreBackedDagSource implements DagSource {
         return new JoinBinding(
                 step -> compiledJoin(byStep, step).plan(),
                 step -> compiledJoin(byStep, step).factKeyColumns(),
-                JoinStoresBinding.onTheCluster());
+                step -> compiledJoin(byStep, step).dimensionRowKeyColumns(),
+                JoinStoresBinding.onTheCluster(),
+                new LoggingDimensionRowDisplacedAlert());
     }
 
     /**
@@ -1803,7 +1805,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * One join step's plan and the key its driving rows are filed under.
+     * One join step's plan and the source-declared keys that identify its driving and dimension rows.
      *
      * <p>Each alias the step declares is registered under both the name the author aliased it to and
      * the table it reads, because the SQL may name either: {@code FROM orders o} and {@code FROM o}
@@ -1858,7 +1860,18 @@ final class StoreBackedDagSource implements DagSource {
             throw new TapstateException(ActuationError.JOIN_SOURCE_KEY_MISSING,
                     Map.of("step", step.id(), "table", driving), null);
         }
-        return new CompiledJoin(plan, key, Map.copyOf(tableByName), join, derivedFrom);
+        Map<String, List<String>> dimensionRowKeyColumns = new LinkedHashMap<>();
+        for (io.tapstate.core.sql.JoinTree.Source source : plan.from().sources()) {
+            if (source.name().equals(plan.factSource().name())) {
+                continue;
+            }
+            List<String> sourceKey = keyByTable.getOrDefault(source.name(), List.of());
+            if (!sourceKey.isEmpty()) {
+                dimensionRowKeyColumns.put(source.name(), List.copyOf(sourceKey));
+            }
+        }
+        return new CompiledJoin(plan, key, Map.copyOf(dimensionRowKeyColumns),
+                Map.copyOf(tableByName), join, derivedFrom);
     }
 
     /** The columns of one table, in the shared type vocabulary the plan is derived against. */
@@ -1879,7 +1892,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * One join step's plan, the key its driving rows are filed under, and the real table behind each
+     * One join step's plan, the keys its source rows are identified by, and the real table behind each
      * name the plan calls a source by - alias and table name both, since the SQL may write either.
      *
      * <p>The two inputs the plan was derived from are carried alongside it. The plan states the answer;
@@ -1888,6 +1901,7 @@ final class StoreBackedDagSource implements DagSource {
      * for, while an untouched query producing new columns is the world having moved under it.
      */
     record CompiledJoin(io.tapstate.core.sql.JoinPlan plan, List<String> factKeyColumns,
+            Map<String, List<String>> dimensionRowKeyColumns,
             Map<String, String> tableByName, TransformBody.Join body,
             List<io.tapstate.core.sql.SourceTable> tables) {
 
@@ -2006,7 +2020,7 @@ final class StoreBackedDagSource implements DagSource {
         String chain = vertex.table();
         byte axis = axes.axisOf(chain);
         return SrsSourceProcessor.metaSupplier(
-                vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
+                vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
                 ringGeneration(vertex.resolution()),
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),

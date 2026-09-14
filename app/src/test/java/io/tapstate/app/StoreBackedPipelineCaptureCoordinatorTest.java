@@ -384,7 +384,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
-    void startRoutesSnapshotRowsToTheBufferUnderTheSourcesRingName() {
+    void startRoutesSnapshotRowsToTheBufferUnderThePipelineAndSourcesRingName() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = cdcSource("orders_src", "orders", null);
         artifacts.save(source);
@@ -394,8 +394,8 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         SnapshotBuffer buffer = new SnapshotBuffer();
         SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
         // A fake starter drains two snapshot rows to the pass-through, exactly as the real snapshot phase does,
-        // so the routing under test -- pass-through to the buffer keyed by the source's ring name -- is exercised
-        // without a Jet member.
+        // so the routing under test -- pass-through to the buffer keyed by the consumer pipeline and source's
+        // ring name -- is exercised without a Jet member.
         CaptureStarter starter = (spec, passthrough) -> {
             passthrough.accept(Envelope.read(1L, "orders", Map.of("id", 1L), Map.of()));
             passthrough.accept(Envelope.read(1L, "orders", Map.of("id", 2L), Map.of()));
@@ -406,10 +406,61 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         coordinator.startCapture("p");
 
-        // The snapshot rows land in the buffer under the ring the source resolves to -- the same ring the source
-        // vertex drains member-side, which is what routes the snapshot through the transform chain ahead of cdc.
+        // The snapshot rows land in the buffer under the pipeline and ring the source resolves to -- the same
+        // coordinates the source vertex drains member-side, which routes its own snapshot through the transform
+        // chain ahead of cdc.
         String ringName = SourceCaptureResolution.of(source).ringName();
-        assertThat(buffer.drain(ringName)).extracting(e -> e.after().get("id")).containsExactly(1L, 2L);
+        assertThat(buffer.drain("p", ringName)).extracting(e -> e.after().get("id")).containsExactly(1L, 2L);
+    }
+
+    @Test
+    void stopReleasesRowsTheCancelledJobDidNotDrainFromThePipelineBuffer() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipeline("p", "orders_src"));
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        AtomicBoolean captureClosed = new AtomicBoolean();
+        CaptureStarter starter = (spec, passthrough) -> {
+            passthrough.accept(Envelope.read(1L, "orders", Map.of("id", 1L), Map.of()));
+            return new CaptureRun(Optional.empty(), false, 1L, Optional.empty(),
+                    Optional.of(() -> captureClosed.set(true)), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()), buffer);
+        coordinator.startCapture("p");
+
+        coordinator.stopCapture("p", false);
+
+        assertThat(captureClosed).as("the producer stopped before its hand-off was released").isTrue();
+        assertThat(buffer.drain("p", SourceCaptureResolution.of(source).ringName())).isEmpty();
+    }
+
+    @Test
+    void stopKeepsTheBufferReachableWhenCaptureRefusesToStop() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipeline("p", "orders_src"));
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        Envelope row = Envelope.read(1L, "orders", Map.of("id", 1L), Map.of());
+        CaptureStarter starter = (spec, passthrough) -> {
+            passthrough.accept(row);
+            return new CaptureRun(Optional.empty(), false, 1L, Optional.empty(),
+                    Optional.of(() -> { throw new IllegalStateException("capture did not stop"); }),
+                    new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()), buffer);
+        coordinator.startCapture("p");
+
+        assertThatThrownBy(() -> coordinator.stopCapture("p", false))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("capture did not stop");
+
+        assertThat(buffer.drain("p", SourceCaptureResolution.of(source).ringName()))
+                .as("a producer that may still append keeps its hand-off attached")
+                .containsExactly(row);
     }
 
     @Test
@@ -434,8 +485,10 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 entry("orders", new TableSnapshot(1L, null, null)),
                 entry("customers", new TableSnapshot(1L, null, null)));
         SourceCaptureResolution resolution = SourceCaptureResolution.of(source);
-        assertThat(buffer.drain(resolution.ringName("orders"))).extracting(e -> e.src()).containsExactly("orders");
-        assertThat(buffer.drain(resolution.ringName("customers"))).extracting(e -> e.src()).containsExactly("customers");
+        assertThat(buffer.drain("p", resolution.ringName("orders")))
+                .extracting(e -> e.src()).containsExactly("orders");
+        assertThat(buffer.drain("p", resolution.ringName("customers")))
+                .extracting(e -> e.src()).containsExactly("customers");
     }
 
     @Test

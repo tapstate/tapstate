@@ -39,13 +39,67 @@ class JsTransformTest {
         Envelope row = Envelope.insert(1L, "orders", new LinkedHashMap<>(
                 Map.of("_id", new ConvertedValue("64f0c0de", "OBJECT_ID"))), null);
 
-        // A guest cannot see into a host object it was not taught about, so the comparison is false for
-        // every row - and a script that neither throws nor logs is indistinguishable from data that
-        // genuinely did not match. Unlike the expression seam, a script rebuilds the whole record, so
-        // this is also where every field stops carrying what a target would use to write it back.
+        // A guest cannot see into a host object it was not taught about, so the comparison would be false
+        // for every row and a script that neither throws nor logs would be indistinguishable from data
+        // that genuinely did not match. The guest sees the portable value, while an untouched slot keeps
+        // the metadata the target needs to restore the source type.
         assertThat(after(js.transform(row).get(0)))
                 .containsEntry("hit", true)
+                .containsEntry("_id", new ConvertedValue("64f0c0de", "OBJECT_ID"));
+    }
+
+    @Test
+    @DisplayName("a converted value written by javascript no longer carries source restoration metadata")
+    void aWrittenConvertedValueDoesNotKeepItsCarrier() {
+        TransformPort js = js(
+                "function process(r, ctx) { r.after._id = '64f0c0de'; return r; }");
+        Envelope row = Envelope.insert(1L, "orders", new LinkedHashMap<>(
+                Map.of("_id", new ConvertedValue("64f0c0de", "OBJECT_ID"))), null);
+
+        assertThat(after(js.transform(row).get(0)))
                 .containsEntry("_id", "64f0c0de");
+    }
+
+    @Test
+    @DisplayName("a nested write drops only the converted container provenance it invalidates")
+    void aNestedWriteDoesNotRestoreAStaleConvertedContainer() {
+        ConvertedValue untouched = new ConvertedValue("64f0c0de", "OBJECT_ID");
+        Map<String, Object> document = new LinkedHashMap<>();
+        document.put("status", "new");
+        document.put("key", untouched);
+        Envelope row = Envelope.insert(1L, "orders", Map.of(
+                "document", new ConvertedValue(document, "DOCUMENT")), null);
+        TransformPort js = js(
+                "function process(r, ctx) { r.after.document.status = 'paid'; return r; }");
+
+        Object output = after(js.transform(row).get(0)).get("document");
+
+        assertThat(output).isInstanceOf(Map.class).isNotInstanceOf(ConvertedValue.class);
+        assertThat(((Map<?, ?>) output).get("status")).isEqualTo("paid");
+        assertThat(((Map<?, ?>) output).get("key")).isEqualTo(untouched);
+    }
+
+    @Test
+    @DisplayName("an array write drops only the converted container provenance it invalidates")
+    void anArrayWriteDoesNotRestoreAStaleConvertedContainer() {
+        ConvertedValue untouched = new ConvertedValue("64f0c0de", "OBJECT_ID");
+        Envelope row = Envelope.insert(1L, "orders", Map.of(
+                "values", new ConvertedValue(List.of(untouched, "old"), "ARRAY")), null);
+        TransformPort js = js(
+                "function process(r, ctx) {"
+                        + " r.after.first = r.after.values[0];"
+                        + " r.after.values[1] = 'new';"
+                        + " r.after.values.push('tail');"
+                        + " return r;"
+                        + " }");
+
+        Map<String, Object> output = after(js.transform(row).get(0));
+
+        assertThat(output.get("values"))
+                .isInstanceOf(List.class)
+                .isNotInstanceOf(ConvertedValue.class)
+                .isEqualTo(List.of(untouched, "new", "tail"));
+        assertThat(output.get("first")).isEqualTo("64f0c0de").isNotInstanceOf(ConvertedValue.class);
     }
 
     @Test

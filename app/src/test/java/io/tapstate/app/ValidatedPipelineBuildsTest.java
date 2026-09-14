@@ -17,6 +17,7 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -144,6 +145,20 @@ class ValidatedPipelineBuildsTest {
         DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("wide");
 
         assertThat(vertexNames(dag)).contains("orders_src", "items_src", "widen", "serve.sync_1");
+    }
+
+    @Test
+    void aCompiledJoinCarriesEachDimensionSourcesOwnRowKeyUnderItsAlias() {
+        InMemoryStorePort store = validated(SOURCE, ITEMS_SOURCE, TARGET, JOIN_PIPELINE);
+        discovered(store, "orders_src", "orders", List.of("id"));
+        discovered(store, "items_src", "order_items", List.of("id"));
+
+        StoreBackedDagSource.CompiledJoin compiled =
+                new StoreBackedDagSource(store, discardingBinder()).compiledJoinsOf("wide").get("widen");
+
+        assertThat(compiled.factKeyColumns()).containsExactly("id");
+        assertThat(compiled.dimensionRowKeyColumns())
+                .containsExactly(Map.entry("i", List.of("id")));
     }
 
     /**

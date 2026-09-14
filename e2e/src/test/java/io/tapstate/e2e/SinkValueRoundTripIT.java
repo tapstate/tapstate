@@ -14,7 +14,8 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * A value written to a target of the same kind as its source arrives as the type it left as.
+ * A value passed untouched through javascript and written to a target of the same kind as its source
+ * arrives as the type it left as.
  *
  * <p>The read path converts a driver's own type into something portable so that everything between
  * the two ends can hold it. The write path has to undo that, or a key that travelled as text is
@@ -71,7 +72,7 @@ class SinkValueRoundTripIT {
     }
 
     @Test
-    void anIdentityABinaryColumnAndAnIntegerKeepTheirTypesAcrossTheChain() {
+    void anIdentityABinaryColumnAndAnIntegerKeepTheirTypesAcrossAnUntouchedJavascriptStep() {
         String storeUri = SharedMongo.replicaSetUrl("e2e_round_trip_store");
         String sourceUri = SharedMongo.replicaSetUrl(SOURCE_DATABASE);
         String targetUri = SharedMongo.replicaSetUrl(TARGET_DATABASE);
@@ -163,7 +164,13 @@ class SinkValueRoundTripIT {
                 source: %s
                 settings: { read_mode: snapshot_and_cdc }
                 transforms:
-                  - { id: rows_through, from: [ %s ], type: filter, expr: "op == 'r' || op == 'i'" }
+                  - id: rows_through
+                    from: [ %s ]
+                    type: js
+                    script: |
+                      function process(record, ctx) {
+                        return record.op === 'r' || record.op === 'i' ? record : null;
+                      }
                 serve:
                   from: rows_through
                   sync:
