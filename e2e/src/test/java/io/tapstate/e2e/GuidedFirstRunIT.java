@@ -134,6 +134,9 @@ class GuidedFirstRunIT {
         String sourceText = Files.readString(source, StandardCharsets.UTF_8);
         assertThat(sourceText).contains(reference);
         assertThat(sourceText)
+                .as("the connector's numeric port is written as a YAML number")
+                .containsPattern("(?m)^\\s*port:\\s*" + Pattern.quote(String.valueOf(mysql.get("port"))) + "\\s*$");
+        assertThat(sourceText)
                 .as("the password may not be written into the source artifact")
                 .doesNotContainPattern("(?m)^\\s*password:\\s*\"?" + Pattern.quote(String.valueOf(mysql.get("password"))));
 

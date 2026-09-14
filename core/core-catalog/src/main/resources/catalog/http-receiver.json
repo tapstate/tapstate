@@ -52,7 +52,7 @@
     },
     {
       "name": "expireSeconds",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Token expiration time"
       },

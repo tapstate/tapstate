@@ -55,6 +55,13 @@ class SpecNormalizerTest {
     }
 
     @Test
+    void takesTheNumericTypeFromAnInputNumberComponent() {
+        // MySQL declares port with the Formily schema type "string", but InputNumber is the
+        // connector's declaration that its config bean receives a Number.
+        assertThat(field(normalize("mysql"), "port").type()).isEqualTo(ConfigType.NUMBER);
+    }
+
+    @Test
     void marksPasswordComponentsSecret() {
         assertThat(field(normalize("mysql"), "password").secret()).isTrue();
         assertThat(field(normalize("mysql"), "host").secret()).isFalse();

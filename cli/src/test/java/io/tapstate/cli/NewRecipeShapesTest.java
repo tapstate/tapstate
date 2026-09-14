@@ -31,7 +31,7 @@ class NewRecipeShapesTest {
             config:
               host: db
               password: ${ORDERS_SRC_PASSWORD}
-              port: "3306"
+              port: 3306
               username: u
             mode: cdc
             tables: [orders]
@@ -71,7 +71,7 @@ class NewRecipeShapesTest {
             config:
               host: db
               password: ${ORDERS_SRC_PASSWORD}
-              port: "3306"
+              port: 3306
               username: u
             mode: cdc
             tables: [orders, shipments]
@@ -114,7 +114,7 @@ class NewRecipeShapesTest {
             config:
               host: db1
               password: ${ORDERS_1_SRC_PASSWORD}
-              port: "3306"
+              port: 3306
               username: u
             mode: cdc
             tables: [orders]
@@ -129,7 +129,7 @@ class NewRecipeShapesTest {
             config:
               host: db2
               password: ${ORDERS_2_SRC_PASSWORD}
-              port: "3306"
+              port: 3306
               username: u
             mode: cdc
             tables: [orders]
@@ -363,7 +363,7 @@ class NewRecipeShapesTest {
                 config:
                   host: db
                   password: ${ORDERS_SRC_PASSWORD}
-                  port: "3306"
+                  port: 3306
                   username: u
                 mode: cdc
                 tables: [orders, shipments]
@@ -377,7 +377,7 @@ class NewRecipeShapesTest {
                 config:
                   host: db2
                   password: ${INVOICES_SRC_PASSWORD}
-                  port: "3306"
+                  port: 3306
                   username: u2
                 mode: cdc
                 tables: [invoices]
@@ -438,7 +438,7 @@ class NewRecipeShapesTest {
                 config:
                   host: db2
                   password: ${SHIPMENTS_SRC_PASSWORD}
-                  port: "3306"
+                  port: 3306
                   username: u2
                 mode: cdc
                 tables: [shipments]

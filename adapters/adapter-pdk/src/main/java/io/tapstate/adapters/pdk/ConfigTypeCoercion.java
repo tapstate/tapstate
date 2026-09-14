@@ -12,12 +12,11 @@ import java.util.regex.Pattern;
  * Converts a connection's config values to the types the connector's own connection form declares,
  * so a value spelled as text reaches the connector as the number or boolean its config bean holds.
  *
- * <p>The values arrive as text because that is what the workspace wrote: a connection whose settings
- * came from a form, a flag or a generated document spells {@code port} as {@code "3306"}, while the
- * connector's config bean holds a {@code Number} and casts to it. Without this the cast throws out of
- * the connector's own code, so the operator is handed a {@code ClassCastException} between two JDK
- * types instead of a diagnosis. The boolean shape is worse: it survives the connection test and fails
- * only at the first write, long after the pipeline reported itself running.
+ * <p>A hand-written or older workspace can spell {@code port} as {@code "3306"}, while the connector's
+ * config bean holds a {@code Number} and casts to it. Without this the cast throws out of the
+ * connector's own code, so the operator is handed a {@code ClassCastException} between two JDK types
+ * instead of a diagnosis. The boolean shape is worse: it survives the connection test and fails only
+ * at the first write, long after the pipeline reported itself running.
  *
  * <p><b>The declaration coerced from is the connector's own</b> — the connection form it ships inside
  * its spec resource ({@code configOptions.connection.properties}), reached through the raw spec text
