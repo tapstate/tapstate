@@ -22,9 +22,9 @@ import java.util.Objects;
  * the projection lives here rather than in a later stage.
  *
  * <p>Snapshot rows and cdc changes flow through this one ordered source: the rows a member-side
- * {@link SnapshotBuffer} holds for this ring are emitted ahead of any cdc change off the ring, so the older
- * snapshot value can never land at the sink after a newer change of the same key. A member with no buffer
- * bound, or a ring with none buffered, is a pure ring tail.
+ * {@link SnapshotBuffer} holds for this pipeline and ring are emitted ahead of any cdc change off the ring,
+ * so the older snapshot value can never land at the sink after a newer change of the same key. A member with
+ * no buffer bound, or this pipeline and ring with none buffered, is a pure ring tail.
  *
  * <p><strong>The buffer is looked at on every pass, not once at init.</strong> It is not only a snapshot
  * seed: a tail running with the shared ring switched off has no ring anyone fills, so every change it
@@ -43,6 +43,7 @@ public final class SrsSourceProcessor extends AbstractProcessor {
     /** The most changes one fill drains before yielding - a bounded batch that lets Jet pace the source. */
     private static final int FILL_BATCH = 256;
 
+    private final String pipelineId;
     private final String ringName;
     private final String src;
     private final StartFrom start;
@@ -62,8 +63,9 @@ public final class SrsSourceProcessor extends AbstractProcessor {
     // Whether this source still owes the bound covering the snapshot rows it was seeded with.
     private boolean snapshotBoundDue;
 
-    private SrsSourceProcessor(String ringName, String src, StartFrom start, long epoch,
+    private SrsSourceProcessor(String pipelineId, String ringName, String src, StartFrom start, long epoch,
             SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp) {
+        this.pipelineId = pipelineId;
         this.ringName = ringName;
         this.src = src;
         this.start = start;
@@ -153,7 +155,7 @@ public final class SrsSourceProcessor extends AbstractProcessor {
         if (buffered == null) {
             return;
         }
-        for (Envelope row : buffered.drain(ringName)) {
+        for (Envelope row : buffered.drain(pipelineId, ringName)) {
             pending.add(row);
             ChainPosition at = row.position();
             if (at == null || at.order() == null || at.order().seq() == SourceOrder.SNAPSHOT_SEQ) {
@@ -244,10 +246,10 @@ public final class SrsSourceProcessor extends AbstractProcessor {
     }
 
     /**
-     * A meta-supplier for a source vertex tailing {@code ringName} from {@code start}, tagging every change
-     * with the logical stream name {@code src} and the generation {@code epoch} the ring was opened under,
-     * and reporting its read cursor through {@code publisherFactory}. The vertex is pinned to total
-     * parallelism one: one reader per ring keeps the change stream in order.
+     * A meta-supplier for pipeline {@code pipelineId}'s source vertex tailing {@code ringName} from
+     * {@code start}, tagging every change with the logical stream name {@code src} and the generation
+     * {@code epoch} the ring was opened under, and reporting its read cursor through {@code publisherFactory}.
+     * The vertex is pinned to total parallelism one: one reader per ring keeps the change stream in order.
      *
      * <p>The generation is resolved when the job is assembled, not read per change: the ring is opened
      * before the job is submitted and does not change generation while it runs, so carrying it here keeps
@@ -255,9 +257,9 @@ public final class SrsSourceProcessor extends AbstractProcessor {
      * a snapshot-only or srs-disabled read, whose rows come from the snapshot buffer and whose ring nobody
      * fills; a change found on such a ring is rejected rather than ordered.
      */
-    public static ProcessorMetaSupplier metaSupplier(String ringName, String src, StartFrom start, long epoch,
-            SrsReadCursorPublisherFactory publisherFactory) {
-        return metaSupplier(ringName, src, start, epoch, publisherFactory, null);
+    public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
+            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory) {
+        return metaSupplier(pipelineId, ringName, src, start, epoch, publisherFactory, null);
     }
 
     /**
@@ -265,8 +267,9 @@ public final class SrsSourceProcessor extends AbstractProcessor {
      * read position as the bound the rest of the job combines; a null one announces nothing at all, which
      * is the frontier standing still rather than running ahead.
      */
-    public static ProcessorMetaSupplier metaSupplier(String ringName, String src, StartFrom start, long epoch,
-            SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp) {
+    public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
+            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
         Objects.requireNonNull(start, "start");
@@ -275,7 +278,7 @@ public final class SrsSourceProcessor extends AbstractProcessor {
             throw new IllegalArgumentException("a ring generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier =
-                () -> new SrsSourceProcessor(ringName, src, start, epoch, publisherFactory, stamp);
+                () -> new SrsSourceProcessor(pipelineId, ringName, src, start, epoch, publisherFactory, stamp);
         return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
     }
 }

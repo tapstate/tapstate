@@ -384,7 +384,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
-    void startRoutesSnapshotRowsToTheBufferUnderTheSourcesRingName() {
+    void startRoutesSnapshotRowsToTheBufferUnderThePipelineAndSourcesRingName() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = cdcSource("orders_src", "orders", null);
         artifacts.save(source);
@@ -394,8 +394,8 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         SnapshotBuffer buffer = new SnapshotBuffer();
         SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
         // A fake starter drains two snapshot rows to the pass-through, exactly as the real snapshot phase does,
-        // so the routing under test -- pass-through to the buffer keyed by the source's ring name -- is exercised
-        // without a Jet member.
+        // so the routing under test -- pass-through to the buffer keyed by the consumer pipeline and source's
+        // ring name -- is exercised without a Jet member.
         CaptureStarter starter = (spec, passthrough) -> {
             passthrough.accept(Envelope.read(1L, "orders", Map.of("id", 1L), Map.of()));
             passthrough.accept(Envelope.read(1L, "orders", Map.of("id", 2L), Map.of()));
@@ -406,10 +406,11 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         coordinator.startCapture("p");
 
-        // The snapshot rows land in the buffer under the ring the source resolves to -- the same ring the source
-        // vertex drains member-side, which is what routes the snapshot through the transform chain ahead of cdc.
+        // The snapshot rows land in the buffer under the pipeline and ring the source resolves to -- the same
+        // coordinates the source vertex drains member-side, which routes its own snapshot through the transform
+        // chain ahead of cdc.
         String ringName = SourceCaptureResolution.of(source).ringName();
-        assertThat(buffer.drain(ringName)).extracting(e -> e.after().get("id")).containsExactly(1L, 2L);
+        assertThat(buffer.drain("p", ringName)).extracting(e -> e.after().get("id")).containsExactly(1L, 2L);
     }
 
     @Test
@@ -434,8 +435,10 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 entry("orders", new TableSnapshot(1L, null, null)),
                 entry("customers", new TableSnapshot(1L, null, null)));
         SourceCaptureResolution resolution = SourceCaptureResolution.of(source);
-        assertThat(buffer.drain(resolution.ringName("orders"))).extracting(e -> e.src()).containsExactly("orders");
-        assertThat(buffer.drain(resolution.ringName("customers"))).extracting(e -> e.src()).containsExactly("customers");
+        assertThat(buffer.drain("p", resolution.ringName("orders")))
+                .extracting(e -> e.src()).containsExactly("orders");
+        assertThat(buffer.drain("p", resolution.ringName("customers")))
+                .extracting(e -> e.src()).containsExactly("customers");
     }
 
     @Test

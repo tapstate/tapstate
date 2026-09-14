@@ -18,10 +18,12 @@ import org.junit.jupiter.api.Test;
 
 /**
  * The member-local snapshot buffer: the seam that carries a source's bounded snapshot rows from the capture
- * side to the source vertex so they can be emitted ahead of the cdc tail. It buffers per ring name, drains a
- * ring's rows once in append order, and isolates one ring's rows from another's.
+ * side to the source vertex so they can be emitted ahead of the cdc tail. It buffers per consumer pipeline
+ * and ring name, drains that consumer's rows once in append order, and isolates both coordinates.
  */
 class SnapshotBufferTest {
+
+    private static final String PIPELINE = "orders_pipeline";
 
     @Test
     @SuppressWarnings("unchecked")
@@ -30,8 +32,8 @@ class SnapshotBufferTest {
         String ring = "srs.chain.late";
         Envelope first = row("orders", 100);
         Envelope later = row("orders", 101);
-        buffer.append(ring, first);
-        assertThat(buffer.drain(ring)).containsExactly(first);
+        buffer.append(PIPELINE, ring, first);
+        assertThat(buffer.drain(PIPELINE, ring)).containsExactly(first);
 
         CountDownLatch adding = new CountDownLatch(1);
         CountDownLatch resume = new CountDownLatch(1);
@@ -52,17 +54,17 @@ class SnapshotBufferTest {
         };
         // Install a real concurrent queue with a scheduling barrier at add: computeIfAbsent can
         // publish an empty queue before append inserts its row. No production operation is replaced.
-        var field = SnapshotBuffer.class.getDeclaredField("byRing");
+        var field = SnapshotBuffer.class.getDeclaredField("byConsumerRing");
         field.setAccessible(true);
-        ConcurrentMap<String, Queue<Envelope>> rings =
-                (ConcurrentMap<String, Queue<Envelope>>) field.get(buffer);
-        rings.put(ring, queue);
+        ConcurrentMap<SnapshotBuffer.BufferKey, Queue<Envelope>> rings =
+                (ConcurrentMap<SnapshotBuffer.BufferKey, Queue<Envelope>>) field.get(buffer);
+        rings.put(new SnapshotBuffer.BufferKey(PIPELINE, ring), queue);
 
         try (var capture = Executors.newSingleThreadExecutor()) {
-            var appended = capture.submit(() -> buffer.append(ring, later));
+            var appended = capture.submit(() -> buffer.append(PIPELINE, ring, later));
             try {
                 assertThat(adding.await(10, TimeUnit.SECONDS)).as("capture reached queue insertion").isTrue();
-                assertThat(buffer.drain(ring)).isEmpty();
+                assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
             } finally {
                 resume.countDown();
             }
@@ -71,7 +73,7 @@ class SnapshotBufferTest {
             // The append finished and the queue holds the row. An explicit next drain rules out
             // a missing processor wakeup: the row must still be reachable through the buffer.
             assertThat(queue).containsExactly(later);
-            assertThat(buffer.drain(ring))
+            assertThat(buffer.drain(PIPELINE, ring))
                     .as("row 101 remains reachable after append completes, even after an empty drain")
                     .containsExactly(later);
         }
@@ -99,7 +101,7 @@ class SnapshotBufferTest {
                     if (replenish.get() && appended.get() < 64) {
                         int id = 100 + appended.incrementAndGet();
                         try {
-                            capture.submit(() -> buffer.append(ring, row("orders", id)))
+                            capture.submit(() -> buffer.append(PIPELINE, ring, row("orders", id)))
                                     .get(10, TimeUnit.SECONDS);
                         } catch (InterruptedException interrupted) {
                             Thread.currentThread().interrupt();
@@ -112,32 +114,32 @@ class SnapshotBufferTest {
                 }
             };
             queue.add(first);
-            var field = SnapshotBuffer.class.getDeclaredField("byRing");
+            var field = SnapshotBuffer.class.getDeclaredField("byConsumerRing");
             field.setAccessible(true);
-            ConcurrentMap<String, Queue<Envelope>> rings =
-                    (ConcurrentMap<String, Queue<Envelope>>) field.get(buffer);
-            rings.put(ring, queue);
+            ConcurrentMap<SnapshotBuffer.BufferKey, Queue<Envelope>> rings =
+                    (ConcurrentMap<SnapshotBuffer.BufferKey, Queue<Envelope>>) field.get(buffer);
+            rings.put(new SnapshotBuffer.BufferKey(PIPELINE, ring), queue);
 
-            List<Envelope> drained = buffer.drain(ring);
+            List<Envelope> drained = buffer.drain(PIPELINE, ring);
             replenish.set(false);
 
             assertThat(drained)
                     .as("a drain returns its initial rows without chasing the active capture")
                     .containsExactly(first);
             assertThat(appended.get()).isEqualTo(1);
-            assertThat(buffer.drain(ring)).extracting(e -> e.after().get("id")).containsExactly(101L);
-            assertThat(buffer.drain(ring)).isEmpty();
+            assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(101L);
+            assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
         }
     }
 
     @Test
     void drainsOneRingsRowsInAppendOrder() {
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.orders", row("orders", 0));
-        buffer.append("srs.chain.orders", row("orders", 1));
-        buffer.append("srs.chain.orders", row("orders", 2));
+        buffer.append(PIPELINE, "srs.chain.orders", row("orders", 0));
+        buffer.append(PIPELINE, "srs.chain.orders", row("orders", 1));
+        buffer.append(PIPELINE, "srs.chain.orders", row("orders", 2));
 
-        List<Envelope> drained = buffer.drain("srs.chain.orders");
+        List<Envelope> drained = buffer.drain(PIPELINE, "srs.chain.orders");
 
         assertThat(drained).extracting(e -> e.after().get("id")).containsExactly(0L, 1L, 2L);
     }
@@ -145,26 +147,42 @@ class SnapshotBufferTest {
     @Test
     void drainIsOnceConsumedSoASecondDrainIsEmpty() {
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.orders", row("orders", 0));
+        buffer.append(PIPELINE, "srs.chain.orders", row("orders", 0));
 
-        assertThat(buffer.drain("srs.chain.orders")).hasSize(1);
-        assertThat(buffer.drain("srs.chain.orders")).isEmpty();
+        assertThat(buffer.drain(PIPELINE, "srs.chain.orders")).hasSize(1);
+        assertThat(buffer.drain(PIPELINE, "srs.chain.orders")).isEmpty();
     }
 
     @Test
     void drainingANeverAppendedRingIsEmptyNotNull() {
         SnapshotBuffer buffer = new SnapshotBuffer();
 
-        assertThat(buffer.drain("srs.chain.absent")).isEmpty();
+        assertThat(buffer.drain(PIPELINE, "srs.chain.absent")).isEmpty();
     }
 
     @Test
     void keepsEachRingsRowsIsolated() {
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.orders", row("orders", 1));
-        buffer.append("srs.chain.items", row("items", 2));
+        buffer.append(PIPELINE, "srs.chain.orders", row("orders", 1));
+        buffer.append(PIPELINE, "srs.chain.items", row("items", 2));
 
-        assertThat(buffer.drain("srs.chain.orders")).extracting(e -> e.after().get("id")).containsExactly(1L);
-        assertThat(buffer.drain("srs.chain.items")).extracting(e -> e.after().get("id")).containsExactly(2L);
+        assertThat(buffer.drain(PIPELINE, "srs.chain.orders")).extracting(e -> e.after().get("id")).containsExactly(1L);
+        assertThat(buffer.drain(PIPELINE, "srs.chain.items")).extracting(e -> e.after().get("id")).containsExactly(2L);
+    }
+
+    @Test
+    void keepsEachConsumersRowsIsolatedOnASharedRing() {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = "srs.chain.orders";
+        buffer.append("first_pipeline", ring, row("orders", 1));
+        buffer.append("second_pipeline", ring, row("orders", 2));
+
+        assertThat(buffer.drain("first_pipeline", ring))
+                .as("one consumer cannot take another consumer's initial load")
+                .extracting(e -> e.after().get("id"))
+                .containsExactly(1L);
+        assertThat(buffer.drain("second_pipeline", ring))
+                .extracting(e -> e.after().get("id"))
+                .containsExactly(2L);
     }
 }
