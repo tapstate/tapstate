@@ -1,5 +1,6 @@
 package io.tapstate.cli;
 
+import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -7,9 +8,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -29,6 +32,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -72,6 +77,20 @@ class ReplTest {
                 sessionToken,
                 now.plusSeconds(3600),
                 now.plusSeconds(7200));
+    }
+
+    private static byte[] completeConnectorJar() {
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (JarOutputStream jar = new JarOutputStream(bytes)) {
+                jar.putNextEntry(new JarEntry("connector.txt"));
+                jar.write("connector".getBytes());
+                jar.closeEntry();
+            }
+            return bytes.toByteArray();
+        } catch (IOException failed) {
+            throw new AssertionError("could not create the connector jar fixture", failed);
+        }
     }
 
     private record Harness(Repl repl, StringWriter sink) {
@@ -2904,9 +2923,10 @@ class ReplTest {
                 new RegisteredConnector("enterprise", "hash-abc", "2.0.9", true));
         Harness h = onlineSession(workdir, client);
         List<URI> fetched = new ArrayList<>();
+        byte[] jar = completeConnectorJar();
         h.repl().connectorFetcher(from -> {
             fetched.add(from);
-            return new byte[] {(byte) 'P', (byte) 'K', 3, 4, 9};
+            return PublishedConnectorArtifacts.Fetched.unvalidated(jar);
         });
         int mark = h.sink().toString().length();
 
@@ -2919,12 +2939,13 @@ class ReplTest {
                 URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/oracle-connector.jar"),
                 URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/sqlserver-connector.jar"));
         assertThat(client.registerCalls).containsExactly(
-                "jwt-tok@http://node1:7900 x5", "jwt-tok@http://node1:7900 x5");
+                "jwt-tok@http://node1:7900 x" + jar.length,
+                "jwt-tok@http://node1:7900 x" + jar.length);
         assertThat(h.sink().toString().substring(mark))
                 .contains("downloading oracle-connector.jar from github.com")
                 .contains("downloading sqlserver-connector.jar from github.com")
-                .contains("uploading oracle-connector.jar (5 B)")
-                .contains("uploading sqlserver-connector.jar (5 B)");
+                .contains("uploading oracle-connector.jar (" + jar.length + " B)")
+                .contains("uploading sqlserver-connector.jar (" + jar.length + " B)");
     }
 
     @Test
@@ -2935,9 +2956,10 @@ class ReplTest {
         Harness h = onlineSession(workdir, client,
                 Map.of("TAPSTATE_CONNECTORS_URL", "https://mirror.example/connectors"));
         List<URI> fetched = new ArrayList<>();
+        byte[] jar = completeConnectorJar();
         h.repl().connectorFetcher(from -> {
             fetched.add(from);
-            return new byte[] {(byte) 'P', (byte) 'K', 3, 4, 9};
+            return PublishedConnectorArtifacts.Fetched.unvalidated(jar);
         });
         int mark = h.sink().toString().length();
 
@@ -2990,7 +3012,8 @@ class ReplTest {
     void aSuccessfulErrorPageCannotBeUploadedAsAConnector(@TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         Harness h = onlineSession(workdir, client);
-        h.repl().connectorFetcher(from -> "not a jar".getBytes());
+        h.repl().connectorFetcher(from ->
+                PublishedConnectorArtifacts.Fetched.unvalidated("not a jar".getBytes()));
         int mark = h.sink().toString().length();
 
         assertThat(h.repl().dispatch("register sqlserver")).isTrue();
@@ -2998,8 +3021,38 @@ class ReplTest {
         String out = h.sink().toString().substring(mark);
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(out).contains("cli.connector-download-failed")
-                .contains("response is not a connector jar");
+                .contains("response is not a complete connector jar");
         assertThat(client.registerCalls).isEmpty();
+    }
+
+    @Test
+    void aTruncatedSuccessfulResponseIsCodedAndNeverUploaded(@TempDir Path workdir) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/connector.jar", exchange -> {
+            exchange.sendResponseHeaders(200, 100);
+            exchange.getResponseBody().write(new byte[] {(byte) 'P', (byte) 'K', 3, 4, 9});
+            exchange.close();
+        });
+        server.start();
+        try {
+            URI truncated = URI.create(
+                    "http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
+            FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+            Harness h = onlineSession(workdir, client);
+            PublishedConnectorArtifacts.Fetcher http = PublishedConnectorArtifacts.Fetcher.http();
+            h.repl().connectorFetcher(ignored -> http.fetch(truncated));
+            int mark = h.sink().toString().length();
+
+            assertThat(h.repl().dispatch("register oracle")).isTrue();
+
+            String out = h.sink().toString().substring(mark);
+            assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+            assertThat(out).contains("cli.connector-download-failed").contains("truncated")
+                    .doesNotContain("uploading");
+            assertThat(client.registerCalls).isEmpty();
+        } finally {
+            server.stop(0);
+        }
     }
 
     @Test

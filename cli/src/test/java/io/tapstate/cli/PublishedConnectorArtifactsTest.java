@@ -4,11 +4,14 @@ import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.catalog.OfficialConnectors;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.URI;
 import java.util.Map;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -22,13 +25,70 @@ class PublishedConnectorArtifactsTest {
 
     @Test
     void theHttpFetcherReturnsACompleteSuccessfulBody() throws Exception {
-        byte[] jar = {(byte) 'P', (byte) 'K', 3, 4, 9};
+        byte[] jar = completeJar();
         HttpServer server = server(200, jar);
         try {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThat(PublishedConnectorArtifacts.download(
                     source, PublishedConnectorArtifacts.Fetcher.http())).isEqualTo(jar);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void theHttpFetcherRejectsATruncatedBodyWithADeclaredLength() {
+        byte[] truncated = {(byte) 'P', (byte) 'K', 3, 4, 9};
+        HttpServer server = declaredLengthServer(100, truncated);
+        try {
+            URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
+
+            assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
+                    source, PublishedConnectorArtifacts.Fetcher.http()))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("truncated");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void completeJarValidationRejectsATruncatedZipWithoutLengthMetadata() {
+        byte[] truncated = {(byte) 'P', (byte) 'K', 3, 4, 9};
+
+        assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
+                URI.create("https://example.invalid/connector.jar"),
+                ignored -> PublishedConnectorArtifacts.Fetched.unvalidated(truncated)))
+                .isInstanceOf(IOException.class)
+                .hasMessage("the response is not a complete connector jar");
+    }
+
+    @Test
+    void theHttpFetcherRejectsAnOversizedDeclaredBodyBeforeReadingIt() {
+        HttpServer server = declaredLengthServer(70L * 1024 * 1024, new byte[0]);
+        try {
+            URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
+
+            assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
+                    source, PublishedConnectorArtifacts.Fetcher.http()))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("exceeds the 64 MiB connector artifact limit");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void theHttpFetcherBoundsAnOversizedChunkedBody() {
+        HttpServer server = chunkedServer(64L * 1024 * 1024 + 1);
+        try {
+            URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
+
+            assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
+                    source, PublishedConnectorArtifacts.Fetcher.http()))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("exceeds the 64 MiB connector artifact limit");
         } finally {
             server.stop(0);
         }
@@ -51,7 +111,7 @@ class PublishedConnectorArtifactsTest {
 
     @Test
     void everyRedirectHopUsesTheSameBoundedDownloadPath() throws Exception {
-        byte[] jar = {(byte) 'P', (byte) 'K', 3, 4, 9};
+        byte[] jar = completeJar();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/release", exchange -> {
             exchange.getResponseHeaders().add("Location", "/connector.jar");
@@ -161,6 +221,29 @@ class PublishedConnectorArtifactsTest {
     }
 
     @Test
+    void noProxyPortQualifiersAndBracketedIpv6MatchTheDestinationExactly() throws Exception {
+        Map<String, String> mismatchedPort = Map.of(
+                "HTTPS_PROXY", "http://proxy.example:8443",
+                "NO_PROXY", "mirror.example:9443");
+        Map<String, String> matchingIpv6 = Map.of(
+                "HTTPS_PROXY", "http://proxy.example:8443",
+                "NO_PROXY", "[2001:db8::1]:443");
+        Map<String, String> mismatchedIpv6 = Map.of(
+                "HTTPS_PROXY", "http://proxy.example:8443",
+                "NO_PROXY", "[2001:db8::1]:9443");
+
+        assertThat(PublishedConnectorArtifacts.proxyFor(
+                URI.create("https://mirror.example/file.jar"), mismatchedPort::get).type())
+                .isEqualTo(Proxy.Type.HTTP);
+        assertThat(PublishedConnectorArtifacts.proxyFor(
+                URI.create("https://[2001:db8::1]/file.jar"), matchingIpv6::get))
+                .isEqualTo(Proxy.NO_PROXY);
+        assertThat(PublishedConnectorArtifacts.proxyFor(
+                URI.create("https://[2001:db8::1]/file.jar"), mismatchedIpv6::get).type())
+                .isEqualTo(Proxy.Type.HTTP);
+    }
+
+    @Test
     void unknownAssetsAndMalformedDownloadConfigurationAreRefused() {
         assertThatThrownBy(() -> PublishedConnectorArtifacts.artifact("not-published", name -> null))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -188,6 +271,61 @@ class PublishedConnectorArtifactsTest {
             return server;
         } catch (IOException failed) {
             throw new AssertionError("could not start the HTTP test server", failed);
+        }
+    }
+
+    private static HttpServer declaredLengthServer(long declaredLength, byte[] body) {
+        try {
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/connector.jar", exchange -> {
+                exchange.sendResponseHeaders(200, declaredLength);
+                exchange.getResponseBody().write(body);
+                exchange.close();
+            });
+            server.start();
+            return server;
+        } catch (IOException failed) {
+            throw new AssertionError("could not start the HTTP test server", failed);
+        }
+    }
+
+    private static HttpServer chunkedServer(long bytes) {
+        try {
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/connector.jar", exchange -> {
+                exchange.sendResponseHeaders(200, 0);
+                byte[] chunk = new byte[8192];
+                long remaining = bytes;
+                try {
+                    while (remaining > 0) {
+                        int length = (int) Math.min(chunk.length, remaining);
+                        exchange.getResponseBody().write(chunk, 0, length);
+                        remaining -= length;
+                    }
+                } catch (IOException clientStoppedAtTheLimit) {
+                    // The bounded client is expected to close before the oversized response completes.
+                } finally {
+                    exchange.close();
+                }
+            });
+            server.start();
+            return server;
+        } catch (IOException failed) {
+            throw new AssertionError("could not start the HTTP test server", failed);
+        }
+    }
+
+    private static byte[] completeJar() {
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (JarOutputStream jar = new JarOutputStream(bytes)) {
+                jar.putNextEntry(new JarEntry("connector.txt"));
+                jar.write("connector".getBytes());
+                jar.closeEntry();
+            }
+            return bytes.toByteArray();
+        } catch (IOException failed) {
+            throw new AssertionError("could not create the connector jar fixture", failed);
         }
     }
 }

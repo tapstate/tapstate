@@ -29,5 +29,7 @@ shaded and carry their own drivers on an isolated class loader:
 
 The release carries companion copies of the Oracle Free Use Terms and the
 Microsoft MIT License beside the enterprise jars; the other jars carry their
-dependency notices under META-INF/. Those licenses govern the connector jars;
-they do not alter the Apache-2.0 license of Tapstate itself.
+dependency notices under META-INF/. Those terms govern only the bundled drivers
+and dependencies identified above; they do not alter the Apache-2.0 license of
+Tapstate itself. The Oracle and SQL Server implementations are paid connector
+implementations; their use remains subject to the applicable Tapdata agreement.

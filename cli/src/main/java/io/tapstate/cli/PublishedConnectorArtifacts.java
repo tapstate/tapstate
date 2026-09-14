@@ -2,14 +2,19 @@ package io.tapstate.cli;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.URI;
 import java.net.URLConnection;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
 import java.util.function.UnaryOperator;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipInputStream;
 
 /** Connector jars available from the floating {@code connectors-preview} release. */
 final class PublishedConnectorArtifacts {
@@ -19,12 +24,16 @@ final class PublishedConnectorArtifacts {
     private static final String ENV_CONNECTORS_URL = "TAPSTATE_CONNECTORS_URL";
     private static final String ENV_BASE_URL = "TAPSTATE_BASE_URL";
 
+    /** Current preview artifacts fit below 51 MiB; 64 MiB bounds both declared and chunked responses. */
+    private static final long MAX_ARTIFACT_BYTES = 64L * 1024 * 1024;
+    private static final int COPY_BUFFER_BYTES = 8192;
+
     /** Exact public ids with a matching {@code <id>-connector.jar} release asset. */
     static final List<String> IDS = List.of("mysql", "mongodb", "postgres", "oracle", "sqlserver");
 
     /** Fetches one complete response body; tests replace the network at this seam. */
     interface Fetcher {
-        byte[] fetch(URI from) throws IOException;
+        Fetched fetch(URI from) throws IOException;
 
         static Fetcher http() {
             return http(name -> null);
@@ -35,7 +44,7 @@ final class PublishedConnectorArtifacts {
             return from -> fetchFollowingRedirects(from, env);
         }
 
-        private static byte[] fetchFollowingRedirects(URI from, UnaryOperator<String> env) throws IOException {
+        private static Fetched fetchFollowingRedirects(URI from, UnaryOperator<String> env) throws IOException {
             URI current = from;
             String originalScheme = from.getScheme();
             for (int redirects = 0; redirects <= 5; redirects++) {
@@ -52,9 +61,7 @@ final class PublishedConnectorArtifacts {
                 try {
                     int status = connection.getResponseCode();
                     if (status == HttpURLConnection.HTTP_OK) {
-                        try (InputStream body = connection.getInputStream()) {
-                            return body.readAllBytes();
-                        }
+                        return readBoundedJar(connection);
                     }
                     if (status < 300 || status >= 400) {
                         throw new IOException("HTTP " + status);
@@ -73,6 +80,17 @@ final class PublishedConnectorArtifacts {
                 }
             }
             throw new IOException("too many connector download redirects");
+        }
+    }
+
+    /** Marks whether the transport already performed the complete-JAR check before allocating the byte array. */
+    record Fetched(byte[] bytes, boolean jarValidated) {
+        static Fetched unvalidated(byte[] bytes) {
+            return new Fetched(bytes, false);
+        }
+
+        private static Fetched validated(byte[] bytes) {
+            return new Fetched(bytes, true);
         }
     }
 
@@ -119,10 +137,16 @@ final class PublishedConnectorArtifacts {
 
     /** Fetches and rejects an error page before its bytes can reach the server registration endpoint. */
     static byte[] download(URI source, Fetcher fetcher) throws IOException {
-        byte[] artifact = fetcher.fetch(source);
-        if (artifact == null || artifact.length < 4
-                || artifact[0] != 'P' || artifact[1] != 'K' || artifact[2] != 3 || artifact[3] != 4) {
-            throw new IOException("the response is not a connector jar");
+        Fetched fetched = fetcher.fetch(source);
+        byte[] artifact = fetched == null ? null : fetched.bytes();
+        if (artifact == null) {
+            throw new IOException("the response is not a complete connector jar");
+        }
+        if (artifact.length > MAX_ARTIFACT_BYTES) {
+            throw artifactTooLarge();
+        }
+        if (!fetched.jarValidated()) {
+            validateCompleteJar(artifact);
         }
         return artifact;
     }
@@ -130,7 +154,7 @@ final class PublishedConnectorArtifacts {
     /** Resolves the conventional proxy variables because native Java does not inherit them itself. */
     static Proxy proxyFor(URI destination, UnaryOperator<String> env) throws IOException {
         String noProxy = first(env, "NO_PROXY", "no_proxy");
-        if (bypasses(destination.getHost(), noProxy)) {
+        if (bypasses(destination, noProxy)) {
             return Proxy.NO_PROXY;
         }
         String configured = "https".equalsIgnoreCase(destination.getScheme())
@@ -163,25 +187,166 @@ final class PublishedConnectorArtifacts {
         return null;
     }
 
-    private static boolean bypasses(String host, String noProxy) {
+    private static boolean bypasses(URI destination, String noProxy) {
+        String host = normalizeHost(destination.getHost());
         if (host == null || noProxy == null || noProxy.isBlank()) {
             return false;
         }
+        int destinationPort = effectivePort(destination);
         for (String entry : noProxy.split(",")) {
             String candidate = entry.strip();
             if (candidate.equals("*")) {
                 return true;
             }
-            int port = candidate.lastIndexOf(':');
-            if (port > 0 && candidate.indexOf(':') == port) {
-                candidate = candidate.substring(0, port);
+            NoProxyTarget target = NoProxyTarget.parse(candidate);
+            if (target == null || target.port() != null && target.port() != destinationPort) {
+                continue;
             }
-            String suffix = candidate.startsWith(".") ? candidate.substring(1) : candidate;
+            String suffix = target.host().startsWith(".") ? target.host().substring(1) : target.host();
             if (!suffix.isEmpty() && (host.equalsIgnoreCase(suffix)
-                    || host.toLowerCase(Locale.ROOT).endsWith("." + suffix.toLowerCase(Locale.ROOT)))) {
+                    || suffix.indexOf(':') < 0
+                    && host.toLowerCase(Locale.ROOT).endsWith("." + suffix.toLowerCase(Locale.ROOT)))) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static Fetched readBoundedJar(HttpURLConnection connection) throws IOException {
+        long declaredLength = connection.getContentLengthLong();
+        if (declaredLength > MAX_ARTIFACT_BYTES) {
+            throw artifactTooLarge();
+        }
+        Path spool = Files.createTempFile("tapstate-connector-", ".jar");
+        try {
+            long received = 0;
+            byte[] buffer = new byte[COPY_BUFFER_BYTES];
+            try (InputStream body = connection.getInputStream(); OutputStream file = Files.newOutputStream(spool)) {
+                while (true) {
+                    int allowed = (int) Math.min(buffer.length, MAX_ARTIFACT_BYTES - received + 1);
+                    int read = body.read(buffer, 0, allowed);
+                    if (read < 0) {
+                        break;
+                    }
+                    if (read == 0) {
+                        continue;
+                    }
+                    received += read;
+                    if (received > MAX_ARTIFACT_BYTES) {
+                        throw artifactTooLarge();
+                    }
+                    file.write(buffer, 0, read);
+                }
+            }
+            if (declaredLength >= 0 && received != declaredLength) {
+                throw new IOException("connector artifact was truncated: expected "
+                        + declaredLength + " bytes but received " + received);
+            }
+            validateCompleteJar(spool);
+            return Fetched.validated(Files.readAllBytes(spool));
+        } finally {
+            Files.deleteIfExists(spool);
+        }
+    }
+
+    private static void validateCompleteJar(byte[] artifact) throws IOException {
+        Path spool = Files.createTempFile("tapstate-connector-check-", ".jar");
+        try {
+            Files.write(spool, artifact);
+            validateCompleteJar(spool);
+        } finally {
+            Files.deleteIfExists(spool);
+        }
+    }
+
+    private static void validateCompleteJar(Path artifact) throws IOException {
+        try (ZipFile archive = new ZipFile(artifact.toFile())) {
+            if (archive.size() == 0) {
+                throw new IOException("connector jar has no entries");
+            }
+        } catch (IOException invalid) {
+            throw new IOException("the response is not a complete connector jar", invalid);
+        }
+
+        try (ZipInputStream entries = new ZipInputStream(Files.newInputStream(artifact))) {
+            byte[] buffer = new byte[COPY_BUFFER_BYTES];
+            int entryCount = 0;
+            while (entries.getNextEntry() != null) {
+                entryCount++;
+                while (entries.read(buffer) >= 0) {
+                    // Reading every entry makes the ZIP implementation verify sizes and CRCs.
+                }
+                entries.closeEntry();
+            }
+            if (entryCount == 0) {
+                throw new IOException("connector jar has no entries");
+            }
+        } catch (IOException invalid) {
+            throw new IOException("the response is not a complete connector jar", invalid);
+        }
+    }
+
+    private static IOException artifactTooLarge() {
+        return new IOException("response exceeds the 64 MiB connector artifact limit");
+    }
+
+    private static int effectivePort(URI destination) {
+        if (destination.getPort() >= 0) {
+            return destination.getPort();
+        }
+        if ("https".equalsIgnoreCase(destination.getScheme())) {
+            return 443;
+        }
+        if ("http".equalsIgnoreCase(destination.getScheme())) {
+            return 80;
+        }
+        return -1;
+    }
+
+    private static String normalizeHost(String host) {
+        if (host != null && host.length() >= 2 && host.startsWith("[") && host.endsWith("]")) {
+            return host.substring(1, host.length() - 1);
+        }
+        return host;
+    }
+
+    private record NoProxyTarget(String host, Integer port) {
+        private static NoProxyTarget parse(String candidate) {
+            if (candidate.isEmpty()) {
+                return null;
+            }
+            if (candidate.startsWith("[")) {
+                int close = candidate.indexOf(']');
+                if (close < 0) {
+                    return null;
+                }
+                String host = candidate.substring(1, close);
+                String remainder = candidate.substring(close + 1);
+                if (remainder.isEmpty()) {
+                    return new NoProxyTarget(host, null);
+                }
+                if (!remainder.startsWith(":")) {
+                    return null;
+                }
+                Integer port = parsePort(remainder.substring(1));
+                return port == null ? null : new NoProxyTarget(host, port);
+            }
+            int firstColon = candidate.indexOf(':');
+            int lastColon = candidate.lastIndexOf(':');
+            if (firstColon >= 0 && firstColon == lastColon) {
+                Integer port = parsePort(candidate.substring(lastColon + 1));
+                return port == null ? null : new NoProxyTarget(candidate.substring(0, lastColon), port);
+            }
+            return new NoProxyTarget(candidate, null);
+        }
+
+        private static Integer parsePort(String value) {
+            try {
+                int port = Integer.parseInt(value);
+                return port >= 0 && port <= 65_535 ? port : null;
+            } catch (NumberFormatException invalid) {
+                return null;
+            }
+        }
     }
 }

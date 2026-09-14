@@ -76,8 +76,10 @@ Oracle and SQL Server connector jars are published as separate assets on the flo
 downloaded by the three-database quickstart unless you explicitly run `register oracle` or
 `register sqlserver`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
 the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
-the MIT License. Their dependency terms govern those jars and do not change Tapstate's
-Apache-2.0 license. The upstream enterprise connector repository has no LICENSE file;
+the MIT License. Those dependency terms govern only the bundled drivers and do not change
+Tapstate's Apache-2.0 license. The Oracle and SQL Server implementations are paid connector
+implementations; their use remains subject to the applicable Tapdata agreement. The upstream
+enterprise connector repository has no LICENSE file;
 publishing these binary assets does not relicense that source repository.
 
 The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
