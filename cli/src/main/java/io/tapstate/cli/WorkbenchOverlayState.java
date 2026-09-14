@@ -225,7 +225,8 @@ sealed interface WorkbenchOverlayState
         }
 
         sealed interface Intent permits Intent.DeleteContext, Intent.CreateSource, Intent.CreatePipeline,
-                Intent.ApplySources, Intent.DiscardChanges, Intent.DiscardSourceYaml, Intent.DiscardPipelineYaml {
+                Intent.ApplySources, Intent.ApplyPipelines, Intent.ChangePipelineLifecycle,
+                Intent.DiscardChanges, Intent.DiscardSourceYaml, Intent.DiscardPipelineYaml {
             record DeleteContext(String contextName) implements Intent {
                 public DeleteContext {
                     Objects.requireNonNull(contextName, "contextName");
@@ -246,6 +247,18 @@ sealed interface WorkbenchOverlayState
 
             record ApplySources(WorkbenchActionGateway.SourceApplyRequest request) implements Intent {
                 public ApplySources {
+                    Objects.requireNonNull(request, "request");
+                }
+            }
+
+            record ApplyPipelines(WorkbenchActionGateway.PipelineApplyRequest request) implements Intent {
+                public ApplyPipelines {
+                    Objects.requireNonNull(request, "request");
+                }
+            }
+
+            record ChangePipelineLifecycle(WorkbenchActionGateway.PipelineLifecycleRequest request) implements Intent {
+                public ChangePipelineLifecycle {
                     Objects.requireNonNull(request, "request");
                 }
             }
@@ -328,6 +341,11 @@ sealed interface WorkbenchOverlayState
             AUTHENTICATION("🔐  Authentication", "Sign in to the selected server"),
             NEW_SOURCE("✨  New Source", "Create a local source artifact"),
             NEW_PIPELINE("⚡  New Pipeline", "Create a local pipeline artifact"),
+            APPLY_SELECTED_PIPELINE("☁️  Apply Selected Pipeline", "Synchronize the selected local pipeline"),
+            START_PIPELINE("▶  Start Pipeline", "Start the selected remote pipeline"),
+            PAUSE_PIPELINE("Ⅱ  Pause Pipeline", "Pause the selected remote pipeline"),
+            RESUME_PIPELINE("▶  Resume Pipeline", "Resume the selected remote pipeline"),
+            STOP_PIPELINE("■  Stop Pipeline", "Stop the selected remote pipeline"),
             APPLY_SELECTED_SOURCE("☁️  Apply Selected Source", "Synchronize the selected local source"),
             APPLY_WORKSPACE_SOURCES("☁️  Apply Workspace Sources", "Synchronize all valid local sources"),
             REFRESH("↻  Refresh", "Load the latest workspace snapshot"),

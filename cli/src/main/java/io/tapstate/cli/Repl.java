@@ -390,6 +390,88 @@ final class Repl {
             }
 
             @Override
+            public PipelineApplyResult applyPipelines(PipelineApplyRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineApplyResult.Unavailable();
+                }
+                try {
+                    Map<String, LocalDraft> draftsById = new LinkedHashMap<>();
+                    for (Path relativePath : request.relativePaths()) {
+                        if (relativePath.getNameCount() < 2 || !"pipeline".equals(relativePath.getName(0).toString())) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-path", "Only Pipeline workspace files can be applied here");
+                        }
+                        LocalDraft draft = draft(relativePath.normalize().toString(), resolveWorkbenchFile(relativePath));
+                        Resource resource = new DslParser().parse(draft.content());
+                        if (!(resource instanceof PipelineResource)) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-kind", "The selected file is not a valid Pipeline artifact");
+                        }
+                        if (draftsById.putIfAbsent(resource.id(), draft) != null) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-duplicate", "More than one local Pipeline has the same id");
+                        }
+                    }
+                    ListOutcome listed = withFailover(() -> controlPlane.list(
+                            session.landingNode(), session.credential(), "pipeline"),
+                            outcome -> outcome instanceof ListOutcome.Unreachable);
+                    if (listed instanceof ListOutcome.Rejected rejected) {
+                        return new PipelineApplyResult.Rejected(rejected.code(), rejected.message());
+                    }
+                    if (listed instanceof ListOutcome.Unreachable) {
+                        return new PipelineApplyResult.Unreachable();
+                    }
+                    Map<String, RemoteArtifact> remoteById = ((ListOutcome.Listed) listed).artifacts().stream()
+                            .collect(java.util.stream.Collectors.toMap(RemoteArtifact::id, artifact -> artifact,
+                                    (left, right) -> left, LinkedHashMap::new));
+                    List<LocalDraft> guarded = new ArrayList<>(draftsById.size());
+                    for (Map.Entry<String, LocalDraft> entry : draftsById.entrySet()) {
+                        RemoteArtifact remote = remoteById.get(entry.getKey());
+                        if (remote == null) {
+                            guarded.add(entry.getValue());
+                        } else if (!remote.readable() || remote.canonicalForm() == null) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-unreadable", "A remote Pipeline cannot be read for safe update");
+                        } else {
+                            guarded.add(new LocalDraft(entry.getValue().source(), entry.getValue().content(),
+                                    CanonicalHash.of(remote.canonicalForm())));
+                        }
+                    }
+                    ApplyOutcome outcome = withFailover(() -> controlPlane.apply(
+                            session.landingNode(), session.credential(), guarded),
+                            value -> value instanceof ApplyOutcome.Unreachable);
+                    return switch (outcome) {
+                        case ApplyOutcome.Applied applied -> new PipelineApplyResult.Applied(applied.items().stream()
+                                .filter(item -> "pipeline".equals(item.kind()))
+                                .map(item -> new SourceApplyItem(item.id(), item.change())).toList());
+                        case ApplyOutcome.Rejected rejected -> new PipelineApplyResult.Rejected(
+                                rejected.code(), rejected.message());
+                        case ApplyOutcome.Unreachable ignored -> new PipelineApplyResult.Unreachable();
+                    };
+                } catch (DslException rejected) {
+                    return new PipelineApplyResult.Rejected(rejected.code().code(), "A local Pipeline is not valid");
+                } catch (IOException | RuntimeException unavailable) {
+                    return new PipelineApplyResult.Unavailable();
+                }
+            }
+
+            @Override
+            public PipelineLifecycleResult changePipelineLifecycle(PipelineLifecycleRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineLifecycleResult.Unavailable();
+                }
+                LifecycleOutcome outcome = withFailover(() -> controlPlane.lifecycle(
+                        session.landingNode(), session.credential(), request.pipelineId(), request.verb()),
+                        value -> value instanceof LifecycleOutcome.Unreachable);
+                return switch (outcome) {
+                    case LifecycleOutcome.Accepted accepted -> new PipelineLifecycleResult.Changed(accepted.targetState());
+                    case LifecycleOutcome.Rejected rejected -> new PipelineLifecycleResult.Rejected(
+                            rejected.code(), rejected.message());
+                    case LifecycleOutcome.Unreachable ignored -> new PipelineLifecycleResult.Unreachable();
+                };
+            }
+
+            @Override
             public SourceApplyResult applySources(SourceApplyRequest request) {
                 if (!session.isConnected() || !session.isAuthenticated()) {
                     return new SourceApplyResult.Unavailable();

@@ -601,6 +601,11 @@ final class Workbench {
                 case NEW_PIPELINE -> openPipelineCreate();
                 case APPLY_SELECTED_SOURCE -> confirmSourceApply(selectedSourceRequest().orElseThrow());
                 case APPLY_WORKSPACE_SOURCES -> confirmSourceApply(workspaceSourceRequest().orElseThrow());
+                case APPLY_SELECTED_PIPELINE -> confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                case START_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "start");
+                case PAUSE_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "pause");
+                case RESUME_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "resume");
+                case STOP_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "stop");
                 case REFRESH -> {
                     runtime.updateState(WorkbenchState::closeOverlay);
                     if (refreshCoordinator != null) {
@@ -695,6 +700,14 @@ final class Workbench {
                 }
                 case WorkbenchOverlayState.Confirm.Intent.ApplySources apply -> {
                     submitSourceApply(confirm, apply);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.ApplyPipelines apply -> {
+                    submitPipelineApply(confirm, apply);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.ChangePipelineLifecycle lifecycle -> {
+                    submitPipelineLifecycle(confirm, lifecycle);
                     yield true;
                 }
                 case WorkbenchOverlayState.Confirm.Intent.DiscardChanges ignored -> runtime.updateState(state ->
@@ -1352,6 +1365,16 @@ final class Workbench {
             if (workspaceSourceRequest().isPresent()) {
                 actions.add(WorkbenchOverlayState.Actions.Action.APPLY_WORKSPACE_SOURCES);
             }
+            if (selectedPipelineApplyRequest().isPresent()) {
+                actions.add(WorkbenchOverlayState.Actions.Action.APPLY_SELECTED_PIPELINE);
+            }
+            if (selectedPipelineId().isPresent()) {
+                actions.addAll(List.of(
+                        WorkbenchOverlayState.Actions.Action.START_PIPELINE,
+                        WorkbenchOverlayState.Actions.Action.PAUSE_PIPELINE,
+                        WorkbenchOverlayState.Actions.Action.RESUME_PIPELINE,
+                        WorkbenchOverlayState.Actions.Action.STOP_PIPELINE));
+            }
             actions.add(WorkbenchOverlayState.Actions.Action.REFRESH);
             actions.add(WorkbenchOverlayState.Actions.Action.SHELL);
             return List.copyOf(actions);
@@ -1433,6 +1456,112 @@ final class Workbench {
                         restoreActions("Server could not be reached");
                 case WorkbenchActionGateway.SourceApplyResult.Unavailable ignored ->
                         restoreActions("Source apply is unavailable");
+            }
+        }
+
+        private Optional<WorkbenchActionGateway.PipelineApplyRequest> selectedPipelineApplyRequest() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()
+                    || !(state.snapshot().orElseThrow().workspace().remoteState() instanceof WorkbenchRemoteState.Available)) {
+                return Optional.empty();
+            }
+            return selectedPipelineRow().filter(Session::isApplicablePipeline)
+                    .map(row -> new WorkbenchActionGateway.PipelineApplyRequest(
+                            List.of(row.local().getFirst().relativePath())));
+        }
+
+        private Optional<String> selectedPipelineId() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()
+                    || !(state.snapshot().orElseThrow().workspace().remoteState() instanceof WorkbenchRemoteState.Available)) {
+                return Optional.empty();
+            }
+            return selectedPipelineRow().map(row -> row.key().id());
+        }
+
+        private Optional<WorkbenchArtifactRow> selectedPipelineRow() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            List<WorkbenchArtifactRow> rows = switch (state.selectedTab()) {
+                case WORKSPACE -> WorkbenchRenderer.sorted(state.snapshot().orElseThrow().workspace().rows(), state.workspaceTable());
+                case PIPELINES -> WorkbenchRenderer.sorted(state.snapshot().orElseThrow().pipelines().rows(), state.pipelinesTable());
+                default -> List.of();
+            };
+            if (rows.isEmpty()) {
+                return Optional.empty();
+            }
+            int selected = state.selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                    ? state.workspaceTable().selectedIndex() : state.pipelinesTable().selectedIndex();
+            WorkbenchArtifactRow row = rows.get(Math.clamp(selected, 0, rows.size() - 1));
+            return "pipeline".equals(row.key().kind()) ? Optional.of(row) : Optional.empty();
+        }
+
+        private static boolean isApplicablePipeline(WorkbenchArtifactRow row) {
+            return "pipeline".equals(row.key().kind()) && row.local().size() == 1 && row.local().getFirst().valid();
+        }
+
+        private boolean confirmPipelineApply(WorkbenchActionGateway.PipelineApplyRequest request) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.ApplyPipelines(request), "Apply Pipeline?",
+                    "Apply the selected local Pipeline to the current server?", false, state.overlay())));
+        }
+
+        private void submitPipelineApply(WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.ApplyPipelines apply) {
+            if (actionCoordinator == null || actionGateway == null) {
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.applyPipelines(apply.request()),
+                    failure -> new WorkbenchActionGateway.PipelineApplyResult.Unavailable(),
+                    this::completePipelineApply);
+        }
+
+        private void completePipelineApply(WorkbenchActionGateway.PipelineApplyResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.PipelineApplyResult.Applied ignored -> {
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    refresh();
+                }
+                case WorkbenchActionGateway.PipelineApplyResult.Rejected rejected -> restoreActions(
+                        rejected.code() + ": " + rejected.message());
+                case WorkbenchActionGateway.PipelineApplyResult.Unreachable ignored -> restoreActions("Server could not be reached");
+                case WorkbenchActionGateway.PipelineApplyResult.Unavailable ignored -> restoreActions("Pipeline apply is unavailable");
+            }
+        }
+
+        private boolean confirmPipelineLifecycle(String pipelineId, String verb) {
+            String title = Character.toUpperCase(verb.charAt(0)) + verb.substring(1) + " Pipeline?";
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.ChangePipelineLifecycle(
+                            new WorkbenchActionGateway.PipelineLifecycleRequest(pipelineId, verb)),
+                    title, title.replace("?", " " + pipelineId + "?"), false, state.overlay())));
+        }
+
+        private void submitPipelineLifecycle(WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.ChangePipelineLifecycle lifecycle) {
+            if (actionCoordinator == null || actionGateway == null) {
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.changePipelineLifecycle(lifecycle.request()),
+                    failure -> new WorkbenchActionGateway.PipelineLifecycleResult.Unavailable(),
+                    this::completePipelineLifecycle);
+        }
+
+        private void completePipelineLifecycle(WorkbenchActionGateway.PipelineLifecycleResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.PipelineLifecycleResult.Changed ignored -> {
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    refresh();
+                }
+                case WorkbenchActionGateway.PipelineLifecycleResult.Rejected rejected -> restoreActions(
+                        rejected.code() + ": " + rejected.message());
+                case WorkbenchActionGateway.PipelineLifecycleResult.Unreachable ignored -> restoreActions("Server could not be reached");
+                case WorkbenchActionGateway.PipelineLifecycleResult.Unavailable ignored ->
+                        restoreActions("Pipeline lifecycle control is unavailable");
             }
         }
 

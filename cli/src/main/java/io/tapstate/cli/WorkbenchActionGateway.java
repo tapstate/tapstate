@@ -55,6 +55,14 @@ interface WorkbenchActionGateway {
         return new PipelineCreateResult.Unavailable();
     }
 
+    default PipelineApplyResult applyPipelines(PipelineApplyRequest request) {
+        return new PipelineApplyResult.Unavailable();
+    }
+
+    default PipelineLifecycleResult changePipelineLifecycle(PipelineLifecycleRequest request) {
+        return new PipelineLifecycleResult.Unavailable();
+    }
+
     record ContextOption(String name, boolean suggested) {
         public ContextOption {
             Objects.requireNonNull(name, "name");
@@ -220,6 +228,22 @@ interface WorkbenchActionGateway {
         }
     }
 
+    record PipelineApplyRequest(List<Path> relativePaths) {
+        public PipelineApplyRequest {
+            relativePaths = List.copyOf(relativePaths);
+            if (relativePaths.isEmpty() || relativePaths.stream().anyMatch(Objects::isNull)) {
+                throw new IllegalArgumentException("Pipeline apply request must contain paths");
+            }
+        }
+    }
+
+    record PipelineLifecycleRequest(String pipelineId, String verb) {
+        public PipelineLifecycleRequest {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(verb, "verb");
+        }
+    }
+
     record SourceApplyRequest(List<Path> relativePaths) {
         public SourceApplyRequest {
             relativePaths = List.copyOf(relativePaths);
@@ -322,6 +346,48 @@ interface WorkbenchActionGateway {
         }
 
         record Unavailable() implements PipelineCreateResult {
+        }
+    }
+
+    sealed interface PipelineApplyResult {
+        record Applied(List<SourceApplyItem> items) implements PipelineApplyResult {
+            public Applied {
+                items = List.copyOf(items);
+            }
+        }
+
+        record Rejected(String code, String message) implements PipelineApplyResult {
+            public Rejected {
+                Objects.requireNonNull(code, "code");
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unreachable() implements PipelineApplyResult {
+        }
+
+        record Unavailable() implements PipelineApplyResult {
+        }
+    }
+
+    sealed interface PipelineLifecycleResult {
+        record Changed(String state) implements PipelineLifecycleResult {
+            public Changed {
+                Objects.requireNonNull(state, "state");
+            }
+        }
+
+        record Rejected(String code, String message) implements PipelineLifecycleResult {
+            public Rejected {
+                Objects.requireNonNull(code, "code");
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unreachable() implements PipelineLifecycleResult {
+        }
+
+        record Unavailable() implements PipelineLifecycleResult {
         }
     }
 
