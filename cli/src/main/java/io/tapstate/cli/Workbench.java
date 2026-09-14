@@ -1578,19 +1578,23 @@ final class Workbench {
             runtime.updateState(state -> state.withOverlay(confirm.asPending()));
             actionCoordinator.submit(() -> actionGateway.applyPipelines(apply.request()),
                     failure -> new WorkbenchActionGateway.PipelineApplyResult.Unavailable(),
-                    this::completePipelineApply);
+                    result -> completePipelineApply(confirm, result));
         }
 
-        private void completePipelineApply(WorkbenchActionGateway.PipelineApplyResult result) {
+        private void completePipelineApply(
+                WorkbenchOverlayState.Confirm confirm,
+                WorkbenchActionGateway.PipelineApplyResult result) {
             switch (result) {
                 case WorkbenchActionGateway.PipelineApplyResult.Applied ignored -> {
                     runtime.updateState(WorkbenchState::closeOverlay);
                     refresh();
                 }
-                case WorkbenchActionGateway.PipelineApplyResult.Rejected rejected -> restoreActions(
-                        rejected.code() + ": " + rejected.message());
-                case WorkbenchActionGateway.PipelineApplyResult.Unreachable ignored -> restoreActions("Server could not be reached");
-                case WorkbenchActionGateway.PipelineApplyResult.Unavailable ignored -> restoreActions("Pipeline apply is unavailable");
+                case WorkbenchActionGateway.PipelineApplyResult.Rejected rejected -> restorePipelineFailure(
+                        confirm, rejected.code() + ": " + rejected.message());
+                case WorkbenchActionGateway.PipelineApplyResult.Unreachable ignored ->
+                        restorePipelineFailure(confirm, "Server could not be reached");
+                case WorkbenchActionGateway.PipelineApplyResult.Unavailable ignored ->
+                        restorePipelineFailure(confirm, "Pipeline apply is unavailable");
             }
         }
 
@@ -1610,21 +1614,33 @@ final class Workbench {
             runtime.updateState(state -> state.withOverlay(confirm.asPending()));
             actionCoordinator.submit(() -> actionGateway.changePipelineLifecycle(lifecycle.request()),
                     failure -> new WorkbenchActionGateway.PipelineLifecycleResult.Unavailable(),
-                    this::completePipelineLifecycle);
+                    result -> completePipelineLifecycle(confirm, result));
         }
 
-        private void completePipelineLifecycle(WorkbenchActionGateway.PipelineLifecycleResult result) {
+        private void completePipelineLifecycle(
+                WorkbenchOverlayState.Confirm confirm,
+                WorkbenchActionGateway.PipelineLifecycleResult result) {
             switch (result) {
                 case WorkbenchActionGateway.PipelineLifecycleResult.Changed ignored -> {
                     runtime.updateState(WorkbenchState::closeOverlay);
                     refresh();
                 }
-                case WorkbenchActionGateway.PipelineLifecycleResult.Rejected rejected -> restoreActions(
-                        rejected.code() + ": " + rejected.message());
-                case WorkbenchActionGateway.PipelineLifecycleResult.Unreachable ignored -> restoreActions("Server could not be reached");
+                case WorkbenchActionGateway.PipelineLifecycleResult.Rejected rejected -> restorePipelineFailure(
+                        confirm, rejected.code() + ": " + rejected.message());
+                case WorkbenchActionGateway.PipelineLifecycleResult.Unreachable ignored ->
+                        restorePipelineFailure(confirm, "Server could not be reached");
                 case WorkbenchActionGateway.PipelineLifecycleResult.Unavailable ignored ->
-                        restoreActions("Pipeline lifecycle control is unavailable");
+                        restorePipelineFailure(confirm, "Pipeline lifecycle control is unavailable");
             }
+        }
+
+        private void restorePipelineFailure(WorkbenchOverlayState.Confirm confirm, String message) {
+            if (confirm.previous().filter(WorkbenchOverlayState.Actions.class::isInstance).isPresent()) {
+                restoreActions(message);
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    confirm.intent(), confirm.title(), message, false, confirm.previous())));
         }
 
         private void restoreActions(String message) {
