@@ -72,14 +72,20 @@ final class WorkbenchRenderer {
         Optional<WorkbenchOverlayState.SourceCreate> sourceCreate = state.overlay()
                 .filter(WorkbenchOverlayState.SourceCreate.class::isInstance)
                 .map(WorkbenchOverlayState.SourceCreate.class::cast);
+        Optional<WorkbenchOverlayState.SourceYamlEditor> sourceYamlEditor = state.overlay()
+                .filter(WorkbenchOverlayState.SourceYamlEditor.class::isInstance)
+                .map(WorkbenchOverlayState.SourceYamlEditor.class::cast);
         ContentLayout content = sourceCreate
                 .map(source -> renderSourceCreatePage(frame, contentArea, source, theme))
+                .or(() -> sourceYamlEditor.map(editor -> renderSourceYamlEditorPage(
+                        frame, contentArea, editor, theme)))
                 .orElseGet(() -> renderContent(frame, contentArea, state, wide, theme));
         FooterLayout footer = renderFooter
                 ? renderFooter(frame, area, footerY, state, theme)
                 : new FooterLayout(List.of());
         List<OverlayHit> overlayHits = state.overlay()
-                .filter(overlay -> !(overlay instanceof WorkbenchOverlayState.SourceCreate))
+                .filter(overlay -> !(overlay instanceof WorkbenchOverlayState.SourceCreate)
+                        && !(overlay instanceof WorkbenchOverlayState.SourceYamlEditor))
                 .map(overlay -> renderOverlay(frame,
                         overlay instanceof WorkbenchOverlayState.Actions ? contentArea : area, overlay, theme))
                 .orElseGet(List::of);
@@ -184,6 +190,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.ContextCreate ignored -> 8;
             case WorkbenchOverlayState.SourceCreate source -> source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
                     ? 12 : 9;
+            case WorkbenchOverlayState.SourceYamlEditor ignored -> 8;
             case WorkbenchOverlayState.Confirm ignored -> 4;
             case WorkbenchOverlayState.Login login -> transientLogin(login) ? 7 : 6;
             case WorkbenchOverlayState.Actions actions -> actions.actions().size() + 1;
@@ -213,6 +220,8 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.ContextCreate create ->
                     renderContextCreate(frame, area, box, create, theme);
             case WorkbenchOverlayState.SourceCreate source -> renderSourceCreate(frame, area, box, source, theme);
+            case WorkbenchOverlayState.SourceYamlEditor editor -> renderSourceYamlEditor(
+                    frame, area, box, editor, theme);
             case WorkbenchOverlayState.Confirm confirm -> renderConfirm(frame, area, box, confirm, theme);
             case WorkbenchOverlayState.Login login -> renderLogin(frame, area, box, login, theme);
             case WorkbenchOverlayState.Actions actions -> renderActions(frame, area, box, actions, theme);
@@ -226,6 +235,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.ContextPicker ignored -> "Choose Context";
             case WorkbenchOverlayState.ContextCreate ignored -> "New Context";
             case WorkbenchOverlayState.SourceCreate ignored -> "New Source";
+            case WorkbenchOverlayState.SourceYamlEditor ignored -> "Edit YAML";
             case WorkbenchOverlayState.Confirm confirm -> confirm.title();
             case WorkbenchOverlayState.Login login -> "Sign in to " + login.contextName();
             case WorkbenchOverlayState.Actions ignored -> "Actions";
@@ -369,6 +379,18 @@ final class WorkbenchRenderer {
         return List.of();
     }
 
+    private static List<OverlayHit> renderSourceYamlEditor(
+            Frame frame,
+            Rect area,
+            Rect box,
+            WorkbenchOverlayState.SourceYamlEditor editor,
+            WorkbenchTheme theme) {
+        renderDocument(frame, new Rect(box.x() + 2, box.y() + 1,
+                Math.max(1, box.width() - 4), Math.max(1, box.height() - 2)),
+                editor.document(), theme);
+        return List.of();
+    }
+
     private static ContentLayout renderSourceCreatePage(
             Frame frame,
             Rect area,
@@ -474,6 +496,24 @@ final class WorkbenchRenderer {
         source.message().ifPresent(message -> write(
                 frame, formArea.x(), formArea.bottom() - 1, message, theme.error(), formArea));
         return new ContentLayout(List.of(), Math.max(1, formArea.height()));
+    }
+
+    private static ContentLayout renderSourceYamlEditorPage(
+            Frame frame,
+            Rect area,
+            WorkbenchOverlayState.SourceYamlEditor editor,
+            WorkbenchTheme theme) {
+        String title = " ✎ Edit source/" + editor.source().id() + ".tap.yml"
+                + (editor.document().dirty() ? " *" : "") + " ";
+        Block block = Block.builder()
+                .borderType(BorderType.ROUNDED)
+                .borders(Borders.ALL)
+                .borderStyle(theme.accent())
+                .title(Title.from(Line.from(Span.styled(title, theme.title()))))
+                .build();
+        frame.renderWidget(block, area);
+        renderDocument(frame, block.inner(area), editor.document(), theme);
+        return new ContentLayout(List.of(), Math.max(1, block.inner(area).height()));
     }
 
     private static void renderSourcePageField(
@@ -605,7 +645,7 @@ final class WorkbenchRenderer {
             }
             inlineWidth += displayWidth(sourceConfigOptionText(field.options().get(index), value));
         }
-        if (inlineWidth <= width) {
+        if (inlineWidth + 4 <= width) {
             return List.of(field.options());
         }
         List<List<WorkbenchActionGateway.SourceConfigOption>> lines = new ArrayList<>();
@@ -1400,6 +1440,9 @@ final class WorkbenchRenderer {
                     source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW ? "preview" : "choose",
                     Optional.empty()));
         }
+        if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW) {
+            hints.add(new FooterHint("F4", "edit", Optional.of(FooterAction.EDIT)));
+        }
         hints.add(new FooterHint("Enter", source.pending() ? "wait"
                 : source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW ? "create" : "next",
                 Optional.empty()));
@@ -1424,6 +1467,10 @@ final class WorkbenchRenderer {
                     new FooterHint("Enter", create.pending() ? "wait" : "next", Optional.empty()),
                     new FooterHint("Esc", "cancel", Optional.empty()));
             case WorkbenchOverlayState.SourceCreate source -> sourceCreateFooter(source);
+            case WorkbenchOverlayState.SourceYamlEditor editor -> List.of(
+                    new FooterHint("↑↓←→", "navigate", Optional.empty()),
+                    new FooterHint("Esc", "cancel", Optional.empty()),
+                    new FooterHint("F5", "save & close", Optional.of(FooterAction.SAVE_AND_CLOSE)));
             case WorkbenchOverlayState.Confirm confirm -> confirm.pending()
                     ? List.of(new FooterHint("…", "working", Optional.empty()))
                     : List.of(

@@ -11,6 +11,7 @@ sealed interface WorkbenchOverlayState
                 WorkbenchOverlayState.ContextPicker,
                 WorkbenchOverlayState.ContextCreate,
                 WorkbenchOverlayState.SourceCreate,
+                WorkbenchOverlayState.SourceYamlEditor,
                 WorkbenchOverlayState.Confirm,
                 WorkbenchOverlayState.Login,
                 WorkbenchOverlayState.Actions,
@@ -161,6 +162,15 @@ sealed interface WorkbenchOverlayState
         }
     }
 
+    record SourceYamlEditor(
+            SourceCreate source,
+            WorkbenchWorkspaceState.Document document) implements WorkbenchOverlayState {
+        public SourceYamlEditor {
+            Objects.requireNonNull(source, "source");
+            Objects.requireNonNull(document, "document");
+        }
+    }
+
     record Confirm(
             Intent intent,
             String title,
@@ -178,7 +188,8 @@ sealed interface WorkbenchOverlayState
             return new Confirm(intent, title, message, true, previous);
         }
 
-        sealed interface Intent permits Intent.DeleteContext, Intent.CreateSource, Intent.DiscardChanges {
+        sealed interface Intent permits Intent.DeleteContext, Intent.CreateSource,
+                Intent.DiscardChanges, Intent.DiscardSourceYaml {
             record DeleteContext(String contextName) implements Intent {
                 public DeleteContext {
                     Objects.requireNonNull(contextName, "contextName");
@@ -193,6 +204,12 @@ sealed interface WorkbenchOverlayState
 
             enum DiscardChanges implements Intent {
                 INSTANCE
+            }
+
+            record DiscardSourceYaml(SourceYamlEditor editor) implements Intent {
+                public DiscardSourceYaml {
+                    Objects.requireNonNull(editor, "editor");
+                }
             }
         }
     }

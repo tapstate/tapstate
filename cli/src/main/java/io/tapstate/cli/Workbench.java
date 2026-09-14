@@ -383,14 +383,22 @@ final class Workbench {
                         : state.reduce(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ESCAPE), visibleRows()));
                 case SORT -> runtime.updateState(state -> state.reduce(KeyEvent.ofChar('s'), visibleRows()));
                 case OPEN -> openSelectedWorkspaceFile(false);
-                case EDIT -> runtime.state().workspaceView().focus() == WorkbenchWorkspaceState.Focus.VIEWER
-                        && runtime.state().workspaceView().document().isPresent()
-                        ? runtime.updateState(state -> state.withWorkspaceView(state.workspaceView().edit()))
-                        : openSelectedWorkspaceFile(true);
+                case EDIT -> {
+                    if (runtime.state().overlay().orElse(null) instanceof WorkbenchOverlayState.SourceCreate source
+                            && source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW) {
+                        yield openSourceYamlEditor(source);
+                    }
+                    yield runtime.state().workspaceView().focus() == WorkbenchWorkspaceState.Focus.VIEWER
+                            && runtime.state().workspaceView().document().isPresent()
+                            ? runtime.updateState(state -> state.withWorkspaceView(state.workspaceView().edit()))
+                            : openSelectedWorkspaceFile(true);
+                }
                 case TOGGLE_FOCUS -> runtime.updateState(state -> state.withWorkspaceView(
                         state.workspaceView().toggleFocus()));
                 case SAVE -> saveWorkspaceFile(false);
-                case SAVE_AND_CLOSE -> saveWorkspaceFile(true);
+                case SAVE_AND_CLOSE -> runtime.state().overlay().orElse(null)
+                        instanceof WorkbenchOverlayState.SourceYamlEditor editor
+                        ? acceptSourceYamlEditor(editor) : saveWorkspaceFile(true);
                 case CANCEL_EDIT -> requestWorkspaceEditCancel();
                 case DISCARD -> runtime.updateState(state -> state.withWorkspaceView(
                         state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER))));
@@ -501,6 +509,11 @@ final class Workbench {
                             yield updateSourceCreate(source, source.stage(), selected, source.connector(), source.mode(),
                                     source.tables(), source.id(), source.canonicalYaml(), false, source.message());
                         }
+                        case WorkbenchOverlayState.SourceYamlEditor editor -> runtime.updateState(state ->
+                                state.withOverlay(new WorkbenchOverlayState.SourceYamlEditor(
+                                        editor.source(), editor.document().edit(KeyEvent.ofKey(direction < 0
+                                                ? dev.tamboui.tui.event.KeyCode.UP
+                                                : dev.tamboui.tui.event.KeyCode.DOWN)))));
                         default -> true;
                     };
                 }
@@ -523,6 +536,7 @@ final class Workbench {
                             state.withOverlay(picker.select(index)));
                         case WorkbenchOverlayState.ContextCreate ignored -> true;
                         case WorkbenchOverlayState.SourceCreate ignored -> true;
+                        case WorkbenchOverlayState.SourceYamlEditor ignored -> true;
                         case WorkbenchOverlayState.Confirm ignored -> true;
                         case WorkbenchOverlayState.Login ignored -> true;
                         case WorkbenchOverlayState.Actions actions -> handleActionsKey(
@@ -534,6 +548,9 @@ final class Workbench {
                 return true;
             }
             if (key.isCancel()) {
+                if (overlay instanceof WorkbenchOverlayState.SourceYamlEditor editor) {
+                    return requestSourceYamlEditorCancel(editor);
+                }
                 return overlay instanceof WorkbenchOverlayState.Confirm confirm
                         ? cancelConfirm(confirm)
                         : closeOverlay(overlay);
@@ -543,6 +560,7 @@ final class Workbench {
                 case WorkbenchOverlayState.ContextPicker picker -> handleContextKey(picker, key);
                 case WorkbenchOverlayState.ContextCreate create -> handleContextCreateKey(create, key);
                 case WorkbenchOverlayState.SourceCreate source -> handleSourceCreateKey(source, key);
+                case WorkbenchOverlayState.SourceYamlEditor editor -> handleSourceYamlEditorKey(editor, key);
                 case WorkbenchOverlayState.Confirm confirm -> handleConfirmKey(confirm, key);
                 case WorkbenchOverlayState.Login login -> handleLoginKey(login, key);
                 case WorkbenchOverlayState.Actions actions -> handleActionsKey(actions, key);
@@ -664,6 +682,8 @@ final class Workbench {
                 }
                 case WorkbenchOverlayState.Confirm.Intent.DiscardChanges ignored -> runtime.updateState(state ->
                         state.withWorkspaceView(state.workspaceView().cancelEdit()).closeOverlay());
+                case WorkbenchOverlayState.Confirm.Intent.DiscardSourceYaml discard -> runtime.updateState(state ->
+                        state.withOverlay(discard.editor().source()));
             };
         }
 
@@ -710,6 +730,16 @@ final class Workbench {
                     "Unsaved changes will be lost.",
                     false,
                     Optional.empty());
+        }
+
+        private static WorkbenchOverlayState.Confirm discardSourceYamlConfirm(
+                WorkbenchOverlayState.SourceYamlEditor editor) {
+            return new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.DiscardSourceYaml(editor),
+                    "Discard Changes?",
+                    "Unsaved YAML changes will be lost.",
+                    false,
+                    Optional.of(editor));
         }
 
         private boolean handleContextCreateKey(
@@ -817,6 +847,10 @@ final class Workbench {
             if (source.pending()) {
                 return true;
             }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
+                    && key.isKey(dev.tamboui.tui.event.KeyCode.F4)) {
+                return openSourceYamlEditor(source);
+            }
             if (key.isCancel()) {
                 if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW) {
                     return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.ID, 0,
@@ -864,6 +898,53 @@ final class Workbench {
                 return appendSourceCreateText(source, key.string());
             }
             return true;
+        }
+
+        private boolean openSourceYamlEditor(WorkbenchOverlayState.SourceCreate source) {
+            String yaml = source.canonicalYaml().orElse("");
+            if (yaml.isBlank()) {
+                return true;
+            }
+            WorkbenchWorkspaceState.Document document = WorkbenchWorkspaceState.Document
+                    .open(java.nio.file.Path.of("source-draft.tap.yml"), yaml)
+                    .edit();
+            return runtime.updateState(state -> state.withOverlay(
+                    new WorkbenchOverlayState.SourceYamlEditor(source, document)));
+        }
+
+        private boolean handleSourceYamlEditorKey(
+                WorkbenchOverlayState.SourceYamlEditor editor, KeyEvent key) {
+            if (key.hasCtrl() && key.isCharIgnoreCase('s')) {
+                return acceptSourceYamlEditor(editor);
+            }
+            if (key.isKey(dev.tamboui.tui.event.KeyCode.F5)) {
+                return acceptSourceYamlEditor(editor);
+            }
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceYamlEditor(
+                    editor.source(), editor.document().edit(key))));
+        }
+
+        private boolean requestSourceYamlEditorCancel(
+                WorkbenchOverlayState.SourceYamlEditor editor) {
+            if (!editor.document().dirty()) {
+                return runtime.updateState(state -> state.withOverlay(editor.source()));
+            }
+            return runtime.updateState(state -> state.withOverlay(discardSourceYamlConfirm(editor)));
+        }
+
+        private boolean acceptSourceYamlEditor(
+                WorkbenchOverlayState.SourceYamlEditor editor) {
+            String yaml = editor.document().content();
+            if (yaml.isBlank()) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceYamlEditor(
+                        editor.source(), editor.document())));
+            }
+            WorkbenchOverlayState.SourceCreate source = editor.source();
+            WorkbenchOverlayState.SourceCreate accepted = new WorkbenchOverlayState.SourceCreate(
+                    source.catalog(), WorkbenchOverlayState.SourceCreate.Stage.PREVIEW, 0,
+                    source.filter(), source.connector(), source.mode(), source.tables(), source.id(),
+                    source.config(), Optional.of(yaml), false, Optional.empty());
+            return runtime.updateState(state -> state.withOverlay(accepted));
         }
 
         private boolean appendSourceCreateText(WorkbenchOverlayState.SourceCreate source, String text) {
@@ -1281,6 +1362,10 @@ final class Workbench {
             if (overlay instanceof WorkbenchOverlayState.SourceCreate source && !source.pending()) {
                 return appendSourceCreateText(source, text);
             }
+            if (overlay instanceof WorkbenchOverlayState.SourceYamlEditor editor) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceYamlEditor(
+                        editor.source(), editor.document().insert(text))));
+            }
             return true;
         }
 
@@ -1569,6 +1654,7 @@ final class Workbench {
                 case WorkbenchOverlayState.ContextPicker picker -> picker.previous();
                 case WorkbenchOverlayState.ContextCreate create -> create.previous();
                 case WorkbenchOverlayState.SourceCreate ignored -> Optional.empty();
+                case WorkbenchOverlayState.SourceYamlEditor ignored -> Optional.empty();
                 case WorkbenchOverlayState.Confirm confirm -> confirm.previous();
                 case WorkbenchOverlayState.Login login -> login.previous();
                 case WorkbenchOverlayState.Actions ignored -> Optional.empty();
