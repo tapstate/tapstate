@@ -1487,7 +1487,7 @@ final class WorkbenchRenderer {
                             new FooterHint("F6", "shell", Optional.of(FooterAction.SHELL)),
                             new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
                             new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
-            case SOURCES, PIPELINES -> hasSelectableRows
+            case SOURCES -> hasSelectableRows
                     ? List.of(
                             new FooterHint("↑↓", "navigate", Optional.empty()),
                             new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
@@ -1500,6 +1500,7 @@ final class WorkbenchRenderer {
                             new FooterHint("F6", "shell", Optional.of(FooterAction.SHELL)),
                             new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
                             new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
+            case PIPELINES -> pipelineFooter(state, hasSelectableRows);
             };
         }
         if (state.overlay().isEmpty()) {
@@ -1525,6 +1526,48 @@ final class WorkbenchRenderer {
             }
         }
         return new FooterLayout(hits);
+    }
+
+    private static List<FooterHint> pipelineFooter(WorkbenchState state, boolean hasSelectableRows) {
+        if (!hasSelectableRows) {
+            return List.of(new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
+                    new FooterHint("F6", "shell", Optional.of(FooterAction.SHELL)),
+                    new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
+                    new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
+        }
+        List<FooterHint> hints = new ArrayList<>(List.of(
+                new FooterHint("↑↓", "navigate", Optional.empty()),
+                new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
+                new FooterHint("s", "sort", Optional.of(FooterAction.SORT))));
+        selectedPipeline(state).ifPresent(row -> {
+            boolean remoteAvailable = state.snapshot().orElseThrow().pipelines().remoteState()
+                    instanceof WorkbenchRemoteState.Available;
+            if (row.local().size() == 1 && row.local().getFirst().valid() && remoteAvailable) {
+                hints.add(new FooterHint("F10", "apply", Optional.of(FooterAction.APPLY_PIPELINE)));
+            }
+            if (!row.remote().isEmpty() && remoteAvailable) {
+                hints.add(new FooterHint("F5", "start", Optional.of(FooterAction.START_PIPELINE)));
+                hints.add(new FooterHint("p", "pause", Optional.of(FooterAction.PAUSE_PIPELINE)));
+                hints.add(new FooterHint("u", "resume", Optional.of(FooterAction.RESUME_PIPELINE)));
+                hints.add(new FooterHint("x", "stop", Optional.of(FooterAction.STOP_PIPELINE)));
+            }
+        });
+        hints.addAll(List.of(new FooterHint("F6", "shell", Optional.of(FooterAction.SHELL)),
+                new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
+                new FooterHint("q", "quit", Optional.of(FooterAction.QUIT))));
+        return List.copyOf(hints);
+    }
+
+    private static Optional<WorkbenchArtifactRow> selectedPipeline(WorkbenchState state) {
+        if (state.snapshot().isEmpty()) {
+            return Optional.empty();
+        }
+        List<WorkbenchArtifactRow> rows = sorted(state.snapshot().orElseThrow().pipelines().rows(), state.pipelinesTable());
+        if (rows.isEmpty()) {
+            return Optional.empty();
+        }
+        WorkbenchArtifactRow row = rows.get(Math.clamp(state.pipelinesTable().selectedIndex(), 0, rows.size() - 1));
+        return "pipeline".equals(row.key().kind()) ? Optional.of(row) : Optional.empty();
     }
 
     private static List<FooterHint> workspaceFooter(WorkbenchState state) {
@@ -1558,10 +1601,30 @@ final class WorkbenchRenderer {
                 new FooterHint("Enter", "open", Optional.of(FooterAction.OPEN)),
                 new FooterHint("F4", "edit", Optional.of(FooterAction.EDIT)),
                 new FooterHint("F6", "shell", Optional.of(FooterAction.SHELL))));
+        selectedWorkspaceArtifact(state).ifPresent(row -> {
+            boolean remoteAvailable = state.snapshot().orElseThrow().workspace().remoteState()
+                    instanceof WorkbenchRemoteState.Available;
+            boolean applicable = ("source".equals(row.key().kind()) || "pipeline".equals(row.key().kind()))
+                    && row.local().size() == 1 && row.local().getFirst().valid();
+            if (remoteAvailable && applicable) {
+                hints.add(4, new FooterHint("F10", "apply", Optional.of(FooterAction.APPLY_SELECTED_ARTIFACT)));
+            }
+        });
         if (state.workspaceView().document().isPresent()) {
             hints.add(new FooterHint("Tab", "viewer", Optional.of(FooterAction.TOGGLE_FOCUS)));
         }
         return List.copyOf(hints);
+    }
+
+    private static Optional<WorkbenchArtifactRow> selectedWorkspaceArtifact(WorkbenchState state) {
+        if (state.snapshot().isEmpty()) {
+            return Optional.empty();
+        }
+        List<WorkbenchArtifactRow> rows = sorted(state.snapshot().orElseThrow().workspace().rows(), state.workspaceTable());
+        if (rows.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(rows.get(Math.clamp(state.workspaceTable().selectedIndex(), 0, rows.size() - 1)));
     }
 
     private static List<FooterHint> sourceCreateFooter(WorkbenchOverlayState.SourceCreate source) {
@@ -1964,6 +2027,12 @@ final class WorkbenchRenderer {
         CANCEL_EDIT,
         DISCARD,
         CANCEL_DISCARD,
+        APPLY_PIPELINE,
+        START_PIPELINE,
+        PAUSE_PIPELINE,
+        RESUME_PIPELINE,
+        STOP_PIPELINE,
+        APPLY_SELECTED_ARTIFACT,
         CONFIRM,
         CANCEL_CONFIRM
     }

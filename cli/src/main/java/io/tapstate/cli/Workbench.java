@@ -261,6 +261,32 @@ final class Workbench {
                     refresh();
                     return true;
                 }
+                if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.PIPELINES) {
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.F10) && selectedPipelineApplyRequest().isPresent()) {
+                        return confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                    }
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.F5) && selectedPipelineId().isPresent()) {
+                        return confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "start");
+                    }
+                    if (key.isChar('p') && selectedPipelineId().isPresent()) {
+                        return confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "pause");
+                    }
+                    if (key.isChar('u') && selectedPipelineId().isPresent()) {
+                        return confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "resume");
+                    }
+                    if (key.isChar('x') && selectedPipelineId().isPresent()) {
+                        return confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "stop");
+                    }
+                }
+                if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                        && key.isKey(dev.tamboui.tui.event.KeyCode.F10)) {
+                    if (selectedSourceRequest().isPresent()) {
+                        return confirmSourceApply(selectedSourceRequest().orElseThrow());
+                    }
+                    if (selectedPipelineApplyRequest().isPresent()) {
+                        return confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                    }
+                }
                 if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE) {
                     if (runtime.state().workspaceView().focus()
                             == WorkbenchWorkspaceState.Focus.VIEWER
@@ -409,6 +435,17 @@ final class Workbench {
                         state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER))));
                 case CANCEL_DISCARD -> runtime.updateState(state -> state.withWorkspaceView(
                         state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ESCAPE))));
+                case APPLY_PIPELINE -> confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                case START_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "start");
+                case PAUSE_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "pause");
+                case RESUME_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "resume");
+                case STOP_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "stop");
+                case APPLY_SELECTED_ARTIFACT -> {
+                    if (selectedSourceRequest().isPresent()) {
+                        yield confirmSourceApply(selectedSourceRequest().orElseThrow());
+                    }
+                    yield confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                }
                 case CONFIRM -> confirmOverlay();
                 case CANCEL_CONFIRM -> cancelConfirmOverlay();
             };
