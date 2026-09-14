@@ -1007,6 +1007,18 @@ final class Workbench {
                         Optional.empty(), Optional.empty());
             }
             if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) {
+                List<WorkbenchActionGateway.SourceConfigField> fields = sourceConfigFields(source);
+                if (fields.isEmpty()) {
+                    return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.ID, 0,
+                            source.connector(), source.mode(), source.tables(), source.id(), Optional.empty(),
+                            false, Optional.empty());
+                }
+                int selected = Math.clamp(source.selectedIndex(), 0, fields.size() - 1);
+                if (selected < fields.size() - 1) {
+                    return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.CONFIG, selected + 1,
+                            source.connector(), source.mode(), source.tables(), source.id(), Optional.empty(),
+                            false, Optional.empty());
+                }
                 return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.ID, 0, source.connector(),
                         source.mode(), source.tables(), source.id(), Optional.empty(), false, Optional.empty());
             }
