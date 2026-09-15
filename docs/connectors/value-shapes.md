@@ -29,7 +29,7 @@ For MongoDB, the seven types its connector declares a conversion for:
 | `Binary` | base64 - `SGVsbG8gVGFwc3RhdGU=`, the same text `mongosh` prints |
 | `Code`, `Symbol` | the text it holds |
 | regular expression | `/pattern/flags` |
-| `Decimal128` | the exact decimal value, with all significant digits |
+| `Decimal128` | the exact decimal value, with all significant digits - **see the special-value limit below** |
 | BSON timestamp | its seconds-based instant - **see the counter limit below** |
 
 Everything else - integers, floating point numbers, exact decimals, text, booleans, dates - is
@@ -53,11 +53,15 @@ connector rebuilds from that. Two consequences follow, and both are visible rath
 
 ## Limits worth knowing before you rely on this
 
-The remaining limit comes from the portable value the connector returns:
+The limits that remain come from the portable value the connector returns:
 
+- **A `Decimal128` special value is not an exact decimal.** `NaN`, `Infinity`, `-Infinity` and
+  negative zero have no exact decimal form at all, so the exactness above does not reach them: each
+  keeps the double the connector's own conversion produced. Ordinary finite values - every value a
+  column of money or quantity holds - are unaffected.
 - **A BSON timestamp's counter is not represented.** Its seconds field reads as the corresponding
   instant, but the per-second ordering counter has no counterpart in the portable date-time value and
   is not carried. A BSON timestamp is an internal replication type and is rare in application data;
   an ordinary date column is a different type and is not affected.
 
-This remaining limit is tracked separately.
+Each is tracked separately.
