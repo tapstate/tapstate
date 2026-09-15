@@ -1206,7 +1206,7 @@ final class ControlPlane {
             throw new AssertionError("metrics answer did not parse: " + body);
         }
         // Absent until a position is acked, and absent is a real reading here rather than a broken face.
-        if (!(map.get("perTableOffset") instanceof Map<?, ?> offsets)) {
+        if (!(map.get("targetAckedPosition") instanceof Map<?, ?> offsets)) {
             return Optional.empty();
         }
         return offsets.get(table) instanceof String position ? Optional.of(position) : Optional.empty();

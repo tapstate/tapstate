@@ -1727,16 +1727,51 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
-    void metricsCapturesPerTableOffsetFromTheOpenMap() throws Exception {
-        // perTableOffset is a sibling of the metrics map, not a cell inside it: a source position is a
+    void metricsCapturesTheTargetAckedPositionFromTheOpenMap() throws Exception {
+        // The position is a sibling of the metrics map, not a cell inside it: a source position is a
         // string and every metrics cell is a number, so the two never share a container.
         HttpServer server = apiServer("/api/pipelines/pl1/metrics", 200,
-                "{\"pipelineId\":\"pl1\",\"metrics\":{\"recordCount\":6},\"perTableOffset\":{\"orders\":\"w7\"}}",
+                "{\"pipelineId\":\"pl1\",\"metrics\":{\"recordCount\":6},"
+                        + "\"targetAckedPosition\":{\"orders\":\"w7\"}}",
                 new AtomicReference<>());
         try {
             MetricsOutcome outcome = new HttpControlPlaneClient().metrics(baseOf(server), "tok", "pl1");
             assertThat(outcome).isEqualTo(new MetricsOutcome.Found(
                     "pl1", Map.of("recordCount", 6L), Map.of("orders", "w7")));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void metricsCarriesTheNamesOfThePositionsTheServerDoesNotCollect() throws Exception {
+        // Which positions exist but are not recorded is the server's fact, so it travels on the wire. A
+        // CLI holding its own copy would keep printing "not collected" over a server that had started
+        // collecting one, and would be wrong for exactly as long as it took to ship a CLI release.
+        HttpServer server = apiServer("/api/pipelines/pl1/metrics", 200,
+                "{\"pipelineId\":\"pl1\",\"metrics\":{\"recordCount\":6},"
+                        + "\"targetAckedPosition\":{\"orders\":\"w7\"},"
+                        + "\"positionsNotCollected\":[\"sourceHeadPosition\",\"processedPosition\"]}",
+                new AtomicReference<>());
+        try {
+            MetricsOutcome outcome = new HttpControlPlaneClient().metrics(baseOf(server), "tok", "pl1");
+            assertThat(outcome).isEqualTo(new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
+                    Map.of("orders", "w7"), List.of("sourceHeadPosition", "processedPosition")));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void metricsFromAServerThatNamesNoUncollectedPositionsReadsBackAnEmptyList() throws Exception {
+        // An older server sends no such list. Reading it back as empty is what keeps this CLI usable
+        // against one: the alternative is inventing names it never sent and printing them as its answer.
+        HttpServer server = apiServer("/api/pipelines/pl1/metrics", 200,
+                "{\"pipelineId\":\"pl1\",\"metrics\":{\"recordCount\":6}}", new AtomicReference<>());
+        try {
+            MetricsOutcome outcome = new HttpControlPlaneClient().metrics(baseOf(server), "tok", "pl1");
+            assertThat(outcome).isInstanceOf(MetricsOutcome.Found.class);
+            assertThat(((MetricsOutcome.Found) outcome).positionsNotCollected()).isEmpty();
         } finally {
             server.stop(0);
         }

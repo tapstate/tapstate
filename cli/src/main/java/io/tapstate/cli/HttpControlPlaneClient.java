@@ -1110,10 +1110,15 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     /**
      * The metrics decoded from a 200 body's {@code metrics} object, or {@code null} unless the body carries a
-     * string id and a metrics object. Each numeric cell is read as a long; the sibling {@code perTableOffset}
-     * object carries the per-table positions ({@code table -> srcpos}) and is absent until one is acked. Any
-     * non-numeric metrics cell is dropped, so a malformed entry never crashes the read. An empty object is a
-     * legitimate empty (no source wired yet).
+     * string id and a metrics object. Each numeric cell is read as a long; the sibling
+     * {@code targetAckedPosition} object carries how far the target has confirmed writes, per table, and is
+     * absent until one is acked. Any non-numeric metrics cell is dropped, so a malformed entry never crashes
+     * the read. An empty object is a legitimate empty (no source wired yet).
+     *
+     * <p>{@code positionsNotCollected} is read from the body rather than known here. Which positions this
+     * product records is the server's fact, and a CLI that carried its own copy would keep saying a position
+     * is not collected for as long as it took to ship a CLI release after the server began collecting it.
+     * An older server sends no such list and reads back as an empty one, which prints nothing extra.
      */
     private static MetricsOutcome.Found metricsFound(String body) {
         if (JsonReader.parse(body) instanceof Map<?, ?> m
@@ -1125,15 +1130,23 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     stats.put(name, value.longValue());
                 }
             }
-            Map<String, String> perTableOffset = new LinkedHashMap<>();
-            if (m.get("perTableOffset") instanceof Map<?, ?> offsets) {
-                for (Map.Entry<?, ?> e : offsets.entrySet()) {
+            Map<String, String> targetAckedPosition = new LinkedHashMap<>();
+            if (m.get("targetAckedPosition") instanceof Map<?, ?> positions) {
+                for (Map.Entry<?, ?> e : positions.entrySet()) {
                     if (e.getKey() instanceof String table && e.getValue() instanceof String position) {
-                        perTableOffset.put(table, position);
+                        targetAckedPosition.put(table, position);
                     }
                 }
             }
-            return new MetricsOutcome.Found(id, stats, perTableOffset);
+            List<String> notCollected = new ArrayList<>();
+            if (m.get("positionsNotCollected") instanceof List<?> names) {
+                for (Object name : names) {
+                    if (name instanceof String named) {
+                        notCollected.add(named);
+                    }
+                }
+            }
+            return new MetricsOutcome.Found(id, stats, targetAckedPosition, notCollected);
         }
         return null;
     }

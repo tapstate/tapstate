@@ -66,8 +66,22 @@ final class Repl {
      * preview: they may be renamed as the metric model settles, and the read face is where a user decides
      * whether to build on them, so the disclaimer belongs there rather than only in the documentation.
      */
+    /**
+     * What the names on this face promise, which is nothing yet. Written as "the names above" rather than
+     * "metric names": a position is not a metric, and the narrower wording left the one field on this face
+     * that is not a number outside a disclaimer printed directly underneath it.
+     */
     private static final String METRIC_NAMES_UNSTABLE =
-            "(metric names are unstable in this preview and may change)";
+            "(the names above are unstable in this preview and may change)";
+
+    /** The one position this product records, named on every face so no reader has to guess which it is. */
+    private static final String TARGET_ACKED_POSITION = "targetAckedPosition";
+
+    /** What a position that is recorded but has no value yet reads as, as against one nobody records. */
+    private static final String NOTHING_ACKED_YET = "nothing acked yet";
+
+    /** What a position nobody records reads as, printed beside its name rather than left out entirely. */
+    private static final String NOT_COLLECTED = "not collected";
 
     /** REPL-only words handled here rather than by the command table; completed alongside the verbs. */
     static final List<String> BUILTINS =
@@ -3226,10 +3240,17 @@ final class Repl {
     }
 
     /**
-     * {@code metrics <pipeline-id>} — reads the pipeline's open map of run statistics and its per-table source
-     * positions and prints one {@code <name>  <value>} line each in name order (a per-table position under a
-     * {@code perTableOffset.<table>} key), or a benign {@code no metrics} line when none are wired yet
-     * (unavailable, never faked). A coded refusal renders its code and message.
+     * {@code metrics <pipeline-id>} — reads the pipeline's open map of run statistics and the one source
+     * position it records, and prints one {@code <name>  <value>} line each in name order (a per-table
+     * position under a {@code targetAckedPosition.<table>} key), or a benign {@code no metrics} line when
+     * nothing is wired yet (unavailable, never faked). A coded refusal renders its code and message.
+     *
+     * <p>Once there is anything to print, the positions the server says it does not record are printed too,
+     * by name, reading {@code not collected}. Leaving them out is what makes a stalled run unreadable: with
+     * one unnamed position on screen a reader supplies the missing ones from expectation and concludes the
+     * source is idle, when what the line actually says is only how far the target has confirmed writes. A
+     * recorded position with nothing in it yet is distinguished from an unrecorded one for the same reason
+     * — the two are one blank line apart on screen and a different problem apart in the world.
      */
     private int metricsOnline(List<String> words) {
         String id = readTargetId(words);
@@ -3244,10 +3265,17 @@ final class Repl {
             case MetricsOutcome.Found found -> {
                 Map<String, String> lines = new TreeMap<>();
                 found.metrics().forEach((name, value) -> lines.put(name, String.valueOf(value)));
-                found.perTableOffset().forEach((table, position) -> lines.put("perTableOffset." + table, position));
+                found.targetAckedPosition().forEach(
+                        (table, position) -> lines.put(TARGET_ACKED_POSITION + "." + table, position));
                 if (lines.isEmpty()) {
                     out.println("no metrics");
                 } else {
+                    // Nothing is wired at all in the branch above, so no position is on screen to be read as
+                    // the wrong one; here one is, and that is where naming the rest starts earning its line.
+                    if (found.targetAckedPosition().isEmpty()) {
+                        lines.put(TARGET_ACKED_POSITION, NOTHING_ACKED_YET);
+                    }
+                    found.positionsNotCollected().forEach(name -> lines.put(name, NOT_COLLECTED));
                     lines.forEach((name, value) -> out.println(name + "  " + value));
                     // The names above are not a compatibility promise yet. Saying so here, next to them, is
                     // the difference between a user who knowingly accepts the churn and one who wires a

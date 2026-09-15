@@ -59,9 +59,10 @@ class ObservationTest {
     }
 
     @Test
-    void carriesPerTableOffsetPositionsAsOpaqueStrings() {
-        // perTableOffset (=sink_acked_srcpos) is an opaque source position (binlog/GTID/LSN), a String,
-        // not a numeric metric — so it rides a separate positions projection, not the Long metrics map.
+    void carriesTargetAckedPositionsAsOpaqueStrings() {
+        // The stored position is how far the target confirmed writes: an opaque source position
+        // (binlog/GTID/LSN), a String, not a numeric metric — so it rides a separate positions projection,
+        // not the Long metrics map. Which of the four positions it is is the read face's word to say.
         Observation obs = new Observation(
                 "orders_sync",
                 PipelineState.RUNNING,

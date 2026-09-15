@@ -606,7 +606,7 @@ tool for stopping its own process.
 
 ```console
 tapstate(admin@127.0.0.1:8080)> status order_pipeline --watch    # live state; Ctrl-C to stop
-tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # recordCount / errorCount / per-table offset
+tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # recordCount / errorCount / positions
 tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local operational log tail
 ```
 
@@ -615,9 +615,16 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   the first `status`/`metrics` may report no observation yet, and a `status` right
   after `stop` can still say `running`. Use `--watch`, or retry after a second.
 - `metrics` is the signal for progress: `recordCount` climbing, `errorCount` at 0.
-- **Metric names are unstable in this preview.** They may be renamed as the metric model
-  settles, so treat them as something to read, not something to build on: a dashboard or
-  an alert wired to these names will need revisiting. The `metrics` output says so too.
+- **The position it prints is `targetAckedPosition`: how far the target has confirmed writes.**
+  It is not how far the source could be read to and not how far the pipeline has processed. Those
+  two are printed by name as `not collected`, because a position that is simply missing reads the
+  same as one this product has no concept of — and only one of those is an answer. A target that
+  has stopped accepting writes freezes this position while the other two would still be moving, so
+  reading it as either of them turns a stalled target into a quiet source.
+- **The names this face prints are unstable in this preview** — the position's included, not
+  only the metrics'. They may be renamed as the model settles, so treat them as something to
+  read, not something to build on: a dashboard or an alert wired to these names will need
+  revisiting. The `metrics` output says so too.
   The lifecycle state in `status` is not affected — that one is a stable contract.
 
 Verify the objects landed, straight from the store — `mongosh` runs inside the Mongo

@@ -52,7 +52,12 @@ public final class PipelineObservationQueryService {
                         observation.failure(), observation.observedAt()));
     }
 
-    /** The pipeline's open map of run statistics plus its per-table source positions. */
+    /**
+     * The pipeline's open map of run statistics plus, per table, the one source position it records: how
+     * far the target has confirmed writes. The stored projection carries that position under a name that
+     * does not say which of the four positions it is; this face gives it back its name, because the face
+     * is where somebody decides whether a run is stuck.
+     */
     public PipelineMetrics metrics(String pipelineId) {
         Observation observation = require(pipelineId);
         return new PipelineMetrics(observation.pipelineId(), observation.metrics(), observation.positions());

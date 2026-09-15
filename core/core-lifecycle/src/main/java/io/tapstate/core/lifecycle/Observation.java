@@ -19,9 +19,14 @@ import java.util.Objects;
  *       are wired yet (unavailable), never faked.</li>
  *   <li>{@code snapshot} — per-table initial-load progress; empty outside a snapshot phase or when
  *       unavailable.</li>
- *   <li>{@code positions} — per-table source positions ({@code table -> opaque srcpos}), the durable
- *       sink-acked position (binlog/GTID/LSN). A String, not a count, so it rides here rather than the
- *       numeric metrics map; a read face presents it alongside metrics. Empty when unwired.</li>
+ *   <li>{@code positions} — per-table source positions ({@code table -> opaque srcpos}), and exactly one
+ *       kind of position: how far the target has confirmed writes (binlog/GTID/LSN). It is not how far the
+ *       source could be read to and not how far the pipeline has processed — neither of those is recorded
+ *       anywhere, and a reader who takes this for one of them reads a stalled target as an idle source. A
+ *       String, not a count, so it rides here rather than the numeric metrics map; a read face presents it
+ *       alongside metrics, under a name that says which position it is. The plain name here is the stored
+ *       field's own: renaming it would rename a key in every document already written, for a reader who is
+ *       a read face rather than a person. Empty when unwired.</li>
  *   <li>{@code failure} — why the run died, coded, or {@code null} while the pipeline is healthy. The
  *       state says a job died and the error count says it was counted; this says what killed it, so the
  *       reason is readable as data rather than only as a log line.</li>

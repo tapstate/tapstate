@@ -103,7 +103,7 @@ class PipelineObservationApiTest {
             Map.of("recordCount", 42L, "errorCount", 0L),
             Map.of("orders", new TableSnapshot(10, 100L, 10)));
 
-    /** One running pipeline whose sink-acked source positions have advanced, to exercise perTableOffset. */
+    /** One running pipeline whose target-acked source positions have advanced, to exercise that field. */
     private static final Observation PL_POS = new Observation("pl2", PipelineState.RUNNING,
             Map.of("recordCount", 6L, "errorCount", 0L),
             Map.of(),
@@ -200,30 +200,60 @@ class PipelineObservationApiTest {
     }
 
     @Test
-    void metricsExposesPerTableOffsetWhenPositionsArePublished() {
+    void metricsExposesTheTargetAckedPositionWhenPositionsArePublished() {
         Map<String, Object> body = client().get().uri("/api/pipelines/pl2/metrics")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
 
         assertThat(body.get("pipelineId")).isEqualTo("pl2");
         // A source position is a string, and the metrics map is numeric run statistics. Carrying the
-        // positions as a sibling rather than nested inside that map keeps every metrics cell a number,
+        // position as a sibling rather than nested inside that map keeps every metrics cell a number,
         // so a reader never has to type-test a cell before using it.
-        assertThat(body.get("perTableOffset")).isEqualTo(Map.of("orders", "w7"));
+        assertThat(body.get("targetAckedPosition")).isEqualTo(Map.of("orders", "w7"));
         Map<String, Object> metrics = (Map<String, Object>) body.get("metrics");
-        assertThat(metrics).doesNotContainKey("perTableOffset");
+        assertThat(metrics).doesNotContainKey("targetAckedPosition");
         assertThat(metrics.get("recordCount")).isNotNull();
     }
 
     @Test
-    void metricsOmitsPerTableOffsetWhenNoPositionsArePublished() {
+    void metricsNamesThePositionItCarriesRatherThanCallingItAnOffset() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl2/metrics")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        // The old name said where, not which. Three different positions could have sat under it, they move
+        // at three different times, and a caller that guessed wrong read a stalled target as an idle source
+        // — so the field says which one it is and the ambiguous name is gone rather than kept beside it.
+        assertThat(body).containsKey("targetAckedPosition");
+        assertThat(body).doesNotContainKey("perTableOffset");
+    }
+
+    @Test
+    void metricsNamesThePositionsThisProductDoesNotCollect() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl2/metrics")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        // A position that is simply missing from the document reads exactly like one the product has no
+        // concept of, and a caller cannot act on a difference it cannot see. Naming them makes "not
+        // measured" a reading, and makes a later wiring of one an absence from this list rather than a
+        // field that quietly begins appearing.
+        assertThat(body.get("positionsNotCollected"))
+                .isEqualTo(List.of("sourceHeadPosition", "processedPosition"));
+    }
+
+    @Test
+    void metricsOmitsTheTargetAckedPositionWhenNoPositionsArePublished() {
         Map<String, Object> body = client().get().uri("/api/pipelines/pl1/metrics")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
 
         // Absent, not an empty object: no position has been acked, which is the same never-faked rule the
-        // numeric metrics follow.
-        assertThat(body).doesNotContainKey("perTableOffset");
+        // numeric metrics follow. The names of what is not collected still travel — this pipeline's target
+        // position is recorded and empty, which is not what those two are.
+        assertThat(body).doesNotContainKey("targetAckedPosition");
+        assertThat(body.get("positionsNotCollected"))
+                .isEqualTo(List.of("sourceHeadPosition", "processedPosition"));
     }
 
     @Test

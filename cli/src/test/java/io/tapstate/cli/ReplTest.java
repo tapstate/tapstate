@@ -4539,7 +4539,7 @@ class ReplTest {
     }
 
     @Test
-    void metricsPrintsPerTableOffsetLinesAlongsideTheStats() {
+    void metricsPrintsTheTargetAckedPositionAlongsideTheStats() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found(
                 "pl1", Map.of("recordCount", 6L), Map.of("orders", "w7"));
@@ -4547,12 +4547,12 @@ class ReplTest {
         int mark = h.sink().toString().length();
         h.repl().dispatch("metrics pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("recordCount").contains("perTableOffset.orders").contains("w7");
+        assertThat(out).contains("recordCount").contains("targetAckedPosition.orders").contains("w7");
     }
 
     @Test
-    void metricsWithOnlyPerTableOffsetPrintsItRatherThanNoMetrics() {
-        // Positions-only: numeric stats empty but a per-table position is wired, so the offset prints and
+    void metricsWithOnlyAPositionPrintsItRatherThanNoMetrics() {
+        // Positions-only: numeric stats empty but a per-table position is wired, so the position prints and
         // "no metrics" must not — it fires only when both sources are empty.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", "w7"));
@@ -4560,7 +4560,61 @@ class ReplTest {
         int mark = h.sink().toString().length();
         h.repl().dispatch("metrics pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("perTableOffset.orders").contains("w7").doesNotContain("no metrics");
+        assertThat(out).contains("targetAckedPosition.orders").contains("w7").doesNotContain("no metrics");
+        // And the disclaimer covers it. A position is not a metric, so a note about metric names printed
+        // under a face whose only name is a position would be a promise nobody made about the one line
+        // on screen.
+        assertThat(out)
+                .as("the only name printed here is the position's, and it is the one the note is about")
+                .contains("unstable");
+    }
+
+    @Test
+    void metricsNamesThePositionsNobodyRecordsInsteadOfLeavingThemOut() {
+        // The line that is printed says how far the target has confirmed writes. A reader who wanted to
+        // know whether the source had gone quiet supplies the other two from expectation unless the output
+        // says they are not measured — and then reads a stalled target as an idle source.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
+                Map.of("orders", "w7"), List.of("sourceHeadPosition", "processedPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("metrics pl1");
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("sourceHeadPosition  not collected");
+        assertThat(out).contains("processedPosition  not collected");
+        assertThat(out).contains("targetAckedPosition.orders  w7");
+    }
+
+    @Test
+    void metricsSaysARecordedPositionHasNothingYetRatherThanLeavingItOut() {
+        // "Recorded and still empty" and "not recorded at all" are one blank line apart on screen and a
+        // different problem apart in the world: the first is a run that has not landed anything yet, the
+        // second is a measurement this product does not take. Printing neither makes them the same answer.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
+                Map.of(), List.of("sourceHeadPosition", "processedPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("metrics pl1");
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("targetAckedPosition  nothing acked yet");
+        assertThat(out).contains("sourceHeadPosition  not collected");
+    }
+
+    @Test
+    void metricsWithNothingWiredAtAllNamesNoPositionAtAll() {
+        // Nothing is on screen for a name to be read as, so naming the absent positions here would be an
+        // answer about positions given to somebody the face just told it knows nothing about.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of(),
+                List.of("sourceHeadPosition", "processedPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("metrics pl1");
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("no metrics");
+        assertThat(out).doesNotContain("not collected").doesNotContain("targetAckedPosition");
     }
 
     @Test
