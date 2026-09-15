@@ -165,6 +165,7 @@ final class Workbench {
         private final RefreshCoordinator refreshCoordinator;
         private final WorkbenchActionCoordinator actionCoordinator;
         private final SelectedPipelineStatusCoordinator pipelineStatusCoordinator;
+        private final WorkbenchLogCoordinator logCoordinator;
         private final WorkbenchShellPanel shellPanel;
         private volatile WorkbenchSnapshot lastSuccessfulSnapshot;
         private WorkbenchRenderer.RenderLayout layout = WorkbenchRenderer.RenderLayout.forTooSmallFrame();
@@ -193,6 +194,7 @@ final class Workbench {
             this.refreshCoordinator = null;
             this.actionCoordinator = null;
             this.pipelineStatusCoordinator = null;
+            this.logCoordinator = null;
             this.shellPanel = null;
         }
 
@@ -228,6 +230,7 @@ final class Workbench {
             this.refreshCoordinator = new RefreshCoordinator(this::publishRefreshResult);
             this.actionCoordinator = actionGateway == null ? null : new WorkbenchActionCoordinator(runtime);
             this.pipelineStatusCoordinator = actionGateway == null ? null : new SelectedPipelineStatusCoordinator(runtime);
+            this.logCoordinator = actionGateway == null ? null : new WorkbenchLogCoordinator();
             this.shellPanel = repl == null ? null : new WorkbenchShellPanel(
                     repl, runtime::requestRender, runtime::runLater);
         }
@@ -285,6 +288,26 @@ final class Workbench {
                 if (key.isCharIgnoreCase('r') && refreshCoordinator != null) {
                     refresh();
                     return true;
+                }
+                if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.LOGS) {
+                    if (key.isCharIgnoreCase('l')) {
+                        return runtime.state().logs().map(WorkbenchLogsState::pipelineId)
+                                .map(this::openLogLevel).orElse(true);
+                    }
+                    if (key.isCharIgnoreCase('f')) {
+                        if (runtime.state().logs().map(WorkbenchLogsState::following).orElse(false)) {
+                            logCoordinator.cancel();
+                            return runtime.updateState(state -> state.withLogs(state.logs().map(WorkbenchLogsState::toggleFollow)));
+                        }
+                        return runtime.updateState(state -> state.withLogs(Optional.empty()));
+                    }
+                    if (key.isCharIgnoreCase('w')) return runtime.updateState(state -> state.withLogs(state.logs().map(WorkbenchLogsState::toggleWrap)));
+                    if (key.isUp() || key.isCharIgnoreCase('k')) return runtime.updateState(state -> state.withLogs(state.logs().map(value -> value.scroll(1))));
+                    if (key.isDown() || key.isCharIgnoreCase('j')) return runtime.updateState(state -> state.withLogs(state.logs().map(value -> value.scroll(-1))));
+                    if (key.isPageUp()) return runtime.updateState(state -> state.withLogs(state.logs().map(value -> value.scroll(10))));
+                    if (key.isPageDown()) return runtime.updateState(state -> state.withLogs(state.logs().map(value -> value.scroll(-10))));
+                    if (key.isHome()) return runtime.updateState(state -> state.withLogs(state.logs().map(WorkbenchLogsState::toOldest)));
+                    if (key.isEnd()) return runtime.updateState(state -> state.withLogs(state.logs().map(WorkbenchLogsState::toNewest)));
                 }
                 if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.PIPELINES) {
                     if (key.isKey(dev.tamboui.tui.event.KeyCode.F10) && selectedPipelineApplyRequest().isPresent()) {
@@ -358,6 +381,10 @@ final class Workbench {
             if (event instanceof MouseEvent mouse) {
                 if (mouse.kind() == MouseEventKind.SCROLL_UP || mouse.kind() == MouseEventKind.SCROLL_DOWN) {
                     int direction = mouse.kind() == MouseEventKind.SCROLL_UP ? -1 : 1;
+                    if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.LOGS) {
+                        return runtime.updateState(state -> state.withLogs(state.logs()
+                                .map(value -> value.scroll(direction < 0 ? 3 : -3))));
+                    }
                     return runtime.updateState(state -> state.reduce(
                             KeyEvent.ofKey(direction < 0
                                     ? dev.tamboui.tui.event.KeyCode.UP : dev.tamboui.tui.event.KeyCode.DOWN),
@@ -457,6 +484,7 @@ final class Workbench {
                 case CANCEL_DISCARD -> runtime.updateState(state -> state.withWorkspaceView(
                         state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ESCAPE))));
                 case APPLY_PIPELINE -> confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                case LOGS -> runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.LOGS));
                 case START_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "start");
                 case PAUSE_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "pause");
                 case RESUME_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "resume");
@@ -606,6 +634,8 @@ final class Workbench {
                         case WorkbenchOverlayState.Login ignored -> true;
                         case WorkbenchOverlayState.Actions actions -> handleActionsKey(
                                 actions.select(index), KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER));
+                    case WorkbenchOverlayState.LogLevel level -> handleLogLevelKey(
+                            level.select(index), KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER));
                     case WorkbenchOverlayState.Help ignored -> true;
                 };
             }
@@ -634,7 +664,30 @@ final class Workbench {
                 case WorkbenchOverlayState.Confirm confirm -> handleConfirmKey(confirm, key);
                 case WorkbenchOverlayState.Login login -> handleLoginKey(login, key);
                 case WorkbenchOverlayState.Actions actions -> handleActionsKey(actions, key);
+                case WorkbenchOverlayState.LogLevel level -> handleLogLevelKey(level, key);
                 case WorkbenchOverlayState.Help ignored -> true;
+            };
+        }
+
+        private boolean openLogLevel(String pipelineId) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.LogLevel(pipelineId, 2)));
+        }
+
+        private boolean handleLogLevelKey(WorkbenchOverlayState.LogLevel level, KeyEvent key) {
+            if (key.isUp() || key.isDown()) {
+                return runtime.updateState(state -> state.withOverlay(level.select(
+                        level.selectedIndex() + (key.isUp() ? -1 : 1))));
+            }
+            if (!(key.isSelect() || key.isConfirm())) {
+                return true;
+            }
+            if (actionGateway == null) {
+                return true;
+            }
+            return switch (actionGateway.setPipelineLogLevel(level.pipelineId(), level.selectedLevel())) {
+                case PipelineLogLevelOutcome.Changed ignored -> runtime.updateState(WorkbenchState::closeOverlay);
+                case PipelineLogLevelOutcome.Rejected ignored -> runtime.updateState(WorkbenchState::closeOverlay);
+                case PipelineLogLevelOutcome.Unreachable ignored -> runtime.updateState(WorkbenchState::closeOverlay);
             };
         }
 
@@ -2252,6 +2305,7 @@ final class Workbench {
 
         void render(Frame frame) {
             ensureSelectedPipelineStatus();
+            ensureLogs();
             if (shellPanel == null || !shellPanel.isOpen() || runtime.state().overlay().isPresent()
                     || frame.area().height() < 24) {
                 layout = WorkbenchRenderer.render(frame, runtime.state());
@@ -2278,6 +2332,9 @@ final class Workbench {
             }
             if (pipelineStatusCoordinator != null) {
                 pipelineStatusCoordinator.close();
+            }
+            if (logCoordinator != null) {
+                logCoordinator.close();
             }
             if (refreshCoordinator != null) {
                 refreshCoordinator.close();
@@ -2455,6 +2512,44 @@ final class Workbench {
             runtime.updateState(state -> state.withSelectedPipelineStatus(Optional.empty()));
         }
 
+        private void ensureLogs() {
+            if (runtime.state().selectedTab() != WorkbenchState.WorkbenchTab.LOGS) {
+                if (logCoordinator != null) logCoordinator.cancel();
+                return;
+            }
+            if (actionGateway == null || logCoordinator == null) {
+                return;
+            }
+            Optional<String> target = logsTargetId();
+            if (target.isEmpty()) {
+                runtime.updateState(state -> state.withLogs(Optional.empty()));
+                return;
+            }
+            String id = target.orElseThrow();
+            if (runtime.state().logs().map(WorkbenchLogsState::pipelineId).filter(id::equals).isPresent()) return;
+            runtime.updateState(state -> state.withLogs(Optional.of(WorkbenchLogsState.loading(id))));
+            logCoordinator.start(actionGateway, id, outcome -> runtime.runLater(() -> {
+                if (runtime.state().selectedTab() != WorkbenchState.WorkbenchTab.LOGS
+                        || runtime.state().logs().map(WorkbenchLogsState::pipelineId).filter(id::equals).isEmpty()) return;
+                runtime.updateState(state -> state.withLogs(state.logs().map(current -> switch (outcome) {
+                    case LogsOutcome.Found found -> current.append(found);
+                    case LogsOutcome.Rejected rejected -> current.fail(rejected.message());
+                    case LogsOutcome.Unreachable ignored -> current.fail("Logs are unreachable.");
+                })));
+                runtime.requestRender();
+            }), ignored -> { });
+        }
+
+        private Optional<String> logsTargetId() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) return Optional.empty();
+            List<WorkbenchArtifactRow> rows = WorkbenchRenderer.sorted(
+                    state.snapshot().orElseThrow().pipelines().rows(), state.pipelinesTable());
+            if (rows.isEmpty()) return Optional.empty();
+            WorkbenchArtifactRow row = rows.get(Math.clamp(state.pipelinesTable().selectedIndex(), 0, rows.size() - 1));
+            return row.remote().isEmpty() ? Optional.empty() : Optional.of(row.key().id());
+        }
+
         private int visibleRows() {
             return Math.max(1, layout.visibleRowCapacity());
         }
@@ -2499,7 +2594,8 @@ final class Workbench {
                 } catch (RuntimeException failure) {
                     result = new WorkbenchActionGateway.PipelineStatusResult.Unavailable();
                 }
-                runtime.runLater(() -> complete(currentSequence, result, completion));
+                WorkbenchActionGateway.PipelineStatusResult completed = result;
+                runtime.runLater(() -> complete(currentSequence, completed, completion));
             });
         }
 

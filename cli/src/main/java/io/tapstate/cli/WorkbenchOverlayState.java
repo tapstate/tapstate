@@ -17,7 +17,27 @@ sealed interface WorkbenchOverlayState
                 WorkbenchOverlayState.Confirm,
                 WorkbenchOverlayState.Login,
                 WorkbenchOverlayState.Actions,
+                WorkbenchOverlayState.LogLevel,
                 WorkbenchOverlayState.Help {
+
+    record LogLevel(String pipelineId, int selectedIndex) implements WorkbenchOverlayState {
+        static final List<String> LEVELS = List.of("ERROR", "WARN", "INFO", "DEBUG", "TRACE");
+
+        public LogLevel {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            if (selectedIndex < 0 || selectedIndex >= LEVELS.size()) {
+                throw new IllegalArgumentException("Log level selection is outside the menu");
+            }
+        }
+
+        LogLevel select(int index) {
+            return new LogLevel(pipelineId, Math.clamp(index, 0, LEVELS.size() - 1));
+        }
+
+        String selectedLevel() {
+            return LEVELS.get(selectedIndex);
+        }
+    }
 
     record More(int selectedIndex) implements WorkbenchOverlayState {
         public More {

@@ -1,6 +1,9 @@
 package io.tapstate.cli;
 
 import dev.tamboui.layout.Rect;
+import dev.tamboui.layout.Constraint;
+import dev.tamboui.layout.Layout;
+import dev.tamboui.style.Overflow;
 import dev.tamboui.style.Style;
 import dev.tamboui.terminal.Frame;
 import dev.tamboui.text.CharWidth;
@@ -12,8 +15,14 @@ import dev.tamboui.widgets.block.Borders;
 import dev.tamboui.widgets.block.Title;
 import dev.tamboui.widgets.Clear;
 import dev.tamboui.widgets.paragraph.Paragraph;
+import dev.tamboui.widgets.scrollbar.Scrollbar;
+import dev.tamboui.widgets.scrollbar.ScrollbarState;
+import dev.tamboui.text.Text;
 
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -41,6 +50,11 @@ final class WorkbenchRenderer {
     private static final Pattern YAML_NUMBER = Pattern.compile(":\\s+(\\d+\\.?\\d*)\\s*$");
     private static final Pattern YAML_STRING_VALUE = Pattern.compile("\"(?:[^\"\\\\]|\\\\.)*\"|'[^']*'");
     private static final Pattern YAML_LIST_MARKER = Pattern.compile("^(\\s*)(-)(\\s)");
+    private static final Pattern LOG_CLASS_OR_FRAME = Pattern.compile(
+            "(?<![\\w$])(?:[A-Za-z_$][\\w$]*\\.){2,}[A-Za-z_$][\\w$]*(?:\\([^)]*:\\d+\\))?");
+    private static final DateTimeFormatter LOG_TIMESTAMP = DateTimeFormatter
+            .ofPattern("uuuu-MM-dd HH:mm:ss.SSS")
+            .withZone(ZoneId.systemDefault());
 
     private WorkbenchRenderer() {
     }
@@ -209,6 +223,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.Confirm ignored -> 4;
             case WorkbenchOverlayState.Login login -> transientLogin(login) ? 7 : 6;
             case WorkbenchOverlayState.Actions actions -> actions.actions().size() + (actions.message().isPresent() ? 2 : 1);
+            case WorkbenchOverlayState.LogLevel ignored -> 5;
             case WorkbenchOverlayState.Help ignored -> 6;
         };
         int height = contentRows + 2;
@@ -244,6 +259,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.Confirm confirm -> renderConfirm(frame, area, box, confirm, theme);
             case WorkbenchOverlayState.Login login -> renderLogin(frame, area, box, login, theme);
             case WorkbenchOverlayState.Actions actions -> renderActions(frame, area, box, actions, theme);
+            case WorkbenchOverlayState.LogLevel level -> renderLogLevel(frame, area, box, level, theme);
             case WorkbenchOverlayState.Help ignored -> renderHelp(frame, area, box, theme);
         };
     }
@@ -260,8 +276,22 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.Confirm confirm -> confirm.title();
             case WorkbenchOverlayState.Login login -> "Sign in to " + login.contextName();
             case WorkbenchOverlayState.Actions ignored -> "Actions";
+            case WorkbenchOverlayState.LogLevel ignored -> "Log level";
             case WorkbenchOverlayState.Help ignored -> "Help";
         };
+    }
+
+    private static List<OverlayHit> renderLogLevel(
+            Frame frame, Rect area, Rect box, WorkbenchOverlayState.LogLevel level, WorkbenchTheme theme) {
+        List<OverlayHit> hits = new ArrayList<>();
+        for (int index = 0; index < WorkbenchOverlayState.LogLevel.LEVELS.size(); index++) {
+            boolean selected = index == level.selectedIndex();
+            int y = box.y() + 1 + index;
+            String text = (selected ? "> " : "  ") + WorkbenchOverlayState.LogLevel.LEVELS.get(index);
+            int width = write(frame, box.x() + 2, y, text, selected ? theme.selection() : theme.base(), area);
+            hits.add(new OverlayHit(index, new Rect(box.x() + 2, y, width, 1)));
+        }
+        return List.copyOf(hits);
     }
 
     private static List<OverlayHit> renderMore(
@@ -934,6 +964,10 @@ final class WorkbenchRenderer {
                 && state.snapshot().isPresent()) {
             return renderWorkspace(frame, area, state, state.snapshot().orElseThrow(), theme);
         }
+        if (state.selectedTab() == WorkbenchState.WorkbenchTab.LOGS) {
+            renderLogs(frame, area, state.logs(), theme);
+            return new ContentLayout(List.of(), Math.max(1, area.height() - 2));
+        }
         Block block = Block.builder()
                 .borderType(BorderType.ROUNDED)
                 .borders(Borders.ALL)
@@ -977,6 +1011,97 @@ final class WorkbenchRenderer {
         write(frame, inner.x(), inner.bottom() - 1,
                 notification(state), notificationStyle(state, theme), inner);
         return new ContentLayout(rowHits, visibleRows);
+    }
+
+    private static void renderLogs(Frame frame, Rect area, Optional<WorkbenchLogsState> logs, WorkbenchTheme theme) {
+        if (logs.isEmpty()) {
+            Block block = panel("Logs", false, theme);
+            frame.renderWidget(block, area);
+            write(frame, block.inner(area).x(), block.inner(area).y(), "Select a remote Pipeline in 4 Pipelines.", theme.muted(), block.inner(area));
+            return;
+        }
+        WorkbenchLogsState view = logs.orElseThrow();
+        Block block = panel("[" + view.pipelineId() + "] Logs", false, theme);
+        frame.renderWidget(block, area);
+        Rect inner = block.inner(area);
+        int y = inner.y();
+        if (view.loading()) write(frame, inner.x(), y++, "Loading logs for " + view.pipelineId() + "...", theme.muted(), inner);
+        if (view.truncated()) write(frame, inner.x(), y++, "Earlier logs are no longer retained on this node.", theme.warning(), inner);
+        if (view.error().isPresent()) write(frame, inner.x(), y++, view.error().orElseThrow(), theme.error(), inner);
+        if (view.lines().isEmpty() && !view.loading()) write(frame, inner.x(), y, "No logs received yet.", theme.muted(), inner);
+        int visibleHeight = Math.max(1, inner.bottom() - y);
+        List<Line> allLines = logLines(view.lines(), theme);
+        int start = Math.max(0, allLines.size() - visibleHeight - view.scrollOffset());
+        int end = Math.min(allLines.size(), start + visibleHeight);
+        List<Line> visibleLines = new ArrayList<>(Math.max(0, end - start));
+        for (int i = start; i < end; i++) visibleLines.add(allLines.get(i));
+        Rect contentArea = inner;
+        if (allLines.size() > visibleHeight) {
+            List<Rect> chunks = Layout.horizontal()
+                    .constraints(Constraint.fill(), Constraint.length(1))
+                    .split(inner);
+            ScrollbarState scrollState = new ScrollbarState();
+            scrollState.contentLength(allLines.size())
+                    .viewportContentLength(visibleHeight)
+                    .position(start);
+            frame.renderStatefulWidget(Scrollbar.builder().build(), chunks.get(1), scrollState);
+            contentArea = chunks.getFirst();
+        }
+        if (!visibleLines.isEmpty()) {
+            frame.renderWidget(Paragraph.builder()
+                    .text(Text.from(visibleLines))
+                    .overflow(view.wrapped() ? Overflow.WRAP_WORD : Overflow.CLIP)
+                    .build(), new Rect(contentArea.x(), y, contentArea.width(), visibleHeight));
+        }
+        if (view.newLines()) write(frame, inner.right() - 3, inner.y(), "(*)", theme.accent(), inner);
+    }
+
+    private static List<Line> logLines(List<RemoteLogLine> entries, WorkbenchTheme theme) {
+        List<Line> lines = new ArrayList<>();
+        for (RemoteLogLine entry : entries) {
+            String[] messageLines = safeText(entry.message()).split("\\R", -1);
+            lines.add(logLine(entry, messageLines.length == 0 ? "" : messageLines[0], theme));
+            for (int index = 1; index < messageLines.length; index++) {
+                List<Span> spans = new ArrayList<>();
+                spans.add(Span.styled("                          ", theme.muted()));
+                spans.addAll(logMessageSpans(messageLines[index], theme));
+                lines.add(Line.from(spans));
+            }
+        }
+        return lines;
+    }
+
+    private static Line logLine(RemoteLogLine line, String message, WorkbenchTheme theme) {
+        String level = line.level() == null ? "UNKNOWN" : line.level().toUpperCase(Locale.ROOT);
+        Style levelStyle = switch (level) {
+            case "ERROR", "FATAL" -> theme.error().bold();
+            case "WARN", "WARNING" -> theme.warning().bold();
+            case "INFO" -> theme.success().bold();
+            case "DEBUG" -> theme.info().bold();
+            default -> theme.muted();
+        };
+        List<Span> spans = new ArrayList<>();
+        spans.add(Span.styled(LOG_TIMESTAMP.format(Instant.ofEpochMilli(line.timestampMillis())) + "  ", theme.muted()));
+        spans.add(Span.styled(String.format(Locale.ROOT, "%-5s", level) + " ", levelStyle));
+        spans.addAll(logMessageSpans(message, theme));
+        return Line.from(spans);
+    }
+
+    private static List<Span> logMessageSpans(String text, WorkbenchTheme theme) {
+        List<Span> spans = new ArrayList<>();
+        Matcher matcher = LOG_CLASS_OR_FRAME.matcher(text);
+        int offset = 0;
+        while (matcher.find()) {
+            if (matcher.start() > offset) {
+                spans.add(Span.styled(text.substring(offset, matcher.start()), theme.base()));
+            }
+            spans.add(Span.styled(matcher.group(), theme.codeKey()));
+            offset = matcher.end();
+        }
+        if (offset < text.length() || spans.isEmpty()) {
+            spans.add(Span.styled(text.substring(offset), theme.base()));
+        }
+        return spans;
     }
 
     private static ContentLayout renderWorkspace(
@@ -1531,6 +1656,11 @@ final class WorkbenchRenderer {
                             new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
                             new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
             case PIPELINES -> pipelineFooter(state, hasSelectableRows);
+            case LOGS -> List.of(new FooterHint("↑↓", "scroll", Optional.empty()), new FooterHint("Home/End", "top/live", Optional.empty()), new FooterHint("PgUp/PgDn", "page", Optional.empty()),
+                    new FooterHint("l", "level", Optional.empty()),
+                    new FooterHint("f", "follow " + state.logs().map(value -> value.following() ? "[on]" : "[off]").orElse("[on]"), Optional.empty()),
+                    new FooterHint("w", "wrap " + state.logs().map(value -> value.wrapped() ? "[on]" : "[off]").orElse("[on]"), Optional.empty()),
+                    new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)), new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
             };
         }
         if (state.overlay().isEmpty()) {
@@ -1576,6 +1706,7 @@ final class WorkbenchRenderer {
                 hints.add(new FooterHint("F10", "apply", Optional.of(FooterAction.APPLY_PIPELINE)));
             }
             if (!row.remote().isEmpty() && remoteAvailable) {
+                hints.add(new FooterHint("5", "logs", Optional.of(FooterAction.LOGS)));
                 hints.add(new FooterHint("F5", "start", Optional.of(FooterAction.START_PIPELINE)));
                 hints.add(new FooterHint("p", "pause", Optional.of(FooterAction.PAUSE_PIPELINE)));
                 hints.add(new FooterHint("u", "resume", Optional.of(FooterAction.RESUME_PIPELINE)));
@@ -1777,6 +1908,7 @@ final class WorkbenchRenderer {
             case WORKSPACE -> "💻";
             case SOURCES -> "🔌";
             case PIPELINES -> "🔀";
+            case LOGS -> "📜";
         };
     }
 
@@ -1786,6 +1918,7 @@ final class WorkbenchRenderer {
             case WORKSPACE -> "2";
             case SOURCES -> "3";
             case PIPELINES -> "4";
+            case LOGS -> "5";
         };
     }
 
@@ -1795,11 +1928,12 @@ final class WorkbenchRenderer {
             case WORKSPACE -> "Workspace";
             case SOURCES -> "Sources";
             case PIPELINES -> "Pipelines";
+            case LOGS -> "Logs";
         };
     }
 
     private static String tabBadge(WorkbenchState state, WorkbenchState.WorkbenchTab tab) {
-        if (tab == WorkbenchState.WorkbenchTab.OVERVIEW) {
+        if (tab == WorkbenchState.WorkbenchTab.OVERVIEW || tab == WorkbenchState.WorkbenchTab.LOGS) {
             return "";
         }
         String count = state.snapshot().map(snapshot -> switch (tab) {
@@ -1811,6 +1945,7 @@ final class WorkbenchRenderer {
             case PIPELINES -> snapshot.pipelines().remoteState() instanceof WorkbenchRemoteState.Available
                     ? Integer.toString(snapshot.pipelines().rows().size())
                     : "?";
+            case LOGS -> "";
         }).orElse("?");
         return "(" + count + ")";
     }
@@ -1836,6 +1971,7 @@ final class WorkbenchRenderer {
             case OVERVIEW, WORKSPACE -> snapshot.workspace().remoteState();
             case SOURCES -> snapshot.sources().remoteState();
             case PIPELINES -> snapshot.pipelines().remoteState();
+            case LOGS -> snapshot.pipelines().remoteState();
         };
     }
 
@@ -1846,6 +1982,7 @@ final class WorkbenchRenderer {
             case WORKSPACE -> snapshot.workspace().rows();
             case SOURCES -> snapshot.sources().rows();
             case PIPELINES -> snapshot.pipelines().rows();
+            case LOGS -> List.of();
         };
     }
 
@@ -1856,6 +1993,7 @@ final class WorkbenchRenderer {
             case WORKSPACE -> state.workspaceTable();
             case SOURCES -> state.sourcesTable();
             case PIPELINES -> state.pipelinesTable();
+            case LOGS -> WorkbenchTableState.empty();
         };
     }
 
@@ -1875,6 +2013,7 @@ final class WorkbenchRenderer {
             case WORKSPACE -> "No workspace artifacts.";
             case SOURCES -> "No sources.";
             case PIPELINES -> "No pipelines.";
+            case LOGS -> "No logs.";
         };
     }
 
@@ -2086,6 +2225,7 @@ final class WorkbenchRenderer {
         DISCARD,
         CANCEL_DISCARD,
         APPLY_PIPELINE,
+        LOGS,
         START_PIPELINE,
         PAUSE_PIPELINE,
         RESUME_PIPELINE,

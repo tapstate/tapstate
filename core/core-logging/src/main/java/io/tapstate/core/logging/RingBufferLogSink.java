@@ -19,6 +19,7 @@ public final class RingBufferLogSink implements LogSink {
 
     private final int maxLinesPerPipeline;
     private final Map<String, PipelineBuffer> byPipeline;
+    private final Map<String, PipelineLogLevel> levels = new LinkedHashMap<>();
 
     /**
      * @param maxPipelines        the most pipelines to retain lines for; the least-recently-appended
@@ -43,6 +44,9 @@ public final class RingBufferLogSink implements LogSink {
     public synchronized void append(String pipelineId, LogLine line) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(line, "line");
+        if (!level(pipelineId).accepts(line.level())) {
+            return;
+        }
         // Remove then re-insert so this pipeline becomes the most-recently-appended entry (insertion
         // order is the recency order the cardinality bound evicts against).
         PipelineBuffer buffer = byPipeline.remove(pipelineId);
@@ -54,6 +58,16 @@ public final class RingBufferLogSink implements LogSink {
             buffer.lines.removeFirst();
         }
         byPipeline.put(pipelineId, buffer);
+    }
+
+    @Override
+    public synchronized void level(String pipelineId, PipelineLogLevel level) {
+        levels.put(Objects.requireNonNull(pipelineId, "pipelineId"), Objects.requireNonNull(level, "level"));
+    }
+
+    @Override
+    public synchronized PipelineLogLevel level(String pipelineId) {
+        return levels.getOrDefault(Objects.requireNonNull(pipelineId, "pipelineId"), PipelineLogLevel.INFO);
     }
 
     @Override

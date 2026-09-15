@@ -67,6 +67,19 @@ interface WorkbenchActionGateway {
         return new PipelineStatusResult.Unavailable();
     }
 
+    default LogsOutcome readPipelineLogs(String pipelineId, RemoteLogCursor after) {
+        return new LogsOutcome.Unreachable();
+    }
+
+    default String followPipelineLogs(String pipelineId, RemoteLogCursor after, LogStream sink,
+            java.util.function.BooleanSupplier stop) {
+        return null;
+    }
+
+    default PipelineLogLevelOutcome setPipelineLogLevel(String pipelineId, String level) {
+        return new PipelineLogLevelOutcome.Unreachable();
+    }
+
     record ContextOption(String name, boolean suggested) {
         public ContextOption {
             Objects.requireNonNull(name, "name");

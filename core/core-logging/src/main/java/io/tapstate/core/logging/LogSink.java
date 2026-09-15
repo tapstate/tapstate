@@ -11,6 +11,16 @@ import java.util.List;
  */
 public interface LogSink {
 
+    /** Changes the minimum severity retained for future lines of one pipeline. */
+    default void level(String pipelineId, PipelineLogLevel level) {
+        throw new UnsupportedOperationException("Pipeline log levels are unavailable");
+    }
+
+    /** Returns the minimum severity retained for future lines of one pipeline. */
+    default PipelineLogLevel level(String pipelineId) {
+        return PipelineLogLevel.INFO;
+    }
+
     /** Records one log line against a pipeline. */
     void append(String pipelineId, LogLine line);
 

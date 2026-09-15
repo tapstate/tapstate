@@ -15,7 +15,8 @@ record WorkbenchState(
         WorkbenchWorkspaceState workspaceView,
         WorkbenchTableState sourcesTable,
         WorkbenchTableState pipelinesTable,
-        Optional<WorkbenchPipelineStatus> selectedPipelineStatus) {
+        Optional<WorkbenchPipelineStatus> selectedPipelineStatus,
+        Optional<WorkbenchLogsState> logs) {
 
     WorkbenchState {
         Objects.requireNonNull(selectedTab, "selectedTab");
@@ -27,6 +28,7 @@ record WorkbenchState(
         Objects.requireNonNull(sourcesTable, "sourcesTable");
         Objects.requireNonNull(pipelinesTable, "pipelinesTable");
         Objects.requireNonNull(selectedPipelineStatus, "selectedPipelineStatus");
+        Objects.requireNonNull(logs, "logs");
     }
 
     static WorkbenchState initial() {
@@ -39,7 +41,7 @@ record WorkbenchState(
                 WorkbenchWorkspaceState.empty(),
                 WorkbenchTableState.empty(),
                 WorkbenchTableState.empty(),
-                Optional.empty());
+                Optional.empty(), Optional.empty());
     }
 
     WorkbenchState reduce(KeyEvent key) {
@@ -93,7 +95,7 @@ record WorkbenchState(
                 workspaceView,
                 sourcesTable,
                 pipelinesTable,
-                selectedPipelineStatus);
+                selectedPipelineStatus, logs);
     }
 
     WorkbenchState closeOverlay() {
@@ -106,7 +108,7 @@ record WorkbenchState(
                 workspaceView,
                 sourcesTable,
                 pipelinesTable,
-                selectedPipelineStatus);
+                selectedPipelineStatus, logs);
     }
 
     WorkbenchState selectRow(WorkbenchTab tab, int index, int visibleRows) {
@@ -141,7 +143,7 @@ record WorkbenchState(
                 contextChanged ? WorkbenchWorkspaceState.empty() : workspaceView,
                 contextChanged ? WorkbenchTableState.empty() : sourcesTable,
                 contextChanged ? WorkbenchTableState.empty() : pipelinesTable,
-                contextChanged ? Optional.empty() : selectedPipelineStatus);
+                contextChanged ? Optional.empty() : selectedPipelineStatus, contextChanged ? Optional.empty() : logs);
     }
 
     WorkbenchState acceptSnapshot(WorkbenchSnapshot published) {
@@ -165,7 +167,7 @@ record WorkbenchState(
                 workspaceView,
                 sourcesTable.clamp(published.sources().rows().size()),
                 pipelinesTable.clamp(published.pipelines().rows().size()),
-                selectedPipelineStatus);
+                selectedPipelineStatus, logs);
     }
 
     private WorkbenchState withTable(WorkbenchTab tab, WorkbenchTableState table) {
@@ -174,6 +176,7 @@ record WorkbenchState(
             case WORKSPACE -> copy(selectedTab, table, sourcesTable, pipelinesTable);
             case SOURCES -> copy(selectedTab, workspaceTable, table, pipelinesTable);
             case PIPELINES -> copy(selectedTab, workspaceTable, sourcesTable, table);
+            case LOGS -> this;
         };
     }
 
@@ -184,21 +187,26 @@ record WorkbenchState(
             WorkbenchTableState pipelines) {
         return new WorkbenchState(
                 tab, expectedSnapshot, snapshot, overlay,
-                workspace, workspaceView, sources, pipelines, selectedPipelineStatus);
+                workspace, workspaceView, sources, pipelines, selectedPipelineStatus, logs);
     }
 
     WorkbenchState withWorkspaceView(WorkbenchWorkspaceState view) {
         Objects.requireNonNull(view, "view");
         return new WorkbenchState(
                 selectedTab, expectedSnapshot, snapshot, overlay,
-                workspaceTable, view, sourcesTable, pipelinesTable, selectedPipelineStatus);
+                workspaceTable, view, sourcesTable, pipelinesTable, selectedPipelineStatus, logs);
     }
 
     WorkbenchState withSelectedPipelineStatus(Optional<WorkbenchPipelineStatus> status) {
         Objects.requireNonNull(status, "status");
         return status.equals(selectedPipelineStatus) ? this : new WorkbenchState(
                 selectedTab, expectedSnapshot, snapshot, overlay,
-                workspaceTable, workspaceView, sourcesTable, pipelinesTable, status);
+                workspaceTable, workspaceView, sourcesTable, pipelinesTable, status, logs);
+    }
+
+    WorkbenchState withLogs(Optional<WorkbenchLogsState> next) {
+        return new WorkbenchState(selectedTab, expectedSnapshot, snapshot, overlay,
+                workspaceTable, workspaceView, sourcesTable, pipelinesTable, selectedPipelineStatus, next);
     }
 
     private WorkbenchTableState table(WorkbenchTab tab) {
@@ -207,6 +215,7 @@ record WorkbenchState(
             case WORKSPACE -> workspaceTable;
             case SOURCES -> sourcesTable;
             case PIPELINES -> pipelinesTable;
+            case LOGS -> WorkbenchTableState.empty();
         };
     }
 
@@ -220,6 +229,7 @@ record WorkbenchState(
             case WORKSPACE -> current.workspace().rows().size();
             case SOURCES -> current.sources().rows().size();
             case PIPELINES -> current.pipelines().rows().size();
+            case LOGS -> 0;
         };
     }
 
@@ -236,6 +246,7 @@ record WorkbenchState(
         if (key.isChar('4')) {
             return WorkbenchTab.PIPELINES;
         }
+        if (key.isChar('5')) return WorkbenchTab.LOGS;
         if (key.isCancel()) {
             return WorkbenchTab.OVERVIEW;
         }
@@ -268,7 +279,8 @@ record WorkbenchState(
         OVERVIEW('1', "Overview", "No workbench snapshot is loaded yet."),
         WORKSPACE('2', "Workspace", "No workspace artifacts are loaded yet."),
         SOURCES('3', "Sources", "No source snapshot is loaded yet."),
-        PIPELINES('4', "Pipelines", "No pipeline snapshot is loaded yet.");
+        PIPELINES('4', "Pipelines", "No pipeline snapshot is loaded yet."),
+        LOGS('5', "Logs", "Select a Pipeline to load its logs.");
 
         private final char shortcut;
         private final String label;
@@ -297,7 +309,7 @@ record WorkbenchState(
         }
 
         boolean hasTable() {
-            return this != OVERVIEW;
+            return this != OVERVIEW && this != LOGS;
         }
 
     }

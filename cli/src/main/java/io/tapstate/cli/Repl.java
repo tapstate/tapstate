@@ -490,6 +490,35 @@ final class Repl {
             }
 
             @Override
+            public LogsOutcome readPipelineLogs(String pipelineId, RemoteLogCursor after) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new LogsOutcome.Unreachable();
+                }
+                return withFailover(() -> controlPlane.logs(
+                        session.landingNode(), session.credential(), pipelineId, after),
+                        value -> value instanceof LogsOutcome.Unreachable);
+            }
+
+            @Override
+            public PipelineLogLevelOutcome setPipelineLogLevel(String pipelineId, String level) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineLogLevelOutcome.Unreachable();
+                }
+                return withFailover(() -> controlPlane.logLevel(
+                        session.landingNode(), session.credential(), pipelineId, level),
+                        value -> value instanceof PipelineLogLevelOutcome.Unreachable);
+            }
+
+            @Override
+            public String followPipelineLogs(String pipelineId, RemoteLogCursor after, LogStream sink,
+                    java.util.function.BooleanSupplier stop) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return "unavailable";
+                }
+                return controlPlane.followLogs(session.landingNode(), session.credential(), pipelineId, after, sink, stop);
+            }
+
+            @Override
             public SourceApplyResult applySources(SourceApplyRequest request) {
                 if (!session.isConnected() || !session.isAuthenticated()) {
                     return new SourceApplyResult.Unavailable();

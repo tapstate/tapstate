@@ -45,6 +45,7 @@ class ControlOperationsTest {
                         "pipeline.metrics",
                         "pipeline.snapshot",
                         "pipeline.logs",
+                        "pipeline.log-level",
                         "user.create",
                         "user.passwd",
                         "user.list",
@@ -97,6 +98,7 @@ class ControlOperationsTest {
         for (String id : List.of("pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.WRITE);
         }
+        assertThat(registry.resolve("pipeline.log-level").scope()).isEqualTo(Scope.WRITE);
         // the pipeline observation reads (status/metrics/snapshot store-backed, logs node-local) are all
         // read faces; read-scoped, unaudited.
         for (String id : List.of("pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs")) {
@@ -123,6 +125,7 @@ class ControlOperationsTest {
                         "pipeline.stop",
                         "pipeline.pause",
                         "pipeline.resume",
+                        "pipeline.log-level",
                         "user.create",
                         "user.passwd",
                         "token.create",
@@ -160,7 +163,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(37);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(38);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }

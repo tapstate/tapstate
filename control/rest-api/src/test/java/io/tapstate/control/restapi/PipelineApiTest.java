@@ -310,11 +310,11 @@ class PipelineApiTest {
         });
 
         assertThat(projectedPipelineVerbs)
-                .as("the full pipeline surface — four lifecycle writes and four observation reads — projects "
-                        + "onto the authenticated /api surface (this test boots the whole face bundle)")
+                .as("the full pipeline surface projects onto the authenticated /api face")
                 .containsExactlyInAnyOrder(
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
-                        "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs");
+                        "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
+                        "pipeline.log-level");
     }
 
     // ---- fixtures ----

@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.logging.LogCursor;
 import io.tapstate.core.logging.LogPage;
 import io.tapstate.core.logging.LogSink;
+import io.tapstate.core.logging.PipelineLogLevel;
 
 import java.util.Objects;
 
@@ -42,5 +43,18 @@ public final class PipelineLogQueryService {
         }
         LogPage page = logs.page(pipelineId, after, limit);
         return new PipelineLogs(pipelineId, page.lines(), page.nextCursor(), page.truncated());
+    }
+
+    /** Changes the minimum severity retained for future node-local lines of one pipeline. */
+    public PipelineLogLevel level(String pipelineId, PipelineLogLevel level) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(level, "level");
+        logs.level(pipelineId, level);
+        return logs.level(pipelineId);
+    }
+
+    /** Returns the minimum severity retained for future node-local lines of one pipeline. */
+    public PipelineLogLevel level(String pipelineId) {
+        return logs.level(Objects.requireNonNull(pipelineId, "pipelineId"));
     }
 }

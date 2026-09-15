@@ -184,6 +184,9 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LOGS = mcp(
             "pipeline.logs", Scope.READ, false,
             "Read the bounded, secret-redacted log tail for a Pipeline.");
+    public static final Operation PIPELINE_LOG_LEVEL = new Operation(
+            "pipeline.log-level", Scope.WRITE, true, null,
+            "Set the minimum severity retained for one Pipeline's future node-local log lines.", CLI_ONLY);
 
     // security domain: all admin-scoped. The mutating ones are audited; the list queries are not.
     public static final Operation USER_CREATE = new Operation("user.create", Scope.ADMIN, true, null, CLI_ONLY);
@@ -225,6 +228,7 @@ public final class ControlOperations {
             PIPELINE_METRICS,
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
+            PIPELINE_LOG_LEVEL,
             USER_CREATE,
             USER_PASSWD,
             USER_LIST,
