@@ -628,6 +628,15 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   same as one this product has no concept of — and only one of those is an answer. A target that
   has stopped accepting writes freezes this position while the other two would still be moving, so
   reading it as either of them turns a stalled target into a quiet source.
+- **`logs` carries what the connector itself said, not only what the host could tell from outside.**
+  When a source refuses a connection, the connector is the only thing that knows why -- the password,
+  the permission, the database that is not there -- and that sentence is now written into the tail of
+  the pipeline it was driving, alongside the host's own coded failure. Two limits, said plainly: a
+  connector's routine progress chatter is kept out of this tail on purpose (it would push the one line
+  you came for out of a bounded window), and a line a connector writes from a thread of its own making,
+  long after the call that started it returned, reaches the server's console without being filed under
+  any pipeline -- nothing can say which run it belonged to. A schema discovery's lines are likewise
+  filed under no pipeline, because any number of pipelines may read the same source.
 - **The names this face prints are unstable in this preview** — the position's included, not
   only the metrics'. They may be renamed as the model settles, so treat them as something to
   read, not something to build on: a dashboard or an alert wired to these names will need

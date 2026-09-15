@@ -6,6 +6,7 @@ import io.tapdata.entity.event.dml.TapDeleteRecordEvent;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
+import io.tapdata.entity.logger.TapLogger;
 import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.utils.cache.KVMap;
@@ -101,6 +102,17 @@ public class CsvConnector implements TapConnector {
     /** A test affordance for a saved-source witness: discovery fails when persistence loses this secret. */
     private static final String REQUIRE_PASSWORD = "require_password";
 
+    /** What this connector says when it is driven without the password its settings declare it needs. */
+    private static final String CANNOT_AUTHENTICATE = "password authentication failed: no password was given";
+
+    /**
+     * The same refusal said on the contract's shared static channel, deliberately in different words: a
+     * reader of the tail cannot tell which channel carried a sentence, so two sentences that read alike
+     * would let either channel alone satisfy a witness meant to hold both.
+     */
+    private static final String CANNOT_AUTHENTICATE_ALOUD =
+            "the connection was refused before any row was read";
+
     private static final String SUFFIX = ".csv";
 
     /**
@@ -184,6 +196,19 @@ public class CsvConnector implements TapConnector {
 
     @Override
     public void init(TapConnectionContext context) {
+        if (passwordRequired(context) && !passwordPresent(context)) {
+            // A connector knows why it cannot open a connection, and nothing outside it does: to the host
+            // this is one more read that failed. It says so on both of the channels the contract gives it
+            // -- the log on the context it was driven with, and the shared static one -- because the real
+            // connectors use both, and a witness that carried only one would leave the other's users with
+            // the silence this exists to remove.
+            context.getLog().error(CANNOT_AUTHENTICATE + " for the directory {}", directory(context));
+            TapLogger.error("CsvConnector", CANNOT_AUTHENTICATE_ALOUD);
+            // The failure it throws says less than the two lines above on purpose. What the host can see
+            // from outside is only that a read failed; a thrown message repeating what the connector just
+            // logged would let a witness of "the connector's words arrived" pass on the host's own line.
+            throw new IllegalStateException("cannot open a connection");
+        }
         stopped = false;
     }
 

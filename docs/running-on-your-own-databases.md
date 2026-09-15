@@ -103,3 +103,26 @@ io.tapstate.core.common.TapstateException: nest.embed-target-not-parent-key {emb
 
 So the status tells you to read the log, and how long it has been failing; the log tells you what
 failed. Having the server's output in your own terminal is one of the reasons to run it this way.
+
+## When a source refuses the connection
+
+The connector is the only thing that knows why a database said no: the password, the permission, the
+database that is not there. From outside it, the server can say only that the read failed and name the
+exception class. So what the connector says about it is written into that pipeline's own tail:
+
+```
+tapstate(admin@127.0.0.1:8080)> logs order_pipeline
+2026-09-15T08:21:04.318Z  ERROR  password authentication failed for user "orders_reader"
+2026-09-15T08:21:04.502Z  WARN   Pipeline order_pipeline entered FAILED [connector.capture-failed]: its data-plane job died
+```
+
+The first line is the connector's; the second is the server's own account of the same event. You want
+the first one - it names the thing to go and fix.
+
+Two limits worth knowing before you go looking for a line that is not there. A connector's routine
+progress chatter is deliberately kept out of this tail: it is a bounded window of recent lines, and
+chatter would push the one line you came for out of it (raise the server's log level if you want it).
+And a line a connector writes from a thread of its own making - a reconnect loop, a driver's own
+monitor - reaches the server's console without being filed under any pipeline, because nothing at that
+point can say which run it belonged to. If the tail is quiet, the server's own output is the next place
+to look.
