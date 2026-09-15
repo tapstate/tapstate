@@ -80,14 +80,26 @@ that actually reaches the database.
 
 ## When a pipeline says `running` but nothing arrives
 
-`status` reports the pipeline's last published state. A pipeline whose plan cannot be built - a nest
-tree that is refused, for instance - fails while reconciling, retries on the next tick, and keeps
-reporting `running` because nothing published a failure over it. The reason is in the server's log,
-once per tick:
+`status` reports the pipeline's last published state, and then answers this question directly. A
+pipeline whose plan cannot be built - a nest tree that is refused, for instance - fails while
+reconciling, retries on the next tick, and keeps reporting `running`, because nothing has seen its
+job die and reporting it as failed would be a guess. What `status` adds is that it says so:
+
+```
+order_pipeline  running
+why: the server keeps failing to bring this pipeline up: 12 passes in a row have thrown
+  read       metrics.errorCount = 12
+  read       status.state = running
+  next       read the server's own log -- the reason is printed there once per pass
+  cannot say whether the job itself is still alive: nothing here has seen it die, so the state
+             stays running rather than being guessed into a failure
+```
+
+The reason itself is in the server's log, once per tick:
 
 ```
 io.tapstate.core.common.TapstateException: nest.embed-target-not-parent-key {embedPath=lines, ...}
 ```
 
-So when a pipeline reads `running` and its target stays empty, read the log rather than the status.
-Having the server's output in your own terminal is one of the reasons to run it this way.
+So the status tells you to read the log, and how long it has been failing; the log tells you what
+failed. Having the server's output in your own terminal is one of the reasons to run it this way.

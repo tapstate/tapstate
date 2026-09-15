@@ -1093,9 +1093,13 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         if (JsonReader.parse(body) instanceof Map<?, ?> m
                 && m.get("pipelineId") instanceof String id
                 && m.get("state") instanceof String state) {
+            // How old the reading is, as the server measured it. Absent on a server that does not report
+            // it and on an observation stored before the time was recorded; both read back null, which
+            // means "nobody can say" and is never replaced by a subtraction against this machine's clock.
+            Long ageMillis = m.get("observedAgeMillis") instanceof Number age ? age.longValue() : null;
             Object rawFailure = m.get("failure");
             if (rawFailure == null) {
-                return new StatusOutcome.Found(id, state);
+                return new StatusOutcome.Found(id, state, null, null, ageMillis);
             }
             if (!(rawFailure instanceof Map<?, ?> failure) || !(failure.get("code") instanceof String code)) {
                 return null;
@@ -1103,7 +1107,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // The message is the server's rendering of that code; when it is absent the code still names
             // the diagnosis, so it stands in rather than the whole read degrading to unreachable.
             String message = failure.get("message") instanceof String rendered ? rendered : code;
-            return new StatusOutcome.Found(id, state, code, message);
+            return new StatusOutcome.Found(id, state, code, message, ageMillis);
         }
         return null;
     }

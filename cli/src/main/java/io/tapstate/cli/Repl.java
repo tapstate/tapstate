@@ -3211,9 +3211,15 @@ final class Repl {
     }
 
     /**
-     * {@code status <pipeline-id>} — reads the pipeline's lifecycle state from the server and prints
-     * {@code <id>  <state>}. A missing id is a benign usage line; a pipeline that has published no
+     * {@code status <pipeline-id>} — reads the pipeline's lifecycle state from the server, prints
+     * {@code <id>  <state>}, and then answers the one question somebody typing this actually has: if it is
+     * not working, what is wrong. A missing id is a benign usage line; a pipeline that has published no
      * observation is a coded refusal ({@code monitor.no-observation}) rendering its code and message.
+     *
+     * <p>The answer is a fixed checklist walked over readings that already existed on four separate faces.
+     * Correlating them by hand is what this replaces; no new measurement is taken and no new face is added.
+     * The state line above it is unchanged and still the first thing printed, so anything reading it keeps
+     * working.
      */
     private int statusOnline(List<String> words) {
         String id = readTargetId(words);
@@ -3231,6 +3237,7 @@ final class Repl {
                     // coded refusal on stderr.
                     renderStatusFailure(found.failureCode(), found.failureMessage());
                 }
+                renderDiagnosis(out, id, found);
                 out.flush();
                 yield Cli.EXIT_OK;
             }
@@ -4519,6 +4526,55 @@ final class Repl {
      * redirected input, e.g. {@code status pl1 > out.txt 2> err.txt}) can still tell "your command was
      * refused" from "the pipeline you asked about is dead" by which stream carried it.
      */
+    /**
+     * The one answer, printed under the state: what the checklist concluded, the face and value it read to
+     * conclude it, and where to look next.
+     *
+     * <p>Printed on every status, not only a failing one. A checklist that came up empty prints its
+     * readings and what it could not decide, because "nothing matched" and "everything is fine" are
+     * different claims and only the first one is true.
+     *
+     * <p>The other two faces are read only when the status face has not already answered. A run whose
+     * publisher has gone silent is the clearest case of that: every other face would be re-reading the same
+     * old observation, so asking them costs two round trips to learn nothing.
+     */
+    private void renderDiagnosis(PrintWriter out, String id, StatusOutcome.Found found) {
+        StatusDiagnosis.Answer answer = StatusDiagnosis
+                .fromStatusAlone(id, found.state(), found.failureCode(), found.observedAgeMillis())
+                .orElseGet(() -> StatusDiagnosis.of(id, found.state(), found.failureCode(),
+                        found.failureMessage(), found.observedAgeMillis(),
+                        metricsFacts(id), tablesLoading(id)));
+        out.println(Ansi.AUTO.string("@|bold why:|@") + " " + answer.conclusion());
+        answer.readings().forEach(reading -> out.println("  read       " + reading));
+        if (answer.next() != null) {
+            out.println("  next       " + answer.next());
+        }
+        answer.cannotSay().forEach(unanswerable -> out.println("  cannot say " + unanswerable));
+    }
+
+    /**
+     * The metrics face's readings for the diagnosis, or null when that face did not answer.
+     *
+     * <p>No failover here, deliberately: the status read just picked the node, and a supplementary read
+     * that cannot be answered becomes "could not be read" in the answer rather than a second round of node
+     * hunting. Null is carried all the way into the answer, because a face nobody could read and a face
+     * with nothing wrong in it are the two readings this command exists to keep apart.
+     */
+    private MetricsFacts metricsFacts(String id) {
+        return controlPlane.metrics(session.landingNode(), session.credential(), id)
+                        instanceof MetricsOutcome.Found found
+                ? MetricsFacts.of(found.metrics())
+                : null;
+    }
+
+    /** How many tables the snapshot face reports loading, or null when that face did not answer. */
+    private Integer tablesLoading(String id) {
+        return controlPlane.snapshot(session.landingNode(), session.credential(), id)
+                        instanceof SnapshotOutcome.Found found
+                ? found.tables().size()
+                : null;
+    }
+
     private void renderStatusFailure(String code, String message) {
         PrintWriter out = commandLine.getOut();
         if (!code.isBlank()) {

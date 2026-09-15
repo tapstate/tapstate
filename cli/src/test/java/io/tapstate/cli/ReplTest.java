@@ -4156,6 +4156,74 @@ class ReplTest {
     }
 
     @Test
+    void statusPrintsTheStateLineFirstAndTheAnswerUnderIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 252_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // The state line is untouched and still first: anything that reads this output by its first line
+        // keeps working, and the answer is added below rather than replacing what was there.
+        assertThat(out.lines().findFirst().orElseThrow()).isEqualTo("pl1  running");
+        assertThat(out).contains("why:").contains("publisher may have stopped").contains("4m12s");
+        assertThat(out).contains("read       status.observedAt = 4m12s ago");
+        assertThat(out).contains("next       ");
+    }
+
+    @Test
+    void statusThatTheStatusFaceAnsweredDoesNotGoAndReadTheOtherFaces() {
+        // A reading this old makes every other face a re-read of the same old observation, so asking them
+        // costs two round trips to learn nothing. Pinned because the cost is invisible in the output.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 252_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("status pl1");
+
+        assertThat(client.metricsCalls).isEmpty();
+        assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void statusThatMatchesNothingReadsTheOtherFacesAndSaysWhatItCannotDecide() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 128L));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // Its opposite is the failure mode: five rules coming up empty is a statement about five rules,
+        // and printing it as a clean bill of health is the product defaulting to healthy on thin signals.
+        assertThat(out).contains("nothing on this checklist matched");
+        assertThat(out).contains("cannot say whether the source has changes waiting");
+        assertThat(client.metricsCalls).hasSize(1);
+        assertThat(client.snapshotCalls).hasSize(1);
+    }
+
+    @Test
+    void statusSaysAFaceWasUnreadRatherThanEmptyWhenItCouldNotBeRead() {
+        // The fake answers both supplementary faces with unreachable. "No errors" and "nobody answered"
+        // are one word apart on screen, and only one of them is something a reader may act on.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("metrics = could not be read").contains("snapshot = could not be read");
+        assertThat(out).doesNotContain("nothing has moved");
+    }
+
+    @Test
     void restartStillNeedsAPipelineToRestart() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         Harness h = onlineSession(Path.of("tap-work"), client);
