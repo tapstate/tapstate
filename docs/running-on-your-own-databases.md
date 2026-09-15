@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/running-on-your-own-databases
+---
+
 # Running the server against databases you started yourself
 
 The [quickstart](quickstart-online.md) brings up databases, the server and the first admin together,
