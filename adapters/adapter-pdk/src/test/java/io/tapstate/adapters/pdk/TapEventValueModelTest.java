@@ -396,10 +396,11 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void aCarriedValueInsideAnArrayReachesTheTargetAsItsPortableValue() {
-        // An array is named as an array and its elements are not named at all, so an element has no
-        // path of its own to look up. Pinned rather than left to be found: the way in converts these
-        // as readily as it converts a document's fields, and only the way out stops short.
+    void anArrayElementIsNeverRebuiltAsWhateverTheArrayItselfIsDeclaredToBe() {
+        // The array column is declared the very type its element is, and the row holds that type
+        // nowhere else - so the array's own declared name is the only name on offer. Lending it to the
+        // element would rebuild every element as whatever the array is declared to be and report
+        // success, which is a worse answer than the portable value, so the element stays portable.
         Envelope decoded = insert(row("refs", List.of(new DriverKey("64f0c0de"))),
                 CODECS, Map.of("refs", KEY_COLUMN));
 

@@ -51,9 +51,13 @@ connector rebuilds from that. Two consequences follow, and both are visible rath
   elements are positional and may each be a different type, so "the type of this array's elements" is
   not something a schema can state. An element is restored from what your source's schema calls that
   type elsewhere in the same row instead - an `ObjectId` inside an array is written back as an
-  `ObjectId` because the collection's `_id` is one and the schema names it. Where the row holds no
-  such column, or the schema spells that type two different ways, the element arrives as its text
-  form, which is visible in the target rather than silently the wrong type.
+  `ObjectId` because the collection's `_id` is one and the schema names it. That reading is taken
+  one document at a time, off the values that document itself carries. Where the document holds no
+  such column - the schema names none, or the one it names is absent or null in that document - or
+  the schema spells that type two different ways, the element arrives as its text form. So one
+  collection can land with its elements restored in the documents that carry the naming column and
+  as text in the ones that do not; either way it is visible in the target rather than silently the
+  wrong type. An `_id` is always there, which is why an `ObjectId` element is the reliable case.
 
 ## Limits worth knowing before you rely on this
 
