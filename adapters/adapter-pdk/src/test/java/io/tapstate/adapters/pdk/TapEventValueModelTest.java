@@ -425,12 +425,14 @@ class TapEventValueModelTest {
         assertThat(encoded.getAfter().get("meta"))
                 .as("the half the schema names, which the way back already restores")
                 .isEqualTo(Map.of("ref", key));
-        // The array half is what a target of the same kind stores wrongly: the element arrives as the
-        // text it travelled as, the row lands, and the write reports success. The array's own declared
-        // name cannot close this - it is declared an array here, and rebuilding an element as whatever
-        // the array is declared to be would be a different defect that also reported success.
+        // The array half is what a target of the same kind stored wrongly before this reading existed:
+        // the element arrived as the text it travelled as, the row landed, and the write reported
+        // success. The array's own declared name cannot close that - it is declared an array here, and
+        // rebuilding an element as whatever the array is declared to be would be a different defect
+        // that also reported success. What restores it is the name this same schema gives that driver
+        // type at the one place it does name one: the dotted path asserted above.
         assertThat(encoded.getAfter().get("arr"))
-                .as("the same value inside an array, which reaches the target as its portable value")
+                .as("the same value inside an array, restored from what the schema calls that type")
                 .isEqualTo(List.of(key));
     }
 
