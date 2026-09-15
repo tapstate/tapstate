@@ -136,6 +136,17 @@ public enum DslError implements TapstateErrorCode {
      */
     UNWIND_NEEDS_AN_UPSERT_TARGET(
             "dsl.unwind-needs-an-upsert-target", Set.of("step", "sync", "path")),
+    /**
+     * A sync element writing through a connector this release does not support as a write target.
+     * {@code connector} names it, {@code source} the connection supplier the element referenced.
+     *
+     * <p>Judged only for a connector this release officially supports: one it does not is a
+     * connector no shipped deployment can register in the first place, so refusing it here would
+     * speak about a document only a deployment that widened its own accepted set can produce.
+     */
+    UNSUPPORTED_TARGET_CONNECTOR(
+            "dsl.unsupported-target-connector",
+            Set.of("connector", "source", "resource", "supported", "path")),
     /** A generated unwind column would overwrite a parent column or another generated column. */
     UNWIND_COLUMN_ALREADY_EXISTS(
             "dsl.unwind-column-already-exists", Set.of("column", "option")),

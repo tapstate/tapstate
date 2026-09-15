@@ -28,8 +28,6 @@ a-dimension-change-reaches-the-orders-already-written on IN_PROCESS
 a-dimension-change-reaches-the-orders-already-written on REAL_PROCESS
 a-large-recompute-finishes-after-the-input-stops on IN_PROCESS
 a-large-recompute-finishes-after-the-input-stops on REAL_PROCESS
-a-mongo-collection-lands-in-a-postgres-table on IN_PROCESS
-a-mongo-collection-lands-in-a-postgres-table on REAL_PROCESS
 a-mongo-collection-lands-in-the-managed-store on IN_PROCESS
 a-mongo-collection-lands-in-the-managed-store on REAL_PROCESS
 a-parent-column-change-reaches-the-assembled-document on IN_PROCESS
@@ -78,10 +76,6 @@ editing-the-list-adds-and-removes-rows on IN_PROCESS
 editing-the-list-adds-and-removes-rows on REAL_PROCESS
 holding-one-stream-does-not-stop-the-other on IN_PROCESS
 holding-one-stream-does-not-stop-the-other on REAL_PROCESS
-mysql-rows-land-in-a-sqlserver-target on IN_PROCESS
-mysql-rows-land-in-a-sqlserver-target on REAL_PROCESS
-mysql-rows-land-in-an-oracle-target on IN_PROCESS
-mysql-rows-land-in-an-oracle-target on REAL_PROCESS
 negative-lookahead-source-regex-roundtrip on IN_PROCESS
 negative-lookahead-source-regex-roundtrip on REAL_PROCESS
 one-row-with-a-list-becomes-one-row-per-element on IN_PROCESS
@@ -92,8 +86,6 @@ real-mysql-rows-cross-to-a-real-mongo-target on IN_PROCESS
 real-mysql-rows-cross-to-a-real-mongo-target on REAL_PROCESS
 rows-cross-from-a-source-file-to-a-target-file on IN_PROCESS
 rows-cross-from-a-source-file-to-a-target-file on REAL_PROCESS
-rows-cross-from-mysql-into-another-mysql on IN_PROCESS
-rows-cross-from-mysql-into-another-mysql on REAL_PROCESS
 the-golden-path-two-engines-become-one-object on IN_PROCESS
 the-golden-path-two-engines-become-one-object on REAL_PROCESS
 the-snapshot-half-reaches-the-target on IN_PROCESS
