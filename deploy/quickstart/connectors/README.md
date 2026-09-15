@@ -9,14 +9,19 @@ This preview certifies the following database kinds, with certification scoped b
 
 | Database | Connector kind | Certified use |
 |---|---|---|
-| MySQL | `mysql` | Read and write |
-| PostgreSQL | `postgres` | Read and write |
+| MySQL | `mysql` | Read |
+| PostgreSQL | `postgres` | Read |
 | MongoDB | `mongodb` | Read and write |
-| Oracle | `oracle` | Read and write |
-| SQL Server | `sqlserver` | Read and write |
+| Oracle | `oracle` | Read |
+| SQL Server | `sqlserver` | Read |
 
-Oracle Free 23 and SQL Server 2022 targets are verified with MySQL snapshot and CDC
-inserts, updates and deletes, automatic table/index preparation, and full-load policies.
+A `serve.sync` element installs onto the `mongodb` kind and no other,
+on any of its accepted ids. Applying a pipeline whose sync names one of the other
+certified connectors is refused, naming that connector and the document the element is
+written in; reading through it is unaffected.
+
+Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other kinds,
+with snapshot and CDC inserts, updates and deletes.
 Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
 all-data-type matrix. The default accepted set contains 16 connector ids

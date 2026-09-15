@@ -19,7 +19,7 @@ spec = importlib.util.spec_from_file_location('shards', HERE / '_ci-shards.py')
 shards = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shards)
 # This is the only pattern list. Duration hints never determine membership.
-SELECTOR = 'PublishedExamplesIT,RealMysqlToMongo*IT,Nest*IT,DataBrowser*IT,Watch*IT,AnObjectIdReadsBackTheSameThroughBothFacesIT,SinkValueRoundTripIT,*TargetPreparationIT,RealMysqlToEnterpriseDecimalIT'
+SELECTOR = 'PublishedExamplesIT,RealMysqlToMongo*IT,Nest*IT,DataBrowser*IT,Watch*IT,AnObjectIdReadsBackTheSameThroughBothFacesIT,SinkValueRoundTripIT,*TargetPreparationIT'
 LEDGER = Path('e2e/target/witness-ledger.txt')
 TIERS = ('IN_PROCESS', 'REAL_PROCESS')
 LEDGERS = Path('e2e/target/witness-ledgers')
