@@ -102,13 +102,28 @@ final class RowImages {
 
     private static Object decoded(Object value) {
         if (value instanceof Decimal128 decimal) {
+            // Two different values arrive here as the driver's own decimal, and both leave as the portable
+            // form the rest of the tree speaks. One is a portable exact decimal this module itself wrote:
+            // BSON has a single exact-decimal type, so what went in as a BigDecimal comes back as this, and
+            // turning it back is what makes the reload equal to the change that was stored.
+            //
+            // The other is a driver decimal that travelled bare, because the connector it came from
+            // registered no conversion for it. That one is knowingly re-typed rather than handed back as
+            // it came: no driver type escapes this module (rule R3), a rule the target's own class loader
+            // enforces whether or not this code respects it. So a bare decimal read out of the log is the
+            // portable form of the same number rather than the object the ring holds, and the same change
+            // read the two ways is not equal. Nothing in the product reads a change back out -- the ring's
+            // write gate parks the source read rather than evicting anything unread -- so the two readings
+            // are never compared; this is the ring store's own contract being honoured.
             try {
                 return decimal.bigDecimalValue();
             } catch (ArithmeticException e) {
                 // A special value -- NaN, an infinity, negative zero -- has no exact decimal form at all,
-                // and asking for one throws rather than answering. The double is what the read boundary
-                // hands on for exactly those, so a reload agrees with a change that never met the log,
-                // and no driver type escapes the module (rule R3) on the way.
+                // and asking for one throws rather than answering, which would take the reload of a stored
+                // change down instead of giving the row back. Only a bare one reaches this: a converted
+                // special value keeps the connector's own double at the read boundary and is written as a
+                // BSON double, so it never arrives as a decimal at all. The double is the portable form of
+                // the same value here too.
                 return decimal.doubleValue();
             }
         }

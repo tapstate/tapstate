@@ -120,11 +120,29 @@ class RowImagesTest {
     }
 
     @Test
-    void aDecimal128SpecialValueComesBackAsTheDoubleTheReadBoundaryHandsOn() {
-        // A driver decimal the source connector registered no conversion for travels bare, so it is
-        // what the log is handed. NaN, an infinity and negative zero have no exact decimal form at
-        // all, and asking one for its decimal value throws rather than answering - which would take
-        // the reload of a stored change down instead of giving the row back.
+    void aBareDriverDecimalComesBackAsThePortableFormOfTheSameNumber() {
+        Decimal128 bare = Decimal128.parse("1234567890.123456789012345678901234");
+
+        Map<String, Object> read = overTheWire(new LinkedHashMap<>(Map.of("amount", bare)));
+
+        // A driver decimal the source connector registered no conversion for travels bare, so the log
+        // is handed the driver's own object. It does not come back as one, and that is deliberate
+        // rather than incidental: no driver type escapes this module, where the target's own class
+        // loader cannot read it. What comes back is the same number in its portable form, so a change
+        // read out of the log equals the one still in the ring as a number and not as an object.
+        assertThat(read.get("amount"))
+                .isInstanceOf(BigDecimal.class)
+                .isNotInstanceOf(Decimal128.class)
+                .isEqualTo(bare.bigDecimalValue());
+    }
+
+    @Test
+    void aBareDecimal128SpecialValueComesBackAsThePortableDouble() {
+        // The same bare lane, for the values with no exact decimal form at all: NaN, an infinity and
+        // negative zero. Asking one of those for its decimal value throws rather than answering, which
+        // would take the reload of a stored change down instead of giving the row back. A converted
+        // special value never arrives here - it keeps the connector's own double at the read boundary,
+        // and BSON writes that as a double.
         Map<String, Object> read = overTheWire(new LinkedHashMap<>(Map.of(
                 "nan", Decimal128.NaN,
                 "infinite", Decimal128.POSITIVE_INFINITY,
