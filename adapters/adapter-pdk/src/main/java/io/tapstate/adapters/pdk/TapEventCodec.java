@@ -102,8 +102,16 @@ public final class TapEventCodec {
             return Envelope.insert(ts(insert), src(insert), row(insert.getAfter(), codecs, columnTypes), null);
         }
         if (event instanceof TapUpdateRecordEvent update) {
+            // One reading over both images, because they are two halves of one row. Taken per image, an
+            // update whose before image the connector reported without the column that names a driver
+            // type would decode its arrays as the text they travelled as on that side and as the driver's
+            // own type on the other - the two halves of one change disagreeing about a value that never
+            // changed, with nothing on either side able to see it.
+            SchemaNames names =
+                    SchemaNames.read(codecs, columnTypes, update.getBefore(), update.getAfter());
             return Envelope.update(ts(update), src(update),
-                    row(update.getBefore(), codecs, columnTypes), row(update.getAfter(), codecs, columnTypes),
+                    walk(update.getBefore(), codecs, names, true),
+                    walk(update.getAfter(), codecs, names, true),
                     null);
         }
         if (event instanceof TapDeleteRecordEvent delete) {
@@ -160,7 +168,7 @@ public final class TapEventCodec {
      */
     private static Map<String, Object> row(
             Map<String, Object> row, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
-        return walk(row, codecs, SchemaNames.read(row, codecs, columnTypes), true);
+        return walk(row, codecs, SchemaNames.read(codecs, columnTypes, row, null), true);
     }
 
     /**
@@ -278,58 +286,54 @@ public final class TapEventCodec {
      * would rebuild elements as one of them and succeed; the elements stay portable instead, which is
      * the visible second-best rather than a silent wrong one.
      *
-     * <p><b>Read off the whole row before the walk, not as the walk reaches each value.</b> Read as it
-     * goes, an array that happened to sit before the named column would restore and the same array
-     * after it would not, so one document would decode two ways depending only on the order a
-     * connector reported its fields.
+     * <p><b>Taken off the whole row at once, never as the walk reaches each value.</b> Read as the walk
+     * went, an array that happened to sit before the named column would restore and the same array after
+     * it would not, so one document would decode two ways depending only on the order a connector
+     * reported its fields. It is taken off both images of a change together for the same reason: two
+     * halves of one row must not disagree about a value that did not change, and a connector is free to
+     * report a before image the named column is not in. Taking it on the first array element the walk
+     * reaches rather than up front is the same reading - the whole row either way - and leaves a row
+     * holding no array paying nothing for it, which is most rows.
      *
      * <p>Only driver types the connector registered a conversion for are read, because only those ever
      * reach a way back; it also keeps one ordinary kind spelled at two widths — a schema naming
      * {@code STRING(100)} beside {@code STRING(4)} — from being a conflict that means anything. A caller
      * that supplies no declared types at all, which is every read face, pays nothing for any of this.
      */
-    private record SchemaNames(Map<String, String> byPath, Map<Class<?>, String> byType) {
+    private static final class SchemaNames {
 
         /** No schema was supplied, so nothing is named: every value travels as its portable value. */
-        private static final SchemaNames NONE = new SchemaNames(Map.of(), Map.of());
+        private static final SchemaNames NONE = new SchemaNames(Map.of(), null, null, null);
 
-        static SchemaNames read(
-                Map<String, Object> row, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
-            if (row == null || columnTypes.isEmpty()) {
-                return NONE;
-            }
-            Map<Class<?>, String> byType = new LinkedHashMap<>();
-            Set<Class<?>> spelledTwoWays = new LinkedHashSet<>();
-            row.forEach((column, value) -> read(value, column, codecs, columnTypes, byType, spelledTwoWays));
-            spelledTwoWays.forEach(byType::remove);
-            return new SchemaNames(columnTypes, byType.isEmpty() ? Map.of() : byType);
+        private final Map<String, String> byPath;
+        private final TapCodecsRegistry codecs;
+        private final Map<String, Object> before;
+        private final Map<String, Object> after;
+
+        /**
+         * What the schema calls each driver type it names a place for, taken whole off every image this
+         * change carries, and taken only once an array element has asked — so a row holding no array,
+         * which is most rows on the hottest path this adapter has, never walks itself a second time.
+         */
+        private Map<Class<?>, String> byType;
+
+        private SchemaNames(Map<String, String> byPath, TapCodecsRegistry codecs,
+                Map<String, Object> before, Map<String, Object> after) {
+            this.byPath = byPath;
+            this.codecs = codecs;
+            this.before = before;
+            this.after = after;
         }
 
-        private static void read(Object value, String path, TapCodecsRegistry codecs,
-                Map<String, String> columnTypes, Map<Class<?>, String> byType,
-                Set<Class<?>> spelledTwoWays) {
-            if (value == null) {
-                return;
-            }
-            // The walk's own precedence, so the two cannot disagree: a driver type the connector
-            // converts is read as one even where its class happens to be a map, and only what is
-            // left over is descended into.
-            if (codecs.getCustomToTapValueCodec(value.getClass()) != null) {
-                String declared = columnTypes.get(path);
-                if (declared != null) {
-                    String already = byType.putIfAbsent(value.getClass(), declared);
-                    if (already != null && !already.equals(declared)) {
-                        spelledTwoWays.add(value.getClass());
-                    }
-                }
-                return;
-            }
-            if (value instanceof Map<?, ?> document) {
-                document.forEach((field, nested) ->
-                        read(nested, path + "." + field, codecs, columnTypes, byType, spelledTwoWays));
-            }
-            // An array is not descended into: its elements are the values this reading is being taken
-            // for, and the schema names no place that reaches one.
+        /**
+         * The reading for one change, over the images it carries: both of an update, the one image every
+         * other change has, and nothing at all where the caller supplied no declared types.
+         */
+        static SchemaNames read(TapCodecsRegistry codecs, Map<String, String> columnTypes,
+                Map<String, Object> before, Map<String, Object> after) {
+            return columnTypes.isEmpty() || (before == null && after == null)
+                    ? NONE
+                    : new SchemaNames(columnTypes, codecs, before, after);
         }
 
         /**
@@ -340,7 +344,55 @@ public final class TapEventCodec {
             if (path != null) {
                 return byPath.get(path);
             }
-            return value == null ? null : byType.get(value.getClass());
+            if (value == null || codecs == null) {
+                return null;
+            }
+            if (byType == null) {
+                byType = byType();
+            }
+            return byType.get(value.getClass());
+        }
+
+        private Map<Class<?>, String> byType() {
+            Map<Class<?>, String> named = new LinkedHashMap<>();
+            Set<Class<?>> spelledTwoWays = new LinkedHashSet<>();
+            read(before, named, spelledTwoWays);
+            read(after, named, spelledTwoWays);
+            spelledTwoWays.forEach(named::remove);
+            return named.isEmpty() ? Map.of() : named;
+        }
+
+        private void read(Map<String, Object> image, Map<Class<?>, String> named,
+                Set<Class<?>> spelledTwoWays) {
+            if (image != null) {
+                image.forEach((column, value) -> read(value, column, named, spelledTwoWays));
+            }
+        }
+
+        private void read(Object value, String path, Map<Class<?>, String> named,
+                Set<Class<?>> spelledTwoWays) {
+            if (value == null) {
+                return;
+            }
+            // The walk's own precedence, so the two cannot disagree: a driver type the connector
+            // converts is read as one even where its class happens to be a map, and only what is
+            // left over is descended into.
+            if (codecs.getCustomToTapValueCodec(value.getClass()) != null) {
+                String declared = byPath.get(path);
+                if (declared != null) {
+                    String already = named.putIfAbsent(value.getClass(), declared);
+                    if (already != null && !already.equals(declared)) {
+                        spelledTwoWays.add(value.getClass());
+                    }
+                }
+                return;
+            }
+            if (value instanceof Map<?, ?> document) {
+                document.forEach((field, nested) ->
+                        read(nested, path + "." + field, named, spelledTwoWays));
+            }
+            // An array is not descended into: its elements are the values this reading is being taken
+            // for, and the schema names no place that reaches one.
         }
     }
 

@@ -77,7 +77,7 @@ class SinkValueRoundTripIT {
     }
 
     @Test
-    void anIdentityABinaryColumnAndAnIntegerKeepTheirTypesAcrossAnUntouchedJavascriptStep() {
+    void anIdentityABinaryColumnAnIntegerAndAnIdentityInsideAnArrayKeepTheirTypesAcrossAnUntouchedJavascriptStep() {
         String storeUri = SharedMongo.replicaSetUrl("e2e_round_trip_store");
         String sourceUri = SharedMongo.replicaSetUrl(SOURCE_DATABASE);
         String targetUri = SharedMongo.replicaSetUrl(TARGET_DATABASE);

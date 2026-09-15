@@ -467,6 +467,28 @@ class TapEventValueModelTest {
     }
 
     @Test
+    void bothImagesOfOneUpdateRestoreItsArrayTheSameWay() {
+        // A before image the connector reported without the column that names this driver type, beside
+        // an after image that has it - which a connector is free to do, and several do. Read per image,
+        // the half that carries the name would restore and the half that does not would not, so one
+        // change would say an array changed when nothing in it did.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = TapEventCodec.decodeChange(
+                TapUpdateRecordEvent.create().table("orders").referenceTime(1000L)
+                        .before(row("arr", List.of(key)))
+                        .after(row("_id", key, "arr", List.of(key))),
+                CODECS,
+                Map.of("_id", KEY_COLUMN, "arr", "ARRAY"));
+
+        TapUpdateRecordEvent encoded = (TapUpdateRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getBefore().get("arr"))
+                .as("the array on the side the naming column is missing from")
+                .isEqualTo(encoded.getAfter().get("arr"))
+                .isEqualTo(List.of(key));
+    }
+
+    @Test
     void aDriverTypeTheSchemaSpellsTwoWaysLeavesItsArrayElementsAlone() {
         // Two named columns of one driver type, declared differently - which a schema is free to do.
         // There is then no single answer to what this source calls that type, and picking either
