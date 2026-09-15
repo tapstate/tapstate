@@ -22,7 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * written as text: the row lands, the write reports success, and only the target's own column type is
  * wrong - which nothing on the read side can see, and no count or row comparison would move.
  *
- * <p>Three columns, each opening a different hole:
+ * <p>Four columns, each opening a different hole:
  *
  * <ul>
  *   <li>the <b>identity</b>, which comes back only if the write side hands the target the object the
