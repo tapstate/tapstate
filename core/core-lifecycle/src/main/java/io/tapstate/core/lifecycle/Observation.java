@@ -1,5 +1,6 @@
 package io.tapstate.core.lifecycle;
 
+import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
 
@@ -24,6 +25,11 @@ import java.util.Objects;
  *   <li>{@code failure} — why the run died, coded, or {@code null} while the pipeline is healthy. The
  *       state says a job died and the error count says it was counted; this says what killed it, so the
  *       reason is readable as data rather than only as a log line.</li>
+ *   <li>{@code observedAt} — when this projection was taken, or {@code null} when it is not known: a
+ *       document written before the field existed, or a publisher that did not record one. Without it a
+ *       healthy run whose state has not changed and a run whose publisher stopped four minutes ago are
+ *       the same bytes. Null means exactly "not known" and must never be filled in from another clock —
+ *       a read face substituting its own time would report every stalled pipeline as fresh.</li>
  * </ul>
  */
 public record Observation(
@@ -32,7 +38,8 @@ public record Observation(
         Map<String, Long> metrics,
         Map<String, TableSnapshot> snapshot,
         Map<String, String> positions,
-        ObservationFailure failure) {
+        ObservationFailure failure,
+        Instant observedAt) {
 
     public Observation {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -43,6 +50,21 @@ public record Observation(
         metrics = metrics == null ? Map.of() : Map.copyOf(metrics);
         snapshot = snapshot == null ? Map.of() : Map.copyOf(snapshot);
         positions = positions == null ? Map.of() : Map.copyOf(positions);
+    }
+
+    /**
+     * An observation carrying no observation time — the shape callers used before the projection recorded
+     * when it was taken. Backward compatible: observedAt reads null, which reads as "not known" rather
+     * than as any particular time.
+     */
+    public Observation(
+            String pipelineId,
+            PipelineState state,
+            Map<String, Long> metrics,
+            Map<String, TableSnapshot> snapshot,
+            Map<String, String> positions,
+            ObservationFailure failure) {
+        this(pipelineId, state, metrics, snapshot, positions, failure, null);
     }
 
     /**

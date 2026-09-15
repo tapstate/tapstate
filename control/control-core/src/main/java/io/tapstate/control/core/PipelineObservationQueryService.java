@@ -40,14 +40,16 @@ public final class PipelineObservationQueryService {
     /** The pipeline's lifecycle state, with the coded reason its run died when there is one. */
     public PipelineStatus status(String pipelineId) {
         Observation observation = require(pipelineId);
-        return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure());
+        return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(),
+                observation.observedAt());
     }
 
     /** Returns the latest status when an observation exists, without turning an unobserved pipeline into an error. */
     public Optional<PipelineStatus> findStatus(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         return observations.read(pipelineId)
-                .map(observation -> new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure()));
+                .map(observation -> new PipelineStatus(observation.pipelineId(), observation.state(),
+                        observation.failure(), observation.observedAt()));
     }
 
     /** The pipeline's open map of run statistics plus its per-table source positions. */
