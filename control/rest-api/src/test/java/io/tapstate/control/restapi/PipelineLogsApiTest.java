@@ -120,6 +120,24 @@ class PipelineLogsApiTest {
     }
 
     @Test
+    void logsResumesStrictlyAfterTheProvidedCursor() {
+        PipelineLogs initial = client().get().uri("/api/pipelines/pl1/logs?limit=1")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+
+        FakeLogSink sink = context.getBean(FakeLogSink.class);
+        sink.append("pl1", new LogLine(1_700_000_000_200L, "INFO", "checkpoint complete"));
+
+        PipelineLogs resumed = client().get().uri("/api/pipelines/pl1/logs?after="
+                        + initial.nextCursor().token())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+
+        assertThat(resumed.lines()).extracting(LogLine::message).containsExactly("checkpoint complete");
+        assertThat(resumed.truncated()).isFalse();
+    }
+
+    @Test
     void logsRejectsNonPositiveLimitsAsClientErrors() {
         for (String limit : List.of("0", "-1")) {
             ApiError body = client().get().uri("/api/pipelines/pl1/logs?limit=" + limit)

@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineLogs;
+import io.tapstate.core.logging.LogCursor;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -29,10 +30,17 @@ class PipelineLogsController {
     @GetMapping("/pipelines/{id}/logs")
     PipelineLogs logs(
             @PathVariable("id") String id,
-            @RequestParam(value = "limit", required = false) Integer limit) {
+            @RequestParam(value = "limit", required = false) Integer limit,
+            @RequestParam(value = "after", required = false) String after) {
         if (limit != null && limit < 1) {
             throw MalformedRequest.rejecting("limit must be positive", null);
         }
-        return limit == null ? logs.logs(id) : logs.logs(id, limit);
+        LogCursor cursor;
+        try {
+            cursor = after == null ? null : LogCursor.parse(after);
+        } catch (IllegalArgumentException invalidCursor) {
+            throw MalformedRequest.rejecting("after must be a log cursor", invalidCursor);
+        }
+        return logs.logs(id, cursor, limit == null ? Integer.MAX_VALUE : limit);
     }
 }

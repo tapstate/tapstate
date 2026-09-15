@@ -19,4 +19,29 @@ public interface LogSink {
      * snapshot. Empty when the pipeline has logged nothing (or is unknown to this node).
      */
     List<LogLine> tail(String pipelineId);
+
+    /**
+     * Reads a resumable page after {@code after}. Production sinks with bounded retention override this
+     * method with their stable append sequence. The fallback keeps existing lightweight sinks source
+     * compatible while providing append-only test doubles with a deterministic cursor.
+     */
+    default LogPage page(String pipelineId, LogCursor after, int limit) {
+        if (limit < 1) {
+            throw new IllegalArgumentException("limit must be positive");
+        }
+        List<LogLine> lines = tail(pipelineId);
+        String generation = "tail";
+        boolean truncated = after != null && !generation.equals(after.generation());
+        int from;
+        if (after == null) {
+            from = Math.max(0, lines.size() - limit);
+        } else if (truncated) {
+            from = 0;
+        } else {
+            from = (int) Math.min(after.sequence(), lines.size());
+        }
+        int to = (int) Math.min((long) lines.size(), (long) from + limit);
+        LogCursor next = to == 0 ? after : new LogCursor(generation, to);
+        return new LogPage(lines.subList(from, to), next, truncated);
+    }
 }
