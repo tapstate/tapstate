@@ -33,7 +33,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>a plain <b>integer</b>, which says the two lanes did not get mixed up. An ordinary box takes
  *       the bare lane and must stay bare; an implementation that boxed it too for the sake of a
  *       uniform row would find no way back for that box and write null - a column that is there, has
- *       the right name, and holds nothing.</li>
+ *       the right name, and holds nothing;</li>
+ *   <li>an <b>identity inside an array</b>, which the source's schema cannot name at all: elements
+ *       are positional and may each be a different type, so discovery names the array and stops.
+ *       It comes back only if the write side reads what that schema calls this type where it does
+ *       name it - the collection's own identity column. Unrestored it is a plain string sitting
+ *       beside a restored identity in the same document, from the same run.</li>
  * </ul>
  *
  * <p>A 128-bit decimal is deliberately not among them. Its conversion loses digits on the way in and
@@ -81,11 +86,15 @@ class SinkValueRoundTripIT {
 
         try (ServerHandle server = InProcessServer.start(storeUri);
                 MongoEndpoints mongo = new MongoEndpoints()) {
+            // One the array carries, which no schema names a place for, beside the document's own
+            // identity below - which the driver assigns, and which the schema does name.
+            ObjectId insideTheArray = new ObjectId();
             // No identity of its own, so the driver assigns one - the ordinary case, and the only one
             // that exercises the way back at all.
             Document seeded = new Document()
                     .append("bin", new Binary(BYTES))
-                    .append("qty", QUANTITY);
+                    .append("qty", QUANTITY)
+                    .append("refs", List.of(insideTheArray));
             mongo.insert(source, COLLECTION, seeded);
             ObjectId identity = seeded.getObjectId("_id");
 
@@ -129,6 +138,12 @@ class SinkValueRoundTripIT {
                     // way it boxes a driver type would find no way back for that box and write null.
                     .isEqualTo((long) QUANTITY)
                     .isNotInstanceOf(String.class);
+            assertThat(arrived.get("refs"))
+                    // Equality rather than a type check on the element: an identity and the text it
+                    // travelled as print alike and are never equal, so this fails on exactly the
+                    // difference under test.
+                    .as("the identity inside the array, which the schema names no place for")
+                    .isEqualTo(List.of(insideTheArray));
         }
     }
 

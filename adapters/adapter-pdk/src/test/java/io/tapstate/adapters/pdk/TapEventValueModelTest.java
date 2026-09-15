@@ -434,6 +434,60 @@ class TapEventValueModelTest {
     }
 
     @Test
+    void anArrayElementIsRestoredWhicheverOrderTheConnectorReportedTheRowIn() {
+        // The same row with the array reported first. What the schema calls this driver type is read
+        // off the whole row before any value is converted, so the answer cannot depend on field order -
+        // read as the walk went, this row would restore nothing and the one above would restore, and a
+        // document would decode two ways for no reason a reader could see.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("arr", List.of(key), "meta", new LinkedHashMap<>(Map.of("ref", key))),
+                CODECS,
+                Map.of("meta.ref", KEY_COLUMN, "meta", "DOCUMENT", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("arr")).isEqualTo(List.of(key));
+    }
+
+    @Test
+    void aCarriedValueInsideADocumentInsideAnArrayIsRestoredTheSameWay() {
+        // Below an element there is no place the schema could name either, so the same reading answers
+        // all the way down rather than stopping at the element itself.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("meta", new LinkedHashMap<>(Map.of("ref", key)),
+                        "arr", List.of(new LinkedHashMap<>(Map.of("ref", key)))),
+                CODECS,
+                Map.of("meta.ref", KEY_COLUMN, "meta", "DOCUMENT", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("arr")).isEqualTo(List.of(Map.of("ref", key)));
+    }
+
+    @Test
+    void aDriverTypeTheSchemaSpellsTwoWaysLeavesItsArrayElementsAlone() {
+        // Two named columns of one driver type, declared differently - which a schema is free to do.
+        // There is then no single answer to what this source calls that type, and picking either
+        // spelling would rebuild every element as one of them and report success.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("id", key, "ref", key, "arr", List.of(key)),
+                CODECS,
+                Map.of("id", KEY_COLUMN, "ref", "OTHER_KEY", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("arr"))
+                .as("the element, which has no name of its own and now no unambiguous type either")
+                .isEqualTo(List.of("64f0c0de"));
+        // The named halves are untouched by the ambiguity: each is looked up by its own place.
+        assertThat(encoded.getAfter().get("id")).isEqualTo(key);
+        assertThat(encoded.getAfter().get("ref")).isEqualTo("64f0c0de");
+    }
+
+    @Test
     void aDriverObjectFromAnotherConnectorsLoaderIsNotHandedToThisOnesConversion(@TempDir Path dir)
             throws ClassNotFoundException {
         // Two connectors, two isolated loaders, one class name. Conversions are looked up by name, so

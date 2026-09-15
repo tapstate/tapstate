@@ -7,9 +7,11 @@ import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
@@ -141,7 +143,7 @@ public final class TapEventCodec {
      */
     private static Map<String, Object> row(
             Map<String, Object> row, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
-        return walk(row, codecs, columnTypes, true);
+        return walk(row, codecs, SchemaNames.read(row, codecs, columnTypes), true);
     }
 
     /**
@@ -156,11 +158,11 @@ public final class TapEventCodec {
      * sink would rebuild, and a read rebuilds nothing.
      */
     static Map<String, Object> connectorConverted(Map<String, Object> row, TapCodecsRegistry codecs) {
-        return walk(row, codecs, Map.of(), false);
+        return walk(row, codecs, SchemaNames.NONE, false);
     }
 
     private static Map<String, Object> walk(Map<String, Object> row, TapCodecsRegistry codecs,
-            Map<String, String> columnTypes, boolean toNamespaceWidths) {
+            SchemaNames names, boolean toNamespaceWidths) {
         if (row == null) {
             return null;
         }
@@ -168,7 +170,7 @@ public final class TapEventCodec {
         boolean changed = false;
         for (Map.Entry<String, Object> column : row.entrySet()) {
             Object value =
-                    converted(column.getValue(), codecs, columnTypes, column.getKey(), toNamespaceWidths);
+                    converted(column.getValue(), codecs, names, column.getKey(), toNamespaceWidths);
             changed |= value != column.getValue();
             out.put(column.getKey(), value);
         }
@@ -180,17 +182,15 @@ public final class TapEventCodec {
      * array's elements are as reachable from a reader as a top-level column is; a container whose
      * contents all pass through unchanged is returned as it is, so the ordinary row costs no copy.
      *
-     * <p>{@code path} is how the schema names this value, which is the column's own name at the top
-     * level and the dotted path below it — the spelling discovery itself uses for a field inside a
-     * document, reported in the same field map the top-level columns come from. It is null where the
-     * schema names nothing, and a null path looks nothing up rather than falling back to an enclosing
-     * name: rebuilding a value as whatever its container is declared to be is worse than handing over
-     * the portable value, because it succeeds.
+     * <p>{@code path} is how the schema names this value's place, which is the column's own name at
+     * the top level and the dotted path below it — the spelling discovery itself uses for a field
+     * inside a document, reported in the same field map the top-level columns come from. It is null
+     * only beneath an array, the one place the schema has no way to name at all; what the source calls
+     * a value there is read off its own driver type instead, by {@link SchemaNames}.
      */
     private static Object converted(Object value, TapCodecsRegistry codecs,
-            Map<String, String> columnTypes, String path, boolean toNamespaceWidths) {
-        Object registered =
-                registered(value, codecs, path == null ? null : columnTypes.get(path));
+            SchemaNames names, String path, boolean toNamespaceWidths) {
+        Object registered = registered(value, codecs, names.of(value, path));
         if (registered != null) {
             return registered;
         }
@@ -213,9 +213,9 @@ public final class TapEventCodec {
             boolean changed = false;
             for (Map.Entry<?, ?> entry : map.entrySet()) {
                 // A field inside a document is named by the path that reaches it, which is what the
-                // lookup is keyed by. Below a value the schema does not name, the path stays null and
-                // stays null all the way down.
-                Object element = converted(entry.getValue(), codecs, columnTypes,
+                // lookup is keyed by. Beneath an array the path is already gone and stays gone all the
+                // way down, because nothing under an element has a place the schema could name either.
+                Object element = converted(entry.getValue(), codecs, names,
                         path == null ? null : path + "." + entry.getKey(), toNamespaceWidths);
                 changed |= element != entry.getValue();
                 converted.put(entry.getKey(), element);
@@ -226,16 +226,105 @@ public final class TapEventCodec {
             List<Object> converted = new ArrayList<>(list.size());
             boolean changed = false;
             for (Object element : list) {
-                // An element has no name of its own — the schema names the array and stops — so there
-                // is nothing to look up, and lending it the array's own name would rebuild it as
-                // whatever the array is declared to be.
-                Object next = converted(element, codecs, columnTypes, null, toNamespaceWidths);
+                // An element has no place of its own to look up — the schema names the array and
+                // stops — so the path ends here. Deliberately not the array's own name: that would
+                // rebuild every element as whatever the array is declared to be, and succeed.
+                Object next = converted(element, codecs, names, null, toNamespaceWidths);
                 changed |= next != element;
                 converted.add(next);
             }
             return changed ? converted : list;
         }
         return value;
+    }
+
+    /**
+     * What the source's schema calls the values of one row: by the place it names, and — for the one
+     * place it can never name — by the driver type it named there.
+     *
+     * <p>The way back is keyed on a name, so a value the schema names nothing for is written as the
+     * portable value it travelled as. A field inside a document has a place in the field map, spelled
+     * as the dotted path that reaches it, so the path reading answers for it; where that reading comes
+     * back empty the schema was asked about that place and said nothing, and the absence is its answer.
+     *
+     * <p><b>An array's elements have no place at all.</b> They are positional and may each be a
+     * different type, so "the type of this array's elements" is not something a field map can state and
+     * discovery reports no row for it — the schema is not silent about elements, it has nowhere to
+     * speak. So an element's name is read off its own driver type: the name this same schema gives that
+     * exact type where it does name a place holding one. That is still the source's own answer and not
+     * a guess about the element, which is why it is preferred to the two alternatives — leaving the
+     * element as its portable value, which a target of the same kind then stores as the wrong type, and
+     * lending it the array's own declared name, which would rebuild every element as whatever the array
+     * is declared to be and report success.
+     *
+     * <p><b>A type this schema spells two ways has no answer and gets none.</b> Picking either spelling
+     * would rebuild elements as one of them and succeed; the elements stay portable instead, which is
+     * the visible second-best rather than a silent wrong one.
+     *
+     * <p><b>Read off the whole row before the walk, not as the walk reaches each value.</b> Read as it
+     * goes, an array that happened to sit before the named column would restore and the same array
+     * after it would not, so one document would decode two ways depending only on the order a
+     * connector reported its fields.
+     *
+     * <p>Only driver types the connector registered a conversion for are read, because only those ever
+     * reach a way back; it also keeps one ordinary kind spelled at two widths — a schema naming
+     * {@code STRING(100)} beside {@code STRING(4)} — from being a conflict that means anything. A caller
+     * that supplies no declared types at all, which is every read face, pays nothing for any of this.
+     */
+    private record SchemaNames(Map<String, String> byPath, Map<Class<?>, String> byType) {
+
+        /** No schema was supplied, so nothing is named: every value travels as its portable value. */
+        private static final SchemaNames NONE = new SchemaNames(Map.of(), Map.of());
+
+        static SchemaNames read(
+                Map<String, Object> row, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
+            if (row == null || columnTypes.isEmpty()) {
+                return NONE;
+            }
+            Map<Class<?>, String> byType = new LinkedHashMap<>();
+            Set<Class<?>> spelledTwoWays = new LinkedHashSet<>();
+            row.forEach((column, value) -> read(value, column, codecs, columnTypes, byType, spelledTwoWays));
+            spelledTwoWays.forEach(byType::remove);
+            return new SchemaNames(columnTypes, byType.isEmpty() ? Map.of() : byType);
+        }
+
+        private static void read(Object value, String path, TapCodecsRegistry codecs,
+                Map<String, String> columnTypes, Map<Class<?>, String> byType,
+                Set<Class<?>> spelledTwoWays) {
+            if (value == null) {
+                return;
+            }
+            // The walk's own precedence, so the two cannot disagree: a driver type the connector
+            // converts is read as one even where its class happens to be a map, and only what is
+            // left over is descended into.
+            if (codecs.getCustomToTapValueCodec(value.getClass()) != null) {
+                String declared = columnTypes.get(path);
+                if (declared != null) {
+                    String already = byType.putIfAbsent(value.getClass(), declared);
+                    if (already != null && !already.equals(declared)) {
+                        spelledTwoWays.add(value.getClass());
+                    }
+                }
+                return;
+            }
+            if (value instanceof Map<?, ?> document) {
+                document.forEach((field, nested) ->
+                        read(nested, path + "." + field, codecs, columnTypes, byType, spelledTwoWays));
+            }
+            // An array is not descended into: its elements are the values this reading is being taken
+            // for, and the schema names no place that reaches one.
+        }
+
+        /**
+         * What this schema calls the value at {@code path}, or — where the path ended because an array
+         * did — what it calls that value's own driver type. Null when it names neither.
+         */
+        String of(Object value, String path) {
+            if (path != null) {
+                return byPath.get(path);
+            }
+            return value == null ? null : byType.get(value.getClass());
+        }
     }
 
     /**
