@@ -45,21 +45,21 @@ class ArtifactQueryServiceTest {
 
     @Test
     void getReadsBackAnAppliedArtifactAsItsCanonicalForm() {
-        apply.apply("alice", List.of(draft(TGT_MY)));
+        apply.apply("alice", List.of(draft(TGT_MG)));
 
-        Optional<StoredArtifact> got = query.get("tgt_my");
+        Optional<StoredArtifact> got = query.get("tgt_mg");
 
         assertThat(got).isPresent();
-        assertThat(got.get().id()).isEqualTo("tgt_my");
+        assertThat(got.get().id()).isEqualTo("tgt_mg");
         assertThat(got.get().kind()).isEqualTo("source");
         assertThat(got.get().canonicalForm())
                 .as("get reads back the stored canonical form")
-                .isEqualTo(offlineCanonical(TGT_MY));
+                .isEqualTo(offlineCanonical(TGT_MG));
     }
 
     @Test
     void getReturnsEmptyForAnUnstoredId() {
-        apply.apply("alice", List.of(draft(TGT_MY)));
+        apply.apply("alice", List.of(draft(TGT_MG)));
 
         assertThat(query.get("no_such_id")).isEmpty();
     }
@@ -70,12 +70,12 @@ class ArtifactQueryServiceTest {
         // form byte-for-byte, using the one CanonicalWriter the authoring corpus golden locks. No second
         // baseline is checked in on the online side: forking the canonical form here is exactly the drift
         // this guards, so the expectation is the offline contract.
-        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
+        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG), draft(PIPELINE)));
 
         assertThat(query.get("src_ora")).get().extracting(StoredArtifact::canonicalForm)
                 .isEqualTo(offlineCanonical(SRC_ORA));
-        assertThat(query.get("tgt_my")).get().extracting(StoredArtifact::canonicalForm)
-                .isEqualTo(offlineCanonical(TGT_MY));
+        assertThat(query.get("tgt_mg")).get().extracting(StoredArtifact::canonicalForm)
+                .isEqualTo(offlineCanonical(TGT_MG));
     }
 
     /**
@@ -93,7 +93,7 @@ class ArtifactQueryServiceTest {
      */
     @Test
     void aPipelinesStoredFormIsTheOfflineCanonicalPlusTheSwitchesApplyRecorded() {
-        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
+        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG), draft(PIPELINE)));
 
         String stored = query.get("ora2my_ods").orElseThrow().canonicalForm();
 
@@ -108,10 +108,10 @@ class ArtifactQueryServiceTest {
 
     @Test
     void listReturnsEveryStoredArtifactAsItsCanonicalForm() {
-        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
+        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG), draft(PIPELINE)));
 
         assertThat(query.list()).extracting(ArtifactListEntry::id)
-                .containsExactlyInAnyOrder("src_ora", "tgt_my", "ora2my_ods");
+                .containsExactlyInAnyOrder("src_ora", "tgt_mg", "ora2my_ods");
         // Each listed artifact carries the same canonical form its own get returns.
         assertThat(query.list()).allSatisfy(a ->
                 assertThat(a.canonicalForm())
@@ -120,14 +120,14 @@ class ArtifactQueryServiceTest {
 
     @Test
     void listKeepsAnUnreadableStoredRowVisibleWhileGetRemainsStrict() {
-        apply.apply("alice", List.of(draft(TGT_MY)));
+        apply.apply("alice", List.of(draft(TGT_MG)));
         store.putUnreadable("corrupt", "pipeline", "not: [valid");
 
         List<ArtifactListEntry> listed = query.list();
 
         assertThat(listed).extracting(ArtifactListEntry::id)
-                .containsExactlyInAnyOrder("tgt_my", "corrupt");
-        assertThat(listed).filteredOn(a -> a.id().equals("tgt_my")).singleElement()
+                .containsExactlyInAnyOrder("tgt_mg", "corrupt");
+        assertThat(listed).filteredOn(a -> a.id().equals("tgt_mg")).singleElement()
                 .satisfies(a -> assertThat(a.readable()).isTrue());
         assertThat(listed).filteredOn(a -> a.id().equals("corrupt")).singleElement()
                 .satisfies(a -> {
@@ -149,9 +149,9 @@ class ArtifactQueryServiceTest {
         // The hash is the precondition an edit or a removal has to supply, and it is taken over the
         // resource's structure -- so the canonical bytes returned beside it are not enough to derive it,
         // and this read is the only place a caller can get it. get then delete needs no second source.
-        apply.apply("alice", List.of(draft(TGT_MY)));
+        apply.apply("alice", List.of(draft(TGT_MG)));
 
-        StoredArtifact got = query.get("tgt_my").orElseThrow();
+        StoredArtifact got = query.get("tgt_mg").orElseThrow();
 
         assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(new DslParser().parse(got.canonicalForm())));
     }
@@ -163,13 +163,13 @@ class ArtifactQueryServiceTest {
         // else — the raw draft text before canonicalization, a second writer — still yields a well-formed
         // 64-char string that every shape assertion accepts, and every delete-after-get then fails as a
         // version conflict. Pinning it against the apply outcome is what catches that.
-        ApplyResult applied = apply.apply("alice", List.of(draft(TGT_MY)));
+        ApplyResult applied = apply.apply("alice", List.of(draft(TGT_MG)));
         String issuedOnWrite = applied.outcomes().stream()
-                .filter(o -> o.id().equals("tgt_my"))
+                .filter(o -> o.id().equals("tgt_mg"))
                 .findFirst().orElseThrow()
                 .contentHash();
 
-        assertThat(query.get("tgt_my").orElseThrow().contentHash()).isEqualTo(issuedOnWrite);
+        assertThat(query.get("tgt_mg").orElseThrow().contentHash()).isEqualTo(issuedOnWrite);
     }
 
     @Test
@@ -177,17 +177,17 @@ class ArtifactQueryServiceTest {
         // Discriminating against a hash taken over the id (or any other per-resource constant): the id is
         // unchanged across this edit, so such an implementation returns the same hash for both versions
         // and a stale precondition would be accepted as current.
-        apply.apply("alice", List.of(draft(TGT_MY)));
-        String before = query.get("tgt_my").orElseThrow().contentHash();
+        apply.apply("alice", List.of(draft(TGT_MG)));
+        String before = query.get("tgt_mg").orElseThrow().contentHash();
 
-        apply.apply("alice", List.of(draft(TGT_MY_CHANGED)));
+        apply.apply("alice", List.of(draft(TGT_MG_CHANGED)));
 
-        assertThat(query.get("tgt_my").orElseThrow().contentHash()).isNotEqualTo(before);
+        assertThat(query.get("tgt_mg").orElseThrow().contentHash()).isNotEqualTo(before);
     }
 
     @Test
     void everyListedArtifactCarriesTheHashItsOwnGetReturns() {
-        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
+        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG), draft(PIPELINE)));
 
         assertThat(query.list()).allSatisfy(a ->
                 assertThat(a.contentHash())
@@ -198,10 +198,10 @@ class ArtifactQueryServiceTest {
     void listByKindReturnsOnlyArtifactsOfThatKind() {
         // The read-by-kind query lives in the read service (server-as-truth read semantics), so a face
         // stays a pure projection: list("source") returns the two sources, list("pipeline") the pipeline.
-        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
+        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG), draft(PIPELINE)));
 
         assertThat(query.list("source")).extracting(ArtifactListEntry::id)
-                .containsExactlyInAnyOrder("src_ora", "tgt_my");
+                .containsExactlyInAnyOrder("src_ora", "tgt_mg");
         assertThat(query.list("pipeline")).extracting(ArtifactListEntry::id)
                 .containsExactly("ora2my_ods");
     }
@@ -211,12 +211,12 @@ class ArtifactQueryServiceTest {
         // A blank or absent kind filter is "no filter": the query returns every stored artifact across
         // kinds, the same as the unfiltered list, so the endpoint's optional ?kind= parameter degrades
         // to list-all.
-        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY), draft(PIPELINE)));
+        apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG), draft(PIPELINE)));
 
         assertThat(query.list((String) null)).extracting(ArtifactListEntry::id)
-                .containsExactlyInAnyOrder("src_ora", "tgt_my", "ora2my_ods");
+                .containsExactlyInAnyOrder("src_ora", "tgt_mg", "ora2my_ods");
         assertThat(query.list("   ")).extracting(ArtifactListEntry::id)
-                .containsExactlyInAnyOrder("src_ora", "tgt_my", "ora2my_ods");
+                .containsExactlyInAnyOrder("src_ora", "tgt_mg", "ora2my_ods");
     }
 
     @Test
@@ -224,20 +224,20 @@ class ArtifactQueryServiceTest {
         // Server-as-truth: the store is the read source and only apply mutates it. Apply v1 -> get is v1;
         // preparing the edit through plan (the store-free validate + canonicalize front half, which writes
         // nothing) leaves the store — and get — at v1; applying the edit is what finally moves get to v2.
-        apply.apply("alice", List.of(draft(TGT_MY)));
-        assertThat(query.get("tgt_my")).get().extracting(StoredArtifact::canonicalForm)
-                .isEqualTo(offlineCanonical(TGT_MY));
+        apply.apply("alice", List.of(draft(TGT_MG)));
+        assertThat(query.get("tgt_mg")).get().extracting(StoredArtifact::canonicalForm)
+                .isEqualTo(offlineCanonical(TGT_MG));
 
         // The edit is only prepared, never applied — plan touches no store — so get still reads v1.
-        apply.plan(List.of(draft(TGT_MY_CHANGED)));
-        assertThat(query.get("tgt_my")).get().extracting(StoredArtifact::canonicalForm)
+        apply.plan(List.of(draft(TGT_MG_CHANGED)));
+        assertThat(query.get("tgt_mg")).get().extracting(StoredArtifact::canonicalForm)
                 .as("a prepared-but-unapplied edit does not reach the truth layer")
-                .isEqualTo(offlineCanonical(TGT_MY));
+                .isEqualTo(offlineCanonical(TGT_MG));
 
-        apply.apply("alice", List.of(draft(TGT_MY_CHANGED)));
-        assertThat(query.get("tgt_my")).get().extracting(StoredArtifact::canonicalForm)
+        apply.apply("alice", List.of(draft(TGT_MG_CHANGED)));
+        assertThat(query.get("tgt_mg")).get().extracting(StoredArtifact::canonicalForm)
                 .as("get reflects the last apply — server-as-truth, last write wins")
-                .isEqualTo(offlineCanonical(TGT_MY_CHANGED));
+                .isEqualTo(offlineCanonical(TGT_MG_CHANGED));
     }
 
     @Test
@@ -254,20 +254,20 @@ class ArtifactQueryServiceTest {
 
     // ---- fixtures ----
 
-    private static final String TGT_MY = """
+    private static final String TGT_MG = """
             version: tapstate/v1
             kind: source
-            id: tgt_my
-            connector: mysql
-            config: { host: 10.30.0.5, username: writer, password: My_2026 }
+            id: tgt_mg
+            connector: mongodb
+            config: { uri: "mongodb://10.30.0.11:27017/ods" }
             """;
 
-    private static final String TGT_MY_CHANGED = """
+    private static final String TGT_MG_CHANGED = """
             version: tapstate/v1
             kind: source
-            id: tgt_my
-            connector: mysql
-            config: { host: 10.30.0.5, username: writer, password: Changed_2026 }
+            id: tgt_mg
+            connector: mongodb
+            config: { uri: "mongodb://10.30.0.12:27017/ods" }
             """;
 
     private static final String SRC_ORA = """
@@ -291,7 +291,7 @@ class ArtifactQueryServiceTest {
               from: /.*/
               sync:
                 - id: my_ods
-                  source: tgt_my
+                  source: tgt_mg
                   write_mode: upsert
                   ddl: apply
             """;

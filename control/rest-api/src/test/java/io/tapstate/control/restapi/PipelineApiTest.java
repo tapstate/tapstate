@@ -707,7 +707,7 @@ class PipelineApiTest {
             version: tapstate/v1
             kind: source
             id: tgt_x
-            connector: mysql
+            connector: mongodb
             """;
 
     /**

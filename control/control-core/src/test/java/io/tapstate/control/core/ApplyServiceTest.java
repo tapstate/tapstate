@@ -72,13 +72,13 @@ class ApplyServiceTest {
         }
     }
 
-    // A guaranteed-valid mysql source used as a pure connection (X18 dual-role: no mode / tables).
-    private static final String TGT_MY = """
+    // A guaranteed-valid mongodb source used as a pure connection (X18 dual-role: no mode / tables).
+    private static final String TGT_MG = """
             version: tapstate/v1
             kind: source
-            id: tgt_my
-            connector: mysql
-            config: { host: 10.30.0.5, username: writer, password: My_2026 }
+            id: tgt_mg
+            connector: mongodb
+            config: { uri: "mongodb://10.30.0.11:27017/ods", auth_source: admin }
             """;
 
     /**
@@ -268,11 +268,11 @@ class ApplyServiceTest {
 
     @Test
     void planCanonicalizesAndHashesAValidResource() {
-        ApplyPlan plan = service.plan(List.of(draft(TGT_MY)));
+        ApplyPlan plan = service.plan(List.of(draft(TGT_MG)));
 
         assertThat(plan.artifacts()).hasSize(1);
         PreparedArtifact prepared = plan.artifacts().get(0);
-        assertThat(prepared.id()).isEqualTo("tgt_my");
+        assertThat(prepared.id()).isEqualTo("tgt_mg");
         assertThat(prepared.kind()).isEqualTo("source");
         String expectedCanonical = new CanonicalWriter().write(prepared.resource());
         assertThat(prepared.canonicalForm())
@@ -285,17 +285,17 @@ class ApplyServiceTest {
 
     @Test
     void validateReportsThePlannedChangesWithoutWritingOrAuditing() {
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
         int writesBeforeValidation = store.saveCount;
         auditStore.records.clear();
 
         ArtifactValidationResult result = service.validate(List.of(
-                draft(TGT_MY), draft(SRC_ORA_STANDALONE)));
+                draft(TGT_MG), draft(SRC_ORA_STANDALONE)));
 
         assertThat(result.valid()).isTrue();
         assertThat(result.diagnostics()).isEmpty();
         assertThat(result.outcomes()).extracting(ArtifactOutcome::id)
-                .containsExactly("tgt_my", "src_ora");
+                .containsExactly("tgt_mg", "src_ora");
         assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
                 .containsExactly(ArtifactOutcome.Change.UNCHANGED, ArtifactOutcome.Change.CREATED);
         assertThat(store.saveCount).isEqualTo(writesBeforeValidation);
@@ -305,7 +305,7 @@ class ApplyServiceTest {
     @Test
     void invalidValidationReturnsOneStructuredDiagnosticWithoutWritingOrAuditing() {
         ArtifactValidationResult result = service.validate(List.of(
-                draft(TGT_MY + "bogus_field: 1\n")));
+                draft(TGT_MG + "bogus_field: 1\n")));
 
         assertThat(result.valid()).isFalse();
         assertThat(result.outcomes()).isEmpty();
@@ -320,7 +320,7 @@ class ApplyServiceTest {
     @Test
     void anUnknownFieldIsRejectedAtValidationWithItsDslCode() {
         // The structural tier: a field outside the tapstate/v1 schema.
-        String withUnknownField = TGT_MY + "bogus_field: 1\n";
+        String withUnknownField = TGT_MG + "bogus_field: 1\n";
 
         Throwable t = catchThrowable(() -> service.plan(List.of(draft(withUnknownField))));
 
@@ -437,7 +437,7 @@ class ApplyServiceTest {
 
     @Test
     void aDuplicateIdAcrossTheBatchIsRejected() {
-        Throwable t = catchThrowable(() -> service.plan(List.of(draft(TGT_MY), draft(TGT_MY))));
+        Throwable t = catchThrowable(() -> service.plan(List.of(draft(TGT_MG), draft(TGT_MG))));
 
         assertThat(t).isInstanceOf(DslException.class);
         assertThat(((DslException) t).code()).isEqualTo(DslError.DUPLICATE_ID);
@@ -445,15 +445,15 @@ class ApplyServiceTest {
 
     @Test
     void aParseErrorIsAttributedToItsDraftSource() {
-        String withUnknownField = TGT_MY + "bogus_field: 1\n";
+        String withUnknownField = TGT_MG + "bogus_field: 1\n";
 
         Throwable t = catchThrowable(() ->
-                service.plan(List.of(new ArtifactDraft("tgt_my.tap.yml", withUnknownField))));
+                service.plan(List.of(new ArtifactDraft("tgt_mg.tap.yml", withUnknownField))));
 
         assertThat(t).isInstanceOf(DslException.class);
         assertThat(((DslException) t).source())
                 .as("a parse error is located at its originating draft")
-                .isEqualTo("tgt_my.tap.yml");
+                .isEqualTo("tgt_mg.tap.yml");
     }
 
     @Test
@@ -463,12 +463,12 @@ class ApplyServiceTest {
         String reordered = """
                 version: tapstate/v1
                 kind: source
-                id: tgt_my
-                connector: mysql
-                config: { password: My_2026, username: writer, host: 10.30.0.5 }
+                id: tgt_mg
+                connector: mongodb
+                config: { auth_source: admin, uri: "mongodb://10.30.0.11:27017/ods" }
                 """;
 
-        String hashA = service.plan(List.of(draft(TGT_MY))).artifacts().get(0).contentHash();
+        String hashA = service.plan(List.of(draft(TGT_MG))).artifacts().get(0).contentHash();
         String hashB = service.plan(List.of(draft(reordered))).artifacts().get(0).contentHash();
 
         assertThat(hashA).isEqualTo(hashB);
@@ -476,10 +476,10 @@ class ApplyServiceTest {
 
     @Test
     void aMultiResourceWorkspaceIsPreparedPerResource() {
-        ApplyPlan plan = service.plan(List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MY)));
+        ApplyPlan plan = service.plan(List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MG)));
 
         assertThat(plan.artifacts()).extracting(PreparedArtifact::id)
-                .containsExactly("src_ora", "ora2my_ods", "tgt_my");
+                .containsExactly("src_ora", "ora2my_ods", "tgt_mg");
         assertThat(plan.artifacts()).allSatisfy(a ->
                 assertThat(a.contentHash()).matches("[0-9a-f]{64}"));
     }
@@ -508,25 +508,25 @@ class ApplyServiceTest {
 
     @Test
     void applyToAnEmptyStoreCreatesTheResourceAndWritesOnce() {
-        ApplyResult result = service.apply("alice", List.of(draft(TGT_MY)));
+        ApplyResult result = service.apply("alice", List.of(draft(TGT_MG)));
 
         assertThat(result.outcomes()).singleElement().satisfies(o -> {
-            assertThat(o.id()).isEqualTo("tgt_my");
+            assertThat(o.id()).isEqualTo("tgt_mg");
             assertThat(o.kind()).isEqualTo("source");
             assertThat(o.change()).isEqualTo(ArtifactOutcome.Change.CREATED);
             assertThat(o.contentHash()).matches("[0-9a-f]{64}");
         });
         assertThat(store.saveCount).as("a create writes exactly once").isEqualTo(1);
-        assertThat(store.get("tgt_my")).isPresent();
+        assertThat(store.get("tgt_mg")).isPresent();
     }
 
     @Test
     void reapplyingIdenticalContentIsANoOpAndDoesNotWrite() {
         // The core no-op guarantee: applying the same resource twice writes only once; the second apply
         // reads the stored artifact, finds an equal content hash, and skips the store write.
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
 
-        ApplyResult second = service.apply("alice", List.of(draft(TGT_MY)));
+        ApplyResult second = service.apply("alice", List.of(draft(TGT_MG)));
 
         assertThat(second.outcomes()).singleElement()
                 .extracting(ArtifactOutcome::change).isEqualTo(ArtifactOutcome.Change.UNCHANGED);
@@ -552,7 +552,7 @@ class ApplyServiceTest {
         ApplyService deriving = new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
                 PlanAdvisories.none(), derived::add);
-        List<ArtifactDraft> batch = List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MY));
+        List<ArtifactDraft> batch = List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MG));
         deriving.apply("alice", batch);
         derived.clear();
 
@@ -581,7 +581,7 @@ class ApplyServiceTest {
                     refreshed.add(pipeline);
                 });
         List<ArtifactDraft> batch = List.of(draft(SRC_ORA), draft(PIPELINE),
-                draft(PIPELINE.replace("ora2my_ods", "second_pipeline")), draft(TGT_MY));
+                draft(PIPELINE.replace("ora2my_ods", "second_pipeline")), draft(TGT_MG));
 
         ApplyResult first = deriving.apply("alice", batch);
 
@@ -618,7 +618,7 @@ class ApplyServiceTest {
                 PlanAdvisories.none(), pipeline -> { throw bug; });
 
         assertThatThrownBy(() -> deriving.apply("alice",
-                List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MY)))).isSameAs(bug);
+                List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MG)))).isSameAs(bug);
     }
 
     @Test
@@ -628,11 +628,11 @@ class ApplyServiceTest {
         String reordered = """
                 version: tapstate/v1
                 kind: source
-                id: tgt_my
-                connector: mysql
-                config: { password: My_2026, username: writer, host: 10.30.0.5 }
+                id: tgt_mg
+                connector: mongodb
+                config: { auth_source: admin, uri: "mongodb://10.30.0.11:27017/ods" }
                 """;
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
 
         ApplyResult second = service.apply("alice", List.of(draft(reordered)));
 
@@ -646,11 +646,11 @@ class ApplyServiceTest {
         String changed = """
                 version: tapstate/v1
                 kind: source
-                id: tgt_my
-                connector: mysql
-                config: { host: 10.30.0.5, username: writer, password: Changed_2026 }
+                id: tgt_mg
+                connector: mongodb
+                config: { uri: "mongodb://10.30.0.12:27017/ods", auth_source: admin }
                 """;
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
 
         ApplyResult second = service.apply("alice", List.of(draft(changed)));
 
@@ -658,16 +658,16 @@ class ApplyServiceTest {
                 .extracting(ArtifactOutcome::change).isEqualTo(ArtifactOutcome.Change.UPDATED);
         assertThat(store.saveCount).as("changed content writes a second time").isEqualTo(2);
         // The store now holds the changed canonical form (server-as-truth: the last write wins).
-        assertThat(new CanonicalWriter().write(store.get("tgt_my").orElseThrow()))
-                .contains("Changed_2026");
+        assertThat(new CanonicalWriter().write(store.get("tgt_mg").orElseThrow()))
+                .contains("10.30.0.12");
     }
 
     @Test
     void aMultiResourceBatchUpsertsEachByIdInSubmissionOrder() {
-        ApplyResult result = service.apply("alice", List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MY)));
+        ApplyResult result = service.apply("alice", List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MG)));
 
         assertThat(result.outcomes()).extracting(ArtifactOutcome::id)
-                .containsExactly("src_ora", "ora2my_ods", "tgt_my");
+                .containsExactly("src_ora", "ora2my_ods", "tgt_mg");
         assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
                 .containsOnly(ArtifactOutcome.Change.CREATED);
         assertThat(store.saveCount).isEqualTo(3);
@@ -675,14 +675,14 @@ class ApplyServiceTest {
 
     @Test
     void aMixedBatchWritesOnlyTheChangedAndNewResources() {
-        // Seed tgt_my. Then apply a batch of [tgt_my unchanged, src_ora new]: only the new resource is
+        // Seed tgt_mg. Then apply a batch of [tgt_mg unchanged, src_ora new]: only the new resource is
         // written — the no-op is decided per artifact, not per batch.
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
         assertThat(store.saveCount).isEqualTo(1);
 
-        ApplyResult result = service.apply("alice", List.of(draft(TGT_MY), draft(SRC_ORA_STANDALONE)));
+        ApplyResult result = service.apply("alice", List.of(draft(TGT_MG), draft(SRC_ORA_STANDALONE)));
 
-        assertThat(result.outcomes()).extracting(ArtifactOutcome::id).containsExactly("tgt_my", "src_ora");
+        assertThat(result.outcomes()).extracting(ArtifactOutcome::id).containsExactly("tgt_mg", "src_ora");
         assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
                 .containsExactly(ArtifactOutcome.Change.UNCHANGED, ArtifactOutcome.Change.CREATED);
         assertThat(store.saveCount).as("only the new resource is written").isEqualTo(2);
@@ -693,7 +693,7 @@ class ApplyServiceTest {
         // Validation runs over the whole batch before any upsert, so an invalid member leaves the store
         // untouched — no partial write. This is the validation-failure half of atomic batch; the
         // write-failure half is asserted by aWriteFailureMidBatchLeavesTheStoreUnchanged.
-        String bad = TGT_MY + "bogus_field: 1\n";
+        String bad = TGT_MG + "bogus_field: 1\n";
 
         Throwable t = catchThrowable(() -> service.apply("alice", List.of(draft(SRC_ORA), draft(bad))));
 
@@ -709,13 +709,13 @@ class ApplyServiceTest {
         // Both resources are valid, so the batch reaches the write phase; the store then fails on the
         // second write. Because apply hands the whole changed set to one atomic saveAll, the failure
         // rolls the batch back and nothing is stored — not even the first, earlier-ordered resource.
-        store.failOnId = "tgt_my";
+        store.failOnId = "tgt_mg";
 
-        Throwable t = catchThrowable(() -> service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY))));
+        Throwable t = catchThrowable(() -> service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG))));
 
         assertThat(t).isInstanceOf(RuntimeException.class);
         assertThat(store.get("src_ora")).as("the earlier-ordered write is rolled back, not left partial").isEmpty();
-        assertThat(store.get("tgt_my")).isEmpty();
+        assertThat(store.get("tgt_mg")).isEmpty();
         assertThat(store.list()).isEmpty();
     }
 
@@ -723,9 +723,9 @@ class ApplyServiceTest {
     void applyWritesTheChangedSetAsOneAtomicBatch() {
         // Two new resources in one apply are written as a single atomic batch, not one write per
         // artifact: the store records exactly one batch carrying both ids in submission order.
-        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG)));
 
-        assertThat(store.saveAllBatches).containsExactly(List.of("src_ora", "tgt_my"));
+        assertThat(store.saveAllBatches).containsExactly(List.of("src_ora", "tgt_mg"));
     }
 
     // ---- no audit, no execute: apply is an audited write and leaves a record per changed artifact ----
@@ -734,7 +734,7 @@ class ApplyServiceTest {
     void applyRecordsOneAuditEntryPerChangedArtifactAttributedToItsOwnId() {
         // artifact.apply is a registered audited verb, so the write must leave an audit record — and the
         // record's resourceId names the artifact it changed, so the log answers "who changed which one".
-        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG)));
 
         assertThat(auditStore.records).hasSize(2);
         assertThat(auditStore.records).allSatisfy(record -> {
@@ -742,7 +742,7 @@ class ApplyServiceTest {
             assertThat(record.principal()).isEqualTo("alice");
         });
         assertThat(auditStore.records).extracting(AuditRecord::resourceId)
-                .containsExactly("src_ora", "tgt_my");
+                .containsExactly("src_ora", "tgt_mg");
     }
 
     @Test
@@ -750,14 +750,14 @@ class ApplyServiceTest {
         // Without this the record is byte-identical to a blind overwrite of the same id, so the log
         // cannot answer whether the writer had read what it replaced — which is the question a
         // precondition exists to make answerable in the first place.
-        String current = service.apply("alice", List.of(draft(TGT_MY)))
+        String current = service.apply("alice", List.of(draft(TGT_MG)))
                 .outcomes().get(0).contentHash();
         auditStore.records.clear();
 
-        service.apply("alice", List.of(draft(TGT_MY_EDITED, current)));
+        service.apply("alice", List.of(draft(TGT_MG_EDITED, current)));
 
         assertThat(auditStore.records).singleElement().satisfies(record -> {
-            assertThat(record.resourceId()).isEqualTo("tgt_my");
+            assertThat(record.resourceId()).isEqualTo("tgt_mg");
             assertThat(record.expectedContentHash()).isEqualTo(current);
         });
     }
@@ -766,7 +766,7 @@ class ApplyServiceTest {
     void anApplyThatDeclaredNoVersionRecordsNone() {
         // The absence has to mean something: a record with no declared version is the unconditional
         // overwrite, and filling in the stored hash here would make every apply look version-checked.
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
 
         assertThat(auditStore.records).singleElement()
                 .satisfies(record -> assertThat(record.expectedContentHash()).isNull());
@@ -777,27 +777,27 @@ class ApplyServiceTest {
         // The drafts are matched to ids by what each one parsed to, not by position in the plan: the
         // plan is built from the validated workspace, whose order is its own. Getting this wrong files
         // one artifact's declared version under a different artifact's record.
-        String current = service.apply("alice", List.of(draft(TGT_MY)))
+        String current = service.apply("alice", List.of(draft(TGT_MG)))
                 .outcomes().get(0).contentHash();
         auditStore.records.clear();
 
-        service.apply("alice", List.of(draft(SRC_ORA_STANDALONE), draft(TGT_MY_EDITED, current)));
+        service.apply("alice", List.of(draft(SRC_ORA_STANDALONE), draft(TGT_MG_EDITED, current)));
 
         assertThat(auditStore.records)
                 .extracting(AuditRecord::resourceId, AuditRecord::expectedContentHash)
                 .containsExactlyInAnyOrder(
                         tuple("src_ora", null),
-                        tuple("tgt_my", current));
+                        tuple("tgt_mg", current));
     }
 
     @Test
     void applyRecordsNoAuditEntryForAnUnchangedArtifact() {
         // The no-op changes nothing, so it is not an auditable effect: re-applying identical content
         // leaves no second record, exactly as it performs no second write.
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
         assertThat(auditStore.records).hasSize(1);
 
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
 
         assertThat(auditStore.records)
                 .as("a no-op apply mutates nothing and so records nothing")
@@ -806,10 +806,10 @@ class ApplyServiceTest {
 
     @Test
     void aMixedBatchRecordsOnlyTheChangedArtifacts() {
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
         auditStore.records.clear();
 
-        service.apply("alice", List.of(draft(TGT_MY), draft(SRC_ORA_STANDALONE)));
+        service.apply("alice", List.of(draft(TGT_MG), draft(SRC_ORA_STANDALONE)));
 
         assertThat(auditStore.records).extracting(AuditRecord::resourceId)
                 .as("the audit log mirrors the write batch — only what actually changed")
@@ -824,12 +824,12 @@ class ApplyServiceTest {
                 TapstateCatalog::load, store, new AuditGate(new FailingAuditStore(), FIXED_CLOCK),
                 new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none());
 
-        Throwable t = catchThrowable(() -> refusing.apply("alice", List.of(draft(TGT_MY))));
+        Throwable t = catchThrowable(() -> refusing.apply("alice", List.of(draft(TGT_MG))));
 
         assertThat(t).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) t).code()).isEqualTo(ControlError.AUDIT_BLOCKED);
         assertThat(store.saveCount).as("an unaudited apply does not execute").isZero();
-        assertThat(store.get("tgt_my")).isEmpty();
+        assertThat(store.get("tgt_mg")).isEmpty();
     }
 
     @Test
@@ -850,23 +850,23 @@ class ApplyServiceTest {
 
     @Test
     void applyExcludesUnchangedResourcesFromTheWriteBatch() {
-        // Seed tgt_my, then apply [tgt_my unchanged, src_ora new]: the one atomic batch carries only the
+        // Seed tgt_mg, then apply [tgt_mg unchanged, src_ora new]: the one atomic batch carries only the
         // new resource — the unchanged one is not rewritten.
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
 
-        service.apply("alice", List.of(draft(TGT_MY), draft(SRC_ORA_STANDALONE)));
+        service.apply("alice", List.of(draft(TGT_MG), draft(SRC_ORA_STANDALONE)));
 
-        assertThat(store.saveAllBatches).containsExactly(List.of("tgt_my"), List.of("src_ora"));
+        assertThat(store.saveAllBatches).containsExactly(List.of("tgt_mg"), List.of("src_ora"));
     }
 
     @Test
     void anAllNoOpBatchPerformsNoWrite() {
         // A batch whose every member is unchanged writes nothing: the changed set is empty, so the one
         // atomic batch apply performs carries no resources.
-        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG)));
         int writesAfterSeed = store.saveCount;
 
-        ApplyResult result = service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        ApplyResult result = service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG)));
 
         assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
                 .containsOnly(ArtifactOutcome.Change.UNCHANGED);
@@ -879,12 +879,12 @@ class ApplyServiceTest {
     void aPlannedBatchCarriesTheAdvisoryFindingsAndStillPreparesEveryArtifact() {
         ApplyService advised = advisedBy(reporting(WIDE_NAMESPACE));
 
-        ApplyPlan plan = advised.plan(List.of(draft(TGT_MY), draft(SRC_ORA_STANDALONE)));
+        ApplyPlan plan = advised.plan(List.of(draft(TGT_MG), draft(SRC_ORA_STANDALONE)));
 
         assertThat(plan.warnings()).containsExactly(WIDE_NAMESPACE);
         assertThat(plan.artifacts()).extracting(PreparedArtifact::id)
                 .as("an advisory finding is a note, not a refusal — the batch is planned in full")
-                .containsExactly("tgt_my", "src_ora");
+                .containsExactly("tgt_mg", "src_ora");
     }
 
     @Test
@@ -894,7 +894,7 @@ class ApplyServiceTest {
         // apart, so a finding lands in warnings and leaves valid / diagnostics untouched.
         ApplyService advised = advisedBy(reporting(WIDE_NAMESPACE));
 
-        ArtifactValidationResult result = advised.validate(List.of(draft(TGT_MY)));
+        ArtifactValidationResult result = advised.validate(List.of(draft(TGT_MG)));
 
         assertThat(result.valid()).as("a finding never invalidates the batch").isTrue();
         assertThat(result.diagnostics()).as("a finding is not merged into the refusal reasons").isEmpty();
@@ -905,12 +905,12 @@ class ApplyServiceTest {
     void applyCarriesTheAdvisoryFindingsAndStillWritesTheBatch() {
         ApplyService advised = advisedBy(reporting(WIDE_NAMESPACE));
 
-        ApplyResult result = advised.apply("alice", List.of(draft(TGT_MY)));
+        ApplyResult result = advised.apply("alice", List.of(draft(TGT_MG)));
 
         assertThat(result.warnings()).containsExactly(WIDE_NAMESPACE);
         assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
                 .containsExactly(ArtifactOutcome.Change.CREATED);
-        assertThat(store.get("tgt_my")).as("a warned apply is still an apply").isPresent();
+        assertThat(store.get("tgt_mg")).as("a warned apply is still an apply").isPresent();
     }
 
     @Test
@@ -923,7 +923,7 @@ class ApplyServiceTest {
             return List.of(WIDE_NAMESPACE);
         });
 
-        ArtifactValidationResult result = advised.validate(List.of(draft(TGT_MY + "bogus_field: 1\n")));
+        ArtifactValidationResult result = advised.validate(List.of(draft(TGT_MG + "bogus_field: 1\n")));
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).extracting(ValidationDiagnostic::code)
@@ -936,9 +936,9 @@ class ApplyServiceTest {
     void anAssemblyWithNoAdvisoryRulesReportsNoWarningsAnywhere() {
         // The positive control for the three cases above: the same batches, reviewed by the no-op pass,
         // report nothing — so a populated warnings list can only have come from the advisory rules.
-        assertThat(service.plan(List.of(draft(TGT_MY))).warnings()).isEmpty();
-        assertThat(service.validate(List.of(draft(TGT_MY))).warnings()).isEmpty();
-        assertThat(service.apply("alice", List.of(draft(TGT_MY))).warnings()).isEmpty();
+        assertThat(service.plan(List.of(draft(TGT_MG))).warnings()).isEmpty();
+        assertThat(service.validate(List.of(draft(TGT_MG))).warnings()).isEmpty();
+        assertThat(service.apply("alice", List.of(draft(TGT_MG))).warnings()).isEmpty();
     }
 
     @Test
@@ -968,39 +968,39 @@ class ApplyServiceTest {
     void applyWithoutAPreconditionBehavesExactlyAsItDidBefore() {
         // The compatibility case: an existing caller passes no hash and keeps overwriting whatever is
         // stored. Without this, adding the precondition could silently start refusing today's callers.
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
 
-        ApplyResult result = service.apply("alice", List.of(draft(TGT_MY_EDITED)));
+        ApplyResult result = service.apply("alice", List.of(draft(TGT_MG_EDITED)));
 
         assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
                 .containsExactly(ArtifactOutcome.Change.UPDATED);
-        assertThat(stored("tgt_my")).isEqualTo(canonicalOf(TGT_MY_EDITED));
+        assertThat(stored("tgt_mg")).isEqualTo(canonicalOf(TGT_MG_EDITED));
     }
 
     @Test
     void applyWithTheCurrentPreconditionUpdatesTheArtifact() {
-        String current = service.apply("alice", List.of(draft(TGT_MY)))
+        String current = service.apply("alice", List.of(draft(TGT_MG)))
                 .outcomes().get(0).contentHash();
 
-        ApplyResult result = service.apply("alice", List.of(draft(TGT_MY_EDITED, current)));
+        ApplyResult result = service.apply("alice", List.of(draft(TGT_MG_EDITED, current)));
 
         assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
                 .containsExactly(ArtifactOutcome.Change.UPDATED);
-        assertThat(stored("tgt_my")).isEqualTo(canonicalOf(TGT_MY_EDITED));
+        assertThat(stored("tgt_mg")).isEqualTo(canonicalOf(TGT_MG_EDITED));
     }
 
     @Test
     void applyWithAStalePreconditionIsRefusedWithTheStoredBytesUnchanged() {
-        service.apply("alice", List.of(draft(TGT_MY)));
-        String before = stored("tgt_my");
+        service.apply("alice", List.of(draft(TGT_MG)));
+        String before = stored("tgt_mg");
         int writesBefore = store.saveCount;
 
-        assertThatThrownBy(() -> service.apply("alice", List.of(draft(TGT_MY_EDITED, "0".repeat(64)))))
+        assertThatThrownBy(() -> service.apply("alice", List.of(draft(TGT_MG_EDITED, "0".repeat(64)))))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code()).isEqualTo(ArtifactError.VERSION_CONFLICT);
-                    assertThat(error.args()).containsExactlyInAnyOrderEntriesOf(Map.of("id", "tgt_my"));
+                    assertThat(error.args()).containsExactlyInAnyOrderEntriesOf(Map.of("id", "tgt_mg"));
                 });
-        assertThat(stored("tgt_my"))
+        assertThat(stored("tgt_mg"))
                 .as("a refused apply leaves the stored canonical bytes exactly as they were")
                 .isEqualTo(before);
         assertThat(store.saveCount).isEqualTo(writesBefore);
@@ -1008,11 +1008,11 @@ class ApplyServiceTest {
 
     @Test
     void oneStaleDraftRefusesTheWholeBatchIncludingItsValidSiblings() {
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
         int writesBefore = store.saveCount;
 
         assertThatThrownBy(() -> service.apply("alice", List.of(
-                draft(SRC_ORA_STANDALONE), draft(TGT_MY_EDITED, "0".repeat(64)))))
+                draft(SRC_ORA_STANDALONE), draft(TGT_MG_EDITED, "0".repeat(64)))))
                 .isInstanceOfSatisfying(TapstateException.class,
                         error -> assertThat(error.code()).isEqualTo(ArtifactError.VERSION_CONFLICT));
         assertThat(store.get("src_ora"))
@@ -1023,10 +1023,10 @@ class ApplyServiceTest {
 
     @Test
     void aPreconditionOnAnArtifactThatIsNotStoredIsRefusedAsNotFound() {
-        assertThatThrownBy(() -> service.apply("alice", List.of(draft(TGT_MY, "0".repeat(64)))))
+        assertThatThrownBy(() -> service.apply("alice", List.of(draft(TGT_MG, "0".repeat(64)))))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code()).isEqualTo(ArtifactError.NOT_FOUND);
-                    assertThat(error.args()).containsExactlyInAnyOrderEntriesOf(Map.of("id", "tgt_my"));
+                    assertThat(error.args()).containsExactlyInAnyOrderEntriesOf(Map.of("id", "tgt_mg"));
                 });
         assertThat(store.saveCount).isZero();
     }
@@ -1040,18 +1040,18 @@ class ApplyServiceTest {
         //
         // This is what discriminates a precondition that is only checked from one that is enforced: an
         // unconditional batch write passes every other test in this class and fails only this one.
-        String readByBoth = service.apply("alice", List.of(draft(TGT_MY))).outcomes().get(0).contentHash();
-        Resource alicesEdit = new DslParser().parse(TGT_MY_EDITED);
+        String readByBoth = service.apply("alice", List.of(draft(TGT_MG))).outcomes().get(0).contentHash();
+        Resource alicesEdit = new DslParser().parse(TGT_MG_EDITED);
         store.concurrentWriter = () -> store.landDirectly(alicesEdit);
 
-        assertThatThrownBy(() -> service.apply("bob", List.of(draft(TGT_MY_EDITED_AGAIN, readByBoth))))
+        assertThatThrownBy(() -> service.apply("bob", List.of(draft(TGT_MG_EDITED_AGAIN, readByBoth))))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code()).isEqualTo(ArtifactError.VERSION_CONFLICT);
-                    assertThat(error.args()).containsExactlyInAnyOrderEntriesOf(Map.of("id", "tgt_my"));
+                    assertThat(error.args()).containsExactlyInAnyOrderEntriesOf(Map.of("id", "tgt_mg"));
                 });
-        assertThat(stored("tgt_my"))
+        assertThat(stored("tgt_mg"))
                 .as("the edit that landed first survives; the loser is refused rather than silently dropped")
-                .isEqualTo(canonicalOf(TGT_MY_EDITED));
+                .isEqualTo(canonicalOf(TGT_MG_EDITED));
     }
 
     @Test
@@ -1059,20 +1059,20 @@ class ApplyServiceTest {
         // The other half of the same window: a caller that declared nothing asked for no check, and
         // must keep overwriting exactly as it always did. Guarding an unasked-for precondition would
         // turn every concurrent apply into a refusal.
-        service.apply("alice", List.of(draft(TGT_MY)));
-        Resource alicesEdit = new DslParser().parse(TGT_MY_EDITED);
+        service.apply("alice", List.of(draft(TGT_MG)));
+        Resource alicesEdit = new DslParser().parse(TGT_MG_EDITED);
         store.concurrentWriter = () -> store.landDirectly(alicesEdit);
 
-        ApplyResult result = service.apply("bob", List.of(draft(TGT_MY_EDITED_AGAIN)));
+        ApplyResult result = service.apply("bob", List.of(draft(TGT_MG_EDITED_AGAIN)));
 
         assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
                 .containsExactly(ArtifactOutcome.Change.UPDATED);
-        assertThat(stored("tgt_my")).isEqualTo(canonicalOf(TGT_MY_EDITED_AGAIN));
+        assertThat(stored("tgt_mg")).isEqualTo(canonicalOf(TGT_MG_EDITED_AGAIN));
     }
 
     @Test
     void typedPipelineCreateRefusesWhenItsSourceChangesAfterWorkspaceValidation() {
-        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG)));
         Resource sourceEdit = new DslParser().parse(SRC_ORA.replace("10.20.0.15", "10.20.0.16"));
         store.concurrentWriter = () -> store.landDirectly(sourceEdit);
 
@@ -1095,15 +1095,15 @@ class ApplyServiceTest {
                 serve: { from: /.*/ }
                 """));
 
-        ApplyPlan plan = service.plan(List.of(draft(TGT_MY)));
+        ApplyPlan plan = service.plan(List.of(draft(TGT_MG)));
 
-        assertThat(plan.artifacts()).extracting(PreparedArtifact::id).containsExactly("tgt_my");
+        assertThat(plan.artifacts()).extracting(PreparedArtifact::id).containsExactly("tgt_mg");
         assertThat(plan.workspacePreconditions()).isEmpty();
     }
 
     @Test
     void typedCreateDoesNotConflictWithAnUnrelatedArtifactEdit() {
-        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG)));
         Resource unrelated = new DslParser().parse(PIPELINE.replace("ora2my_ods", "unrelated_pipeline"));
         store.landDirectly(unrelated);
         Resource unrelatedEdit = new DslParser().parse(
@@ -1126,10 +1126,10 @@ class ApplyServiceTest {
 
     @Test
     void validateReportsAStalePreconditionAsADiagnosticRatherThanThrowing() {
-        service.apply("alice", List.of(draft(TGT_MY)));
+        service.apply("alice", List.of(draft(TGT_MG)));
 
         ArtifactValidationResult result = service.validate(
-                List.of(draft(TGT_MY_EDITED, "0".repeat(64))));
+                List.of(draft(TGT_MG_EDITED, "0".repeat(64))));
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).singleElement().satisfies(diagnostic ->
@@ -1156,20 +1156,20 @@ class ApplyServiceTest {
     // The same oracle source with no pipeline referencing it — a standalone resource for batch tests.
     private static final String SRC_ORA_STANDALONE = SRC_ORA;
 
-    // TGT_MY after an edit: same id, one changed connection field, so it is an update rather than a no-op.
-    private static final String TGT_MY_EDITED = """
+    // TGT_MG after an edit: same id, one changed connection field, so it is an update rather than a no-op.
+    private static final String TGT_MG_EDITED = """
             version: tapstate/v1
             kind: source
-            id: tgt_my
+            id: tgt_mg
             connector: mysql
             config: { host: 10.30.0.9, username: writer, password: My_2026 }
             """;
 
     // A third version of the same id, so two authors' edits can be told apart in the store.
-    private static final String TGT_MY_EDITED_AGAIN = """
+    private static final String TGT_MG_EDITED_AGAIN = """
             version: tapstate/v1
             kind: source
-            id: tgt_my
+            id: tgt_mg
             connector: mysql
             config: { host: 10.30.0.11, username: writer, password: My_2026 }
             """;
@@ -1184,7 +1184,7 @@ class ApplyServiceTest {
               from: /.*/
               sync:
                 - id: my_ods
-                  source: tgt_my
+                  source: tgt_mg
                   write_mode: upsert
                   ddl: apply
             """;

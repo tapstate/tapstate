@@ -8,6 +8,7 @@ import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.DiscoveredTable;
 import io.tapstate.core.dsl.RowExpressionTypeRules;
+import io.tapstate.core.dsl.TargetConnectorRules;
 import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.dsl.WriteKeyRules;
@@ -185,6 +186,12 @@ public final class ApplyService {
         Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources);
         RowExpressionTypeRules.validate(validationResources, discovered);
         WriteKeyRules.validate(validationResources, discovered);
+        // Judged over the submitted resources and resolved against the whole candidate workspace.
+        // The two differ on both sides here: the typed path's validation set is a reference closure
+        // that reaches stored referrers, which must not be refused for an edit they were pulled into,
+        // and a write target is a connection document normally filed by an earlier batch, which has
+        // to be resolvable or every sync whose target was not resubmitted would pass unjudged.
+        TargetConnectorRules.validate(submitted, candidate);
         List<Resource> validated = List.copyOf(workspace.resources());
         Map<String, String> workspacePreconditions = new LinkedHashMap<>();
         for (Resource resource : validated) {

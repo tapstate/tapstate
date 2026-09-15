@@ -6,6 +6,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -33,9 +34,35 @@ final class NestKeys {
             // it, so a key built from one matches nothing and nothing reports it: the join runs, the rows
             // arrive, and the document simply never fills in. Two carriers do compare by their parts, so
             // it is the mixed pairing this is here for, not the matched one.
-            values.add(ConvertedValue.unwrap(row.get(field)));
+            values.add(normalized(ConvertedValue.unwrap(row.get(field))));
         }
         return Collections.unmodifiableList(values);
+    }
+
+    /**
+     * An exact decimal reduced to the number it is; every other value as it came.
+     *
+     * <p>A key is a number, never one spelling of it. {@code BigDecimal} equality compares the scale
+     * beside the value, so {@code 10.50} and {@code 10.5} are two keys where they are one number -
+     * one parent's elements split across two, and its state filed under two names, with nothing to
+     * report: the job runs, the rows arrive, and half of them assemble somewhere nobody looks. A
+     * fixed-scale column never produces both spellings, which is why this went unseen; a document
+     * store's exact decimal keeps whatever scale each value was written with, and one column there
+     * hands over both. A join key drops the trailing zeros for this reason, so the two key boundaries
+     * now answer alike.
+     *
+     * <p>Only the scale goes. Kinds stay apart in the state layer as they always were - {@code 1} the
+     * whole number and {@code 1.0} the decimal are still two keys - and nothing here merges them.
+     */
+    private static Object normalized(Object value) {
+        if (!(value instanceof BigDecimal decimal)) {
+            return value;
+        }
+        BigDecimal stripped = decimal.stripTrailingZeros();
+        // A stripped whole number carries a negative scale (100 becomes 1E+2), which renders in the
+        // state layer as the exponent form. The value is the same either way; this keeps the name the
+        // one an operator reading it would expect.
+        return stripped.scale() < 0 ? stripped.setScale(0) : stripped;
     }
 
     /** The row an event carries: what it became, or what it was when that is all a deletion leaves. */
