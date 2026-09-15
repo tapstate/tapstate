@@ -409,6 +409,31 @@ class TapEventValueModelTest {
     }
 
     @Test
+    void aCarriedValueInsideAnArrayIsRestoredLikeTheSameValueInsideADocument() {
+        // The measured document, both halves in one row and one run: the same driver value inside a
+        // document and inside an array, under the schema a real source reports for it - a dotted path
+        // for the field inside the document, the array named as an array, and nothing named beneath it.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("meta", new LinkedHashMap<>(Map.of("ref", key)), "arr", List.of(key)),
+                CODECS,
+                Map.of("meta.ref", KEY_COLUMN, "meta", "DOCUMENT", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("meta"))
+                .as("the half the schema names, which the way back already restores")
+                .isEqualTo(Map.of("ref", key));
+        // The array half is what a target of the same kind stores wrongly: the element arrives as the
+        // text it travelled as, the row lands, and the write reports success. The array's own declared
+        // name cannot close this - it is declared an array here, and rebuilding an element as whatever
+        // the array is declared to be would be a different defect that also reported success.
+        assertThat(encoded.getAfter().get("arr"))
+                .as("the same value inside an array, which reaches the target as its portable value")
+                .isEqualTo(List.of(key));
+    }
+
+    @Test
     void aDriverObjectFromAnotherConnectorsLoaderIsNotHandedToThisOnesConversion(@TempDir Path dir)
             throws ClassNotFoundException {
         // Two connectors, two isolated loaders, one class name. Conversions are looked up by name, so
