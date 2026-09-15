@@ -78,6 +78,29 @@ wherever the server is. Two cases catch people out:
 Getting this wrong shows up as a connection failure at `discover-schema`, which is the first command
 that actually reaches the database.
 
+## When you start before the source schema has been discovered
+
+`discover-schema` is a command you run, not something `start` does for you, and forgetting it is the
+common first mistake on your own databases. `start` accepts the pipeline - nothing is wrong with the
+definition - and the run then fails on the next convergence pass, so `status` is where you see it:
+
+```
+order_pipeline  failed
+reason: actuation.source-schema-not-discovered
+  Source `src_orders` needs a discovered schema before its tables can be selected.
+why: the run failed, and said why: actuation.source-schema-not-discovered
+  read       status.failure = actuation.source-schema-not-discovered
+  next       tapstate logs order_pipeline
+```
+
+Run `discover-schema` for the source it names, then start again.
+
+One shape does not fail this way, and you should not read that as permission to skip the step: a
+pipeline whose only output is a view over tables named literally starts, reports itself healthy, and
+materializes rows carrying **the primary key alone** - every other column is silently dropped, because
+the columns a view is built from come from the discovered schema and there is none. Nothing on any read
+face says so. Discover the schema before you start, whatever the pipeline's output shape is.
+
 ## When a pipeline says `running` but nothing arrives
 
 `status` reports the pipeline's last published state, and then answers this question directly. A

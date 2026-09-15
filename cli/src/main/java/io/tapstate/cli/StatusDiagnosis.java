@@ -122,10 +122,15 @@ final class StatusDiagnosis {
         }
         if (metrics != null && tablesLoading != null
                 && (metrics.recordCount() == null || metrics.recordCount() == 0) && tablesLoading == 0) {
-            // What this answer is still missing, said here so it is not mistaken for finished: the words the
-            // connector itself wrote about why it could not read are not carried into it yet -- they are
-            // discarded on the way to the log face -- and whether a source that was never discovered lands
-            // in this rule or is refused earlier has not been settled. Both are separate pieces of work.
+            // This rule deliberately says nothing about a source whose schema was never discovered, which is
+            // the shape most likely to be added here by whoever reads it next. Measured, not assumed: such a
+            // source is refused before it runs, with its own code naming it, so it never reaches this rule --
+            // the failure code is read one rule earlier, and repeating it here would send a reader to run a
+            // discovery that is not what is wrong. The one shape that starts anyway, a view over literally
+            // named tables, does not reach this rule either, and for a worse reason: it moves rows, and the
+            // rows are missing every column but the key. No face here can see that, and none pretends to --
+            // records were driven and a table is loading, so the readings this rule matches on are absent.
+            // Filed as tapstate/tapstate#407; when it is fixed, that shape joins the refusal above, not this.
             return new Answer(
                     "nothing has moved: no records driven and no table loading",
                     List.of("metrics.recordCount = "
