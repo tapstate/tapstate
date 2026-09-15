@@ -4,6 +4,7 @@ import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
 import org.bson.Document;
 import org.bson.types.Binary;
+import org.bson.types.Decimal128;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -100,6 +101,9 @@ final class RowImages {
     }
 
     private static Object decoded(Object value) {
+        if (value instanceof Decimal128 decimal) {
+            return decimal.bigDecimalValue();
+        }
         if (value instanceof Map<?, ?> map) {
             if (map.get(CARRIED) != null) {
                 return new ConvertedValue(decoded(map.get(CARRIED)), (String) map.get(ORIGIN_TYPE));

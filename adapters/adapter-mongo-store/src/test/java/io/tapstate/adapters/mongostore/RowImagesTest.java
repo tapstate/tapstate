@@ -10,8 +10,10 @@ import org.bson.Document;
 import org.bson.codecs.DecoderContext;
 import org.bson.codecs.DocumentCodec;
 import org.bson.codecs.EncoderContext;
+import org.bson.types.Decimal128;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 
@@ -99,6 +101,21 @@ class RowImagesTest {
                 .as("BSON hands a binary of that one tag back as a plain byte array rather than as a "
                         + "binary, so a decode that reads the tag off the binary loses this case alone")
                 .isEqualTo(new ConvertedValue(new Bytes((byte) 0, new byte[] {9}), "BINARY"));
+    }
+
+    @Test
+    void aCarriedExactDecimalComesBackAsAPortableBigDecimal() {
+        BigDecimal exact = new BigDecimal("1234567890.123456789012345678901234");
+
+        Map<String, Object> read = overTheWire(
+                Map.of("amount", new ConvertedValue(exact, "DECIMAL128")));
+
+        assertThat(read.get("amount"))
+                .as("the durable log must not replace a portable decimal with its own driver type")
+                .isEqualTo(new ConvertedValue(exact, "DECIMAL128"));
+        assertThat(((ConvertedValue) read.get("amount")).value())
+                .isInstanceOf(BigDecimal.class)
+                .isNotInstanceOf(Decimal128.class);
     }
 
     @Test
