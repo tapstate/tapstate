@@ -42,15 +42,19 @@ This preview certifies the following database kinds, with certification scoped b
 
 | Database | Connector kind | Certified use |
 |---|---|---|
-| MySQL | `mysql` | Read and write |
-| PostgreSQL | `postgres` | Read and write |
+| MySQL | `mysql` | Read |
+| PostgreSQL | `postgres` | Read |
 | MongoDB | `mongodb` | Read and write |
-| Oracle | `oracle` | Read and write |
-| SQL Server | `sqlserver` | Read and write |
+| Oracle | `oracle` | Read |
+| SQL Server | `sqlserver` | Read |
 
-Oracle Free 23 and SQL Server 2022 targets are verified with MySQL snapshot and CDC
-inserts, updates and deletes, automatic table/index preparation, and full-load policies.
-Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
+A `serve.sync` element installs onto the `mongodb` connector and no other. Applying a
+pipeline whose sync names one of the other certified connectors is refused, naming that
+connector; reading through it is unaffected. A connector outside the accepted set is not
+judged, so a deployment that widened its own accepted ids still decides for itself.
+
+Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other
+kinds, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
 all-data-type matrix. The default accepted set contains 16 connector ids
 across these five database kinds, including existing managed variants of MySQL,
@@ -89,17 +93,16 @@ schema passed snapshot reads in the live check, but Oracle LogMiner marked its
 changes unsupported, so CDC delivered no rows. Tapstate does not yet reject that
 schema configuration before starting.
 
-## Preparing a relational target
+## Existing rows in the target
 
-A relational target table is created from the source model when it is absent. The
-runtime also prepares the unique index needed by the chosen upsert key. Existing
+A target collection is created from the source model when it is absent. Existing
 target rows are governed by `on_full_load` on each `serve.sync` element:
 
 | Policy | Before a new full load |
 |---|---|
 | `append` (default) | Keep existing rows and use the configured `write_mode`. |
 | `clear` | Clear existing rows before writing the new full load. |
-| `fail` | Refuse to start writing if the target table is not empty. |
+| `fail` | Refuse to start writing if the target collection is not empty. |
 
 For example, a sync to the `warehouse` connection can request a clean full load:
 
@@ -111,7 +114,7 @@ serve:
       on_full_load: clear
 ```
 
-An empty or newly created table is allowed with `fail`. Resume, failure recovery,
+An empty or newly created collection is allowed with `fail`. Resume, failure recovery,
 and `cdc_only` runs never clear the target, even when `clear` is declared.
 `restart --rerun` resets the pipeline's progress and starts a new full load; it
 still follows `on_full_load`, so use `clear` explicitly when existing target rows

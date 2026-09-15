@@ -157,6 +157,7 @@ dsl.row-expression-type-unsupported
 dsl.undefined-variable
 dsl.unknown-field
 dsl.unsupported-mode
+dsl.unsupported-target-connector
 dsl.unsupported-version
 dsl.unwind-column-already-exists
 dsl.unwind-needs-an-element-key

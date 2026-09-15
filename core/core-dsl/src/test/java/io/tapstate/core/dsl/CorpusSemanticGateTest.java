@@ -83,6 +83,10 @@ class CorpusSemanticGateTest {
         // lives outside it.
         //   CONFIG_REQUIRED: the verdict depends on the live connector catalog, which the offline
         //   WorkspaceLoader this corpus exercises does not consult.
+        //   UNSUPPORTED_TARGET_CONNECTOR: what may be written to is a property of the deployment
+        //   being applied to -- which widens its own accepted connector set -- so the gate runs on
+        //   the apply path and this loader never reaches it (TargetConnectorRulesTest, plus the
+        //   apply-path refusal in control-core).
         //   ROW_EXPRESSION_NEEDS_DISCOVERY / ROW_EXPRESSION_TYPE_UNSUPPORTED /
         //   ROW_EXPRESSION_TYPE_UNKNOWN: the verdict depends on whether a source has been discovered
         //   and on the column types that discovery resolved, neither of which a document declares nor
@@ -103,7 +107,7 @@ class CorpusSemanticGateTest {
         //   unknown kind reported as a kind problem).
         Set<DslError> requiresCorpusWitness = EnumSet.complementOf(EnumSet.of(
                 DslError.MALFORMED_YAML, DslError.UNDEFINED_VARIABLE, DslError.MALFORMED_INTERPOLATION,
-                DslError.CONFIG_REQUIRED,
+                DslError.CONFIG_REQUIRED, DslError.UNSUPPORTED_TARGET_CONNECTOR,
                 DslError.ROW_EXPRESSION_NEEDS_DISCOVERY, DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED,
                 DslError.ROW_EXPRESSION_TYPE_UNKNOWN, DslError.UPSERT_NEEDS_KEY,
                 DslError.UNWIND_COLUMN_ALREADY_EXISTS, DslError.UNSUPPORTED_VERSION));
