@@ -396,16 +396,120 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void aCarriedValueInsideAnArrayReachesTheTargetAsItsPortableValue() {
-        // An array is named as an array and its elements are not named at all, so an element has no
-        // path of its own to look up. Pinned rather than left to be found: the way in converts these
-        // as readily as it converts a document's fields, and only the way out stops short.
+    void anArrayElementIsNeverRebuiltAsWhateverTheArrayItselfIsDeclaredToBe() {
+        // The array column is declared the very type its element is, and the row holds that type
+        // nowhere else - so the array's own declared name is the only name on offer. Lending it to the
+        // element would rebuild every element as whatever the array is declared to be and report
+        // success, which is a worse answer than the portable value, so the element stays portable.
         Envelope decoded = insert(row("refs", List.of(new DriverKey("64f0c0de"))),
                 CODECS, Map.of("refs", KEY_COLUMN));
 
         TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
 
         assertThat(encoded.getAfter().get("refs")).isEqualTo(List.of("64f0c0de"));
+    }
+
+    @Test
+    void aCarriedValueInsideAnArrayIsRestoredLikeTheSameValueInsideADocument() {
+        // The measured document, both halves in one row and one run: the same driver value inside a
+        // document and inside an array, under the schema a real source reports for it - a dotted path
+        // for the field inside the document, the array named as an array, and nothing named beneath it.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("meta", new LinkedHashMap<>(Map.of("ref", key)), "arr", List.of(key)),
+                CODECS,
+                Map.of("meta.ref", KEY_COLUMN, "meta", "DOCUMENT", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("meta"))
+                .as("the half the schema names, which the way back already restores")
+                .isEqualTo(Map.of("ref", key));
+        // The array half is what a target of the same kind stored wrongly before this reading existed:
+        // the element arrived as the text it travelled as, the row landed, and the write reported
+        // success. The array's own declared name cannot close that - it is declared an array here, and
+        // rebuilding an element as whatever the array is declared to be would be a different defect
+        // that also reported success. What restores it is the name this same schema gives that driver
+        // type at the one place it does name one: the dotted path asserted above.
+        assertThat(encoded.getAfter().get("arr"))
+                .as("the same value inside an array, restored from what the schema calls that type")
+                .isEqualTo(List.of(key));
+    }
+
+    @Test
+    void anArrayElementIsRestoredWhicheverOrderTheConnectorReportedTheRowIn() {
+        // The same row with the array reported first. What the schema calls this driver type is read
+        // off the whole row before any value is converted, so the answer cannot depend on field order -
+        // read as the walk went, this row would restore nothing and the one above would restore, and a
+        // document would decode two ways for no reason a reader could see.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("arr", List.of(key), "meta", new LinkedHashMap<>(Map.of("ref", key))),
+                CODECS,
+                Map.of("meta.ref", KEY_COLUMN, "meta", "DOCUMENT", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("arr")).isEqualTo(List.of(key));
+    }
+
+    @Test
+    void aCarriedValueInsideADocumentInsideAnArrayIsRestoredTheSameWay() {
+        // Below an element there is no place the schema could name either, so the same reading answers
+        // all the way down rather than stopping at the element itself.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("meta", new LinkedHashMap<>(Map.of("ref", key)),
+                        "arr", List.of(new LinkedHashMap<>(Map.of("ref", key)))),
+                CODECS,
+                Map.of("meta.ref", KEY_COLUMN, "meta", "DOCUMENT", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("arr")).isEqualTo(List.of(Map.of("ref", key)));
+    }
+
+    @Test
+    void bothImagesOfOneUpdateRestoreItsArrayTheSameWay() {
+        // A before image the connector reported without the column that names this driver type, beside
+        // an after image that has it - which a connector is free to do, and several do. Read per image,
+        // the half that carries the name would restore and the half that does not would not, so one
+        // change would say an array changed when nothing in it did.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = TapEventCodec.decodeChange(
+                TapUpdateRecordEvent.create().table("orders").referenceTime(1000L)
+                        .before(row("arr", List.of(key)))
+                        .after(row("_id", key, "arr", List.of(key))),
+                CODECS,
+                Map.of("_id", KEY_COLUMN, "arr", "ARRAY"));
+
+        TapUpdateRecordEvent encoded = (TapUpdateRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getBefore().get("arr"))
+                .as("the array on the side the naming column is missing from")
+                .isEqualTo(encoded.getAfter().get("arr"))
+                .isEqualTo(List.of(key));
+    }
+
+    @Test
+    void aDriverTypeTheSchemaSpellsTwoWaysLeavesItsArrayElementsAlone() {
+        // Two named columns of one driver type, declared differently - which a schema is free to do.
+        // There is then no single answer to what this source calls that type, and picking either
+        // spelling would rebuild every element as one of them and report success.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("id", key, "ref", key, "arr", List.of(key)),
+                CODECS,
+                Map.of("id", KEY_COLUMN, "ref", "OTHER_KEY", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("arr"))
+                .as("the element, which has no name of its own and now no unambiguous type either")
+                .isEqualTo(List.of("64f0c0de"));
+        // The named halves are untouched by the ambiguity: each is looked up by its own place.
+        assertThat(encoded.getAfter().get("id")).isEqualTo(key);
+        assertThat(encoded.getAfter().get("ref")).isEqualTo("64f0c0de");
     }
 
     @Test
