@@ -145,7 +145,8 @@ public enum DslError implements TapstateErrorCode {
      * speak about a document only a deployment that widened its own accepted set can produce.
      */
     UNSUPPORTED_TARGET_CONNECTOR(
-            "dsl.unsupported-target-connector", Set.of("connector", "source", "path")),
+            "dsl.unsupported-target-connector",
+            Set.of("connector", "source", "resource", "supported", "path")),
     /** A generated unwind column would overwrite a parent column or another generated column. */
     UNWIND_COLUMN_ALREADY_EXISTS(
             "dsl.unwind-column-already-exists", Set.of("column", "option")),

@@ -7,7 +7,9 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.dsl.DslException;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.SchemaStore;
@@ -32,6 +34,13 @@ import org.junit.jupiter.api.Test;
  * <p>The refusal has to land before anything is written, for the same reason as the other apply-path
  * gates: an apply that refused the pipeline and stored it anyway would leave behind exactly the
  * artifact the refusal exists to keep out.
+ *
+ * <p>These cases are the wiring, so they run against a store rather than against a batch: what a
+ * deployment holds and what an author submitted are different sets here, and the two directions the
+ * rule has to get right are only visible once they differ. A write target is filed once and referred
+ * to afterwards, so it is normally stored rather than resubmitted; a stored artifact an earlier
+ * release filed is not the author's to answer for, and on the typed path the resource set reaching
+ * validation reaches it anyway.
  */
 class ApplyServiceTargetConnectorTest {
 
@@ -43,7 +52,7 @@ class ApplyServiceTargetConnectorTest {
             kind: source
             id: src_orders
             connector: mysql
-            config: { host: 10.10.0.5, username: u, password: p }
+            config: { host: 10.10.0.5, database: ods, username: u, password: p }
             mode: cdc
             tables: [ orders ]
             """;
@@ -57,6 +66,23 @@ class ApplyServiceTargetConnectorTest {
                 config: %s
                 """.formatted(id, connector, config);
     }
+
+    private static final String SERVE_DEFINITION = """
+            version: tapstate/v1
+            kind: serve
+            id: out
+            sync: [ { id: s, source: tgt_pg, write_mode: upsert } ]
+            """;
+
+    private static final String PIPELINE_USING_THE_DEFINITION = """
+            version: tapstate/v1
+            kind: pipeline
+            id: orders_out
+            source: src_orders
+            transforms:
+              - { id: keep, from: [orders], type: filter, expr: "op != 'd'" }
+            serve: out
+            """;
 
     private static String pipelineWritingTo(String targetId) {
         return """
@@ -118,6 +144,67 @@ class ApplyServiceTargetConnectorTest {
         assertThat(artifacts.get("orders_out")).isPresent();
     }
 
+    // ---- what a deployment already holds ---------------------------------------------------
+
+    @Test
+    @DisplayName("a typed pipeline write is refused for a definition and a target it only references")
+    void aTypedPipelineWriteIsRefusedForADefinitionAndTargetItOnlyReferences() {
+        // The typed face submits one document. Everything the pipeline writes through is stored, so a
+        // rule resolving ids within the submitted set has nothing to judge and installs the write.
+        DslParser parser = new DslParser();
+        artifacts.landDirectly(parser.parse(READ_SOURCE));
+        artifacts.landDirectly(parser.parse(target("tgt_pg", "postgres",
+                "{ host: 10.30.0.6, database: dw, username: w, password: p }")));
+        artifacts.landDirectly(parser.parse(SERVE_DEFINITION));
+
+        DslException thrown = catchThrowableOfType(DslException.class, () ->
+                service.create("tester", parser.parse(PIPELINE_USING_THE_DEFINITION)));
+
+        assertThat(thrown.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+        assertThat(thrown.args()).containsEntry("connector", "postgres").containsEntry("resource", "out");
+        assertThat(artifacts.get("orders_out")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("apply refuses a sync written in a serve definition, and stores nothing")
+    void applyRefusesASyncCarriedByAServeDefinition() {
+        // Nothing existence-checks a standalone definition's sinks — the reference closure visits an
+        // inline serve only — so a definition is the one place a sync can name a target the batch
+        // never carried. A rule resolving ids within the submitted set finds nothing here.
+        service.apply("tester", List.of(new ArtifactDraft("tgt_pg.tap.yml",
+                target("tgt_pg", "postgres", "{ host: 10.30.0.6, database: dw, username: w, password: p }"))));
+
+        DslException thrown = catchThrowableOfType(DslException.class, () -> service.apply("tester",
+                List.of(new ArtifactDraft("src_orders.tap.yml", READ_SOURCE),
+                        new ArtifactDraft("out.tap.yml", SERVE_DEFINITION),
+                        new ArtifactDraft("orders_out.tap.yml", PIPELINE_USING_THE_DEFINITION))));
+
+        assertThat(thrown.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+        assertThat(thrown.args()).containsEntry("resource", "out");
+        assertThat(thrown.path()).isEqualTo("sync[0].source");
+        assertThat(artifacts.get("orders_out")).isEmpty();
+        assertThat(artifacts.get("out")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("a typed source edit is not refused for a stored pipeline the closure only pulled in")
+    void aTypedSourceEditIsNotRefusedForAPipelineItOnlyPulledIn() {
+        // The state an upgrade inherits: a pipeline filed while a relational target was still
+        // installable. The typed write path validates the submitted source's referrer closure, which
+        // reaches that pipeline and, through it, the connection it writes to.
+        DslParser parser = new DslParser();
+        artifacts.landDirectly(parser.parse(READ_SOURCE));
+        artifacts.landDirectly(parser.parse(target("tgt_pg", "postgres",
+                "{ host: 10.30.0.6, database: dw, username: w, password: p }")));
+        artifacts.landDirectly(parser.parse(pipelineWritingTo("tgt_pg")));
+        Resource rotated = parser.parse(READ_SOURCE.replace("password: p", "password: rotated"));
+
+        assertThatCode(() -> service.replace("tester", rotated,
+                CanonicalHash.of(artifacts.get("src_orders").orElseThrow())))
+                .doesNotThrowAnyException();
+        assertThat(artifacts.get("src_orders").orElseThrow()).isEqualTo(rotated);
+    }
+
     // ---- doubles -------------------------------------------------------------------------
 
     private static final class InMemoryArtifactStore implements ArtifactStore {
@@ -128,6 +215,27 @@ class ApplyServiceTargetConnectorTest {
         public void saveAll(List<Resource> artifacts) {
             saved.addAll(artifacts);
             artifacts.forEach(r -> byId.put(r.id(), r));
+        }
+
+        /**
+         * The conditional batch the typed write path uses: every named id must still store the hash
+         * declared against it, or the batch writes nothing and names the id that moved on.
+         */
+        @Override
+        public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+            for (Map.Entry<String, String> precondition : expectedContentHashes.entrySet()) {
+                Resource stored = byId.get(precondition.getKey());
+                if (stored == null || !CanonicalHash.of(stored).equals(precondition.getValue())) {
+                    return Optional.of(precondition.getKey());
+                }
+            }
+            saveAll(artifacts);
+            return Optional.empty();
+        }
+
+        /** Puts a resource in the store without going through apply, the way an earlier release left it. */
+        void landDirectly(Resource resource) {
+            byId.put(resource.id(), resource);
         }
 
         @Override

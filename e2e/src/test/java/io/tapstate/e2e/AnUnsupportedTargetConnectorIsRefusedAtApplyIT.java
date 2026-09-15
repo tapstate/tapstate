@@ -22,6 +22,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Both directions are asserted against the same server. A rule that refused every batch would
  * satisfy the first half; the second half applies a batch differing only in the target's connector,
  * so what the first case refused is the connector and not the shape of the pipeline.
+ *
+ * <p>The second case is the shape a deployment actually has rather than the shape a test batch has:
+ * the connection was filed by an earlier apply, and the write is declared in a reusable serve
+ * definition rather than inline. Both of those are ordinary, and each one on its own is enough to
+ * make a narrower rule pass the pipeline through.
  */
 class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
 
@@ -51,6 +56,31 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
             id: tgt_out
             connector: mongodb
             config: { uri: "mongodb://10.30.0.11:27017/ods" }
+            """;
+
+    private static final String ATLAS_TARGET = """
+            version: tapstate/v1
+            kind: source
+            id: tgt_out
+            connector: mongodb-atlas
+            config: { isUri: true, uri: "mongodb://10.30.0.11:27017/ods" }
+            """;
+
+    private static final String SERVE_DEFINITION = """
+            version: tapstate/v1
+            kind: serve
+            id: out
+            sync: [ { id: s, source: tgt_out, write_mode: upsert } ]
+            """;
+
+    private static final String PIPELINE_USING_THE_DEFINITION = """
+            version: tapstate/v1
+            kind: pipeline
+            id: orders_out
+            source: src_orders
+            transforms:
+              - { id: keep, from: [orders], type: filter, expr: "op != 'd'" }
+            serve: out
             """;
 
     private static final String PIPELINE = """
@@ -98,6 +128,46 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
             assertThat(control.artifactIds())
                     .as("the same batch, with only the target's connector changed, is installed")
                     .contains("orders_out", "tgt_out", "src_orders");
+        }
+    }
+
+    @Test
+    void aSyncDeclaredInAServeDefinitionIsRefusedEvenWhenItsTargetWasFiledEarlier() {
+        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_target_connector_serve"))) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
+
+            // A connection is filed on its own and referred to afterwards, which is how a deployment
+            // is built up. Nothing about the document says which role it will be asked for, so filing
+            // it is accepted.
+            control.apply(Map.of("tgt_out.tap.yml", PG_TARGET));
+
+            ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
+                    "src_orders.tap.yml", SOURCE,
+                    "out.tap.yml", SERVE_DEFINITION,
+                    "orders_out.tap.yml", PIPELINE_USING_THE_DEFINITION));
+
+            assertThat(refusal.code()).isEqualTo(UNSUPPORTED_TARGET_CONNECTOR);
+            assertThat(refusal.params())
+                    .as("the document to edit is the definition the element is written in, and the "
+                            + "field path is the one that resolves in it")
+                    .containsEntry("connector", "postgres")
+                    .containsEntry("resource", "out")
+                    .containsEntry("path", "sync[0].source");
+            assertThat(control.artifactIds())
+                    .as("what the server holds after refusing the batch")
+                    .doesNotContain("orders_out", "out", "src_orders");
+
+            control.apply(Map.of(
+                    "src_orders.tap.yml", SOURCE,
+                    "tgt_out.tap.yml", ATLAS_TARGET,
+                    "out.tap.yml", SERVE_DEFINITION,
+                    "orders_out.tap.yml", PIPELINE_USING_THE_DEFINITION));
+
+            assertThat(control.artifactIds())
+                    .as("the same batch installs once the target is a connector of the write kind — "
+                            + "a managed variant of it, which is what a deployment on one registers")
+                    .contains("orders_out", "out", "tgt_out", "src_orders");
         }
     }
 }

@@ -75,8 +75,10 @@ class DslErrorTest {
         assertThat(DslError.MISSING_REFERENCE.placeholders()).containsExactlyInAnyOrder("ref", "path");
         assertThat(DslError.AMBIGUOUS_REFERENCE.placeholders()).containsExactlyInAnyOrder("ref", "path");
         assertThat(DslError.MODE_MISMATCH.placeholders()).containsExactlyInAnyOrder("field", "mode", "path");
+        // the document the offending element is written in is named too: a path alone does not say
+        // which of several pipelines in a batch, nor which serve definition carries the element
         assertThat(DslError.UNSUPPORTED_TARGET_CONNECTOR.placeholders())
-                .containsExactlyInAnyOrder("connector", "source", "path");
+                .containsExactlyInAnyOrder("connector", "source", "resource", "supported", "path");
         // the pipeline is what made the field required, so it is named alongside the source that lacks it
         assertThat(DslError.MODE_REQUIRED_FOR_READ.placeholders())
                 .containsExactlyInAnyOrder("source", "pipeline", "path");

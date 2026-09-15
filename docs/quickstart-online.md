@@ -48,9 +48,10 @@ This preview certifies the following database kinds, with certification scoped b
 | Oracle | `oracle` | Read |
 | SQL Server | `sqlserver` | Read |
 
-A `serve.sync` element installs onto the `mongodb` connector and no other. Applying a
-pipeline whose sync names one of the other certified connectors is refused, naming that
-connector; reading through it is unaffected. A connector outside the accepted set is not
+A `serve.sync` element installs onto the `mongodb` kind and no other,
+on any of its accepted ids. Applying a pipeline whose sync names one of the other
+certified connectors is refused, naming that connector and the document the element is
+written in; reading through it is unaffected. A connector outside the accepted set is not
 judged, so a deployment that widened its own accepted ids still decides for itself.
 
 Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other
