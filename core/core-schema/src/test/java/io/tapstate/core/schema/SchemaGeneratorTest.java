@@ -186,8 +186,24 @@ class SchemaGeneratorTest {
         assertThat(pipeline.get("sources")).isNull();
         Json.Obj source = (Json.Obj) pipeline.get("source");
         assertThat(source).isNotNull();
+        // The element is a union now -- a bare id, or an object carrying this pipeline's own srs
+        // switch for that source -- so the scalar branch sits one $ref down instead of inline. What
+        // has to stay true is that `source: src_a` still validates, not where the branch is written,
+        // so the ref is resolved rather than the assertion being weakened to whatever is emitted.
         assertThat(((Json.Arr) source.get("oneOf")).items()).contains(
-                new Json.Obj(List.of(new Json.Entry("type", new Json.Str("string")))));
+                new Json.Obj(List.of(new Json.Entry("$ref", new Json.Str("#/$defs/SourceRef")))));
+        List<Json> element = ((Json.Arr) ((Json.Obj) defs.get("SourceRef")).get("oneOf")).items();
+        assertThat(element).contains(
+                new Json.Obj(List.of(new Json.Entry("type", new Json.Str("string")))),
+                new Json.Obj(List.of(new Json.Entry("$ref", new Json.Str("#/$defs/SourceRef.Spec")))));
+        // Both keys are required on the object form: `srs` is registered as having no constant
+        // default, because reading it back as absent would mean "take the source's value" -- the
+        // link the field exists to cut.
+        Json.Obj spec = (Json.Obj) defs.get("SourceRef.Spec");
+        assertThat(((Json.Arr) spec.get("required")).items())
+                .containsExactlyInAnyOrder(new Json.Str("id"), new Json.Str("srs"));
+        assertThat(((Json.Obj) ((Json.Obj) spec.get("properties")).get("srs")).get("type"))
+                .isEqualTo(new Json.Str("boolean"));
 
         // embed keeps camelCase keys (the canonical writer's exception to snake_case).
         Json.Obj embed = (Json.Obj) ((Json.Obj) defs.get("Embed")).get("properties");

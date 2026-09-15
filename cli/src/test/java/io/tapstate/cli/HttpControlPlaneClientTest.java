@@ -134,6 +134,45 @@ class HttpControlPlaneClientTest {
         }
     }
 
+    /**
+     * The same body, read whole. The version half is already covered above; what this adds is that the
+     * other two survive the trip, because they arrive together and only one of them used to.
+     */
+    @Test
+    void theDetailCarriesEveryFieldTheServerAnswered() throws Exception {
+        HttpServer server = serverReplying("/version", 200,
+                "{\"version\":\"9.9.9\",\"dslVersions\":[\"tapstate/v1\"],\"dataVersion\":4}");
+        try {
+            ControlPlaneClient.ServerVersion detail =
+                    new HttpControlPlaneClient().serverVersionDetail(baseOf(server));
+            assertThat(detail).isNotNull();
+            assertThat(detail.version()).isEqualTo("9.9.9");
+            assertThat(detail.dslVersions()).containsExactly("tapstate/v1");
+            assertThat(detail.dataVersion()).isEqualTo(4);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    /**
+     * A field the server leaves out has to come back as "did not say", never as an empty list or a
+     * zero: an empty grammar list is a server that accepts nothing and a data version of zero is a
+     * store nobody has migrated, and both are answers a caller would print as fact.
+     */
+    @Test
+    void aFieldTheServerLeavesOutComesBackAsNotSaidRatherThanAsEmpty() throws Exception {
+        HttpServer server = serverReplying("/version", 200, "{\"version\":\"9.9.9\"}");
+        try {
+            ControlPlaneClient.ServerVersion detail =
+                    new HttpControlPlaneClient().serverVersionDetail(baseOf(server));
+            assertThat(detail).isNotNull();
+            assertThat(detail.dslVersions()).isNull();
+            assertThat(detail.dataVersion()).isNull();
+        } finally {
+            server.stop(0);
+        }
+    }
+
     @Test
     void malformedIssuerDiscoveryResponseIsReportedAsInvalidRatherThanUnreachable() throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -742,7 +781,7 @@ class HttpControlPlaneClientTest {
                 seen);
         try {
             ApplyOutcome outcome = new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("src_kfk.tap.yml", "kind: source\nid: src_kfk\n")));
+                    List.of(new LocalDraft("src_kfk.tap.yml", "version: tapstate/v1\nkind: source\nid: src_kfk\n")));
             assertThat(outcome).isInstanceOf(ApplyOutcome.Applied.class);
             ApplyOutcome.Applied applied = (ApplyOutcome.Applied) outcome;
             assertThat(applied.items()).containsExactly(
@@ -774,7 +813,7 @@ class HttpControlPlaneClientTest {
                 seen);
         try {
             ApplyOutcome outcome = new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("src_kfk.tap.yml", "kind: source\nid: src_kfk\n")));
+                    List.of(new LocalDraft("src_kfk.tap.yml", "version: tapstate/v1\nkind: source\nid: src_kfk\n")));
 
             assertThat(outcome).isInstanceOf(ApplyOutcome.Applied.class);
             ApplyOutcome.Applied applied = (ApplyOutcome.Applied) outcome;
@@ -800,7 +839,7 @@ class HttpControlPlaneClientTest {
                 seen);
         try {
             ApplyOutcome outcome = new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("src_kfk.tap.yml", "kind: source\nid: src_kfk\n")));
+                    List.of(new LocalDraft("src_kfk.tap.yml", "version: tapstate/v1\nkind: source\nid: src_kfk\n")));
 
             ApplyOutcome.Applied applied = (ApplyOutcome.Applied) outcome;
             assertThat(applied.items()).hasSize(1);
@@ -822,11 +861,11 @@ class HttpControlPlaneClientTest {
         HttpServer server = apiServer("/api/artifacts:apply", 200, "{\"outcomes\":[]}", seen);
         try {
             new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("a.tap.yml", "kind: source\nid: a\n", "f".repeat(64))));
+                    List.of(new LocalDraft("a.tap.yml", "version: tapstate/v1\nkind: source\nid: a\n", "f".repeat(64))));
             assertThat(seen.get().body()).contains("\"expectedContentHash\": \"" + "f".repeat(64) + "\"");
 
             new HttpControlPlaneClient().apply(baseOf(server), "tok-abc",
-                    List.of(new LocalDraft("a.tap.yml", "kind: source\nid: a\n")));
+                    List.of(new LocalDraft("a.tap.yml", "version: tapstate/v1\nkind: source\nid: a\n")));
             assertThat(seen.get().body()).doesNotContain("expectedContentHash");
         } finally {
             server.stop(0);
@@ -1037,7 +1076,7 @@ class HttpControlPlaneClientTest {
         }
         ApplyOutcome outcome = new HttpControlPlaneClient(Duration.ofMillis(400), Duration.ofMillis(400))
                 .apply(URI.create("http://127.0.0.1:" + closedPort),
-                        "tok", List.of(new LocalDraft("a.tap.yml", "kind: source\n")));
+                        "tok", List.of(new LocalDraft("a.tap.yml", "version: tapstate/v1\nkind: source\n")));
         assertThat(outcome).isInstanceOf(ApplyOutcome.Unreachable.class);
     }
 
@@ -1050,11 +1089,45 @@ class HttpControlPlaneClientTest {
                 "{\"pipelineId\":\"pl1\",\"targetState\":\"RUNNING\",\"revision\":\"rev-abc\"}", seen);
         try {
             LifecycleOutcome outcome =
-                    new HttpControlPlaneClient().lifecycle(baseOf(server), "tok-abc", "pl1", "start");
+                    new HttpControlPlaneClient().lifecycle(baseOf(server), "tok-abc", "pl1", "start", null);
             assertThat(outcome).isEqualTo(new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc"));
             assertThat(seen.get().method()).isEqualTo("POST");
             assertThat(seen.get().path()).isEqualTo("/api/pipelines/pl1:start");
             assertThat(seen.get().authorization()).isEqualTo("Bearer tok-abc");
+            assertThat(seen.get().body()).as("a verb with nothing to say sends nothing").isEmpty();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aStopCarriesTheAnswerItWasGivenInItsBody() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1:stop", 200,
+                "{\"pipelineId\":\"pl1\",\"targetState\":\"STOPPED\",\"revision\":\"rev-abc\"}", seen);
+        try {
+            new HttpControlPlaneClient().lifecycle(baseOf(server), "tok", "pl1", "stop", true);
+
+            // The server refuses a stop that does not state this, so an empty body here is not a smaller
+            // request -- it is a stop that never happens, and the refusal names an argument the terminal
+            // did supply.
+            assertThat(seen.get().body()).isEqualTo("{\"purgeState\":true}");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aStopAskedToKeepSaysSoRatherThanSendingNothing() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1:stop", 200,
+                "{\"pipelineId\":\"pl1\",\"targetState\":\"STOPPED\",\"revision\":\"rev-abc\"}", seen);
+        try {
+            new HttpControlPlaneClient().lifecycle(baseOf(server), "tok", "pl1", "stop", false);
+
+            // Paired with the case above on purpose: "keep" and "did not say" are the two things this
+            // whole argument exists to tell apart, and on the wire they are one character apart.
+            assertThat(seen.get().body()).isEqualTo("{\"purgeState\":false}");
         } finally {
             server.stop(0);
         }
@@ -1067,7 +1140,7 @@ class HttpControlPlaneClientTest {
                 new AtomicReference<>());
         try {
             LifecycleOutcome outcome =
-                    new HttpControlPlaneClient().lifecycle(baseOf(server), "tok", "pl1", "pause");
+                    new HttpControlPlaneClient().lifecycle(baseOf(server), "tok", "pl1", "pause", null);
             assertThat(outcome).isEqualTo(
                     new LifecycleOutcome.Rejected("lifecycle.illegal-transition", "Not running."));
         } finally {
@@ -1082,7 +1155,7 @@ class HttpControlPlaneClientTest {
             closedPort = socket.getLocalPort();
         }
         LifecycleOutcome outcome = new HttpControlPlaneClient()
-                .lifecycle(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1", "start");
+                .lifecycle(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1", "start", null);
         assertThat(outcome).isInstanceOf(LifecycleOutcome.Unreachable.class);
     }
 

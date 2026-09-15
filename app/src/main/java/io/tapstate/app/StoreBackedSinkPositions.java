@@ -42,7 +42,7 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
             return Map.of();
         }
         Map<String, String> positions = new LinkedHashMap<>();
-        for (String sourceId : pipeline.get().sources()) {
+        for (String sourceId : pipeline.get().sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
             SourceCaptureResolution resolution;
             try {

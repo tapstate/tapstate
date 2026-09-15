@@ -6,6 +6,7 @@ import dev.cel.runtime.CelEvaluationException;
 import dev.cel.runtime.CelRuntime;
 import dev.cel.runtime.CelRuntimeFactory;
 import io.tapstate.core.dsl.RowExpressions;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -101,6 +102,13 @@ final class RowExpressionProgram {
     // reachable from an expression as a top-level column. A container whose contents all pass through
     // unchanged is returned as it is, so the common row costs no copy.
     private static Object bound(Object value) {
+        // A value a connector converted arrives in a carrier, which an expression can only compare by
+        // identity: `after._id == "64f0..."` is then false for every row, and the expression neither
+        // fails nor warns. The carrier is not restored on the way out - what an expression produces is
+        // a new value, and it is only the row's own untouched values that keep travelling as they came.
+        if (value instanceof ConvertedValue carried) {
+            return bound(carried.value());
+        }
         if (value instanceof byte[] bytes) {
             return ByteString.copyFrom(bytes);
         }

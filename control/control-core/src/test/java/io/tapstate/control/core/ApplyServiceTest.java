@@ -6,11 +6,16 @@ import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import org.junit.jupiter.api.Test;
@@ -47,7 +52,7 @@ class ApplyServiceTest {
     private final RecordingAuditStore auditStore = new RecordingAuditStore();
     private final ApplyService service = new ApplyService(
             TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
-            PlanAdvisories.none());
+            PlanAdvisories.none(), SchemaDerivation.none());
 
     /** An audit store that captures every record it is asked to write. */
     private static final class RecordingAuditStore implements AuditStore {
@@ -75,6 +80,170 @@ class ApplyServiceTest {
             connector: mysql
             config: { host: 10.30.0.5, username: writer, password: My_2026 }
             """;
+
+    /**
+     * The refusal is reached through apply, which is the path an edit to a stored Source usually takes.
+     *
+     * <p>Guarding only the other write path would be a guard in name: the two services write through
+     * different calls, so a check on one of them leaves the other wide open, and the open one here is
+     * the one the command line uses.
+     */
+    @Test
+    void applyRefusesToTurnTheReplayStoreOffWhileAPipelineReadingItIsUp() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", PipelineState.RUNNING);
+        actual.put("p1", PipelineState.RUNNING);
+        ApplyService guarded = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), new LivePipelines(desired, actual));
+
+        assertThatThrownBy(() -> guarded.apply("author", List.of(draft(UNBUFFERED_SRC))))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    /** The same edit lands once the pipeline reading the source is stopped. */
+    @Test
+    void applyAllowsTheChangeOnceThePipelineReadingItIsStopped() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", PipelineState.STOPPED);
+        actual.put("p1", PipelineState.STOPPED);
+        ApplyService guarded = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), new LivePipelines(desired, actual));
+
+        guarded.apply("author", List.of(draft(UNBUFFERED_SRC)));
+
+        assertThat(stored("orders_src")).contains("enabled: false");
+    }
+
+    @Test
+    void typedReplaceAlsoRefusesToTurnTheReplayStoreOffWhileAReaderIsUp() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+        Resource replacement = new DslParser().parse(UNBUFFERED_SRC);
+
+        assertThatThrownBy(() -> guarded.replace(
+                "author", replacement, CanonicalHash.of(store.get("orders_src").orElseThrow())))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    /** A cdc source whose changes are buffered through the shared replay store. */
+    private static final String BUFFERED_SRC = """
+            version: tapstate/v1
+            kind: source
+            id: orders_src
+            connector: mysql
+            mode: cdc
+            config: { host: 10.30.0.5, database: orders, username: writer, password: My_2026 }
+            tables: [orders]
+            srs: { enabled: true }
+            """;
+
+    /** The same source with the buffering turned off -- the one field the guard watches. */
+    private static final String UNBUFFERED_SRC = BUFFERED_SRC.replace("enabled: true", "enabled: false");
+
+    /**
+     * The peer of the two cases above, for the half of the same switch that lives on the pipeline.
+     *
+     * <p>Guarding only the source side would now be a guard in name: after the switch moved, the value
+     * the capture path actually reads is the pipeline's own, so an author who edits it there reaches
+     * exactly the state the source-side refusal exists to prevent, by the shorter route.
+     */
+    @Test
+    void applyRefusesToChangeAPipelinesOwnBufferingSwitchWhileThatPipelineIsUp() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatThrownBy(() -> guarded.apply(
+                "author", List.of(draft(BUFFERED_SRC), draft(PINNED_OFF_PIPELINE))))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    /** And it lands once that pipeline is stopped -- the refusal is about timing, not about the edit. */
+    @Test
+    void theSameEditToAPipelinesOwnSwitchLandsOnceItIsStopped() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.STOPPED);
+
+        guarded.apply("author", List.of(draft(BUFFERED_SRC), draft(PINNED_OFF_PIPELINE)));
+
+        assertThat(stored("p1")).contains("srs: false");
+    }
+
+    /**
+     * A live pipeline whose switch did not move is left alone. Without this, the guard could be
+     * satisfied by refusing every edit to a running pipeline, which is a different rule and one this
+     * layer does not make.
+     */
+    @Test
+    void aLivePipelineEditedAnywhereElseIsNotRefused() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatCode(() -> guarded.apply("author", List.of(
+                draft(BUFFERED_SRC), draft(READER_PIPELINE.replace("op != 'd'", "op != 'u'")))))
+                .doesNotThrowAnyException();
+    }
+
+    /**
+     * Recording a switch for the first time is materialization, not an edit: it is how the value gets
+     * onto the artifact at all, so a pipeline that is already up must not be refused for it. This is the
+     * case a guard written as "the stored and incoming switches differ" gets wrong, because before the
+     * first apply the stored one is absent rather than equal.
+     */
+    @Test
+    void aFirstRecordingOnALivePipelineIsNotRefused() {
+        // Land a pipeline with no switch recorded at all, the way one stored before this field existed
+        // reads, then bring it up and re-apply the same text.
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        store.landDirectly(new DslParser().parse(READER_PIPELINE));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatCode(() -> guarded.apply(
+                "author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE))))
+                .doesNotThrowAnyException();
+    }
+
+    private ApplyService guardedWith(PipelineState state) {
+        TestLifecycleStores.Desired desired = new TestLifecycleStores.Desired();
+        TestLifecycleStores.State actual = new TestLifecycleStores.State();
+        desired.put("p1", state);
+        actual.put("p1", state);
+        return new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), new LivePipelines(desired, actual));
+    }
+
+    /** A pipeline reading that source, in the minimal valid shape. */
+    private static final String READER_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: p1
+            source: orders_src
+            transforms:
+              - id: selected
+                type: filter
+                from: [orders]
+                expr: "op != 'd'"
+            view:
+              id: orders_view
+              from: selected
+              primary_key: id
+              storage:
+                warm:
+                  collection: orders_view
+            """;
+
+    /** The same pipeline with its own switch for that source written off. */
+    private static final String PINNED_OFF_PIPELINE =
+            READER_PIPELINE.replace("source: orders_src", "source: [ { id: orders_src, srs: false } ]");
 
     private static ArtifactDraft draft(String content) {
         return new ArtifactDraft(null, content);
@@ -110,8 +279,8 @@ class ApplyServiceTest {
                 .as("the canonical form is the deterministic serializer's output")
                 .isEqualTo(expectedCanonical);
         assertThat(prepared.contentHash())
-                .as("the content hash is taken over the canonical form")
-                .isEqualTo(CanonicalHash.of(expectedCanonical));
+                .as("the content hash is taken over the resource's structure, not over the text beside it")
+                .isEqualTo(CanonicalHash.of(prepared.resource()));
     }
 
     @Test
@@ -238,7 +407,7 @@ class ApplyServiceTest {
         registered.add(CatalogEntryReader.read(acmeRow("cdc")));
         Supplier<TapstateCatalog> live = () -> TapstateCatalog.merged(TapstateCatalog.load(), List.copyOf(registered));
         ApplyService liveService = new ApplyService(
-                live, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), PlanAdvisories.none());
+                live, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none());
 
         assertThatCode(() -> liveService.plan(List.of(draft(ACME_CDC_SOURCE)))).doesNotThrowAnyException();
 
@@ -323,7 +492,7 @@ class ApplyServiceTest {
     @Test
     void aNullCatalogIsRejected() {
         assertThatThrownBy(() -> new ApplyService(
-                null, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), PlanAdvisories.none()))
+                null, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -331,7 +500,7 @@ class ApplyServiceTest {
     void aNullStoreIsRejected() {
         assertThatThrownBy(() -> new ApplyService(
                 TapstateCatalog::load, null, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
-                PlanAdvisories.none()))
+                PlanAdvisories.none(), SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -362,6 +531,94 @@ class ApplyServiceTest {
         assertThat(second.outcomes()).singleElement()
                 .extracting(ArtifactOutcome::change).isEqualTo(ArtifactOutcome.Change.UNCHANGED);
         assertThat(store.saveCount).as("re-applying unchanged content performs no second write").isEqualTo(1);
+    }
+
+    @Test
+    void aNullDerivationIsRejected() {
+        assertThatThrownBy(() -> new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), null))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void everyPipelineInTheBatchIsRederivedEvenWhenTheApplyWroteNothing() {
+        // The whole reason this hangs off the batch rather than off the write. A pipeline holds its own
+        // copy of what its sources were discovered to be, and the case that most needs refreshing is a
+        // source moving under a pipeline nobody edited - which leaves the pipeline's content hash
+        // byte-identical, so the write is skipped. Keyed on the write, the refresh would be silent in
+        // exactly that case. The second apply below writes nothing and must still derive.
+        List<String> derived = new ArrayList<>();
+        ApplyService deriving = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), derived::add);
+        List<ArtifactDraft> batch = List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MY));
+        deriving.apply("alice", batch);
+        derived.clear();
+
+        ApplyResult second = deriving.apply("alice", batch);
+
+        assertThat(second.outcomes()).extracting(ArtifactOutcome::change)
+                .containsOnly(ArtifactOutcome.Change.UNCHANGED);
+        // The pipeline, and only the pipeline: a source and a target have no derived model of their own,
+        // and deriving one would file a record under an id that is not a pipeline's.
+        assertThat(derived).containsExactly("ora2my_ods");
+    }
+
+    @Test
+    void aPostCommitRefreshFailureWarnsAndStillRefreshesLaterPipelines() {
+        List<String> attempted = new ArrayList<>();
+        List<String> refreshed = new ArrayList<>();
+        boolean[] fail = {true};
+        ValidationDiagnostic advisory = new ValidationDiagnostic("control.unreachable", Map.of());
+        ApplyService deriving = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                (resources, discovered) -> List.of(advisory), pipeline -> {
+                    attempted.add(pipeline);
+                    if (fail[0] && pipeline.equals("ora2my_ods")) {
+                        throw new TapstateException(ArtifactError.NOT_FOUND, Map.of("id", "missing_model"), null);
+                    }
+                    refreshed.add(pipeline);
+                });
+        List<ArtifactDraft> batch = List.of(draft(SRC_ORA), draft(PIPELINE),
+                draft(PIPELINE.replace("ora2my_ods", "second_pipeline")), draft(TGT_MY));
+
+        ApplyResult first = deriving.apply("alice", batch);
+
+        assertThat(first.outcomes()).hasSize(4).allSatisfy(outcome ->
+                assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.CREATED));
+        assertThat(store.list()).hasSize(4);
+        assertThat(attempted).containsExactly("ora2my_ods", "second_pipeline");
+        assertThat(refreshed).containsExactly("second_pipeline");
+        assertThat(first.warnings()).hasSize(2).contains(advisory);
+        assertThat(first.warnings().get(1)).satisfies(warning -> {
+            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.params()).containsEntry("pipeline", "ora2my_ods")
+                    .containsEntry("causeCode", ArtifactError.NOT_FOUND.code())
+                    .containsEntry("causeParams", Map.of("id", "missing_model"));
+        });
+
+        fail[0] = false;
+        attempted.clear();
+        refreshed.clear();
+        ApplyResult retried = deriving.apply("alice", batch);
+
+        assertThat(retried.outcomes()).hasSize(4).allSatisfy(outcome ->
+                assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.UNCHANGED));
+        assertThat(retried.warnings()).containsExactly(advisory);
+        assertThat(refreshed).containsExactly("ora2my_ods", "second_pipeline");
+        assertThat(store.saveCount).isEqualTo(4);
+    }
+
+    @Test
+    void aProgrammerFailureDuringRefreshIsNotConvertedToAnAdvisory() {
+        IllegalStateException bug = new IllegalStateException("broken derivation invariant");
+        ApplyService deriving = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), pipeline -> { throw bug; });
+
+        assertThatThrownBy(() -> deriving.apply("alice",
+                List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MY)))).isSameAs(bug);
     }
 
     @Test
@@ -565,7 +822,7 @@ class ApplyServiceTest {
         // control.audit-blocked and nothing reaches the artifact store.
         ApplyService refusing = new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(new FailingAuditStore(), FIXED_CLOCK),
-                new EmptySchemaStore(), PlanAdvisories.none());
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none());
 
         Throwable t = catchThrowable(() -> refusing.apply("alice", List.of(draft(TGT_MY))));
 
@@ -578,7 +835,7 @@ class ApplyServiceTest {
     @Test
     void aNullAuditGateIsRejected() {
         assertThatThrownBy(() -> new ApplyService(
-                TapstateCatalog::load, store, null, new EmptySchemaStore(), PlanAdvisories.none()))
+                TapstateCatalog::load, store, null, new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -587,7 +844,7 @@ class ApplyServiceTest {
         // The row-expression type check is not optional: a service built without a schema store would
         // silently skip it, and skipping it is exactly the state the check exists to end.
         assertThatThrownBy(() -> new ApplyService(
-                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), null, PlanAdvisories.none()))
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), null, PlanAdvisories.none(), SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -689,7 +946,7 @@ class ApplyServiceTest {
         // A service built without one would silently answer "nothing to report" for every batch, which
         // is indistinguishable from a clean batch — the assembly must name the no-op pass to get it.
         assertThatThrownBy(() -> new ApplyService(
-                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), null))
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(), null, SchemaDerivation.none()))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -702,7 +959,7 @@ class ApplyServiceTest {
     private ApplyService advisedBy(PlanAdvisories advisories) {
         return new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
-                advisories);
+                advisories, SchemaDerivation.none());
     }
 
     // ---- optimistic concurrency: an optional per-draft precondition on apply ----
@@ -814,6 +1071,60 @@ class ApplyServiceTest {
     }
 
     @Test
+    void typedPipelineCreateRefusesWhenItsSourceChangesAfterWorkspaceValidation() {
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        Resource sourceEdit = new DslParser().parse(SRC_ORA.replace("10.20.0.15", "10.20.0.16"));
+        store.concurrentWriter = () -> store.landDirectly(sourceEdit);
+
+        ArtifactWriteResult result = service.create("bob", new DslParser().parse(PIPELINE));
+
+        assertThat(result.write().appliedSuccessfully()).isFalse();
+        assertThat(result.write().refusedId()).isEqualTo("src_ora");
+        assertThat(result.write().refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+        assertThat(store.get("ora2my_ods")).isEmpty();
+        assertThat(stored("src_ora")).isEqualTo(canonicalOf(SRC_ORA.replace("10.20.0.15", "10.20.0.16")));
+    }
+
+    @Test
+    void offlinePlanningIgnoresStoredArtifactsOutsideTheSubmittedClosure() {
+        store.landDirectly(new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: stale_pipeline
+                source: missing_source
+                serve: { from: /.*/ }
+                """));
+
+        ApplyPlan plan = service.plan(List.of(draft(TGT_MY)));
+
+        assertThat(plan.artifacts()).extracting(PreparedArtifact::id).containsExactly("tgt_my");
+        assertThat(plan.workspacePreconditions()).isEmpty();
+    }
+
+    @Test
+    void typedCreateDoesNotConflictWithAnUnrelatedArtifactEdit() {
+        service.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MY)));
+        Resource unrelated = new DslParser().parse(PIPELINE.replace("ora2my_ods", "unrelated_pipeline"));
+        store.landDirectly(unrelated);
+        Resource unrelatedEdit = new DslParser().parse(
+                PIPELINE.replace("ora2my_ods", "unrelated_pipeline")
+                        .replace("snapshot_and_cdc", "cdc_only"));
+        store.concurrentWriter = () -> store.landDirectly(unrelatedEdit);
+        SourceResource created = (SourceResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: new_source
+                connector: mysql
+                config: { host: localhost, database: inventory, username: reader }
+                """);
+
+        ArtifactWriteResult result = service.create("bob", created);
+
+        assertThat(result.write().appliedSuccessfully()).isTrue();
+        assertThat(store.get("new_source")).contains(created);
+    }
+
+    @Test
     void validateReportsAStalePreconditionAsADiagnosticRatherThanThrowing() {
         service.apply("alice", List.of(draft(TGT_MY)));
 
@@ -840,7 +1151,6 @@ class ApplyServiceTest {
                       username: cdc_user, password: Ora_2026 }
             mode: cdc
             tables: [ ORDERS, ORDER_ITEMS, CUSTOMERS ]
-            options: { include_ddl: true }
             """;
 
     // The same oracle source with no pipeline referencing it — a standalone resource for batch tests.
@@ -904,6 +1214,40 @@ class ApplyServiceTest {
         }
 
         @Override
+        public synchronized ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
+            if (concurrentWriter != null) {
+                Runnable other = concurrentWriter;
+                concurrentWriter = null;
+                other.run();
+            }
+            for (ArtifactWrite write : writes) {
+                for (Map.Entry<String, String> precondition : write.readPreconditions().entrySet()) {
+                    String canonical = byId.get(precondition.getKey());
+                    if (canonical == null || !storedHash(canonical).equals(precondition.getValue())) {
+                        return ArtifactBatchWrite.refused(precondition.getKey(), ArtifactMutation.VERSION_CONFLICT);
+                    }
+                }
+            }
+            ArtifactWrite write = writes.getFirst();
+            if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && byId.containsKey(write.resource().id())) {
+                return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
+            }
+            if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
+                String canonical = byId.get(write.resource().id());
+                if (canonical == null) {
+                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.NOT_FOUND);
+                }
+                if (!storedHash(canonical).equals(write.expectedContentHash())) {
+                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.VERSION_CONFLICT);
+                }
+            }
+            byId.put(write.resource().id(), writer.write(write.resource()));
+            saveCount++;
+            saveAllBatches.add(List.of(write.resource().id()));
+            return ArtifactBatchWrite.applied();
+        }
+
+        @Override
         public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
             // The other writer lands here: after the caller planned against what it read, before this
             // write compares. Modelling it inside the store is the only place it can go — that is
@@ -917,7 +1261,7 @@ class ApplyServiceTest {
             // longer names the stored bytes refuses the whole batch and stages nothing.
             for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
                 String canonical = byId.get(expected.getKey());
-                if (canonical == null || !CanonicalHash.of(canonical).equals(expected.getValue())) {
+                if (canonical == null || !storedHash(canonical).equals(expected.getValue())) {
                     return Optional.of(expected.getKey());
                 }
             }
@@ -934,6 +1278,15 @@ class ApplyServiceTest {
             saveCount += artifacts.size();
             saveAllBatches.add(artifacts.stream().map(Resource::id).toList());
             return Optional.empty();
+        }
+
+        /**
+         * The stored version identity for a stored body: taken over the structure the canonical text
+         * describes, not over the text. Hashing the text here would let the fake agree with a caller
+         * that also hashed text, and the store this fake stands in for would agree with neither.
+         */
+        private String storedHash(String canonical) {
+            return CanonicalHash.of(parser.parse(canonical));
         }
 
         /** Commits {@code canonical} for {@code id} directly, as another author's apply would. */

@@ -47,6 +47,12 @@ public class Bootstrap {
             System.exit(e.code().severity() == Severity.ERROR ? EXIT_CODED_DIAGNOSTIC : 0);
             return;
         }
+        if (MigrateCommand.isRequested(args)) {
+            // A read-only look at the system data, and the whole reason it is a mode of this binary:
+            // the moment it matters most is the moment the rest of this refuses to start.
+            System.exit(MigrateCommand.run(args, System.out, System.err));
+            return;
+        }
         SpringApplication app = new SpringApplication(Bootstrap.class);
         // The server owns process termination. Spring's own shutdown hook would close the context on
         // SIGTERM but leave the JVM to exit with the signal's default disposition (128+15 = 143);

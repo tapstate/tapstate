@@ -304,6 +304,55 @@ class ObservationPublisherTest {
     }
 
     /**
+     * What a large rebuild is doing, while it does it. One dimension row edited can owe a million rows of
+     * writing, and for as long as that takes every other reading on this face says healthy - the state is
+     * RUNNING, the error count is zero, the queues drain - while the target holds half the old value and
+     * half the new one. Both numbers are asserted because either alone answers nothing: the rows sent have
+     * nothing to be read against, and the rows there are say only that something big is happening.
+     */
+    @Test
+    void publishWiresHowFarALargeRebuildHasGotAndHowFarItHasToGo() {
+        state.seed("orders", PipelineState.RUNNING);
+        String subject = "join.orders.widen.index.customers/17";
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(),
+                new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
+                id -> Map.of(),
+                id -> Map.of(subject, 40_000L),
+                id -> Map.of(subject, 1_000_000L));
+
+        wired.publish("orders");
+
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .contains(entry("joinRecomputeRowsDone." + subject, 40_000L),
+                        entry("joinRecomputeRowsExpected." + subject, 1_000_000L));
+    }
+
+    /**
+     * And nothing at all where no rebuild worth reporting is running. This is the control the reading above
+     * means nothing without: every dimension edit rebuilds something, so a publisher that put a pair here
+     * on every pass would satisfy the case above and bury the one rebuild that mattered in a constant
+     * stream - which is how a number meant for a rare, minutes-long wait comes to be scrolled past.
+     */
+    @Test
+    void aPipelineWithNoLargeRebuildRunningReportsNeitherNumber() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(),
+                new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
+                id -> Map.of(), id -> Map.of(), id -> Map.of());
+
+        wired.publish("orders");
+
+        assertThat(observations.read("orders").orElseThrow().metrics().keySet())
+                .noneMatch(name -> name.startsWith("joinRecompute"));
+    }
+
+    /**
      * The readings are fetched once per pass and the pass is the only place they exist together, so this is
      * where the watch that turns them into a window has to be fed from. Fetching them a second time for it
      * would pay for the cold layer's count twice a tick.

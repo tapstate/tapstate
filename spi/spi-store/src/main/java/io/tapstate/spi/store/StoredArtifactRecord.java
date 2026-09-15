@@ -26,6 +26,6 @@ public record StoredArtifactRecord(
         Objects.requireNonNull(resource, "resource");
         String canonical = WRITER.write(resource);
         return new StoredArtifactRecord(
-                resource.id(), resource.kind(), canonical, CanonicalHash.of(canonical), true);
+                resource.id(), resource.kind(), canonical, CanonicalHash.of(resource), true);
     }
 }

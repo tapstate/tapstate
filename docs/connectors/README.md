@@ -16,9 +16,12 @@ regenerated from an upstream repository on a schedule, and adding to it means ru
 regeneration.
 
 **Registering with a running server** is the other path: `tapstate register <path>` uploads a
-connector artifact, the server reads the connector's own declarations back out of it, and
-`tapstate connectors` lists what a given server ended up with. This path accepts only the connectors
-this release officially supports, so it is not a way to widen what the catalog offers.
+local connector artifact, while `tapstate register <connector-id>` downloads an exact published
+id from the `connectors-preview` release and uploads it. The server reads the connector's own
+declarations back out of the artifact, and `tapstate connectors` lists what a given server ended
+up with. This path accepts only the connectors this release officially supports, so it is not a
+way to widen what the catalog offers. Existing local files and directories take precedence over
+published ids; `TAPSTATE_CONNECTORS_URL` points the download form at an HTTPS mirror.
 
 The two do not have to agree, and where they disagree the release is the honest one: a row can sit in
 the bundled catalog describing a connector that this release will not install.
@@ -27,3 +30,4 @@ the bundled catalog describing a connector that this release will not install.
 |---|---|
 | [Refreshing the catalog](refreshing-the-catalog.md) | Something moved upstream, or you changed a connector. **What has to be rebuilt, which of the two lanes carries it, and how to run one by hand.** Also: how to read the diff a rebuild produces, and what to look at on a pull request one of the lanes opened. |
 | [Declaring modes](declaring-modes.md) | Derivation says a CSV file does CDC and a message queue does nothing. **The overlay** - this repository's own declaration that outranks it: what justifies an entry, how to add one, and why an empty one is refused rather than accepted. |
+| [Value shapes](value-shapes.md) | A database has types Tapstate has no name for - an `ObjectId`, a binary column. **What you see when you read one, what a target of the same kind stores, and the two conversions that are known to be lossy.** |

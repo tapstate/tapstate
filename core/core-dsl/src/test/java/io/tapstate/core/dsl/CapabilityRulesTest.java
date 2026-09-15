@@ -32,7 +32,7 @@ class CapabilityRulesTest {
 
     @Test
     void rejectsModeOutsideConnectorCapabilityMatrix() {
-        // kafka declares only [stream]; cdc is outside its matrix (ADR-0016 §4).
+        // kafka declares only [stream]; cdc is outside its matrix (§4).
         Resource src = parse("""
                 version: tapstate/v1
                 kind: source
@@ -67,7 +67,7 @@ class CapabilityRulesTest {
     @Test
     void skipsConnectorAbsentFromCatalog() {
         // oracle is an enterprise connector, not in the bundled OSS catalog. Offline cannot judge
-        // its modes — connector registration is authoritative only on the server (ADR-0019 §3.3).
+        // its modes — connector registration is authoritative only on the server.
         Resource src = parse("""
                 version: tapstate/v1
                 kind: source

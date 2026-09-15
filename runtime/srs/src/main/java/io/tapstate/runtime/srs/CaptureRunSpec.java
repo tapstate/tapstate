@@ -1,16 +1,14 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.spi.capture.CaptureConfig;
-import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 
 import java.util.Objects;
-import java.util.function.Supplier;
 
 /**
  * One source run's inputs to the {@link CaptureRunUnit}: the connector config and the pipeline-level
- * dimensions that branch how it is consumed, plus the L1 mock collaborators standing in for real
- * connector machinery.
+ * dimensions that branch how it is consumed.
  *
  * <ul>
  *   <li>{@code config} / {@code readMode} / {@code srsEnabled} — what to read and how to consume it; the
@@ -20,12 +18,13 @@ import java.util.function.Supplier;
  *       consumer pipeline the coordinator registers.</li>
  *   <li>{@code startFrom} — where this pipeline enters the incremental tail; {@code retention} — the
  *       pass-through retention config seeded on a new chain (may be null).</li>
- *   <li>{@code cdcStart} — the source position sampled at snapshot start (an L1 mock for the
- *       snapshot-to-cdc seam); {@code schemaVer} — the schema version stamped on ring items.</li>
- *   <li>{@code watermark} — the per-change source position generator (an L1 mock monotonic stand-in).
- *       What ranks the positions it hands out is not here: the order is the ring's own, assigned on
- *       append, so a run has nothing to be told about it.</li>
+ *   <li>{@code schemaVer} — the schema version stamped on ring items.</li>
  * </ul>
+ *
+ * <p>No position of any kind is carried here. Both a run's seam and its per-change positions are the
+ * source's own and are learned from it as the read happens — the seam from the snapshot batch, each
+ * change's from the change itself. A position supplied alongside the run instead was a stand-in for a
+ * connector, and a stand-in is what makes a restart's positions start over while its generation rises.
  */
 public record CaptureRunSpec(
         CaptureConfig config,
@@ -35,10 +34,8 @@ public record CaptureRunSpec(
         String sourceId,
         String pipelineId,
         StartFrom startFrom,
-        SourcePosition cdcStart,
         String retention,
-        long schemaVer,
-        Supplier<SourcePosition> watermark) {
+        long schemaVer) {
 
     public CaptureRunSpec {
         Objects.requireNonNull(config, "config");
@@ -46,7 +43,13 @@ public record CaptureRunSpec(
         Objects.requireNonNull(sourceId, "sourceId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(startFrom, "startFrom");
-        Objects.requireNonNull(cdcStart, "cdcStart");
-        Objects.requireNonNull(watermark, "watermark");
+        // The connector doing this read files notes it has to find again on a later drive, and which node
+        // they belong to is the pair named right here. Scoped from those two rather than accepted on the
+        // config, so there is one derivation of the pair instead of two held together by nobody: a caller
+        // that stopped scoping the config, or scoped it to another node, would leave the connector filing
+        // under a name no later drive looks at, and nothing above would say so - the rows all arrive, the
+        // chain is still mined once, and the only trace is a connector reading its own notes as empty,
+        // which is what a first run looks like.
+        config = config.at(new PipelineNode(pipelineId, sourceId));
     }
 }

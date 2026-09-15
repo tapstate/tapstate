@@ -21,11 +21,14 @@ class DslErrorTest {
     @Test
     void carriesTheCorpusVocabularyCodes() {
         assertThat(DslError.values()).extracting(DslError::code).containsExactlyInAnyOrder(
+                "dsl.unsupported-version",
                 "dsl.unknown-field",
                 "dsl.forbidden-field",
+                "dsl.missing-field",
                 "dsl.missing-reference",
                 "dsl.ambiguous-reference",
                 "dsl.mode-mismatch",
+                "dsl.mode-required-for-read",
                 "dsl.illegal-value",
                 "dsl.illegal-expression",
                 "dsl.composition",
@@ -47,18 +50,37 @@ class DslErrorTest {
                 "dsl.row-expression-type-unknown",
                 // post-semantic too - whether a table declares a key is a property of the table,
                 // carried only by a discovered model and never by the document naming it
-                "dsl.upsert-needs-key");
+                "dsl.upsert-needs-key",
+                // the unwind gate, and the other way round from the one above: what an expansion
+                // says about its own rows, and which sync those rows reach, are both written in the
+                // document, so both are witnessed by an ordinary corpus case
+                "dsl.unwind-needs-an-element-key",
+                "dsl.unwind-needs-an-upsert-target",
+                // Source columns are available during assembly, not offline corpus validation.
+                "dsl.unwind-column-already-exists",
+                // the join SQL gate: both are raised while reading the artifact, so both are
+                // witnessed by an ordinary corpus case
+                "dsl.join-sql-not-parsable",
+                "dsl.join-sql-unsupported");
     }
 
     @Test
     void declaresThePlaceholderContractPerCode() {
         assertThat(DslError.UNKNOWN_FIELD.placeholders()).containsExactlyInAnyOrder("field", "path");
         assertThat(DslError.FORBIDDEN_FIELD.placeholders()).containsExactlyInAnyOrder("field", "path");
+        assertThat(DslError.MISSING_FIELD.placeholders()).containsExactlyInAnyOrder("field", "path");
         assertThat(DslError.MISSING_REFERENCE.placeholders()).containsExactlyInAnyOrder("ref", "path");
         assertThat(DslError.AMBIGUOUS_REFERENCE.placeholders()).containsExactlyInAnyOrder("ref", "path");
         assertThat(DslError.MODE_MISMATCH.placeholders()).containsExactlyInAnyOrder("field", "mode", "path");
+        // the pipeline is what made the field required, so it is named alongside the source that lacks it
+        assertThat(DslError.MODE_REQUIRED_FOR_READ.placeholders())
+                .containsExactlyInAnyOrder("source", "pipeline", "path");
         assertThat(DslError.ILLEGAL_VALUE.placeholders()).containsExactlyInAnyOrder("value", "expected", "path");
         assertThat(DslError.ILLEGAL_EXPRESSION.placeholders()).containsExactlyInAnyOrder("expr", "detail", "path");
+        assertThat(DslError.JOIN_SQL_NOT_PARSABLE.placeholders())
+                .containsExactlyInAnyOrder("detail", "path");
+        assertThat(DslError.JOIN_SQL_UNSUPPORTED.placeholders())
+                .containsExactlyInAnyOrder("shape", "line", "column", "path");
         assertThat(DslError.COMPOSITION.placeholders()).containsExactlyInAnyOrder("detail", "path");
         assertThat(DslError.DUPLICATE_ID.placeholders()).containsExactlyInAnyOrder("id", "path");
         assertThat(DslError.UNSUPPORTED_MODE.placeholders())
@@ -85,6 +107,12 @@ class DslErrorTest {
                 .containsExactlyInAnyOrder("expr", "column", "table", "path");
         assertThat(DslError.UPSERT_NEEDS_KEY.placeholders())
                 .containsExactlyInAnyOrder("table", "source", "path");
+        // the step is the whole diagnosis: which expansion cannot tell its own rows apart
+        assertThat(DslError.UNWIND_NEEDS_AN_ELEMENT_KEY.placeholders())
+                .containsExactlyInAnyOrder("step", "path");
+        // both ends are named, because either one is a legitimate thing to change
+        assertThat(DslError.UNWIND_NEEDS_AN_UPSERT_TARGET.placeholders())
+                .containsExactlyInAnyOrder("step", "sync", "path");
     }
 
     @Test

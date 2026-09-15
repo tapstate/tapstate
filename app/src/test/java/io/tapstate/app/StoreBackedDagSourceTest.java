@@ -7,8 +7,11 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeBlock;
@@ -31,11 +34,15 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTester;
+import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
@@ -55,6 +62,142 @@ import org.junit.jupiter.api.Test;
  */
 class StoreBackedDagSourceTest {
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"qualified", "source", "multiple", "regex"})
+    void unwindBindsQualifiedReferencesAndEveryMergedSourceKey(String selection) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(cdcSource("customers_src", "customers"));
+        for (String table : List.of("orders", "customers")) {
+            String key = table.equals("orders") ? "o_id" : "c_id";
+            store.schemas.save(new DiscoveredSourceModel(table + "_src", "mysql", 1L,
+                    new SourceModel(List.of(new SourceTable(table, List.of(
+                            new SourceField(key, "bigint", TapstateType.INT64),
+                            new SourceField("items", "array", TapstateType.STRING)), List.of(key), List.of())))));
+        }
+        FromClause from = switch (selection) {
+            case "qualified" -> FromClause.list(FromRef.literal("orders_src.orders"));
+            case "source" -> FromClause.list(FromRef.literal("orders_src"));
+            case "multiple" -> FromClause.list(FromRef.literal("orders"), FromRef.literal("customers"));
+            default -> FromClause.list(FromRef.regex("orders|customers"));
+        };
+        Step.Inline expand = Step.inline("expand", from,
+                new TransformBody.Unwind("items", "item_no", false, null, null), null);
+        PipelineResource pipeline = new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true), SourceRef.spec("customers_src", true)),
+                List.of(expand), null, null, null, null);
+        var port = new StoreBackedDagSource(store).transformBinding(pipeline, expand).get();
+        List<String> streams = from.equals(FromClause.list(FromRef.literal("orders_src.orders")))
+                || from.equals(FromClause.list(FromRef.literal("orders_src")))
+                ? List.of("orders") : List.of("orders", "customers");
+        for (String stream : streams) {
+            String key = stream.equals("orders") ? "o_id" : "c_id";
+            var event = new io.tapstate.core.event.Envelope(
+                    io.tapstate.core.event.Op.UPDATE, 1L, stream,
+                    Map.of(key, 1L, "items", List.of("a")),
+                    Map.of(key, 2L, "items", List.of("a")), null);
+            org.assertj.core.api.Assertions.assertThatCode(() -> port.transform(event))
+                    .as("%s via %s", stream, from).doesNotThrowAnyException();
+            var deleted = port.transform(new io.tapstate.core.event.Envelope(
+                    io.tapstate.core.event.Op.DELETE, 1L, stream, event.before(), null, null));
+            assertThat(deleted).singleElement().satisfies(row -> {
+                assertThat(row.op()).isEqualTo(io.tapstate.core.event.Op.DELETE);
+                assertThat(row.before()).containsEntry(key, 1L);
+            });
+            assertThatThrownBy(() -> port.transform(new io.tapstate.core.event.Envelope(
+                    io.tapstate.core.event.Op.DELETE, 1L, stream, Map.of(key, 1L), null, null)))
+                    .isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+            var output = port.transform(event);
+            assertThat(output).as("%s via %s", stream, from)
+                    .extracting(io.tapstate.core.event.Envelope::op)
+                    .containsExactly(io.tapstate.core.event.Op.DELETE, io.tapstate.core.event.Op.INSERT);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"DELETE,false", "UPDATE,false", "DELETE,true", "UPDATE,true"})
+    void projectionCannotManufactureAnUnwindsBeforeImage(String operation, boolean computed) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(
+                        new SourceField("id", "bigint", TapstateType.INT64),
+                        new SourceField("customer", "varchar", TapstateType.STRING)), List.of("id"), List.of())))));
+        Step.Inline map = Step.inline("map", FromClause.list(FromRef.literal("orders_src.orders")),
+                new TransformBody.MapProjection(Map.of("items", computed
+                        ? FieldRule.computed("[after.id]") : FieldRule.literal(List.of("a")))), null);
+        Step.Inline rename = Step.inline("rename", FromClause.list(FromRef.literal("map")),
+                new TransformBody.MapProjection(Map.of("order_id", FieldRule.rename("id"))), null);
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("rename")),
+                new TransformBody.Unwind("items", "item_no", false, null, null), null);
+        PipelineResource pipeline = new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true)), List.of(map, rename, expand),
+                null, null, null, null);
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+        var port = source.transformBinding(pipeline, map).get();
+        var op = io.tapstate.core.event.Op.valueOf(operation);
+        assertThatThrownBy(() -> port.transform(new io.tapstate.core.event.Envelope(op, 1L, "orders",
+                Map.of("id", 1L), op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L) : null, null)))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+        assertThat(port.transform(new io.tapstate.core.event.Envelope(op, 1L, "orders",
+                Map.of("id", 1L, "customer", "ada"),
+                op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L, "customer", "ada") : null,
+                null))).hasSize(1);
+        PipelineResource ordinary = new PipelineResource("ordinary", null,
+                List.of(SourceRef.spec("orders_src", true)), List.of(map), null, null, null, null);
+        assertThat(source.transformBinding(ordinary, map).get().transform(
+                new io.tapstate.core.event.Envelope(op, 1L, "orders", Map.of("id", 1L),
+                        op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L) : null, null))).hasSize(1);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"DELETE", "UPDATE"})
+    void completeSourceImagesStayValidAfterEarlierProjection(String operation) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(
+                        new SourceField("id", "bigint", TapstateType.INT64),
+                        new SourceField("customer", "varchar", TapstateType.STRING)), List.of("id"), List.of())))));
+        Step.Inline drop = Step.inline("drop", FromClause.list(FromRef.literal("orders")),
+                new TransformBody.MapProjection(Map.of("customer", FieldRule.drop())), null);
+        Step.Inline add = Step.inline("add", FromClause.list(FromRef.literal("drop")),
+                new TransformBody.MapProjection(Map.of("items", FieldRule.literal(List.of("a")))), null);
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("add")),
+                new TransformBody.Unwind("items", "item_no", false, null, null), null);
+        PipelineResource pipeline = new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true)), List.of(drop, add, expand), null, null, null, null);
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+        var first = source.transformBinding(pipeline, drop).get();
+        var second = source.transformBinding(pipeline, add).get();
+        var last = source.transformBinding(pipeline, expand).get();
+        var op = io.tapstate.core.event.Op.valueOf(operation);
+        var event = new io.tapstate.core.event.Envelope(op, 1L, "orders",
+                Map.of("id", 1L, "customer", "ada"),
+                op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L, "customer", "ada") : null, null);
+        org.assertj.core.api.Assertions.assertThatCode(() -> {
+            var result = last.transform(second.transform(first.transform(event).getFirst()).getFirst());
+            assertThat(result).singleElement().satisfies(row -> {
+                assertThat(row.op()).isEqualTo(op);
+                assertThat(row.before()).containsEntry("id", 1L).containsEntry("items", "a");
+            });
+        }).doesNotThrowAnyException();
+        assertThatThrownBy(() -> first.transform(new io.tapstate.core.event.Envelope(
+                op, 1L, "orders", Map.of("id", 1L),
+                op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L) : null, null)))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+        Step.Inline mixed = Step.inline("add", FromClause.list(FromRef.literal("drop"), FromRef.literal("orders")),
+                add.body(), null);
+        PipelineResource mixedPipeline = new PipelineResource("mixed", null,
+                List.of(SourceRef.spec("orders_src", true)), List.of(drop, mixed, expand), null, null, null, null);
+        assertThatThrownBy(() -> source.transformBinding(mixedPipeline, mixed))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+    }
+
     @Test
     void builds_a_real_source_transform_sink_dag_from_the_stored_pipeline() {
         FakeStorePort store = new FakeStorePort();
@@ -62,7 +205,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(connectionSupplier("orders_dest"));
         store.artifacts().save(new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.spec("orders_src", true)),
                 List.of(filter("keep_even", "row.id % 2 == 0", FromRef.literal("orders_src"))),
                 null,
                 serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
@@ -80,6 +223,183 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void building_the_dag_copies_each_read_source_table_into_the_pipelines_own_record() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(filter("keep_even", "row.id % 2 == 0", FromRef.literal("orders_src"))),
+                null,
+                serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+
+        new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(store.derivedSchemas.latest("p", "orders_src.orders"))
+                .get()
+                .extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
+        // Filed under the qualified id, never under the vertex name. This source selects one table, so
+        // the graph names its vertex "orders_src" - the assertion above proves the copy does not follow
+        // that name, which would go missing the day a second table is selected and read as never
+        // recorded rather than as a change.
+        assertThat(store.derivedSchemas.latest("p", "orders_src")).isEmpty();
+    }
+
+    @Test
+    void every_read_table_gets_its_own_copy_matching_its_own_physical_table() {
+        // Two sources and three tables between them. The case above reads one table of one source, so
+        // it holds for a build that copies whatever it happens to reach first; what a pipeline needs is
+        // one copy per table it reads, each matching that table rather than a neighbour of the same
+        // shape. A copy missing here is a source node with no recorded shape at all, which reads as a
+        // table nobody has discovered - an ordinary state, investigated on the source side.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("shop_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")),
+                null, null));
+        store.artifacts().save(cdcSource("events_src", "events"));
+        store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource(
+                "three", null,
+                List.of(SourceRef.spec("shop_src", true), SourceRef.spec("events_src", true)),
+                List.of(Step.inline("all", FromClause.list(
+                                FromRef.literal("shop_src.orders"),
+                                FromRef.literal("shop_src.customers"),
+                                FromRef.literal("events_src.events")),
+                        new TransformBody.Union(), null)),
+                null,
+                serve(FromRef.literal("all"), sync("sync_1", "dest")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("shop_src", "mysql", 1L, new SourceModel(List.of(
+                new SourceTable("orders", List.of(new SourceField("o_id", "bigint", TapstateType.INT64)),
+                        List.of("o_id"), List.of()),
+                new SourceTable("customers", List.of(
+                        new SourceField("c_id", "bigint", TapstateType.INT64),
+                        new SourceField("c_name", "varchar", TapstateType.STRING)),
+                        List.of("c_id"), List.of())))));
+        store.schemas.save(new DiscoveredSourceModel("events_src", "mysql", 1L, new SourceModel(List.of(
+                new SourceTable("events", List.of(
+                        new SourceField("e_id", "bigint", TapstateType.INT64),
+                        new SourceField("kind", "varchar", TapstateType.STRING)),
+                        List.of("e_id"), List.of())))));
+        OpenRingGenerations.forSources(store, "shop_src", "events_src");
+
+        new StoreBackedDagSource(store).dagFor("three");
+
+        // Each copy carries its own table's columns. Written out per table rather than as three
+        // non-empty checks: three copies that all hold the same table would satisfy a count.
+        assertThat(store.derivedSchemas.latest("three", "shop_src.orders"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("o_id", "INT64 NULL"));
+        assertThat(store.derivedSchemas.latest("three", "shop_src.customers"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("c_id", "INT64 NULL", "c_name", "STRING NULL"));
+        assertThat(store.derivedSchemas.latest("three", "events_src.events"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("e_id", "INT64 NULL", "kind", "STRING NULL"));
+    }
+
+    @Test
+    void rediscovery_alone_leaves_every_nodes_complete_record_unchanged() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
+        store.artifacts().save(new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
+                                new TransformBody.MapProjection(Map.of("region", FieldRule.drop())), null),
+                        filter("keep_even", "row.id % 2 == 0", FromRef.literal("trimmed"))),
+                new ViewBlock.Inline("order_state", FromRef.literal("keep_even"), "id", null, null),
+                null, null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64),
+                                new SourceField("region", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+        new StoreBackedDagSource(store).dagFor("p");
+        Map<String, DerivedSchema> before = new LinkedHashMap<>();
+        for (String node : List.of("orders_src.orders", "trimmed", "keep_even", "order_state")) {
+            DerivedSchema recorded = store.derivedSchemas.latest("p", node).orElseThrow();
+            before.put(node, new DerivedSchema(recorded.version(), recorded.schema(), recorded.statement(),
+                    recorded.derivedFrom(), recorded.derivedBy()));
+        }
+        assertThat(before.get("orders_src.orders").schema())
+                .containsExactly(Map.entry("id", "INT64 NULL"), Map.entry("region", "STRING NULL"));
+        for (String node : List.of("trimmed", "keep_even", "order_state")) {
+            assertThat(before.get(node).schema()).containsExactly(Map.entry("id", "INT64 NULL"));
+        }
+
+        DiscoveredSourceModel changed = new DiscoveredSourceModel("orders_src", "mysql", 2L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "varchar", TapstateType.STRING),
+                                new SourceField("note", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of()))));
+        store.schemas.save(changed);
+
+        // A new apply, start or accept intentionally refreshes the records. Rediscovery alone must
+        // not: reading a live view of the physical model would change these already recorded nodes.
+        assertThat(store.schemas.get("orders_src")).contains(changed);
+        before.forEach((node, snapshot) -> {
+            DerivedSchema after = store.derivedSchemas.latest("p", node).orElseThrow();
+            assertThat(after).as("complete record for %s", node).isEqualTo(snapshot);
+            assertThat(after.schema()).as("column order for %s", node)
+                    .containsExactlyEntriesOf(snapshot.schema());
+        });
+    }
+
+    @Test
+    void every_step_records_the_model_it_derives_rather_than_only_the_nodes_that_read() {
+        // A pipeline with no join in it. A source node is recorded by the copy and a join step by the
+        // drift check - two of the eight node kinds - so a pipeline built out of the other six has a
+        // recorded model for what it reads and none for anything it does to it. Asserted shape by
+        // shape rather than by counting records: a walk that filed its upstream unchanged under each
+        // step id would satisfy "every step has one" while saying the dropped column is still there.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        Map<String, FieldRule> dropRegion = new LinkedHashMap<>();
+        dropRegion.put("region", FieldRule.drop());
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
+                                new TransformBody.MapProjection(dropRegion), null),
+                        filter("keep_even", "row.id % 2 == 0", FromRef.literal("trimmed"))),
+                null,
+                serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64),
+                                new SourceField("region", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+
+        new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(store.derivedSchemas.latest("p", "orders_src.orders"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL", "region", "STRING NULL"));
+        assertThat(store.derivedSchemas.latest("p", "trimmed"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
+        // A step that reshapes nothing still records. What a reader asks of a step is what the
+        // pipeline produces there, and a step with no record answers that nobody ever derived one -
+        // which is the same answer a step that failed to derive gives.
+        assertThat(store.derivedSchemas.latest("p", "keep_even"))
+                .get().extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
+    }
+
+    @Test
     void a_view_declared_by_reference_materializes_like_an_inline_one() {
         // The wizard writes this form whenever an author reuses an existing view, so it is not a
         // grammar curiosity: the reference must reach the builder already expanded.
@@ -88,7 +408,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
         store.artifacts().save(new ViewResource("order_state", null, "order_id", null, null, null));
         store.artifacts().save(new PipelineResource(
-                "p", null, List.of("orders_src"), null,
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Use(null, "order_state", FromRef.literal("orders_src")),
                 null, null, null));
 
@@ -106,7 +426,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(new ServeResource(
                 "publish", null, List.of(sync("sync_1", "orders_dest")), null, null, null));
         store.artifacts().save(new PipelineResource(
-                "p", null, List.of("orders_src"), null, null,
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null, null,
                 new ServeBlock.Use(null, "publish", FromRef.literal("orders_src")),
                 null, null));
         discovered(store, "orders_src", "orders");
@@ -124,7 +444,7 @@ class StoreBackedDagSourceTest {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(cdcSource("orders_src", "orders"));
         store.artifacts().save(new PipelineResource(
-                "p", null, List.of("orders_src"), null,
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
                 null, null, null));
 
@@ -143,7 +463,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
         store.artifacts().save(new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.spec("orders_src", true)),
                 null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
                 null, null, null));
@@ -165,6 +485,92 @@ class StoreBackedDagSourceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
                         .isEqualTo("actuation.view-store-unreachable"));
+    }
+
+    @Test
+    void a_script_carries_the_chain_on_at_the_shape_that_reached_it() {
+        // A script settles its own columns while it runs, so nothing can derive what it emits. Left at
+        // that, the record stops at the script and stops for everything below it too - the step after
+        // it derives from an unknown and is unknown itself - so one script blanks the rest of the
+        // pipeline's model. It carries the shape that reached it instead, and says in the record that
+        // this is what it did: the columns below a script rest on an assumption the script can break,
+        // and a reader has to be able to see which row that assumption entered at.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        Map<String, FieldRule> dropRegion = new LinkedHashMap<>();
+        dropRegion.put("region", FieldRule.drop());
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("scripted", FromClause.list(FromRef.literal("orders_src")),
+                                new TransformBody.Js("emit(record)"), null),
+                        Step.inline("trimmed", FromClause.list(FromRef.literal("scripted")),
+                                new TransformBody.MapProjection(dropRegion), null)),
+                null,
+                serve(FromRef.literal("trimmed"), sync("sync_1", "orders_dest")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64),
+                                new SourceField("region", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+
+        new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(store.derivedSchemas.latest("p", "scripted"))
+                .get()
+                .extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL", "region", "STRING NULL"));
+        // Named as carried rather than derived. Without this the row is indistinguishable from a step
+        // that actually works its columns out, and the assumption it rests on disappears.
+        assertThat(store.derivedSchemas.latest("p", "scripted"))
+                .get()
+                .extracting(DerivedSchema::derivedBy)
+                .isEqualTo("carried-through-1");
+        // The step below it is the point of carrying at all: it derives, and it derives from the
+        // carried shape rather than from an unknown.
+        assertThat(store.derivedSchemas.latest("p", "trimmed"))
+                .get()
+                .extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
+    }
+
+    @Test
+    void a_view_records_a_model_of_its_own_although_it_is_not_a_step() {
+        // A view is a block beside the steps rather than one of them, so a walk written as "every
+        // transform step" reaches every node but this one - and a node nobody asks about produces no
+        // error when its model is missing. It stores the rows it is handed, so what it stores is what
+        // reached it, and a reader asking what this pipeline keeps in the managed store is asking here.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
+        Map<String, FieldRule> dropRegion = new LinkedHashMap<>();
+        dropRegion.put("region", FieldRule.drop());
+        store.artifacts().save(new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
+                        new TransformBody.MapProjection(dropRegion), null)),
+                new ViewBlock.Inline("order_state", FromRef.literal("trimmed"), "id", null, null),
+                null, null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64),
+                                new SourceField("region", "varchar", TapstateType.STRING)),
+                        List.of("id"), List.of())))));
+        OpenRingGenerations.forSources(store, "orders_src");
+
+        new StoreBackedDagSource(store).dagFor("p");
+
+        // The step above it drops a column, so the view's own columns are not the source's. Asserted
+        // that way rather than as "the view has a record": a walk that filed what reached the pipeline
+        // under the view's id would satisfy the weaker reading while describing rows it never stores.
+        assertThat(store.derivedSchemas.latest("p", "order_state"))
+                .get()
+                .extracting(DerivedSchema::schema)
+                .isEqualTo(Map.of("id", "INT64 NULL"));
     }
 
     @Test
@@ -276,7 +682,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(cdcSource("orders_src", "orders"));
         store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
         store.artifacts().save(new PipelineResource(
-                "p", null, List.of("orders_src"), null,
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
                 null, null, null));
         return store;
@@ -297,7 +703,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(connectionSupplier("orders_dest"));
         store.artifacts().save(new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.spec("orders_src", true)),
                 null,
                 null,
                 serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")),
@@ -317,10 +723,10 @@ class StoreBackedDagSourceTest {
     void expands_a_multi_table_source_into_one_source_vertex_per_table() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null, null));
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
         store.artifacts().save(connectionSupplier("orders_dest"));
         store.artifacts().save(new PipelineResource(
-                "multi", null, List.of("multi_src"), null, null,
+                "multi", null, List.of(SourceRef.spec("multi_src", true)), null, null,
                 serve(FromRef.literal("multi_src"), sync("sync_1", "orders_dest")), null, null));
         discovered(store, "multi_src", "orders", "customers");
 
@@ -334,16 +740,42 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void keeps_an_explicit_multi_table_serve_subset_on_one_sink_path() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "multi_subset", null, List.of(SourceRef.bare("multi_src")), null, null,
+                new ServeBlock.Inline(
+                        "serve",
+                        FromClause.list(
+                                FromRef.literal("multi_src.orders"),
+                                FromRef.literal("multi_src.customers")),
+                        List.of(sync("sync_1", "orders_dest")), null, null),
+                null, null));
+        discovered(store, "multi_src", "orders", "customers");
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("multi_subset");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "multi_src.orders", "multi_src.customers", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("multi_src.orders", "serve.sync_1"),
+                "multi_src.customers->serve.sync_1#0,1");
+    }
+
+    @Test
     void omitted_tables_expand_to_the_latest_discovered_source_schema() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("all_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null, null));
+                SourceMode.CDC, null, null, null));
         store.schemas.save(new DiscoveredSourceModel("all_src", "mysql", 1L, new SourceModel(List.of(
                 new SourceTable("orders", List.of(), List.of(), List.of()),
                 new SourceTable("customers", List.of(), List.of(), List.of())))));
         store.artifacts().save(connectionSupplier("all_dest"));
         store.artifacts().save(new PipelineResource(
-                "all", null, List.of("all_src"), null, null,
+                "all", null, List.of(SourceRef.spec("all_src", true)), null, null,
                 serve(FromRef.literal("all_src"), sync("sync_1", "all_dest")), null, null));
 
         DAG dag = new StoreBackedDagSource(store).dagFor("all");
@@ -359,11 +791,10 @@ class StoreBackedDagSourceTest {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("players_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC,
-                List.of(TableRef.literal("Player"), TableRef.literal("PlayerCard"), TableRef.literal("Orders")),
-                null, null, null));
+                List.of(TableRef.literal("Player"), TableRef.literal("PlayerCard"), TableRef.literal("Orders")), null, null));
         store.artifacts().save(connectionSupplier("players_dest"));
         store.artifacts().save(new PipelineResource(
-                "players", null, List.of("players_src"), null, null,
+                "players", null, List.of(SourceRef.spec("players_src", true)), null, null,
                 serve(FromRef.regex("Player.*"), sync("sync_1", "players_dest")), null, null));
         discovered(store, "players_src", "Player", "PlayerCard", "Orders");
 
@@ -383,7 +814,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(cdcSource("src_b", "orders"));
         store.artifacts().save(connectionSupplier("dest"));
         store.artifacts().save(new PipelineResource(
-                "ambiguous", null, List.of("src_a", "src_b"), null, null,
+                "ambiguous", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true)), null, null,
                 serve(FromRef.literal("orders"), sync("sync_1", "dest")), null, null));
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
@@ -398,7 +829,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(cdcSource("src_a", "orders"));
         store.artifacts().save(connectionSupplier("dest"));
         store.artifacts().save(new PipelineResource(
-                "missing", null, List.of("src_a"), null, null,
+                "missing", null, List.of(SourceRef.spec("src_a", true)), null, null,
                 serve(FromRef.literal("src_a.customers"), sync("sync_1", "dest")), null, null));
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("missing"))
@@ -443,11 +874,11 @@ class StoreBackedDagSourceTest {
 
     private static SourceResource cdcSource(String id, String table) {
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static SourceResource connectionSupplier(String id) {
-        return new SourceResource(id, null, "mysql", Map.of("host", "d"), null, null, null, null, null);
+        return new SourceResource(id, null, "mysql", Map.of("host", "d"), null, null, null, null);
     }
 
     private static ServeBlock serve(FromRef from, SyncElement... sync) {
@@ -455,11 +886,11 @@ class StoreBackedDagSourceTest {
     }
 
     private static SyncElement sync(String id, String source) {
-        return new SyncElement(id, source, null, null, null, null);
+        return new SyncElement(id, source, null, null, null);
     }
 
     private static Step filter(String id, String expr, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null);
     }
 
     /** Persists the source model a production sync start requires before constructing its DAG. */
@@ -575,13 +1006,30 @@ class StoreBackedDagSourceTest {
             throw new UnsupportedOperationException();
         }
 
+        @Override
+        public PipelineLayoutStore layouts() {
+            throw new UnsupportedOperationException();
+        }
+
         private final SrsMetaStore meta = new InMemorySrsMetaStore();
+        private final SrsLogStore srsLog = new InMemorySrsLogStore();
+        private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
         private final InMemoryKeyedStateStore keyedState = new InMemoryKeyedStateStore();
         private final InMemoryNestDeadLetterStore nestDeadLetters = new InMemoryNestDeadLetterStore();
 
         @Override
         public SrsMetaStore meta() {
             return meta;
+        }
+
+        @Override
+        public SrsLogStore srsLog() {
+            return srsLog;
+        }
+
+        @Override
+        public io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() {
+            return derivedSchemas;
         }
 
         @Override

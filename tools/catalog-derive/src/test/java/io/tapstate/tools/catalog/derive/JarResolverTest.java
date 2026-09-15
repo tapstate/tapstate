@@ -12,8 +12,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Resolves a connector module to its built dist jar — the jar catalog-derive classloads to probe
- * capabilities. The jar is named {@code <module>-<version>.jar}, so a module prefix-matches its own
+ * Resolves a connector id to its built dist jar — the jar catalog-derive classloads to probe
+ * capabilities. The jar is named {@code <id>-connector-<version>.jar}, so the id with its connector suffix matches its own
  * jar without matching a sibling whose name extends it (mysql-connector vs mysql-pxc-connector). A
  * missing or ambiguous match is a build setup error, so it fails loud rather than guessing.
  */
@@ -27,13 +27,13 @@ class JarResolverTest {
         touch("mysql-connector-v1.0-SNAPSHOT.jar");
         touch("mysql-pxc-connector-v1.0-SNAPSHOT.jar");
 
-        assertThat(new JarResolver(dist).resolve("mysql-connector"))
+        assertThat(new JarResolver(dist).resolve("mysql"))
                 .isEqualTo(dist.resolve("mysql-connector-v1.0-SNAPSHOT.jar"));
     }
 
     @Test
     void failsLoudWhenNoJarMatchesTheModule() {
-        assertThatThrownBy(() -> new JarResolver(dist).resolve("mysql-connector"))
+        assertThatThrownBy(() -> new JarResolver(dist).resolve("mysql"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("mysql-connector");
     }
@@ -43,7 +43,7 @@ class JarResolverTest {
         touch("foo-connector-v1.0-SNAPSHOT.jar");
         touch("foo-connector-v2.0-SNAPSHOT.jar");
 
-        assertThatThrownBy(() -> new JarResolver(dist).resolve("foo-connector"))
+        assertThatThrownBy(() -> new JarResolver(dist).resolve("foo"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("foo-connector");
     }
@@ -54,8 +54,8 @@ class JarResolverTest {
 
         // hazelcast-connector and kafka-avro-connector exist in source but are not in the OSS dist
         // build; a missing jar is an expected, recoverable skip, not the build error resolve() raises.
-        assertThat(new JarResolver(dist).find("hazelcast-connector")).isEmpty();
-        assertThat(new JarResolver(dist).find("mysql-connector"))
+        assertThat(new JarResolver(dist).find("hazelcast")).isEmpty();
+        assertThat(new JarResolver(dist).find("mysql"))
                 .contains(dist.resolve("mysql-connector-v1.0-SNAPSHOT.jar"));
     }
 
@@ -64,7 +64,7 @@ class JarResolverTest {
         touch("foo-connector-v1.0-SNAPSHOT.jar");
         touch("foo-connector-v2.0-SNAPSHOT.jar");
 
-        assertThatThrownBy(() -> new JarResolver(dist).find("foo-connector"))
+        assertThatThrownBy(() -> new JarResolver(dist).find("foo"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("foo-connector");
     }

@@ -160,7 +160,9 @@ find_issue() {
         state="$(printf '%s' "$found" | jq -r --arg t "$title" 'first(.[]|select(.title==$t))|.state' | tr '[:upper:]' '[:lower:]')"
         number="$(printf '%s' "$found" | jq -r --arg t "$title" 'first(.[]|select(.title==$t))|.number')"
     else
-        echo "$repo  no single issue titled \"$title\" ($n found); treating as not done" >&2
+        # stdout, like every other outcome here: the caller tees stdout into the step summary and
+        # tees stderr nowhere, so this is the only place the decision below can be seen from.
+        echo "$repo  no single issue titled \"$title\" ($n found); treating as not done"
         state="open"
     fi
 }
@@ -233,19 +235,39 @@ if [ "$state" = closed ]; then
         echo "$repo  site is published: tag $tag on main, and say so on the issue"
         exit 0
     fi
-    sha="$(gh api "repos/$repo/git/ref/heads/main" --jq '.object.sha' 2>/dev/null)"
+    # Every outcome below goes to stdout, and gh's own error travels with it, for the reason the
+    # withdrawal half does the same: the caller tees stdout into the step summary and tees stderr
+    # nowhere, so a release that tagged the published site and one that could not used to leave the
+    # same green step and the same empty summary, and `>/dev/null 2>&1` meant even a person who went
+    # and looked at the other repository was told the fact and never why.
+    #
+    # `gh api` writes the error body to stdout when a request fails, so a read taken for its output
+    # alone hands back that document rather than the sha -- and it is non-empty, which is all an
+    # emptiness guard tests for. The sha is picked out of what came back instead: on success that is
+    # the only thing there, and nothing a failure prints can be mistaken for one.
+    read_out="$(gh api "repos/$repo/git/ref/heads/main" --jq '.object.sha' 2>&1)"
+    sha="$(printf '%s\n' "$read_out" | grep -oE '^[0-9a-f]{40}$' | tail -1)"
     if [ -z "$sha" ]; then
-        echo "$repo  cannot read main; leaving $tag to $owner" >&2
+        echo "::warning::$repo has no $tag for the published site: its main could not be read -- $owner can create the tag by hand: $read_out"
+        echo "$repo  cannot read main, so $tag was not created -- $owner can create it by hand: $read_out"
         exit 0
     fi
-    if gh release create "$tag" --repo "$repo" --target "$sha" --title "$tag" \
+    if create_err="$(gh release create "$tag" --repo "$repo" --target "$sha" --title "$tag" \
          --notes "The documentation published with tapstate $tag. What changed is in the tapstate release: $notes_url" \
-         >/dev/null 2>&1; then
+         2>&1 >/dev/null)"; then
         echo "$repo  $tag created on main"
-        [ -z "${number:-}" ] || gh issue comment "$number" --repo "$repo" \
-            --body "Released as \`$tag\`, cut from \`main\`. Nothing further needed here." >/dev/null 2>&1 || true
+        # A note that does not land costs nobody anything to act on -- the site is published and the
+        # tag is there -- so it is said plainly and raises no warning.
+        if [ -n "${number:-}" ] && ! note_err="$(gh issue comment "$number" --repo "$repo" \
+                --body "Released as \`$tag\`, cut from \`main\`. Nothing further needed here." 2>&1 >/dev/null)"; then
+            echo "$repo  #$number was not told that $tag exists: $note_err"
+        fi
     else
-        echo "$repo  could not create $tag -- $owner can create it by hand" >&2
+        # The site is published and its documentation carries no tag for this version. Nothing else
+        # in the release mentions it and the release goes out either way, so this warning is the only
+        # thing between that and a person.
+        echo "::warning::$repo has no $tag for the published site -- $owner can create it by hand: $create_err"
+        echo "$repo  could not create $tag -- $owner can create it by hand: $create_err"
     fi
     exit 0
 fi

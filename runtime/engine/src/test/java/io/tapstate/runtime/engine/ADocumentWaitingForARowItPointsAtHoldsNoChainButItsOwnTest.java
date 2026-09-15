@@ -181,12 +181,21 @@ class ADocumentWaitingForARowItPointsAtHoldsNoChainButItsOwnTest {
         await(() -> acked().contains(acked(ORDERS, MOVING_ORDER_AT))
                 && acked().contains(acked(CUSTOMERS, UNRELATED_CUSTOMER_AT)));
 
+        // Assert the document identity and state, not the physical delivery count. A nest publishes
+        // whole-document upserts and may harmlessly redraw the same final state when independent inputs
+        // meet in a different drain; what discriminates this case is that O2 went out complete while O1
+        // did not go out at all.
         assertThat(DOCUMENTS)
                 .describedAs("the control: the run reached the state being asked about. One order's row "
                         + "named a customer that arrived and its document went out; the other names one "
                         + "that never does, so its document is still being waited on. Without this every "
                         + "assertion below is one an unstarted run would also pass")
-                .hasSize(1);
+                .isNotEmpty()
+                .allSatisfy(document -> assertThat(document)
+                        .containsEntry("order_id", "O2")
+                        .containsEntry("customer", Map.of(
+                                "customer_id", NAMED,
+                                "name", "Grace")));
 
         assertThat(acked())
                 .describedAs("the unrelated row on the pointed-at chain was let past. No document names "

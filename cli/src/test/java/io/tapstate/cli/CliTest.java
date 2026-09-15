@@ -21,7 +21,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * The dual-mode CLI's command table: the offline-verb whitelist (validate / new / explain), the coded
+ * The dual-mode CLI's command table: the offline-verb whitelist (validate / new / add / explain), the coded
  * not-connected and not-implemented affordances (which must survive the operands these verbs are really
  * typed with), the exit-code contract, and validate wired to the offline DSL link.
  */
@@ -74,8 +74,18 @@ class CliTest {
     void connectedVerbsAreRegisteredNotMissing() {
         // connect is a REPL builtin (session-scoped), not a one-shot subcommand
         assertThat(Cli.newCommandLine().getSubcommands().keySet())
-                .contains("apply", "run")
+                .contains("apply", "up")
                 .doesNotContain("connect");
+    }
+
+    @Test
+    void theCompositeVerbIsUpAndNoLongerAReservedRun() {
+        // `run` was the placeholder for apply-then-start; the verb shipped as `up`, so the placeholder
+        // is gone rather than kept beside the real thing, and `up` is a real command on the table
+        assertThat(Cli.UNIMPLEMENTED_COMPOSITE_VERBS).doesNotContain("run", "up");
+        assertThat(Cli.COMPOSITE_VERBS).contains("up");
+        assertThat(Cli.newCommandLine().getSubcommands().keySet()).contains("up").doesNotContain("run");
+        assertThat(Cli.VERB_BY_OPERATION.values()).doesNotContain("up");
     }
 
     @Test
@@ -175,6 +185,10 @@ class CliTest {
         TreeSet<String> registeredOffline = new TreeSet<>(Cli.newCommandLine().getSubcommands().keySet());
         registeredOffline.removeAll(Cli.CONNECTED_VERBS);
         registeredOffline.removeAll(Cli.UNIMPLEMENTED_COMPOSITE_VERBS);
+        // a composed verb projects no operation of its own -- it is a sequence of ones that do -- so it
+        // is not in the connected list either, and it is the opposite of offline: every verb it composes
+        // needs a server
+        registeredOffline.removeAll(Cli.COMPOSITE_VERBS);
         // the live views project no operation, so they are not in the connected list, but they are the
         // opposite of offline: each is a loop over reads that only a server can answer
         registeredOffline.removeAll(Cli.LIVE_VIEW_VERBS);
@@ -673,6 +687,7 @@ class CliTest {
         // does — this pins the entries to the registered names, in both directions
         TreeSet<String> registered = new TreeSet<>(Cli.CONNECTED_VERBS);
         registered.addAll(Cli.UNIMPLEMENTED_COMPOSITE_VERBS);
+        registered.addAll(Cli.COMPOSITE_VERBS);
         registered.addAll(Cli.LIVE_VIEW_VERBS);
         assertThat(new TreeSet<>(Cli.VERB_HELP.keySet())).isEqualTo(registered);
     }

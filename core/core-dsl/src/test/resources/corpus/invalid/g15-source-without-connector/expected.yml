@@ -1,0 +1,3 @@
+rule: missing-field
+path: connector
+note: "a source declares no connector; the field is required and the parser has nothing to derive it from"

@@ -1,4 +1,4 @@
-# ADR-0016 §14.7 — CSV batch import + cleanse (file mode, bounded one-shot).
+# §14.7 — CSV batch import + cleanse (file mode, bounded one-shot).
 # Bare csv has no discovery catalog: tables is required and literal-only (X12).
 version: tapstate/v1
 kind: source

@@ -23,11 +23,11 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Batch reference closure (plan poc1 B3-6). Offline the closure is the batch (ADR-0021 §3):
+ * Batch reference closure (plan poc1 B3-6). Offline the closure is the batch:
  * every reference a pipeline makes must resolve within the loaded resources. Per pipeline, in
  * order: minimal composition (X17), pipeline-internal id uniqueness, {@code source:} id
- * references, step-id no-shadowing (ADR-0016 §5), {@code from:} addressing (step id / view id /
- * table universe / {@code /…/} regex — ADR-0016 §4/§5/§8), {@code use:} definition references
+ * references, step-id no-shadowing (§5), {@code from:} addressing (step id / view id /
+ * table universe / {@code /…/} regex — §4/§5/§8), {@code use:} definition references
  * (X19), and {@code sync}/{@code push} connection-source references (X18). The first violation
  * throws a {@link DslException} whose {@code rule} is a corpus-vocabulary key (corpus/README.md).
  *
@@ -60,6 +60,13 @@ final class ReferenceClosure {
     }
 
     private void validatePipeline(PipelineResource p) {
+        // The visual editor creates a persisted blank draft before any Source has been chosen.
+        // It is intentionally not runnable yet; the next typed save must supply the full
+        // source + view/serve composition before the normal closure checks apply.
+        if (p.sources().isEmpty() && (p.transforms() == null || p.transforms().isEmpty())
+                && p.view() == null && p.serve() == null) {
+            return;
+        }
         // X17 minimal composition: source (model guarantees non-empty) + an output surface.
         if (p.view() == null && p.serve() == null) {
             throw new DslException(DslError.COMPOSITION, "", 0, 0, null,
@@ -68,7 +75,7 @@ final class ReferenceClosure {
         }
         checkInternalIds(p);
         // source: id references must name kind: source resources in the batch.
-        for (String sid : p.sources()) {
+        for (String sid : p.sourceIds()) {
             if (!sources.containsKey(sid)) {
                 throw missing("source", sid);
             }
@@ -99,7 +106,7 @@ final class ReferenceClosure {
 
         ServeBlock serve = p.serve();
         if (serve != null) {
-            resolveRef(serveFrom(serve), serveScope(stepIds, view), universe, "serve.from");
+            resolveFrom(serveFrom(serve), serveScope(stepIds, view), universe, "serve.from");
             validateServeSinks(serve);
             if (serve instanceof ServeBlock.Use u) {
                 resolveUse(u.use(), Kind.SERVE, "serve.use");
@@ -149,7 +156,7 @@ final class ReferenceClosure {
     }
 
     /**
-     * No-shadowing (ADR-0016 §5): a transform step id — declared or generated — must not equal a
+     * No-shadowing (§5): a transform step id — declared or generated — must not equal a
      * referenced source id or a table name in the universe, or {@code from:} resolution could not
      * tell the step's output apart from the source / table it shadows. This is a distinct check from
      * internal uniqueness above: it crosses namespaces (step id vs the source-id and table-name
@@ -162,7 +169,7 @@ final class ReferenceClosure {
         if (p.transforms() == null) {
             return;
         }
-        Set<String> sourceIds = new LinkedHashSet<>(p.sources());
+        Set<String> sourceIds = new LinkedHashSet<>(p.sourceIds());
         Set<String> literalTables = new HashSet<>();
         for (SourceTables st : universe) {
             literalTables.addAll(st.literals);
@@ -173,7 +180,7 @@ final class ReferenceClosure {
             String path = "transforms[" + i + "].id";
             if (sourceIds.contains(id) || literalTables.contains(id)) {
                 // step id shadows a source id or a literal table name — either way from: addressing
-                // could not tell the step output apart from what it shadows (ADR-0016 §5)
+                // could not tell the step output apart from what it shadows (§5)
                 throw new DslException(DslError.DUPLICATE_ID, path, 0, 0, null, Map.of("id", id));
             }
         }
@@ -295,7 +302,7 @@ final class ReferenceClosure {
         return ids;
     }
 
-    /** serve.from may additionally name the pipeline's view (ADR-0016 §8). */
+    /** serve.from may additionally name the pipeline's view (§8). */
     private static Set<String> serveScope(Set<String> stepIds, ViewBlock view) {
         if (view == null) {
             return stepIds;
@@ -310,7 +317,7 @@ final class ReferenceClosure {
         // duplicate id never inflates the cross-source match count into a false ambiguity. (Rejecting
         // a duplicate id in the source list itself is a separate concern, out of B3-6 closure scope.)
         List<SourceTables> out = new ArrayList<>();
-        for (String sid : new LinkedHashSet<>(p.sources())) {
+        for (String sid : new LinkedHashSet<>(p.sourceIds())) {
             out.add(tableSetOf(sources.get(sid)));     // sources resolved above
         }
         return out;
@@ -347,7 +354,7 @@ final class ReferenceClosure {
         };
     }
 
-    private static FromRef serveFrom(ServeBlock s) {
+    private static FromClause serveFrom(ServeBlock s) {
         return switch (s) {
             case ServeBlock.Inline i -> i.from();
             case ServeBlock.Use u -> u.from();

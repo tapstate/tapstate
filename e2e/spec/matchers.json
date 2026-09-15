@@ -12,7 +12,7 @@
     },
     {
       "word": "doc",
-      "description": "One document at an endpoint, located by equality settings and held to scalar values by path and list lengths by path - what makes 'the right rows crossed' assertable rather than only 'rows crossed'."
+      "description": "One document at an endpoint, located by equality settings and held to scalar values by path, list lengths by path, and paths that must not be there at all - what makes 'the right rows crossed' assertable rather than only 'rows crossed'. The last of the three is the only one a wider document fails: every value and length is satisfied by a document carrying extra fields beside them."
     },
     {
       "word": "error_count",
@@ -43,6 +43,14 @@
     {
       "word": "stop",
       "description": "A lifecycle verb, driven on the pipeline. Written on its own."
+    },
+    {
+      "word": "restart",
+      "description": "A word the terminal offers, driven on the pipeline. It expands into the product's own verbs; the vocabulary follows what a person types."
+    },
+    {
+      "word": "restart --rerun",
+      "description": "A word the terminal offers, driven on the pipeline. It expands into the product's own verbs; the vocabulary follows what a person types."
     },
     {
       "word": "assert",
@@ -102,8 +110,16 @@
       "description": "Provides a mysql store."
     },
     {
+      "word": "oracle",
+      "description": "Provides a oracle store."
+    },
+    {
       "word": "postgres",
       "description": "Provides a postgres store."
+    },
+    {
+      "word": "sqlserver",
+      "description": "Provides a sqlserver store."
     }
   ]
 }

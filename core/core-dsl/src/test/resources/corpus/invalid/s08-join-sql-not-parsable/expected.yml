@@ -1,0 +1,3 @@
+rule: join-sql-not-parsable
+path: transforms[0].sql
+note: "the sql: block does not parse; the parser's own diagnosis is carried through"

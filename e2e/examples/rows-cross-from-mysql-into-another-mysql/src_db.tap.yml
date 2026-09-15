@@ -1,0 +1,7 @@
+version: tapstate/v1
+kind: source
+id: src_db
+connector: mysql
+config: { host: ${SRC_DB_HOST}, port: ${SRC_DB_PORT}, database: ${SRC_DB_DATABASE}, username: ${SRC_DB_USERNAME}, password: ${SRC_DB_PASSWORD} }
+mode: cdc
+tables: [ orders ]

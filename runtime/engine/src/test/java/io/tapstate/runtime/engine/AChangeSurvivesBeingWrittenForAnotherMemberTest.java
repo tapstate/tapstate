@@ -128,6 +128,7 @@ class AChangeSurvivesBeingWrittenForAnotherMemberTest {
                 .describedAs("most positions have no token at all, so this is the ordinary case rather "
                         + "than an edge one - and a wire form that cannot write an absent one fails on "
                         + "the first change rather than on a rare one")
+                .hasSize(1)
                 .allSatisfy(position -> assertThat(position.token()).isNull());
     }
 

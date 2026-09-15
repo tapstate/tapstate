@@ -20,6 +20,7 @@ import io.tapstate.core.logging.LogLine;
 import io.tapstate.core.logging.LogSink;
 import io.tapstate.messages.MessageCatalog;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -489,9 +490,9 @@ class PipelineStreamApiTest {
             public Optional<Resource> get(String id) {
                 if (id.equals("views")) {
                     return Optional.of(new SourceResource(id, null, "mongodb",
-                            Map.of("uri", "mongodb://db.local"), null, null, null, null, null));
+                            Map.of("uri", "mongodb://db.local"), null, null, null, null));
                 }
-                return Optional.of(new PipelineResource(id, null, List.of("src_x"), null, null, null, null, null));
+                return Optional.of(new PipelineResource(id, null, List.of(SourceRef.bare("src_x")), null, null, null, null, null));
             }
 
             @Override

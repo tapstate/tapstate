@@ -9,4 +9,4 @@ config: { base_url: "https://api.github.com", token: ghp_a1b2c3d4 }
 mode: api
 tables:
   - { name: issues, pk: [id] }
-options: { poll_interval: 5m, cursor: updated_at, start_from: earliest }
+options: { start_from: earliest }

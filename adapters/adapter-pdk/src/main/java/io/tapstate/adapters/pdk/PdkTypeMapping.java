@@ -8,6 +8,7 @@ import io.tapdata.entity.schema.type.TapDateTime;
 import io.tapdata.entity.schema.type.TapJson;
 import io.tapdata.entity.schema.type.TapMap;
 import io.tapdata.entity.schema.type.TapNumber;
+import io.tapdata.entity.schema.type.TapRaw;
 import io.tapdata.entity.schema.type.TapString;
 import io.tapdata.entity.schema.type.TapTime;
 import io.tapdata.entity.schema.type.TapType;
@@ -15,6 +16,8 @@ import io.tapdata.entity.schema.type.TapYear;
 import io.tapstate.core.common.TapstateType;
 
 import java.math.BigDecimal;
+import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.StringType;
 
 /**
  * Maps a PDK type onto the tapstate type namespace: the normalization step that turns what a connector
@@ -34,22 +37,113 @@ final class PdkTypeMapping {
     private PdkTypeMapping() {
     }
 
-    /** The tapstate type for a filled PDK type. */
-    static TapstateType of(TapType type) {
+    /**
+     * What a PDK type resolved to and, where nothing did, which unknown it is.
+     *
+     * <p><b>The reason is the whole point of the pair.</b> The several ways a column arrives without a
+     * type want different things done about them - a connector that declared nothing is a connector
+     * problem, a spelling with no member here is this mapping being short a case, and a number
+     * described in a way that names no width is neither. As one bare UNKNOWN they read alike, and the
+     * one they read as is the one nobody investigates.
+     */
+    record Resolved(TapstateType type, String unknownBecause) {
+
+        static Resolved of(TapstateType type) {
+            return new Resolved(type, null);
+        }
+
+        static Resolved unknown(String because) {
+            return new Resolved(TapstateType.UNKNOWN, because);
+        }
+    }
+
+    /**
+     * The tapstate type for a filled PDK type, and the reason where it is unknown. One switch, so the
+     * type and its attribution cannot answer differently.
+     */
+    static Resolved resolve(TapType type) {
         return switch (type) {
             case TapNumber number -> number(number);
-            case TapString ignored -> TapstateType.STRING;
-            case TapBoolean ignored -> TapstateType.BOOLEAN;
-            case TapDate ignored -> TapstateType.DATE;
-            case TapTime ignored -> TapstateType.TIME;
-            case TapDateTime ignored -> TapstateType.DATETIME;
-            case TapYear ignored -> TapstateType.YEAR;
-            case TapBinary ignored -> TapstateType.BINARY;
-            case TapJson ignored -> TapstateType.JSON;
-            case TapArray ignored -> TapstateType.ARRAY;
-            case TapMap ignored -> TapstateType.MAP;
-            case null, default -> TapstateType.UNKNOWN;
+            case TapString ignored -> Resolved.of(TapstateType.STRING);
+            case TapBoolean ignored -> Resolved.of(TapstateType.BOOLEAN);
+            case TapDate ignored -> Resolved.of(TapstateType.DATE);
+            case TapTime ignored -> Resolved.of(TapstateType.TIME);
+            case TapDateTime ignored -> Resolved.of(TapstateType.DATETIME);
+            case TapYear ignored -> Resolved.of(TapstateType.YEAR);
+            case TapBinary ignored -> Resolved.of(TapstateType.BINARY);
+            case TapJson ignored -> Resolved.of(TapstateType.JSON);
+            case TapArray ignored -> Resolved.of(TapstateType.ARRAY);
+            case TapMap ignored -> Resolved.of(TapstateType.MAP);
+            case null -> Resolved.unknown("the connector declared no type for this column");
+            // Named rather than counted: which shape arrived is what says this mapping is short a case
+            // rather than the connector being at fault, and it is the one fact nobody can recover later.
+            default -> Resolved.unknown(
+                    "the connector's " + type.getClass().getSimpleName()
+                            + " has no member in the tapstate type namespace");
         };
+    }
+
+    /** Copies every declared numeric attribute before the framework descriptor leaves discovery. */
+    static NumericType numericType(TapType type) {
+        if (!(type instanceof TapNumber number)) {
+            return null;
+        }
+        return new NumericType(number.getBit(), number.getFixed(), number.getUnsigned(), number.getZerofill(),
+                number.getMinValue(), number.getMaxValue(), number.getPrecision(), number.getScale());
+    }
+
+    /** Copies all declared string attributes, including the source's character width. */
+    static StringType stringType(TapType type) {
+        return type instanceof TapString string
+                ? new StringType(string.getBytes(), string.getFixed(), string.getDoubleBytes(),
+                        string.getDefaultValue(), string.getByteRatio()) : null;
+    }
+
+    static TapType targetType(TapstateType type, NumericType number, StringType string) {
+        if (type == TapstateType.STRING && string != null) {
+            return new TapString().bytes(string.bytes()).fixed(string.fixed()).doubleBytes(string.doubleBytes())
+                    .defaultValue(string.defaultValue()).byteRatio(string.byteRatio());
+        }
+        return targetType(type, number);
+    }
+
+    /** Restores the source descriptor without inventing bounds or a destination SQL spelling. */
+    static TapType targetType(TapstateType type, NumericType number) {
+        if (number == null || (type != TapstateType.DECIMAL && type != TapstateType.INT64 && type != TapstateType.DOUBLE)) {
+            return targetType(type);
+        }
+        return new TapNumber().bit(number.bit()).fixed(number.fixed()).unsigned(number.unsigned())
+                .zerofill(number.zerofill()).minValue(number.minValue()).maxValue(number.maxValue())
+                .precision(number.precision()).scale(number.scale());
+    }
+
+    /** Projects the inferred portable type into the PDK vocabulary; database types remain PDK-owned. */
+    static TapType targetType(TapstateType type) {
+        return switch (type) {
+            case STRING -> new TapString();
+            case INT64 -> new TapNumber().bit(64).scale(0).minValue(SIGNED_64_MIN)
+                    .maxValue(BigDecimal.valueOf(Long.MAX_VALUE));
+            case DECIMAL -> throw new IllegalArgumentException(
+                    "decimal target requires declared numeric attributes; rediscover the source schema. "
+                            + "Computed decimal columns have no declared numeric metadata");
+            case DOUBLE -> new TapNumber().fixed(false).bit(64)
+                    .minValue(BigDecimal.valueOf(-Double.MAX_VALUE)).maxValue(BigDecimal.valueOf(Double.MAX_VALUE));
+            case BOOLEAN -> new TapBoolean();
+            case DATE -> new TapDate();
+            case TIME -> new TapTime();
+            case DATETIME -> new TapDateTime();
+            case YEAR -> new TapYear();
+            case BINARY -> new TapBinary();
+            case JSON -> new TapJson();
+            case ARRAY -> new TapArray();
+            case MAP -> new TapMap();
+            case UNKNOWN -> new TapRaw();
+        };
+    }
+
+    /** The tapstate type alone, for callers that reason about the column and not about its attribution. */
+    static TapstateType of(TapType type) {
+        return resolve(type).type();
     }
 
     /**
@@ -72,16 +166,22 @@ final class PdkTypeMapping {
      * time is the double the driver delivered. Unknown is the only answer that neither guesses nor
      * silently permits - it is refused by name and the author rules on it.
      */
-    private static TapstateType number(TapNumber number) {
+    private static Resolved number(TapNumber number) {
         Boolean fixed = number.getFixed();
         if (fixed != null) {
-            return fixed ? TapstateType.DECIMAL : TapstateType.DOUBLE;
+            return Resolved.of(fixed ? TapstateType.DECIMAL : TapstateType.DOUBLE);
         }
         Integer scale = number.getScale();
         if (scale != null) {
-            return scale == 0 ? TapstateType.INT64 : TapstateType.UNKNOWN;
+            return scale == 0
+                    ? Resolved.of(TapstateType.INT64)
+                    : Resolved.unknown("the connector declared a scale of " + scale
+                            + " without saying whether the column is exact or approximate");
         }
-        return describesAWholeNumber(number) ? TapstateType.INT64 : TapstateType.UNKNOWN;
+        return describesAWholeNumber(number)
+                ? Resolved.of(TapstateType.INT64)
+                : Resolved.unknown(
+                        "the connector named a number type and declared no scale, width or value range");
     }
 
     /**

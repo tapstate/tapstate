@@ -74,7 +74,8 @@ public final class MongoUserStore implements UserStore {
             // A stored document whose fields no longer form a valid user (a field is missing or blank)
             // is a storage-integrity failure, surfaced as an io diagnostic — with the original failure
             // kept as the cause — rather than crashing bare from the record's own validation.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(username)), e);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(username), "field", "user"), e);
         }
     }
 }

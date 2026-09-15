@@ -14,6 +14,7 @@ import java.util.Optional;
 final class InMemorySchemaStore implements SchemaStore {
 
     private final Map<String, DiscoveredSourceModel> byConnection = new LinkedHashMap<>();
+    private int reads;
 
     @Override
     public void save(DiscoveredSourceModel discovered) {
@@ -22,6 +23,17 @@ final class InMemorySchemaStore implements SchemaStore {
 
     @Override
     public Optional<DiscoveredSourceModel> get(String connectionId) {
+        reads++;
         return Optional.ofNullable(byConnection.get(connectionId));
+    }
+
+    /**
+     * How many times anything has read a connection's discovery. Counted rather than left to a case to
+     * assert it "worked": a resolution that reads the whole model once per table and one that reads it
+     * once produce the same answer, and the difference only shows on a source with many tables - which
+     * is where it costs.
+     */
+    int reads() {
+        return reads;
     }
 }

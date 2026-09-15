@@ -24,7 +24,7 @@ permissions:
   contents: read
   pull-requests: read
 
-# Community Edition keeps a single project state; serialize with sonarqube.yml's own group shape so
+# Community Edition keeps a single project state; serialize with CI's analysis group shape so
 # an on-demand run and a push analysis cannot interleave.
 concurrency:
   group: sonarqube-${{ inputs.pr }}
@@ -65,7 +65,7 @@ jobs:
           java-version: "21"
           cache: maven
 
-      # Same three commands as sonarqube.yml, in the same order and for the same reasons - a result
+      # A maintainer-requested fork analysis builds its approved merge result separately - a result
       # produced differently is not comparable with the one every other pull request gets.
       - name: Build, test and analyze
         env:

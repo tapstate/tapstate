@@ -32,6 +32,27 @@ interface ControlPlaneClient extends AutoCloseable {
     String serverVersion(URI baseUrl);
 
     /**
+     * Everything {@code GET {baseUrl}/version} says, not only the number: the release this server was
+     * built from, the authoring grammars it accepts, and the schema version of the system data it is
+     * running against. {@code null} when the server does not answer at all, and a null component when it
+     * answers without that part -- a build older than the field, or a run with no store behind it.
+     *
+     * <p>The default keeps the version and knows nothing else, which is what any implementation that has
+     * not been taught the rest can honestly say.
+     */
+    default ServerVersion serverVersionDetail(URI baseUrl) {
+        String version = serverVersion(baseUrl);
+        return version == null ? null : new ServerVersion(version, null, null);
+    }
+
+    /**
+     * What a server says about itself. A null {@code dslVersions} or {@code dataVersion} means the
+     * server did not report it, which is not the same as reporting none: an empty grammar list would be
+     * a server that accepts nothing, and callers must not print the two alike.
+     */
+    record ServerVersion(String version, List<String> dslVersions, Integer dataVersion) { }
+
+    /**
      * Verifies a username / password via {@code POST {baseUrl}/auth/login} and returns the outcome: a
      * bearer token on success, a coded rejection when the server refuses, or unreachable on any I/O
      * failure. Never throws.
@@ -186,7 +207,8 @@ interface ControlPlaneClient extends AutoCloseable {
      * refuses (an unknown pipeline, a forbidden transition, or a stale revision), or unreachable on any I/O
      * failure. Never throws.
      */
-    LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb);
+    LifecycleOutcome lifecycle(
+            URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState);
 
     /**
      * Reads a pipeline's lifecycle state via {@code GET {baseUrl}/api/pipelines/{pipelineId}/status},
@@ -202,6 +224,26 @@ interface ControlPlaneClient extends AutoCloseable {
      * yet), a coded rejection when the server refuses, or unreachable on any I/O failure. Never throws.
      */
     MetricsOutcome metrics(URI baseUrl, String credential, String pipelineId);
+
+    /**
+     * Reads where a pipeline resumes from via {@code GET {baseUrl}/api/pipelines/{pipelineId}/position},
+     * authenticated by the bearer {@code credential}: the document on success, a coded rejection when the
+     * server refuses, or unreachable on any I/O failure. Never throws.
+     */
+    PositionOutcome position(URI baseUrl, String credential, String pipelineId);
+
+    /**
+     * Moves where a pipeline's chains resume from via
+     * {@code PUT {baseUrl}/api/pipelines/{pipelineId}/position}, sending {@code document} as the body:
+     * the reading afterwards on success, a coded rejection when the server refuses, or unreachable on any
+     * I/O failure. Never throws.
+     *
+     * <p>{@code document} travels as the caller's own bytes and is not parsed on the way out. What the
+     * server compares the request against is what the server itself handed out, so a round trip through a
+     * reader and a writer here could only introduce differences the author never made — and each of those
+     * is something the server would then refuse by name.
+     */
+    PositionOutcome setPosition(URI baseUrl, String credential, String pipelineId, String document);
 
     /**
      * Reads a pipeline's per-table initial-load progress via
@@ -227,6 +269,26 @@ interface ControlPlaneClient extends AutoCloseable {
     /** Sets the minimum severity retained for a Pipeline's future node-local log lines. */
     default PipelineLogLevelOutcome logLevel(URI baseUrl, String credential, String pipelineId, String level) {
         return new PipelineLogLevelOutcome.Unreachable();
+    }
+
+    /**
+     * Reads what a pipeline's join steps derive their output columns to be via
+     * {@code GET {baseUrl}/api/pipelines/{pipelineId}/derived-schema}, authenticated by the bearer
+     * {@code credential}: one report per derived step on success (empty for a pipeline with no join), a
+     * coded rejection when the server refuses, or unreachable on any I/O failure. Never throws.
+     */
+    default DerivedSchemaOutcome derivedSchema(URI baseUrl, String credential, String pipelineId) {
+        return new DerivedSchemaOutcome.Unreachable();
+    }
+
+    /**
+     * Records what a pipeline's join steps produce now as the shape to hold them to from here, via
+     * {@code POST {baseUrl}/api/pipelines/{pipelineId}:accept-derived-schema}, authenticated by the
+     * bearer {@code credential}: the report as it now stands on success, a coded rejection when the
+     * server refuses, or unreachable on any I/O failure. Never throws.
+     */
+    default DerivedSchemaOutcome acceptDerivedSchema(URI baseUrl, String credential, String pipelineId) {
+        return new DerivedSchemaOutcome.Unreachable();
     }
 
     /**

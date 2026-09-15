@@ -8,6 +8,7 @@ import io.tapdata.entity.event.dml.TapRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
 import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.TapTable;
+import io.tapdata.entity.utils.cache.KVMap;
 import io.tapdata.pdk.apis.TapConnector;
 import io.tapdata.pdk.apis.annotations.TapConnectorClass;
 import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
@@ -25,11 +26,14 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -43,6 +47,9 @@ import java.util.stream.Stream;
  * one. Everything the product does around the connector - registering the artifact, resolving the
  * class, deriving the target model, running the DAG, keying the upsert - is the real thing; only the
  * store at each end is a directory instead of a database.
+ *
+ * <p>A table is published by staging its complete contents beside it and atomically replacing the
+ * table's file. Writers must never overwrite a visible table in place because readers open it whole.
  *
  * <h2>Two rules this class must not break</h2>
  *
@@ -91,7 +98,17 @@ public class CsvConnector implements TapConnector {
      */
     private static final String FAIL_CDC = "fail_cdc";
 
+    /** A test affordance for a saved-source witness: discovery fails when persistence loses this secret. */
+    private static final String REQUIRE_PASSWORD = "require_password";
+
     private static final String SUFFIX = ".csv";
+
+    /**
+     * What a table's content is staged under while the table is being replaced. The format's suffix is
+     * absent from it on purpose: a staging file that outlived a crash is then not a table by the same
+     * reading that lists the tables, and no lookup resolves to it.
+     */
+    private static final String STAGING_SUFFIX = ".staging";
 
     /**
      * The one command the read face dispatches. It is pinned on both sides on purpose: the caller sends
@@ -105,6 +122,13 @@ public class CsvConnector implements TapConnector {
 
     private static final long POLL_MILLIS = 100;
 
+    /**
+     * The key this connector files its own name under, in the notepad the engine hands it. Public because
+     * the witness that reads the notepad out of the store has to name the same key, and a copy of the
+     * string in the test is a copy that can drift.
+     */
+    public static final String IDENTITY = "csv-source-identity";
+
     /** Set by {@code stop}; the tail also honours its thread's interrupt. Both signals arrive on cancel. */
     private volatile boolean stopped;
 
@@ -116,8 +140,16 @@ public class CsvConnector implements TapConnector {
         functions
                 .supportBatchRead((context, table, offset, size, consumer) ->
                         consumer.accept(snapshot(context, table.getId()), null))
-                .supportStreamRead((context, tables, offset, size, consumer) ->
-                        tail(context, tables, consumer))
+                .supportStreamRead((context, tables, offset, size, consumer) -> {
+                    mintTheIdentityOnce(context);
+                    tail(context, tables, consumer);
+                })
+                // A streaming source states where its stream stands, and this one does the same. A snapshot
+                // samples it before reading its first row and hands it on as the seam the tail joins at; a
+                // source that names no position leaves that join to guesswork, which a snapshot followed by
+                // a tail refuses rather than papers over. Every stream-capable connector the ecosystem ships
+                // declares this -- the only ones that do not are its own benchmark fixtures.
+                .supportTimestampToStreamOffset((context, startTime) -> highWaterMarks(context))
                 .supportWriteRecord((context, events, table, consumer) ->
                         consumer.accept(write(context, events, table)))
                 // The three the read face drives. Registering them is what lets a specification exercise
@@ -128,6 +160,26 @@ public class CsvConnector implements TapConnector {
                 .supportGetTableInfoFunction(CsvConnector::tableInfo)
                 .supportExecuteCommandFunction((context, command, consumer) ->
                         consumer.accept(execute(context, command)));
+    }
+
+    /**
+     * Writes the name this source knows itself by, once, and never again - the shape a real connector's
+     * own memory takes, reduced to the part the engine is responsible for. A PostgreSQL source records the
+     * replication slot it created; a change-data reader records the server name its recorded positions are
+     * filed under. Both are minted on a first run, looked up on every run after, and unrecoverable when the
+     * notepad handed over is empty: the connector concludes it has never run here and mints another.
+     *
+     * <p>Nothing in this connector ever reads the value back. Being handed back the same bytes is the whole
+     * of its job, which is what makes it usable as a witness: a fresh value where the old one should be is
+     * exactly the failure a real connector suffers, and it is visible without a real database to suffer it
+     * on. It is minted on the stream read rather than the snapshot because that is where a real one mints
+     * it - the drive that needs a name to file positions under.
+     */
+    private static void mintTheIdentityOnce(TapConnectorContext context) {
+        KVMap<Object> notes = context.getStateMap();
+        if (notes.get(IDENTITY) == null) {
+            notes.put(IDENTITY, UUID.randomUUID().toString());
+        }
     }
 
     @Override
@@ -148,6 +200,9 @@ public class CsvConnector implements TapConnector {
     @Override
     public void discoverSchema(
             TapConnectionContext context, List<String> tables, int tableSize, Consumer<List<TapTable>> consumer) {
+        if (passwordRequired(context) && !passwordPresent(context)) {
+            throw new IllegalArgumentException("this connector requires the 'password' setting");
+        }
         List<TapTable> discovered = new ArrayList<>();
         for (String name : tables.isEmpty() ? tableNames(context) : tables) {
             List<String> header = header(file(context, name));
@@ -229,6 +284,27 @@ public class CsvConnector implements TapConnector {
             }
         }
         consumer.streamReadEnded();
+    }
+
+    /**
+     * Where each table's tail stands right now: the highest ordering column value the file currently
+     * holds, and zero for a table with no rows yet. Serializable on purpose -- a recorded position is
+     * written down and read back by a later run, so it outlives the process that sampled it.
+     *
+     * <p>This connector does not yet resume from one: its tail re-reads from the beginning and the sink
+     * absorbs the overlap, so the value is honest about where the stream stood without being acted on.
+     * Making the tail start here is what a resume witness needs, and it belongs with that witness.
+     */
+    private static LinkedHashMap<String, Long> highWaterMarks(TapConnectionContext context) {
+        LinkedHashMap<String, Long> marks = new LinkedHashMap<>();
+        for (String table : tableNames(context)) {
+            long high = 0;
+            for (Map<String, Object> row : rows(file(context, table))) {
+                high = Math.max(high, idOf(row));
+            }
+            marks.put(table, high);
+        }
+        return marks;
     }
 
     /**
@@ -514,6 +590,20 @@ public class CsvConnector implements TapConnector {
         return columns;
     }
 
+    /**
+     * Replaces the table's file with the given rows in one step.
+     *
+     * <p>The content is staged beside the file it replaces and moved into place, rather than written over
+     * it. A file opened for writing is emptied before the text lands, so an in-place rewrite is a table
+     * that observably holds nothing for the length of the write while every row it holds is still there -
+     * and that reading is the one a count taken by anyone else cannot tell apart from a run that wrote
+     * nothing at all. A move is the one step a reader cannot land inside.
+     *
+     * <p>The staged name deliberately does not end in the format's suffix, and is not where a table is
+     * looked for: a directory listing made mid-write sees exactly the tables that have been written,
+     * never a half-written one being called a table. A staging file left behind by a crash is therefore
+     * not a table either, and the next write of that table does not collide with it.
+     */
     private static void write(Path file, List<String> header, List<Map<String, Object>> rows) {
         StringBuilder text = new StringBuilder(String.join(",", header)).append('\n');
         for (Map<String, Object> row : rows) {
@@ -526,10 +616,37 @@ public class CsvConnector implements TapConnector {
         }
         try {
             Files.createDirectories(file.getParent());
-            Files.writeString(file, text.toString());
+            Path staged = Files.createTempFile(file.getParent(), "table-", STAGING_SUFFIX);
+            try {
+                Files.writeString(staged, text.toString());
+                publish(staged, file);
+            } finally {
+                // Nothing reads a staging file, so one a failed write leaves behind is one nothing ever
+                // collects. After the move it is already gone, and this call does nothing.
+                Files.deleteIfExists(staged);
+            }
         } catch (IOException e) {
             throw new UncheckedIOException("cannot write the table at " + file, e);
         }
+    }
+
+    /**
+     * Puts the staged content where the table is, in one step, with the mode a reader other than this
+     * process needs.
+     *
+     * <p>A temp file is created readable by its owner alone, and a move carries that mode onto the table.
+     * The write this replaces left the mode the process's umask gives instead - readable by anyone. These
+     * directories are read across users: a build running in a container and a harness running out here
+     * share one, each reading what the other wrote. So the staged file is given that mode back before it
+     * is moved into place, or a table this process wrote is one the other user cannot open.
+     */
+    private static void publish(Path staged, Path file) throws IOException {
+        try {
+            Files.setPosixFilePermissions(staged, PosixFilePermissions.fromString("rw-r--r--"));
+        } catch (UnsupportedOperationException noPosixPermissions) {
+            // A filesystem that carries no POSIX permissions has nothing to widen.
+        }
+        Files.move(staged, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     private static List<String> read(Path file) {
@@ -580,6 +697,20 @@ public class CsvConnector implements TapConnector {
                 ? null
                 : context.getConnectionConfig().getObject(FAIL_CDC);
         return flag != null && Boolean.parseBoolean(String.valueOf(flag));
+    }
+
+    private static boolean passwordRequired(TapConnectionContext context) {
+        Object flag = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(REQUIRE_PASSWORD);
+        return flag != null && Boolean.parseBoolean(String.valueOf(flag));
+    }
+
+    private static boolean passwordPresent(TapConnectionContext context) {
+        Object password = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject("password");
+        return password != null && !String.valueOf(password).isBlank();
     }
 
     private static Path directory(TapConnectionContext context) {

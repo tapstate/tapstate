@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.entry;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceMode;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.spi.store.DiscoveredSourceModel;
@@ -130,7 +131,7 @@ class StoreBackedSinkPositionsTest {
     void isEmptyWhileAnOmittedSelectionWaitsForDiscovery() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = new SourceResource("orders_src", null, "fake", Map.of("host", "h-orders"),
-                SourceMode.CDC, null, null, null, null);
+                SourceMode.CDC, null, null, null);
         artifacts.save(source);
         artifacts.save(pipeline(PIPELINE, "orders_src"));
 
@@ -141,7 +142,7 @@ class StoreBackedSinkPositionsTest {
     void propagates_invalid_selection_after_discovery() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = new SourceResource("orders_src", null, "fake", Map.of("host", "h-orders"),
-                SourceMode.CDC, List.of(TableRef.regex("[")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.regex("[")), null, null);
         artifacts.save(source);
         artifacts.save(pipeline(PIPELINE, "orders_src"));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
@@ -166,11 +167,13 @@ class StoreBackedSinkPositionsTest {
 
     private static SourceResource source(String id, String table, String host) {
         return new SourceResource(id, null, "fake", Map.of("host", host), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static PipelineResource pipeline(String id, String... sourceIds) {
-        return new PipelineResource(id, null, List.of(sourceIds), null, null, null, null, null);
+        return new PipelineResource(id, null,
+                java.util.Arrays.stream(sourceIds).<SourceRef>map(SourceRef::bare).toList(),
+                null, null, null, null, null);
     }
 
     private static DiscoveredSourceModel discovered(String connectionId, String connectorId, SourceTable table) {

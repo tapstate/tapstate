@@ -20,6 +20,12 @@ target: https://tapstate.dev/docs/quickstart-online
 > installer names what the build expects and continues, and whether it runs from there
 > is yours to own.
 
+> **If you just want to see it run.** The guided path is two commands after installing
+> the CLI — `tapstate new`, then `tapstate up` — and is written up in
+> [First run](first-run/README.md). The one-line demo that brings up this page's whole
+> stack is `curl -sSL https://install.tapstate.dev/demo | sh`. This page is the same
+> flow by hand, for when you want to see each verb.
+
 What you'll do: bring up a Docker Compose stack — databases, the server, and the
 first-admin bootstrap all seeded and started together — then drive two sources through
 one pipeline from the CLI, so that rows from two different database engines are assembled
@@ -27,11 +33,89 @@ into a single object and kept fresh: snapshot first, then live change-data-captu
 
 The worked example is **MySQL + PostgreSQL → one materialized object**. An order lives in
 MySQL, its shipments live in PostgreSQL, and neither database can see the other — so no
-view and no join can produce the result. The runtime itself is connector-agnostic (every
-connector is loaded through the same plugin interface), but this release **registers
-MySQL, PostgreSQL and MongoDB only**: they are the connectors it supports end to end
-today, and registering any other one is refused. The set grows as connectors are
-certified.
+view and no join can produce the result. The runtime itself is connector-agnostic: every
+connector is loaded through the same plugin interface.
+
+## Connector support boundary
+
+This preview certifies the following database kinds, with certification scoped by direction:
+
+| Database | Connector kind | Certified use |
+|---|---|---|
+| MySQL | `mysql` | Read and write |
+| PostgreSQL | `postgres` | Read and write |
+| MongoDB | `mongodb` | Read and write |
+| Oracle | `oracle` | Read and write |
+| SQL Server | `sqlserver` | Read and write |
+
+Oracle Free 23 and SQL Server 2022 targets are verified with MySQL snapshot and CDC
+inserts, updates and deletes, automatic table/index preparation, and full-load policies.
+Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
+negative fractions and CDC updates. This is not an exhaustive cross-version or
+all-data-type matrix. The default accepted set contains 16 connector ids
+across these five database kinds, including existing managed variants of MySQL,
+PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
+Other managed variants of Oracle and SQL Server are outside the default accepted set.
+
+`tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
+on this server. Configuring it puts that server outside the supported configuration;
+acceptance does not certify the added connectors. The setting is empty by default and
+is not configured in release or quickstart artifacts. A `connector.not-official` refusal
+reports the server's actual accepted set, including any additional ids configured there.
+Registration through an upload and registration through the seed directory use the same
+acceptance check.
+
+Numeric source attributes, including precision, scale and value bounds, are preserved
+through schema storage and target preparation. Decimal columns whose metadata was
+stored by an older build need schema rediscovery before automatic target creation.
+Missing or inconsistent decimal metadata is refused before writing; computed decimal
+outputs without a declared numeric domain cannot be auto-created safely.
+
+Oracle and SQL Server connector jars are published as separate assets on the floating
+`connectors-preview` release. They remain outside versioned Tapstate releases and are not
+downloaded by the three-database quickstart unless you explicitly run `register oracle` or
+`register sqlserver`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
+the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
+the MIT License. Those dependency terms govern only the bundled drivers and do not change
+Tapstate's Apache-2.0 license. The Oracle and SQL Server implementations are paid connector
+implementations; their use remains subject to the applicable Tapdata agreement. The upstream
+enterprise connector repository has no LICENSE file;
+publishing these binary assets does not relicense that source repository.
+
+The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
+miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
+mined schema, table and column identifiers within 30 characters. A 63-character
+schema passed snapshot reads in the live check, but Oracle LogMiner marked its
+changes unsupported, so CDC delivered no rows. Tapstate does not yet reject that
+schema configuration before starting.
+
+## Preparing a relational target
+
+A relational target table is created from the source model when it is absent. The
+runtime also prepares the unique index needed by the chosen upsert key. Existing
+target rows are governed by `on_full_load` on each `serve.sync` element:
+
+| Policy | Before a new full load |
+|---|---|
+| `append` (default) | Keep existing rows and use the configured `write_mode`. |
+| `clear` | Clear existing rows before writing the new full load. |
+| `fail` | Refuse to start writing if the target table is not empty. |
+
+For example, a sync to the `warehouse` connection can request a clean full load:
+
+```yaml
+serve:
+  from: orders
+  sync:
+    - source: warehouse
+      on_full_load: clear
+```
+
+An empty or newly created table is allowed with `fail`. Resume, failure recovery,
+and `cdc_only` runs never clear the target, even when `clear` is declared.
+`restart --rerun` resets the pipeline's progress and starts a new full load; it
+still follows `on_full_load`, so use `clear` explicitly when existing target rows
+should be removed. A failed clear stops the pipeline before it writes rows.
 
 ## The one-command demo
 
@@ -41,7 +125,7 @@ the demo workspace, brings the stack up, and runs the pipeline — then prints t
 target row count and the commands to drive CDC and tear down:
 
 ```sh
-curl -sSL https://install.tapstate.dev | sh
+curl -sSL https://install.tapstate.dev/demo | sh
 ```
 
 To read the script before running it, download it into a directory of your own
@@ -49,7 +133,7 @@ first — it then works right there:
 
 ```sh
 mkdir tapstate-demo && cd tapstate-demo
-curl -sSL https://install.tapstate.dev -o quickstart.sh
+curl -sSL https://install.tapstate.dev/demo -o quickstart.sh
 sh quickstart.sh
 ```
 
@@ -199,12 +283,24 @@ curl -fL -O "$base/postgres-connector.jar"
 curl -fL -O "$base/mongodb-connector.jar"
 ```
 
-These three are what this release registers, and they are published so this page runs
-without building the connector repositories first. A jar declaring any other connector
-is refused with `connector.not-official`, whether it is uploaded with `register` or
-staged in the seed directory. They are shaded and carry their own drivers on an
-isolated loader; `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0
-with the Universal FOSS Exception (see [`NOTICE`](../NOTICE)).
+These three jars are published so this walkthrough runs without building the connector
+repositories first. The download list is the demo's selection; the full accepted set and
+certification directions are described in [Connector support boundary](#connector-support-boundary).
+The jars are shaded and carry their own drivers on an isolated loader;
+`mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
+FOSS Exception (see [`NOTICE`](../NOTICE)).
+
+The same release carries Oracle and SQL Server for an explicit registration. From an
+authenticated CLI session, give `register` the published connector id instead of a local path:
+
+```console
+tapstate(admin@127.0.0.1:8080)> register oracle
+tapstate(admin@127.0.0.1:8080)> register sqlserver
+```
+
+The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to
+the connected server. Set `TAPSTATE_CONNECTORS_URL` to an HTTPS mirror when GitHub Releases
+is not reachable.
 
 ## 5. Author the resources
 
@@ -408,10 +504,12 @@ requires a context or contacts the server. `auth login` is intentionally unavail
 while a machine token is selected.
 
 - **`register`** uploads a connector jar to the server (content-addressed and
-  idempotent; re-registering the same jar is a no-op). Its paths resolve against the
-  workspace root — `work/` here — which is why the jars beside it are reached as
-  `../mysql-connector.jar`. An absolute path works too, as does naming a directory:
-  `register ..` uploads every `*.jar` under it as one batch.
+  idempotent; re-registering the same jar is a no-op). An exact published connector id,
+  such as `oracle` or `sqlserver`, is downloaded from `connectors-preview` first. Local
+  paths resolve against the workspace root — `work/` here — which is why the jars beside
+  it are reached as `../mysql-connector.jar`. An absolute path works too, as does naming
+  a directory: `register ..` uploads every `*.jar` under it as one batch. An existing
+  local file or directory always wins over a release id with the same name.
 - **`apply`** with no argument applies the whole workspace as one batch. The batch is
   the reference closure — a pipeline and the sources it names must be applied
   together, so apply the workspace, not one file at a time.
@@ -468,7 +566,7 @@ not put it in command arguments:
 
 `--server` wins over `TAPSTATE_SERVER_URL`; the final default is
 `http://127.0.0.1:8080`. There is intentionally no `--token` option. Without
-`--allow-write`, the sidecar exposes exactly the 10 read tools. With it, five write
+`--allow-write`, the sidecar exposes exactly the 17 read tools. With it, eight write
 tools are added, but the Server still enforces the token scope. A read token cannot
 write even when the tools are locally visible.
 
@@ -605,8 +703,23 @@ In the REPL:
 
 ```console
 tapstate(admin@127.0.0.1:8080)> stop order_pipeline
+This clears what the pipeline accumulated:
+  - what its operators had assembled, and the changes they could not assemble
+  - the position it had read and confirmed up to
+  - what the shared mining chain had read, once this is the last pipeline reading it
+The run after this one has no position to carry on from.
+Your target database is not touched either way.
+Clear order_pipeline? Type yes to go ahead [no]: yes
+order_pipeline  stopped
 tapstate(admin@127.0.0.1:8080)> exit
 ```
+
+`stop` is the verb that clears, so it asks first and says what it is about to take. To stop a
+pipeline and keep all of it — so the next start carries on from where this run got to rather than
+reading the whole source again — use `stop order_pipeline --keep-state`, which asks nothing because
+nothing is going. In a script or a CI step, where there is no terminal to answer at, a plain `stop`
+is refused rather than either waiting on input that never arrives or clearing unasked: add `-y` to
+go ahead, or use `--keep-state`.
 
 Then stop the stack and delete its data:
 

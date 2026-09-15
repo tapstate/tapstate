@@ -3,10 +3,13 @@ package io.tapstate.e2e;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -470,6 +473,20 @@ class E2eExecutorTest {
         assertThat(binding.calls).contains("redeliver:src_mongo.orders");
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"{ update: { where: { id: 5 }, set: { seq: 505 } } }", "update 1"})
+    void aDroppedUpdateCannotPassBecauseRedeliveryReinsertsItsNewValue(String change) {
+        binding.holdsDocument(TARGET, Map.of("id", 5L, "seq", 5L));
+        binding.onRedeliverDocumentBecomes(TARGET, Map.of("id", 5L, "seq", 505L));
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - cdc: { src_mongo.orders: " + change + " }\n"
+                + "  - await: { doc: { tgt_mongo.orders: { where: { id: 5 }, expect: { seq: 505 } } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("expected 505, found 5");
+
+        assertThat(binding.calls).noneMatch(call -> call.startsWith("redeliver:"));
+    }
+
     /** Redelivery exists for lost changes; an await with no change before it has nothing to redeliver. */
     @Test
     void aStalledAwaitWithNoPrecedingChangeNeverRedelivers() {
@@ -547,6 +564,48 @@ class E2eExecutorTest {
                 + "expect: { name: widget, \"items[1].sku\": b }, size: { items: 2 } } } }\n"));
     }
 
+    /**
+     * A column that must not be there is the one thing the rest of this matcher cannot say. Every
+     * value a document is held to is satisfied by a document carrying extra fields beside them, so a
+     * target built one column too wide passes every expectation an author can otherwise write.
+     */
+    @Test
+    void holdsADocumentToAPathThatMustNotBeThere() {
+        binding.holdsDocument(TARGET, Map.of("id", 1L, "name", "widget"));
+
+        execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
+                + "expect: { name: widget }, absent: [amount] } } }\n"));
+    }
+
+    /** And it is the assertion, not a decoration on one: a doc may carry nothing but absent paths. */
+    @Test
+    void reportsAPathThatWasToBeAbsentAndIsNot() {
+        binding.holdsDocument(TARGET, Map.of("id", 1L, "name", "widget", "amount", 12L));
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: "
+                + "{ where: { id: 1 }, absent: [amount] } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("carries amount (12), and that path should not be there at all");
+    }
+
+    /**
+     * A column a target was created with and no row ever filled is still a column. That is the shape
+     * this word exists to catch - a table built one column wider than the pipeline produces - and
+     * reading the value instead of the path would call it absent and agree with the target that has it.
+     */
+    @Test
+    void readsAPathCarryingNothingAsStillBeingThere() {
+        Map<String, Object> withAnEmptyColumn = new LinkedHashMap<>();
+        withAnEmptyColumn.put("id", 1L);
+        withAnEmptyColumn.put("amount", null);
+        binding.holdsDocument(TARGET, withAnEmptyColumn);
+
+        assertThatThrownBy(() -> execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: "
+                + "{ where: { id: 1 }, absent: [amount] } } }\n")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("carries amount (empty), and that path should not be there at all");
+    }
+
     /** Absence and disagreement send an author to different places, so they read differently. */
     @Test
     void reportsAnAbsentDocumentAsItsOwnMismatch() {
@@ -577,6 +636,53 @@ class E2eExecutorTest {
 
         execute(minimal("steps:\n  - assert: { doc: { tgt_mongo.orders: { where: { id: 1 }, "
                 + "expect: { seq: 7 } } } }\n"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {2, 4})
+    void goldenPathWaitsForEachRootsInitialChildren(int delayedRoot) throws Exception {
+        AtomicInteger delayedReads = goldenPathDocuments(delayedRoot, false);
+        executeGoldenPathSnapshot();
+        assertThat(delayedReads.get()).isGreaterThanOrEqualTo(2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {2, 4})
+    void goldenPathStillRejectsChildrenThatNeverArrive(int delayedRoot) {
+        goldenPathDocuments(delayedRoot, true);
+        assertThatThrownBy(this::executeGoldenPathSnapshot)
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("timed out")
+                .hasMessageContaining("shipments expected " + (delayedRoot == 2 ? 2 : 1) + " elements, found 0");
+    }
+
+    private AtomicInteger goldenPathDocuments(int delayedRoot, boolean neverArrives) {
+        binding.countsOverTime(new TableAlias("views", "order_state"), 5L);
+        AtomicInteger delayedReads = new AtomicInteger();
+        binding.documentReader = (table, where) -> {
+            int id = ((Number) where.get("id")).intValue();
+            int children = switch (id) {
+                case 1, 2 -> 2;
+                case 3, 4 -> 1;
+                default -> 0;
+            };
+            if (id == delayedRoot && (delayedReads.incrementAndGet() == 1 || neverArrives)) {
+                children = 0;
+            }
+            return Optional.of(Map.of("id", id,
+                    "customer", List.of("alice", "bob", "carol", "dave", "erin").get(id - 1),
+                    "shipments", java.util.Collections.nCopies(children, Map.of("id", 1))));
+        };
+        return delayedReads;
+    }
+
+    private void executeGoldenPathSnapshot() throws Exception {
+        Envelope published = EnvelopeParser.parse(java.nio.file.Files.readString(java.nio.file.Path.of(
+                "examples/the-golden-path-two-engines-become-one-object/spec.e2e.yml")));
+        // Exercise the published snapshot checks without replacing their matchers or waiting policy.
+        List<Step> snapshot = published.steps().stream().takeWhile(step -> !(step instanceof Step.Cdc)).toList();
+        new E2eExecutor(binding, path -> "order_pipeline", Duration.ofMillis(200), Duration.ofMillis(1))
+                .execute(new Envelope(published.name(), published.setup(), published.pipeline(), published.seed(), snapshot));
     }
 
     private void execute(String yaml) {
@@ -709,6 +815,8 @@ class E2eExecutorTest {
         }
 
         private final Map<TableAlias, Map<String, Object>> fetchable = new HashMap<>();
+        private java.util.function.BiFunction<TableAlias, Map<String, Object>, Optional<Map<String, Object>>>
+                documentReader;
 
         void holdsDocument(TableAlias table, Map<String, Object> document) {
             fetchable.put(table, document);
@@ -717,7 +825,7 @@ class E2eExecutorTest {
         @Override
         public Optional<Map<String, Object>> fetch(TableAlias table, Map<String, Object> where) {
             calls.add("fetch:" + table + "=" + where);
-            return Optional.ofNullable(fetchable.get(table));
+            return documentReader == null ? Optional.ofNullable(fetchable.get(table)) : documentReader.apply(table, where);
         }
 
         @Override
@@ -729,6 +837,12 @@ class E2eExecutorTest {
         @Override
         public void driveStream(String sourceId, StreamVerb verb) {
             calls.add("stream:" + verb.word() + ":" + sourceId);
+        }
+
+        @Override
+        public void restart(String pipelineId, boolean rereadEverything) {
+            drivenPipelineIds.add(pipelineId);
+            calls.add("restart:" + (rereadEverything ? "rerun" : "carry-on"));
         }
 
         @Override
@@ -753,6 +867,13 @@ class E2eExecutorTest {
 
         private TableAlias redeliverMovesTable;
         private long redeliverMovesTo;
+        private TableAlias redeliverDocumentTable;
+        private Map<String, Object> redeliverDocument;
+
+        void onRedeliverDocumentBecomes(TableAlias table, Map<String, Object> document) {
+            redeliverDocumentTable = table;
+            redeliverDocument = document;
+        }
 
         /** Arranges for a redelivery to unblock a count, the way a re-emitted batch reaches a target. */
         void onRedeliverCountBecomes(TableAlias table, long value) {
@@ -763,6 +884,9 @@ class E2eExecutorTest {
         @Override
         public void redeliver(TableAlias table) {
             calls.add("redeliver:" + table);
+            if (redeliverDocumentTable != null) {
+                holdsDocument(redeliverDocumentTable, redeliverDocument);
+            }
             if (redeliverMovesTable != null) {
                 countsOverTime(redeliverMovesTable, redeliverMovesTo);
             }

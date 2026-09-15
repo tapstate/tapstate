@@ -6,6 +6,7 @@ import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRename;
 import io.tapstate.spi.sink.TargetField;
+import io.tapstate.spi.sink.TargetIndex;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
@@ -63,44 +64,63 @@ final class TargetModelResolver {
     /** Resolves one target model per selected source table, preserving source and discovery order. */
     Map<String, TargetTable> resolveAll(PipelineResource pipeline) {
         Map<String, TargetTable> targets = new LinkedHashMap<>();
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-            SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
-            for (String table : resolution.tables()) {
-                discoveredTable(source, table).map(TargetModelResolver::toTargetTable)
-                        .ifPresent(target -> targets.putIfAbsent(table, target));
-            }
+            resolveAll(source, SourceDiscovery.model(storePort, source)).forEach(targets::putIfAbsent);
         }
         return Collections.unmodifiableMap(new LinkedHashMap<>(targets));
     }
 
     /** Resolves one target model per selected table of the source that feeds a sink. */
     Map<String, TargetTable> resolveAll(String sourceId) {
-        Map<String, TargetTable> targets = new LinkedHashMap<>();
         SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-        SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
-        for (String table : resolution.tables()) {
-            discoveredTable(source, table).map(TargetModelResolver::toTargetTable)
-                    .ifPresent(target -> targets.put(table, target));
-        }
-        return Collections.unmodifiableMap(targets);
+        return resolveAll(source, SourceDiscovery.model(storePort, source));
     }
 
     /** Resolves the first selected table for callers that still require a single target. */
     ResolvedTarget resolve(String sourceId) {
         SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-        String table = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source)).table();
-        return new ResolvedTarget(table, resolveAll(sourceId).get(table));
+        SourceModel discovered = SourceDiscovery.model(storePort, source);
+        String table = SourceCaptureResolution.of(source, discovered).table();
+        return new ResolvedTarget(table, resolveAll(source, discovered).get(table));
+    }
+
+    /**
+     * One source's selected tables resolved against a model already in hand.
+     *
+     * <p><b>The discovery is read once, by the caller, and handed in.</b> It is stored per connection
+     * and holds every table of that connection, so reading it again for each selected table asks the
+     * store the same question once per table for one answer - and then walks the whole model looking
+     * for a single name, which is that cost a second time. Neither shows in an answer: the resolution
+     * is identical either way, and the difference only appears on a connection with many tables, which
+     * is exactly where it is paid. The model is indexed by name here for the second half of it.
+     */
+    private Map<String, TargetTable> resolveAll(SourceResource source, SourceModel discovered) {
+        Map<String, SourceTable> byName = tablesByName(discovered);
+        Map<String, TargetTable> targets = new LinkedHashMap<>();
+        for (String table : SourceCaptureResolution.of(source, discovered).tables()) {
+            SourceTable found = byName.get(table);
+            if (found != null) {
+                targets.put(table, toTargetTable(found));
+            }
+        }
+        return Collections.unmodifiableMap(targets);
+    }
+
+    /**
+     * A discovered model's tables by name, first of a repeated name winning - which is the one the
+     * per-table search this replaces would have found.
+     */
+    private static Map<String, SourceTable> tablesByName(SourceModel discovered) {
+        Map<String, SourceTable> byName = new LinkedHashMap<>();
+        if (discovered != null) {
+            discovered.tables().forEach(table -> byName.putIfAbsent(table.name(), table));
+        }
+        return byName;
     }
 
     /** One source's table paired with the target model discovered for it, or a null model when none was. */
     record ResolvedTarget(String sourceTable, TargetTable target) {
-    }
-
-    /** The named table in the source's persisted discovery model, or empty when neither is present. */
-    private Optional<SourceTable> discoveredTable(SourceResource source, String table) {
-        return Optional.ofNullable(SourceDiscovery.model(storePort, source))
-                .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(table)).findFirst());
     }
 
     /**
@@ -114,14 +134,21 @@ final class TargetModelResolver {
         List<TargetField> fields = new ArrayList<>(source.fields().size());
         for (String keyColumn : primaryKey) {
             SourceField field = field(source, keyColumn);
-            fields.add(new TargetField(field.name(), field.dataType(), true));
+            fields.add(new TargetField(field.name(), field.dataType(), true, field.type(), field.numericType(), field.stringType()));
         }
         for (SourceField field : source.fields()) {
             if (!primaryKey.contains(field.name())) {
-                fields.add(new TargetField(field.name(), field.dataType(), false));
+                fields.add(new TargetField(field.name(), field.dataType(), false, field.type(), field.numericType(), field.stringType()));
             }
         }
-        return new TargetTable(source.name(), fields);
+        List<TargetIndex> indexes = new ArrayList<>();
+        if (!primaryKey.isEmpty()) {
+            indexes.add(new TargetIndex(primaryKey, true));
+        }
+        source.indexes().stream().filter(index -> !index.fields().isEmpty())
+                .map(index -> new TargetIndex(index.fields(), index.unique()))
+                .filter(index -> !indexes.contains(index)).forEach(indexes::add);
+        return new TargetTable(source.name(), fields, indexes);
     }
 
     /**
@@ -135,7 +162,7 @@ final class TargetModelResolver {
         if (rename == null) {
             return target;
         }
-        return new TargetTable(TableRename.apply(target.name(), rename), target.fields());
+        return new TargetTable(TableRename.apply(target.name(), rename), target.fields(), target.indexes());
     }
 
     /**
@@ -156,17 +183,25 @@ final class TargetModelResolver {
         for (String column : key) {
             for (TargetField field : model.fields()) {
                 if (field.name().equals(column)) {
-                    fields.add(new TargetField(field.name(), field.type(), true));
+                    fields.add(new TargetField(field.name(), field.type(), true, field.inferredType(), field.numericType(), field.stringType()));
                     break;
                 }
             }
         }
         for (TargetField field : model.fields()) {
             if (!key.contains(field.name())) {
-                fields.add(new TargetField(field.name(), field.type(), false));
+                fields.add(new TargetField(field.name(), field.type(), false, field.inferredType(), field.numericType(), field.stringType()));
             }
         }
-        return new TargetTable(model.name(), fields);
+        List<TargetIndex> indexes = new ArrayList<>(model.indexes());
+        List<String> resolvedKey = fields.stream().filter(TargetField::primaryKey).map(TargetField::name).toList();
+        if (!resolvedKey.isEmpty()) {
+            TargetIndex index = new TargetIndex(resolvedKey, true);
+            if (!indexes.contains(index)) {
+                indexes.add(index);
+            }
+        }
+        return new TargetTable(model.name(), fields, indexes);
     }
 
     /** Applies one sync element's rename rules to every source table that can reach that sink. */

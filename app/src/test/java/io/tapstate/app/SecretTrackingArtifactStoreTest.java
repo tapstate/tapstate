@@ -39,7 +39,7 @@ class SecretTrackingArtifactStoreTest {
                 "legacy", null, "removed-connector",
                 Map.of("host", "db.internal", "port", 3306,
                         "credentials", Map.of("password", "nested-secret")),
-                null, null, null, null, null);
+                null, null, null, null);
 
         store.save(source);
 
@@ -54,7 +54,7 @@ class SecretTrackingArtifactStoreTest {
     private static SourceResource source(String id, String password) {
         return new SourceResource(
                 id, null, "mysql", Map.of("host", "localhost", "password", password),
-                null, null, null, null, null);
+                null, null, null, null);
     }
 
     private static final class RecordingStore implements ArtifactStore {

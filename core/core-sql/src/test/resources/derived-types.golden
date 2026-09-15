@@ -1,0 +1,26 @@
+# The output columns each representative statement derives to: case, column, type, nullability.
+# Locked so that a change to how output columns are worked out - ours, or one arriving with a
+# dependency upgrade - reddens here rather than on somebody's server. A red is not automatically a
+# fault: read what moved, decide whether it is acceptable, and update this file in the same change set
+# as that reasoning. Regenerating it to get green turns the lock into a formality.
+# The statements are in DerivedTypesGoldenTest; this file holds only the answers.
+plain-columns	o_id	INT64	NOT NULL
+plain-columns	c_name	STRING	NOT NULL
+plain-columns	c_tier	STRING	NULL
+numeric-arithmetic	amount	DECIMAL	NOT NULL
+mixed-arithmetic	bumped	INT64	NOT NULL
+mixed-arithmetic	half	DECIMAL	NOT NULL
+compound-expression	total	DECIMAL	NOT NULL
+string-function	shouty	STRING	NOT NULL
+string-function	prefix	STRING	NOT NULL
+concatenation	label	STRING	NULL
+case-expression	kind	STRING	NOT NULL
+case-over-nullable	tier	STRING	NULL
+literals	int_lit	INT64	NOT NULL
+literals	str_lit	STRING	NOT NULL
+literals	dec_lit	DECIMAL	NOT NULL
+comparison	is_bulk	BOOLEAN	NOT NULL
+outer-join-nullability	o_id	INT64	NOT NULL
+outer-join-nullability	c_name	STRING	NULL
+outer-join-nullability	c_tier	STRING	NULL
+outer-join-expression	shouty	STRING	NULL

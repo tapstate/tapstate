@@ -1,0 +1,56 @@
+# An item is moved to another order, on a stream whose key changes the author asked to have followed,
+# over a source whose row image is the minimal one. The run is refused, by name.
+#
+# Following a structural key change needs the row an update replaces: an item that moved to another
+# order and an item that merely had a column edited arrive looking the same - a row sitting where it
+# now sits - and the earlier row is the only thing that tells them apart.
+#
+# What discriminates, and why it is the run's state rather than a document:
+#
+# - No document can show this. Followed blindly the item is written into its new order and left in the
+#   old one, and both documents render correctly: one has an item too many, the other has the item it
+#   is supposed to have. Counting cannot see it either - the item is in the source once and in the
+#   documents twice, and no count downstream is taken over both orders at once. An implementation that
+#   left the copy behind satisfies every assertion anyone could write here about the output.
+#
+# - So the assertion is the refusal, and failure_code rather than merely FAILED: a run that fell over
+#   for any other reason - the source unreachable, the store refusing, the embed direction read the
+#   wrong way round - is also FAILED and carries a code that is not this one.
+#
+# - The first await is the control. It holds the document to the item it starts with, so a run that
+#   never assembled anything cannot be mistaken for one that assembled and then refused the move.
+#
+# `before_image: none` on the items table is the whole setup, and the point is that it is ordinary
+# rather than broken. A seeded table here is arranged to send the whole previous row, which no source
+# does on its own; this puts that one table back to what PostgreSQL does unless somebody changes it,
+# which is to send the columns identifying the row - the item's own id - and not the column that says
+# which order it belongs to. So the earlier row arrives *present*, and without the one column the
+# tracking compares. The orders table is left as it is: nothing about the parent is in question.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
+# example, naming a directory whose jars do not resolve fails it.
+name: a-tracked-row-moved-under-a-minimal-image-is-refused
+setup:
+  databases:
+    src: { kind: postgres }
+    store: { kind: mongo }
+  connectors: [postgres, mongodb]
+  apply: [src_move_orders.tap.yml, src_move_items.tap.yml, views.tap.yml, pipeline.tap.yml]
+  discover: [src_move_orders, src_move_items]
+pipeline: pipeline.tap.yml
+seed:
+  src_move_orders.move_orders:
+    values:
+      - { id: 1, name: first }
+      - { id: 2, name: second }
+  src_move_items.move_items:
+    before_image: none
+    values:
+      - { id: 1, order_id: 1, sku: sku-1 }
+steps:
+  - start
+  - await: { doc: { views.move_state: { where: { id: 1 }, size: { items: 1 } } } }
+  - cdc: { src_move_items.move_items: { update: { where: { id: 1 }, set: { order_id: 2 } } } }
+  - await: { state: FAILED }
+  - assert: { failure_code: nest.key-change-tracking-requires-before-image }
+  - assert: { count: { views.move_state: 2 } }

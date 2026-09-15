@@ -1,0 +1,9 @@
+version: tapstate/v1
+kind: pipeline
+id: breadth_crossing
+source: src_mssql
+settings: { read_mode: snapshot_and_cdc }
+view:
+  id: order_state
+  from: orders
+  primary_key: id

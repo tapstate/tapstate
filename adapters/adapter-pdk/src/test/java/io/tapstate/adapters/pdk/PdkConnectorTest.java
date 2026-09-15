@@ -93,6 +93,26 @@ class PdkConnectorTest {
     }
 
     @Test
+    void theDrivingContextsSpecificationCarriesTheDataTypesMapping(@TempDir Path dir) {
+        String spec = "{\"dataTypes\": {\"int\": {\"to\": \"TapNumber\", \"bit\": 32}}}";
+        ConnectorRef ref = new ConnectorRef(
+                List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, spec);
+        try (PdkConnector connector = PdkConnector.open("demo", ref, Map.of())) {
+            // A connector reads its own type mapping off the specification it is driven with, not off
+            // anything the host keeps to itself. Left null there, the first read of it throws inside the
+            // connector on a path the host only sees as a stack in the log - the change stream starts
+            // anyway and the rows keep coming, so nothing fails.
+            assertThat(connector.context().getSpecification().getDataTypesMap())
+                    .as("the mapping the connector itself reads")
+                    .isNotNull()
+                    // Present is not the same as right: an empty one is also present, and would leave the
+                    // connector resolving nothing while the null check above passed.
+                    .satisfies(map -> assertThat(map.get("int"))
+                            .as("the type this spec declared, resolved through it").isNotNull());
+        }
+    }
+
+    @Test
     void fillFieldTypesLeavesTheFieldsUntouchedForAConnectorWithNoSpec(@TempDir Path dir) {
         // A connector with no spec declares no mapping, so there is nothing to fill and the fields stay as
         // discovered - the tapType null.

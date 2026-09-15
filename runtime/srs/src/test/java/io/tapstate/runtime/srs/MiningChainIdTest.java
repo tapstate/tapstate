@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.capture.CaptureConfig;
 import org.junit.jupiter.api.Test;
 
@@ -102,6 +103,25 @@ class MiningChainIdTest {
 
         assertThat(MiningChainId.resolve(cfg, null)).isEqualTo(MiningChainId.of(cfg));
         assertThat(MiningChainId.resolve(cfg, "  ")).isEqualTo(MiningChainId.of(cfg));
+    }
+
+    /**
+     * The node a config is read for is not part of what the chain is keyed by, and this is the case that
+     * says so. Two pipelines reading one database through one set of settings differ in exactly that
+     * field, and merging them onto a single mined stream is the whole point of deriving identity from
+     * the physical coordinate — so a derivation that folded the node in would give each pipeline a chain
+     * of its own and mine the same log once per reader. Nothing above would say so: every ring name
+     * would still be well-formed, every pipeline would still receive its rows, and the only trace would
+     * be the source's log being read twice.
+     */
+    @Test
+    void theNodeAConfigIsReadForIsNotPartOfTheChainIdentity() {
+        Map<String, Object> settings = Map.of("host", "db1");
+        CaptureConfig one = config(settings, List.of("orders")).at(new PipelineNode("p1", "src_a"));
+        CaptureConfig other = config(settings, List.of("orders")).at(new PipelineNode("p2", "src_b"));
+
+        assertThat(MiningChainId.of(one)).isEqualTo(MiningChainId.of(other));
+        assertThat(MiningChainId.of(one)).isEqualTo(MiningChainId.of(config(settings, List.of("orders"))));
     }
 
     @Test

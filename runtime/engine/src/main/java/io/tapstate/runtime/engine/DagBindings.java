@@ -6,6 +6,7 @@ import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.runtime.engine.join.JoinBinding;
 import io.tapstate.runtime.engine.nest.NestBinding;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.transform.TransformPort;
@@ -42,6 +43,11 @@ import java.util.function.Function;
  *   <li>{@code nest} - what a nest node needs that the engine will not decide: the table behind each
  *       embedded alias, where each of its vertices keeps state, and where a change that can never
  *       reach a document goes. A pipeline with no nest never asks for it.
+ *   <li>{@code join} - what a join node needs that the engine will not decide: what its SQL compiles
+ *       to, what the driving source's rows are identified by, and where its state lives. The plan
+ *       arrives compiled because the library that parses SQL is granted to one core module and this
+ *       ring cannot see it; the key columns arrive because they come from a discovered schema this
+ *       ring may not read. A pipeline with no join never asks for it.
  * </ul>
  */
 public record DagBindings(
@@ -51,7 +57,26 @@ public record DagBindings(
         Function<FromRef, List<String>> upstreams,
         Function<String, List<String>> sourceKeys,
         Function<ViewBlock, SupplierEx<? extends SinkWriter>> viewSinks,
-        NestBinding nest) {
+        NestBinding nest,
+        JoinBinding join) {
+
+    /** Bindings for a pipeline with no join in it, which therefore needs no join binding. */
+    public DagBindings(
+            Function<String, ProcessorMetaSupplier> sourceVertices,
+            Function<Step, SupplierEx<? extends TransformPort>> transformPorts,
+            Function<SyncElement, SupplierEx<? extends SinkWriter>> sinkWriters,
+            Function<FromRef, List<String>> upstreams,
+            Function<String, List<String>> sourceKeys,
+            Function<ViewBlock, SupplierEx<? extends SinkWriter>> viewSinks,
+            NestBinding nest) {
+        this(sourceVertices, transformPorts, sinkWriters, upstreams, sourceKeys, viewSinks, nest, null);
+    }
+
+    /** The same bindings with a join node's needs supplied. */
+    public DagBindings withJoin(JoinBinding join) {
+        return new DagBindings(sourceVertices, transformPorts, sinkWriters, upstreams, sourceKeys,
+                viewSinks, nest, join);
+    }
 
     /** Bindings for a pipeline with neither a view nor a nest, which therefore need neither. */
     public DagBindings(

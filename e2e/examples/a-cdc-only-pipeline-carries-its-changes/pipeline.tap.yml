@@ -1,0 +1,12 @@
+version: tapstate/v1
+kind: pipeline
+id: e2e_cdc_only_pipeline
+source:
+  - { id: src_file, srs: false }
+settings: { read_mode: cdc_only }
+transforms:
+  - { id: changes, from: [orders], type: filter, expr: "op == 'i'" }
+serve:
+  from: changes
+  sync:
+    - source: tgt_file

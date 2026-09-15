@@ -51,6 +51,7 @@ import org.junit.jupiter.api.Test;
 class SrsSourceProcessorTest {
 
     private static final String CURSOR_KEY = "test.source.cursor";
+    private static final String PIPELINE = "orders_pipeline";
 
     private static HazelcastInstance hz;
 
@@ -165,9 +166,9 @@ class SrsSourceProcessorTest {
         // strictly before cdc (op i, positioned), the ordering that keeps a stale snapshot from landing after
         // a newer change. Distinct id ranges make the two streams unmistakable in the observed order.
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.snapfirst", snapshotRow(100));
-        buffer.append("srs.chain.snapfirst", snapshotRow(101));
-        buffer.append("srs.chain.snapfirst", snapshotRow(102));
+        buffer.append(PIPELINE, "srs.chain.snapfirst", snapshotRow(100));
+        buffer.append(PIPELINE, "srs.chain.snapfirst", snapshotRow(101));
+        buffer.append(PIPELINE, "srs.chain.snapfirst", snapshotRow(102));
         fill("srs.chain.snapfirst", 2);
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
 
@@ -188,8 +189,8 @@ class SrsSourceProcessorTest {
         // The snapshot phase stamps its rows with the generation the snapshot began in before they reach the
         // buffer; the ring's changes take the same generation and the sequence the ring assigned them.
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.inv1", snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
-        buffer.append("srs.chain.inv1", snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, "srs.chain.inv1", snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, "srs.chain.inv1", snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
         fill("srs.chain.inv1", 2);
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
 
@@ -222,8 +223,8 @@ class SrsSourceProcessorTest {
         // sent, and nothing anywhere reports it. Nothing else in this vertex enforces that, so a bounded
         // read added later - the very shape this one stands in for - would take the property away silently.
         SnapshotBuffer buffer = new SnapshotBuffer();
-        buffer.append("srs.chain.nofinish", snapshotRow(100));
-        buffer.append("srs.chain.nofinish", snapshotRow(101));
+        buffer.append(PIPELINE, "srs.chain.nofinish", snapshotRow(100));
+        buffer.append(PIPELINE, "srs.chain.nofinish", snapshotRow(101));
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
 
         Job job = hz.getJet().newJob(projectedDag(
@@ -251,7 +252,7 @@ class SrsSourceProcessorTest {
         fill("srs.chain.nogen", 2);
 
         Job job = hz.getJet().newJob(new DAG().vertex(new Vertex("source",
-                SrsSourceProcessor.metaSupplier("srs.chain.nogen", "orders", StartFrom.earliest(), 0L,
+                SrsSourceProcessor.metaSupplier(PIPELINE, "srs.chain.nogen", "orders", StartFrom.earliest(), 0L,
                         SrsReadCursorPublisherFactory.NONE))));
 
         assertThatThrownBy(() -> job.join())
@@ -277,11 +278,33 @@ class SrsSourceProcessorTest {
         // A source is the only vertex that can say a change exists at all, so the frontier starts here. What a
         // bound is encoded as belongs to whoever wires the job -- this ring knows a sequence, not an axis or a
         // packing -- so the test stamps its own: axis 7, the sequence itself.
-        runRecordingBounds("srs.chain.bound", "orders", "out-bound", 3, 1024, "b:7:2");
+        runRecordingBounds("srs.chain.bound", "orders", "out-bound", 3, 1024, "b:7:3");
 
         // The bound trails the changes it stands for. A source that spoke first would be promising changes
         // still sitting in its own outbox, and nothing later takes such a promise back.
-        assertThat(SEEN).containsSubsequence("i:0", "i:1", "i:2", "b:7:2");
+        assertThat(SEEN).containsSubsequence("i:0", "i:1", "i:2", "b:7:3");
+    }
+
+    @Test
+    void promisesTheSnapshotIsThroughOnceItsRowsHaveLeft() throws InterruptedException {
+        SEEN.clear();
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.append(PIPELINE, "srs.chain.boundsnap", snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, "srs.chain.boundsnap", snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+
+        try {
+            // Nothing is ever written to this ring: a full load is exactly the run where no change exists yet.
+            runRecordingBounds("srs.chain.boundsnap", "orders", "out-boundsnap", 2, 1024, "b:7:0");
+
+            // Every row of one snapshot carries the reserved position, so no higher position of this table
+            // will ever settle while the load runs. Saying nothing until the first change leaves a sink with
+            // no second proof to close those rows on, and a table read in full that nothing records as
+            // written -- read again from the start on the next resume, for as long as the load lasts.
+            assertThat(SEEN).containsSubsequence("i:100", "i:101", "b:7:0");
+        } finally {
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+        }
     }
 
     @Test
@@ -292,9 +315,9 @@ class SrsSourceProcessorTest {
         // A one-deep edge queue makes the outbox refuse mid-batch, so the source finishes emitting the read
         // remainder on a later run. A bound worked out while part of that batch is still buffered would be
         // claiming changes that have not left this vertex, and no later message takes such a claim back.
-        runRecordingBounds("srs.chain.boundbp", "orders", "out-boundbp", 6, 1, "b:7:5");
+        runRecordingBounds("srs.chain.boundbp", "orders", "out-boundbp", 6, 1, "b:7:6");
 
-        assertThat(SEEN).containsSubsequence("i:5", "b:7:5");
+        assertThat(SEEN).containsSubsequence("i:5", "b:7:6");
     }
 
     @Test
@@ -312,7 +335,7 @@ class SrsSourceProcessorTest {
 
             assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
             assertThat(SEEN.stream().filter(entry -> entry.startsWith("b:")).toList())
-                    .containsExactly("b:7:1");
+                    .containsExactly("b:7:2");
         } finally {
             job.cancel();
         }
@@ -324,7 +347,8 @@ class SrsSourceProcessorTest {
         // A static resolution check: a total-parallelism-one supplier hands the real supplier to one member and
         // a no-op to the rest, so resolving over several members yields more than one distinct supplier.
         ProcessorMetaSupplier meta = SrsSourceProcessor.metaSupplier(
-                "srs.chain.pins", "orders", StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE);
+                PIPELINE, "srs.chain.pins", "orders", StartFrom.earliest(), 1L,
+                SrsReadCursorPublisherFactory.NONE);
         List<Address> addresses = List.of(
                 Address.createUnresolvedAddress("10.0.0.1", 5701),
                 Address.createUnresolvedAddress("10.0.0.2", 5702),
@@ -340,6 +364,37 @@ class SrsSourceProcessorTest {
      * Everything the recording vertex is handed, changes and bounds alike, lands in {@link #SEEN} in the
      * order it arrived - which is what "a bound never overtakes the changes it covers" is a claim about.
      */
+    /**
+     * The source keeps taking what the capture buffers for it, not only what was there when it started.
+     *
+     * <p>An srs-disabled tail has no ring anyone fills: this buffer is the only channel its changes travel
+     * on, and the capture keeps appending to it for as long as the pipeline runs. A source that looked at
+     * the buffer once, as it initialized, delivers whatever burst happened to be there and strands every
+     * change after it -- in a member-local queue nothing drains again, with the job still RUNNING, nothing
+     * thrown and the tail reporting healthy. Measured before this held: the row appended after start never
+     * arrived and was still sitting in the buffer.
+     *
+     * <p>The first row is awaited before the second is appended, so the second is known to have been added
+     * after the drain at init rather than racing it -- which is the whole of what this case is about.
+     */
+    @Test
+    void keeps_taking_what_the_capture_buffers_after_it_has_started() throws InterruptedException {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.append(PIPELINE, "srs.chain.late", snapshotRow(100));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        com.hazelcast.jet.Job job =
+                hz.getJet().newJob(recordingDag("srs.chain.late", "orders", "out-late", 1024));
+        try {
+            awaitSize(hz.getList("out-late"), 1);
+            buffer.append(PIPELINE, "srs.chain.late", snapshotRow(101));
+            awaitSize(hz.getList("out-late"), 2);
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-late").destroy();
+        }
+    }
+
     private static void runRecordingBounds(String ringName, String src, String sinkName, int size, int queueSize,
             String bound) throws InterruptedException {
         Job job = hz.getJet().newJob(recordingDag(ringName, src, sinkName, queueSize));
@@ -368,14 +423,18 @@ class SrsSourceProcessorTest {
 
     /**
      * source -> record -> list, with the source stamping its read progress. The stamp is the test's own -
-     * axis 7, the sequence itself - because a change ring knows a sequence and nothing about which axis its
-     * stream was numbered onto or how a bound is packed.
+     * axis 7 - because a change ring knows a sequence and nothing about which axis its stream was numbered
+     * onto or how a bound is packed. It has the shape the real packing has rather than the sequence as it
+     * stands: the reserved snapshot position at the bottom of the generation, every ring sequence one above
+     * it. Handing the reserved position straight through makes a bound of the lowest long, which is the
+     * value that means "no bound" and so is one no source can send.
      */
     private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize) {
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
-                ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
-                order -> new Watermark(order.seq(), (byte) 7)));
+                PIPELINE, ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
+                order -> new Watermark(
+                        order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7)));
         Vertex record = dag.newVertex("record", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of(RecordingBounds::new)));
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(sinkName)).localParallelism(1);
@@ -438,7 +497,8 @@ class SrsSourceProcessorTest {
             SrsReadCursorPublisherFactory publisherFactory, long epoch) {
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source",
-                SrsSourceProcessor.metaSupplier(ringName, src, StartFrom.earliest(), epoch, publisherFactory));
+                SrsSourceProcessor.metaSupplier(
+                        PIPELINE, ringName, src, StartFrom.earliest(), epoch, publisherFactory));
         Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
                 .localParallelism(1);
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(sinkName)).localParallelism(1);

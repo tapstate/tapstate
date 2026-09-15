@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.AssemblyIdentity;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
@@ -36,9 +37,32 @@ public final class ArtifactQueryService {
         return store.get(id).map(this::view);
     }
 
+    /**
+     * What the stored artifact's run would be assembled from, or empty when none is stored.
+     *
+     * <p>Read here rather than derived from {@link #get}: the reading needs the resource, and the view
+     * a read returns has already been flattened to text. Both readings come off the same writer, which
+     * is what keeps "what changed" and "what it hashes to" from drifting apart.
+     */
+    public Optional<String> assemblyIdentityOf(String id) {
+        Objects.requireNonNull(id, "id");
+        return store.get(id).map(AssemblyIdentity::of);
+    }
+
     /** Lists every stored artifact, retaining rows whose stored body is unreadable. */
     public List<ArtifactListEntry> list() {
         return store.listStored().stream().map(this::view).toList();
+    }
+
+    /** Returns one typed stored resource and its canonical hash without parsing canonical text. */
+    public Optional<StoredResource> getResource(String id) {
+        Objects.requireNonNull(id, "id");
+        return store.get(id).map(this::typedView);
+    }
+
+    /** Lists typed stored resources and their canonical hashes without exposing canonical text. */
+    public List<StoredResource> listResources() {
+        return store.list().stream().map(this::typedView).toList();
     }
 
     /**
@@ -50,22 +74,23 @@ public final class ArtifactQueryService {
         if (kind == null || kind.isBlank()) {
             return list();
         }
-        return store.listStored().stream()
-                .filter(r -> r.kind().equals(kind))
-                .map(this::view)
-                .toList();
+        return store.listStored(kind).stream().map(this::view).toList();
     }
 
     private StoredArtifact view(Resource resource) {
-        // The hash is taken over the very bytes this view returns, not over the resource or its id, so a
-        // caller can hand it straight back as a precondition without re-deriving anything.
-        String canonicalForm = writer.write(resource);
+        // The hash comes back beside the canonical form rather than being derivable from it: it is taken
+        // over the resource's structure, so a caller holding only these bytes cannot recompute it and
+        // must hand this field straight back as a precondition.
         return new StoredArtifact(
-                resource.id(), resource.kind(), canonicalForm, CanonicalHash.of(canonicalForm));
+                resource.id(), resource.kind(), writer.write(resource), CanonicalHash.of(resource));
     }
 
     private ArtifactListEntry view(StoredArtifactRecord row) {
         return new ArtifactListEntry(
                 row.id(), row.kind(), row.canonicalForm(), row.contentHash(), row.readable());
+    }
+
+    private StoredResource typedView(Resource resource) {
+        return new StoredResource(resource, CanonicalHash.of(resource));
     }
 }

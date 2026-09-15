@@ -1,4 +1,3 @@
 rule: missing-reference
-adr: "ADR-0016 §1 (X17) + ADR-0021 §3"
 path: source
 note: "pipeline references source id 'src_missing' which does not exist in the batch"

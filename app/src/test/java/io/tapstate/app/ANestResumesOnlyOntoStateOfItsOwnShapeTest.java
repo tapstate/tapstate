@@ -10,6 +10,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -91,7 +92,7 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source(PARENT_SOURCE, PARENT_TABLE));
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
-        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
+        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
         artifacts.save(pipeline(embedPath));
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
@@ -116,16 +117,16 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("o", FromRef.literal(PARENT_TABLE));
         aliases.put("i", FromRef.literal(CHILD_TABLE));
-        return new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE, CHILD_SOURCE),
-                List.of(Step.inline(STEP, FromClause.aliases(aliases), body, null, null)), null,
+        return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
+                List.of(Step.inline(STEP, FromClause.aliases(aliases), body, null)), null,
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
     }
 
     private static SourceResource source(String id, String table) {
         return new SourceResource(id, null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static DiscoveredSourceModel discovered(String connectionId, SourceTable table) {

@@ -80,7 +80,7 @@ class ANestIsSizedAgainstItsMemoryWhenItIsAppliedTest {
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
     private final ApplyService service = new ApplyService(
             TapstateCatalog::load, artifacts, new AuditGate(record -> { }, FIXED_CLOCK), schemas,
-            new NestSizingAdvisories(DEPLOYMENT_BUDGET));
+            new NestSizingAdvisories(DEPLOYMENT_BUDGET), SchemaDerivation.none());
 
     /** Records what discovery found: three tables, each with the row count it reported (null = none). */
     private void discovered(Long customers, Long orders, Long lines) {

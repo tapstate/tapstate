@@ -7,23 +7,35 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.LinkedBlockingQueue;
 
 /**
- * A member-local buffer that carries one source's bounded snapshot rows from the capture side to the source
- * vertex, keyed by the per-table change ring the source reads. The capture side appends every snapshot row
- * for a ring; the source vertex drains them once and emits them ahead of the ring's cdc tail. That ordering
- * is the data-consistency guarantee: a snapshot row (the older value) must reach the sink before any cdc
- * change of the same key, or a stale snapshot would overwrite a newer change.
+ * A member-local hand-off from the capture side to the source vertex, keyed by the consumer pipeline and
+ * the per-table change ring the source reads. The capture side appends; that pipeline's source vertex takes
+ * what is there and emits it ahead of whatever the ring holds. The pipeline coordinate is essential because
+ * several pipelines can tail one shared ring while each owns its initial load. Without it, an already-running
+ * neighbour can drain a later pipeline's rows into its own target. The ordering within each hand-off is the
+ * data-consistency guarantee: a snapshot row (the older value) must reach the sink before any cdc change of
+ * the same key, or a stale snapshot would overwrite a newer change.
  *
- * <p>It is plain member-local state, never a distributed structure: there is one embedded member per process,
- * the capture side that writes and the source vertex that reads run in that one process, and a snapshot row
- * carries no source position, so it never needs to survive a member restart the way the cdc ring's durable
- * source offset does. Both sides may touch it concurrently, so it is backed by concurrent maps and queues.
+ * <p>It carries a source's bounded snapshot rows, and on a source running with the shared ring switched
+ * off it carries that source's changes too -- there is no ring for them to travel on, so this is the whole
+ * of how they reach the sink. That second use is unbounded and lasts as long as the pipeline does, which
+ * is why the vertex comes back to it rather than reading it once.
  *
- * <p>A drain is once-consumed: it removes a ring's rows and returns them, so a second drain of the same ring
- * yields nothing. That matches how the source vertex resolves the buffer exactly once when it initializes.
+ * <p>It is plain member-local state, never a distributed structure: there is one embedded member per
+ * process, and the capture side that writes and the source vertex that reads both run in that one process.
+ * Nothing in it needs to survive a member restart, but not because nothing in it is positioned -- a change
+ * handed over by a ring-less tail carries its position like any other. It is because a restart re-reads
+ * from the durable offset, and that offset only ever moves to what a sink has confirmed: whatever was
+ * waiting here when the process died sits above it and is read again. Both sides may touch it
+ * concurrently, so it is backed by concurrent maps and queues.
+ *
+ * <p>A drain is once-consumed: it removes one pipeline-and-ring hand-off's rows and returns them, so a second
+ * drain yields only what arrived since. That is what lets the vertex come back to it on every pass without
+ * re-emitting anything. Each drain takes at most the rows counted when it starts; concurrent appends remain
+ * for a later pass instead of extending the current drain indefinitely.
  */
 public final class SnapshotBuffer {
 
@@ -34,23 +46,51 @@ public final class SnapshotBuffer {
      */
     public static final String USER_CONTEXT_KEY = "tapstate.srs.snapshot-buffer";
 
-    private final ConcurrentMap<String, Queue<Envelope>> byRing = new ConcurrentHashMap<>();
+    private final ConcurrentMap<BufferKey, Queue<Envelope>> byConsumerRing = new ConcurrentHashMap<>();
 
-    /** Appends one snapshot row to {@code ringName}'s buffer, preserving append order within the ring. */
-    public void append(String ringName, Envelope row) {
-        Objects.requireNonNull(ringName, "ringName");
+    /** Appends one row to a pipeline's buffer for {@code ringName}, preserving append order. */
+    public void append(String pipelineId, String ringName, Envelope row) {
         Objects.requireNonNull(row, "row");
-        byRing.computeIfAbsent(ringName, ignored -> new ConcurrentLinkedQueue<>()).add(row);
+        byConsumerRing.computeIfAbsent(new BufferKey(pipelineId, ringName), ignored -> new LinkedBlockingQueue<>())
+                .add(row);
     }
 
     /**
-     * Removes and returns {@code ringName}'s buffered snapshot rows in append order, or an empty list when
-     * the ring was never appended to or has already been drained. Once-consumed: the ring's buffer is
-     * cleared, so a later drain returns nothing.
+     * Removes and returns the rows currently buffered for this pipeline and {@code ringName} in append order,
+     * or an empty list when none are waiting. Concurrent appends remain for a later drain; every row is
+     * consumed once by the pipeline it belongs to.
      */
-    public List<Envelope> drain(String ringName) {
-        Objects.requireNonNull(ringName, "ringName");
-        Queue<Envelope> rows = byRing.remove(ringName);
-        return rows == null ? List.of() : new ArrayList<>(rows);
+    public List<Envelope> drain(String pipelineId, String ringName) {
+        // Keep the queue attached: an append may already hold it but not yet have inserted its row.
+        Queue<Envelope> rows = byConsumerRing.get(new BufferKey(pipelineId, ringName));
+        if (rows == null) return List.of();
+        // LinkedBlockingQueue reads its count without walking a tail that capture can keep extending.
+        // Take the whole initial batch so seeded snapshot rows still precede any change off the ring.
+        int remaining = rows.size();
+        List<Envelope> drained = new ArrayList<>();
+        Envelope row;
+        while (remaining-- > 0 && (row = rows.poll()) != null) {
+            drained.add(row);
+        }
+        return drained;
+    }
+
+    /**
+     * Releases every hand-off owned by a pipeline once its capture has stopped and its source vertex has
+     * been cancelled. Live drains deliberately leave their queues attached to protect an append that already
+     * holds one; lifecycle release is the point where both the queues and their coordinate strings can go.
+     * A neighbouring consumer of the same ring is unaffected.
+     */
+    public void release(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        byConsumerRing.keySet().removeIf(key -> key.pipelineId().equals(pipelineId));
+    }
+
+    /** The two coordinates that make a buffered row private to one consumer of a shared ring. */
+    record BufferKey(String pipelineId, String ringName) {
+        BufferKey {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(ringName, "ringName");
+        }
     }
 }

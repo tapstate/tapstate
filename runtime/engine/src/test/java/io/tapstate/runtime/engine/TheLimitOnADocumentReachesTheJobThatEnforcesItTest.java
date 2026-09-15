@@ -19,6 +19,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -128,13 +129,13 @@ class TheLimitOnADocumentReachesTheJobThatEnforcesItTest {
         aliases.put("customer", FromRef.literal("customers"));
         aliases.put("policy", FromRef.literal("policies"));
         aliases.put("claim", FromRef.literal("claims"));
-        Step step = Step.inline(NODE, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(NODE, FromClause.aliases(aliases), body, null);
 
         PipelineResource pipeline = new PipelineResource(PIPELINE, null,
-                List.of("customers", "policies", "claims"),
+                List.of(SourceRef.bare("customers"), SourceRef.bare("policies"), SourceRef.bare("claims")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(NODE),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         List<Map<String, Object>> policyRows = new ArrayList<>();

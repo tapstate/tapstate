@@ -68,7 +68,7 @@ final class FailureScene {
             scene.append("  ").append(table).append(" = ");
             try {
                 scene.append(binding.count(table));
-            } catch (RuntimeException couldNotRead) {
+            } catch (RuntimeException | AssertionError couldNotRead) {
                 scene.append("unreadable (").append(couldNotRead.getClass().getSimpleName()).append(": ")
                         .append(scrubbed(couldNotRead.getMessage())).append(')');
             }
@@ -82,6 +82,7 @@ final class FailureScene {
                 case Step.Assertion assertion -> assertion.matcher();
                 case Step.Lifecycle ignored -> null;
                 case Step.StreamLifecycle ignored -> null;
+                case Step.Composed ignored -> null;
                 case Step.Cdc ignored -> null;
             };
             if (matcher instanceof Matcher.Doc doc) {
@@ -106,7 +107,7 @@ final class FailureScene {
         try {
             Optional<Map<String, Object>> found = binding.fetch(table, doc.where());
             scene.append(found.map(FailureScene::scrubbed).orElse("no document matches"));
-        } catch (RuntimeException couldNotRead) {
+        } catch (RuntimeException | AssertionError couldNotRead) {
             scene.append("unreadable (").append(scrubbed(couldNotRead.getMessage())).append(')');
         }
         scene.append('\n');
@@ -123,6 +124,7 @@ final class FailureScene {
                 case Step.Assertion assertion -> places.addAll(tablesOf(assertion.matcher()));
                 case Step.Lifecycle ignored -> { }
                 case Step.StreamLifecycle ignored -> { }
+                case Step.Composed ignored -> { }
             }
         }
         return places;
@@ -142,7 +144,7 @@ final class FailureScene {
         scene.append("  ").append(what).append(" = ");
         try {
             scene.append(reading.take().map(FailureScene::scrubbed).orElse("nothing published yet"));
-        } catch (RuntimeException couldNotRead) {
+        } catch (RuntimeException | AssertionError couldNotRead) {
             scene.append("unreadable (").append(scrubbed(couldNotRead.getMessage())).append(')');
         }
         scene.append('\n');

@@ -1,6 +1,6 @@
 package io.tapstate.core.model;
 
-/** Sink-side DDL event policy (ADR-0016 §8, X5). Default is {@code fail} — stop rather than drift. */
+/** Sink-side DDL event policy (§8, X5). Default is {@code fail} — stop rather than drift. */
 @Doc("How the sink reacts to incoming schema-change (DDL) events; defaults to fail to avoid silent drift.")
 public enum DdlPolicy {
     @Doc("Apply the schema change to the target so its structure tracks the source.")

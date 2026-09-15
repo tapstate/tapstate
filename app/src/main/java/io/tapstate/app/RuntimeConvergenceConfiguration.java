@@ -59,7 +59,13 @@ class RuntimeConvergenceConfiguration {
                 // statistics everywhere else, because the rows counted here were never going to appear in
                 // any document. Without it on this face, "is anything being thrown away" is answerable
                 // only by reading logs on whichever member happened to run the vertex.
-                engine::nestDeadLetters);
+                engine::nestDeadLetters,
+                // What a large rebuild is doing while it does it. A single dimension row edited can owe a
+                // million rows of writing, and for as long as that takes the target holds half the old
+                // value and half the new one while every other reading on this face says healthy: the job
+                // runs, the queues drain, the error count is zero. Without these two an operator cannot
+                // tell that from a pipeline that has finished, and so cannot tell whether to wait.
+                engine::joinRecomputeDone, engine::joinRecomputeExpected);
     }
 
     @Bean

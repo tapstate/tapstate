@@ -169,6 +169,24 @@ public final class RowExpressions {
     }
 
     /**
+     * What a computed value produces, in tapstate's own types, judged in the environment
+     * {@link #typedValueError} judges it in. {@code UNKNOWN} on two counts: an expression that does
+     * not check out has no result type to give, and one whose result is a CEL type no column maps to
+     * has no tapstate type to name.
+     *
+     * <p>Unknown rather than the nearest type on purpose. The answer is written into a schema a
+     * target table is later built from, so a near miss is a column of the wrong shape - silently
+     * rounded, silently truncated - while an unknown is a column somebody has to rule on.
+     */
+    public static TapstateType typedValueType(String expr, Map<String, TapstateType> columns) {
+        CelValidationResult result = typed(expr, columns).build().compile(expr);
+        if (result.hasError()) {
+            return TapstateType.UNKNOWN;
+        }
+        return FROM_CEL_TYPE.getOrDefault(checked(result).getResultType(), TapstateType.UNKNOWN);
+    }
+
+    /**
      * Compiles a predicate to a checked AST for evaluation. The expression is expected to have
      * already passed validation, so a compile failure here is a programmer error (an unchecked
      * expression reaching the runtime), not a diagnosable user condition — it bare-throws.
@@ -197,6 +215,29 @@ public final class RowExpressions {
         StructType row = StructType.create(ROW_TYPE, ImmutableSet.copyOf(fields.keySet()),
                 name -> Optional.ofNullable(fields.get(name)));
         return envelope(row);
+    }
+
+    /**
+     * The tapstate type a CEL type came from, for every CEL type {@link #celTypeOf} produces.
+     * Inverted from that mapping rather than written out beside it, so the two cannot disagree about
+     * a single pair - the same reason {@link #withoutExactCelType} is derived from it and not
+     * restated.
+     *
+     * <p><b>Nothing outside the mapping's image is in here, and the exclusion is real rather than
+     * incidental.</b> The standard library produces types no column can hold - a timestamp, a
+     * duration, an unsigned integer - and so does a container CEL types more narrowly than a column
+     * maps to ({@code map(string, string)} is not the {@code map(string, dyn)} a MAP column becomes).
+     * Every one of them has to answer unknown: the nearest type would be a guess, and this answer is
+     * written into a schema a target table is built from later.
+     */
+    private static final Map<CelType, TapstateType> FROM_CEL_TYPE = fromCelType();
+
+    private static Map<CelType, TapstateType> fromCelType() {
+        Map<CelType, TapstateType> byCelType = new LinkedHashMap<>();
+        for (TapstateType type : TapstateType.values()) {
+            byCelType.put(celTypeOf(type), type);
+        }
+        return Map.copyOf(byCelType);
     }
 
     /** A tapstate type as CEL sees it, or a named opaque type where CEL has no exact counterpart. */

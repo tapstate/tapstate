@@ -1,5 +1,5 @@
 # Invalid: references src_missing which is absent from this batch (closure = the batch
-# in offline validate, ADR-0021 §3 projection).
+# in offline validate).
 version: tapstate/v1
 kind: pipeline
 id: orphan_pipe

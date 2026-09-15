@@ -118,19 +118,21 @@ try:
         "connection_test_result",
         "connector_get",
         "connector_list",
+        "pipeline_list",
         "pipeline_logs",
         "pipeline_metrics",
         "pipeline_snapshot",
         "pipeline_status",
         "source_draft",
+        "source_list",
         "system_version",
     }
     assert tool_names == expected, (
         f"unexpected tools: {sorted(tool_names - expected)}; "
         f"missing tools: {sorted(expected - tool_names)}"
     )
-    # Write verbs stay off a face that was not granted them, and the retired Source CRUD stays retired.
-    assert tool_names.isdisjoint({"source_create", "source_list", "source_get", "source_update", "source_delete"})
+    # Source list is intentionally read-only on MCP; mutating and single-resource CRUD stay off it.
+    assert tool_names.isdisjoint({"source_create", "source_get", "source_update", "source_delete"})
 
     process.stdin.close()
     process.wait(timeout=5)

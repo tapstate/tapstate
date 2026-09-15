@@ -121,17 +121,87 @@ class ArtifactStoreTest {
                 });
     }
 
+    @Test
+    void defaultWriteAllPreservesLegacyUpsertAndSingleReplaceSemantics() {
+        LegacySingleWriteStore store = new LegacySingleWriteStore();
+        Resource original = source("localhost");
+        Resource replacement = source("replica");
+        store.seed(original);
+
+        assertThat(store.writeAll(List.of(ArtifactWrite.upsert(replacement))))
+                .isEqualTo(ArtifactBatchWrite.applied());
+        assertThat(store.saveAllCalls).isEqualTo(1);
+        assertThat(store.storedCanonical("orders")).isEqualTo(WRITER.write(replacement));
+
+        ArtifactBatchWrite stale = store.writeAll(List.of(ArtifactWrite.replaceOnly(
+                original, hash(original))));
+        assertThat(stale.refusedId()).isEqualTo("orders");
+        assertThat(stale.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+
+        ArtifactBatchWrite missing = store.writeAll(List.of(ArtifactWrite.replaceOnly(
+                source("missing", "replica"), hash(original))));
+        assertThat(missing.refusedId()).isEqualTo("missing");
+        assertThat(missing.refusal()).isEqualTo(ArtifactMutation.NOT_FOUND);
+    }
+
+    @Test
+    void defaultWriteAllKeepsAnUpsertWorkspaceGuardAtomic() {
+        ConditionalBatchStore store = new ConditionalBatchStore();
+        Resource original = source("localhost");
+        Resource replacement = source("replica");
+        store.seed(original);
+
+        ArtifactBatchWrite outcome = store.writeAll(List.of(
+                ArtifactWrite.upsert(replacement).guardedBy(Map.of("orders", "0".repeat(64)))));
+
+        assertThat(outcome.refusedId()).isEqualTo("orders");
+        assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+        assertThat(store.storedCanonical("orders")).isEqualTo(WRITER.write(original));
+    }
+
+    @Test
+    void defaultWriteAllRefusesAConditionalWriteWhoseReadGuardsCannotBeHonored() {
+        LegacySingleWriteStore store = new LegacySingleWriteStore();
+        Resource original = source("localhost");
+        store.seed(original);
+
+        assertThatThrownBy(() -> store.writeAll(List.of(
+                ArtifactWrite.createOnly(source("customers", "replica"))
+                        .guardedBy(Map.of("orders", hash(original))))))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("read preconditions");
+        assertThat(store.get("customers")).isEmpty();
+    }
+
+    @Test
+    void defaultConditionalBatchCarriesReadGuardsBesideReplaceConditions() {
+        ConditionalBatchStore store = new ConditionalBatchStore();
+        Resource original = source("localhost");
+        Resource dependency = source("customers", "localhost");
+        store.seed(original);
+        store.seed(dependency);
+
+        ArtifactBatchWrite outcome = store.writeAll(List.of(
+                ArtifactWrite.replaceOnly(source("replica"), hash(original))
+                        .guardedBy(Map.of("customers", "0".repeat(64))),
+                ArtifactWrite.upsert(source("new_source", "localhost"))));
+
+        assertThat(outcome.refusedId()).isEqualTo("customers");
+        assertThat(store.storedCanonical("orders")).isEqualTo(WRITER.write(original));
+        assertThat(store.get("new_source")).isEmpty();
+    }
+
     private static Resource source(String host) {
         return source("orders", host);
     }
 
     private static Resource source(String id, String host) {
         return new SourceResource(id, null, "mysql", Map.of("host", host),
-                null, null, null, null, null);
+                null, null, null, null);
     }
 
     private static String hash(Resource artifact) {
-        return CanonicalHash.of(WRITER.write(artifact));
+        return CanonicalHash.of(artifact);
     }
 
     /**
@@ -140,9 +210,13 @@ class ArtifactStoreTest {
      * refuses a non-empty one, rather than quietly writing unconditionally and leaving every caller
      * believing in a check that was never made.
      */
-    private static final class DefaultingStore implements ArtifactStore {
+    private static class DefaultingStore implements ArtifactStore {
 
-        private final Map<String, Resource> resources = new LinkedHashMap<>();
+        protected final Map<String, Resource> resources = new LinkedHashMap<>();
+
+        void seed(Resource artifact) {
+            resources.put(artifact.id(), artifact);
+        }
 
         @Override
         public void saveAll(List<Resource> artifacts) {
@@ -157,6 +231,74 @@ class ArtifactStoreTest {
         @Override
         public List<Resource> list() {
             return new ArrayList<>(resources.values());
+        }
+
+        String storedCanonical(String id) {
+            return WRITER.write(resources.get(id));
+        }
+
+    }
+
+    private static final class ConditionalBatchStore extends DefaultingStore {
+
+        @Override
+        public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+            for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
+                Resource stored = resources.get(expected.getKey());
+                if (stored == null || !hash(stored).equals(expected.getValue())) {
+                    return Optional.of(expected.getKey());
+                }
+            }
+            saveAll(artifacts);
+            return Optional.empty();
+        }
+
+    }
+
+    /**
+     * An adapter that predates conditional batches but implements the original single-replace
+     * contract. The default command adapter must preserve these exact outcomes.
+     */
+    private static final class LegacySingleWriteStore implements ArtifactStore {
+
+        private final Map<String, Resource> resources = new LinkedHashMap<>();
+        private int saveAllCalls;
+
+        void seed(Resource resource) {
+            resources.put(resource.id(), resource);
+        }
+
+        @Override
+        public void saveAll(List<Resource> artifacts) {
+            saveAllCalls++;
+            artifacts.forEach(artifact -> resources.put(artifact.id(), artifact));
+        }
+
+        @Override
+        public ArtifactMutation replace(String id, String expectedContentHash, Resource replacement) {
+            Resource current = resources.get(id);
+            if (current == null) {
+                return ArtifactMutation.NOT_FOUND;
+            }
+            if (!hash(current).equals(expectedContentHash)) {
+                return ArtifactMutation.VERSION_CONFLICT;
+            }
+            resources.put(id, replacement);
+            return ArtifactMutation.REPLACED;
+        }
+
+        @Override
+        public Optional<Resource> get(String id) {
+            return Optional.ofNullable(resources.get(id));
+        }
+
+        @Override
+        public List<Resource> list() {
+            return new ArrayList<>(resources.values());
+        }
+
+        private String storedCanonical(String id) {
+            return WRITER.write(resources.get(id));
         }
     }
 

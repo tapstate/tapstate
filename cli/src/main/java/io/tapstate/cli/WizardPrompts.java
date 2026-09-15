@@ -37,7 +37,13 @@ final class WizardPrompts {
 
     /** Ask a view's primary key (optional), so an inline view and a standalone one ask it identically. */
     static String askPrimaryKey(Prompter prompter) {
-        return blankToNull(prompter.ask("Primary key (blank for none)", null));
+        // Re-asked rather than allowed to be blank: the key is what the view's sink indexes uniquely,
+        // so a view scaffolded without one is a document this CLI's own validate refuses.
+        String answer = prompter.ask("Primary key", null);
+        while (answer == null || answer.isBlank()) {
+            answer = prompter.ask("Primary key (required)", null);
+        }
+        return answer;
     }
 
     /**

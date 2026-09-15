@@ -1,0 +1,7 @@
+version: tapstate/v1
+kind: source
+id: src_store
+connector: mongodb
+config: { uri: "${SRC_STORE_URI}" }
+mode: cdc
+tables: [ orders ]

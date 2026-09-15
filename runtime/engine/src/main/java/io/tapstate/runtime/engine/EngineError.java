@@ -54,7 +54,23 @@ public enum EngineError implements TapstateErrorCode {
      * ability to resume, taking every pipeline mining the same chain with it.
      */
     FRONTIER_PINNED("engine.frontier-pinned",
-            Set.of("chain", "minutes", "gap", "cause"), Severity.WARNING);
+            Set.of("chain", "minutes", "gap", "cause"), Severity.WARNING),
+
+    /**
+     * Running: a second row of a joined source arrived under a join key another row was already filed
+     * under, so that earlier row has been replaced and is now unreachable. {@code source} is the source
+     * the join calls that side by and {@code key} is the key both rows share.
+     *
+     * <p>A warning because nothing failed and nothing is repaired here. One key holds one row, so every
+     * fact row under it joins to whichever arrived last and the target ends up shorter than the query
+     * describes - holding both rows instead would move dimension state, output cardinality and row
+     * identity together, which is a far larger change than this. What this removes is the third answer a
+     * query must not be given: accepted, wrong, and silent. A target quietly short of rows is
+     * indistinguishable from a correct one and every row it does hold looks entirely ordinary, so the
+     * moment of replacement is the only place anything can observe it.
+     */
+    JOIN_DIMENSION_ROW_DISPLACED("engine.join-dimension-row-displaced",
+            Set.of("source", "key"), Severity.WARNING);
 
     private final String code;
     private final Set<String> placeholders;

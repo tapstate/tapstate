@@ -30,6 +30,7 @@ public final class SchemaDiscoveryService {
     private final AuditGate auditGate;
     private final Clock clock;
     private final ConnectorConfigValidator configValidator;
+    private final SourceConnectionResolver sourceConnections;
 
     public SchemaDiscoveryService(
             SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock) {
@@ -39,11 +40,18 @@ public final class SchemaDiscoveryService {
     public SchemaDiscoveryService(
             SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock,
             ConnectorConfigValidator configValidator) {
+        this(probe, schemaStore, auditGate, clock, configValidator, null);
+    }
+
+    public SchemaDiscoveryService(
+            SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock,
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
         this.probe = Objects.requireNonNull(probe, "probe");
         this.schemaStore = Objects.requireNonNull(schemaStore, "schemaStore");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.configValidator = configValidator;
+        this.sourceConnections = sourceConnections;
     }
 
     /**
@@ -57,10 +65,12 @@ public final class SchemaDiscoveryService {
      */
     public SchemaReport discover(
             String connectionId, String connectorId, Map<String, Object> settings, String principal) {
+        ConnectionConfig config = sourceConnections == null
+                ? new ConnectionConfig(connectionId, connectorId, settings)
+                : sourceConnections.resolve(connectionId, connectorId, settings);
         if (configValidator != null) {
-            configValidator.validate(connectorId, settings);
+            configValidator.validate(config.connectorId(), config.settings());
         }
-        ConnectionConfig config = new ConnectionConfig(connectionId, connectorId, settings);
         return auditGate.dispatch(
                 ControlOperations.CONNECTION_DISCOVER_SCHEMA,
                 new AuditContext(principal, config.id()),

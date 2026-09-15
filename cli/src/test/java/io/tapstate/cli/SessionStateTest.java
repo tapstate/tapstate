@@ -378,8 +378,20 @@ class SessionStateTest {
         }
 
         @Override
-        public LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb) {
+        public LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb,
+                                          Boolean purgeState) {
             return new LifecycleOutcome.Unreachable();
+        }
+
+        @Override
+        public PositionOutcome position(URI baseUrl, String credential, String pipelineId) {
+            return new PositionOutcome.Unreachable();
+        }
+
+        @Override
+        public PositionOutcome setPosition(URI baseUrl, String credential, String pipelineId,
+                                           String document) {
+            return new PositionOutcome.Unreachable();
         }
 
         @Override

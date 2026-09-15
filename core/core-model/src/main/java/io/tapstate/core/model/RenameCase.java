@@ -1,6 +1,6 @@
 package io.tapstate.core.model;
 
-/** Bulk rename case rule (ADR-0016 §8, X4); applied to the source name before prefix/suffix. */
+/** Bulk rename case rule (§8, X4); applied to the source name before prefix/suffix. */
 @Doc("Case conversion applied to the source name before any prefix or suffix is added.")
 public enum RenameCase {
     @Doc("Convert the name to all uppercase letters.")

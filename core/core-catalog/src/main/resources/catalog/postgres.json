@@ -62,7 +62,7 @@
     },
     {
       "name": "port",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Port"
       },
@@ -284,7 +284,7 @@
     },
     {
       "name": "pgtoPort",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Pgto Server Port"
       },
@@ -519,7 +519,7 @@
     },
     {
       "name": "defaultWalLogSize",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Default Wal log total size(MB)"
       },

@@ -8,7 +8,8 @@ package io.tapstate.spi.store;
  * connector catalog rows (one normalized capability row per registered connector), the latest
  * connection-test result per connection, the per-pipeline observation store (plain upsert latest
  * projection, read by the monitor read faces), the SRS meta store (one durable coordination
- * record per mining chain), the cold layer under a stateful operator, and the channel holding what
+ * record per mining chain), the side record of the columns a step derives for itself, the editor-only
+ * Pipeline canvas layout store, the cold layer under a stateful operator, and the channel holding what
  * such an operator could never assemble. A pure interface over the core ring only (rule R2); a store
  * backend (a database adapter) implements the sub-stores behind it.
  */
@@ -46,6 +47,22 @@ public interface StorePort {
 
     /** The SRS meta store: one durable offset / consumer-cursor / schema record per mining chain. */
     SrsMetaStore meta();
+
+    /**
+     * The SRS change log: every change that entered a chain's per-table ring, so the changes outlive the
+     * process that read them and a ring can be rebuilt where it left off.
+     */
+    SrsLogStore srsLog();
+
+    /**
+     * The side record of the columns a pipeline step works out for itself, keyed by pipeline and step.
+     * Kept beside the artifact rather than inside it: a derived value inside the canonical bytes would
+     * make a pipeline nobody edited read as edited the moment the derivation changed.
+     */
+    DerivedSchemaStore derivedSchemas();
+
+    /** The editor-only canvas layout store; it never changes a Pipeline artifact's content hash. */
+    PipelineLayoutStore layouts();
 
     /**
      * The cold layer under a stateful operator: one opaque state document per key, within a namespace.

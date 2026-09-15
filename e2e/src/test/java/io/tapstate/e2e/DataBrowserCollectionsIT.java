@@ -143,11 +143,7 @@ class DataBrowserCollectionsIT {
      * a header and one row, because a file with no header is not a table this connector can describe.
      */
     private void putThereByHand(String table) {
-        try {
-            Files.writeString(targetDirectory.resolve(table + ".csv"), "id,note\n1,written by hand\n");
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        FileEndpoints.replaceTable(targetDirectory.resolve(table + ".csv"), "id,note\n1,written by hand\n");
     }
 
     private void writeWorkspace() {

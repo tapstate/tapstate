@@ -1,4 +1,4 @@
-# ADR-0016 §14.1 — Oracle multi-table -> MySQL mirror (rename + three read modes + DDL).
+# §14.1 — Oracle multi-table -> MySQL mirror (rename + three read modes + DDL).
 # CDC source; what to read (snapshot then incremental) is set on the pipeline (read_mode, §1/§4).
 version: tapstate/v1
 kind: source
@@ -8,4 +8,3 @@ config: { host: 10.20.0.15, port: 1521, service_name: ORCL,
           username: cdc_user, password: Ora_2026 }
 mode: cdc
 tables: [ ORDERS, ORDER_ITEMS, CUSTOMERS ]
-options: { include_ddl: true }

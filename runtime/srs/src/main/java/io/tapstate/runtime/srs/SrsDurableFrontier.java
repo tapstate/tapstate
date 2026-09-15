@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 
 import java.util.Collection;
@@ -36,10 +37,13 @@ public final class SrsDurableFrontier {
      * consumer has acked nothing). {@code candidate} is the position the reader has read up to.
      *
      * <p>Empty also covers a winning position that carries no token of its own — a frontier that has
-     * reached snapshot rows and no change yet. There is nothing to write down for it, and leaving the
-     * offset where it was only ever means re-mining changes that were already read.
+     * reached snapshot rows, or changes the source stated no position at. There is nothing to write down
+     * for it, and leaving the offset where it was only ever means re-mining changes that were already read.
+     *
+     * <p>The pair is returned, never the token alone. The order is what the store ranks the advance
+     * against, and a store handed a token with no order cannot tell an advance from a rewind.
      */
-    public static Optional<String> safeAdvance(
+    public static Optional<ChainPosition> safeAdvance(
             ChainPosition candidate, Collection<ConsumerOffset> consumers) {
         Objects.requireNonNull(candidate, "candidate");
         Objects.requireNonNull(consumers, "consumers");
@@ -49,16 +53,39 @@ public final class SrsDurableFrontier {
         // The answer is the lowest of the reader's own position and every consumer's, so the reader's is
         // where the search starts rather than a separate clamp afterwards - one comparison, and no step
         // where the running lowest is still nothing.
+        requireRankable(candidate.order(), "the position read up to");
         ChainPosition safe = candidate;
         for (ConsumerOffset consumer : consumers) {
             ChainPosition acked = consumer.sinkAcked();
             if (acked == null) {
                 return Optional.empty();
             }
+            requireRankable(acked.order(), "the position consumer '" + consumer.pipelineId() + "' acked");
             if (acked.order().compareTo(safe.order()) < 0) {
                 safe = acked;
             }
         }
-        return Optional.ofNullable(safe.token());
+        return safe.token() == null ? Optional.empty() : Optional.of(safe);
+    }
+
+    /**
+     * Refuses a position that carries no order, naming what could not be ranked.
+     *
+     * <p>The position type allows an absent order on purpose and leaves the judgement to whoever needs
+     * one, because what absence means depends on the reader: a snapshot row is ordered but tokenless, a
+     * synthetic event may carry neither. Here it can only be a defect upstream -- a change that reached a
+     * sink, or a read that got recorded, without ever having been ordered. Ranking it is the one thing
+     * that must not happen: this comparison decides what is safe to forget, and a missing order compared
+     * as though it were a real one silently reorders which changes those are.
+     *
+     * <p>Bare, not coded: nothing a user did produces this, and nothing downstream can act on it. It is an
+     * invariant violation, and the wiring that produced it is the thing to fix.
+     */
+    private static void requireRankable(SourceOrder order, String what) {
+        if (order == null) {
+            throw new IllegalStateException(
+                    what + " carries no order and cannot be ranked; a position reached this frontier "
+                            + "without ever being ordered");
+        }
     }
 }

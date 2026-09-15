@@ -1,13 +1,17 @@
 package io.tapstate.control.core;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
+import java.util.jar.JarEntry;
+import java.util.jar.JarInputStream;
 
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.catalog.TapstateCatalog;
@@ -19,20 +23,30 @@ import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.IoError;
 
 /**
- * The online catalog view: the bundled snapshot overlaid with the rows derived for registered
- * connectors, read live from the store so a runtime registration is visible without a restart. It
- * backs the connector.list read verb and feeds the online apply path its capability matrix, while the
- * offline CLI keeps reading only the bundled snapshot (its honest boundary).
+ * The online catalog view: the bundled snapshot remains the capability and detail baseline, while rows
+ * derived for registered connectors are read live from the store so a runtime registration is visible
+ * without a restart. The connector.list read verb exposes only those registered rows as authoring
+ * candidates; merged() remains the capability matrix for online validation, while the offline CLI keeps
+ * reading only the bundled snapshot (its honest boundary).
  */
 public final class ConnectorCatalogView {
 
     private static final String BUNDLED = "bundled";
     private static final String REGISTERED = "registered";
+    private static final int MAX_CACHED_ICONS = 128;
+    private static final int MAX_ICON_BYTES = 1024 * 1024;
 
     private final TapstateCatalog bundled;
     private final ConnectorCatalogStore store;
     private final ConnectorSpecStore specStore;
     private final ConnectorRegistry registry;
+    private final Map<IconCacheKey, Optional<ConnectorIcon>> icons = Collections.synchronizedMap(
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<IconCacheKey, Optional<ConnectorIcon>> eldest) {
+                    return size() > MAX_CACHED_ICONS;
+                }
+            });
 
     public ConnectorCatalogView(
             TapstateCatalog bundled, ConnectorCatalogStore store, ConnectorSpecStore specStore,
@@ -43,23 +57,81 @@ public final class ConnectorCatalogView {
         this.registry = Objects.requireNonNull(registry, "registry");
     }
 
-    /** The live online catalog = the bundled snapshot with registered rows overlaid (registered shadows). */
+    /** The live capability catalog = the bundled snapshot with registered rows overlaid (registered shadows). */
     public TapstateCatalog merged() {
         return TapstateCatalog.merged(bundled, store.list());
     }
 
-    /** Every connector visible online, tagged {@code bundled} or {@code registered}. */
+    /**
+     * Every registered connector available as an authoring candidate.
+     *
+     * <p>The bundled snapshot remains available through {@link #merged()} and {@link #detail(String)}
+     * for capability validation and explicit detail reads, but an unregistered bundled row is not a
+     * connector the control plane can author against because its spec source is not stored here.
+     */
     public List<ConnectorSummary> summaries() {
         List<ConnectorCatalogEntry> registered = store.list();
-        Set<String> registeredIds = new HashSet<>();
-        for (ConnectorCatalogEntry entry : registered) {
-            registeredIds.add(entry.id());
-        }
         List<ConnectorSummary> summaries = new ArrayList<>();
-        for (ConnectorCatalogEntry entry : TapstateCatalog.merged(bundled, registered).all()) {
-            summaries.add(ConnectorSummary.of(entry, registeredIds.contains(entry.id()) ? REGISTERED : BUNDLED));
+        for (ConnectorCatalogEntry entry : registered) {
+            summaries.add(ConnectorSummary.of(entry, REGISTERED));
         }
         return summaries;
+    }
+
+    /** The declared catalog icon stored inside the one artifact registered under this connector id. */
+    public Optional<ConnectorIcon> icon(String id) {
+        Objects.requireNonNull(id, "id");
+        Optional<ConnectorCatalogEntry> stored = store.get(id);
+        if (stored.isEmpty()) {
+            return Optional.empty();
+        }
+        String icon = stored.get().icon();
+        if (icon == null || icon.isBlank()) {
+            return Optional.empty();
+        }
+        List<ConnectorRegistration> registrations = registry.findAll(id);
+        if (registrations.size() != 1) {
+            return Optional.empty();
+        }
+        IconCacheKey key = new IconCacheKey(registrations.get(0).contentHash(), icon);
+        synchronized (icons) {
+            return icons.computeIfAbsent(key, cacheKey -> registry.artifact(cacheKey.contentHash())
+                    .flatMap(artifact -> iconFrom(artifact, cacheKey.declaredPath())));
+        }
+    }
+
+    private static Optional<ConnectorIcon> iconFrom(byte[] artifact, String declaredPath) {
+        String path = declaredPath.startsWith("/") ? declaredPath.substring(1) : declaredPath;
+        try (JarInputStream jar = new JarInputStream(new ByteArrayInputStream(artifact))) {
+            JarEntry entry;
+            while ((entry = jar.getNextJarEntry()) != null) {
+                if (!entry.isDirectory() && entry.getName().equals(path)) {
+                    byte[] bytes = jar.readNBytes(MAX_ICON_BYTES + 1);
+                    return bytes.length > MAX_ICON_BYTES
+                            ? Optional.empty()
+                            : Optional.of(new ConnectorIcon(bytes, mediaType(path)));
+                }
+            }
+            return Optional.empty();
+        } catch (IOException ignored) {
+            return Optional.empty();
+        }
+    }
+
+    private record IconCacheKey(String contentHash, String declaredPath) {
+    }
+
+    private static String mediaType(String path) {
+        int dot = path.lastIndexOf('.');
+        String extension = dot < 0 ? "" : path.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
+        return switch (extension) {
+            case "png" -> "image/png";
+            case "jpg", "jpeg" -> "image/jpeg";
+            case "gif" -> "image/gif";
+            case "webp" -> "image/webp";
+            case "svg" -> "image/svg+xml";
+            default -> "application/octet-stream";
+        };
     }
 
     /**

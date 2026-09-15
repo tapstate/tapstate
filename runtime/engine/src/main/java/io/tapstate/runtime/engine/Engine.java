@@ -12,6 +12,7 @@ import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.NestStateReading;
+import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
 import io.tapstate.runtime.engine.nest.NestMemoryBudget;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -287,6 +288,39 @@ public final class Engine {
      */
     public Map<String, Long> nestDeadLetters(String pipelineId) {
         return byChain(pipelineId, NestDeadLetterMetricNames::namespaceOf);
+    }
+
+    /**
+     * How many rows each large rebuild of the pipeline has sent so far, keyed by the namespace and
+     * dimension key it is about; empty when it has no live job and while no rebuild large enough to
+     * report is under way.
+     *
+     * <p>Read beside {@link #joinRecomputeExpected}, which says how many rows that rebuild has
+     * altogether. The distance between the two is the whole of what this says: while it is open the
+     * target holds half the old value of one dimension row and half the new one, and everything else
+     * about the pipeline reads healthy - the job runs, the queues drain, the error count is zero.
+     *
+     * <p>Absent rather than zero, and the absence covers two different things on purpose: no rebuild is
+     * running, or the one running is small enough that nobody needs telling. Both are the quiet state.
+     * A rebuild that has finished keeps its last reading, which is the number it ended on.
+     *
+     * <p>Kept at its highest per subject rather than summed, because a rebuild belongs to whichever
+     * processor owns the key's partition and every collection of it reports that same running total.
+     */
+    public Map<String, Long> joinRecomputeDone(String pipelineId) {
+        return byChain(pipelineId, JoinRecomputeMetricNames::doneSubjectOf);
+    }
+
+    /**
+     * About how many rows each large rebuild of the pipeline has altogether, keyed the same way and
+     * empty in the same cases as {@link #joinRecomputeDone}.
+     *
+     * <p>An estimate read off the index rather than a count: counting it exactly would mean walking
+     * every page of the bucket before walking them again to rebuild it, which is the cost the reading
+     * exists to warn about.
+     */
+    public Map<String, Long> joinRecomputeExpected(String pipelineId) {
+        return byChain(pipelineId, JoinRecomputeMetricNames::expectedSubjectOf);
     }
 
     /**

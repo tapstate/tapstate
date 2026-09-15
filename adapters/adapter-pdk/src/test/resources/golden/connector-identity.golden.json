@@ -1,0 +1,40 @@
+{
+  "globalNamespace": "pdk.global-state",
+  "cases": [
+    {
+      "case": "a pipeline reading a source",
+      "connectorId": "postgres",
+      "pipelineId": "p-orders",
+      "nodeId": "src_pg_main",
+      "stateNamespace": "pdk.state.p-orders.src_pg_main"
+    },
+    {
+      "case": "a second pipeline on the same source",
+      "connectorId": "postgres",
+      "pipelineId": "p-audit",
+      "nodeId": "src_pg_main",
+      "stateNamespace": "pdk.state.p-audit.src_pg_main"
+    },
+    {
+      "case": "the write side of the same pipeline",
+      "connectorId": "postgres",
+      "pipelineId": "p-orders",
+      "nodeId": "to_mongo",
+      "stateNamespace": "pdk.state.p-orders.to_mongo"
+    },
+    {
+      "case": "a node id carrying dots of its own",
+      "connectorId": "postgres",
+      "pipelineId": "p-orders",
+      "nodeId": "src.a.b",
+      "stateNamespace": "pdk.state.p-orders.src.a.b"
+    },
+    {
+      "case": "a read-only drive naming no node",
+      "connectorId": "postgres",
+      "pipelineId": null,
+      "nodeId": null,
+      "stateNamespace": null
+    }
+  ]
+}

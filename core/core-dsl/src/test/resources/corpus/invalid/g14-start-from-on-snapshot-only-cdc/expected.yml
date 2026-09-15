@@ -1,0 +1,3 @@
+rule: mode-mismatch
+path: settings.start_from
+note: "start_from on a cdc source read snapshot_only; the read_mode removed the tail, so the mode token reported is snapshot_only rather than a source mode"

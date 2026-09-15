@@ -238,6 +238,11 @@ final class MongoEndpoints implements Endpoints {
         return collection(address, table).listIndexes().into(new ArrayList<>());
     }
 
+    /** How many documents of {@code table} match {@code where}. */
+    public long count(EndpointAddress address, String table, Map<String, Object> where) {
+        return collection(address, table).countDocuments(filterOf(where));
+    }
+
     @Override
     public long count(EndpointAddress address, String table) {
         return collection(address, table).countDocuments();

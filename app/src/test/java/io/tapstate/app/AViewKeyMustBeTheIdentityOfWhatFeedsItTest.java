@@ -8,6 +8,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -71,9 +72,9 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         // turns overwriting the same document.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders"), TableRef.literal("invoices")), null, null, null));
+                List.of(TableRef.literal("orders"), TableRef.literal("invoices")), null, null));
         artifacts.save(managedStore());
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("src"), "id", null, null),
                 null, settings(), null));
 
@@ -90,11 +91,11 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         // database the deployment does not own - silently, because the id resolved fine.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders")), null, null, null));
+                List.of(TableRef.literal("orders")), null, null));
         artifacts.save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "mysql",
                 Map.of("host", "the-users-own-warehouse"), SourceMode.CDC,
-                List.of(TableRef.literal("facts")), null, null, null));
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
+                List.of(TableRef.literal("facts")), null, null));
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null, null),
                 null, settings(), null));
 
@@ -119,9 +120,9 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         // discovered as id, the view upserting - and uniquely indexing - a column rows can share.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders")), null, null, null));
+                List.of(TableRef.literal("orders")), null, null));
         artifacts.save(managedStore());
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
                 null, settings(), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
@@ -142,9 +143,9 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         // nothing to hold the key against.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders")), null, null, null));
+                List.of(TableRef.literal("orders")), null, null));
         artifacts.save(managedStore());
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
                 new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
                 null, settings(), null));
 
@@ -169,9 +170,9 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
     private static InMemoryArtifactStore nestWorkspace(List<String> rootKey, String viewKey) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src_orders", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders")), null, null, null));
+                List.of(TableRef.literal("orders")), null, null));
         artifacts.save(new SourceResource("src_items", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("order_items")), null, null, null));
+                List.of(TableRef.literal("order_items")), null, null));
         artifacts.save(managedStore());
 
         // The embed targets the root key exactly, so the nest's own compile gate passes and the
@@ -187,9 +188,9 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("o", FromRef.literal("orders"));
         aliases.put("i", FromRef.literal("order_items"));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
 
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src_orders", "src_items"),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src_orders", true), SourceRef.spec("src_items", true)),
                 List.of(step),
                 new ViewBlock.Inline("order_state", FromRef.literal(STEP), viewKey, null, null),
                 null, settings(), null));
@@ -198,7 +199,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
     private static SourceResource managedStore() {
         return new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "fake",
-                Map.of("host", "d"), null, null, null, null, null);
+                Map.of("host", "d"), null, null, null, null);
     }
 
     private static Settings settings() {

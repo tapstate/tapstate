@@ -206,12 +206,13 @@ class SpecSchemaAgreesWithParserTest {
                 steps:
                   - pause: ""
                 """,
-                // A verb the product does not have.
+                // A verb nothing offers. Not `restart`, which the harness now takes: the step
+                // record rules out a rewind in writing, so it stays a word no specification may write.
                 """
                 name: n
                 pipeline: p.tap.yml
                 steps:
-                  - restart
+                  - rewind
                 """,
                 // A lane word. Nothing selects a lane from a specification, so naming one is not a
                 // harmless leftover: it would be a choice the author believes is being taken.

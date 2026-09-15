@@ -15,6 +15,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -158,13 +159,13 @@ class SrsDagRunTest {
     private static PipelineResource linearPipeline() {
         return new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 List.of(Step.inline("transform",
                         FromClause.list(FromRef.literal("orders_src")),
-                        new TransformBody.Filter("true"), null, null)),
+                        new TransformBody.Filter("true"), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("transform"),
-                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null, null)),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)),
                         null, null),
                 null, null);
     }
@@ -179,7 +180,7 @@ class SrsDagRunTest {
         SupplierEx<SinkWriter> intoSink = () -> new CapturingSinkWriter(sinkName);
         return new DagBindings(
                 sourceId -> SrsSourceProcessor.metaSupplier(
-                        ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE),
+                        "p", ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE),
                 step -> transformPort,
                 syncElement -> intoSink,
                 ref -> Map.of(

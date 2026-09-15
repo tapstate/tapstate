@@ -1,0 +1,23 @@
+version: tapstate/v1
+kind: pipeline
+id: moved_items
+source: [ src_move_orders, src_move_items ]
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: move_doc
+    type: nest
+    from: { o: move_orders, i: move_items }
+    root:
+      from: o
+      key: [ id ]
+      embed:
+        - from: i
+          on: { order_id: id }
+          as: array
+          path: items
+          arrayKey: [ id ]
+          trackKeyChanges: true
+view:
+  id: move_state
+  from: move_doc
+  primary_key: id

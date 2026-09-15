@@ -141,11 +141,7 @@ class DataBrowserFindShapeIT {
         for (int row = 1; row <= SEEDED_ROWS; row++) {
             csv.append(row).append(',').append(status(row)).append('\n');
         }
-        try {
-            Files.writeString(dataDirectory.resolve(COLLECTION + ".csv"), csv.toString());
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        FileEndpoints.replaceTable(dataDirectory.resolve(COLLECTION + ".csv"), csv.toString());
     }
 
     /** Zero-padded so that the text order and the numeric order are the same one. */

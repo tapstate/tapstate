@@ -1,6 +1,6 @@
 {
-  "specSha": "0bbc5d2c",
-  "capabilitySha": "0bbc5d2c",
+  "specSha": "ce0ab33",
+  "capabilitySha": "f3bd43a",
   "entries": [
     "GitHub",
     "activemq",
@@ -53,6 +53,7 @@
     "mysql-pxc",
     "oceanbase",
     "open-gauss",
+    "oracle",
     "paimon-plus",
     "polar-db-mysql",
     "polar-db-postgres",
@@ -66,6 +67,7 @@
     "selectdb",
     "shein",
     "snowflake",
+    "sqlserver",
     "starrocks",
     "tablestore",
     "tdengine",

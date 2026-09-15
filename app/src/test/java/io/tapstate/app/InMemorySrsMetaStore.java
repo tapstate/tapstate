@@ -5,6 +5,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,11 +37,20 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
-    public synchronized void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+    public synchronized void rewindSourceReadOffset(String miningChainId, String token) {
         SrsMeta m = require(miningChainId);
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), sourceReadOffset, m.consumerOffsets(), m.cdcStartPosition(),
-                m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                m.miningChainId(), new ChainPosition(null, token), m.consumerOffsets(),
+                m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch(),
+                Instant.now()));
+    }
+
+    @Override
+    public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+        SrsMeta m = require(miningChainId);
+        records.put(miningChainId, new SrsMeta(
+                m.miningChainId(), position, m.consumerOffsets(), m.cdcStartPosition(),
+                m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
     }
 
     @Override
@@ -50,8 +60,23 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
         next.add(offset);
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
-                m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
+                m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
+    }
+
+    /**
+     * The tables {@code existing} was already recorded as having loaded, or none for a consumer with no
+     * record yet.
+     *
+     * <p>Carried through every per-facet mutator, because the real store's are path-scoped updates that
+     * touch one field and leave the rest of the consumer's record alone. Rebuilding the consumer from
+     * the facet being written -- which the three-argument constructor does, defaulting this to none --
+     * erases the completed tables on the next cursor or ack advance, and it erases them in the one
+     * direction nothing notices: the load looks unfinished, so a resume reads it all again and gets the
+     * right answer for the wrong reason.
+     */
+    private static List<String> completedOf(ConsumerOffset existing) {
+        return existing == null ? List.of() : existing.snapshotCompletedTables();
     }
 
     @Override
@@ -70,10 +95,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
         perTable.put(table, lastReadSeq);
         ChainPosition ack = existing == null ? null : existing.sinkAcked();
-        next.add(new ConsumerOffset(pipelineId, perTable, ack));
+        next.add(new ConsumerOffset(pipelineId, perTable, ack, completedOf(existing)));
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
-                m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
+                m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
     }
 
     @Override
@@ -89,18 +114,18 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             }
         }
         Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
-        next.add(new ConsumerOffset(pipelineId, perTable, position));
+        next.add(new ConsumerOffset(pipelineId, perTable, position, completedOf(existing)));
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
-                m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
+                m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
     }
 
     @Override
     public synchronized void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
         SrsMeta m = require(miningChainId);
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), cdcStartPosition,
-                m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), m.epoch(), snapshotEpoch));
+                m.miningChainId(), m.sourceRead(), m.consumerOffsets(), cdcStartPosition,
+                m.schemaHistory(), m.retention(), m.epoch(), snapshotEpoch));
     }
 
     @Override
@@ -108,8 +133,8 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         SrsMeta m = require(miningChainId);
         long opened = m.epoch() + 1;
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
-                m.schemaHistory(), m.retention(), m.snapshotCompletedTables(), opened, m.snapshotEpoch()));
+                m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
+                m.schemaHistory(), m.retention(), opened, m.snapshotEpoch()));
         return opened;
     }
 
@@ -119,21 +144,34 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         List<SchemaVersion> next = new ArrayList<>(m.schemaHistory());
         next.add(version);
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
-                next, m.retention(), m.snapshotCompletedTables(), m.epoch(), m.snapshotEpoch()));
+                m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
+                next, m.retention(), m.epoch(), m.snapshotEpoch()));
     }
 
     @Override
-    public synchronized void markSnapshotComplete(String miningChainId, String table) {
+    public synchronized void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
         SrsMeta m = require(miningChainId);
-        if (m.snapshotCompletedTables().contains(table)) {
-            return;
+        // Per pipeline, not per chain: the mark says this pipeline's sink took the table, and the
+        // pipelines sharing a chain each write somewhere of their own.
+        List<ConsumerOffset> consumers = new ArrayList<>();
+        ConsumerOffset mine = null;
+        for (ConsumerOffset consumer : m.consumerOffsets()) {
+            if (consumer.pipelineId().equals(pipelineId)) {
+                mine = consumer;
+            } else {
+                consumers.add(consumer);
+            }
         }
-        List<String> next = new ArrayList<>(m.snapshotCompletedTables());
-        next.add(table);
-        records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), m.consumerOffsets(), m.cdcStartPosition(),
-                m.schemaHistory(), m.retention(), next, m.epoch(), m.snapshotEpoch()));
+        List<String> completed =
+                new ArrayList<>(mine == null ? List.of() : mine.snapshotCompletedTables());
+        if (!completed.contains(table)) {
+            completed.add(table);
+        }
+        consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
+                mine == null ? null : mine.sinkAcked(), completed));
+        records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
+                m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(),
+                m.snapshotEpoch()));
     }
 
     @Override
@@ -148,6 +186,12 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void dropChain(String miningChainId) {
+        // Idempotent for the same reason the detach below is: an absent chain already satisfies it.
+        records.remove(miningChainId);
+    }
+
+    @Override
     public synchronized void detachConsumer(String miningChainId, String pipelineId) {
         // Idempotent, unlike the advancing mutators: an absent chain already satisfies what a detach states.
         SrsMeta m = records.get(miningChainId);
@@ -156,9 +200,14 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         }
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(pipelineId));
+        // Every field but the consumers is carried across. The six-argument constructor would
+        // default the snapshot-complete tables to none and both generations to zero, which is not what
+        // a detach does to a chain -- and a generation reset is indistinguishable, later, from a chain
+        // that never opened one.
         records.put(miningChainId, new SrsMeta(
-                m.miningChainId(), m.sourceReadOffset(), next, m.cdcStartPosition(),
-                m.schemaHistory(), m.retention()));
+                m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
+                m.schemaHistory(), m.retention(), m.epoch(),
+                m.snapshotEpoch()));
     }
 
     private SrsMeta require(String miningChainId) {
