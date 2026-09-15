@@ -56,6 +56,15 @@ class TheAssembledApplyServiceSizesNestsTest {
             tables: [ customers, orders, lines ]
             """;
 
+    /** The write target: this release installs a sync only onto the mongodb connector. */
+    private static final String TARGET = """
+            version: tapstate/v1
+            kind: source
+            id: tgt_mg
+            connector: mongodb
+            config: { uri: "mongodb://10.30.0.11:27017/ods" }
+            """;
+
     private static final String PIPELINE = """
             version: tapstate/v1
             kind: pipeline
@@ -82,7 +91,7 @@ class TheAssembledApplyServiceSizesNestsTest {
                           arrayKey: [line_id]
             serve:
               from: doc
-              sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+              sync: [ { id: out, source: tgt_mg, write_mode: upsert } ]
             """;
 
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
@@ -127,7 +136,8 @@ class TheAssembledApplyServiceSizesNestsTest {
     }
 
     private static List<ArtifactDraft> batch() {
-        return List.of(new ArtifactDraft("source.yaml", SOURCE), new ArtifactDraft("pipeline.yaml", PIPELINE));
+        return List.of(new ArtifactDraft("source.yaml", SOURCE), new ArtifactDraft("target.yaml", TARGET),
+                new ArtifactDraft("pipeline.yaml", PIPELINE));
     }
 
     @Test

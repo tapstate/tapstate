@@ -58,6 +58,9 @@ class DslErrorTest {
                 "dsl.unwind-needs-an-upsert-target",
                 // Source columns are available during assembly, not offline corpus validation.
                 "dsl.unwind-column-already-exists",
+                // the write-target gate: which connectors may be written to is a property of the
+                // deployment applied to, not of the document, so it is raised on the apply path
+                "dsl.unsupported-target-connector",
                 // the join SQL gate: both are raised while reading the artifact, so both are
                 // witnessed by an ordinary corpus case
                 "dsl.join-sql-not-parsable",
@@ -72,6 +75,10 @@ class DslErrorTest {
         assertThat(DslError.MISSING_REFERENCE.placeholders()).containsExactlyInAnyOrder("ref", "path");
         assertThat(DslError.AMBIGUOUS_REFERENCE.placeholders()).containsExactlyInAnyOrder("ref", "path");
         assertThat(DslError.MODE_MISMATCH.placeholders()).containsExactlyInAnyOrder("field", "mode", "path");
+        // the document the offending element is written in is named too: a path alone does not say
+        // which of several pipelines in a batch, nor which serve definition carries the element
+        assertThat(DslError.UNSUPPORTED_TARGET_CONNECTOR.placeholders())
+                .containsExactlyInAnyOrder("connector", "source", "resource", "supported", "path");
         // the pipeline is what made the field required, so it is named alongside the source that lacks it
         assertThat(DslError.MODE_REQUIRED_FOR_READ.placeholders())
                 .containsExactlyInAnyOrder("source", "pipeline", "path");

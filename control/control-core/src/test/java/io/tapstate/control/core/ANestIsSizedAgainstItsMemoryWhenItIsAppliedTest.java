@@ -46,6 +46,15 @@ class ANestIsSizedAgainstItsMemoryWhenItIsAppliedTest {
             tables: [ customers, orders, lines ]
             """;
 
+    /** The write target: this release installs a sync only onto the mongodb connector. */
+    private static final String TARGET = """
+            version: tapstate/v1
+            kind: source
+            id: tgt_mg
+            connector: mongodb
+            config: { uri: "mongodb://10.30.0.11:27017/ods" }
+            """;
+
     /** customers → orders → lines: orders has children, so it holds state of its own. */
     private static final String PIPELINE = """
             version: tapstate/v1
@@ -73,7 +82,7 @@ class ANestIsSizedAgainstItsMemoryWhenItIsAppliedTest {
                           arrayKey: [line_id]
             serve:
               from: doc
-              sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+              sync: [ { id: out, source: tgt_mg, write_mode: upsert } ]
             """;
 
     private final InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
@@ -100,7 +109,8 @@ class ANestIsSizedAgainstItsMemoryWhenItIsAppliedTest {
     }
 
     private static List<ArtifactDraft> batch() {
-        return List.of(new ArtifactDraft("source.yaml", SOURCE), new ArtifactDraft("pipeline.yaml", PIPELINE));
+        return List.of(new ArtifactDraft("source.yaml", SOURCE), new ArtifactDraft("target.yaml", TARGET),
+                new ArtifactDraft("pipeline.yaml", PIPELINE));
     }
 
     private static ValidationDiagnostic withCode(List<ValidationDiagnostic> warnings, String code) {
@@ -172,7 +182,7 @@ class ANestIsSizedAgainstItsMemoryWhenItIsAppliedTest {
 
         assertThat(withCode(applied.warnings(), "nest.state-far-exceeds-memory-budget"))
                 .as("apply carries what validate would have said").isNotNull();
-        assertThat(applied.outcomes()).as("and the batch was still written").hasSize(2);
+        assertThat(applied.outcomes()).as("and the batch was still written").hasSize(3);
     }
 
     /** An artifact store that answers from memory, so a batch can be applied without one. */
