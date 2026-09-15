@@ -309,9 +309,14 @@ public final class TapEventCodec {
      * milliseconds.
      */
     private static Object portable(Object source, Object value) {
-        if (BSON_DECIMAL128.equals(source.getClass().getName()) && value instanceof Double) {
+        if (BSON_DECIMAL128.equals(source.getClass().getName()) && value instanceof Double narrowed) {
             BigDecimal exact = decimal128Value(source);
-            if (exact != null) {
+            // Match the exact wrong result before correcting it, the same way the timestamp correction
+            // below does: only the plain narrowing of this very value is replaced. A conversion that
+            // answered some other double decided something of its own - rounding to a declared scale,
+            // say - and replacing that with the full source value would overrule the connector rather
+            // than repair it, silently and on every row.
+            if (exact != null && exact.doubleValue() == narrowed.doubleValue()) {
                 return exact;
             }
         }
