@@ -14,6 +14,7 @@ import org.bson.types.Decimal128;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -116,6 +117,22 @@ class RowImagesTest {
         assertThat(((ConvertedValue) read.get("amount")).value())
                 .isInstanceOf(BigDecimal.class)
                 .isNotInstanceOf(Decimal128.class);
+    }
+
+    @Test
+    void aDecimal128SpecialValueComesBackAsTheDoubleTheReadBoundaryHandsOn() {
+        // A driver decimal the source connector registered no conversion for travels bare, so it is
+        // what the log is handed. NaN, an infinity and negative zero have no exact decimal form at
+        // all, and asking one for its decimal value throws rather than answering - which would take
+        // the reload of a stored change down instead of giving the row back.
+        Map<String, Object> read = overTheWire(new LinkedHashMap<>(Map.of(
+                "nan", Decimal128.NaN,
+                "infinite", Decimal128.POSITIVE_INFINITY,
+                "negativeZero", Decimal128.NEGATIVE_ZERO)));
+
+        assertThat(read.get("nan")).isEqualTo(Double.NaN);
+        assertThat(read.get("infinite")).isEqualTo(Double.POSITIVE_INFINITY);
+        assertThat(read.get("negativeZero")).isEqualTo(-0.0d);
     }
 
     @Test

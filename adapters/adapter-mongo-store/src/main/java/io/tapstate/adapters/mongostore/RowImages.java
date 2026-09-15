@@ -102,7 +102,15 @@ final class RowImages {
 
     private static Object decoded(Object value) {
         if (value instanceof Decimal128 decimal) {
-            return decimal.bigDecimalValue();
+            try {
+                return decimal.bigDecimalValue();
+            } catch (ArithmeticException e) {
+                // A special value -- NaN, an infinity, negative zero -- has no exact decimal form at all,
+                // and asking for one throws rather than answering. The double is what the read boundary
+                // hands on for exactly those, so a reload agrees with a change that never met the log,
+                // and no driver type escapes the module (rule R3) on the way.
+                return decimal.doubleValue();
+            }
         }
         if (value instanceof Map<?, ?> map) {
             if (map.get(CARRIED) != null) {
