@@ -344,7 +344,12 @@ public final class TapEventCodec {
             if (path != null) {
                 return byPath.get(path);
             }
-            if (value == null || codecs == null) {
+            // Only a class the connector registered a conversion for can ever be in the reading, so an
+            // element of any other kind is answered without taking one. Without this an array of plain
+            // text or numbers - which is most arrays - makes the first element it holds walk the whole
+            // change a second time to be told nothing, on the hottest path this adapter has.
+            if (value == null || codecs == null
+                    || codecs.getCustomToTapValueCodec(value.getClass()) == null) {
                 return null;
             }
             if (byType == null) {
