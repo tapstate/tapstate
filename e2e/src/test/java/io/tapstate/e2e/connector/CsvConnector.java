@@ -113,6 +113,12 @@ public class CsvConnector implements TapConnector {
     private static final String CANNOT_AUTHENTICATE_ALOUD =
             "the connection was refused before any row was read";
 
+    /** What it says on the context log when its change stream dies, written on the tail's own thread. */
+    private static final String CDC_STREAM_DIED = "the change stream stopped and will not resume";
+
+    /** The same, on the shared static channel; different words for the reason the pair above gives. */
+    private static final String CDC_STREAM_DIED_ALOUD = "no further changes will be read from this source";
+
     private static final String SUFFIX = ".csv";
 
     /**
@@ -284,6 +290,11 @@ public class CsvConnector implements TapConnector {
         if (cdcRejected(context)) {
             // The stream started, then dies - the read-side mirror of a rejected write. The product wraps
             // whatever the tail throws and surfaces it as an observable failure; the type here is immaterial.
+            // It says why first, on both channels: this runs on the tail's own thread, which is the host's
+            // but not the one reconciling, so a line written here is the case for carrying the attribution
+            // onto the thread a drive actually runs on rather than onto the caller that started it.
+            context.getLog().error(CDC_STREAM_DIED + " for {}", tables);
+            TapLogger.error("CsvConnector", CDC_STREAM_DIED_ALOUD);
             throw new IllegalStateException(
                     "the '" + FAIL_CDC + "' setting makes this source's cdc stream fail");
         }

@@ -31,9 +31,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p><b>Two things are asserted apart, because they fail apart.</b> That the words were carried at all,
  * and that they were filed against the run they belong to. A line written but unattributed is in the
  * console and nowhere else: the operator tailing that pipeline sees nothing, while a test asking only
- * "was it logged" is satisfied. So a second pipeline runs beside it, over a source that works, and its
- * tail is asserted not to hold the other one's words -- which is what a broadcast, or a single global
- * "whatever is running now", would look like.
+ * "was it logged" is satisfied. So a second pipeline runs beside it, one whose change stream starts and then
+ * dies, and two things are read off it: that what its connector said from the tail's own thread reached
+ * its tail -- that thread is the host's, but not the one reconciling, and an attribution that stopped at
+ * the reconciling thread would leave it out -- and that its tail does not hold the first one's words,
+ * which is what a broadcast, or a single global "whatever is running now", would look like.
  *
  * <p>Read through the shipped front end rather than off the API: the tail a person reads is one hop
  * further than the document, and a line reaching the face while the command printed something else would
@@ -53,13 +55,19 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
     private static final String SOURCE_PASSWORD = "the-source-password";
 
     private static final String REFUSED_PIPELINE = "connector_words_refused";
-    private static final String WORKING_PIPELINE = "connector_words_working";
+
+    /** A second run whose tail dies once it has started: what it says there is said on the tail's own thread. */
+    private static final String TAIL_PIPELINE = "connector_words_tail";
 
     /** What the connector writes on the log of the context it was driven with. */
     private static final String ON_ITS_OWN_LOG = "password authentication failed: no password was given";
 
     /** What it writes on the contract's shared static channel -- different words, so each is witnessed alone. */
     private static final String ON_THE_SHARED_CHANNEL = "the connection was refused before any row was read";
+
+    /** What the second run's connector says from the tail's own thread, on each of the two channels. */
+    private static final String FROM_THE_TAIL = "the change stream stopped and will not resume";
+    private static final String FROM_THE_TAIL_ALOUD = "no further changes will be read from this source";
 
     @BeforeAll
     static void requireDocker() {
@@ -68,9 +76,9 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
 
     @Test
     void theConnectorsOwnReasonReachesTheTailOfTheRunItBelongsTo(
-            @TempDir Path refusedSource, @TempDir Path workingSource, @TempDir Path target) {
+            @TempDir Path refusedSource, @TempDir Path tailSource, @TempDir Path target) {
         FileEndpoints.replaceTable(refusedSource.resolve("orders.csv"), "id,name\n1,one\n");
-        FileEndpoints.replaceTable(workingSource.resolve("orders.csv"), "id,name\n2,two\n");
+        FileEndpoints.replaceTable(tailSource.resolve("orders.csv"), "id,name\n2,two\n");
 
         try (ServerHandle server = Tiers.IN_PROCESS.launch(
                 SharedMongo.replicaSetUrl("connector_words_state"))) {
@@ -82,19 +90,18 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
             // The source declares it needs a password and carries none: the shape of a credential that was
             // rotated after the schema was taken, which is why the schema is discovered with one below.
             resources.put("src_refused.tap.yml", sourceYaml("src_refused", refusedSource, false));
-            resources.put("src_working.tap.yml", sourceYaml("src_working", workingSource, true));
+            resources.put("src_tail.tap.yml", tailSourceYaml(tailSource));
             resources.put("tgt_file.tap.yml", targetYaml(target));
             resources.put("refused.tap.yml", pipelineYaml(REFUSED_PIPELINE, "src_refused"));
-            resources.put("working.tap.yml", pipelineYaml(WORKING_PIPELINE, "src_working"));
+            resources.put("tail.tap.yml", pipelineYaml(TAIL_PIPELINE, "src_tail"));
             control.apply(resources);
             control.discoverSchema("src_refused", E2eConnectorJar.CONNECTOR_ID,
                     Map.of("uri", refusedSource.toString(), "password", SOURCE_PASSWORD,
                             "require_password", true));
-            control.discoverSchema("src_working", E2eConnectorJar.CONNECTOR_ID,
-                    Map.of("uri", workingSource.toString(), "password", SOURCE_PASSWORD,
-                            "require_password", true));
+            control.discoverSchema("src_tail", E2eConnectorJar.CONNECTOR_ID,
+                    Map.of("uri", tailSource.toString()));
 
-            control.lifecycle(WORKING_PIPELINE, LifecycleVerb.START);
+            control.lifecycle(TAIL_PIPELINE, LifecycleVerb.START);
             control.lifecycle(REFUSED_PIPELINE, LifecycleVerb.START);
 
             Await.until("the refused run's tail to hold the connector's own reason", TIMEOUT,
@@ -116,13 +123,39 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
                             + "until somebody carries it")
                     .contains(ON_THE_SHARED_CHANNEL);
 
-            CliOnce.Run working = CliOnce.runSession(PASSWORD, "logs " + WORKING_PIPELINE + "\nexit\n",
+            // The second run says its piece from the tail's own thread -- the host's thread, but not the
+            // one reconciling, which is where the attribution would otherwise stop. Asserted separately
+            // because a drive that only ever ran on the reconciling thread would inherit an attribution
+            // it was never given, and pass.
+            Await.until("the second run's tail to hold what its connector said from the tail thread", TIMEOUT,
+                    () -> control.logs(TAIL_PIPELINE).contains(FROM_THE_TAIL)
+                            && control.logs(TAIL_PIPELINE).contains(FROM_THE_TAIL_ALOUD),
+                    () -> control.logs(TAIL_PIPELINE));
+
+            CliOnce.Run tail = CliOnce.runSession(PASSWORD, "logs " + TAIL_PIPELINE + "\nexit\n",
                     "-c", server.baseUrl().toString(), "-u", USER);
-            assertThat(working.stdout())
+            assertThat(tail.stdout())
+                    .as("what a connector says from the thread its tail runs on")
+                    .contains(FROM_THE_TAIL)
+                    .contains(FROM_THE_TAIL_ALOUD);
+            assertThat(tail.stdout())
                     .as("a line belongs to the run that produced it, not to whatever else is running")
                     .doesNotContain(ON_ITS_OWN_LOG)
                     .doesNotContain(ON_THE_SHARED_CHANNEL);
         }
+    }
+
+    /** A source whose change stream starts and then dies, so its connector speaks from the tail's thread. */
+    private static String tailSourceYaml(Path directory) {
+        return """
+                version: tapstate/v1
+                kind: source
+                id: src_tail
+                connector: %s
+                config: { uri: "%s", fail_cdc: true }
+                mode: cdc
+                tables: [ orders ]
+                """.formatted(E2eConnectorJar.CONNECTOR_ID, directory);
     }
 
     private static String sourceYaml(String id, Path directory, boolean withPassword) {
