@@ -173,6 +173,23 @@ class PipelineStreamApiTest {
         }
     }
 
+    @Test
+    void followResumesStrictlyAfterTheRequestedCursor() throws Exception {
+        FakeLogSink sink = context.getBean(FakeLogSink.class);
+        sink.append("pl2", new LogLine(1_700_000_000_000L, "INFO", "submitted job"));
+        sink.append("pl2", new LogLine(1_700_000_000_100L, "INFO", "converged to RUNNING"));
+
+        FrameSink frames = new FrameSink();
+        WebSocket ws = connect("/api/pipelines/pl2/logs/follow?after=tail%3A1", readToken(), frames);
+        try {
+            Map<?, ?> resumed = frames.nextFrame();
+            assertThat(messages(resumed)).containsExactly("converged to RUNNING");
+            assertThat(resumed.get("truncated")).isEqualTo(false);
+        } finally {
+            ws.abort();
+        }
+    }
+
     // ---- the handshake is guarded like every other read ----
 
     @Test

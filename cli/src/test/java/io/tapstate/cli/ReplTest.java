@@ -29,6 +29,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -5262,6 +5263,176 @@ class ReplTest {
         assertThat(saved.contexts().get("dev").seeds()).containsExactly(URI.create("http://127.0.0.1:7900"));
         assertThat(saved.workspaceBindings()).containsEntry(workspace.toRealPath().toString(), "dev");
         assertThat(output.toString()).contains("created context dev").contains("bound dev");
+    }
+
+    @Test
+    void workbenchGatewaySelectsAContextAndUsesTheSharedPersistentLogin(@TempDir Path home)
+            throws IOException {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ContextConfigStore configStore = ContextConfigStore.underHome(home);
+        ContextManager manager = new ContextManager(configStore);
+        manager.create("dev", List.of(seed), true);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        Instant now = Instant.parse("2026-08-17T10:00:00Z");
+        client.loginOutcome = persistentLogin(
+                now, "urn:tapstate:cluster:test-cluster", "alice", "tss_workbench.session");
+        AuthFileStore authStore = AuthFileStore.underHome(home);
+        CommandLine commandLine = Cli.newCommandLine();
+        StringWriter output = new StringWriter();
+        commandLine.setOut(new PrintWriter(output));
+        commandLine.setErr(new PrintWriter(output));
+        Repl repl = new Repl(
+                commandLine,
+                workspace,
+                client,
+                new ScriptedPrompter(),
+                name -> null,
+                new ContextResolver(configStore, name -> null),
+                null,
+                new AuthService(client, authStore, Clock.fixed(now, ZoneOffset.UTC)),
+                manager);
+        WorkbenchActionGateway gateway = repl.workbenchActionGateway();
+
+        assertThat(gateway.contexts()).containsExactly(new WorkbenchActionGateway.ContextOption("dev", false));
+        assertThat(gateway.selectContext("dev"))
+                .isEqualTo(new WorkbenchActionGateway.ContextResult.Ready("dev", false));
+        SecretBuffer password = new SecretBuffer();
+        password.append("pw");
+
+        assertThat(gateway.login(
+                new WorkbenchActionGateway.LoginRequest(Optional.empty(), "alice"), password))
+                .isEqualTo(new WorkbenchActionGateway.LoginResult.SignedIn("alice"));
+        assertThat(password.cleared()).isTrue();
+        assertThat(repl.session().credential()).isEqualTo("jwt-alice");
+        assertThat(client.loginCalls)
+                .containsExactly("alice:pw@http://127.0.0.1:7900 persistent=true");
+        assertThat(authStore.load(
+                        manager.suggestions().getFirst().definition().authRef(),
+                        manager.suggestions().getFirst().definition().id()))
+                .isPresent();
+        assertThat(output.toString()).doesNotContain("pw");
+    }
+
+    @Test
+    void workbenchGatewayCreatesAContextThroughTheSharedManager(@TempDir Path home)
+            throws Exception {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        URI seed = URI.create("http://127.0.0.1:7900");
+        ContextConfigStore store = ContextConfigStore.underHome(home);
+        ContextManager manager = new ContextManager(store);
+        FakeControlPlane client = new FakeControlPlane(seed);
+        CommandLine commandLine = Cli.newCommandLine();
+        commandLine.setOut(new PrintWriter(new StringWriter()));
+        commandLine.setErr(new PrintWriter(new StringWriter()));
+        Repl repl = new Repl(
+                commandLine,
+                workspace,
+                client,
+                new ScriptedPrompter(),
+                name -> null,
+                new ContextResolver(store, name -> null),
+                null,
+                null,
+                manager);
+
+        assertThat(repl.workbenchActionGateway().createContext("dev", seed, true))
+                .isEqualTo(new WorkbenchActionGateway.ContextResult.Ready("dev", false));
+
+        assertThat(store.load().contexts()).containsOnlyKeys("dev");
+        assertThat(store.load().contexts().get("dev").seeds()).containsExactly(seed);
+        assertThat(store.load().lastContext()).isEqualTo("dev");
+        assertThat(store.load().workspaceBindings())
+                .containsEntry(workspace.toRealPath().toString(), "dev");
+        assertThat(client.discovered)
+                .as("creating a context must not perform remote issuer discovery")
+                .isEmpty();
+        assertThat(repl.session().isConnected()).isFalse();
+        assertThat(repl.session().isAuthenticated()).isFalse();
+
+        Repl reopened = new Repl(
+                commandLine,
+                workspace,
+                client,
+                new ScriptedPrompter(),
+                name -> null,
+                new ContextResolver(store, name -> null),
+                null,
+                null,
+                new ContextManager(store));
+        WorkbenchSnapshot reopenedSnapshot = reopened.workbenchDataSource()
+                .load(1, 1, new RefreshRequest.CancellationToken());
+        assertThat(reopenedSnapshot.session().contextName()).contains("dev");
+        assertThat(reopenedSnapshot.session().connection()).isEqualTo(WorkbenchConnection.CONNECTED);
+        assertThat(reopenedSnapshot.session().authentication()).isEqualTo(WorkbenchAuthentication.SIGNED_OUT);
+    }
+
+    @Test
+    void workbenchFileGatewayStaysInsideTheWorkspace(@TempDir Path home) throws IOException {
+        Path workspace = Files.createDirectories(home.resolve("orders/source"));
+        Path root = workspace.getParent();
+        Path artifact = workspace.resolve("orders.tap.yml");
+        Files.writeString(artifact, "kind: Source\n");
+        Path outside = home.resolve("outside.tap.yml");
+        Files.writeString(outside, "do-not-change\n");
+        Harness harness = harness(root, new FakeControlPlane(URI.create("http://127.0.0.1:7900")));
+        WorkbenchActionGateway gateway = harness.repl().workbenchActionGateway();
+
+        assertThat(gateway.readWorkspaceFile(Path.of("source/orders.tap.yml")))
+                .isEqualTo(new WorkbenchActionGateway.FileReadResult.Loaded(
+                        Path.of("source/orders.tap.yml"), "kind: Source\n"));
+        assertThat(gateway.writeWorkspaceFile(
+                Path.of("source/orders.tap.yml"), "kind: Source\nmetadata: {}\n"))
+                .isEqualTo(new WorkbenchActionGateway.FileWriteResult.Saved());
+        assertThat(Files.readString(artifact)).contains("metadata: {}");
+
+        assertThat(gateway.readWorkspaceFile(Path.of("../outside.tap.yml")))
+                .isEqualTo(new WorkbenchActionGateway.FileReadResult.Unavailable());
+        assertThat(gateway.writeWorkspaceFile(Path.of("../outside.tap.yml"), "overwritten"))
+                .isEqualTo(new WorkbenchActionGateway.FileWriteResult.Unavailable());
+        assertThat(Files.readString(outside)).isEqualTo("do-not-change\n");
+    }
+
+    @Test
+    void workbenchGatewayLogsIntoATemporaryConnectionWithoutCreatingAContext() {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.loginOutcome = new LoginOutcome.Success("jwt-alice");
+        Harness harness = harness(Path.of("tap-work"), client);
+        assertThat(harness.repl().connectForLaunch(seed.toString(), true)).isZero();
+        SecretBuffer password = new SecretBuffer();
+        password.append("pw");
+
+        assertThat(harness.repl().workbenchActionGateway().login(
+                new WorkbenchActionGateway.LoginRequest(Optional.empty(), "alice"), password))
+                .isEqualTo(new WorkbenchActionGateway.LoginResult.SignedIn("alice"));
+
+        assertThat(password.cleared()).isTrue();
+        assertThat(harness.repl().session().credential()).isEqualTo("jwt-alice");
+        assertThat(client.loginCalls)
+                .containsExactly("alice:pw@http://127.0.0.1:7900");
+        assertThat(harness.sink().toString()).doesNotContain("pw");
+    }
+
+    @Test
+    void workbenchGatewayConnectsAndLogsIntoATemporaryServerInOneTypedAction() {
+        URI seed = URI.create("http://127.0.0.1:7900");
+        FakeControlPlane client = new FakeControlPlane(seed);
+        client.loginOutcome = new LoginOutcome.Success("jwt-alice");
+        Harness harness = harness(Path.of("tap-work"), client);
+        SecretBuffer password = new SecretBuffer();
+        password.append("pw");
+
+        assertThat(harness.repl().workbenchActionGateway().login(
+                new WorkbenchActionGateway.LoginRequest(Optional.of(seed), "alice"), password))
+                .isEqualTo(new WorkbenchActionGateway.LoginResult.SignedIn("alice"));
+
+        assertThat(password.cleared()).isTrue();
+        assertThat(harness.repl().session().landingNode()).isEqualTo(seed);
+        assertThat(harness.repl().session().credential()).isEqualTo("jwt-alice");
+        assertThat(client.loginCalls)
+                .containsExactly("alice:pw@http://127.0.0.1:7900");
+        assertThat(harness.sink().toString()).doesNotContain("pw", "connected to");
     }
 
     @Test

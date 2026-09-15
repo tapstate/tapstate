@@ -12,33 +12,31 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
  * The Tapstate CLI: the surface-ring product front-end. Dual-mode — bare {@code tapstate} opens the
- * offline REPL; one-shot subcommands share the same verb table for scripting / AI.
+ * full-screen workbench; one-shot subcommands share the same verb table for scripting / AI.
  *
- * <p>Offline verbs are a whitelist: {@code validate} / {@code new} / {@code add} / {@code explain} /
- * {@code ls} / {@code desc} run fully without any server. The server-state verbs are registered too, so they are
+ * <p>Offline verbs are a whitelist: {@code validate} / {@code new} / {@code explain} / {@code ls} /
+ * {@code desc} run fully without any server. The server-state verbs are registered too, so they are
  * discoverable and report a coded "not connected" diagnostic rather than going missing; they reach a
  * service through the REPL, where a connection is established and held — the CLI talks to a running
  * Tapstate over HTTP only (rule R6).
  */
 @Command(name = "tapstate", mixinStandardHelpOptions = true, version = Cli.VERSION,
         subcommands = {
-                ValidateCmd.class, NewCmd.class, AddCmd.class, DemoCmd.class, ExplainCmd.class, LsCmd.class,
+                ValidateCmd.class, NewCmd.class, DemoCmd.class, ExplainCmd.class, LsCmd.class,
                 DescCmd.class, McpCmd.class, AliasCmd.class, VersionCmd.class},
         // the second line is indented by hand under the "Usage: " heading picocli prints before the first
         customSynopsis = {
-                "tapstate [LAUNCH]                   open a session (interactive)",
+                "tapstate [LAUNCH]                   open the full-screen workbench",
                 "       tapstate [LAUNCH] COMMAND [ARGS...]  run one command and exit"},
         description = {
                 "",
-                "With no command, opens a session: a prompt that holds a workspace and, once you",
-                "connect, a server connection. The session commands are listed below. It exits",
-                "with the status of the first command in it that was refused, so a script that",
-                "pipes commands in reads one status for the whole run.",
+                "With no command, opens the full-screen workbench in the selected workspace. Its",
+                "interactive views own the terminal until you quit.",
                 "",
                 "With a command, runs it once and exits -- the form for scripts. A command takes",
                 "its own options, so the workspace is `tapstate validate -w DIR`, not",
@@ -58,12 +56,12 @@ import java.util.function.Supplier;
                 ""},
         footerHeading = "%nExamples:%n",
         footer = {
-                "  tapstate                      open a session in the default workspace",
-                "  tapstate -w ./work            open a session in ./work",
+                "  tapstate                      open the workbench in the default workspace",
+                "  tapstate -w ./work            open the workbench in ./work",
                 "  tapstate validate ./work      validate a workspace and exit",
                 "  tapstate help apply           describe one command",
                 "  TAPSTATE_PASSWORD=secret tapstate -c localhost:8080 -u admin",
-                "                                open a session already signed in",
+                "                                open the workbench already signed in",
                 "  tapstate -c localhost:8080 -u admin ls",
                 "                                run one command against a server and exit"},
         exitCodeListHeading = "%nExit codes:%n",
@@ -81,7 +79,7 @@ public final class Cli implements Runnable {
      * declaration, and the version is wanted on a path that must not depend on either. The build pins it
      * to the project version, so the string here cannot quietly drift from what was released.
      */
-    static final String VERSION = "tapstate 0.4.5";
+    static final String VERSION = "tapstate 0.4.4";
 
     /**
      * Just the number out of {@link #VERSION}, for the places that print it beside another version and
@@ -108,7 +106,7 @@ public final class Cli implements Runnable {
      * so the declared list can never drift from the verbs actually wired up.
      */
     static final List<String> OFFLINE_VERBS =
-            List.of("validate", "new", "add", "demo", "explain", "ls", "desc", "version");
+            List.of("validate", "new", "demo", "explain", "ls", "desc", "version");
 
     /**
      * How this face spells each operation it projects: operation id → verb name. The spelling is not
@@ -154,33 +152,15 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.status", "status"),
             Map.entry("pipeline.metrics", "metrics"),
             Map.entry("pipeline.snapshot", "snapshot"),
-            Map.entry("pipeline.logs", "logs"),
-            Map.entry("pipeline.position", "position"),
-            Map.entry("pipeline.set-position", "position"),
-            // Both on one verb, as the three token operations are: what a reader is doing is looking at
-            // one thing, and accepting it is the same look followed by a decision. A verb of its own for
-            // the accept would be a second word for the same subject; a flag on the start would not be
-            // anybody looking at all.
-            Map.entry("pipeline.derived-schema", "derived-schema"),
-            Map.entry("pipeline.accept-derived-schema", "derived-schema"));
+            Map.entry("pipeline.logs", "logs"));
 
     /**
-     * Verbs that chain several registered operations rather than projecting one, and are not
-     * implemented yet. They are registered so they stay discoverable, but they report that they do not
-     * exist yet — not that a connection is missing, which would be false in both states: connecting
-     * does not implement them. A composite that ships leaves this list for {@link #COMPOSITE_VERBS}
-     * under its final name; the placeholder is not kept beside it.
+     * Verbs that chain several registered operations rather than projecting one ({@code run} is apply
+     * then start), and are not implemented yet. They are registered so they stay discoverable, but they
+     * report that they do not exist yet — not that a connection is missing, which would be false in both
+     * states: connecting does not implement them.
      */
-    static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("export", "diff", "edit");
-
-    /**
-     * Verbs this face composes out of registered operations rather than projecting one. They need a
-     * connection like any other online verb, and they are listed apart from the projection because the
-     * projection is checked against the operation registry in both directions -- a composed verb has no
-     * operation of its own to be checked against, and putting one there to satisfy the check is exactly
-     * the thing composing it was meant to avoid.
-     */
-    static final List<String> COMPOSITE_VERBS = List.of("up", "restart");
+    static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("run", "export", "diff", "edit");
 
     /**
      * The live views over a collection. They project no registered operation and never will: each is a
@@ -237,8 +217,8 @@ public final class Cli implements Runnable {
                     "Remove one stored artifact for good; --if-match pins the version removed.")),
             Map.entry("connectors", new VerbHelp("[-o text|json|yaml]",
                     "List the connectors registered on the server.")),
-            Map.entry("register", new VerbHelp("<path|connector-id> [-o text|json|yaml]",
-                    "Upload local connector artifacts, or fetch a published connector by id.")),
+            Map.entry("register", new VerbHelp("<path> [-o text|json|yaml]",
+                    "Upload a connector artifact, or a directory of them.")),
             Map.entry("test", new VerbHelp("<id> [-o text|json|yaml]",
                     "Try a connection's configuration against the live endpoint.")),
             Map.entry("test-result", new VerbHelp("<id> [-o text|json|yaml]",
@@ -251,10 +231,8 @@ public final class Cli implements Runnable {
                     "Create, list, or revoke machine tokens.")),
             Map.entry("start", new VerbHelp("<pipeline-id>",
                     "Start a pipeline.")),
-            Map.entry("stop", new VerbHelp("<pipeline-id> [--keep-state] [-y]",
-                    "Stop a pipeline and clear what it accumulated; --keep-state keeps it.")),
-            Map.entry("restart", new VerbHelp("<pipeline-id> [--rerun] [-y]",
-                    "Cycle a pipeline and carry on; --rerun reads the whole source again.")),
+            Map.entry("stop", new VerbHelp("<pipeline-id>",
+                    "Stop a pipeline.")),
             Map.entry("pause", new VerbHelp("<pipeline-id>",
                     "Pause a running pipeline, holding its position.")),
             Map.entry("resume", new VerbHelp("<pipeline-id>",
@@ -265,16 +243,8 @@ public final class Cli implements Runnable {
                     "Show a pipeline's counters and per-table positions.")),
             Map.entry("snapshot", new VerbHelp("<pipeline-id>",
                     "Show a pipeline's per-table snapshot progress.")),
-            Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
-                    "Compare a join's recorded and current columns; --accept re-reads the sources.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",
                     "Tail a pipeline's log on its node; --follow streams until Ctrl-C.")),
-            // "per chain" is the load-bearing half of this line. A pipeline's position is one value per
-            // mining chain, covering every table on it; the metrics face shows that value projected onto
-            // each table, and somebody reading only that would come here expecting to set two tables to
-            // two different places -- which is not a state the record can hold.
-            Map.entry("position", new VerbHelp("<pipeline-id> [-f <file>]",
-                    "Show where a pipeline resumes from, per chain; -f writes it back.")),
             // The summary is one line because picocli wraps a longer one, and a wrapped line is a line the
             // help guard cannot pin. The call grammar lives where it is needed instead: in the usage this
             // verb prints when it cannot read a call.
@@ -286,13 +256,10 @@ public final class Cli implements Runnable {
                     "Watch one row in place until Ctrl-C; needs a terminal.")),
             Map.entry("tail", new VerbHelp("<source>.<collection> [<filter>]",
                     "Follow a whole collection's changes until Ctrl-C; pipes fine.")),
-            // The composite that ships. The operands are the flags it takes, since it names no resource:
-            // the bound workspace is the operand.
-            Map.entry("up", new VerbHelp(
-                    "[--server <url>] [-u <name>] [--start-local] [--yes] [-o text|json|yaml] [-w <dir>]",
-                    "Bring the bound workspace to running: apply, discover, apply, start.")),
             // The reserved verbs. Each says what it is reserved for: "not implemented yet" answers the
             // question only once the reader knows what was going to be there.
+            Map.entry("run", new VerbHelp("[<path>]",
+                    "Apply a workspace and start its pipelines in one step.")),
             Map.entry("export", new VerbHelp("<id>",
                     "Write a stored artifact back out as canonical YAML.")),
             Map.entry("diff", new VerbHelp("<file>",
@@ -360,15 +327,9 @@ public final class Cli implements Runnable {
         for (String verb : LIVE_VIEW_VERBS) {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
-        for (String verb : COMPOSITE_VERBS) {
-            if (!verb.equals("up")) {
-                commandLine.addSubcommand(verb, new ConnectedVerb());
-            }
-        }
         for (String verb : UNIMPLEMENTED_COMPOSITE_VERBS) {
             commandLine.addSubcommand(verb, new UnimplementedVerb());
         }
-        commandLine.addSubcommand(new UpCmd());
         // The version belongs to the binary, not to any one verb, so every verb reports the same one.
         // Set centrally rather than annotated per class: the standard help mixin registers -V wherever
         // it is applied, and a spec with no version answers that advertised option with an empty line
@@ -404,7 +365,7 @@ public final class Cli implements Runnable {
         int column = BUILTIN_HELP.entrySet().stream().mapToInt(e -> call(e).length()).max().orElse(0);
         commandLine.getHelpSectionMap().put(SECTION_REPL_BUILTINS, help -> {
             StringBuilder text = new StringBuilder(String.format(
-                    "%nSession commands (type these at the prompt, after starting `tapstate`):%n"));
+                    "%nInteractive actions (being migrated into the workbench):%n"));
             // sorted by name so the rendering is stable across runs
             BUILTIN_HELP.entrySet().stream()
                     .sorted(Map.Entry.comparingByKey())
@@ -502,66 +463,44 @@ public final class Cli implements Runnable {
 
     /**
      * Runs whatever the launch options asked for: establish the connection they name, then either run
-     * the one command they carry and leave, or open the session and hand over to the read loop.
+     * the one command they carry and leave, or open the full-screen workbench.
      *
-     * <p>A failed connection or sign-in stops there. Dropping into a session that is not connected after
+     * <p>A failed connection or sign-in stops there. Dropping into a workbench that is not connected after
      * being asked for one would look like it had worked, and running the command anyway would report a
      * missing connection rather than the reason there is none.
      */
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter) {
-        return runSession(launch, controlPlane, prompter, () -> System.console() != null);
-    }
-
-    /**
-     * The same run, with the terminal question answered by the caller. A test process never has a
-     * terminal, so without this seam the one-shot face could only ever exercise the half of a
-     * confirmation that refuses -- and the half that asks is the one a person meets.
-     */
-    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
-                          Supplier<Prompter> prompter, BooleanSupplier terminal) {
         Path home = Path.of(System.getProperty("user.home"));
-        ContextResolver resolver = HomeStores.resolver(home, launch::environment);
-        AuthService authService = HomeStores.auth(home, controlPlane, java.time.Clock.systemUTC());
-        return runSession(launch, controlPlane, prompter, resolver, authService, terminal);
+        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
+        AuthService authService = new AuthService(
+                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
+        return runSession(launch, controlPlane, prompter, resolver, authService, Workbench::run);
     }
 
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, ContextResolver resolver) {
-        return runSession(launch, controlPlane, prompter, resolver, null,
-                () -> System.console() != null);
+        return runSession(launch, controlPlane, prompter, resolver, null, Workbench::run);
+    }
+
+    /** Test seam for the bare-command workbench handoff. */
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, Function<Repl, Integer> workbench) {
+        Path home = Path.of(System.getProperty("user.home"));
+        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
+        AuthService authService = new AuthService(
+                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
+        return runSession(launch, controlPlane, prompter, resolver, authService, workbench);
     }
 
     private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                                   Supplier<Prompter> prompter, ContextResolver resolver,
-                                  AuthService authService, BooleanSupplier terminal) {
-        return runSession(launch, controlPlane, prompter, resolver, authService, terminal, newCommandLine(),
-                Path.of(System.getProperty("user.home")));
-    }
-
-    /** The injected command table keeps one-shot output observable without redirecting process streams. */
-    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
-                          Supplier<Prompter> prompter, ContextResolver resolver,
-                          AuthService authService, CommandLine commandLine) {
-        return runSession(launch, controlPlane, prompter, resolver, authService,
-                () -> System.console() != null, commandLine, Path.of(System.getProperty("user.home")));
-    }
-
-    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
-                          Supplier<Prompter> prompter, ContextResolver resolver,
-                          AuthService authService, CommandLine commandLine, Path home) {
-        return runSession(launch, controlPlane, prompter, resolver, authService,
-                () -> System.console() != null, commandLine, home);
-    }
-
-    private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
-                                  Supplier<Prompter> prompter, ContextResolver resolver,
-                                  AuthService authService, BooleanSupplier terminal, CommandLine commandLine,
-                                  Path home) {
+                                  AuthService authService, Function<Repl, Integer> workbench) {
         Prompter oneShotPrompter = null;
+        PromptOwner launchPrompt = new PromptOwner(prompter);
         try {
             if (launch.hasConflictingTargets()) {
-                Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
+                Diagnostics.printText(newCommandLine().getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
                 return EXIT_USAGE;
             }
             if (launch.isOneShot() && launch.command().size() >= 2
@@ -575,19 +514,9 @@ public final class Cli implements Runnable {
                     && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }
-            // `up` asks which server the first time a workspace is brought up, so a one-shot run of it at
-            // a terminal needs a prompter too; without a terminal it asks nothing and refuses instead.
-            if (launch.isOneShot() && !launch.command().isEmpty()
-                    && launch.command().get(0).equals("up")
-                    && System.console() != null) {
-                oneShotPrompter = prompter.get();
-            }
-            Repl repl = new Repl(commandLine, launch.root(), controlPlane, oneShotPrompter,
+            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
-                    HomeStores.contexts(home));
-            repl.homeDir = home;
-            repl.terminalCheck(terminal);
-            repl.prompterSource(prompter);
+                    new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
             String machineToken = launch.machineToken();
             if (machineToken != null) {
                 repl.installMachineToken(machineToken);
@@ -595,7 +524,7 @@ public final class Cli implements Runnable {
             if (launch.connects()) {
                 int established = machineToken == null
                         ? repl.signIn(launch.connect(), launch.user(),
-                                () -> launch.resolvePassword(prompter), launch.isOneShot())
+                                () -> launch.resolvePassword(launchPrompt::get), launch.isOneShot())
                         : repl.connectForLaunch(launch.connect(), launch.isOneShot());
                 if (established != EXIT_OK) {
                     return established;
@@ -605,14 +534,52 @@ public final class Cli implements Runnable {
                 repl.dispatch(launch.command(), true);
                 return repl.lastExitCode();
             }
-            repl.run();
-            // a session that refused a line has to say so: piped into a script, the status is all it reads
-            return repl.sessionExitCode();
+            launchPrompt.close();
+            return workbench.apply(repl);
         } finally {
+            launchPrompt.close();
             if (oneShotPrompter instanceof JLinePrompter jline) {
                 jline.close();
             }
             controlPlane.close();
+        }
+    }
+
+    /** Retains a lazily opened prompt owner until its terminal can be closed before workbench handoff. */
+    private static final class PromptOwner implements AutoCloseable {
+        private final Supplier<Prompter> factory;
+        private Prompter prompt;
+        private boolean closed;
+
+        private PromptOwner(Supplier<Prompter> factory) {
+            this.factory = factory;
+        }
+
+        private Prompter get() {
+            if (closed) {
+                throw new IllegalStateException("prompt owner is already closed");
+            }
+            if (prompt == null) {
+                prompt = factory.get();
+            }
+            return prompt;
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            if (prompt instanceof AutoCloseable closeable) {
+                try {
+                    closeable.close();
+                } catch (RuntimeException failure) {
+                    throw failure;
+                } catch (Exception failure) {
+                    throw new IllegalStateException("could not close prompt owner", failure);
+                }
+            }
         }
     }
 }

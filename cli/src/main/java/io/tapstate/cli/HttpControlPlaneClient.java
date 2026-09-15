@@ -1238,9 +1238,15 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public LogsOutcome logs(URI baseUrl, String credential, String pipelineId) {
+        return logs(baseUrl, credential, pipelineId, null);
+    }
+
+    @Override
+    public LogsOutcome logs(URI baseUrl, String credential, String pipelineId, RemoteLogCursor after) {
         try {
+            String suffix = after == null ? "" : "?after=" + encode(after.token());
             HttpRequest request =
-                    authed(baseUrl, "/api/pipelines/" + pipelineId + "/logs", credential).GET().build();
+                    authed(baseUrl, "/api/pipelines/" + pipelineId + "/logs" + suffix, credential).GET().build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
@@ -1270,9 +1276,36 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     parsed.add(new RemoteLogLine(ts.longValue(), level, message));
                 }
             }
-            return new LogsOutcome.Found(id, parsed);
+            RemoteLogCursor cursor = null;
+            if (m.get("nextCursor") instanceof Map<?, ?> next
+                    && next.get("generation") instanceof String generation
+                    && next.get("sequence") instanceof Number sequence) {
+                cursor = new RemoteLogCursor(generation, sequence.longValue());
+            }
+            boolean truncated = m.get("truncated") instanceof Boolean value && value;
+            return new LogsOutcome.Found(id, parsed, cursor, truncated);
         }
         return null;
+    }
+
+    @Override
+    public PipelineLogLevelOutcome logLevel(URI baseUrl, String credential, String pipelineId, String level) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + ":log-level", credential)
+                    .POST(HttpRequest.BodyPublishers.ofString(JsonOut.write(Map.of("level", level)), StandardCharsets.UTF_8))
+                    .build();
+            HttpResponse<String> response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200 && JsonReader.parse(response.body()) instanceof String changed) {
+                return new PipelineLogLevelOutcome.Changed(changed);
+            }
+            Rejection rejection = rejection(response.body(), "The server refused the log level change.");
+            return new PipelineLogLevelOutcome.Rejected(rejection.code(), rejection.message());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new PipelineLogLevelOutcome.Unreachable();
+        } catch (IOException | RuntimeException unavailable) {
+            return new PipelineLogLevelOutcome.Unreachable();
+        }
     }
 
     // --- streaming reads over a websocket (status --watch / logs --follow) -----------------------
@@ -1297,10 +1330,24 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     @Override
     public String followLogs(URI baseUrl, String credential, String pipelineId,
             LogStream sink, BooleanSupplier stop) {
-        return stream(wsUri(baseUrl, "/api/pipelines/" + pipelineId + "/logs/follow"), credential, stop, frame -> {
+        return followLogs(baseUrl, credential, pipelineId, null, sink, stop);
+    }
+
+    @Override
+    public String followLogs(URI baseUrl, String credential, String pipelineId, RemoteLogCursor after,
+            LogStream sink, BooleanSupplier stop) {
+        AtomicReference<RemoteLogCursor> cursor = new AtomicReference<>(after);
+        return stream(() -> {
+            RemoteLogCursor latest = cursor.get();
+            String suffix = latest == null ? "" : "?after=" + encode(latest.token());
+            return wsUri(baseUrl, "/api/pipelines/" + pipelineId + "/logs/follow" + suffix);
+        }, credential, stop, frame -> {
             LogsOutcome.Found found = logsFound(frame);
-            if (found != null && !found.lines().isEmpty()) {
-                sink.lines(found.pipelineId(), found.lines());
+            if (found != null && (!found.lines().isEmpty() || found.truncated())) {
+                if (found.nextCursor() != null) {
+                    cursor.set(found.nextCursor());
+                }
+                sink.page(found);
             }
         });
     }
@@ -1360,6 +1407,11 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * code is returned; every other ending returns {@code null}. Never throws.
      */
     private String stream(URI wsUri, String credential, BooleanSupplier stop, Consumer<String> onFrame) {
+        return stream(() -> wsUri, credential, stop, onFrame);
+    }
+
+    /** Rebuilds the endpoint on reconnect when a stream cursor advances with each received frame. */
+    private String stream(Supplier<URI> wsUri, String credential, BooleanSupplier stop, Consumer<String> onFrame) {
         while (!stop.getAsBoolean()) {
             CountDownLatch closed = new CountDownLatch(1);
             AtomicReference<String> refusal = new AtomicReference<>();
@@ -1367,7 +1419,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             try {
                 ws = client().newWebSocketBuilder()
                         .header("Authorization", "Bearer " + credential)
-                        .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal))
+                        .buildAsync(wsUri.get(), new StreamListener(onFrame, closed, refusal))
                         .join();
             } catch (RuntimeException handshakeFailed) {
                 // join() wraps a refused (401/403) or unreachable handshake in a CompletionException (a
