@@ -11,6 +11,9 @@ import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StateStore;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -125,6 +128,7 @@ public final class ObservationPublisher {
     private final Function<String, Map<String, Long>> joinRecomputeExpected;
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
+    private final Clock clock;
 
     /**
      * A publisher with no metric, position or snapshot source: recordCount stays absent and positions and
@@ -284,6 +288,30 @@ public final class ObservationPublisher {
             Function<String, Map<String, Long>> nestDeadLetters,
             Function<String, Map<String, Long>> joinRecomputeDone,
             Function<String, Map<String, Long>> joinRecomputeExpected) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, Clock.systemUTC());
+    }
+
+    /**
+     * A publisher reading the observation time from {@code clock} rather than the system clock. Every
+     * publish stamps when the projection was taken, so a read face can tell a run whose state has simply
+     * not changed from one whose publisher stopped; a test drives that clock to witness the difference
+     * without waiting for real time to pass.
+     */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Clock clock) {
+        this.clock = Objects.requireNonNull(clock, "clock");
         this.joinRecomputeDone = Objects.requireNonNull(joinRecomputeDone, "joinRecomputeDone");
         this.joinRecomputeExpected =
                 Objects.requireNonNull(joinRecomputeExpected, "joinRecomputeExpected");
@@ -333,7 +361,7 @@ public final class ObservationPublisher {
                     metrics(pipelineId, actual, readings, gaps, pinned, nestDeadLetters.apply(pipelineId),
                             joinRecomputeDone.apply(pipelineId),
                             joinRecomputeExpected.apply(pipelineId)),
-                    snapshots.apply(pipelineId), positions.apply(pipelineId), carried));
+                    snapshots.apply(pipelineId), positions.apply(pipelineId), carried, observedNow()));
             // Fed after the observation is written and never before. The observation is the contract and
             // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
             // cost a pipeline the read face that says it is alive at all.
@@ -358,7 +386,17 @@ public final class ObservationPublisher {
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
         observations.save(new Observation(pipelineId, lastState, Map.of("errorCount", consecutiveFailures),
-                null, lastPositions, lastFailure));
+                null, lastPositions, lastFailure, observedNow()));
+    }
+
+    /**
+     * When this projection is being taken, truncated to milliseconds. The store keeps it as a BSON date,
+     * which is millisecond precision, so truncating here rather than on the way out keeps the value a
+     * caller holds identical to the one that comes back — nanoseconds that only exist until the first
+     * round trip would make two equal observations compare unequal depending on where they were read.
+     */
+    private Instant observedNow() {
+        return Instant.now(clock).truncatedTo(ChronoUnit.MILLIS);
     }
 
     /**

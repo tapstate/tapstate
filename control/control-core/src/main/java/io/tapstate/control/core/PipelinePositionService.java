@@ -161,7 +161,7 @@ public final class PipelinePositionService {
         refuseChange("tables", asked.chainId(),
                 asked.tables().isEmpty() ? null : asked.tables(), stored.tables());
         refuseChange("recordedAt", asked.chainId(), asked.recordedAt(), stored.recordedAt());
-        refuseChange("sinkAcked", asked.chainId(), asked.sinkAcked(), stored.sinkAcked());
+        refuseChange("targetAcked", asked.chainId(), asked.targetAcked(), stored.targetAcked());
         refuseChange("sharedWith", asked.chainId(),
                 asked.sharedWith().isEmpty() ? null : asked.sharedWith(), stored.sharedWith());
         if (asked.resumeFrom() != null) {

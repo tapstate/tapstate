@@ -6,6 +6,9 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
 
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -16,9 +19,16 @@ import java.util.TreeMap;
  *
  * <p>The failure is omitted while the pipeline is healthy rather than serialized as null, so a client tells
  * "nothing wrong" from "something wrong" by presence alone.
+ *
+ * <p>{@code observedAt} says when the projection behind this answer was taken and {@code observedAgeMillis}
+ * how long ago that was, measured here rather than by the caller: the caller's wall clock is its own, and a
+ * client minutes out of step with the server would report a fresh pipeline as stale or the reverse. Both are
+ * omitted together when the time is not known, so a reader tells "this is how old it is" from "nobody can
+ * say how old this is" by presence alone — the absent case is an answer, not a gap to fill in locally.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
-record PipelineStatusResponse(String pipelineId, PipelineState state, Failure failure) {
+record PipelineStatusResponse(String pipelineId, PipelineState state, Failure failure, Instant observedAt,
+        Long observedAgeMillis) {
 
     /**
      * A coded failure as a client reads it: the canonical code string (the stable identity — the enum never
@@ -29,7 +39,18 @@ record PipelineStatusResponse(String pipelineId, PipelineState state, Failure fa
     }
 
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog) {
-        return new PipelineStatusResponse(status.pipelineId(), status.state(), failure(status.failure(), catalog));
+        return of(status, catalog, Clock.systemUTC());
+    }
+
+    /**
+     * The same projection reading now from {@code clock}, so the age can be witnessed at a known instant
+     * rather than by waiting for real time to pass.
+     */
+    static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog, Clock clock) {
+        Instant observedAt = status.observedAt();
+        return new PipelineStatusResponse(status.pipelineId(), status.state(),
+                failure(status.failure(), catalog), observedAt,
+                observedAt == null ? null : Duration.between(observedAt, clock.instant()).toMillis());
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {

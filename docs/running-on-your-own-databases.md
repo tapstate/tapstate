@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/running-on-your-own-databases
+---
+
 # Running the server against databases you started yourself
 
 The [quickstart](quickstart-online.md) brings up databases, the server and the first admin together,
@@ -78,16 +84,74 @@ wherever the server is. Two cases catch people out:
 Getting this wrong shows up as a connection failure at `discover-schema`, which is the first command
 that actually reaches the database.
 
+## When you start before the source schema has been discovered
+
+`discover-schema` is a command you run, not something `start` does for you, and forgetting it is the
+common first mistake on your own databases. `start` accepts the pipeline - nothing is wrong with the
+definition - and the run then fails on the next convergence pass, so `status` is where you see it:
+
+```
+order_pipeline  failed
+reason: actuation.source-schema-not-discovered
+  Source `src_orders` needs a discovered schema before its tables can be selected.
+why: the run failed, and said why: actuation.source-schema-not-discovered
+  read       status.failure = actuation.source-schema-not-discovered
+  next       tapstate logs order_pipeline
+```
+
+Run `discover-schema` for the source it names, then start again.
+
+One shape does not fail this way, and you should not read that as permission to skip the step: a
+pipeline whose only output is a view over tables named literally starts, reports itself healthy, and
+materializes rows carrying **the primary key alone** - every other column is silently dropped, because
+the columns a view is built from come from the discovered schema and there is none. Nothing on any read
+face says so. Discover the schema before you start, whatever the pipeline's output shape is.
+
 ## When a pipeline says `running` but nothing arrives
 
-`status` reports the pipeline's last published state. A pipeline whose plan cannot be built - a nest
-tree that is refused, for instance - fails while reconciling, retries on the next tick, and keeps
-reporting `running` because nothing published a failure over it. The reason is in the server's log,
-once per tick:
+`status` reports the pipeline's last published state, and then answers this question directly. A
+pipeline whose plan cannot be built - a nest tree that is refused, for instance - fails while
+reconciling, retries on the next tick, and keeps reporting `running`, because nothing has seen its
+job die and reporting it as failed would be a guess. What `status` adds is that it says so:
+
+```
+order_pipeline  running
+why: the server keeps failing to bring this pipeline up: 12 passes in a row have thrown
+  read       metrics.errorCount = 12
+  read       status.state = running
+  next       read the server's own log -- the reason is printed there once per pass
+  cannot say whether the job itself is still alive: nothing here has seen it die, so the state
+             stays running rather than being guessed into a failure
+```
+
+The reason itself is in the server's log, once per tick:
 
 ```
 io.tapstate.core.common.TapstateException: nest.embed-target-not-parent-key {embedPath=lines, ...}
 ```
 
-So when a pipeline reads `running` and its target stays empty, read the log rather than the status.
-Having the server's output in your own terminal is one of the reasons to run it this way.
+So the status tells you to read the log, and how long it has been failing; the log tells you what
+failed. Having the server's output in your own terminal is one of the reasons to run it this way.
+
+## When a source refuses the connection
+
+The connector is the only thing that knows why a database said no: the password, the permission, the
+database that is not there. From outside it, the server can say only that the read failed and name the
+exception class. So what the connector says about it is written into that pipeline's own tail:
+
+```
+tapstate(admin@127.0.0.1:8080)> logs order_pipeline
+2026-09-15T08:21:04.318Z  ERROR  password authentication failed for user "orders_reader"
+2026-09-15T08:21:04.502Z  WARN   Pipeline order_pipeline entered FAILED [connector.capture-failed]: its data-plane job died
+```
+
+The first line is the connector's; the second is the server's own account of the same event. You want
+the first one - it names the thing to go and fix.
+
+Two limits worth knowing before you go looking for a line that is not there. A connector's routine
+progress chatter is deliberately kept out of this tail: it is a bounded window of recent lines, and
+chatter would push the one line you came for out of it (raise the server's log level if you want it).
+And a line a connector writes from a thread of its own making - a reconnect loop, a driver's own
+monitor - reaches the server's console without being filed under any pipeline, because nothing at that
+point can say which run it belonged to. If the tail is quiet, the server's own output is the next place
+to look.

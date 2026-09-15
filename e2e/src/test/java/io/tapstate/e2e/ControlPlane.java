@@ -935,6 +935,38 @@ final class ControlPlane {
      * is merely slow to converge, and the specification would sit out its whole bound and then blame the
      * data. The code is the product's contract for exactly this distinction, so the code is what is read.
      */
+    /**
+     * How old the published observation is, as the product itself reports it, or empty when nothing has
+     * been published yet.
+     *
+     * <p>Read from the product rather than computed here from a timestamp and this JVM's clock. The age
+     * is what the product offers a reader to tell a stalled publisher from a healthy run; computing it
+     * on this side would assert a subtraction the test wrote, and would keep passing if the product
+     * stopped offering one.
+     */
+    Optional<Long> observedAgeMillis(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/status"));
+        return interpretObservedAgeMillis(response.statusCode(), response.body(), pipelineId);
+    }
+
+    static Optional<Long> interpretObservedAgeMillis(int status, String body, String pipelineId) {
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return Optional.empty();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the status of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
+                || !(map.get("observedAgeMillis") instanceof Number age)) {
+            // Not waited out as though the pipeline were slow: a published observation carries its age,
+            // so a 200 without one is the contract being gone, which is the thing to say out loud.
+            throw new AssertionError("status carried no observedAgeMillis: " + body);
+        }
+        return Optional.of(age.longValue());
+    }
+
     static Optional<PipelineState> interpretState(int status, String body, String pipelineId) {
         if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
             return Optional.empty();
@@ -1206,7 +1238,7 @@ final class ControlPlane {
             throw new AssertionError("metrics answer did not parse: " + body);
         }
         // Absent until a position is acked, and absent is a real reading here rather than a broken face.
-        if (!(map.get("perTableOffset") instanceof Map<?, ?> offsets)) {
+        if (!(map.get("targetAckedPosition") instanceof Map<?, ?> offsets)) {
             return Optional.empty();
         }
         return offsets.get(table) instanceof String position ? Optional.of(position) : Optional.empty();

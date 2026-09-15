@@ -194,7 +194,7 @@ class ControlPlaneTest {
     void readsTheDurablePositionOfOneTable() {
         String body = JsonWriter.write(Map.of("pipelineId", PIPELINE,
                 "metrics", Map.of("errorCount", 0),
-                "perTableOffset", Map.of("orders", "bin.000003:1544", "order_items", "bin.000003:2210")));
+                "targetAckedPosition", Map.of("orders", "bin.000003:1544", "order_items", "bin.000003:2210")));
 
         assertThat(ControlPlane.interpretDurablePosition(200, body, PIPELINE, "order_items"))
                 .contains("bin.000003:2210");
@@ -209,7 +209,7 @@ class ControlPlaneTest {
     void readsATableWithNothingAckedYetAsAbsent() {
         String body = JsonWriter.write(Map.of("pipelineId", PIPELINE,
                 "metrics", Map.of("errorCount", 0),
-                "perTableOffset", Map.of("orders", "bin.000003:1544")));
+                "targetAckedPosition", Map.of("orders", "bin.000003:1544")));
 
         assertThat(ControlPlane.interpretDurablePosition(200, body, PIPELINE, "order_items")).isEmpty();
     }
