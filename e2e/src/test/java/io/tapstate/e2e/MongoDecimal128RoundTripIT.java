@@ -1,12 +1,6 @@
 package io.tapstate.e2e;
 
-import com.mongodb.ConnectionString;
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
-import com.mongodb.client.MongoCollection;
-import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
-import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.bson.types.Decimal128;
@@ -14,15 +8,15 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * A MongoDB 128-bit decimal keeps every significant digit through a pipeline to another MongoDB,
- * including CDC delivered after more changes arrive during a pause than the in-memory ring can hold.
+ * A MongoDB 128-bit decimal keeps every significant digit through a pipeline to another MongoDB, on
+ * both paths a row can take: the snapshot it was already there for, and a change that arrives while
+ * the pipeline runs.
  *
  * <p>The document is written directly with the driver, carried through the shipped pipeline, and read
  * directly from the target with the driver. The real connector's read conversion narrows the source
@@ -35,6 +29,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * decimal-shaped after the value had already been narrowed, so the assertion compares the target's
  * actual 128-bit decimal digit for digit.
  *
+ * <p><b>What this case deliberately does not cover: a change rebuilt from the durable log.</b> A
+ * pause-and-backlog scaffold was tried here and covered nothing. The ring never evicts an unread
+ * change - the write gate parks the source read at capacity instead - so its store is never asked to
+ * load one back, and every assertion below passes whether or not a reload ever happened. That half of
+ * the fix is pinned where the reload is real and observable, in the store's own case
+ * ({@code MongoSrsLogStoreIT.anExactDecimalReloadsAsThePortableValueTheChangeCarried}).
+ *
  * <p>Gated on Docker and on the real connector jar. Run it with:
  *
  * <pre>
@@ -45,16 +46,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class MongoDecimal128RoundTripIT {
 
-    private static final int RING_CAPACITY = 1024;
-    private static final int PAUSED_CHANGES = RING_CAPACITY + 1;
     private static final String SOURCE_ID = "src_mongo";
     private static final String TARGET_ID = "tgt_mongo";
     private static final String PIPELINE_ID = "decimal128_round_trip";
     private static final String COLLECTION = "orders";
     private static final String SOURCE_DATABASE = "e2e_decimal128_src";
     private static final String TARGET_DATABASE = "e2e_decimal128_tgt";
-    private static final String DOCUMENT_ID = "exact-decimal";
-    private static final String FIRST_REPLAYED = "first-replayed";
+    private static final String SNAPSHOT = "snapshot";
+    private static final String CHANGED = "changed";
     private static final Decimal128 AMOUNT =
             Decimal128.parse("1234567890.123456789012345678901234");
     private static final Duration TIMEOUT = Duration.ofSeconds(30);
@@ -66,7 +65,7 @@ class MongoDecimal128RoundTripIT {
     }
 
     @Test
-    void keepsEverySignificantDigitAfterAPausedCdcBacklog() {
+    void keepsEverySignificantDigitThroughSnapshotAndCdc() {
         String storeUri = SharedMongo.replicaSetUrl("e2e_decimal128_store");
         String sourceUri = SharedMongo.replicaSetUrl(SOURCE_DATABASE);
         String targetUri = SharedMongo.replicaSetUrl(TARGET_DATABASE);
@@ -74,11 +73,9 @@ class MongoDecimal128RoundTripIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
         try (ServerHandle server = InProcessServer.start(storeUri);
-                MongoClient sourceClient = MongoClients.create(sourceUri);
-                MongoClient storeClient = MongoClients.create(storeUri);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             mongo.insert(source, COLLECTION,
-                    new Document("_id", DOCUMENT_ID).append("marker", "snapshot").append("amount", AMOUNT));
+                    new Document("_id", "exact-decimal").append("marker", SNAPSHOT).append("amount", AMOUNT));
 
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");
@@ -91,55 +88,25 @@ class MongoDecimal128RoundTripIT {
                     Map.of("uri", sourceUri, "database", SOURCE_DATABASE));
             control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
 
-            Await.until("the decimal document to reach the target", TIMEOUT,
-                    () -> !mongo.documents(target, COLLECTION).isEmpty(),
-                    () -> reading(control, mongo.documents(target, COLLECTION)));
-            assertExactDecimal(mongo.documents(target, COLLECTION), "snapshot");
+            awaitExactDecimal(control, mongo, target, SNAPSHOT);
 
-            control.lifecycle(PIPELINE_ID, LifecycleVerb.PAUSE);
-            awaitState(control, PipelineState.PAUSED);
+            // The other path the same column takes. A snapshot row is read and converted in one place
+            // and a change in another, so a correction that reached only one of them would arrive here
+            // as a target holding the exact value for the row that was already there and a rounded
+            // double for the one inserted a moment later.
+            mongo.insert(source, COLLECTION,
+                    new Document("_id", "exact-decimal-change").append("marker", CHANGED).append("amount", AMOUNT));
 
-            MongoCollection<Document> sourceCollection = sourceClient
-                    .getDatabase(SOURCE_DATABASE)
-                    .getCollection(COLLECTION);
-            sourceCollection.insertMany(pausedChanges());
-
-            String storeDatabase = new ConnectionString(storeUri).getDatabase();
-            if (storeDatabase == null) {
-                throw new AssertionError("the store url names no database: " + storeUri);
-            }
-            MongoCollection<Document> durableLog = storeClient
-                    .getDatabase(storeDatabase)
-                    .getCollection(MongoStorePort.SRS_LOG);
-            Await.until("the oldest paused change to reach the durable log", TIMEOUT,
-                    () -> durableLog.countDocuments(new Document("after.marker", FIRST_REPLAYED)) == 1L,
-                    () -> durableLog.countDocuments() + " durable changes, state="
-                            + control.state(PIPELINE_ID) + ", logs=" + control.logs(PIPELINE_ID));
-
-            control.lifecycle(PIPELINE_ID, LifecycleVerb.RESUME);
-            awaitState(control, PipelineState.RUNNING);
-
-            Await.until("the oldest paused decimal change to reach the target", TIMEOUT,
-                    () -> exactDecimal(mongo.documents(target, COLLECTION), FIRST_REPLAYED),
-                    () -> reading(control, mongo.documents(target, COLLECTION)));
-            assertExactDecimal(mongo.documents(target, COLLECTION), FIRST_REPLAYED);
+            awaitExactDecimal(control, mongo, target, CHANGED);
         }
     }
 
-    private static List<Document> pausedChanges() {
-        List<Document> changes = new ArrayList<>(PAUSED_CHANGES);
-        for (int i = 0; i < PAUSED_CHANGES; i++) {
-            changes.add(new Document("_id", "cdc-decimal-" + i)
-                    .append("marker", i == 0 ? FIRST_REPLAYED : "paused-" + i)
-                    .append("amount", AMOUNT));
-        }
-        return changes;
-    }
-
-    private static void awaitState(ControlPlane control, PipelineState expected) {
-        Await.until("the decimal pipeline to reach " + expected, TIMEOUT,
-                () -> control.state(PIPELINE_ID).filter(expected::equals).isPresent(),
-                () -> "state=" + control.state(PIPELINE_ID) + ", logs=" + control.logs(PIPELINE_ID));
+    private static void awaitExactDecimal(ControlPlane control, MongoEndpoints mongo,
+            EndpointAddress target, String marker) {
+        Await.until("the " + marker + " decimal document to reach the target", TIMEOUT,
+                () -> exactDecimal(mongo.documents(target, COLLECTION), marker),
+                () -> reading(control, mongo.documents(target, COLLECTION)));
+        assertExactDecimal(mongo.documents(target, COLLECTION), marker);
     }
 
     private static boolean exactDecimal(List<Document> documents, String marker) {
