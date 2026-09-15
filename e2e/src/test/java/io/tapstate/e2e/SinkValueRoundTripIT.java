@@ -41,9 +41,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       beside a restored identity in the same document, from the same run.</li>
  * </ul>
  *
- * <p>A 128-bit decimal is deliberately not among them. Its conversion loses digits on the way in and
- * that loss is accepted knowingly, so asserting it round-trips would be asserting something already
- * decided against.
+ * <p>A 128-bit decimal is covered separately by {@link MongoDecimal128RoundTripIT}. It goes directly
+ * from source to sink there because this case's JavaScript step produces a derived decimal column,
+ * whose precision and bounds the target model deliberately does not invent.
  *
  * <p>Java rather than a declarative example, and the reason is a missing word rather than a
  * preference: the claim is about the storage type of a column at the target, and the specification

@@ -13,6 +13,7 @@ import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
@@ -166,6 +167,25 @@ class MongoSrsLogStoreIT {
                             + "to accept the field names the encoding uses, which only a real one says")
                     .containsEntry("_id", new ConvertedValue("650f1a2b3c4d5e6f70819200", "OBJECT_ID"))
                     .containsEntry("amount", "12.50");
+        });
+    }
+
+    @Test
+    void anExactDecimalReloadsAsThePortableValueTheChangeCarried() {
+        withStore(store -> {
+            BigDecimal exact = new BigDecimal("1234567890.123456789012345678901234");
+            store.store(RING, 201L, new SrsLogRecord("bin.4:91828", Op.INSERT, 43L, null,
+                    Map.of("amount", new ConvertedValue(exact, "DECIMAL128")), 3L));
+
+            Object amount = ((ConvertedValue) store.load(RING, 201L)
+                    .orElseThrow()
+                    .after()
+                    .get("amount"))
+                    .value();
+            assertThat(amount)
+                    .as("a durable reload must not replace the portable decimal with a Mongo driver value")
+                    .isEqualTo(exact)
+                    .isInstanceOf(BigDecimal.class);
         });
     }
 

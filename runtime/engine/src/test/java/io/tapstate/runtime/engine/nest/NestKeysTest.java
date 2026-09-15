@@ -4,6 +4,7 @@ import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 
@@ -82,5 +83,61 @@ class NestKeysTest {
 
         assertThat(NestKeys.valuesOf(row, List.of("region", "tier")))
                 .containsExactly("eu", 2L);
+    }
+
+    @Test
+    void twoSpellingsOfOneExactDecimalAreOneKey() {
+        Map<String, Object> written = Map.of("amount", new BigDecimal("10.50"));
+        Map<String, Object> theSameNumber = Map.of("amount", new BigDecimal("10.5"));
+
+        // A document store keeps the scale each value was written with, so one column hands over both
+        // of these for one number. Compared with the scale they arrive in they are two keys - one
+        // parent's elements split in half, filed under two names in the state layer, and no error
+        // anywhere: the job runs, the rows arrive, and the document simply never fills in.
+        assertThat(NestKeys.valuesOf(written, List.of("amount")))
+                .isEqualTo(NestKeys.valuesOf(theSameNumber, List.of("amount")));
+        // The hash decides which member a key routes to, so an unnormalized one sends the two
+        // spellings to two places before anything compares them at all.
+        assertThat(NestKeys.valuesOf(written, List.of("amount")).hashCode())
+                .isEqualTo(NestKeys.valuesOf(theSameNumber, List.of("amount")).hashCode());
+    }
+
+    @Test
+    void aWholeNumberWrittenAsAnExactDecimalKeepsItsPlainName() {
+        Map<String, Object> row = Map.of("amount", new BigDecimal("100.00"));
+
+        // Dropping the trailing zeros alone leaves 1E+2, which is the same number and a name nobody
+        // reading the state layer would connect to the column it came from.
+        assertThat(NestStateKeys.nameOf(NestKeys.valuesOf(row, List.of("amount"))))
+                .isEqualTo("[100]~m");
+    }
+
+    @Test
+    void aKeyOnAnExactDecimalStillTellsDifferentNumbersApart() {
+        Map<String, Object> row = Map.of("amount", new BigDecimal("10.50"));
+
+        // Which is what makes the case above mean anything: equal for one number is free if every
+        // number is equal to every other. The second pair is the digit the narrowing this normalization
+        // rides on used to lose, so it also pins that the key sees the whole value.
+        assertThat(NestKeys.valuesOf(row, List.of("amount")))
+                .isNotEqualTo(NestKeys.valuesOf(Map.of("amount", new BigDecimal("10.51")), List.of("amount")));
+        assertThat(NestKeys.valuesOf(
+                        Map.of("amount", new BigDecimal("1234567890.123456789012345678901234")),
+                        List.of("amount")))
+                .isNotEqualTo(NestKeys.valuesOf(
+                        Map.of("amount", new BigDecimal("1234567890.123456789012345678901235")),
+                        List.of("amount")));
+    }
+
+    @Test
+    void anExactDecimalAndAWholeNumberAreStillTwoKeys() {
+        Map<String, Object> decimal = Map.of("amount", new BigDecimal("1.0"));
+        Map<String, Object> whole = Map.of("amount", 1L);
+
+        // Normalizing the scale is not coercion between kinds. The state layer names a decimal and a
+        // whole number with different letters on purpose, and merging them here would file two keys it
+        // tells apart under one name.
+        assertThat(NestKeys.valuesOf(decimal, List.of("amount")))
+                .isNotEqualTo(NestKeys.valuesOf(whole, List.of("amount")));
     }
 }
