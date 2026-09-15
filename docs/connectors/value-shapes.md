@@ -59,6 +59,19 @@ The limits that remain come from the portable value the connector returns:
   negative zero have no exact decimal form at all, so the exactness above does not reach them: each
   keeps the double the connector's own conversion produced. Ordinary finite values - every value a
   column of money or quantity holds - are unaffected.
+- **An exact decimal is matched as the number it is.** A `Decimal128` column used to key an embedded
+  document does so as its exact value: two spellings of one number - `NumberDecimal("10.50")` and
+  `NumberDecimal("10.5")` - are one key, and a decimal key no longer lands on the same key as a plain
+  `DOUBLE` column in another source the way the rounded value did. An upgrade consequence follows from
+  the same change: a pipeline already running with a nest or a join keyed on such a column files its
+  state under a new name from the first change after the upgrade, so what it assembled before is not
+  found again. Recreate such a pipeline rather than upgrading it in place.
+- **A `js` transform reads an exact decimal as an object, not as a number.** `r.after.amount * 1.1`
+  is `NaN` there and `r.after.amount > 100` is `false`, with nothing thrown and nothing logged. This
+  is how every exact decimal column has always reached a script - a relational `NUMERIC` one
+  included - and a `Decimal128` column now reaches it the same way instead of as a rounded double.
+  The `filter` and `map` ports are unaffected: they refuse arithmetic on a decimal while the pipeline
+  is being validated, rather than answering something wrong at run time.
 - **A BSON timestamp's counter is not represented.** Its seconds field reads as the corresponding
   instant, but the per-second ordering counter has no counterpart in the portable date-time value and
   is not carried. A BSON timestamp is an internal replication type and is rare in application data;
