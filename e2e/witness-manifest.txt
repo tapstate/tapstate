@@ -84,6 +84,8 @@ one-select-covers-the-snapshot-and-the-changes-after-it on IN_PROCESS
 one-select-covers-the-snapshot-and-the-changes-after-it on REAL_PROCESS
 real-mysql-rows-cross-to-a-real-mongo-target on IN_PROCESS
 real-mysql-rows-cross-to-a-real-mongo-target on REAL_PROCESS
+rows-confirmed-by-a-target-are-counted-where-they-landed on IN_PROCESS
+rows-confirmed-by-a-target-are-counted-where-they-landed on REAL_PROCESS
 rows-cross-from-a-source-file-to-a-target-file on IN_PROCESS
 rows-cross-from-a-source-file-to-a-target-file on REAL_PROCESS
 the-golden-path-two-engines-become-one-object on IN_PROCESS
