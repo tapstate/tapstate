@@ -187,12 +187,16 @@ final class ServerBinding {
 
     /**
      * Signs in through the same service every other sign-in uses, registers the context when it is new
-     * and the sign-in succeeded, and only then binds the directory. {@code justStarted} says the server
-     * is a stack that came up a moment ago: its bootstrap creates the admin right after the server first
-     * answers, so a refused login there is retried for as long as the stack was given to answer at all -
-     * and once signed in, the binding waits for the stack's boot-time sweep to register the bundled
-     * connectors, so the first {@code up} never lands in the seconds between the server listening and
-     * them existing.
+     * and the sign-in succeeded, and only then binds the directory. Both refusals name what the person
+     * already has - the principal, or the server - and never the context: until the sign-in succeeds
+     * that name is settled but unwritten, so a remedy addressed to it would look for a context no
+     * later command can find.
+     *
+     * <p>{@code justStarted} says the server is a stack that came up a moment ago: its bootstrap
+     * creates the admin right after the server first answers, so a refused login there is retried for
+     * as long as the stack was given to answer at all - and once signed in, the binding waits for the
+     * stack's boot-time sweep to register the bundled connectors, so the first {@code up} never lands
+     * in the seconds between the server listening and them existing.
      */
     private void signInAndBind(Path workspace, URI server, Credentials credentials, boolean justStarted, String user)
             throws IOException {
@@ -225,7 +229,7 @@ final class ServerBinding {
                         Map.of("code", rejected.code(), "principal", rejected.principal()), null);
             }
             case AuthService.LoginResult.Unreachable ignored -> throw new TapstateException(
-                    CliError.AUTH_LOGIN_UNREACHABLE, Map.of("context", name), null);
+                    CliError.SIGN_IN_UNUSABLE, Map.of("server", server.toString()), null);
         }
         // the binding is keyed by the directory's real path, so the directory has to be there first
         Files.createDirectories(workspace);

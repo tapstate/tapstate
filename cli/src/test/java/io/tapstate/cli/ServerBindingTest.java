@@ -16,6 +16,7 @@ import java.util.function.UnaryOperator;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.entry;
 
 /**
  * Binding a workspace to a server: the question, the sign-in that makes the answer usable, the local
@@ -130,6 +131,26 @@ class ServerBindingTest {
         assertThat(manager(home).suggestions())
                 .as("a server nobody ever signed in to is not one this machine knows about")
                 .isEmpty();
+    }
+
+    @Test
+    void aSignInWithoutAUsableSessionNamesTheServerAndRegistersNothing(@TempDir Path home, @TempDir Path ws) {
+        // An older server: it answers the probe and takes the password, but hands back nothing that can
+        // be kept. A server that cannot be reached for the login at all arrives in the same branch.
+        Fakes fakes = new Fakes(true);
+        fakes.probe.loginOutcome = new LoginOutcome.Success("access-only");
+
+        assertThatThrownBy(() -> binding(home, null, fakes, PASSWORD_IN_ENV)
+                .bind(ws, URI.create("https://example:9999"), false, "u"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.SIGN_IN_UNUSABLE))
+                .satisfies(e -> assertThat(((TapstateException) e).args())
+                        .as("the refusal names the server that was typed, not a context nothing wrote")
+                        .containsExactly(entry("server", "https://example:9999")));
+        assertThat(manager(home).suggestions())
+                .as("so there is nothing here for a remedy to be addressed to")
+                .isEmpty();
+        assertThat(manager(home).contextBoundExactlyTo(ws)).isEmpty();
     }
 
     @Test

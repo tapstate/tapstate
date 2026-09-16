@@ -144,6 +144,9 @@ cli.server-not-named:
 cli.password-required:
   message: "Signing in to {server} needs a password, and there is nothing to ask."
   solution: "Set {variable} in the environment, or pass --server for a server you are already signed in to."
+cli.sign-in-unusable:
+  message: "Signing in to {server} did not return a usable persistent session."
+  solution: "Check the server connection and compatibility, then run `tapstate up` again."
 cli.request-timed-out:
   message: "The request to {server} timed out before the server answered."
   solution: "The server may be busy or the upload large. It may have completed there anyway — re-running a register is safe (it is idempotent). Wait and retry, or check the server logs."
