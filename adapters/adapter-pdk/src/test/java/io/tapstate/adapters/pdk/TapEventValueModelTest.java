@@ -712,6 +712,29 @@ class TapEventValueModelTest {
                 .isEqualTo(2);
     }
 
+    @Test
+    void anArrayOfValuesNoConversionIsRegisteredForTakesNoReadingAtAll() {
+        // Only a class the connector registered a conversion for can ever be in the reading, so an
+        // element of any other kind is answered without taking one. This is the ordinary array - plain
+        // text, numbers - and it asks on every element, the schema naming no place that reaches one.
+        // Answering those off the reading instead would walk the whole change a second time to be told
+        // nothing, on the hottest path this adapter has.
+        CountingCodecs codecs = countingCodecs();
+
+        Envelope decoded = insert(
+                row("stamp", new DriverStamp(7), "tags", List.of("red", "blue"), "sizes", List.of(1, 2)),
+                codecs,
+                Map.of("stamp", "STAMP", "tags", "ARRAY", "sizes", "ARRAY"));
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(decoded, codecs)).getAfter())
+                .as("the arrays decode as they always did, which is what makes the count below mean anything")
+                .containsEntry("tags", List.of("red", "blue"))
+                .containsEntry("sizes", List.of(1L, 2L));
+        assertThat(codecs.lookupsOf(DriverStamp.class))
+                .as("the walk's own lookup, with no reading taken on top of it")
+                .isEqualTo(1);
+    }
+
     /**
      * The same registrations the cases above run against, counting what the decode asks it - which is
      * the one thing that says how many times a row was walked, since a walk cannot reach a value
