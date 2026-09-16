@@ -588,6 +588,46 @@ class TapEventValueModelTest {
     }
 
     @Test
+    void oneCollectionLandsBothWaysWhereTheColumnThatNamesTheTypeIsNullable() {
+        // One schema, one collection, two documents that differ only in whether the nullable column
+        // naming this driver type is populated. The reading is taken off the document's own values, so
+        // the one that carries the name restores its array and the one that does not leaves its
+        // elements portable: the same collection landing both ways, in the same run and the same
+        // pipeline. That is the ordinary case rather than a corner of it - a nullable column of a
+        // driver type is ordinary - so it is pinned here rather than left to be discovered in a target.
+        //
+        // Pinned rather than closed, because no reading of the schema alone can do better. A field map
+        // says what a column is called and never which driver class that name belongs to; the registry
+        // is keyed by class and carries no name. Only a value ties the two together, so the tie cannot
+        // be worked out per table before the values arrive.
+        //
+        // Carrying the tie across documents instead - learning it from one and keeping it for the rest
+        // of the table - would trade this for something worse. A document would then decode by what the
+        // stream happened to deliver before it: the same document restored on one run and left portable
+        // on the next after a resume from a different position, a snapshot and its change stream
+        // disagreeing, and values already written to the target unable to be taken back when a second
+        // spelling turned up later and withdrew the name. None of that is visible in the target. Taken
+        // per document, the answer is a function of that document alone - whatever it is, it is the
+        // same every time that document is read, which is the property a reader can act on.
+        DriverKey key = new DriverKey("64f0c0de");
+        Map<String, String> schema = Map.of("cover", KEY_COLUMN, "thumbs", "ARRAY");
+
+        Envelope carried = insert(row("cover", key, "thumbs", List.of(key)), CODECS, schema);
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(carried, CODECS)).getAfter().get("thumbs"))
+                .as("the document that carries the naming column restores its elements")
+                .isEqualTo(List.of(key));
+
+        Map<String, Object> withoutCover = row("thumbs", List.of(key));
+        withoutCover.put("cover", null);
+        Envelope nulled = insert(withoutCover, CODECS, schema);
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(nulled, CODECS)).getAfter().get("thumbs"))
+                .as("the same array in the same collection, portable where that column is null")
+                .isEqualTo(List.of("64f0c0de"));
+    }
+
+    @Test
     void aRowTheSchemaNamesThroughoutIsNotWalkedASecondTime() {
         // What this source calls a driver type is only ever asked for where the schema names no place,
         // so a row it names throughout has no use for the answer - and that is most rows on the hottest
