@@ -180,6 +180,20 @@ fi
 has "the release pins its own commit"     version 'git/refs'
 has "and pins every satellite"            version 'satellites[.]sh branch'
 has "and asks the documentation site"     version 'docs-release[.]sh open'
+# The gate writes the follow-ups it let past to a file and the request reads it, in two steps of this
+# job, and the end of the release does the same thing again in another. Nothing anywhere fails if the
+# two names stop matching: the gate writes its file, the request finds none, and the issue goes out
+# with no section -- which is character-for-character what "nothing is outstanding" looks like. So
+# what is pinned is that each job names one path twice.
+for j in version satellites; do
+  n="$(job "$j" | grep -cF 'RUNNER_TEMP/docs-open.tsv')"
+  if [ "$n" = 2 ]; then
+    ok "the follow-ups written in '$j' are read in '$j'"
+  else
+    bad "the follow-ups written in '$j' are read in '$j'" \
+        "wanted the same path named twice (written, then carried into the issue), got $n"
+  fi
+done
 has "and refuses a branch that exists"    version 'already exists'
 
 # Gate 2 is the only one of the six with no step of its own: it is the smokes in `cli-native`, and it

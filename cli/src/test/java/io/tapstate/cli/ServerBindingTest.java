@@ -13,9 +13,11 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.util.List;
 import java.util.function.UnaryOperator;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.entry;
 
 /**
  * Binding a workspace to a server: the question, the sign-in that makes the answer usable, the local
@@ -89,6 +91,17 @@ class ServerBindingTest {
         return AuthFileStore.underHome(home).load(definition.authRef(), definition.id()).isPresent();
     }
 
+    /** Every session saved under {@code home}, whichever identity addresses it. */
+    private static List<Path> savedSessions(Path home) throws IOException {
+        Path authDir = home.resolve(".tapstate/auth");
+        if (!Files.isDirectory(authDir)) {
+            return List.of();
+        }
+        try (Stream<Path> entries = Files.list(authDir)) {
+            return entries.filter(entry -> entry.getFileName().toString().endsWith(".json")).toList();
+        }
+    }
+
     // ---- a server already listening on the default ------------------------------------------------
 
     @Test
@@ -127,6 +140,29 @@ class ServerBindingTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.AUTH_LOGIN_REJECTED));
         assertThat(manager(home).contextBoundExactlyTo(ws)).isEmpty();
+        assertThat(manager(home).suggestions())
+                .as("a server nobody ever signed in to is not one this machine knows about")
+                .isEmpty();
+    }
+
+    @Test
+    void aSignInWithoutAUsableSessionNamesTheServerAndRegistersNothing(@TempDir Path home, @TempDir Path ws) {
+        // An older server: it answers the probe and takes the password, but hands back nothing that can
+        // be kept. A server that cannot be reached for the login at all arrives in the same branch.
+        Fakes fakes = new Fakes(true);
+        fakes.probe.loginOutcome = new LoginOutcome.Success("access-only");
+
+        assertThatThrownBy(() -> binding(home, null, fakes, PASSWORD_IN_ENV)
+                .bind(ws, URI.create("https://example:9999"), false, "u"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.SIGN_IN_UNUSABLE))
+                .satisfies(e -> assertThat(((TapstateException) e).args())
+                        .as("the refusal names the server that was typed, not a context nothing wrote")
+                        .containsExactly(entry("server", "https://example:9999")));
+        assertThat(manager(home).suggestions())
+                .as("so there is nothing here for a remedy to be addressed to")
+                .isEmpty();
+        assertThat(manager(home).contextBoundExactlyTo(ws)).isEmpty();
     }
 
     @Test
@@ -149,6 +185,33 @@ class ServerBindingTest {
         assertThat(manager(home).contextBoundExactlyTo(ws)).contains("local-2");
         assertThat(ContextConfigStore.underHome(home).load().contexts().get("local-2").seeds())
                 .containsExactly(DEFAULT_SERVER);
+    }
+
+    @Test
+    void aNameTakenWhileTheSignInWasInFlightLeavesNoSessionBehind(@TempDir Path home, @TempDir Path ws)
+            throws IOException {
+        // The name is settled from a snapshot read before the login and reserves nothing, so the window
+        // it is free in now spans the whole sign-in. Another run registering `local` inside that window
+        // is what this stands in for: the session has been saved by then, under an identity that was
+        // about to be written and now never will be.
+        Fakes fakes = new Fakes(true);
+        fakes.probe.duringLogin = () ->
+                manager(home).create("local", List.of(URI.create("http://other.example:8080")), true);
+
+        assertThatThrownBy(() -> binding(home, new ScriptedPrompter("", "", "pw"), fakes).bind(ws, null, false, null))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code())
+                        .as("the refusal names what actually took the name")
+                        .isEqualTo(CliError.CONTEXT_ALREADY_EXISTS));
+        assertThat(savedSessions(home))
+                .as("nothing is left addressed by an identity that was never stored")
+                .isEmpty();
+        assertThat(manager(home).contextBoundExactlyTo(ws)).isEmpty();
+        assertThat(manager(home).suggestions()).extracting(ContextManager.ContextChoice::name)
+                .as("and the context the other run registered is exactly as it left it")
+                .containsExactly("local");
+        assertThat(ContextConfigStore.underHome(home).load().contexts().get("local").seeds())
+                .containsExactly(URI.create("http://other.example:8080"));
     }
 
     @Test

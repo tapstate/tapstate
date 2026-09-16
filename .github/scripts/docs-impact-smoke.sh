@@ -95,6 +95,14 @@ refute "the spurious-label refusal does not ask for the label"     "no \`docs-ne
 
 # Bots do not get the template, so a gate that refuses them only teaches people to switch it off.
 expect "a bot author is exempt"                    0 "not asked of"    "$untouched"     "" "dependabot[bot]"
+# The same account under the name the release-time reader gives it. Two callers ask this script the
+# same question about one pull request, and they spell its author differently: only one of them goes
+# through a webhook payload. With one spelling in the predicate, a pull request passed here and was
+# refused by the release.
+expect "and under the name gh gives the same app"  0 "not asked of"    "$untouched"     "" "app/tapstate-catalog-bot"
+# The slash is what the pattern turns on, so a person whose name merely starts with those letters is
+# asked like anybody else. Without this, widening the predicate is a way to stop asking people.
+expect "a person whose name starts with app is not" 1 "answered neither field" "$untouched" "" "appleseed"
 expect "and a human with the same body is not"     1 "answered neither" "$untouched"    "" "someone"
 
 # Labels arrive as a list; the gate must not match a different label that contains the word.
