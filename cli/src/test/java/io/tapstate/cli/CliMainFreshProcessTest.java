@@ -328,22 +328,17 @@ class CliMainFreshProcessTest {
     }
 
     @Test
-    void aPipedSessionYieldsTheStatusOfARefusedLine(@TempDir Path home) throws Exception {
+    void aOneShotCommandYieldsTheStatusOfItsRefusal(@TempDir Path home) throws Exception {
         Path workspace = Files.createDirectory(home.resolve("orders"));
-        // The reported shape: a script pipes its lines in and reads the status the run leaves behind.
-        // `apply` is refused because no context names a server, but the verb is not the point -- any
-        // refused line is. `exit` follows it because that is how a script ends the session, and because
-        // it leaves the refusal somewhere other than the last line, which is the only place a status
-        // read off the end would find it.
-        Path script = Files.writeString(home.resolve("session.txt"), "apply nope\nexit\n");
-
-        ProcessResult result = runCli(home, workspace, Map.of(), script);
+        // Bare launches own the full-screen workbench. Scripts use a one-shot command instead, whose
+        // process status is the result of the command it was given.
+        ProcessResult result = runCli(home, workspace, Map.of(), "apply", "nope");
 
         assertThat(result.stderr())
-                .withFailMessage("the line was not refused, so this is not the reported run: %s", result.stderr())
+                .withFailMessage("the command was not refused, so this is not the reported run: %s", result.stderr())
                 .contains("error: cli.context-required");
         assertThat(result.exitCode())
-                .withFailMessage("a refused line left the session exiting %s: stdout=%s stderr=%s",
+                .withFailMessage("a refused command exited %s: stdout=%s stderr=%s",
                         result.exitCode(), result.stdout(), result.stderr())
                 .isNotZero();
     }
