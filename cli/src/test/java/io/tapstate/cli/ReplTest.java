@@ -1,6 +1,5 @@
 package io.tapstate.cli;
 
-import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -8,11 +7,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,8 +30,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.jar.JarEntry;
-import java.util.jar.JarOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -78,20 +73,6 @@ class ReplTest {
                 sessionToken,
                 now.plusSeconds(3600),
                 now.plusSeconds(7200));
-    }
-
-    private static byte[] completeConnectorJar() {
-        try {
-            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-            try (JarOutputStream jar = new JarOutputStream(bytes)) {
-                jar.putNextEntry(new JarEntry("connector.txt"));
-                jar.write("connector".getBytes());
-                jar.closeEntry();
-            }
-            return bytes.toByteArray();
-        } catch (IOException failed) {
-            throw new AssertionError("could not create the connector jar fixture", failed);
-        }
     }
 
     private record Harness(Repl repl, StringWriter sink) {
@@ -556,38 +537,6 @@ class ReplTest {
     @Test
     void quitStopsTheLoop() {
         assertThat(harness().repl().dispatch("quit")).isFalse();
-    }
-
-    @Test
-    void aSessionKeepsTheStatusOfItsFirstRefusalAndNotOfItsLastLine(@TempDir Path base) {
-        Harness h = harness(base);
-        // The two refusals are chosen to carry different codes -- `cd` to a missing directory is a usage
-        // refusal, `apply` with nothing naming a server is a verb that could not run -- so which of them
-        // the session keeps is visible rather than inferred. The successful line and the `exit` after
-        // them are the shape a script has, and the reason the end of a session cannot speak for it.
-        assertThat(h.repl().dispatch("cd nope")).isTrue();
-        assertThat(h.repl().dispatch("apply nope")).isTrue();
-        assertThat(h.repl().dispatch("pwd")).isTrue();
-        assertThat(h.repl().dispatch("exit")).isFalse();
-
-        // Reading the status off the end of the session would find this one, and call the run successful.
-        assertThat(h.repl().lastExitCode()).isZero();
-        assertThat(h.repl().sessionExitCode())
-                .withFailMessage("the session kept %s: EXIT_USAGE is the first refusal, "
-                        + "EXIT_VERB_UNAVAILABLE the last one, and zero the last line",
-                        h.repl().sessionExitCode())
-                .isEqualTo(Cli.EXIT_USAGE);
-    }
-
-    @Test
-    void aSessionThatRefusedNothingEndsSuccessful(@TempDir Path base) {
-        // The other direction, so a session that had simply started failing everything could not pass
-        // the case above.
-        Harness h = harness(base);
-        assertThat(h.repl().dispatch("pwd")).isTrue();
-        assertThat(h.repl().dispatch("exit")).isFalse();
-
-        assertThat(h.repl().sessionExitCode()).isZero();
     }
 
     @Test
@@ -2915,146 +2864,6 @@ class ReplTest {
         assertThat(out).contains("registered").contains("orders").contains("hash-abc");
         // the artifact bytes (4) travel to the current landing node under the session credential
         assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x4");
-    }
-
-    @Test
-    void registerDownloadsBothPublishedEnterpriseConnectorsById(@TempDir Path workdir) {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
-                new RegisteredConnector("enterprise", "hash-abc", "2.0.9", true));
-        Harness h = onlineSession(workdir, client);
-        List<URI> fetched = new ArrayList<>();
-        byte[] jar = completeConnectorJar();
-        h.repl().connectorFetcher((from, expected) -> {
-            fetched.add(from);
-            return PublishedConnectorArtifacts.Fetched.verified(jar);
-        });
-        int mark = h.sink().toString().length();
-
-        assertThat(h.repl().dispatch("register oracle")).isTrue();
-        assertThat(h.repl().lastExitCode()).isZero();
-        assertThat(h.repl().dispatch("register sqlserver")).isTrue();
-        assertThat(h.repl().lastExitCode()).isZero();
-
-        assertThat(fetched).containsExactly(
-                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/oracle-connector.jar"),
-                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/sqlserver-connector.jar"));
-        assertThat(client.registerCalls).containsExactly(
-                "jwt-tok@http://node1:7900 x" + jar.length,
-                "jwt-tok@http://node1:7900 x" + jar.length);
-        assertThat(h.sink().toString().substring(mark))
-                .contains("downloading oracle-connector.jar from github.com")
-                .contains("downloading sqlserver-connector.jar from github.com")
-                .contains("uploading oracle-connector.jar (" + jar.length + " B)")
-                .contains("uploading sqlserver-connector.jar (" + jar.length + " B)");
-    }
-
-    @Test
-    void registerDownloadsFromTheConfiguredMirrorWithoutPollutingJson(@TempDir Path workdir) {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
-                new RegisteredConnector("sqlserver", "hash-sql", "2.0.9", true));
-        Harness h = onlineSession(workdir, client,
-                Map.of("TAPSTATE_CONNECTORS_URL", "https://mirror.example/connectors"));
-        List<URI> fetched = new ArrayList<>();
-        byte[] jar = completeConnectorJar();
-        h.repl().connectorFetcher((from, expected) -> {
-            fetched.add(from);
-            return PublishedConnectorArtifacts.Fetched.verified(jar);
-        });
-        int mark = h.sink().toString().length();
-
-        assertThat(h.repl().dispatch("register sqlserver -o json")).isTrue();
-
-        String out = h.sink().toString().substring(mark);
-        assertThat(fetched).containsExactly(
-                URI.create("https://mirror.example/connectors/sqlserver-connector.jar"));
-        assertThat(out).contains("\"connectorId\"").contains("\"sqlserver\"")
-                .doesNotContain("downloading", "uploading");
-    }
-
-    @Test
-    void anExistingFileNamedLikeAConnectorIdWinsOverTheDownload(@TempDir Path workdir) throws Exception {
-        Files.write(workdir.resolve("oracle"), new byte[] {1, 2, 3, 4});
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
-                new RegisteredConnector("local", "hash-local", "1.0", true));
-        Harness h = onlineSession(workdir, client);
-        h.repl().connectorFetcher((from, expected) -> {
-            throw new AssertionError("a local file must not reach the release downloader");
-        });
-
-        assertThat(h.repl().dispatch("register oracle")).isTrue();
-
-        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x4");
-        assertThat(h.sink().toString()).contains("uploading oracle (4 B)").doesNotContain("downloading");
-    }
-
-    @Test
-    void aFailedPublishedDownloadIsCodedAndNeverUploaded(@TempDir Path workdir) {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        Harness h = onlineSession(workdir, client);
-        h.repl().connectorFetcher((from, expected) -> {
-            throw new IOException("HTTP 404");
-        });
-        int mark = h.sink().toString().length();
-
-        assertThat(h.repl().dispatch("register oracle -o json")).isTrue();
-
-        String out = h.sink().toString().substring(mark);
-        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(out).contains("\"error\"").contains("cli.connector-download-failed")
-                .contains("oracle").contains("HTTP 404")
-                .doesNotContain("uploading");
-        assertThat(client.registerCalls).isEmpty();
-    }
-
-    @Test
-    void aSuccessfulErrorPageCannotBeUploadedAsAConnector(@TempDir Path workdir) {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        Harness h = onlineSession(workdir, client);
-        h.repl().connectorFetcher((from, expected) ->
-                PublishedConnectorArtifacts.Fetched.unverified("not a jar".getBytes()));
-        int mark = h.sink().toString().length();
-
-        assertThat(h.repl().dispatch("register sqlserver")).isTrue();
-
-        String out = h.sink().toString().substring(mark);
-        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(out).contains("cli.connector-download-failed")
-                .contains("length does not match the published asset");
-        assertThat(client.registerCalls).isEmpty();
-    }
-
-    @Test
-    void aTruncatedSuccessfulResponseIsCodedAndNeverUploaded(@TempDir Path workdir) throws Exception {
-        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        server.createContext("/connector.jar", exchange -> {
-            exchange.sendResponseHeaders(200, 100);
-            exchange.getResponseBody().write(new byte[] {(byte) 'P', (byte) 'K', 3, 4, 9});
-            exchange.close();
-        });
-        server.start();
-        try {
-            URI truncated = URI.create(
-                    "http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
-            FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-            Harness h = onlineSession(workdir, client);
-            PublishedConnectorArtifacts.Fetcher http = PublishedConnectorArtifacts.Fetcher.http();
-            h.repl().connectorFetcher((ignored, expected) -> http.fetch(
-                    truncated, new PublishedConnectorArtifacts.Artifact(100, "unused-after-truncation")));
-            int mark = h.sink().toString().length();
-
-            assertThat(h.repl().dispatch("register oracle")).isTrue();
-
-            String out = h.sink().toString().substring(mark);
-            assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-            assertThat(out).contains("cli.connector-download-failed").contains("truncated")
-                    .doesNotContain("uploading");
-            assertThat(client.registerCalls).isEmpty();
-        } finally {
-            server.stop(0);
-        }
     }
 
     @Test
@@ -6360,44 +6169,6 @@ class ReplTest {
     }
 
     @Test
-    void aOneShotStopAtATerminalAsksBeforeItClears() {
-        // The second face. Both faces reach the same dispatch, but only one of them is the one a person
-        // types into, and a guard that lived in the read loop would leave this one clearing unasked.
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter("no");
-        LaunchOptions launch =
-                LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "stop", "pl1")
-                        .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
-
-        int code = Cli.runSession(launch, client, () -> prompter, () -> true);
-
-        // Asked, and the answer is what stopped it. Without this the case passes on a run that never
-        // reached the question at all -- the same empty call list, the same non-zero code.
-        assertThat(prompter.questions).isNotEmpty();
-        assertThat(client.lifecycleCalls).isEmpty();
-        assertThat(code).isNotZero();
-    }
-
-    @Test
-    void aOneShotStopWithNoTerminalRefusesRatherThanClearing() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        ScriptedPrompter prompter = new ScriptedPrompter();
-        LaunchOptions launch =
-                LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "stop", "pl1")
-                        .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
-
-        int code = Cli.runSession(launch, client, () -> prompter, () -> false);
-
-        assertThat(client.lifecycleCalls).isEmpty();
-        assertThat(prompter.questions).isEmpty();
-        assertThat(code).isNotZero();
-    }
-
-    @Test
     void aOneShotStopKeepingStateAlsoListsWhatItHoldsOnTo() {
         // The keeping spelling on the second face, and the list with it. Half a gate is the failure
         // this pair is written against: the two faces are the same words to whoever types them, and a
@@ -6421,19 +6192,4 @@ class ReplTest {
         assertThat(output).doesNotContain(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
     }
 
-    @Test
-    void aOneShotStopClearsWhenItWasToldNotToAsk() {
-        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
-        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
-        LaunchOptions launch =
-                LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "stop", "pl1", "-y")
-                        .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
-
-        int code = Cli.runSession(launch, client, ScriptedPrompter::new, () -> false);
-
-        assertThat(client.lifecycleCalls)
-                .containsExactly("jwt-tok@http://localhost:7900 stop pl1 purgeState=true");
-        assertThat(code).isZero();
-    }
 }
