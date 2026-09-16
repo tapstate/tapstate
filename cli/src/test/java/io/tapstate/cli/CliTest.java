@@ -229,6 +229,7 @@ class CliTest {
         // selected server. Keeping the choice at the process boundary ensures -c/-u is not silently
         // discarded before session setup (the regression covered by the E2E version check).
         assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("version"))).isTrue();
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("up"))).isFalse();
         assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("-c", "http://node:8080",
                 "version"))).isFalse();
         assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("--context", "dev",
