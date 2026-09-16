@@ -127,6 +127,9 @@ class ServerBindingTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(CliError.AUTH_LOGIN_REJECTED));
         assertThat(manager(home).contextBoundExactlyTo(ws)).isEmpty();
+        assertThat(manager(home).suggestions())
+                .as("a server nobody ever signed in to is not one this machine knows about")
+                .isEmpty();
     }
 
     @Test
