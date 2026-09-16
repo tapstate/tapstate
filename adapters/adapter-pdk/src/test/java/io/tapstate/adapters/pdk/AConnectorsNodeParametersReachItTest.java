@@ -14,16 +14,20 @@ import static org.assertj.core.api.Assertions.assertThat;
  * A connector's spec declares two config forms, not one: the connection form a connection is authored
  * against, and the node form whose settings belong to one use of that connection inside a pipeline.
  * Both are the connector's own declaration, and a connector reads the second off the node config the
- * host hands it — there is no other way in. The host authors one settings map, so the connector's own
- * spec is what says which of those settings belong to the node.
+ * host hands it. The host authors one settings map, so the connector's own spec is what says which of
+ * those settings belong to the node.
  *
- * <p>The witness is MongoDB's {@code preImage} switch, which its spec declares under
- * {@code configOptions.node}. The connector asks its change stream for
- * {@code fullDocumentBeforeChange} only when that switch is on, and a MongoDB delete otherwise carries
- * the document key alone. A view keyed on a field of the document — the ordinary case — then has
- * nothing to build its filter from the first time anything is deleted, and the whole run fails on that
- * one event. Enabling pre-images on the collection does not help: no server-side configuration
- * supplies a before-image the client never asked for.
+ * <p>The witness is MongoDB's {@code preImage4Sink} switch, which its spec declares under
+ * {@code configOptions.node} and which the connector reads as {@code getNodeConfig().get(...)} before
+ * deciding whether to turn pre-images on for the collection it writes. A setting read that way has no
+ * second way in: hand the connector no node config and it is silenced outright, whatever the workspace
+ * wrote. {@code shardCollection} is read the same way.
+ *
+ * <p>A node-form setting the connector instead loads into a config bean is not a witness of this seam,
+ * because the connection config is the whole authored settings map and a bean load takes the matching
+ * property out of it. MongoDB's {@code preImage} is that shape: measured on a real MongoDB source, it
+ * reaches the change stream with this projection and without it alike. Only the settings read off the
+ * node config directly tell the two apart.
  *
  * <p>The seam is {@link PdkConnector#open}, the one place every connector-facing config map is built,
  * so what arrives here is what every discovery, connection test and drive sees.
@@ -32,7 +36,7 @@ class AConnectorsNodeParametersReachItTest {
 
     /**
      * A spec in the shape connectors ship: a connection form, and a node form declaring the switch a
-     * MongoDB source reads its before-image behaviour from.
+     * MongoDB target reads straight off its node config to decide about pre-images.
      */
     private static final String SPEC = """
             {
@@ -46,7 +50,7 @@ class AConnectorsNodeParametersReachItTest {
                 },
                 "node": {
                   "properties": {
-                    "preImage": {"type": "boolean", "x-component": "Switch"}
+                    "preImage4Sink": {"type": "boolean", "x-component": "Switch"}
                   }
                 }
               }
@@ -59,13 +63,13 @@ class AConnectorsNodeParametersReachItTest {
                 List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, SPEC);
         Map<String, Object> settings = new LinkedHashMap<>();
         settings.put("uri", "mongodb://localhost:27017/orders");
-        settings.put("preImage", true);
+        settings.put("preImage4Sink", true);
 
         try (PdkConnector connector = PdkConnector.open("demo", ref, settings)) {
             assertThat(connector.context().getNodeConfig())
                     .as("a connector reads a parameter its spec declares for the node off the node "
                             + "config and nowhere else, so a null one is the setting never arriving")
-                    .containsEntry("preImage", true);
+                    .containsEntry("preImage4Sink", true);
         }
     }
 
@@ -75,7 +79,7 @@ class AConnectorsNodeParametersReachItTest {
                 List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, SPEC);
         Map<String, Object> settings = new LinkedHashMap<>();
         settings.put("uri", "mongodb://localhost:27017/orders");
-        settings.put("preImage", true);
+        settings.put("preImage4Sink", true);
 
         try (PdkConnector connector = PdkConnector.open("demo", ref, settings)) {
             // The node config is what the node form declares, not a second copy of everything: a
