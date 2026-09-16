@@ -62,6 +62,14 @@ public final class SinkProcessor extends AbstractProcessor {
     private final SinkAck sinkAck;
     private final SinkFrontier frontier;
     private final FrontierGauge gauge;
+    private final DeliveryGauge delivery;
+    // What has settled since this processor started, kept here because the readings are cumulative and a
+    // batch only knows its own rows. Keyed by table, then by the source operation within it.
+    private final Map<String, Map<String, Long>> deliveredByTableAndOp = new LinkedHashMap<>();
+    // The newest event time settled per table, epoch milliseconds. Kept beside the counts rather than
+    // derived from them: a count says how much arrived and this says how current it is, and a table that
+    // is being written steadily with hours-old events reads healthy on the first and not on the second.
+    private final Map<String, Long> newestSettledEventTime = new LinkedHashMap<>();
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();
@@ -98,8 +106,14 @@ public final class SinkProcessor extends AbstractProcessor {
 
     SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
             int maxInFlight, int maxBatchSize, FrontierGauge gauge) {
+        this(writer, sinkAck, frontier, maxInFlight, maxBatchSize, gauge, DeliveryGauge.none());
+    }
+
+    SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
+            int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery) {
         this.writer = Objects.requireNonNull(writer, "writer");
         this.gauge = Objects.requireNonNull(gauge, "gauge");
+        this.delivery = Objects.requireNonNull(delivery, "delivery");
         if (maxInFlight < 1) {
             throw new IllegalArgumentException("maxInFlight must be at least 1: " + maxInFlight);
         }
@@ -199,7 +213,10 @@ public final class SinkProcessor extends AbstractProcessor {
             }
             List<ChainEntry> positions = new ArrayList<>(positionsOf(batch));
             positions.addAll(absorbed);
-            inFlight.add(new InFlightBatch(settlementOf(batch), positions));
+            // Tallied while the rows are still here and counted only once the write settles. Holding the
+            // envelopes themselves until then would keep a batch's worth of rows alive for the length of a
+            // write; this keeps one number per table and operation in it instead.
+            inFlight.add(new InFlightBatch(settlementOf(batch), positions, DeliveredRows.of(batch)));
         }
         // A saturated in-flight set leaves the rest of the inbox unread; Jet backpressures upstream
         // until reapSettled frees a slot on a later call.
@@ -308,6 +325,12 @@ public final class SinkProcessor extends AbstractProcessor {
             if (frontier != null) {
                 frontier.settled(batch.positions(), sinkAck);
             }
+            // Counted here and nowhere earlier: this is the first line after the write is known to have
+            // succeeded, which is the boundary the count is defined at. A row counted on hand-off would be
+            // counted again when a failed write was retried, and would already have been counted for a
+            // write that never succeeded at all.
+            batch.delivered().foldInto(deliveredByTableAndOp, newestSettledEventTime);
+            reportDelivered();
             return true;
         });
         if (frontier != null) {
@@ -326,6 +349,15 @@ public final class SinkProcessor extends AbstractProcessor {
     private void reportTrailing() {
         gauge.trailing(frontier.gaps());
         gauge.pinned(frontier.stalls());
+    }
+
+    /** Hands out what has settled so far, both readings from the one set of totals this processor keeps. */
+    private void reportDelivered() {
+        if (deliveredByTableAndOp.isEmpty()) {
+            return;
+        }
+        delivery.delivered(deliveredByTableAndOp);
+        delivery.reached(newestSettledEventTime);
     }
 
     /** What this batch contributes to the frontier, empty when no frontier is tracked. */
@@ -365,8 +397,35 @@ public final class SinkProcessor extends AbstractProcessor {
         }
     }
 
-    /** One outstanding write and what its batch contributes to the frontier once it settles. */
-    private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions) {
+    /** One outstanding write, what its batch contributes to the frontier, and what it delivers. */
+    private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
+            DeliveredRows delivered) {
+    }
+
+    /**
+     * What one batch would add to the delivery totals once it settles: how many rows of each table and
+     * operation it holds, and the newest event time among them per table. Taken when the batch is formed
+     * and applied when the write succeeds, so nothing here depends on the envelopes still being reachable.
+     */
+    private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> newestEventTime) {
+
+        static DeliveredRows of(List<Envelope> batch) {
+            Map<String, Map<String, Long>> rows = new LinkedHashMap<>();
+            Map<String, Long> newest = new LinkedHashMap<>();
+            for (Envelope event : batch) {
+                rows.computeIfAbsent(event.src(), table -> new LinkedHashMap<>())
+                        .merge(event.op().symbol(), 1L, Long::sum);
+                newest.merge(event.src(), event.ts(), Math::max);
+            }
+            return new DeliveredRows(rows, newest);
+        }
+
+        void foldInto(Map<String, Map<String, Long>> totals, Map<String, Long> newestByTable) {
+            rows.forEach((table, byOp) -> byOp.forEach((op, count) ->
+                    totals.computeIfAbsent(table, ignored -> new LinkedHashMap<>())
+                            .merge(op, count, Long::sum)));
+            newestEventTime.forEach((table, ts) -> newestByTable.merge(table, ts, Math::max));
+        }
     }
 
     /**
