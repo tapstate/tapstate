@@ -18,8 +18,11 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 
 import java.time.Instant;
@@ -58,8 +61,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private final SnapshotBuffer snapshotBuffer;
     private final Map<String, List<CaptureRun>> runsByPipeline = new ConcurrentHashMap<>();
 
-    /** What each running pipeline's tables loaded, keyed by pipeline then table; dropped when it stops. */
-    private final Map<String, Map<String, TableSnapshot>> snapshotsByPipeline = new ConcurrentHashMap<>();
+    /** What each running pipeline's load read, keyed by pipeline; dropped when it stops. */
+    private final Map<String, SnapshotReading> snapshotsByPipeline = new ConcurrentHashMap<>();
 
     /**
      * The tables each running pipeline's snapshot covers, per chain; dropped when it stops. Only the
@@ -91,18 +94,27 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         List<CaptureRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
+        // Taken before the first source is opened, because the load is what these totals accumulate from
+        // and its first row is read inside the loop below. Stamping it afterwards would date the whole
+        // load to the moment it ended, and a rate computed across the first two scrapes would divide by a
+        // window that had already closed.
+        Instant loadBegan = Instant.now();
         try {
             for (SourceRef ref : pipeline.sources()) {
                 String sourceId = ref.id();
                 SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-                SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
+                // Read once and used twice: it decides which streams this run reads, and it carries the
+                // row count the last discovery took of each of them. Asking the store again for the second
+                // use would pay for a second read per source on every start.
+                SourceModel discovered = SourceDiscovery.model(storePort, source);
+                SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discovered);
                 CaptureRunSpec spec = deriveSpec(
                         pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref));
                 Map<String, Long> observedSnapshotCounts = new LinkedHashMap<>();
                 CaptureRun run = captureStarter.start(
                         spec, snapshotPassthrough(pipelineId, resolution, observedSnapshotCounts));
                 runs.add(run);
-                recordSnapshot(attributed, sourceId, spec, run, observedSnapshotCounts);
+                recordSnapshot(attributed, sourceId, spec, run, observedSnapshotCounts, discovered);
                 snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
             }
         } catch (RuntimeException | Error failure) {
@@ -116,7 +128,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             throw failure;
         }
         runsByPipeline.put(pipelineId, runs);
-        snapshotsByPipeline.put(pipelineId, keyByTableOrQualifyOnCollision(attributed));
+        snapshotsByPipeline.put(pipelineId, reading(attributed, loadBegan));
         snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
     }
 
@@ -153,7 +165,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             String sourceId,
             CaptureRunSpec spec,
             CaptureRun run,
-            Map<String, Long> observedSnapshotCounts) {
+            Map<String, Long> observedSnapshotCounts,
+            SourceModel discovered) {
         List<String> streams = spec.config().streams();
         if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
             return;
@@ -163,10 +176,66 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             long count = streams.size() == 1
                     ? counts.getOrDefault(table, run.snapshotCount())
                     : counts.getOrDefault(table, 0L);
-            // The total is reported by no source today, so it stays null and the percentage with it -- progress
-            // with no total is honest partial data, never a faked complete load.
-            attributed.add(new AttributedSnapshot(sourceId, table, new TableSnapshot(count, null, null)));
+            Long total = estimatedRows(discovered, table);
+            attributed.add(new AttributedSnapshot(sourceId, table, new TableSnapshot(count, total, share(count, total))));
         }
+    }
+
+    /**
+     * About how many rows {@code table} holds, as the last discovery of this source counted it, or null
+     * where nothing counted it -- a connector that cannot count, a count that was not reached, a model
+     * discovered before counting existed, or no discovered model at all.
+     *
+     * <p>It is an estimate and is treated as one everywhere it goes: it was taken at discovery time and
+     * nothing has maintained it since, so a table that grew while nobody looked reports a load past its own
+     * total. Null is not narrowed to zero on the way through, because a table nothing counted and a table
+     * counted as empty are the two readings a progress figure must never confuse.
+     */
+    private static Long estimatedRows(SourceModel discovered, String table) {
+        if (discovered == null) {
+            return null;
+        }
+        return discovered.tables().stream()
+                .filter(candidate -> candidate.name().equals(table))
+                .findFirst()
+                .map(SourceTable::approximateRowCount)
+                .orElse(null);
+    }
+
+    /**
+     * What share of {@code total} the {@code loaded} rows are, as whole percent, or null where the share is
+     * not a number anybody could act on.
+     *
+     * <p>Two cases have no share rather than a computed one. Without a total there is nothing to take a
+     * share of, which is the read face's standing rule -- progress with no total is honest partial data and
+     * is never dressed up as a complete load. A total of zero is the sharper case: it is kept, because it
+     * is what discovery counted, but a load that read rows out of a table counted as empty says the count
+     * is stale, and no percentage describes that.
+     *
+     * <p>A share past a hundred is reported as a hundred. The load is finished by the time this is asked,
+     * so overshooting a stale estimate means complete, and a progress figure above full is not a state
+     * anything can be in -- publishing one would leave every reader to decide for themselves what it meant.
+     */
+    private static Integer share(long loaded, Long total) {
+        if (total == null || total <= 0L) {
+            return null;
+        }
+        return (int) Math.min(100L, loaded * 100L / total);
+    }
+
+    /**
+     * What {@code attributed} amounts to for the whole pipeline: the per-table loads keyed for the read
+     * face, counted from {@code loadBegan}.
+     *
+     * <p>A pipeline that ran no bounded load reports nothing at all rather than a start with no rows. The
+     * two are not the same claim: one says no load ran, and the other would say a load ran and read
+     * nothing, which is a real and different state that a table entry at zero rows already expresses.
+     */
+    private static SnapshotReading reading(List<AttributedSnapshot> attributed, Instant loadBegan) {
+        if (attributed.isEmpty()) {
+            return SnapshotReading.NONE;
+        }
+        return new SnapshotReading(keyByTableOrQualifyOnCollision(attributed), loadBegan);
     }
 
     /**
@@ -189,8 +258,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     @Override
-    public Map<String, TableSnapshot> snapshotProgress(String pipelineId) {
-        return snapshotsByPipeline.getOrDefault(pipelineId, Map.of());
+    public SnapshotReading snapshotProgress(String pipelineId) {
+        return snapshotsByPipeline.getOrDefault(pipelineId, SnapshotReading.NONE);
     }
 
     /**

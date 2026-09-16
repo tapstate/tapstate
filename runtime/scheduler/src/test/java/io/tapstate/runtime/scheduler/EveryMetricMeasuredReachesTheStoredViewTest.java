@@ -7,6 +7,8 @@ import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -21,6 +23,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.entry;
 
 /**
  * The publisher measures a set of facts and the stored observation carries a flat view of them. This
@@ -36,6 +39,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class EveryMetricMeasuredReachesTheStoredViewTest {
 
     private static final Instant AT = Instant.parse("2026-09-16T12:00:00Z");
+    private static final Instant LOAD_BEGAN = Instant.parse("2026-09-16T11:00:00Z");
 
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final CapturingObservationStore observations = new CapturingObservationStore();
@@ -45,7 +49,7 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
         return new ObservationPublisher(state, observations,
                 id -> OptionalLong.of(128_500L),
                 id -> Map.of("orders", "w7"),
-                id -> Map.of(),
+                id -> loaded(),
                 id -> Map.of("chain-a", 4L),
                 id -> Map.of("nest.orders.doc.$root",
                         new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))),
@@ -58,9 +62,14 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 Clock.fixed(AT, ZoneOffset.UTC));
     }
 
+    /** One table's finished load, with a total, so both of the load's measurements are in play. */
+    private static SnapshotReading loaded() {
+        return new SnapshotReading(Map.of("orders", new TableSnapshot(90_000L, 120_000L, 75)), LOAD_BEGAN);
+    }
+
     @Test
-    @DisplayName("the stored view holds exactly the metrics that were measured")
-    void theFlatViewDropsNothingThatIsMeasuredToday() {
+    @DisplayName("the stored view holds every metric it can carry, and says which face carries the rest")
+    void theFlatViewCarriesAllButTheLoadAndSaysSo() {
         state.create("orders", PipelineState.RUNNING.name(), AT);
         ObservationPublisher publisher = everythingWired();
 
@@ -71,15 +80,24 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                         new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))),
                 Map.of("chain-a", 4L), Map.of("chain-b", 61_000L),
                 Map.of("nest.orders.doc.$root", 3L), Map.of("orders.region", 120L),
-                Map.of("orders.region", 1_000L));
+                Map.of("orders.region", 1_000L), loaded());
         // Every family is actually in play, so this is not an empty set agreeing with an empty set: the
         // count is asserted before the two are compared.
-        assertThat(measured).hasSize(13);
-        assertThat(FlatMetricProjection.of(measured).dropped()).isEmpty();
+        assertThat(measured).hasSize(15);
+        // The load's two measurements are the only ones this face cannot carry, and it says so rather than
+        // letting them go missing. They are not lost with them: the same observation carries the same load
+        // as its own snapshot dataset, asserted below, which is the face this drop points at. Putting them
+        // on this one as well would spell one number two ways in one document.
+        assertThat(FlatMetricProjection.of(measured).dropped()).containsExactlyInAnyOrder(
+                "tapstate.pipeline.snapshot.rows", "tapstate.pipeline.snapshot.rows.total");
 
         Observation published = observations.read("orders").orElseThrow();
-        assertThat(published.metrics().keySet())
-                .containsExactlyInAnyOrderElementsOf(measured.stream().map(MetricFact::name).toList());
+        assertThat(published.metrics().keySet()).containsExactlyInAnyOrderElementsOf(
+                measured.stream().map(MetricFact::name)
+                        .filter(name -> !name.startsWith("tapstate.pipeline.snapshot.rows"))
+                        .toList());
+        assertThat(published.snapshot())
+                .containsOnly(entry("orders", new TableSnapshot(90_000L, 120_000L, 75)));
     }
 
     @Test
@@ -87,7 +105,7 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
     void theUnitTravelsWithTheFactRatherThanTheName() {
         List<MetricFact> measured = everythingWired().facts("orders", PipelineState.RUNNING, AT,
                 Map.of("nest.orders.doc.$root", new NestStateReading(4_000L, 900L, 30L, 210L)),
-                Map.of("chain-a", 4L), Map.of("chain-b", 61_000L), Map.of(), Map.of(), Map.of());
+                Map.of("chain-a", 4L), Map.of("chain-b", 61_000L), Map.of(), Map.of(), Map.of(), loaded());
 
         assertThat(measured).filteredOn(fact -> fact.name().equals("frontierStalledMillis.chain-b"))
                 .singleElement()
@@ -107,7 +125,7 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
 
         List<MetricFact> measured = publisher.facts("orders", PipelineState.RUNNING, AT,
                 Map.of("nest.orders.doc.$root", new NestStateReading(4_000L, 900L, 30L, 210L)),
-                Map.of("chain-a", 4L), Map.of("chain-b", 61_000L), Map.of(), Map.of(), Map.of());
+                Map.of("chain-a", 4L), Map.of("chain-b", 61_000L), Map.of(), Map.of(), Map.of(), loaded());
         // A rate is a difference of values over a difference of these. Points of one pass stamped at
         // different instants would put part of this publisher's own loop into that divisor.
         assertThat(measured).isNotEmpty()

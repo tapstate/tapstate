@@ -11,6 +11,7 @@ import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -370,7 +371,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
 
     private List<MetricFact> facts(CaptureReading captured, DeliveryReading delivered, Instant at) {
         return publisherAt(captured, delivered, at).facts("orders", PipelineState.RUNNING, at,
-                Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
+                Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), SnapshotReading.NONE);
     }
 
     private static FlatMetricProjection projectionOf(List<MetricFact> facts) {
@@ -387,7 +388,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
             CaptureReading captured, DeliveryReading delivered, Instant at) {
         return new ObservationPublisher(state, observations,
                 id -> OptionalLong.of(128_500L),
-                id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),

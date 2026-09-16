@@ -14,6 +14,7 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
@@ -136,6 +137,21 @@ public final class ObservationPublisher {
     private static final String RECORDS_METRIC = "tapstate.pipeline.records";
     private static final String LAG_METRIC = "tapstate.pipeline.lag";
 
+    /**
+     * The bounded load's two measurements, which carry their table as an attribute the way the pair above
+     * do. They are a monitoring backend's view of the same load the observation's own snapshot dataset
+     * describes, taken from the same reading rather than counted a second time -- one account, two
+     * projections, so the two faces cannot come to disagree.
+     *
+     * <p>How far the load got accumulates and about how far it has to go does not, which is why they are a
+     * counter and a gauge and not two of either. The total is what the last discovery of the source
+     * counted: an estimate, never maintained since, and free to be revised downwards by the next
+     * discovery. Declaring it a counter would promise a reader it only ever rises, and the first
+     * re-discovery of a table that shrank would break that promise silently.
+     */
+    private static final String SNAPSHOT_ROWS_METRIC = "tapstate.pipeline.snapshot.rows";
+    private static final String SNAPSHOT_ROWS_TOTAL_METRIC = "tapstate.pipeline.snapshot.rows.total";
+
     private static final String PIPELINE_ID_ATTRIBUTE = "tapstate.pipeline.id";
     private static final String TABLE_ID_ATTRIBUTE = "tapstate.table.id";
     private static final String DIRECTION_ATTRIBUTE = "direction";
@@ -196,7 +212,7 @@ public final class ObservationPublisher {
     private final ObservationStore observations;
     private final Function<String, OptionalLong> recordCounts;
     private final Function<String, Map<String, String>> positions;
-    private final Function<String, Map<String, TableSnapshot>> snapshots;
+    private final Function<String, SnapshotReading> snapshots;
     private final Function<String, Map<String, Long>> frontierGaps;
     private final Function<String, Map<String, NestStateReading>> nestStateReadings;
     private final Function<String, Map<String, Long>> frontierStalls;
@@ -216,25 +232,27 @@ public final class ObservationPublisher {
      * constructor.
      */
     public ObservationPublisher(StateStore state, ObservationStore observations) {
-        this(state, observations, id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of());
+        this(state, observations, id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
+                id -> Map.of());
     }
 
     /** A publisher wired to its metric and position sources but with no snapshot or frontier source. */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions) {
-        this(state, observations, recordCounts, positions, id -> Map.of(), id -> Map.of());
+        this(state, observations, recordCounts, positions, id -> SnapshotReading.NONE, id -> Map.of());
     }
 
     /**
      * A publisher wired to its live run-statistic sources: {@code recordCounts} yields the records a
      * pipeline's live job has driven to its sinks (empty when it has no live job), {@code positions}
      * yields the durable per-table sink-acked source positions (empty when none), and {@code snapshots}
-     * yields the per-table initial-load progress (empty when no table has been loaded). All three are
+     * yields the per-table initial-load progress with the moment the load began (nothing when no load has
+     * run). All three are
      * ports so the scheduler stays clear of the engine, the store and the capture side that back them.
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots) {
+            Function<String, SnapshotReading> snapshots) {
         this(state, observations, recordCounts, positions, snapshots, id -> Map.of(), id -> Map.of());
     }
 
@@ -245,7 +263,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps) {
         this(state, observations, recordCounts, positions, snapshots, frontierGaps, id -> Map.of());
     }
@@ -257,7 +275,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps,
             Function<String, Map<String, NestStateReading>> nestStateReadings) {
         this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
@@ -272,7 +290,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps,
             Function<String, Map<String, NestStateReading>> nestStateReadings,
             NestColdLayerWatch coldLayer) {
@@ -292,7 +310,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps,
             Function<String, Map<String, NestStateReading>> nestStateReadings,
             NestColdLayerWatch coldLayer,
@@ -310,7 +328,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps,
             Function<String, Map<String, NestStateReading>> nestStateReadings,
             NestColdLayerWatch coldLayer,
@@ -333,7 +351,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps,
             Function<String, Map<String, NestStateReading>> nestStateReadings,
             NestColdLayerWatch coldLayer,
@@ -358,7 +376,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps,
             Function<String, Map<String, NestStateReading>> nestStateReadings,
             NestColdLayerWatch coldLayer,
@@ -380,7 +398,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps,
             Function<String, Map<String, NestStateReading>> nestStateReadings,
             NestColdLayerWatch coldLayer,
@@ -403,7 +421,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps,
             Function<String, Map<String, NestStateReading>> nestStateReadings,
             NestColdLayerWatch coldLayer,
@@ -430,7 +448,7 @@ public final class ObservationPublisher {
      */
     public ObservationPublisher(StateStore state, ObservationStore observations,
             Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
-            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, SnapshotReading> snapshots,
             Function<String, Map<String, Long>> frontierGaps,
             Function<String, Map<String, NestStateReading>> nestStateReadings,
             NestColdLayerWatch coldLayer,
@@ -499,12 +517,16 @@ public final class ObservationPublisher {
             // drops what it cannot hold; nothing it drops today, which is what this publisher's own test
             // pins, so that the first metric with dimensions is a decision somebody makes rather than a
             // metric that quietly fails to appear on this face.
+            // Taken once and used twice, like the frontier readings above: the load is published as two
+            // metrics and as the observation's own snapshot dataset, and asking its source again for the
+            // second use would let the two faces of one load describe different passes of it.
+            SnapshotReading loaded = snapshots.apply(pipelineId);
             List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
                     nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                    joinRecomputeExpected.apply(pipelineId));
+                    joinRecomputeExpected.apply(pipelineId), loaded);
             observations.save(new Observation(pipelineId, actual,
                     FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                    snapshots.apply(pipelineId), positions.apply(pipelineId), carried, at));
+                    loaded.byTable(), positions.apply(pipelineId), carried, at));
             // Fed after the observation is written and never before. The observation is the contract and
             // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
             // cost a pipeline the read face that says it is alive at all.
@@ -575,7 +597,8 @@ public final class ObservationPublisher {
      */
     List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
-            Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected) {
+            Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
+            SnapshotReading loaded) {
         List<MetricFact> facts = new ArrayList<>();
         facts.add(readAt("errorCount", "{error}", at, actual == PipelineState.FAILED ? 1L : 0L));
         recordCounts.apply(pipelineId)
@@ -620,6 +643,45 @@ public final class ObservationPublisher {
                 readAt(JOIN_RECOMPUTE_EXPECTED_PREFIX + subject, "{row}", at, rows)));
         movement(pipelineId, at, captures.apply(pipelineId), deliveries.apply(pipelineId))
                 .forEach(facts::add);
+        load(pipelineId, at, loaded).forEach(facts::add);
+        return facts;
+    }
+
+    /**
+     * The facts a pipeline's bounded load makes: how many rows of each table it read, and about how many
+     * each of those tables was last counted to hold. Empty for a pipeline that ran no load, so one reading
+     * a change stream alone is absent rather than present at zero rows.
+     *
+     * <p>Both come from the reading the observation's snapshot dataset is built from, on the same pass, so
+     * a monitoring backend and the read face can never be describing different moments of the same load.
+     *
+     * <p>The total is left out per table rather than for the reading as a whole. A pipeline may read one
+     * table off a connector that can count and another off one that cannot, and a total defaulted for the
+     * second would size an unmeasured table at whatever the default was. Nothing here turns an absent
+     * count into a zero or into the rows already done: both would read as a finished load.
+     */
+    private static List<MetricFact> load(String pipelineId, Instant at, SnapshotReading loaded) {
+        if (loaded == null || loaded.start().isEmpty()) {
+            return List.of();
+        }
+        Instant start = loaded.countingSince();
+        List<MetricPoint> done = new ArrayList<>();
+        List<MetricPoint> expected = new ArrayList<>();
+        loaded.byTable().forEach((table, progress) -> {
+            Map<String, String> attributes =
+                    Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, TABLE_ID_ATTRIBUTE, table);
+            done.add(MetricPoint.accumulated(attributes, start, at, progress.rowsDone()));
+            if (progress.rowsTotal() != null) {
+                expected.add(MetricPoint.reading(attributes, at, progress.rowsTotal()));
+            }
+        });
+        List<MetricFact> facts = new ArrayList<>();
+        if (!done.isEmpty()) {
+            facts.add(new MetricFact(SNAPSHOT_ROWS_METRIC, MetricType.COUNTER, "{row}", done));
+        }
+        if (!expected.isEmpty()) {
+            facts.add(new MetricFact(SNAPSHOT_ROWS_TOTAL_METRIC, MetricType.GAUGE, "{row}", expected));
+        }
         return facts;
     }
 

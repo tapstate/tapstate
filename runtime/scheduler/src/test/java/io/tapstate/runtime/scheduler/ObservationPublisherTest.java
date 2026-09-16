@@ -9,6 +9,7 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
@@ -51,14 +52,14 @@ class ObservationPublisherTest {
     private ObservationPublisher withWatch(
             NestColdLayerAlert alert, Function<String, Map<String, NestStateReading>> readings) {
         return new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), readings,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), readings,
                 new NestColdLayerWatch(new NestColdLayerPressure(0.5, 100), alert));
     }
 
     /** A publisher with nothing wired but the clock it reads the observation time from. */
     private ObservationPublisher withClock(Clock clock) {
         return new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -129,7 +130,7 @@ class ObservationPublisherTest {
     void publishWiresHowFarEachChainsFrontierTrailsIntoTheMetrics() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
                 id -> Map.of("orders", 0L, "order_items", 480L));
 
         wired.publish("orders");
@@ -146,7 +147,7 @@ class ObservationPublisherTest {
     void publishWiresHowLongEachChainHasBeenPinnedIntoTheMetrics() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
                 id -> Map.of("orders", 0L, "order_items", 480L),
                 id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
@@ -169,7 +170,7 @@ class ObservationPublisherTest {
     void theTimePinnedIsAbsentFromTheMetricsWhenNoChainIsPinned() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
                 id -> Map.of("orders", 0L));
 
         wired.publish("orders");
@@ -184,7 +185,7 @@ class ObservationPublisherTest {
     void theFrontierGapIsAbsentFromTheMetricsWhenNoSinkReportsOne() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(
-                state, observations, id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of());
+                state, observations, id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE);
 
         wired.publish("orders");
 
@@ -197,7 +198,7 @@ class ObservationPublisherTest {
     void publishWiresWhatEachNestNamespaceHoldsAndWhatItCostsIntoTheMetrics() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.$root", new NestStateReading(4_000L, 900L, 30L, 210L)));
 
         wired.publish("orders");
@@ -228,7 +229,7 @@ class ObservationPublisherTest {
     void publishWiresHowDeepOneKeysWaitHasEverGotIntoTheMetrics() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.$root",
                         new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.empty())));
 
@@ -249,7 +250,7 @@ class ObservationPublisherTest {
     void publishWiresHowMuchANamespaceHoldsAltogetherBesideWhatIsInMemory() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.$root",
                         new NestStateReading(4_000L, 900L, 30L, 210L, OptionalLong.of(400_000L))));
 
@@ -269,7 +270,7 @@ class ObservationPublisherTest {
     void howMuchANamespaceHoldsAltogetherIsAbsentWhereThereIsNoColdLayerToAsk() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.$root", new NestStateReading(4_000L, 900L, 30L, 210L)));
 
         wired.publish("orders");
@@ -287,7 +288,7 @@ class ObservationPublisherTest {
     void publishWiresHowManyChangesANamespaceCouldNeverPlaceInADocument() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -308,7 +309,7 @@ class ObservationPublisherTest {
     void aNamespaceThatDiscardedNothingReportsNothingRatherThanZero() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.items", new NestStateReading(4_000L, 900L, 30L, 210L)));
 
         wired.publish("orders");
@@ -329,7 +330,7 @@ class ObservationPublisherTest {
         state.seed("orders", PipelineState.RUNNING);
         String subject = "join.orders.widen.index.customers/17";
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -354,7 +355,7 @@ class ObservationPublisherTest {
     void aPipelineWithNoLargeRebuildRunningReportsNeitherNumber() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -439,7 +440,7 @@ class ObservationPublisherTest {
     void theNestStateReadingsAreAbsentFromTheMetricsWhenNoNamespaceReportsAny() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of());
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of());
 
         wired.publish("orders");
 
@@ -492,7 +493,7 @@ class ObservationPublisherTest {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
                 id -> OptionalLong.empty(), id -> Map.of(),
-                id -> Map.of("orders", new TableSnapshot(500L, null, null)));
+                id -> new SnapshotReading(Map.of("orders", new TableSnapshot(500L, null, null)), T0));
 
         wired.publish("orders");
 

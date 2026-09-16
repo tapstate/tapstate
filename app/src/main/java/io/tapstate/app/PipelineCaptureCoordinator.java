@@ -1,9 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.CaptureReading;
-import io.tapstate.core.lifecycle.TableSnapshot;
+import io.tapstate.core.lifecycle.SnapshotReading;
 
-import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -62,15 +61,20 @@ interface PipelineCaptureCoordinator {
     }
 
     /**
-     * How far each of the pipeline's tables got through its initial load, keyed by table, or empty when no
-     * capture is running for it. A coordinator that runs no capture reports none.
+     * How far each of the pipeline's tables got through its initial load, keyed by table, with the moment
+     * that load began; nothing when no capture is running for it. A coordinator that runs no capture
+     * reports nothing.
+     *
+     * <p>The start rides along because the rows are a total and a total without what it accumulates from
+     * cannot be read: a pipeline restarted onto a fresh load and one whose count went backwards are the
+     * same observation otherwise.
      *
      * <p>What this reports is the finished load, not a live position in one: a table's bounded snapshot read
      * drains in one blocking pass, so its row count exists only once that pass returns. Until then the table
      * is simply absent, which the read face publishes as unavailable rather than as a table at zero rows.
      */
-    default Map<String, TableSnapshot> snapshotProgress(String pipelineId) {
-        return Map.of();
+    default SnapshotReading snapshotProgress(String pipelineId) {
+        return SnapshotReading.NONE;
     }
 
     /**
