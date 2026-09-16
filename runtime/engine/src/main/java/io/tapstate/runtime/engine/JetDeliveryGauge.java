@@ -32,8 +32,12 @@ final class JetDeliveryGauge implements DeliveryGauge {
     /** What a per-table newest-settled event time is named, with the table appended. */
     static final String REACHED_PREFIX = "outEventTime.";
 
+    /** What the moment this sink began counting is named. One per sink, with nothing appended. */
+    static final String SINCE_METRIC = "outCountingSince";
+
     private final Map<String, Metric> deliveredByKey = new HashMap<>();
     private final Map<String, Metric> reachedByTable = new HashMap<>();
+    private Metric since;
 
     @Override
     public void delivered(Map<String, Map<String, Long>> rowsByTableAndOp) {
@@ -46,6 +50,14 @@ final class JetDeliveryGauge implements DeliveryGauge {
     public void reached(Map<String, Long> newestEventTimeByTable) {
         newestEventTimeByTable.forEach((table, eventTime) ->
                 reachedByTable.computeIfAbsent(table, JetDeliveryGauge::reachedMetricFor).set(eventTime));
+    }
+
+    @Override
+    public void countingSince(long epochMillis) {
+        if (since == null) {
+            since = Metrics.metric(SINCE_METRIC);
+        }
+        since.set(epochMillis);
     }
 
     /**

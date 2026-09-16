@@ -160,6 +160,36 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         assertThat(delivery.eventTimes).isEmpty();
     }
 
+    @Test
+    void reports_what_the_totals_accumulate_from_every_time_it_reports_them() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        SinkProcessor processor = init(new ImmediateWriter(), delivery);
+
+        pump(processor, row("orders", 1L));
+        pump(processor, row("orders", 2L));
+
+        // One start, published with every reading of the totals rather than once beside them. A running
+        // total is readable only against what it accumulates from, and the two arriving by different
+        // routes is how a consumer comes to hold a total from this execution against a start from the
+        // one before it.
+        assertThat(delivery.starts).hasSameSizeAs(delivery.rows);
+        assertThat(delivery.starts).containsOnly(delivery.starts.get(0));
+        assertThat(delivery.starts.get(0)).isPositive();
+    }
+
+    @Test
+    void does_not_say_what_it_counts_from_before_it_has_counted_anything() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        SinkProcessor processor = init(new ImmediateWriter(), delivery);
+
+        drain(processor);
+
+        // The start travels with the totals, so a sink with no totals publishes neither. A start on its
+        // own would be a stream that exists with nothing in it, which is not the same as a sink that has
+        // not delivered.
+        assertThat(delivery.starts).isEmpty();
+    }
+
     /** A row of {@code table} whose event time is {@code ts}. */
     private static Envelope row(String table, long ts) {
         return Envelope.insert(ts, table, Map.of("id", ts), null);
@@ -200,6 +230,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
     private static final class RecordingDelivery implements DeliveryGauge {
         private final List<Map<String, Map<String, Long>>> rows = new ArrayList<>();
         private final List<Map<String, Long>> eventTimes = new ArrayList<>();
+        private final List<Long> starts = new ArrayList<>();
 
         @Override
         public void delivered(Map<String, Map<String, Long>> rowsByTableAndOp) {
@@ -211,6 +242,11 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         @Override
         public void reached(Map<String, Long> newestEventTimeByTable) {
             eventTimes.add(Map.copyOf(newestEventTimeByTable));
+        }
+
+        @Override
+        public void countingSince(long epochMillis) {
+            starts.add(epochMillis);
         }
 
         Map<String, Map<String, Long>> latestRows() {

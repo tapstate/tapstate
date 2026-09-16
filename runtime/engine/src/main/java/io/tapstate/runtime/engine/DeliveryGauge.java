@@ -36,6 +36,16 @@ interface DeliveryGauge {
     void reached(Map<String, Long> newestEventTimeByTable);
 
     /**
+     * Takes the reading the two above are only readable against: the moment this sink began counting, as
+     * epoch milliseconds. A running total with no start is a stream in which a restart and a decrease are
+     * the same observation, so whoever reads the counts needs to know what they accumulate from — and the
+     * only start that is true of them is the one taken where they are taken. A start read off the job's
+     * submission would outlive the counters: an execution that restarts inside a job resets them and
+     * leaves that start standing, which is the exact shape it was supposed to rule out.
+     */
+    void countingSince(long epochMillis);
+
+    /**
      * A gauge nothing reads, for a sink driven outside a running job. Never a way to opt a real sink out:
      * a delivery no one counts is the state this seam exists to end.
      */
@@ -48,6 +58,10 @@ interface DeliveryGauge {
 
             @Override
             public void reached(Map<String, Long> newestEventTimeByTable) {
+            }
+
+            @Override
+            public void countingSince(long epochMillis) {
             }
         };
     }

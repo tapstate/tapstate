@@ -355,6 +355,30 @@ public final class Engine {
     }
 
     /**
+     * The moment the pipeline's live job began counting what it has delivered, as epoch milliseconds;
+     * empty when it has no live job or nothing has counted yet.
+     *
+     * <p>The <strong>latest</strong> start among its sinks, not the earliest. The counts beside it are
+     * summed across sinks, and a sum is only true of a window every one of its terms was counting through
+     * — so the instant the whole total accumulates from is the one the last sink to start began at. Taking
+     * the earliest would describe the total as covering ground the later sink was not yet counting.
+     */
+    public OptionalLong countingSince(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) {
+            return OptionalLong.empty();
+        }
+        JobMetrics collected = job.getMetrics();
+        OptionalLong latest = OptionalLong.empty();
+        for (Measurement measurement : collected.get(JetDeliveryGauge.SINCE_METRIC)) {
+            latest = latest.isPresent()
+                    ? OptionalLong.of(Math.max(latest.getAsLong(), measurement.value()))
+                    : OptionalLong.of(measurement.value());
+        }
+        return latest;
+    }
+
+    /**
      * The event time of the newest row of each table the pipeline's live job has had confirmed, as epoch
      * milliseconds; empty when it has no live job, and absent for a table with nothing confirmed.
      *

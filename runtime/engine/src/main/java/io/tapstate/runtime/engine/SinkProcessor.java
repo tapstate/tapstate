@@ -92,6 +92,11 @@ public final class SinkProcessor extends AbstractProcessor {
     // before it leaves this processor — see reapSettled and JobFailureRegistry.
     private String pipelineId;
     private JobFailureRegistry failureRegistry;
+    // When this processor began counting, epoch milliseconds. Taken here rather than from the job because
+    // the counters are this processor's: an execution that restarts inside a job builds a new processor
+    // with its totals back at zero, and a start that did not move with them would describe a stream that
+    // no longer exists.
+    private long countingSince;
 
     /** No sink-ack watermark: the order-independent or append-only path (any in-flight bound is allowed). */
     public SinkProcessor(SinkWriter writer, int maxInFlight, int maxBatchSize) {
@@ -186,6 +191,7 @@ public final class SinkProcessor extends AbstractProcessor {
     @Override
     protected void init(Processor.Context context) {
         this.pipelineId = context.jobConfig().getName();
+        this.countingSince = System.currentTimeMillis();
         HazelcastInstance instance = context.hazelcastInstance();
         this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
     }
@@ -358,6 +364,9 @@ public final class SinkProcessor extends AbstractProcessor {
         }
         delivery.delivered(deliveredByTableAndOp);
         delivery.reached(newestSettledEventTime);
+        // Published with them and never alone: a total is readable only against what it accumulates from,
+        // and the two arriving by different routes is how they come to disagree.
+        delivery.countingSince(countingSince);
     }
 
     /** What this batch contributes to the frontier, empty when no frontier is tracked. */
