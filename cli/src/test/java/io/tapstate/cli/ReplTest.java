@@ -120,6 +120,16 @@ class ReplTest {
         return new Harness(new Repl(cl, workdir, controlPlane, prompter, env::get), sink);
     }
 
+    @Test
+    void upHelpIsHandledByTheSessionDispatcher() {
+        Harness h = harness();
+
+        assertThat(Repl.isOnlineVerb("up")).isTrue();
+        assertThat(h.repl().dispatch(List.of("up", "--help"))).isTrue();
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
+        assertThat(h.sink().toString()).contains("Stages, in order: preflight");
+    }
+
     /**
      * A network-free stand-in that answers healthy only for the given base URLs and records probes. The
      * connected verbs return their canned outcome when the target base is healthy and {@link
