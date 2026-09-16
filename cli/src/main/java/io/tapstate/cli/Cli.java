@@ -532,6 +532,13 @@ public final class Cli implements Runnable {
                     && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }
+            // The first `up` establishes a workspace binding, so it needs the same terminal-owned
+            // prompter as the other one-shot flows that may ask a question.
+            if (launch.isOneShot() && !launch.command().isEmpty()
+                    && launch.command().get(0).equals("up")
+                    && System.console() != null) {
+                oneShotPrompter = prompter.get();
+            }
             Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
                     new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
