@@ -628,6 +628,51 @@ class TapEventValueModelTest {
     }
 
     @Test
+    void aLaterUpdateOfOneRowRewritesTheArrayItsSnapshotRestored() {
+        // The same row twice: the snapshot, which carries every column, and a later change that touches
+        // only the array. A change stream reports the key plus what changed, so neither image of that
+        // change holds the column naming this driver type - and the reading is taken off the change, so
+        // there is nothing to take. The elements travel as text, and a write into a keyed target sets
+        // the fields it is given, so that text lands over the values the snapshot already restored. The
+        // write reports success and the target shows the text: the same field is the driver's type
+        // after the snapshot and text after the update, in one table and one run.
+        //
+        // Pinned rather than closed, because the only readings that could answer here are the two the
+        // per-document case above already weighs and rejects. Keeping the tie from an earlier change
+        // makes a row decode by whatever the stream happened to deliver before it, so a resume from
+        // another position silently changes the answer and nothing in the target shows it. Refusing to
+        // write an element the reading cannot name turns a value the target can hold into a dropped
+        // field or a failed row. A visibly wrong type in the target is the better of the three.
+        DriverKey key = new DriverKey("64f0c0de");
+        DriverKey added = new DriverKey("64f0c0df");
+        Map<String, String> schema = Map.of("_id", "STRING", "cover", KEY_COLUMN, "thumbs", "ARRAY");
+
+        Envelope snapshot = TapEventCodec.decodeSnapshotRow(
+                TapInsertRecordEvent.create().table("albums").referenceTime(1000L)
+                        .after(row("_id", "album-1", "cover", key, "thumbs", List.of(key))),
+                CODECS, schema);
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(snapshot, CODECS)).getAfter().get("thumbs"))
+                .as("the snapshot carries the naming column, so the target stores the driver's type")
+                .isEqualTo(List.of(key));
+
+        Envelope update = TapEventCodec.decodeChange(
+                TapUpdateRecordEvent.create().table("albums").referenceTime(2000L)
+                        .before(row("_id", "album-1", "thumbs", List.of(key)))
+                        .after(row("_id", "album-1", "thumbs", List.of(key, added))),
+                CODECS, schema);
+
+        TapUpdateRecordEvent encoded = (TapUpdateRecordEvent) TapEventCodec.encode(update, CODECS);
+
+        assertThat(encoded.getAfter().get("thumbs"))
+                .as("neither image names that type, so the same array is written back as text")
+                .isEqualTo(List.of("64f0c0de", "64f0c0df"));
+        assertThat(encoded.getBefore().get("thumbs"))
+                .as("both halves of the change agree, which is what the one reading over two images buys")
+                .isEqualTo(List.of("64f0c0de"));
+    }
+
+    @Test
     void aRowTheSchemaNamesThroughoutIsNotWalkedASecondTime() {
         // What this source calls a driver type is only ever asked for where the schema names no place,
         // so a row it names throughout has no use for the answer - and that is most rows on the hottest

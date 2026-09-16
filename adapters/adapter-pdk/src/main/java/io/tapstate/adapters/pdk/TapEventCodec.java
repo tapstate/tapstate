@@ -107,6 +107,14 @@ public final class TapEventCodec {
             // type would decode its arrays as the text they travelled as on that side and as the driver's
             // own type on the other - the two halves of one change disagreeing about a value that never
             // changed, with nothing on either side able to see it.
+            //
+            // Both images together is as wide as this goes, and an update is narrower than a row: a
+            // change stream reports the key plus what changed, so one touching only an array names that
+            // driver type nowhere and its elements travel as text - landing, since a keyed write sets
+            // the fields it is given, over values the snapshot of that same row had restored. Known and
+            // pinned rather than closed: widening the reading past the change makes a row decode by
+            // whatever arrived before it, which a resume from another position silently changes, and
+            // refusing the write turns a value the target can hold into a dropped field or a failed row.
             SchemaNames names =
                     SchemaNames.read(codecs, columnTypes, update.getBefore(), update.getAfter());
             return Envelope.update(ts(update), src(update),
