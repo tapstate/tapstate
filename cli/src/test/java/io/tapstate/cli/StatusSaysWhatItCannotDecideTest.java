@@ -38,7 +38,7 @@ class StatusSaysWhatItCannotDecideTest {
 
     @Test
     void nothingMatchedIsNotReportedAsHealthy() {
-        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 1);
+        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 1L);
 
         assertThat(answer.conclusion()).contains("nothing on this checklist matched");
         assertThat(answer.conclusion()).doesNotContainIgnoringCase("healthy");
@@ -47,7 +47,7 @@ class StatusSaysWhatItCannotDecideTest {
 
     @Test
     void itHandsBackEveryReadingItWentThrough() {
-        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 1);
+        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 1L);
 
         // Each of the four faces the checklist consults appears, so a conclusion of "nothing matched" can be
         // checked against what was actually read rather than taken on trust.
@@ -57,12 +57,12 @@ class StatusSaysWhatItCannotDecideTest {
                 "metrics.errorCount = 0",
                 "metrics.recordCount = 128",
                 "metrics.frontierStalledMillis = none above zero",
-                "snapshot = 1 table(s) loading");
+                "snapshot = 1 row(s) loaded");
     }
 
     @Test
     void itAlwaysNamesTheSourcePositionItDoesNotCollect() {
-        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 1);
+        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 1L);
 
         assertThat(answer.cannotSay())
                 .anyMatch(line -> line.contains("whether the source has changes waiting")
@@ -71,7 +71,7 @@ class StatusSaysWhatItCannotDecideTest {
 
     @Test
     void anObservationWithNoTimeOnItIsNamedRatherThanDatedFromHere() {
-        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, null, moving(), 1);
+        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, null, moving(), 1L);
 
         assertThat(answer.readings()).contains("status.observedAt = not known");
         assertThat(answer.cannotSay()).anyMatch(line -> line.contains("how old any of this is"));
@@ -79,7 +79,7 @@ class StatusSaysWhatItCannotDecideTest {
 
     @Test
     void aPausedRunIsToldThatADeadJobWouldNotShowHere() {
-        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "PAUSED", null, null, FRESH, moving(), 0);
+        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "PAUSED", null, null, FRESH, moving(), 0L);
 
         assertThat(answer.cannotSay()).anyMatch(line -> line.contains("paused run's job is still alive"));
     }
@@ -88,7 +88,7 @@ class StatusSaysWhatItCannotDecideTest {
     void aRunningRunIsNotToldAboutThePausedGap() {
         // The mirror of the case above. Without it, a version that printed every limitation on every status
         // would pass that one, and the list would stop being about this pipeline.
-        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 0);
+        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 0L);
 
         assertThat(answer.cannotSay()).noneMatch(line -> line.contains("paused run's job is still alive"));
     }
@@ -100,15 +100,27 @@ class StatusSaysWhatItCannotDecideTest {
         assertThat(answer.readings()).contains("metrics = could not be read", "snapshot = could not be read");
         assertThat(answer.cannotSay())
                 .anyMatch(line -> line.contains("anything the metrics face answers"))
-                .anyMatch(line -> line.contains("whether a table is loading"));
+                .anyMatch(line -> line.contains("how much of the initial load is done"));
         // And it must not have concluded anything about movement from a face it never read: "no records
         // driven" over an unanswered metrics call is a finding invented out of a failed request.
         assertThat(answer.conclusion()).doesNotContain("nothing has moved");
     }
 
     @Test
+    void aSnapshotFaceThatAnsweredStillSaysWhatItCannotMeasure() {
+        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 1L);
+
+        // It reports rows loaded and no total to measure them against, so a load still running and one
+        // that finished hours ago read the same here. Left unsaid, a number beside the word snapshot is
+        // read as progress in flight, which is the reading this whole answer exists to stop.
+        assertThat(answer.cannotSay())
+                .anyMatch(line -> line.contains("whether an initial load is still running")
+                        && line.contains("no total to measure them against"));
+    }
+
+    @Test
     void aNoMatchAnswerNeverComesBackWithAnEmptyCannotSayList() {
-        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 1);
+        StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, moving(), 1L);
 
         assertThat(answer.cannotSay()).isNotEmpty();
     }

@@ -151,7 +151,10 @@ the first one - it names the thing to go and fix.
 Two limits worth knowing before you go looking for a line that is not there. A connector's routine
 progress chatter is deliberately kept out of this tail: it is a bounded window of recent lines, and
 chatter would push the one line you came for out of it (raise the server's log level if you want it).
-And a line a connector writes from a thread of its own making - a reconnect loop, a driver's own
-monitor - reaches the server's console without being filed under any pipeline, because nothing at that
-point can say which run it belonged to. If the tail is quiet, the server's own output is the next place
-to look.
+And a line can still arrive under no pipeline at all. What a connector says through the log it is
+driven with is filed against its pipeline whatever thread writes it - a reconnect loop's error line is
+in the tail. But the connector contract also carries a shared, process-wide channel that names no
+pipeline of its own, and the driver a connector bundles may log through its own logger from a thread of
+its own - a connection-pool monitor, a background reaper. Those reach the server's console filed under
+no pipeline, because at that point nothing can say which run they belonged to. If the tail is quiet,
+the server's own output is the next place to look.

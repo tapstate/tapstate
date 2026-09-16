@@ -98,11 +98,17 @@ final class StatusDiagnosis {
      *                      carried through to the answer rather than treated as an empty face, because
      *                      "nothing is wrong there" and "nobody looked" are the two readings this exists to
      *                      keep apart
-     * @param tablesLoading how many tables the snapshot face reports loading, or null when that face could
-     *                      not be read, for the same reason
+     * @param snapshotRowsLoaded how many rows the snapshot face reports loaded across every table it
+     *                      carries, or null when that face could not be read, for the same reason. Rows
+     *                      rather than tables, and measured rather than assumed: that face holds an entry
+     *                      for every selected table from the moment a run starts and keeps it for the life
+     *                      of the run, so counting its entries answers "how many tables were selected",
+     *                      which is true of a run that has loaded nothing and of one that finished hours
+     *                      ago alike. It reports no total for a table and therefore no completion, so what
+     *                      it can be asked is how much it has loaded, never whether it is still loading
      */
     static Answer of(String pipelineId, String state, String failureCode, String failureMessage,
-            Long observedAgeMillis, MetricsFacts metrics, Integer tablesLoading) {
+            Long observedAgeMillis, MetricsFacts metrics, Long snapshotRowsLoaded) {
         Optional<Answer> early = fromStatusAlone(pipelineId, state, failureCode, observedAgeMillis);
         if (early.isPresent()) {
             return early.get();
@@ -120,8 +126,13 @@ final class StatusDiagnosis {
                     List.of("whether the job itself is still alive: nothing here has seen it die, so the "
                             + "state stays " + lower(state) + " rather than being guessed into a failure"));
         }
-        if (metrics != null && tablesLoading != null
-                && (metrics.recordCount() == null || metrics.recordCount() == 0) && tablesLoading == 0) {
+        if (metrics != null && snapshotRowsLoaded != null && converging(state)
+                && (metrics.recordCount() == null || metrics.recordCount() == 0) && snapshotRowsLoaded == 0) {
+            // Gated on the state for the same reason rule 3 is: both readings this matches on are also
+            // true of every pipeline with no live job. No job is asked for a record count, and the
+            // snapshot face is dropped when a pipeline stops -- so without the gate a run somebody just
+            // stopped, and a bounded run that reached COMPLETED after moving every row, are both told
+            // that nothing has moved and sent to read the logs.
             // This rule deliberately says nothing about a source whose schema was never discovered, which is
             // the shape most likely to be added here by whoever reads it next. Measured, not assumed: such a
             // source is refused before it runs, with its own code naming it, so it never reaches this rule --
@@ -129,13 +140,13 @@ final class StatusDiagnosis {
             // discovery that is not what is wrong. The one shape that starts anyway, a view over literally
             // named tables, does not reach this rule either, and for a worse reason: it moves rows, and the
             // rows are missing every column but the key. No face here can see that, and none pretends to --
-            // records were driven and a table is loading, so the readings this rule matches on are absent.
+            // records were driven and rows were loaded, so the readings this rule matches on are absent.
             // Filed as tapstate/tapstate#407; when it is fixed, that shape joins the refusal above, not this.
             return new Answer(
-                    "nothing has moved: no records driven and no table loading",
+                    "nothing has moved: no records driven and no rows loaded",
                     List.of("metrics.recordCount = "
                                     + (metrics.recordCount() == null ? "not published" : metrics.recordCount()),
-                            "snapshot = no table loading"),
+                            "snapshot = no rows loaded"),
                     "tapstate logs " + pipelineId,
                     List.of("whether the source simply has nothing new: how far the source could be read to "
                             + "is not collected, so an idle source and a read that is stuck look the same "
@@ -151,12 +162,12 @@ final class StatusDiagnosis {
                     "check the target is accepting writes -- the chain is holding changes it cannot confirm",
                     List.of());
         }
-        return nothingMatched(state, observedAgeMillis, metrics, tablesLoading);
+        return nothingMatched(state, observedAgeMillis, metrics, snapshotRowsLoaded);
     }
 
     /** Every reading the checklist went through, plus what these faces structurally cannot answer. */
     private static Answer nothingMatched(
-            String state, Long observedAgeMillis, MetricsFacts metrics, Integer tablesLoading) {
+            String state, Long observedAgeMillis, MetricsFacts metrics, Long snapshotRowsLoaded) {
         List<String> readings = new ArrayList<>();
         readings.add("status.observedAt = "
                 + (observedAgeMillis == null ? "not known" : human(observedAgeMillis) + " ago"));
@@ -170,8 +181,8 @@ final class StatusDiagnosis {
                     + (metrics.recordCount() == null ? "not published" : metrics.recordCount()));
             readings.add("metrics.frontierStalledMillis = none above zero");
         }
-        readings.add("snapshot = " + (tablesLoading == null ? "could not be read"
-                : tablesLoading == 0 ? "no table loading" : tablesLoading + " table(s) loading"));
+        readings.add("snapshot = " + (snapshotRowsLoaded == null ? "could not be read"
+                : snapshotRowsLoaded == 0 ? "no rows loaded" : snapshotRowsLoaded + " row(s) loaded"));
 
         List<String> cannotSay = new ArrayList<>();
         if (observedAgeMillis == null) {
@@ -187,8 +198,13 @@ final class StatusDiagnosis {
         if (metrics == null) {
             cannotSay.add("anything the metrics face answers: it could not be read on this call");
         }
-        if (tablesLoading == null) {
-            cannotSay.add("whether a table is loading: the snapshot face could not be read on this call");
+        if (snapshotRowsLoaded == null) {
+            cannotSay.add("how much of the initial load is done: the snapshot face could not be read on "
+                    + "this call");
+        } else {
+            cannotSay.add("whether an initial load is still running: the snapshot face reports how many "
+                    + "rows each table loaded and no total to measure them against, so a load in flight "
+                    + "and a finished one read the same here");
         }
         return new Answer("nothing on this checklist matched -- here is everything it read", readings, null,
                 cannotSay);

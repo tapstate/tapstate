@@ -1116,7 +1116,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * The metrics decoded from a 200 body's {@code metrics} object, or {@code null} unless the body carries a
      * string id and a metrics object. Each numeric cell is read as a long; the sibling
      * {@code targetAckedPosition} object carries how far the target has confirmed writes, per table, and is
-     * absent until one is acked. Any non-numeric metrics cell is dropped, so a malformed entry never crashes
+     * absent until one is acked -- or, from a server that predates that name, under the older one. Any non-numeric metrics cell is dropped, so a malformed entry never crashes
      * the read. An empty object is a legitimate empty (no source wired yet).
      *
      * <p>{@code positionsNotCollected} is read from the body rather than known here. Which positions this
@@ -1135,7 +1135,13 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 }
             }
             Map<String, String> targetAckedPosition = new LinkedHashMap<>();
-            if (m.get("targetAckedPosition") instanceof Map<?, ?> positions) {
+            // An older server sends the same map under its former name. Read that when the current name is
+            // absent: without it this CLI reports a position that is acked as "nothing acked yet", which is
+            // exactly the "recorded but empty" against "nobody records it" confusion this face was renamed
+            // to end -- and it would report it against a server that is answering perfectly well.
+            Object acked = m.get("targetAckedPosition") instanceof Map<?, ?> current
+                    ? current : m.get("perTableOffset");
+            if (acked instanceof Map<?, ?> positions) {
                 for (Map.Entry<?, ?> e : positions.entrySet()) {
                     if (e.getKey() instanceof String table && e.getValue() instanceof String position) {
                         targetAckedPosition.put(table, position);

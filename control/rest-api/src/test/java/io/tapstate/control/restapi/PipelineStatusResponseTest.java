@@ -52,6 +52,24 @@ class PipelineStatusResponseTest {
     }
 
     @Test
+    void anObservationStampedAheadOfTheServingClockIsNotAnAgeBeforeThePresent() {
+        // Two clocks, not one: a cluster publishes on whichever node converges and answers this read on
+        // whichever node was dialled. A publishing node running 800ms ahead of the serving one makes the
+        // difference negative, and negative is rendered by the reading face as an age before now -- a
+        // pipeline last observed "-800ms ago".
+        PipelineStatus status = new PipelineStatus("orders", PipelineState.RUNNING, null, OBSERVED_AT);
+
+        PipelineStatusResponse response = PipelineStatusResponse.of(status, catalog,
+                Clock.fixed(OBSERVED_AT.minusMillis(800), ZoneOffset.UTC));
+
+        // Floored, not dropped: the reading is still an age and still says this observation is recent. The
+        // direction is the safe one -- a floor can only make a reading look fresher, never stale, so clock
+        // skew never turns into a publisher this product reports as stopped.
+        assertThat(response.observedAgeMillis()).isZero();
+        assertThat(response.observedAt()).isEqualTo(OBSERVED_AT);
+    }
+
+    @Test
     void saysNothingAboutAgeWhenTheObservationTimeIsNotKnown() {
         PipelineStatus status = new PipelineStatus("orders", PipelineState.RUNNING);
 

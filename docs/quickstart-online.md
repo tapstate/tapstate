@@ -637,10 +637,13 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   the permission, the database that is not there -- and that sentence is now written into the tail of
   the pipeline it was driving, alongside the host's own coded failure. Two limits, said plainly: a
   connector's routine progress chatter is kept out of this tail on purpose (it would push the one line
-  you came for out of a bounded window), and a line a connector writes from a thread of its own making,
-  long after the call that started it returned, reaches the server's console without being filed under
-  any pipeline -- nothing can say which run it belonged to. A schema discovery's lines are likewise
-  filed under no pipeline, because any number of pipelines may read the same source.
+  you came for out of a bounded window), and a line that reaches the log by neither of the routes the
+  host attributes -- the contract's shared, process-wide channel, which names no pipeline of its own,
+  and the driver a connector bundles logging from a thread of its own -- reaches the server's console
+  without being filed under any pipeline, because nothing there can say which run it belonged to. What
+  the connector itself writes through the log it was driven with is filed against its pipeline whatever
+  thread writes it. A schema discovery's lines are filed under no pipeline for a different reason:
+  any number of pipelines may read the same source.
 - **The names this face prints are unstable in this preview** — the position's included, not
   only the metrics'. They may be renamed as the model settles, so treat them as something to
   read, not something to build on: a dashboard or an alert wired to these names will need

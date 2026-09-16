@@ -4208,6 +4208,51 @@ class ReplTest {
     }
 
     @Test
+    void statusTakesRowsLoadedOffTheSnapshotFaceRatherThanCountingItsEntries() {
+        // Three tables selected, none of which has loaded a row -- a snapshot pipeline stuck at the start,
+        // which is the situation the "nothing has moved" rule exists for. The face holds an entry for every
+        // selected table from the moment the run starts and keeps it for the life of the run, so counting
+        // its entries answers a different question (how many tables were selected) and never reaches zero
+        // on a pipeline like this one.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 0L));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
+                "orders", new RemoteTableSnapshot(0L, null, null),
+                "items", new RemoteTableSnapshot(0L, null, null),
+                "shipments", new RemoteTableSnapshot(0L, null, null)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("nothing has moved");
+        assertThat(out).contains("read       snapshot = no rows loaded");
+        // And it does not claim a load is in flight. The face reports no total for a table and therefore no
+        // completion, so "loading" is a word it cannot support.
+        assertThat(out).doesNotContain("table(s) loading");
+    }
+
+    @Test
+    void statusCountsWhatTheSnapshotLoadedWhenItHasLoadedSomething() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 0L));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
+                "orders", new RemoteTableSnapshot(900L, null, null),
+                "items", new RemoteTableSnapshot(124L, null, null)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).doesNotContain("nothing has moved");
+        assertThat(out).contains("read       snapshot = 1024 row(s) loaded");
+    }
+
+    @Test
     void statusSaysAFaceWasUnreadRatherThanEmptyWhenItCouldNotBeRead() {
         // The fake answers both supplementary faces with unreachable. "No errors" and "nobody answered"
         // are one word apart on screen, and only one of them is something a reader may act on.

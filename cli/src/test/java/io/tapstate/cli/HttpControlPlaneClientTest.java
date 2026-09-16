@@ -1744,6 +1744,27 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void metricsReadsAnOlderServersNameForTheSamePosition() throws Exception {
+        // A CLI from this line against a server that has not been upgraded yet: it sends the same map under
+        // the name this face used before. Read only under the current name, it comes back empty and the
+        // face prints "nothing acked yet" for a position that is acked -- the "recorded but empty" against
+        // "nobody records it" confusion this rename set out to end, reported against a server that is
+        // answering perfectly well. The sibling fields in this same body already degrade cleanly.
+        HttpServer server = apiServer("/api/pipelines/pl1/metrics", 200,
+                "{\"pipelineId\":\"pl1\",\"metrics\":{\"recordCount\":6},"
+                        + "\"perTableOffset\":{\"orders\":\"w7\"}}",
+                new AtomicReference<>());
+        try {
+            MetricsOutcome outcome = new HttpControlPlaneClient().metrics(baseOf(server), "tok", "pl1");
+            assertThat(outcome).isInstanceOf(MetricsOutcome.Found.class);
+            assertThat(((MetricsOutcome.Found) outcome).targetAckedPosition())
+                    .containsEntry("orders", "w7");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void metricsCarriesTheNamesOfThePositionsTheServerDoesNotCollect() throws Exception {
         // Which positions exist but are not recorded is the server's fact, so it travels on the wire. A
         // CLI holding its own copy would keep printing "not collected" over a server that had started

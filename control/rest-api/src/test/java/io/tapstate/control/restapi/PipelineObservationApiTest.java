@@ -50,6 +50,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.SpringBootConfiguration;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
+import org.springframework.boot.jackson.autoconfigure.JsonMapperBuilderCustomizer;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -358,6 +359,14 @@ class PipelineObservationApiTest {
         }
 
         @Bean
+        JsonMapperBuilderCustomizer strictRequestShape() {
+            // The production customizer itself, not a copy of it. Without it this context binds request
+            // bodies more leniently than the running server does, so every reading it takes of what a
+            // write-back accepts or refuses is a reading of the harness rather than of the product.
+            return new ControlHttpFace().sourceJsonContract();
+        }
+
+        @Bean
         FakeObservationStore observationStore() {
             return new FakeObservationStore();
         }
@@ -547,6 +556,29 @@ class PipelineObservationApiTest {
         // Moved, and reported with no ring coordinate: nothing here observed that token go past.
         assertThat(((Map<?, ?>) chain.get("resumeFrom")).get("token")).isEqualTo("mysql-bin.000001:4");
         assertThat(((Map<?, ?>) chain.get("resumeFrom")).get("epoch")).isNull();
+    }
+
+    @Test
+    void aWriteBackCarryingTheFieldsFormerNameIsRefusedRatherThanIgnored() {
+        // A client that read this document from an older server hands it back carrying the name that
+        // server used. The field is not editable either way, so the only question is whether an edit that
+        // cannot be honoured is refused or dropped in silence -- and a dropped one reads to the caller
+        // exactly like an accepted one.
+        ApiError body = client().put().uri("/api/pipelines/pl1/position")
+                .header("Authorization", "Bearer " + machineToken(Scope.WRITE))
+                .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                .body("{\"chains\":[{\"chainId\":\"shop@mysql-1\","
+                        + "\"resumeFrom\":{\"token\":\"mysql-bin.000001:4\"},"
+                        + "\"sinkAcked\":{\"token\":\"mysql-bin.000009:12\"}}]}")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode().is4xxClientError())
+                            .as("an unknown field is refused, not accepted with that field dropped")
+                            .isTrue();
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body).isNotNull();
+        assertThat(body.code()).isNotBlank();
     }
 
     @Test

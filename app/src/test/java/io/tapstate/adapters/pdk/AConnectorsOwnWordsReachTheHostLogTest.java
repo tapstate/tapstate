@@ -83,6 +83,23 @@ class AConnectorsOwnWordsReachTheHostLogTest {
     }
 
     @Test
+    void aLoweredLineCarriesItsPipelineToo() {
+        // Lowering rather than dropping is only worth anything if the line can be found by turning the
+        // level up. An unattributed line is filtered out of the pipeline's own tail, so a connector author
+        // who raises their connector to debug would reach the host log and still see nothing where they
+        // are looking -- which is the reading this level mapping exists to provide.
+        List<ILoggingEvent> written = captured("io.tapstate.connector.demo", () -> {
+            ConnectorLog log = new ConnectorLog("demo", PIPELINE);
+            log.info("read 1000 rows");
+            log.debug("polling");
+            log.trace("offset advanced");
+        });
+
+        assertThat(written).hasSize(3).allSatisfy(event -> assertThat(event.getMDCPropertyMap())
+                .containsEntry(PipelineAttribution.MDC_KEY, PIPELINE));
+    }
+
+    @Test
     void aLineCarriesThePipelineItsConnectorWasOpenedForWhateverThreadWritesIt() throws Exception {
         AtomicReference<String> onItsOwnThread = new AtomicReference<>();
 

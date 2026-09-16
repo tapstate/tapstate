@@ -65,11 +65,10 @@ final class Repl {
      * Printed under a non-empty metrics read. The metric names are not a compatibility promise in this
      * preview: they may be renamed as the metric model settles, and the read face is where a user decides
      * whether to build on them, so the disclaimer belongs there rather than only in the documentation.
-     */
-    /**
-     * What the names on this face promise, which is nothing yet. Written as "the names above" rather than
-     * "metric names": a position is not a metric, and the narrower wording left the one field on this face
-     * that is not a number outside a disclaimer printed directly underneath it.
+     *
+     * <p>Written as "the names above" rather than "metric names": a position is not a metric, and the
+     * narrower wording left the one field on this face that is not a number outside a disclaimer printed
+     * directly underneath it.
      */
     private static final String METRIC_NAMES_UNSTABLE =
             "(the names above are unstable in this preview and may change)";
@@ -4519,14 +4518,6 @@ final class Repl {
     }
 
     /**
-     * Renders why a pipeline died, for a status read that succeeded and simply reports an unhealthy
-     * pipeline -- distinct from {@link #renderRejection}, which reports that the command itself was
-     * refused. Both arrive as a code plus a rendered message, but this one is not a refusal: it prints to
-     * stdout, without the red {@code error:} banner, so a caller separating the streams (piped or
-     * redirected input, e.g. {@code status pl1 > out.txt 2> err.txt}) can still tell "your command was
-     * refused" from "the pipeline you asked about is dead" by which stream carried it.
-     */
-    /**
      * The one answer, printed under the state: what the checklist concluded, the face and value it read to
      * conclude it, and where to look next.
      *
@@ -4543,7 +4534,7 @@ final class Repl {
                 .fromStatusAlone(id, found.state(), found.failureCode(), found.observedAgeMillis())
                 .orElseGet(() -> StatusDiagnosis.of(id, found.state(), found.failureCode(),
                         found.failureMessage(), found.observedAgeMillis(),
-                        metricsFacts(id), tablesLoading(id)));
+                        metricsFacts(id), snapshotRowsLoaded(id)));
         out.println(Ansi.AUTO.string("@|bold why:|@") + " " + answer.conclusion());
         answer.readings().forEach(reading -> out.println("  read       " + reading));
         if (answer.next() != null) {
@@ -4567,14 +4558,31 @@ final class Repl {
                 : null;
     }
 
-    /** How many tables the snapshot face reports loading, or null when that face did not answer. */
-    private Integer tablesLoading(String id) {
+    /**
+     * How many rows the snapshot face reports loaded across every table it carries, or null when that face
+     * did not answer.
+     *
+     * <p>Rows, not tables. That face holds one entry per selected table from the moment a run starts and
+     * keeps it for the life of the run, so its size answers how many tables were selected -- the same
+     * number for a run that has loaded nothing and for one whose load finished hours ago. It reports no
+     * total for a table either, so it cannot be asked whether a load is still in flight; what it can be
+     * asked is how much has been loaded, which is the reading the checklist actually wants.
+     */
+    private Long snapshotRowsLoaded(String id) {
         return controlPlane.snapshot(session.landingNode(), session.credential(), id)
                         instanceof SnapshotOutcome.Found found
-                ? found.tables().size()
+                ? found.tables().values().stream().mapToLong(RemoteTableSnapshot::rowsDone).sum()
                 : null;
     }
 
+    /**
+     * Renders why a pipeline died, for a status read that succeeded and simply reports an unhealthy
+     * pipeline -- distinct from {@link #renderRejection}, which reports that the command itself was
+     * refused. Both arrive as a code plus a rendered message, but this one is not a refusal: it prints to
+     * stdout, without the red {@code error:} banner, so a caller separating the streams (piped or
+     * redirected input, e.g. {@code status pl1 > out.txt 2> err.txt}) can still tell "your command was
+     * refused" from "the pipeline you asked about is dead" by which stream carried it.
+     */
     private void renderStatusFailure(String code, String message) {
         PrintWriter out = commandLine.getOut();
         if (!code.isBlank()) {

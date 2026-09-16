@@ -19,7 +19,10 @@ import org.slf4j.LoggerFactory;
  * error a reader came for. Lowered rather than dropped: it stays reachable by turning the level up,
  * which is what a connector author debugging their own connector needs, and it is no longer printed
  * straight to the console by the contract's default -- so it goes through the same format, the same
- * redaction and the same attribution as every other line.
+ * redaction and the same attribution as every other line. The lowered levels are attributed for that
+ * reason and not for symmetry: an unattributed line is filtered out of the pipeline's own tail, so
+ * turning the level up would reach the host log and still show the author nothing where they are
+ * looking -- which is the whole of what lowering rather than dropping was for.
  *
  * <p>Each line is filed against the pipeline this connector was opened for, whatever thread writes it --
  * a connector may write from a thread of its own, long after the call that created it returned. A drive
@@ -70,17 +73,17 @@ final class ConnectorLog implements Log {
 
     @Override
     public void debug(String message, Object... params) {
-        host.debug(message, params);
+        attributed(() -> host.debug(message, params));
     }
 
     @Override
     public void info(String message, Object... params) {
-        host.debug(message, params);
+        attributed(() -> host.debug(message, params));
     }
 
     @Override
     public void trace(String message, Object... params) {
-        host.trace(message, params);
+        attributed(() -> host.trace(message, params));
     }
 
     @Override

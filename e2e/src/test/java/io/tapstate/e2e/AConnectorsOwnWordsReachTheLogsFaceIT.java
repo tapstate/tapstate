@@ -76,7 +76,7 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
 
     @Test
     void theConnectorsOwnReasonReachesTheTailOfTheRunItBelongsTo(
-            @TempDir Path refusedSource, @TempDir Path tailSource, @TempDir Path target) {
+            @TempDir Path refusedSource, @TempDir Path tailSource, @TempDir Path target, @TempDir Path jars) {
         FileEndpoints.replaceTable(refusedSource.resolve("orders.csv"), "id,name\n1,one\n");
         FileEndpoints.replaceTable(tailSource.resolve("orders.csv"), "id,name\n2,two\n");
 
@@ -84,7 +84,10 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
                 SharedMongo.replicaSetUrl("connector_words_state"))) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin(USER, PASSWORD);
-            control.registerConnector(E2eConnectorJar.CONNECTOR_ID, read(E2eConnectorJar.buildInto(target)));
+            // The jar goes in a directory of its own, not in the one both pipelines write their rows into:
+            // a file target enumerates what is in its directory, and a case about connector log attribution
+            // must not be the thing that reddens when it starts counting a file it did not put there.
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID, read(E2eConnectorJar.buildInto(jars)));
 
             Map<String, String> resources = new LinkedHashMap<>();
             // The source declares it needs a password and carries none: the shape of a credential that was

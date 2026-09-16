@@ -3,6 +3,7 @@ package io.tapstate.cli;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -41,7 +42,7 @@ class StatusExplainsWhereItIsStuckTest {
     @Test
     void anOldReadingSaysThePublisherMayHaveStopped() {
         StatusDiagnosis.Answer answer =
-                StatusDiagnosis.of(ID, "RUNNING", null, null, LONG_SILENCE, moving(), 0);
+                StatusDiagnosis.of(ID, "RUNNING", null, null, LONG_SILENCE, moving(), 0L);
 
         assertThat(answer.conclusion()).contains("4m12s").contains("publisher may have stopped");
         assertThat(answer.readings()).anyMatch(reading -> reading.startsWith("status.observedAt"));
@@ -51,7 +52,7 @@ class StatusExplainsWhereItIsStuckTest {
     @Test
     void aCodedFailureIsReportedAsTheReasonTheRunDied() {
         StatusDiagnosis.Answer answer = StatusDiagnosis.of(
-                ID, "FAILED", "engine.job-failed", "the job stopped", FRESH, moving(), 0);
+                ID, "FAILED", "engine.job-failed", "the job stopped", FRESH, moving(), 0L);
 
         assertThat(answer.conclusion()).contains("engine.job-failed");
         assertThat(answer.readings()).contains("status.failure = engine.job-failed");
@@ -61,7 +62,7 @@ class StatusExplainsWhereItIsStuckTest {
     @Test
     void errorsCountedAgainstARunningStateSayTheServerKeepsFailingToBringItUp() {
         StatusDiagnosis.Answer answer = StatusDiagnosis.of(
-                ID, "RUNNING", null, null, FRESH, new MetricsFacts(3L, 128L, Map.of()), 0);
+                ID, "RUNNING", null, null, FRESH, new MetricsFacts(3L, 128L, Map.of()), 0L);
 
         // The count rises on any throw from a convergence pass -- a plan that cannot be built throws the
         // same way an unreachable store does -- so the sentence names the symptom and sends the reader to
@@ -75,21 +76,65 @@ class StatusExplainsWhereItIsStuckTest {
     }
 
     @Test
-    void noRecordsAndNoLoadingTableSayNothingHasMoved() {
+    void noRecordsAndNoRowsLoadedSayNothingHasMoved() {
         StatusDiagnosis.Answer answer =
-                StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, new MetricsFacts(0L, 0L, Map.of()), 0);
+                StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, new MetricsFacts(0L, 0L, Map.of()), 0L);
 
         assertThat(answer.conclusion()).contains("nothing has moved");
-        assertThat(answer.readings()).contains("metrics.recordCount = 0", "snapshot = no table loading");
+        assertThat(answer.readings()).contains("metrics.recordCount = 0", "snapshot = no rows loaded");
         // The honest half: this reading cannot separate a stuck read from a source with nothing new, and
         // says so rather than letting the reader assume it did.
         assertThat(answer.cannotSay()).anyMatch(line -> line.contains("how far the source could be read to"));
     }
 
     @Test
+    void aRunWithNoLiveJobIsNotToldThatNothingHasMoved() {
+        // Both readings this rule matches on are also what a pipeline with no live job looks like: nothing
+        // asks a job that is not there for a record count, and the snapshot face is dropped when a run
+        // stops. So the rule is gated on the state, exactly as the error-count rule above it is -- without
+        // that, the two commonest healthy shapes there are, a run somebody stopped on purpose and a
+        // bounded run that finished after moving every row, are both told nothing has moved and sent to
+        // read the logs.
+        for (String atRest : List.of("STOPPED", "COMPLETED", "PAUSED")) {
+            StatusDiagnosis.Answer answer =
+                    StatusDiagnosis.of(ID, atRest, null, null, FRESH, new MetricsFacts(0L, null, Map.of()), 0L);
+
+            assertThat(answer.conclusion())
+                    .as("a pipeline in %s has no live job to have moved anything", atRest)
+                    .doesNotContain("nothing has moved");
+            assertThat(answer.conclusion()).contains("nothing on this checklist matched");
+            assertThat(answer.next())
+                    .as("and it is not sent to the logs to look for a failure nothing has reported")
+                    .isNull();
+        }
+    }
+
+    @Test
+    void aRunningSnapshotThatHasLoadedNothingStillMatches() {
+        // The case the rule exists for, and the one a count of selected tables could never reach: the
+        // snapshot face holds an entry for every selected table from the moment the run starts and keeps
+        // it for the life of the run, so its size is never zero on a snapshot pipeline. What is zero when
+        // nothing has moved is how much it has loaded.
+        StatusDiagnosis.Answer answer =
+                StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, new MetricsFacts(0L, null, Map.of()), 0L);
+
+        assertThat(answer.conclusion()).contains("nothing has moved");
+        assertThat(answer.readings()).contains("metrics.recordCount = not published", "snapshot = no rows loaded");
+    }
+
+    @Test
+    void aSnapshotThatHasLoadedRowsIsNotToldNothingHasMoved() {
+        StatusDiagnosis.Answer answer =
+                StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, new MetricsFacts(0L, 0L, Map.of()), 4_096L);
+
+        assertThat(answer.conclusion()).doesNotContain("nothing has moved");
+        assertThat(answer.readings()).contains("snapshot = 4096 row(s) loaded");
+    }
+
+    @Test
     void aChainThatHasNotAdvancedIsNamedWithHowLongItHasStood() {
         StatusDiagnosis.Answer answer = StatusDiagnosis.of(
-                ID, "RUNNING", null, null, FRESH, new MetricsFacts(0L, 128L, Map.of("orders", 96_000L)), 0);
+                ID, "RUNNING", null, null, FRESH, new MetricsFacts(0L, 128L, Map.of("orders", 96_000L)), 0L);
 
         assertThat(answer.conclusion()).contains("stopped advancing").contains("orders");
         assertThat(answer.readings()).contains("metrics.frontierStalledMillis.orders = 1m36s");
@@ -101,7 +146,7 @@ class StatusExplainsWhereItIsStuckTest {
         // count stopped, no table is loading, a chain is standing still, errors were counted, and the last
         // thing published was a failure. Without an order this prints five paragraphs and answers nothing.
         StatusDiagnosis.Answer answer = StatusDiagnosis.of(ID, "RUNNING", "engine.job-failed",
-                "the job stopped", LONG_SILENCE, new MetricsFacts(7L, 0L, Map.of("orders", 96_000L)), 0);
+                "the job stopped", LONG_SILENCE, new MetricsFacts(7L, 0L, Map.of("orders", 96_000L)), 0L);
 
         assertThat(answer.conclusion()).contains("publisher may have stopped");
         assertThat(answer.conclusion()).doesNotContain("engine.job-failed");
