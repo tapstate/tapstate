@@ -212,7 +212,7 @@ final class ServerBinding {
         switch (result) {
             case AuthService.LoginResult.Success success -> {
                 if (!registration.registered()) {
-                    contexts.register(name, definition);
+                    registerOrSignOut(context, name, definition);
                 }
                 if (justStarted) {
                     stack.awaitConnectors(() -> registeredConnectors(success.session()));
@@ -234,6 +234,32 @@ final class ServerBinding {
         // the binding is keyed by the directory's real path, so the directory has to be there first
         Files.createDirectories(workspace);
         contexts.bind(workspace, name);
+    }
+
+    /**
+     * Writes the context the sign-in just succeeded through, and takes the saved session back out
+     * again when that write cannot happen. The name was settled from a snapshot read before the
+     * login and reserves nothing, so another run can register it while the login is in flight - and
+     * by then a session has been saved, addressed by the identity that was going to be written under
+     * that name. Left behind, that record is one no context names and no later run ever looks up
+     * again, which is the state this whole path exists not to produce; it goes out with the
+     * registration that never landed, and the caller still sees what actually refused the run.
+     *
+     * <p>Only the copy on this machine is removed. Revoking the session on the server would take a
+     * second call that can be refused or go unanswered, and a server that cannot be reached must not
+     * be the reason the unreachable record stays on disk; the session expires there on its own.
+     */
+    private void registerOrSignOut(ResolvedContext.Named context, String name, ContextDefinition definition) {
+        try {
+            contexts.register(name, definition);
+        } catch (RuntimeException unwritten) {
+            try {
+                auth.logout(context, true);
+            } catch (RuntimeException alsoFailed) {
+                unwritten.addSuppressed(alsoFailed);
+            }
+            throw unwritten;
+        }
     }
 
     /**
