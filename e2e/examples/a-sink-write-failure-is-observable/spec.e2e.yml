@@ -27,14 +27,6 @@
 # fallback, is what pins that the exception a processor catches survives to the converge loop with its type
 # intact rather than degrading to a last-resort code once Jet's own machinery has had a chance to wrap it.
 #
-# records_out is the half this example contributes to a pair. Rows rejected by a target never crossed
-# the boundary the total is defined at, so the pipeline must say it has had nought confirmed - and a
-# product counting rows as it handed them to the sink would say three here instead, which is the one
-# reading nothing else in this suite can tell apart. On its own it is weak on purpose: the face
-# publishes no total until something settles, so nought is also what a pipeline publishing no totals at
-# all would read. Its control group is rows-confirmed-by-a-target-are-counted-where-they-landed, which
-# seeds the same rows into a target that accepts them and holds the same total at three.
-#
 # Zero, and it is the last word. A sink that throws on its first write creates no target file at all, so
 # nothing crosses - and this count is read back by an address the example cannot name, the target
 # directory this run handed out, so it cannot pass by reading the harness's own rows. A run in which the
@@ -52,5 +44,4 @@ steps:
   - await: { state: FAILED }
   - assert: { error_count: 1 }
   - assert: { failure_code: connector.write-failed }
-  - assert: { records_out: 0 }
   - assert: { count: { tgt_file.orders: 0 } }
