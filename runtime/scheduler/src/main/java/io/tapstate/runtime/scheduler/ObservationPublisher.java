@@ -1,6 +1,10 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
@@ -14,7 +18,8 @@ import io.tapstate.spi.store.StateStore;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
@@ -357,11 +362,21 @@ public final class ObservationPublisher {
             // and what raised the alarm they are reading would then be different passes of the same run.
             Map<String, Long> gaps = frontierGaps.apply(pipelineId);
             Map<String, Long> pinned = frontierStalls.apply(pipelineId);
+            // One instant for the whole pass, shared by the observation and by every point in it. Asking
+            // the clock again per metric would stamp one pass with a spread of times, and a consumer
+            // computing a rate across two passes would divide by a difference that is partly this
+            // publisher's own loop.
+            Instant at = observedNow();
+            // The stored document carries the flat numeric view of these facts. It is a projection and it
+            // drops what it cannot hold; nothing it drops today, which is what this publisher's own test
+            // pins, so that the first metric with dimensions is a decision somebody makes rather than a
+            // metric that quietly fails to appear on this face.
+            List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
+                    nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
+                    joinRecomputeExpected.apply(pipelineId));
             observations.save(new Observation(pipelineId, actual,
-                    metrics(pipelineId, actual, readings, gaps, pinned, nestDeadLetters.apply(pipelineId),
-                            joinRecomputeDone.apply(pipelineId),
-                            joinRecomputeExpected.apply(pipelineId)),
-                    snapshots.apply(pipelineId), positions.apply(pipelineId), carried, observedNow()));
+                    FlatMetricProjection.of(measured).metrics(),
+                    snapshots.apply(pipelineId), positions.apply(pipelineId), carried, at));
             // Fed after the observation is written and never before. The observation is the contract and
             // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
             // cost a pipeline the read face that says it is alive at all.
@@ -385,8 +400,11 @@ public final class ObservationPublisher {
         PipelineState lastState = previous != null ? previous.state() : PipelineState.NEW;
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
-        observations.save(new Observation(pipelineId, lastState, Map.of("errorCount", consecutiveFailures),
-                null, lastPositions, lastFailure, observedNow()));
+        Instant at = observedNow();
+        observations.save(new Observation(pipelineId, lastState,
+                FlatMetricProjection.of(List.of(readAt("errorCount", "{error}", at, consecutiveFailures)))
+                        .metrics(),
+                null, lastPositions, lastFailure, at));
     }
 
     /**
@@ -400,47 +418,78 @@ public final class ObservationPublisher {
     }
 
     /**
-     * The numeric run statistics for the pipeline: errorCount is derived from the actual state (a FAILED job
-     * is one observable error, else zero) and is always present; recordCount is added from its source only
-     * when a live job reports one, so its absence reads as "not wired" rather than a zero count.
+     * One metric read at {@code at}, with no dimensions broken out of its name. Every statistic this
+     * publisher produces is of that shape today, which is why the helper offers no other.
      */
-    private Map<String, Long> metrics(String pipelineId, PipelineState actual,
+    private static MetricFact readAt(String name, String unit, Instant at, long value) {
+        return MetricFact.single(name, MetricType.GAUGE, unit, MetricPoint.reading(Map.of(), at, value));
+    }
+
+    /**
+     * The run statistics for the pipeline, as the internal facts every metric consumer projects from:
+     * errorCount is derived from the actual state (a FAILED job is one observable error, else zero) and is
+     * always present; recordCount is added from its source only when a live job reports one, so its
+     * absence reads as "not wired" rather than a zero count. Naming each one's unit is the point of
+     * assembling facts rather than bare numbers: a duration published as a number is a duration somebody
+     * eventually thresholds in the wrong unit, and two of these are durations.
+     *
+     * <p><strong>Every fact here is a value read at this tick, and none of them accumulates.</strong>
+     * Several of the underlying quantities do accumulate inside the engine - accesses, backfills, discards,
+     * rows rebuilt - but nothing records what they accumulate from. Declaring them as accumulating without
+     * that start would hand every consumer a stream in which a restart and a decrease are the same
+     * observation; taking the start from this clock would invent one, and it would be wrong from the first
+     * restart onward. So they are readings until the engine reports a start alongside them. That is a gap
+     * in what is measured, and describing them as anything else here would only hide it.
+     *
+     * <p>Each family still carries its one dimension inside its name, appended to a fixed prefix, which is
+     * why every point below is attribute-free. That is what a flat numeric face can carry; the facts exist
+     * first so that changing it has one place to happen instead of one per consumer.
+     */
+    List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
             Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected) {
-        Map<String, Long> metrics = new HashMap<>();
-        metrics.put("errorCount", actual == PipelineState.FAILED ? 1L : 0L);
-        recordCounts.apply(pipelineId).ifPresent(count -> metrics.put("recordCount", count));
-        // One entry per chain that reported a reading, so a chain keeping up and a chain that has stalled
+        List<MetricFact> facts = new ArrayList<>();
+        facts.add(readAt("errorCount", "{error}", at, actual == PipelineState.FAILED ? 1L : 0L));
+        recordCounts.apply(pipelineId)
+                .ifPresent(count -> facts.add(readAt("recordCount", "{record}", at, count)));
+        // One fact per chain that reported a reading, so a chain keeping up and a chain that has stalled
         // stay distinguishable; a chain that reported none is absent rather than zero, which would read as
-        // the healthy end of the same scale.
-        gaps.forEach((chain, gap) -> metrics.put(FRONTIER_GAP_PREFIX + chain, gap));
-        // One entry per chain that is pinned, and none for a chain that is not. The two readings do not
+        // the healthy end of the same scale. The distance is dimensionless: what it counts is a position's
+        // worth of ground, which is neither a row nor a second, and naming it either would be a guess a
+        // reader would then threshold on.
+        gaps.forEach((chain, gap) -> facts.add(readAt(FRONTIER_GAP_PREFIX + chain, "1", at, gap)));
+        // One fact per chain that is pinned, and none for a chain that is not. The two readings do not
         // cover the same chains and neither is the other's default: a chain that caught up has a distance
         // and no pin, and a chain that never advanced has a pin and no distance.
-        pinned.forEach((chain, millis) -> metrics.put(FRONTIER_STALLED_PREFIX + chain, millis));
+        pinned.forEach(
+                (chain, millis) -> facts.add(readAt(FRONTIER_STALLED_PREFIX + chain, "ms", at, millis)));
         // One set per namespace that reported, so a resolver thrashing against its cold layer stays
         // distinguishable from an assembler that is not; a namespace reporting nothing is absent rather
         // than present at zero, which would read as a state layer that had emptied.
         nestReadings.forEach((namespace, reading) -> {
-            metrics.put(NEST_ENTRIES_PREFIX + namespace, reading.entries());
-            metrics.put(NEST_ACCESSES_PREFIX + namespace, reading.accesses());
-            metrics.put(NEST_BACKFILLS_PREFIX + namespace, reading.backfills());
-            metrics.put(NEST_BACKFILL_MILLIS_PREFIX + namespace, reading.backfillMillis());
-            metrics.put(NEST_PENDING_HIGH_WATER_PREFIX + namespace, reading.pendingHighWater());
-            reading.stored().ifPresent(stored -> metrics.put(NEST_STORED_PREFIX + namespace, stored));
+            facts.add(readAt(NEST_ENTRIES_PREFIX + namespace, "{entry}", at, reading.entries()));
+            facts.add(readAt(NEST_ACCESSES_PREFIX + namespace, "{access}", at, reading.accesses()));
+            facts.add(readAt(NEST_BACKFILLS_PREFIX + namespace, "{backfill}", at, reading.backfills()));
+            facts.add(readAt(NEST_BACKFILL_MILLIS_PREFIX + namespace, "ms", at, reading.backfillMillis()));
+            facts.add(readAt(NEST_PENDING_HIGH_WATER_PREFIX + namespace, "{record}", at,
+                    reading.pendingHighWater()));
+            reading.stored().ifPresent(
+                    stored -> facts.add(readAt(NEST_STORED_PREFIX + namespace, "{entry}", at, stored)));
         });
-        // One entry per namespace that discarded something, and none for a namespace that discarded
+        // One fact per namespace that discarded something, and none for a namespace that discarded
         // nothing. The absence is load-bearing here rather than merely tidy: rows that never reach a
         // document leave no other trace, so a reader has only this to go on, and a zero published on every
         // pass is what an unwired count would look like too.
-        discarded.forEach((namespace, count) -> metrics.put(NEST_DEAD_LETTERED_PREFIX + namespace, count));
+        discarded.forEach((namespace, count) -> facts.add(
+                readAt(NEST_DEAD_LETTERED_PREFIX + namespace, "{change}", at, count)));
         // One pair per rebuild large enough to be worth telling anybody about, and nothing at all for a
         // pipeline where none is running. Both halves are published from their own map rather than one
         // being defaulted from the other: a rebuild whose size arrived without its progress would read as
         // one that has sent no rows, which is the shape of a rebuild that is stuck.
-        rebuildDone.forEach((subject, rows) -> metrics.put(JOIN_RECOMPUTE_DONE_PREFIX + subject, rows));
-        rebuildExpected.forEach(
-                (subject, rows) -> metrics.put(JOIN_RECOMPUTE_EXPECTED_PREFIX + subject, rows));
-        return metrics;
+        rebuildDone.forEach((subject, rows) -> facts.add(
+                readAt(JOIN_RECOMPUTE_DONE_PREFIX + subject, "{row}", at, rows)));
+        rebuildExpected.forEach((subject, rows) -> facts.add(
+                readAt(JOIN_RECOMPUTE_EXPECTED_PREFIX + subject, "{row}", at, rows)));
+        return facts;
     }
 }
