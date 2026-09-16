@@ -2250,6 +2250,7 @@ final class Workbench {
                 case WorkbenchOverlayState.Confirm confirm -> confirm.previous();
                 case WorkbenchOverlayState.Login login -> login.previous();
                 case WorkbenchOverlayState.Actions ignored -> Optional.empty();
+                case WorkbenchOverlayState.LogLevel ignored -> Optional.empty();
                 case WorkbenchOverlayState.Help ignored -> Optional.of(new WorkbenchOverlayState.More(2));
                 case WorkbenchOverlayState.More ignored -> Optional.empty();
             };
