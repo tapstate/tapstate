@@ -1,5 +1,8 @@
 package io.tapstate.app;
 
+import java.util.OptionalLong;
+import java.time.Instant;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.runtime.engine.Engine;
@@ -65,7 +68,28 @@ class RuntimeConvergenceConfiguration {
                 // value and half the new one while every other reading on this face says healthy: the job
                 // runs, the queues drain, the error count is zero. Without these two an operator cannot
                 // tell that from a pipeline that has finished, and so cannot tell whether to wait.
-                engine::joinRecomputeDone, engine::joinRecomputeExpected);
+                engine::joinRecomputeDone, engine::joinRecomputeExpected,
+                // How much reached the targets and how current the newest of it is. Composed here from
+                // three readings the engine reports separately because none of them is readable alone: a
+                // running total means nothing without what it counts from, and a count of rows says
+                // nothing about whether they are current -- which is the question a pipeline quietly
+                // falling behind answers with a perfectly healthy count.
+                id -> deliveredBy(engine, id),
+                Clock.systemUTC());
+    }
+
+    /**
+     * What {@code engine}'s live job for {@code pipelineId} reports about rows that reached a target.
+     * A run with no start reported has counted nothing, so it reports nothing rather than totals nobody
+     * could place against a starting point.
+     */
+    private static DeliveryReading deliveredBy(Engine engine, String pipelineId) {
+        OptionalLong since = engine.countingSince(pipelineId);
+        if (since.isEmpty()) {
+            return DeliveryReading.NONE;
+        }
+        return new DeliveryReading(engine.recordsDelivered(pipelineId),
+                engine.newestDeliveredEventTime(pipelineId), Instant.ofEpochMilli(since.getAsLong()));
     }
 
     @Bean

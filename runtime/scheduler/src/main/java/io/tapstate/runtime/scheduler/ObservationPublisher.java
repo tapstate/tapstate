@@ -1,6 +1,8 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
+import io.tapstate.core.lifecycle.FlatReduction;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -120,6 +122,45 @@ public final class ObservationPublisher {
     private static final String JOIN_RECOMPUTE_DONE_PREFIX = "joinRecomputeRowsDone.";
     private static final String JOIN_RECOMPUTE_EXPECTED_PREFIX = "joinRecomputeRowsExpected.";
 
+    /**
+     * The two measurements that carry their dimensions as attributes rather than in their names. Their
+     * names are the canonical ones a monitoring backend sees; how the flat face below spells them is that
+     * face's business and is decided in {@link #FLAT_REDUCTIONS}.
+     */
+    private static final String RECORDS_METRIC = "tapstate.pipeline.records";
+    private static final String LAG_METRIC = "tapstate.pipeline.lag";
+
+    private static final String PIPELINE_ID_ATTRIBUTE = "tapstate.pipeline.id";
+    private static final String TABLE_ID_ATTRIBUTE = "tapstate.table.id";
+    private static final String DIRECTION_ATTRIBUTE = "direction";
+    private static final String OP_ATTRIBUTE = "op";
+    private static final String OUTBOUND = "out";
+
+    /**
+     * How the two dimensioned measurements are spelled on the flat face, which has one name per number and
+     * so cannot hold them as they are. Rows collapse to one key per direction: the whole pipeline's
+     * throughput rather than each table's and each operation's, because this face is read by a person at a
+     * command line and a pipeline over twenty tables would otherwise bury them under two hundred keys
+     * whose names are decided by the data. The distance a pipeline is behind keeps its table, the way the
+     * per-chain readings above already do — there are as many of those as there are tables, and the table
+     * that stopped moving is the one worth seeing on its own.
+     *
+     * <p>Collapsing is not the same as dropping and is recorded separately by the projection, so what a
+     * reader of this face is actually looking at stays answerable.
+     */
+    private static final Map<String, FlatReduction> FLAT_REDUCTIONS = Map.of(
+            RECORDS_METRIC, attributes -> "records." + attributes.get(DIRECTION_ATTRIBUTE),
+            LAG_METRIC, attributes -> "lag." + attributes.get(TABLE_ID_ATTRIBUTE));
+
+    /**
+     * The name the metric contract gives each of this engine's change kinds. Its set is closed at five and
+     * so is the engine's, but they are not the same five: a snapshot read is a source operation the
+     * contract has no name of its own for, so it lands under the name the contract keeps for exactly that
+     * — rather than being given one here, which would be this layer deciding a contract it implements.
+     */
+    private static final Map<String, String> OP_NAMES = Map.of(
+            "i", "insert", "u", "update", "d", "delete", "ddl", "ddl", "r", "other");
+
     private final StateStore state;
     private final ObservationStore observations;
     private final Function<String, OptionalLong> recordCounts;
@@ -131,6 +172,7 @@ public final class ObservationPublisher {
     private final Function<String, Map<String, Long>> nestDeadLetters;
     private final Function<String, Map<String, Long>> joinRecomputeDone;
     private final Function<String, Map<String, Long>> joinRecomputeExpected;
+    private final Function<String, DeliveryReading> deliveries;
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
     private final Clock clock;
@@ -316,6 +358,31 @@ public final class ObservationPublisher {
             Function<String, Map<String, Long>> joinRecomputeDone,
             Function<String, Map<String, Long>> joinRecomputeExpected,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, id -> DeliveryReading.NONE, clock);
+    }
+
+    /**
+     * A publisher also wired to what its sinks have delivered: {@code deliveries} yields the rows each
+     * table has had confirmed by a target, broken out by source operation, the newest event time among
+     * them, and the moment the counting began. The one port carries all three because none is readable
+     * without the others.
+     */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, DeliveryReading> deliveries,
+            Clock clock) {
+        this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.joinRecomputeDone = Objects.requireNonNull(joinRecomputeDone, "joinRecomputeDone");
         this.joinRecomputeExpected =
@@ -375,7 +442,7 @@ public final class ObservationPublisher {
                     nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
                     joinRecomputeExpected.apply(pipelineId));
             observations.save(new Observation(pipelineId, actual,
-                    FlatMetricProjection.of(measured).metrics(),
+                    FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                     snapshots.apply(pipelineId), positions.apply(pipelineId), carried, at));
             // Fed after the observation is written and never before. The observation is the contract and
             // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
@@ -490,6 +557,60 @@ public final class ObservationPublisher {
                 readAt(JOIN_RECOMPUTE_DONE_PREFIX + subject, "{row}", at, rows)));
         rebuildExpected.forEach((subject, rows) -> facts.add(
                 readAt(JOIN_RECOMPUTE_EXPECTED_PREFIX + subject, "{row}", at, rows)));
+        delivered(pipelineId, at, deliveries.apply(pipelineId)).forEach(facts::add);
         return facts;
+    }
+
+    /**
+     * The two facts a run's deliveries make: how many rows of each table and operation reached a target,
+     * and how old the newest row of each table is. Empty for a pipeline whose run reports nothing, so a
+     * pipeline that is not running is absent from both rather than present at zero.
+     */
+    private List<MetricFact> delivered(String pipelineId, Instant at, DeliveryReading reading) {
+        if (reading == null || reading.isEmpty()) {
+            return List.of();
+        }
+        List<MetricFact> facts = new ArrayList<>();
+        // The one measurement here that accumulates, and the first that can: the run reports what its
+        // totals count from, so the stream has the start identity every other family on this face still
+        // lacks. Without it this would have to be a reading like the rest.
+        reading.start().ifPresent(start -> {
+            List<MetricPoint> rows = new ArrayList<>();
+            reading.rowsByTableAndOp().forEach((table, byOp) -> byOp.forEach((symbol, count) ->
+                    rows.add(MetricPoint.accumulated(Map.of(
+                            PIPELINE_ID_ATTRIBUTE, pipelineId,
+                            TABLE_ID_ATTRIBUTE, table,
+                            DIRECTION_ATTRIBUTE, OUTBOUND,
+                            OP_ATTRIBUTE, OP_NAMES.getOrDefault(symbol, "other")),
+                            start, at, count))));
+            if (!rows.isEmpty()) {
+                facts.add(new MetricFact(RECORDS_METRIC, MetricType.COUNTER, "{record}", rows));
+            }
+        });
+        List<MetricPoint> ages = new ArrayList<>();
+        reading.newestEventTimeByTable().forEach((table, eventTime) -> ages.add(MetricPoint.reading(
+                Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, TABLE_ID_ATTRIBUTE, table),
+                at, ageInSeconds(at, eventTime))));
+        if (!ages.isEmpty()) {
+            facts.add(new MetricFact(LAG_METRIC, MetricType.GAUGE, "s", ages));
+        }
+        return facts;
+    }
+
+    /**
+     * How old {@code eventTimeMillis} is at {@code at}, in whole seconds. Worked out here and not in the
+     * run, because it goes on growing while nothing arrives: a distance recorded where the row settled
+     * would stand still for exactly as long as a pipeline did, and read as healthy throughout.
+     *
+     * <p><strong>This is the age of the last row that landed, which is not how far the source is ahead.</strong>
+     * A source with nothing new to send drives this up while the pipeline is perfectly caught up, and
+     * telling the two apart needs something nobody here has: where the source's own log now ends.
+     *
+     * <p>A source clock running ahead of ours reads as nought rather than as a negative age. An age below
+     * zero is not a state anything can be in, and publishing one would have every reader decide for
+     * themselves what it meant.
+     */
+    private static long ageInSeconds(Instant at, long eventTimeMillis) {
+        return Math.max(0L, (at.toEpochMilli() - eventTimeMillis) / 1000L);
     }
 }
