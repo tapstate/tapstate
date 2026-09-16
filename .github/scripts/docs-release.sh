@@ -2,8 +2,9 @@
 #
 # The documentation site's part in a release, which is coordinated rather than pinned.
 #
-#   docs-release.sh open <version>                          ask for the site to be published
-#   docs-release.sh settle <version> --notes-url <url>      after publishing: tag it, or ask again
+#   docs-release.sh open <version> [--followups <path>]     ask for the site to be published
+#   docs-release.sh settle <version> --notes-url <url> [--followups <path>]
+#                                                           after publishing: tag it, or ask again
 #   docs-release.sh retire <version>                        the attempt is over: withdraw the request
 #
 # Why this repository is not on the satellite list. The site is built by Netlify from two branches:
@@ -39,6 +40,18 @@
 # treated as "not done" rather than guessed at: asking twice costs a notification, tagging the wrong
 # thing costs a published site.
 #
+# What --followups carries. The release-time documentation gate refuses a major over a page follow-up
+# that is still open here, and lets a minor or a patch through: a release below major is not held for
+# an issue somebody else has to close. "Let through" has to reach that somebody, or it is only
+# "unnoticed" -- so the gate writes the still-open ones to a file and this lists them in whichever
+# issue it is opening. At `open` that is the request itself; at `settle` it is the second issue when
+# the first was not finished, and a comment on the first when it was. The list `settle` carries comes
+# from a second scan rather than from what the release found when it started, because the whole
+# stretch between those two moments is time the documentation owner may have spent closing them.
+#
+# An absent or empty file writes nothing at all. "Nothing is outstanding" and "nobody looked" must
+# not render as the same paragraph.
+#
 # DOCS_OWNER names who is asked. Its default is also written into docs-followup.yml, which assigns
 # the same person; the two are twins and have to move together. Neither is the ledger for who holds
 # the role -- that is the repository's CODEOWNERS -- and pointing both at it is worth doing the day
@@ -56,12 +69,14 @@ esac
 repo="${DOCS_REPO:-tapstate/docs}"
 owner="${DOCS_OWNER:-heywalter}"
 notes_url=""
+followups=""
 plan=0
 assume=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --notes-url) notes_url="${2:-}"; shift 2 ;;
+        --followups) followups="${2:-}"; shift 2 ;;
         --plan) plan=1; shift ;;
         --assume-state) assume="${2:-}"; shift 2 ;;
         *) echo "docs-release.sh: unknown argument '$1'" >&2; exit 2 ;;
@@ -89,6 +104,46 @@ esac
 
 title="Release $version: publish the documentation site"
 tag="v$version"
+
+# The page follow-ups this release did not wait for, as the gate found them. One line per issue:
+# <pull request>TAB<issue>TAB<pull request url>.
+followups_block() {
+    [ -n "$followups" ] || return 0
+    # Existence, then emptiness, and they are two guards rather than one `-s` because they answer
+    # different things: without the first, a path that is not there reaches awk and the step summary
+    # of a release carries a complaint about a file nobody asked about; the second is what makes an
+    # empty list write nothing. `-s` alone reads as both and is neither.
+    [ -f "$followups" ] || return 0
+    fu_count="$(awk 'NF{n++} END{print n+0}' "$followups")"
+    [ "$fu_count" != 0 ] || return 0
+    printf '**Pages %s ships without.** %s follow-up issue(s) from this release are still open\n' "$tag" "$fu_count"
+    printf 'here. A release below major is not held for them, which is why this is a list rather than\n'
+    printf 'the reason the release stopped. Each one is still owed; closing it is what takes it off\n'
+    printf 'this list next time.\n\n'
+    while IFS="$(printf '\t')" read -r fu_pr fu_issue fu_url; do
+        [ -n "$fu_issue" ] || continue
+        printf -- '- #%s -- %s\n' "$fu_issue" "${fu_url:-$fu_pr}"
+    done < "$followups"
+}
+
+# The same thing with the separator that makes it a section of a longer body. Kept apart from the
+# block itself so a comment, which is the whole message, does not open with a horizontal rule.
+followups_section() {
+    fu_sec="$(followups_block)"
+    [ -n "$fu_sec" ] || return 0
+    printf '\n\n---\n\n%s' "$fu_sec"
+}
+
+# Under --plan no issue is created, so nothing would say what its body was going to carry. It prints
+# the section itself rather than a count of it, and that is the point: a count is computed from the
+# file and stays right while the line that builds each bullet is broken, which is the failure this
+# has -- an issue that says "2 follow-up issue(s)" above two empty bullets.
+plan_followups() {
+    fu_plan="$(followups_block)"
+    [ -n "$fu_plan" ] || return 0
+    printf '%s  the issue carries:\n' "$repo"
+    printf '%s\n' "$fu_plan" | sed 's/^/    /'
+}
 
 # Open a request in the documentation repository and put it in front of the person it is for.
 #
@@ -128,6 +183,7 @@ ask() {
 if [ "$verb" = open ]; then
     if [ "$plan" = 1 ]; then
         echo "$repo  open issue \"$title\", assigned to $owner"
+        plan_followups
         exit 0
     fi
     ask "$title" \
@@ -141,7 +197,7 @@ publishes:
 - still open, and the release goes out anyway -- it is not held up for this -- and you get a second
   issue asking you to finish and then create \`$tag\` yourself.
 
-Nothing here blocks the release. It does decide whether the tag is one less thing for you to do." \
+Nothing here blocks the release. It does decide whether the tag is one less thing for you to do.$(followups_section)" \
         "asked $owner to publish the site for $tag"
     exit 0
 fi
@@ -233,6 +289,7 @@ find_issue
 if [ "$state" = closed ]; then
     if [ "$plan" = 1 ]; then
         echo "$repo  site is published: tag $tag on main, and say so on the issue"
+        plan_followups
         exit 0
     fi
     # Every outcome below goes to stdout, and gh's own error travels with it, for the reason the
@@ -262,6 +319,17 @@ if [ "$state" = closed ]; then
                 --body "Released as \`$tag\`, cut from \`main\`. Nothing further needed here." 2>&1 >/dev/null)"; then
             echo "$repo  #$number was not told that $tag exists: $note_err"
         fi
+        # This branch opens no second issue -- the request was finished -- and the pages the release
+        # went out without are still owed. Without this they would be said once, in the request that
+        # has just been closed, and never at the end where the list is actually current.
+        fu_body="$(followups_block)"
+        if [ -n "$fu_body" ] && [ -n "${number:-}" ]; then
+            if fu_err="$(gh issue comment "$number" --repo "$repo" --body "$fu_body" 2>&1 >/dev/null)"; then
+                echo "$repo  #$number told what $tag shipped without"
+            else
+                echo "$repo  #$number was not told what $tag shipped without: $fu_err"
+            fi
+        fi
     else
         # The site is published and its documentation carries no tag for this version. Nothing else
         # in the release mentions it and the release goes out either way, so this warning is the only
@@ -274,6 +342,7 @@ fi
 
 if [ "$plan" = 1 ]; then
     echo "$repo  site not published yet: open a second issue asking $owner to finish and tag $tag"
+    plan_followups
     exit 0
 fi
 ask "Still to do: publish the documentation for $tag" \
@@ -290,6 +359,6 @@ Two things, in this order:
 The tag is yours this time rather than ours because the release has already gone; nothing here is
 going to create it after the fact.
 
-The tapstate release: $notes_url" \
+The tapstate release: $notes_url$(followups_section)" \
    "site not published in time; asked $owner to finish and tag $tag themselves"
 exit 0

@@ -6,6 +6,7 @@ import ch.qos.logback.classic.spi.ThrowableProxyUtil;
 import ch.qos.logback.core.AppenderBase;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.core.logging.LogSink;
+import io.tapstate.core.logging.PipelineAttribution;
 import io.tapstate.core.logging.SecretRedactor;
 
 import java.util.Objects;
@@ -21,7 +22,7 @@ import java.util.Objects;
 final class PipelineLogAppender extends AppenderBase<ILoggingEvent> {
 
     /** The MDC attribution slot a log line is filtered by; matches the slot reserved in the log format. */
-    static final String PIPELINE_ID_MDC_KEY = "pipeline_id";
+    static final String PIPELINE_ID_MDC_KEY = PipelineAttribution.MDC_KEY;
 
     private final LogSink sink;
     private final SecretRedactor redactor;

@@ -49,7 +49,7 @@ class TheGlobalNotepadIsSharedByEveryPipelineTest {
 
     private PdkConnector openFor(Path dir, String pipelineId, String nodeId) {
         return PdkConnector.open(
-                "demo", ref(dir), Map.of(), ConnectorStateNamespace.of(new PipelineNode(pipelineId, nodeId)), store);
+                "demo", ref(dir), Map.of(), new PipelineNode(pipelineId, nodeId), store);
     }
 
     @Test

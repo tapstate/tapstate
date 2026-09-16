@@ -3966,6 +3966,119 @@ class ReplTest {
     }
 
     @Test
+    void statusPrintsTheStateLineFirstAndTheAnswerUnderIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 252_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // The state line is untouched and still first: anything that reads this output by its first line
+        // keeps working, and the answer is added below rather than replacing what was there.
+        assertThat(out.lines().findFirst().orElseThrow()).isEqualTo("pl1  running");
+        assertThat(out).contains("why:").contains("publisher may have stopped").contains("4m12s");
+        assertThat(out).contains("read       status.observedAt = 4m12s ago");
+        assertThat(out).contains("next       ");
+    }
+
+    @Test
+    void statusThatTheStatusFaceAnsweredDoesNotGoAndReadTheOtherFaces() {
+        // A reading this old makes every other face a re-read of the same old observation, so asking them
+        // costs two round trips to learn nothing. Pinned because the cost is invisible in the output.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 252_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("status pl1");
+
+        assertThat(client.metricsCalls).isEmpty();
+        assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void statusThatMatchesNothingReadsTheOtherFacesAndSaysWhatItCannotDecide() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 128L));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // Its opposite is the failure mode: five rules coming up empty is a statement about five rules,
+        // and printing it as a clean bill of health is the product defaulting to healthy on thin signals.
+        assertThat(out).contains("nothing on this checklist matched");
+        assertThat(out).contains("cannot say whether the source has changes waiting");
+        assertThat(client.metricsCalls).hasSize(1);
+        assertThat(client.snapshotCalls).hasSize(1);
+    }
+
+    @Test
+    void statusTakesRowsLoadedOffTheSnapshotFaceRatherThanCountingItsEntries() {
+        // Three tables selected, none of which has loaded a row -- a snapshot pipeline stuck at the start,
+        // which is the situation the "nothing has moved" rule exists for. The face holds an entry for every
+        // selected table from the moment the run starts and keeps it for the life of the run, so counting
+        // its entries answers a different question (how many tables were selected) and never reaches zero
+        // on a pipeline like this one.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 0L));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
+                "orders", new RemoteTableSnapshot(0L, null, null),
+                "items", new RemoteTableSnapshot(0L, null, null),
+                "shipments", new RemoteTableSnapshot(0L, null, null)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("nothing has moved");
+        assertThat(out).contains("read       snapshot = no rows loaded");
+        // And it does not claim a load is in flight. The face reports no total for a table and therefore no
+        // completion, so "loading" is a word it cannot support.
+        assertThat(out).doesNotContain("table(s) loading");
+    }
+
+    @Test
+    void statusCountsWhatTheSnapshotLoadedWhenItHasLoadedSomething() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 0L));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
+                "orders", new RemoteTableSnapshot(900L, null, null),
+                "items", new RemoteTableSnapshot(124L, null, null)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).doesNotContain("nothing has moved");
+        assertThat(out).contains("read       snapshot = 1024 row(s) loaded");
+    }
+
+    @Test
+    void statusSaysAFaceWasUnreadRatherThanEmptyWhenItCouldNotBeRead() {
+        // The fake answers both supplementary faces with unreachable. "No errors" and "nobody answered"
+        // are one word apart on screen, and only one of them is something a reader may act on.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("metrics = could not be read").contains("snapshot = could not be read");
+        assertThat(out).doesNotContain("nothing has moved");
+    }
+
+    @Test
     void restartStillNeedsAPipelineToRestart() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         Harness h = onlineSession(Path.of("tap-work"), client);
@@ -4349,7 +4462,7 @@ class ReplTest {
     }
 
     @Test
-    void metricsPrintsPerTableOffsetLinesAlongsideTheStats() {
+    void metricsPrintsTheTargetAckedPositionAlongsideTheStats() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found(
                 "pl1", Map.of("recordCount", 6L), Map.of("orders", "w7"));
@@ -4357,12 +4470,12 @@ class ReplTest {
         int mark = h.sink().toString().length();
         h.repl().dispatch("metrics pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("recordCount").contains("perTableOffset.orders").contains("w7");
+        assertThat(out).contains("recordCount").contains("targetAckedPosition.orders").contains("w7");
     }
 
     @Test
-    void metricsWithOnlyPerTableOffsetPrintsItRatherThanNoMetrics() {
-        // Positions-only: numeric stats empty but a per-table position is wired, so the offset prints and
+    void metricsWithOnlyAPositionPrintsItRatherThanNoMetrics() {
+        // Positions-only: numeric stats empty but a per-table position is wired, so the position prints and
         // "no metrics" must not — it fires only when both sources are empty.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", "w7"));
@@ -4370,7 +4483,61 @@ class ReplTest {
         int mark = h.sink().toString().length();
         h.repl().dispatch("metrics pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("perTableOffset.orders").contains("w7").doesNotContain("no metrics");
+        assertThat(out).contains("targetAckedPosition.orders").contains("w7").doesNotContain("no metrics");
+        // And the disclaimer covers it. A position is not a metric, so a note about metric names printed
+        // under a face whose only name is a position would be a promise nobody made about the one line
+        // on screen.
+        assertThat(out)
+                .as("the only name printed here is the position's, and it is the one the note is about")
+                .contains("unstable");
+    }
+
+    @Test
+    void metricsNamesThePositionsNobodyRecordsInsteadOfLeavingThemOut() {
+        // The line that is printed says how far the target has confirmed writes. A reader who wanted to
+        // know whether the source had gone quiet supplies the other two from expectation unless the output
+        // says they are not measured — and then reads a stalled target as an idle source.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
+                Map.of("orders", "w7"), List.of("sourceHeadPosition", "processedPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("metrics pl1");
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("sourceHeadPosition  not collected");
+        assertThat(out).contains("processedPosition  not collected");
+        assertThat(out).contains("targetAckedPosition.orders  w7");
+    }
+
+    @Test
+    void metricsSaysARecordedPositionHasNothingYetRatherThanLeavingItOut() {
+        // "Recorded and still empty" and "not recorded at all" are one blank line apart on screen and a
+        // different problem apart in the world: the first is a run that has not landed anything yet, the
+        // second is a measurement this product does not take. Printing neither makes them the same answer.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
+                Map.of(), List.of("sourceHeadPosition", "processedPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("metrics pl1");
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("targetAckedPosition  nothing acked yet");
+        assertThat(out).contains("sourceHeadPosition  not collected");
+    }
+
+    @Test
+    void metricsWithNothingWiredAtAllNamesNoPositionAtAll() {
+        // Nothing is on screen for a name to be read as, so naming the absent positions here would be an
+        // answer about positions given to somebody the face just told it knows nothing about.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of(),
+                List.of("sourceHeadPosition", "processedPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("metrics pl1");
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("no metrics");
+        assertThat(out).doesNotContain("not collected").doesNotContain("targetAckedPosition");
     }
 
     @Test

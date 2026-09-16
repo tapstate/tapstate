@@ -1,0 +1,24 @@
+# A source that names its tables by pattern cannot be started before its schema is discovered, whatever
+# the pipeline does with them: there is nothing for the pattern to match against until discovery has
+# run. Its sibling case asserts the same refusal for a sync, and this one exists because the two are
+# refused from different places - the sync path requires a discovered model outright, while a pattern is
+# refused by the selector itself, which is reached on the view path too.
+#
+# Nothing is discovered on purpose, and that absence is the case. The setup has no discover step, which
+# every other example that reads a source has.
+#
+# The state and the code are both asserted. FAILED alone would also pass for an unrelated crash, and the
+# code alone would not show that the lifecycle state was published. The count is asserted beside them so
+# that "refused" means no rows were written, rather than a refusal that arrived after a partial write.
+name: a-view-whose-source-matches-tables-by-pattern-is-refused-without-discovery
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, views.tap.yml, pipeline.tap.yml]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders: { rows: 3 }
+steps:
+  - start
+  - await: { state: FAILED }
+  - assert: { failure_code: actuation.source-schema-not-discovered }
+  - assert: { count: { views.order_state: 0 } }

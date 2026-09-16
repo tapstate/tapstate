@@ -96,6 +96,14 @@ enum CliError implements TapstateErrorCode {
      */
     PASSWORD_REQUIRED("cli.password-required", Set.of("server", "variable")),
 
+    /**
+     * Signing in to {@code server} while binding a workspace returned nothing that can be kept: the
+     * server could not be reached for the login, or answered without a persistent session this release
+     * can use. Names the server rather than a context, because a binding that fails here has settled a
+     * context name without writing it - naming it would point at an entry no later command can find.
+     */
+    SIGN_IN_UNUSABLE("cli.sign-in-unusable", Set.of("server")),
+
     /** A connector id supplied to the wizard that is not in the bundled catalog. */
     UNKNOWN_CONNECTOR("cli.unknown-connector", Set.of("connector")),
 

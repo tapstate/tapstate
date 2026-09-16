@@ -36,10 +36,22 @@ label="docs-needed"
 fields=("Draft in this repository" "Public page it is headed for")
 
 # Bots do not get the template, and refusing them does not make anyone write documentation -- it
-# makes somebody switch this check off for everyone. Matched on the trailing marker GitHub gives
-# every app account, so a new bot needs no edit here.
+# makes somebody switch this check off for everyone.
+#
+# Two spellings, because one account arrives here under two names and its readers do not agree. A
+# webhook payload calls an app `<slug>[bot]`; `gh pr view --json author` calls the same one
+# `app/<slug>`. Neither is a login a person can register -- `[` and `/` are both refused by GitHub --
+# so matching both cannot exempt anybody real, and a name like `appliance` is untouched because the
+# slash is what the pattern turns on.
+#
+# Matching only the first is how the same account was a bot at pull-request time and a person at
+# release time, from this same script reading that same body. Measured 2026-09-16: three pull
+# requests opened by an app passed their pull-request check and then refused a release, months after
+# anyone could have acted on it, and the body they were refused over is one nothing ever asked them
+# to write. A predicate that answers "is this a bot" differently depending on who is asking is not a
+# predicate.
 case "$actor" in
-  *'[bot]') echo "clean: $actor is a bot, and the template is not asked of one."; exit 0 ;;
+  *'[bot]'|app/*) echo "clean: $actor is a bot, and the template is not asked of one."; exit 0 ;;
 esac
 
 if ! grep -qE "^## ${section}[[:space:]]*$" <<<"$body"; then
