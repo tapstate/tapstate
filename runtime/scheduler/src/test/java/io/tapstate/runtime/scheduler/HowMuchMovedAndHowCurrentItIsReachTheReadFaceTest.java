@@ -133,6 +133,34 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     }
 
     @Test
+    @DisplayName("a change kind nobody here knows still lands inside the closed set of names")
+    void anUnknownChangeKindDoesNotLeakOntoTheFaceAsItsOwnName() {
+        DeliveryReading strange = new DeliveryReading(Map.of("orders", Map.of("zzz", 3L)),
+                Map.of("orders", AT.toEpochMilli()), STARTED);
+
+        MetricFact records = factNamed(facts(strange, AT), "tapstate.pipeline.records");
+
+        // The whole point of the operation being a closed set is that nothing arriving from the data can
+        // add a value to it. A symbol passed through as its own name would put the number of series this
+        // metric has in the hands of whatever produced the symbol - which is the one thing the closed set
+        // was closed to prevent.
+        assertThat(records.points()).singleElement()
+                .satisfies(point -> assertThat(point.attributes().get("op")).isEqualTo("other"));
+    }
+
+    @Test
+    @DisplayName("a run that started but has settled nothing publishes no count at all")
+    void aRunWithAStartAndNoRowsPublishesNoCount() {
+        DeliveryReading startedOnly = new DeliveryReading(Map.of(), Map.of(), STARTED);
+
+        // A start on its own is not a delivery. Publishing the counter here would put a pipeline that has
+        // moved nothing on the face as one whose total happens to be zero, and the two differ by whether
+        // anybody should be worried.
+        assertThat(facts(startedOnly, AT)).extracting(MetricFact::name)
+                .doesNotContain("tapstate.pipeline.records", "tapstate.pipeline.lag");
+    }
+
+    @Test
     @DisplayName("the stored flat view carries a total per direction and an age per table")
     void theFlatFaceShowsTheThroughputCollapsedAndTheAgePerTable() {
         state.create("orders", PipelineState.RUNNING.name(), AT);

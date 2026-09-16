@@ -565,9 +565,14 @@ public final class ObservationPublisher {
      * The two facts a run's deliveries make: how many rows of each table and operation reached a target,
      * and how old the newest row of each table is. Empty for a pipeline whose run reports nothing, so a
      * pipeline that is not running is absent from both rather than present at zero.
+     *
+     * <p>That emptiness is decided per fact and not once up front. A run may have a start and nothing
+     * settled, or rows for one table and a recency reading for another, and each fact is left out on its
+     * own account; a check covering both would be a second place for the same decision to be made, and
+     * one of the two would eventually stop agreeing with it.
      */
     private List<MetricFact> delivered(String pipelineId, Instant at, DeliveryReading reading) {
-        if (reading == null || reading.isEmpty()) {
+        if (reading == null) {
             return List.of();
         }
         List<MetricFact> facts = new ArrayList<>();
