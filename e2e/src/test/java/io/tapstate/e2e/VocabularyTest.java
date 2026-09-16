@@ -39,7 +39,8 @@ class VocabularyTest {
     @Test
     void matcherWordsAreTheOnesTheParserAccepts() {
         assertThat(Vocabulary.MATCHERS)
-                .containsExactly("count", "dead_lettered", "doc", "error_count", "failure_code", "state");
+                .containsExactly("count", "dead_lettered", "doc", "error_count", "failure_code",
+                        "records_out", "state");
     }
 
     @Test

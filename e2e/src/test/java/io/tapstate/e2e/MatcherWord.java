@@ -55,6 +55,21 @@ enum MatcherWord {
      */
     FAILURE_CODE,
 
+    /**
+     * How many rows the pipeline has had confirmed by its targets, added up over its tables and source
+     * operations. Its source is the metrics read face, which carries one total per direction.
+     *
+     * <p>Counted where the target confirmed them and nowhere earlier, which is the whole of what this word
+     * is for: a pipeline handing rows to a sink that rejects every one of them reads the same as a healthy
+     * one on every other word here - the rows left the source, the job runs, nothing was discarded - and
+     * differs only in that this total stays at nought.
+     *
+     * <p><strong>A nought here needs a sibling asserting a real total to mean anything.</strong> The face
+     * publishes no entry until something settles, and no entry reads as nought, so this word alone is
+     * satisfied by a pipeline that published nothing at all.
+     */
+    RECORDS_OUT,
+
     /** The pipeline's published lifecycle state. */
     STATE;
 

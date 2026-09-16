@@ -63,6 +63,12 @@ final class ControlPlane {
      */
     private static final String DEAD_LETTERED_PREFIX = "nestDeadLettered.";
 
+    /**
+     * The flat face's name for rows confirmed by a target. Exact, not a prefix: the inbound total sits
+     * beside it under the same stem, and the two are meant to be read apart.
+     */
+    private static final String RECORDS_OUT_METRIC = "records.out";
+
     private final URI baseUrl;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
 
@@ -1028,6 +1034,49 @@ final class ControlPlane {
     /** What a metrics answer says about discarded changes, read exactly the way the error count is. */
     static Optional<Long> interpretDeadLettered(int status, String body, String pipelineId) {
         return interpretMetricTotal(status, body, pipelineId, DEAD_LETTERED_PREFIX);
+    }
+
+    /**
+     * How many rows this pipeline has had confirmed by its targets, or empty when it has published no
+     * observation yet.
+     *
+     * <p>Read by exact name rather than by prefix, unlike the readings around it. What is being asked for
+     * is one published total, and the face carries a sibling under the same stem for the other direction:
+     * a prefix would add the two together and answer a question nobody asked.
+     */
+    Optional<Long> recordsOut(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        return interpretRecordsOut(response.statusCode(), response.body(), pipelineId);
+    }
+
+    /** What a metrics answer says about rows that reached a target, read by exact name. */
+    static Optional<Long> interpretRecordsOut(int status, String body, String pipelineId) {
+        return interpretMetricByName(status, body, pipelineId, RECORDS_OUT_METRIC);
+    }
+
+    /**
+     * One published metric of {@code pipelineId} by its exact name; empty when the pipeline has published
+     * no observation at all, and nought when it has published one that does not carry this name.
+     *
+     * <p>That nought is the deliberate half. A name absent from a published observation means the thing it
+     * counts has not happened, which is a reading; it is only an unmeasured one when nothing was published
+     * at all, and those two arrive as different HTTP answers rather than as the same missing key.
+     */
+    static Optional<Long> interpretMetricByName(
+            int status, String body, String pipelineId, String name) {
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return Optional.empty();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the metrics of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
+                || !(map.get("metrics") instanceof Map<?, ?> metrics)) {
+            throw new AssertionError("metrics answer carried no metrics: " + body);
+        }
+        return Optional.of(metrics.get(name) instanceof Number value ? value.longValue() : 0L);
     }
 
     /**

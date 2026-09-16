@@ -1,0 +1,36 @@
+# How much a pipeline has moved, read from the product rather than counted at the far end.
+#
+# Every sibling example asks the target how many rows it holds. That answers whether rows crossed; it
+# does not answer what the product believes, and the product's own answer is the one a person reads on
+# a dashboard. This example holds the two together: the target holds three rows, and the pipeline says
+# it has had three confirmed. A total published from the wrong place - rows counted as they were handed
+# to the sink rather than once the target took them - agrees with this example exactly, which is why its
+# pair is the one that matters (see a-sink-write-failure-is-observable, which seeds the same rows into a
+# target that rejects every write and holds this same total at nought).
+#
+# Asserted twice, before and after a change, because one reading cannot tell a counter from a gauge. A
+# total that simply mirrors how many rows the target currently holds passes the first assertion; the
+# second one it passes too, and that is the honest limit of what this example pins. What the second
+# assertion does pin is that the total keeps up: a count published once and never refreshed - the shape
+# a metric wired only at start-up produces - rests at three and fails.
+#
+# cdc_only, and that is load-bearing rather than incidental. This total is read off the live job, so a
+# bounded read that finishes takes it away with the job the moment it completes: the number is gone
+# exactly when it has finished being interesting. A tailing pipeline keeps its job, and so keeps
+# answering. The arrivals are one per row either way here - this connector's tail remembers how far it
+# has read within a run - so three seeded rows cross three times, not three plus a replay.
+name: rows-confirmed-by-a-target-are-counted-where-they-landed
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  discover: [src_file]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders: { rows: 3 }
+steps:
+  - start
+  - await: { count: { tgt_file.orders: 3 } }
+  - assert: { records_out: 3 }
+  - cdc: { src_file.orders: insert 2 }
+  - await: { count: { tgt_file.orders: 5 } }
+  - assert: { records_out: 5 }

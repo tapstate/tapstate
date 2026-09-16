@@ -229,6 +229,7 @@ final class SpecGenerator {
                         case DOC -> keyed(word.word(), docBody());
                         case ERROR_COUNT -> keyed(word.word(), errorCountBody());
                         case FAILURE_CODE -> keyed(word.word(), failureCodeBody());
+                        case RECORDS_OUT -> keyed(word.word(), recordsOutBody());
                         case STATE -> keyed(word.word(), stateBody());
                     });
         }
@@ -417,6 +418,17 @@ final class SpecGenerator {
         return discarded;
     }
 
+    private static Map<String, Object> recordsOutBody() {
+        Map<String, Object> rows = scalar("integer",
+                "How many rows this pipeline is expected to have had confirmed by its targets, added up "
+                        + "over its tables and the operations its sources performed. Nought asserted here "
+                        + "is only an assertion beside a sibling asserting a real total: the face "
+                        + "publishes no entry until something settles, so nought is also what a pipeline "
+                        + "publishing nothing at all would read.");
+        rows.put("minimum", 0);
+        return rows;
+    }
+
     private static Map<String, Object> failureCodeBody() {
         Map<String, Object> code = scalar("string",
                 "The canonical code of the failure the pipeline this specification names is expected to "
@@ -515,6 +527,13 @@ final class SpecGenerator {
                     + "while it is FAILED, zero otherwise.";
             case FAILURE_CODE -> "The canonical code of the failure the pipeline published, read from the "
                     + "status face: what killed the run, not just that it died.";
+            case RECORDS_OUT -> "How many rows the pipeline has had confirmed by its targets, added up "
+                    + "over its tables and the operations its sources performed, read from the metrics "
+                    + "face. Counted where the target confirmed them and nowhere earlier: a pipeline "
+                    + "handing rows to a sink that rejects every one of them reads healthy on every other "
+                    + "word here and differs only in that this total stays at nought. A nought asserted "
+                    + "here needs a sibling asserting a real total to mean anything, because the face "
+                    + "publishes no entry until something settles.";
             case STATE -> "The pipeline's published lifecycle state, read from the observation face.";
         };
     }

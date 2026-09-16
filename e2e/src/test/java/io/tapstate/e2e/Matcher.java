@@ -58,6 +58,14 @@ public sealed interface Matcher {
     record DeadLettered(long expected) implements Matcher {}
 
     /**
+     * How many rows the pipeline this specification names has had confirmed by its targets, added up over
+     * its tables and the operations its sources performed, read from its metrics face. Written as one
+     * number for the reason {@link DeadLettered} is: the breakdown is keyed by names derived from the
+     * pipeline, and a specification naming one would be copying an internal name by hand.
+     */
+    record RecordsOut(long expected) implements Matcher {}
+
+    /**
      * One document at an endpoint: located by the equality settings in {@code where}, held to scalar
      * values by path in {@code expect}, to list lengths by path in {@code size}, and to paths that
      * must not be there at all in {@code absent}. Paths read {@code a.b} for a field of a field and
@@ -101,5 +109,9 @@ public sealed interface Matcher {
 
     static Matcher deadLettered(long expected) {
         return new DeadLettered(expected);
+    }
+
+    static Matcher recordsOut(long expected) {
+        return new RecordsOut(expected);
     }
 }
