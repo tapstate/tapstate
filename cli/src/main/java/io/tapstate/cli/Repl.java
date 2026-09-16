@@ -4,7 +4,6 @@ import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
-import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.model.Resource;
@@ -2163,9 +2162,13 @@ final class Repl {
     }
 
     private void announcePipelineState(boolean keepState) {
-        PipelineStateInventory.lines(!keepState, PipelineStateInventory.vocabulary())
-                .forEach(commandLine.getOut()::println);
-        commandLine.getOut().flush();
+        PrintWriter out = commandLine.getOut();
+        if (keepState) {
+            out.println("keeping the pipeline's accumulated state and resume position");
+        } else {
+            out.println("clearing the pipeline's accumulated state and resume position");
+        }
+        out.flush();
     }
 
     private int restartOnline(List<String> words) {
