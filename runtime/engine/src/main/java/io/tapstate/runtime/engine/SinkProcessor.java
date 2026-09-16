@@ -62,7 +62,10 @@ public final class SinkProcessor extends AbstractProcessor {
     private final SinkAck sinkAck;
     private final SinkFrontier frontier;
     private final FrontierGauge gauge;
-    private final DeliveryGauge delivery;
+    private final DeliveryGauge supplied;
+    // Which of the two the readings actually go to, settled at init: the one supplied, or one that reads
+    // nothing when this processor turns out not to be running inside a job. See init.
+    private DeliveryGauge delivery;
     // What has settled since this processor started, kept here because the readings are cumulative and a
     // batch only knows its own rows. Keyed by table, then by the source operation within it.
     private final Map<String, Map<String, Long>> deliveredByTableAndOp = new LinkedHashMap<>();
@@ -118,7 +121,8 @@ public final class SinkProcessor extends AbstractProcessor {
             int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery) {
         this.writer = Objects.requireNonNull(writer, "writer");
         this.gauge = Objects.requireNonNull(gauge, "gauge");
-        this.delivery = Objects.requireNonNull(delivery, "delivery");
+        this.supplied = Objects.requireNonNull(delivery, "delivery");
+        this.delivery = this.supplied;
         if (maxInFlight < 1) {
             throw new IllegalArgumentException("maxInFlight must be at least 1: " + maxInFlight);
         }
@@ -194,6 +198,14 @@ public final class SinkProcessor extends AbstractProcessor {
         this.countingSince = System.currentTimeMillis();
         HazelcastInstance instance = context.hazelcastInstance();
         this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
+        // A gauge that writes into a job's statistics can only do so from that job's own threads, and a
+        // sink is also driven by hand - which is how its behaviour is pinned at all. Outside a job there
+        // is nothing to write into and asking for a handle fails outright, taking the sink down with it,
+        // so the readings go nowhere instead. The same absence already decides the failure registry
+        // above, and for the same reason: neither exists until there is a job to hold it.
+        if (instance == null && supplied.readableOnlyOnAJobThread()) {
+            this.delivery = DeliveryGauge.none();
+        }
     }
 
     @Override

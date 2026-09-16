@@ -53,6 +53,11 @@ final class JetDeliveryGauge implements DeliveryGauge {
     }
 
     @Override
+    public boolean readableOnlyOnAJobThread() {
+        return true;
+    }
+
+    @Override
     public void countingSince(long epochMillis) {
         if (since == null) {
             since = Metrics.metric(SINCE_METRIC);

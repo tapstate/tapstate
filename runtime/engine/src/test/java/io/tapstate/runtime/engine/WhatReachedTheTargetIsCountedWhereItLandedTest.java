@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.jet.core.test.TestInbox;
@@ -188,6 +189,24 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         // own would be a stream that exists with nothing in it, which is not the same as a sink that has
         // not delivered.
         assertThat(delivery.starts).isEmpty();
+    }
+
+    @Test
+    void drives_by_hand_without_a_job_rather_than_failing_for_want_of_one() throws Exception {
+        // The gauge a real sink is given, on a processor with no job behind it - which is how every case
+        // above drives one, and how a sink's behaviour is pinned at all. Its readings go into statistics
+        // the job collects, and asking for a handle where there is no job fails outright and takes the
+        // sink down with it. So the readings go nowhere instead; a sink that could not be driven by hand
+        // would be a sink nothing could pin.
+        SinkProcessor processor = new SinkProcessor(new ImmediateWriter(), null, null, 1, 1024,
+                FrontierGauge.none(), new JetDeliveryGauge());
+        processor.init(new TestOutbox(new int[] {}, 128), new TestProcessorContext());
+
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(row("orders", 1L)));
+        processor.process(0, inbox);
+
+        assertThatCode(() -> drain(processor)).doesNotThrowAnyException();
     }
 
     /** A row of {@code table} whose event time is {@code ts}. */

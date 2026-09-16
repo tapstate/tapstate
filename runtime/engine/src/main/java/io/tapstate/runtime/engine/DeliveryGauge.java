@@ -46,6 +46,19 @@ interface DeliveryGauge {
     void countingSince(long epochMillis);
 
     /**
+     * Whether taking a reading requires the thread of a running job. A gauge that writes into a job's own
+     * statistics does; one that keeps the readings itself does not.
+     *
+     * <p>It is asked rather than assumed because a sink is driven two ways. In a job its processors run on
+     * the job's threads and the answer is yes; driven by hand - which is how its behaviour is pinned at all
+     * - there is no job and no statistics to write into, and asking for a handle there fails outright. A
+     * sink that could not be driven by hand would be a sink whose behaviour nothing could pin.
+     */
+    default boolean readableOnlyOnAJobThread() {
+        return false;
+    }
+
+    /**
      * A gauge nothing reads, for a sink driven outside a running job. Never a way to opt a real sink out:
      * a delivery no one counts is the state this seam exists to end.
      */
