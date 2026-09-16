@@ -1005,12 +1005,15 @@ final class ControlPlane {
      * "how many altogether" is their sum rather than a cell of its own.
      *
      * <p><strong>A pipeline that has failed nothing has no such key, and this reports nought for it.</strong>
-     * That is the honest total -- the sum of nothing -- but it means an assertion of nought here is
-     * satisfied by a publisher that stopped publishing just as well as by a pipeline that is fine.
-     * <strong>So assert a positive number, never nought.</strong> This used to read a single
-     * {@code errorCount} cell that the runtime derived from the pipeline's state and always published, and
-     * a missing cell was therefore a regression worth throwing over; there is no such cell any more,
-     * because a state written as a number was never a count of anything.
+     * That is the honest total -- the sum of nothing. What it costs is one distinction: an assertion of
+     * nought here, <em>on its own</em>, is satisfied by a publisher that stopped publishing just as well as
+     * by a pipeline that is fine. It is not satisfied by a stopped publisher once it is paired with
+     * anything that had to read a live observation to pass -- a state assertion, say, since reading a state
+     * at all proves an observation is being republished. So a nought here wants a companion, not a ban.
+     *
+     * <p>This used to read a single {@code errorCount} cell that the runtime derived from the pipeline's
+     * state and always published, and a missing cell was therefore a regression worth throwing over. There
+     * is no such cell any more, because a state written as a number was never a count of anything.
      */
     static Optional<Long> interpretErrorCount(int status, String body, String pipelineId) {
         if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {

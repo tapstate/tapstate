@@ -149,9 +149,10 @@ class ControlPlaneTest {
         // until something is counted, so a pipeline that has failed nothing has no cell here at all, and
         // the honest total over no cells is nought.
         //
-        // What that gives up: "nothing has failed" and "the publisher stopped" are now the same reading.
-        // A specification must therefore assert a positive number -- error_count: 0 is satisfied by both,
-        // and is the shape of assertion that passes for a reason unrelated to what it was written to hold.
+        // What that gives up, stated no wider than it is: "nothing has failed" and "the publisher stopped"
+        // are the same reading *for this word alone*. A specification asserting error_count: 0 next to
+        // anything that had to read a live observation -- a state assertion, say -- has already excluded the
+        // stopped publisher, and the nought still means nothing failed. Alone, it does not.
         assertThat(ControlPlane.interpretErrorCount(
                         200, JsonWriter.write(Map.of("pipelineId", PIPELINE, "metrics", Map.of())), PIPELINE))
                 .contains(0L);
