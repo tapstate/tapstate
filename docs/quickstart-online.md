@@ -609,8 +609,9 @@ tool for stopping its own process.
 ## 7. Observe and verify
 
 ```console
+tapstate(admin@127.0.0.1:8080)> status order_pipeline             # state, and why if it is not working
 tapstate(admin@127.0.0.1:8080)> status order_pipeline --watch    # live state; Ctrl-C to stop
-tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # recordCount / errorCount / per-table offset
+tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # recordCount / errorCount / positions
 tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local operational log tail
 ```
 
@@ -619,9 +620,34 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   the first `status`/`metrics` may report no observation yet, and a `status` right
   after `stop` can still say `running`. Use `--watch`, or retry after a second.
 - `metrics` is the signal for progress: `recordCount` climbing, `errorCount` at 0.
-- **Metric names are unstable in this preview.** They may be renamed as the metric model
-  settles, so treat them as something to read, not something to build on: a dashboard or
-  an alert wired to these names will need revisiting. The `metrics` output says so too.
+- **`status` answers "why is it not working" itself**, under the state line: it walks a short fixed
+  checklist over the same four faces you can read by hand and prints what it concluded, the face and
+  value it read, and where to look next. When nothing on the checklist matches it does **not** report
+  that all is well — it prints every reading it went through and names the questions these faces
+  cannot answer, so you go and look at the thing the product genuinely cannot see instead of
+  trusting a silence. `--watch` is unchanged: it streams the state only, and says nothing more.
+- **The position it prints is `targetAckedPosition`: how far the target has confirmed writes.**
+  It is not how far the source could be read to and not how far the pipeline has processed. Those
+  two are printed by name as `not collected`, because a position that is simply missing reads the
+  same as one this product has no concept of — and only one of those is an answer. A target that
+  has stopped accepting writes freezes this position while the other two would still be moving, so
+  reading it as either of them turns a stalled target into a quiet source.
+- **`logs` carries what the connector itself said, not only what the host could tell from outside.**
+  When a source refuses a connection, the connector is the only thing that knows why -- the password,
+  the permission, the database that is not there -- and that sentence is now written into the tail of
+  the pipeline it was driving, alongside the host's own coded failure. Two limits, said plainly: a
+  connector's routine progress chatter is kept out of this tail on purpose (it would push the one line
+  you came for out of a bounded window), and a line that reaches the log by neither of the routes the
+  host attributes -- the contract's shared, process-wide channel, which names no pipeline of its own,
+  and the driver a connector bundles logging from a thread of its own -- reaches the server's console
+  without being filed under any pipeline, because nothing there can say which run it belonged to. What
+  the connector itself writes through the log it was driven with is filed against its pipeline whatever
+  thread writes it. A schema discovery's lines are filed under no pipeline for a different reason:
+  any number of pipelines may read the same source.
+- **The names this face prints are unstable in this preview** — the position's included, not
+  only the metrics'. They may be renamed as the model settles, so treat them as something to
+  read, not something to build on: a dashboard or an alert wired to these names will need
+  revisiting. The `metrics` output says so too.
   The lifecycle state in `status` is not affected — that one is a stable contract.
 
 Verify the objects landed, straight from the store — `mongosh` runs inside the Mongo

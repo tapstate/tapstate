@@ -15,7 +15,10 @@ import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StateStore;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -38,6 +41,7 @@ import static org.assertj.core.api.Assertions.entry;
 class ObservationPublisherTest {
 
     private static final Instant T0 = Instant.parse("2026-07-01T00:00:00Z");
+    private static final Instant OBSERVED_AT = Instant.parse("2026-07-01T12:34:56.789Z");
 
     private final MutableStateStore state = new MutableStateStore();
     private final RecordingObservationStore observations = new RecordingObservationStore();
@@ -49,6 +53,16 @@ class ObservationPublisherTest {
         return new ObservationPublisher(state, observations,
                 id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), readings,
                 new NestColdLayerWatch(new NestColdLayerPressure(0.5, 100), alert));
+    }
+
+    /** A publisher with nothing wired but the clock it reads the observation time from. */
+    private ObservationPublisher withClock(Clock clock) {
+        return new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(),
+                new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
+                id -> Map.of(), id -> Map.of(), id -> Map.of(), clock);
     }
 
     /** Collects the namespaces reported, which is what a caller of the publisher can observe of the watch. */
@@ -615,6 +629,76 @@ class ObservationPublisherTest {
         assertThat(published.metrics()).containsOnly(entry("errorCount", 5L));
         assertThat(published.failure()).isEqualTo(priorFailure);
         assertThat(published.positions()).isEqualTo(priorPositions);
+    }
+
+    @Test
+    void publishRecordsWhenTheObservationWasTaken() {
+        state.seed("orders", PipelineState.RUNNING);
+
+        withClock(new MutableClock(OBSERVED_AT)).publish("orders");
+
+        Observation published = observations.read("orders").orElseThrow();
+        // Without this the read faces cannot tell a healthy run whose state has not changed from one whose
+        // publisher stopped minutes ago: both are the same stored bytes. The exact instant is asserted rather
+        // than its presence, because a stamp taken from the wrong source would still be present.
+        assertThat(published.observedAt()).isEqualTo(OBSERVED_AT);
+    }
+
+    @Test
+    void publishReconcileFailureRecordsWhenTheObservationWasTaken() {
+        withClock(new MutableClock(OBSERVED_AT)).publishReconcileFailure("orders", 3L);
+
+        Observation published = observations.read("orders").orElseThrow();
+        // This path matters most of the three: when the converge pass keeps throwing it is the only one still
+        // writing, so an unstamped projection here is exactly the case where staleness needs to be visible.
+        assertThat(published.observedAt()).isEqualTo(OBSERVED_AT);
+    }
+
+    @Test
+    void republishingMovesTheObservationTimeForward() {
+        state.seed("orders", PipelineState.RUNNING);
+        MutableClock clock = new MutableClock(OBSERVED_AT);
+        ObservationPublisher wired = withClock(clock);
+        wired.publish("orders");
+
+        clock.advanceSeconds(90);
+        wired.publish("orders");
+
+        // The point of the field is an age that grows while nothing else about the pipeline changes: the
+        // state, metrics and positions are identical across these two publishes. A stamp read once at
+        // construction, or copied from the checkpoint's own touch time, passes both tests above and fails
+        // here - and it is this case, not those, that a stalled publisher actually looks like.
+        assertThat(observations.read("orders").orElseThrow().observedAt())
+                .isEqualTo(OBSERVED_AT.plusSeconds(90));
+    }
+
+    /** A clock the test moves by hand, so an age can be witnessed without waiting for real time to pass. */
+    private static final class MutableClock extends Clock {
+
+        private Instant now;
+
+        private MutableClock(Instant now) {
+            this.now = now;
+        }
+
+        void advanceSeconds(long seconds) {
+            now = now.plusSeconds(seconds);
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            throw new UnsupportedOperationException("the publisher never rezones its clock");
+        }
     }
 
     /** In-memory state store double: seedable checkpoints, read-only for what the publisher needs. */

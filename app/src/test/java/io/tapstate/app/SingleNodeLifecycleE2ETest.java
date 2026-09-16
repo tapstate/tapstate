@@ -96,7 +96,13 @@ class SingleNodeLifecycleE2ETest {
         assertThat(job).as("start submits the pipeline's Jet job").isNotNull();
         awaitStatus(job, JobStatus.RUNNING);
         assertActualState(RUNNING, 1);
-        assertThat(readFaces.status(PIPE)).isEqualTo(new PipelineStatus(PIPE, RUNNING));
+        assertReadFaceReports(PIPE, RUNNING);
+        // The assembled path stamps when the reading was taken. Without it a run whose publisher stopped
+        // and a run whose state has not changed are the same bytes -- and nothing else in this case would
+        // notice, because every assertion here holds just as well over a reading from four minutes ago.
+        assertThat(readFaces.status(PIPE).observedAt())
+                .as("the converge pass records when it observed the pipeline")
+                .isNotNull();
         assertThat(readFaces.metrics(PIPE).metrics())
                 .as("errorCount is wired: a healthy run reports zero errors")
                 .containsOnly(entry("errorCount", 0L));
@@ -105,17 +111,17 @@ class SingleNodeLifecycleE2ETest {
         desire(PAUSED);
         awaitStatus(job, JobStatus.SUSPENDED);
         assertActualState(PAUSED, 2);
-        assertThat(readFaces.status(PIPE)).isEqualTo(new PipelineStatus(PIPE, PAUSED));
+        assertReadFaceReports(PIPE, PAUSED);
 
         desire(RUNNING);
         awaitStatus(job, JobStatus.RUNNING);
         assertActualState(RUNNING, 3);
-        assertThat(readFaces.status(PIPE)).isEqualTo(new PipelineStatus(PIPE, RUNNING));
+        assertReadFaceReports(PIPE, RUNNING);
 
         desire(STOPPED);
         awaitStatus(job, JobStatus.FAILED); // Jet reports a cancelled job as FAILED
         assertActualState(STOPPED, 4);
-        assertThat(readFaces.status(PIPE)).isEqualTo(new PipelineStatus(PIPE, STOPPED));
+        assertReadFaceReports(PIPE, STOPPED);
     }
 
     @Test
@@ -162,4 +168,20 @@ class SingleNodeLifecycleE2ETest {
         }
         throw new AssertionError("job did not reach " + expected + " within budget; last status was " + last);
     }
+
+    /**
+     * The state the read face reports, compared on the fields this case is about.
+     *
+     * <p>Not whole-record equality: the observation now carries when it was taken, so a record built here
+     * to compare against would have to invent a time, and would fail on whatever time it invented. What
+     * this case is about is the state the converger reached and the absence of a failure over it -- and
+     * that the reading is stamped at all is asserted once, separately, where it means something.
+     */
+    private void assertReadFaceReports(String pipelineId, PipelineState expected) {
+        assertThat(readFaces.status(pipelineId))
+                .returns(pipelineId, PipelineStatus::pipelineId)
+                .returns(expected, PipelineStatus::state)
+                .returns(null, PipelineStatus::failure);
+    }
+
 }

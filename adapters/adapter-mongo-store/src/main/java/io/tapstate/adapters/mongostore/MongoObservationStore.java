@@ -11,6 +11,8 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
 import org.bson.Document;
 
+import java.time.Instant;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -86,6 +88,12 @@ public final class MongoObservationStore implements ObservationStore {
                 .append("metrics", metrics)
                 .append("snapshot", snapshot)
                 .append("positions", positions);
+        if (observation.observedAt() != null) {
+            // Stored as a BSON date, not a string: the server can then order and expire on it, and a
+            // lexicographic sort over an instant is not a chronological one. Absent when the publisher did
+            // not record a time, so absence keeps meaning "not known" rather than the epoch.
+            document.append("observedAt", Date.from(observation.observedAt()));
+        }
         if (observation.failure() != null) {
             // Only a pipeline that actually died carries a failure: the field is absent while healthy rather
             // than present and empty, so absence keeps meaning "nothing went wrong".
@@ -106,7 +114,24 @@ public final class MongoObservationStore implements ObservationStore {
             throw corrupt(id);
         }
         return new Observation(id, parseState(state, id), readMetrics(document, id), readSnapshot(document, id),
-                readPositions(document, id), readFailure(document, id));
+                readPositions(document, id), readFailure(document, id), readObservedAt(document, id));
+    }
+
+    /**
+     * Reads when the projection was taken; a missing field reads null — the document was written before this
+     * version recorded it, or its publisher did not. Null stays null: a reader filling it in from its own
+     * clock would report every stale projection as fresh, which is the one answer this field exists to stop.
+     * A non-date cell is corruption, caught here rather than escaping as a ClassCastException later.
+     */
+    private static Instant readObservedAt(Document document, String id) {
+        Object raw = document.get("observedAt");
+        if (raw == null) {
+            return null;
+        }
+        if (!(raw instanceof Date observedAt)) {
+            throw corrupt(id);
+        }
+        return observedAt.toInstant();
     }
 
     /**

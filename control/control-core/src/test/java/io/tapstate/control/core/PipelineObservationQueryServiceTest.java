@@ -170,17 +170,27 @@ class PipelineObservationQueryServiceTest {
     }
 
     @Test
-    void metricsProjectsThePublishedPositions() {
+    void metricsProjectsThePublishedPositionsAsTheTargetAckedOnes() {
         var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(runningWithPositions()));
 
-        assertThat(service.metrics("orders_sync").positions()).containsEntry("orders", "w7");
+        // The stored projection calls them positions; this face calls them what they are, because it is
+        // the face somebody reads to decide whether a run is stuck.
+        assertThat(service.metrics("orders_sync").targetAckedPosition()).containsEntry("orders", "w7");
     }
 
     @Test
     void metricsPositionsAreEmptyWhenTheObservationHasNone() {
         var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()));
 
-        assertThat(service.metrics("orders_sync").positions()).isEmpty();
+        assertThat(service.metrics("orders_sync").targetAckedPosition()).isEmpty();
+    }
+
+    @Test
+    void theMetricsFaceNamesThePositionsItDoesNotRecord() {
+        // Empty here would say this face records every position there is and simply has none of them,
+        // which is the reading that turns a stalled target into an idle source.
+        assertThat(PipelineMetrics.POSITIONS_NOT_COLLECTED)
+                .containsExactly("sourceHeadPosition", "processedPosition");
     }
 
     @Test

@@ -31,6 +31,23 @@
       <artifactId>tapdata-pdk-api</artifactId>
     </dependency>
 
+    <!-- The host's logging facade. A connector's own output is written through this rather than being
+         dropped or printed straight to the console, so it lands in the same log, under the same format,
+         and with the pipeline attribution the read face files lines by. Facade only: which backend it
+         binds to stays the assembly root's choice. -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+
+    <!-- The name of the attribution slot a log line carries its pipeline in, shared with the appender
+         that files lines by it rather than spelled twice (core ring, zero third-party). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-logging</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
     <!-- The event envelope this bridge projects PDK TapEvents to and from — the shared currency the
          spi ports carry (core ring, zero third-party). Compile scope: the codec's signatures are in
          terms of it. -->

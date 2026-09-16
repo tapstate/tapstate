@@ -9,6 +9,8 @@ import io.tapstate.spi.store.IoError;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
+import java.util.Date;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -40,6 +42,38 @@ class MongoObservationStoreTest {
         assertThat(orders.get("rowsDone")).isEqualTo(90000L);
         assertThat(orders.get("rowsTotal")).isEqualTo(120000L);
         assertThat(orders.get("donePct")).isEqualTo(75);
+    }
+
+    @Test
+    void roundTripPreservesWhenTheObservationWasTaken() {
+        Instant observedAt = Instant.parse("2026-07-01T12:34:56.789Z");
+        Observation obs = new Observation("orders_sync", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+                null, observedAt);
+
+        assertThat(MongoObservationStore.toObservation(MongoObservationStore.toDocument(obs))).isEqualTo(obs);
+    }
+
+    @Test
+    void theObservationTimeIsStoredAsADateNotAString() {
+        Observation obs = new Observation("orders_sync", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+                null, Instant.parse("2026-07-01T12:34:56.789Z"));
+
+        Object stored = MongoObservationStore.toDocument(obs).get("observedAt");
+
+        // A stored instant is only useful if the server can order and expire it, and a string sorts
+        // lexicographically rather than chronologically. The round trip above passes either way, so this is
+        // the assertion that holds the encoding.
+        assertThat(stored).isInstanceOf(Date.class);
+    }
+
+    @Test
+    void toObservationOnADocumentMissingTheObservationTimeReadsNotKnown() {
+        Document legacy = new Document("_id", "orders_sync").append("state", "RUNNING");
+
+        // A document written before this version recorded the time is read, not rejected, and the absence
+        // stays an absence: filling it in from the reader's own clock would report every stale projection
+        // as fresh.
+        assertThat(MongoObservationStore.toObservation(legacy).observedAt()).isNull();
     }
 
     @Test
