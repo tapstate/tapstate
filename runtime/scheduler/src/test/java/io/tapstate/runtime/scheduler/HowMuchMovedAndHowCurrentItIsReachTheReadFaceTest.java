@@ -1,5 +1,6 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.event.Op;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
@@ -18,9 +19,11 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -331,6 +334,34 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
             assertThat(point.attributes().get("op")).isEqualTo("read");
             assertThat(point.attributes().get("direction")).isEqualTo("in");
         });
+    }
+
+    @Test
+    @DisplayName("no change kind the engine has lands on the name kept for kinds nothing recognises")
+    void everyOperationTheEngineProducesReachesTheFaceAsItself() {
+        Set<String> names = new HashSet<>();
+        int checked = 0;
+        for (Op op : Op.values()) {
+            CaptureReading one =
+                    new CaptureReading(Map.of("orders", Map.of(op.symbol(), 1L)), READING_SINCE);
+
+            MetricFact records =
+                    factNamed(facts(one, DeliveryReading.NONE, AT), "tapstate.pipeline.records");
+
+            String name = (String) records.points().get(0).attributes().get("op");
+            // "other" is for a symbol arriving from outside the engine's own set. A kind the engine
+            // itself produces reaching it would tell a reader only that somebody gave up - and it would
+            // arrive the day somebody adds a kind, silently, with nothing to notice a list gone stale.
+            assertThat(name).as("%s reaches the face as itself", op).isNotEqualTo("other");
+            assertThat(name).as("%s is named at all", op).isNotBlank();
+            names.add(name);
+            checked++;
+        }
+        // The witness the loop above needs: an empty set of kinds would satisfy every assertion in it.
+        assertThat(checked).isEqualTo(Op.values().length).isNotZero();
+        // And distinct, which the assertions inside the loop cannot see one at a time. Two kinds sharing
+        // a name would be two series added together, and the sum reads exactly like a healthy single one.
+        assertThat(names).hasSize(checked);
     }
 
     private List<MetricFact> facts(DeliveryReading reading, Instant at) {

@@ -1,5 +1,6 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.event.Op;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
@@ -22,12 +23,15 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Publishes a pipeline's observation from its converged actual state: it reads the fenced checkpoint,
@@ -175,12 +179,18 @@ public final class ObservationPublisher {
      * produces reads only while it is loading — is a consequence rather than a definition, and it stops
      * being true of every operation but this one the moment the load ends.
      *
+     * <p><strong>Derived from the engine's own change kinds, not copied from them.</strong> A list typed
+     * out here would be right on the day it was written and would then go on publishing a kind added later
+     * under the name kept for kinds nothing recognises — a value a reader cannot interpret, arriving
+     * silently, with no gate anywhere that a second copy had stopped agreeing with the first.
+     *
      * <p>The fallback covers a symbol nothing here recognises, which is the one case "other" is for: the
      * closed set of operation names exists so that nothing arriving from the data can add a value to it.
-     * Two unrecognised symbols therefore land on one name, which is what the summing below is for.
+     * A symbol reaches that fallback only by arriving from outside the engine's own set. Two such symbols
+     * therefore land on one name, which is what the summing below is for.
      */
-    private static final Map<String, String> OP_NAMES = Map.of(
-            "i", "insert", "u", "update", "d", "delete", "ddl", "ddl", "r", "read");
+    private static final Map<String, String> OP_NAMES = Arrays.stream(Op.values())
+            .collect(Collectors.toUnmodifiableMap(Op::symbol, op -> op.name().toLowerCase(Locale.ROOT)));
 
     private final StateStore state;
     private final ObservationStore observations;
