@@ -152,9 +152,10 @@ final class PdkConnector implements AutoCloseable {
             // and drift the first time either grows a second source.
             TapNodeSpecification specification = new TapNodeSpecification();
             specification.setDataTypesMap(dataTypesFrom(ref.spec()));
+            Map<String, Object> config = ConfigTypeCoercion.coerce(connectorId, ref.spec(), settings);
             TapConnectorContext context = new TapConnectorContext(
-                    specification, DataMap.create(ConfigTypeCoercion.coerce(connectorId, ref.spec(), settings)),
-                    null, new ConnectorLog(connectorId, pipelineId));
+                    specification, DataMap.create(config), nodeConfigFrom(ref.spec(), config),
+                    new ConnectorLog(connectorId, pipelineId));
             // A connector reaches what it keeps for itself through the context's state maps during init,
             // discovery and the drive; the context leaves them null, so give it live ones or the first
             // touch NPEs. The map handed over here is the same reference for as long as this handle
@@ -309,6 +310,38 @@ final class PdkConnector implements AutoCloseable {
             }
             converted.getData().forEach(table.getNameFieldMap()::put);
         }
+    }
+
+    /**
+     * The node config to hand the connector: every setting the connector's own spec declares under its
+     * {@link ConnectorForm#NODE node form}.
+     *
+     * <p>A connector reads a setting that form declares off this map and nowhere else, so a host that
+     * hands over none of them silences every one of them, whatever the workspace wrote. The host
+     * authors one settings map, and the connector's own spec is what says which part of it belongs to
+     * the node — a MongoDB source reads its before-image behaviour from one such setting, and without
+     * it a delete carries the document key alone.
+     *
+     * <p>A projection of the authored settings rather than a split of them: a name can be declared in
+     * both forms, and the connection config stays the whole authored map as it has always been, so
+     * nothing a connector reads today stops arriving.
+     *
+     * <p>Never null, even when it stays empty — a connector that reads its node config without first
+     * checking for one crashes bare on a null, while an empty map answers every question it asks with
+     * the same "not set" a missing field would.
+     */
+    private static DataMap nodeConfigFrom(String spec, Map<String, Object> settings) {
+        DataMap nodeConfig = DataMap.create();
+        if (settings == null || settings.isEmpty()) {
+            return nodeConfig;
+        }
+        Map<String, Map<?, ?>> declared = ConnectorForm.NODE.items(spec);
+        settings.forEach((name, value) -> {
+            if (declared.containsKey(name)) {
+                nodeConfig.put(name, value);
+            }
+        });
+        return nodeConfig;
     }
 
     /**

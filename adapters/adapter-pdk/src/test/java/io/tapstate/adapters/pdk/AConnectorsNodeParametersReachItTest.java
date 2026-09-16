@@ -68,4 +68,35 @@ class AConnectorsNodeParametersReachItTest {
                     .containsEntry("preImage", true);
         }
     }
+
+    @Test
+    void aConnectionParameterStaysOutOfTheNodeConfigAndInTheConnectionConfig(@TempDir Path dir) {
+        ConnectorRef ref = new ConnectorRef(
+                List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, SPEC);
+        Map<String, Object> settings = new LinkedHashMap<>();
+        settings.put("uri", "mongodb://localhost:27017/orders");
+        settings.put("preImage", true);
+
+        try (PdkConnector connector = PdkConnector.open("demo", ref, settings)) {
+            // The node config is what the node form declares, not a second copy of everything: a
+            // connector reading it to decide what this one use of the connection does must not find
+            // where the database is mixed in with it.
+            assertThat(connector.context().getNodeConfig()).doesNotContainKey("uri");
+            assertThat(connector.context().getConnectionConfig())
+                    .containsEntry("uri", "mongodb://localhost:27017/orders");
+        }
+    }
+
+    @Test
+    void aConnectorDeclaringNoNodeFormIsHandedAnEmptyNodeConfigRatherThanNone(@TempDir Path dir) {
+        // The synthetic paths and the connectors that ship a connection form alone. A connector may
+        // read its node config without first checking for one -- an upstream connector does exactly
+        // that -- so handing it nothing at all is a bare crash where an empty map answers "not set".
+        ConnectorRef ref = new ConnectorRef(
+                List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null);
+
+        try (PdkConnector connector = PdkConnector.open("demo", ref, Map.of("uri", "mongodb://host/db"))) {
+            assertThat(connector.context().getNodeConfig()).isNotNull().isEmpty();
+        }
+    }
 }

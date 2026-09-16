@@ -9,8 +9,8 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * Converts a connection's config values to the types the connector's own connection form declares,
- * so a value spelled as text reaches the connector as the number or boolean its config bean holds.
+ * Converts a connector's config values to the types the connector's own forms declare, so a value
+ * spelled as text reaches the connector as the number or boolean its config bean holds.
  *
  * <p>A hand-written or older workspace can spell {@code port} as {@code "3306"}, while the connector's
  * config bean holds a {@code Number} and casts to it. Without this the cast throws out of the
@@ -18,9 +18,11 @@ import java.util.regex.Pattern;
  * instead of a diagnosis. The boolean shape is worse: it survives the connection test and fails only
  * at the first write, long after the pipeline reported itself running.
  *
- * <p><b>The declaration coerced from is the connector's own</b> — the connection form it ships inside
- * its spec resource ({@code configOptions.connection.properties}), reached through the raw spec text
- * the ref carries. Two facts on a form item declare a non-text type, and both are the connector's:
+ * <p><b>The declaration coerced from is the connector's own</b> — the {@link ConnectorForm forms} it
+ * ships inside its spec resource, reached through the raw spec text the ref carries. Both forms are
+ * read, because a connector loads both configs into the one bean that casts: a node-form setting
+ * spelled as text reaches that cast exactly as a connection-form one does. Two facts on a form item
+ * declare a non-text type, and both are the connector's:
  *
  * <ul>
  *   <li>the schema {@code type}, when it says {@code boolean}, or {@code number} / {@code integer} /
@@ -140,35 +142,23 @@ final class ConfigTypeCoercion {
     }
 
     /**
-     * Each field the connector's connection form declares as a number or a boolean, keyed by the name
-     * the connector reads it under. Container nodes are flattened: a form groups optional fields under a
-     * node of its own, while the connector still reads them by their leaf name.
+     * Each field either of the connector's forms declares as a number or a boolean, keyed by the name
+     * the connector reads it under. The spec is parsed once and both forms read off that one parse.
      */
     private static Map<String, Declared> declaredTypes(String spec) {
         Map<String, Declared> declared = new LinkedHashMap<>();
-        if (JsonReader.parse(spec) instanceof Map<?, ?> root
-                && root.get("configOptions") instanceof Map<?, ?> configOptions
-                && configOptions.get("connection") instanceof Map<?, ?> connection
-                && connection.get("properties") instanceof Map<?, ?> properties) {
-            collect(properties, declared);
+        if (!(JsonReader.parse(spec) instanceof Map<?, ?> root)) {
+            return declared;
+        }
+        for (ConnectorForm form : ConnectorForm.values()) {
+            form.itemsIn(root).forEach((name, item) -> {
+                Declared type = declaredType(item);
+                if (type != null) {
+                    declared.put(name, type);
+                }
+            });
         }
         return declared;
-    }
-
-    private static void collect(Map<?, ?> properties, Map<String, Declared> out) {
-        for (Map.Entry<?, ?> entry : properties.entrySet()) {
-            if (!(entry.getKey() instanceof String name) || !(entry.getValue() instanceof Map<?, ?> item)) {
-                continue; // a non-object property value is a malformed form item — skip it, don't guess
-            }
-            if (item.get("properties") instanceof Map<?, ?> nested) {
-                collect(nested, out);
-                continue;
-            }
-            Declared declared = declaredType(item);
-            if (declared != null) {
-                out.put(name, declared);
-            }
-        }
     }
 
     /** The non-text type this form item declares, or null when it declares text or nothing. */
