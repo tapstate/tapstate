@@ -210,8 +210,10 @@ public final class TapEventCodec {
      * <p>{@code path} is how the schema names this value's place, which is the column's own name at
      * the top level and the dotted path below it — the spelling discovery itself uses for a field
      * inside a document, reported in the same field map the top-level columns come from. It is null
-     * only beneath an array, the one place the schema has no way to name at all; what the source calls
-     * a value there is read off its own driver type instead, by {@link SchemaNames}.
+     * beneath an array, the one place the schema has no way to name at all. Wherever the field map
+     * holds no row for the place - because an array ended the path, or because discovery never
+     * described it - what the source calls the value is read off its own driver type instead, by
+     * {@link SchemaNames}.
      */
     private static Object converted(Object value, TapCodecsRegistry codecs,
             SchemaNames names, String path, boolean toNamespaceWidths) {
@@ -264,44 +266,53 @@ public final class TapEventCodec {
     }
 
     /**
-     * What the source's schema calls the values of one row: by the place it names, and — for the one
-     * place it can never name — by the driver type it named there.
+     * What the source's schema calls the values of one row: by the place it names, and — wherever it
+     * names no place — by the driver type it named somewhere it did.
      *
-     * <p>The way back is keyed on a name, so a value the schema names nothing for is written as the
-     * portable value it travelled as. A field inside a document has a place in the field map, spelled
-     * as the dotted path that reaches it, so the path reading answers for it; where that reading comes
-     * back empty the schema was asked about that place and said nothing, and the absence is its answer.
+     * <p>The way back is keyed on a name, so a value nothing names reaches the target as the portable
+     * value it travelled as and is stored there as the wrong type. The place reading is tried first and
+     * is never overruled: a column has a place in the field map and a field inside a document has one
+     * too, spelled as the dotted path that reaches it, so wherever discovery described the place, the
+     * schema's own word for it is the answer even where the value's own class would say something else.
      *
-     * <p><b>An array's elements have no place at all.</b> They are positional and may each be a
-     * different type, so "the type of this array's elements" is not something a field map can state and
-     * discovery reports no row for it — the schema is not silent about elements, it has nowhere to
-     * speak. So an element's name is read off its own driver type: the name this same schema gives that
-     * exact type where it does name a place holding one. That is still the source's own answer and not
-     * a guess about the element, which is why it is preferred to the two alternatives — leaving the
-     * element as its portable value, which a target of the same kind then stores as the wrong type, and
-     * lending it the array's own declared name, which would rebuild every element as whatever the array
-     * is declared to be and report success.
+     * <p><b>An absent place is not the schema answering.</b> An array's elements have nowhere for it to
+     * speak: they are positional and may each be a different type, so "the type of this array's
+     * elements" is not something a field map can state, and discovery reports no row for one. And a
+     * field map holding no row for a document's interior, or for a column, is the fields discovery
+     * happened to meet in the documents it sampled rather than a census of the collection — the
+     * ordinary case for a schemaless source, not a corner of it. Neither absence says anything about
+     * the type, so both are read the same way: off the value's own driver type, as the name this same
+     * schema gives that exact type where it does name a place holding one. Reading only one of them
+     * decodes one document two ways — {@code refs[0]} arriving as the driver's own type while
+     * {@code meta.ref} beside it, holding that very value, arrives as text — with the better-described
+     * place getting the worse answer.
+     *
+     * <p>That name is still the source's own answer and not a guess about the value, which is why it is
+     * preferred to the two alternatives — leaving the value as its portable value, which a target of
+     * the same kind then stores as the wrong type, and lending it the declared name of the container
+     * holding it, which would rebuild every element of an array as whatever the array is declared to be,
+     * and every field of a document as whatever the document is, and report success.
      *
      * <p><b>A type this change spells two ways has no answer and gets none.</b> Picking either spelling
-     * would rebuild elements as one of them and succeed; the elements stay portable instead, which is
+     * would rebuild those values as one of them and succeed; they stay portable instead, which is
      * the visible second-best rather than a silent wrong one. <b>Two ways is what the values this change
      * carries say, not what the whole schema says.</b> A declared name reaches a driver type only through
      * a value that has both, so a second spelling whose column is absent or null here is not seen at all
      * and the one spelling on offer is used — a change is ambiguous only where it shows the ambiguity.
-     * A collection whose schema really does spell one type two ways therefore lands its elements
+     * A collection whose schema really does spell one type two ways therefore lands those values
      * portable in the documents that carry both columns and rebuilt in the ones that carry only one,
      * which is the same per-change reading the naming column itself gets and visible in the target
      * either way. The schema alone cannot do better: nothing in a field map says which declared name
      * belongs to which driver class until a value arrives holding the two together.
      *
      * <p><b>Taken off the whole row at once, never as the walk reaches each value.</b> Read as the walk
-     * went, an array that happened to sit before the named column would restore and the same array after
-     * it would not, so one document would decode two ways depending only on the order a connector
-     * reported its fields. It is taken off both images of a change together for the same reason: two
-     * halves of one row must not disagree about a value that did not change, and a connector is free to
-     * report a before image the named column is not in. Taking it on the first array element the walk
-     * reaches rather than up front is the same reading - the whole row either way - and leaves a row
-     * holding no array paying nothing for it, which is most rows.
+     * went, an unnamed value that happened to sit before the naming column would restore and the same
+     * value after it would not, so one document would decode two ways depending only on the order a
+     * connector reported its fields. It is taken off both images of a change together for the same
+     * reason: two halves of one row must not disagree about a value that did not change, and a connector
+     * is free to report a before image the named column is not in. Taking it on the first unnamed value
+     * the walk reaches rather than up front is the same reading - the whole row either way - and leaves
+     * a row whose every value the schema does name paying nothing for it, which is most rows.
      *
      * <p>Only driver types the connector registered a conversion for are read, because only those ever
      * reach a way back; it also keeps one ordinary kind spelled at two widths — a schema naming
@@ -320,8 +331,9 @@ public final class TapEventCodec {
 
         /**
          * What the schema calls each driver type it names a place for, taken whole off every image this
-         * change carries, and taken only once an array element has asked — so a row holding no array,
-         * which is most rows on the hottest path this adapter has, never walks itself a second time.
+         * change carries, and taken only once a value the schema names no place for has asked — so a
+         * row it names throughout, which is most rows on the hottest path this adapter has, never walks
+         * itself a second time.
          */
         private Map<Class<?>, String> byType;
 
@@ -345,17 +357,20 @@ public final class TapEventCodec {
         }
 
         /**
-         * What this schema calls the value at {@code path}, or — where the path ended because an array
-         * did — what it calls that value's own driver type. Null when it names neither.
+         * What this schema calls the value at {@code path}, or — where it names no place there, the
+         * path having ended beneath an array or never been described — what it calls that value's own
+         * driver type. Null when it names neither.
          */
         String of(Object value, String path) {
-            if (path != null) {
-                return byPath.get(path);
+            String declared = path == null ? null : byPath.get(path);
+            if (declared != null) {
+                return declared;
             }
-            // Only a class the connector registered a conversion for can ever be in the reading, so an
-            // element of any other kind is answered without taking one. Without this an array of plain
-            // text or numbers - which is most arrays - makes the first element it holds walk the whole
-            // change a second time to be told nothing, on the hottest path this adapter has.
+            // Only a class the connector registered a conversion for can ever be in the reading, so a
+            // value of any other kind is answered without taking one. Without this the plain text and
+            // numbers no schema happens to name - which is most of what an unnamed place holds - make
+            // the first one the walk reaches walk the whole change a second time to be told nothing, on
+            // the hottest path this adapter has.
             if (value == null || codecs == null
                     || codecs.getCustomToTapValueCodec(value.getClass()) == null) {
                 return null;

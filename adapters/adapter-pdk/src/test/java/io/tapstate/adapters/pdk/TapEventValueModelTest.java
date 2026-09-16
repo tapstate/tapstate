@@ -383,16 +383,58 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void aCarriedValueInsideADocumentTheSchemaDoesNotNameReachesTheTargetAsItsPortableValue() {
+    void aFieldInsideADocumentIsNeverRebuiltAsWhateverTheDocumentItselfIsDeclaredToBe() {
         // The column is named, its interior is not - which is what discovery reports for a document
-        // nobody sampled to that depth. Lending the interior the column's own declared name would
-        // rebuild it as whatever the column is, so the absence is honoured rather than filled in.
+        // nobody sampled to that depth - and the column is declared the very type its interior holds,
+        // so the document's own declared name is the only name in the row. Lending it down would
+        // rebuild every field of the document as whatever the document is declared to be and report
+        // success, which is worse than the portable value. Nothing else here names this driver type,
+        // so the interior has no answer of its own and stays portable.
         Envelope decoded = insert(row("doc", new LinkedHashMap<>(Map.of("ref", new DriverKey("64f0c0de")))),
                 CODECS, Map.of("doc", KEY_COLUMN));
 
         TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
 
         assertThat(encoded.getAfter().get("doc")).isEqualTo(Map.of("ref", "64f0c0de"));
+    }
+
+    @Test
+    void aFieldTheSchemaNeverDescribedIsRestoredLikeAnArrayElementBesideIt() {
+        // One document, one driver type, three places: a column the schema names, a field inside a
+        // document it names nothing beneath, and an array element it has no way to name. Read beneath
+        // arrays only, this row decodes two ways - the element restored, the field beside it holding
+        // that very value arriving as the text it travelled as, with the better-described place
+        // getting the worse answer. A field map naming `meta` and nothing under it is the fields
+        // discovery met in the documents it sampled, not a statement that `meta.ref` has no type, so
+        // that absence is read the same way the element's is.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("_id", key, "meta", new LinkedHashMap<>(Map.of("ref", key)), "refs", List.of(key)),
+                CODECS,
+                Map.of("_id", KEY_COLUMN, "meta", "DOCUMENT", "refs", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("meta"))
+                .as("the field whose place the schema never described")
+                .isEqualTo(Map.of("ref", key));
+        assertThat(encoded.getAfter().get("refs"))
+                .as("the element beside it, which gets the same answer")
+                .isEqualTo(List.of(key));
+    }
+
+    @Test
+    void aColumnTheSchemaNeverDescribedIsRestoredTheSameWay() {
+        // The same absence one level up. A field that first appeared after discovery sampled the
+        // collection has no row in the field map either, and a schemaless source produces those
+        // routinely; the declared name that does reach this driver type is read for it too, so the
+        // column lands as the driver's own type rather than as its text.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(row("_id", key, "parent", key), CODECS, Map.of("_id", KEY_COLUMN));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("parent")).isEqualTo(key);
     }
 
     @Test
