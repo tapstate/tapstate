@@ -82,6 +82,7 @@ cli.repl-builtin-only
 cli.request-timed-out
 cli.resource-not-found
 cli.server-not-named
+cli.sign-in-unusable
 cli.unknown-connector
 cli.verb-not-implemented
 cli.version-mismatch
