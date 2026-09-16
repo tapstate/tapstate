@@ -12,6 +12,7 @@ import io.tapdata.entity.mapping.DefaultExpressionMatchingMap;
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.utils.DataMap;
 import io.tapdata.pdk.apis.TapConnector;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.entity.ConnectorCapabilities;
@@ -53,19 +54,22 @@ final class PdkConnector implements AutoCloseable {
     private final ConnectorFunctions functions;
     private final TapConnectorContext context;
     private final String stateNamespace;
+    /** The pipeline this handle was opened for, or null for a drive that names none. */
+    private final String pipelineId;
     private final TapCodecsRegistry codecs;
     /** Volatile because the thread that stops an instance is rarely the thread that drove it. */
     private volatile boolean stopped;
 
     private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
-                         TapCodecsRegistry codecs, String stateNamespace) {
+                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId) {
         this.connectorId = connectorId;
         this.loader = loader;
         this.connector = connector;
         this.functions = functions;
         this.context = context;
         this.stateNamespace = stateNamespace;
+        this.pipelineId = pipelineId;
         this.codecs = codecs;
     }
 
@@ -75,7 +79,7 @@ final class PdkConnector implements AutoCloseable {
      * later drive for anything they wrote to be read back by.
      */
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings) {
-        return open(connectorId, ref, settings, null);
+        return open(connectorId, ref, settings, null, null);
     }
 
     /**
@@ -83,12 +87,15 @@ final class PdkConnector implements AutoCloseable {
      * handle. Throws a coded connector-domain exception for the structural failures: an incompatible
      * API level, a missing / non-connector class, or an un-instantiable connector.
      *
-     * <p>{@code stateNamespace} is where whatever this connector keeps for itself belongs — derived
-     * from the pipeline node the drive is for, and null for a drive that names no node.
+     * <p>{@code node} is the pipeline node the drive is for, and null for a drive that names none. It
+     * decides two things at once, which is why it is carried rather than derived away at the call: where
+     * whatever this connector keeps for itself belongs, and which pipeline its own log lines are filed
+     * against. Passing one and not the other would let a connector's notes and its words disagree about
+     * whose run they belong to.
      */
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
-                             String stateNamespace) {
-        return open(connectorId, ref, settings, stateNamespace, null);
+                             PipelineNode node) {
+        return open(connectorId, ref, settings, node, null);
     }
 
     /**
@@ -98,8 +105,13 @@ final class PdkConnector implements AutoCloseable {
      * what every caller got before there was anywhere to put them.
      */
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
-                             String stateNamespace, KeyedStateStore stateStore) {
+                             PipelineNode node, KeyedStateStore stateStore) {
         ensureDeploymentIdentity();
+        // The contract's shared static log channel prints to standard output until somebody listens, and
+        // the first connector opened is the earliest point at which anybody has.
+        ConnectorLog.installSharedChannel();
+        String stateNamespace = ConnectorStateNamespace.of(node);
+        String pipelineId = node == null ? null : node.pipelineId();
         gateApiLevel(connectorId, ref);
 
         ConnectorClassLoader loader;
@@ -142,7 +154,7 @@ final class PdkConnector implements AutoCloseable {
             specification.setDataTypesMap(dataTypesFrom(ref.spec()));
             TapConnectorContext context = new TapConnectorContext(
                     specification, DataMap.create(ConfigTypeCoercion.coerce(connectorId, ref.spec(), settings)),
-                    null, new SilentLog());
+                    null, new ConnectorLog(connectorId, pipelineId));
             // A connector reaches what it keeps for itself through the context's state maps during init,
             // discovery and the drive; the context leaves them null, so give it live ones or the first
             // touch NPEs. The map handed over here is the same reference for as long as this handle
@@ -166,7 +178,7 @@ final class PdkConnector implements AutoCloseable {
             // the connector uses its own default capability behaviour, which is the L1 intent.
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
-                    connectorId, loader, connector, functions, context, codecs, stateNamespace);
+                    connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId);
             opened = true;
             return result;
         } finally {
@@ -324,14 +336,28 @@ final class PdkConnector implements AutoCloseable {
         return context;
     }
 
-    /** Runs {@code action} with the connector's own loader installed as the thread context loader. */
+    /**
+     * Runs {@code action} with the connector's own loader installed as the thread context loader, and
+     * with this handle's pipeline named for as long as it runs.
+     *
+     * <p>The attribution is here rather than at each drive because this is the one seam every drive goes
+     * through, and because what it covers is not only the connector's own calls: the libraries a
+     * connector brings with it log through the host's facade too, on whatever thread is running the
+     * drive, and those lines are as much part of why a run is stuck as anything the connector says
+     * itself. Both the loader and the attribution are handed back afterwards -- the threads this runs on
+     * are shared and outlive the drive.
+     */
     <T> T underLoader(Action<T> action) throws Throwable {
         ClassLoader restore = Thread.currentThread().getContextClassLoader();
+        String previousPipeline = pipelineId == null ? null : ConnectorAttribution.claim(pipelineId);
         try {
             Thread.currentThread().setContextClassLoader(connector.getClass().getClassLoader());
             return action.run();
         } finally {
             Thread.currentThread().setContextClassLoader(restore);
+            if (pipelineId != null) {
+                ConnectorAttribution.restore(previousPipeline);
+            }
         }
     }
 

@@ -65,9 +65,22 @@ final class Repl {
      * Printed under a non-empty metrics read. The metric names are not a compatibility promise in this
      * preview: they may be renamed as the metric model settles, and the read face is where a user decides
      * whether to build on them, so the disclaimer belongs there rather than only in the documentation.
+     *
+     * <p>Written as "the names above" rather than "metric names": a position is not a metric, and the
+     * narrower wording left the one field on this face that is not a number outside a disclaimer printed
+     * directly underneath it.
      */
     private static final String METRIC_NAMES_UNSTABLE =
-            "(metric names are unstable in this preview and may change)";
+            "(the names above are unstable in this preview and may change)";
+
+    /** The one position this product records, named on every face so no reader has to guess which it is. */
+    private static final String TARGET_ACKED_POSITION = "targetAckedPosition";
+
+    /** What a position that is recorded but has no value yet reads as, as against one nobody records. */
+    private static final String NOTHING_ACKED_YET = "nothing acked yet";
+
+    /** What a position nobody records reads as, printed beside its name rather than left out entirely. */
+    private static final String NOT_COLLECTED = "not collected";
 
     /** REPL-only words handled here rather than by the command table; completed alongside the verbs. */
     static final List<String> BUILTINS =
@@ -3197,9 +3210,15 @@ final class Repl {
     }
 
     /**
-     * {@code status <pipeline-id>} — reads the pipeline's lifecycle state from the server and prints
-     * {@code <id>  <state>}. A missing id is a benign usage line; a pipeline that has published no
+     * {@code status <pipeline-id>} — reads the pipeline's lifecycle state from the server, prints
+     * {@code <id>  <state>}, and then answers the one question somebody typing this actually has: if it is
+     * not working, what is wrong. A missing id is a benign usage line; a pipeline that has published no
      * observation is a coded refusal ({@code monitor.no-observation}) rendering its code and message.
+     *
+     * <p>The answer is a fixed checklist walked over readings that already existed on four separate faces.
+     * Correlating them by hand is what this replaces; no new measurement is taken and no new face is added.
+     * The state line above it is unchanged and still the first thing printed, so anything reading it keeps
+     * working.
      */
     private int statusOnline(List<String> words) {
         String id = readTargetId(words);
@@ -3217,6 +3236,7 @@ final class Repl {
                     // coded refusal on stderr.
                     renderStatusFailure(found.failureCode(), found.failureMessage());
                 }
+                renderDiagnosis(out, id, found);
                 out.flush();
                 yield Cli.EXIT_OK;
             }
@@ -3226,10 +3246,17 @@ final class Repl {
     }
 
     /**
-     * {@code metrics <pipeline-id>} — reads the pipeline's open map of run statistics and its per-table source
-     * positions and prints one {@code <name>  <value>} line each in name order (a per-table position under a
-     * {@code perTableOffset.<table>} key), or a benign {@code no metrics} line when none are wired yet
-     * (unavailable, never faked). A coded refusal renders its code and message.
+     * {@code metrics <pipeline-id>} — reads the pipeline's open map of run statistics and the one source
+     * position it records, and prints one {@code <name>  <value>} line each in name order (a per-table
+     * position under a {@code targetAckedPosition.<table>} key), or a benign {@code no metrics} line when
+     * nothing is wired yet (unavailable, never faked). A coded refusal renders its code and message.
+     *
+     * <p>Once there is anything to print, the positions the server says it does not record are printed too,
+     * by name, reading {@code not collected}. Leaving them out is what makes a stalled run unreadable: with
+     * one unnamed position on screen a reader supplies the missing ones from expectation and concludes the
+     * source is idle, when what the line actually says is only how far the target has confirmed writes. A
+     * recorded position with nothing in it yet is distinguished from an unrecorded one for the same reason
+     * — the two are one blank line apart on screen and a different problem apart in the world.
      */
     private int metricsOnline(List<String> words) {
         String id = readTargetId(words);
@@ -3244,10 +3271,17 @@ final class Repl {
             case MetricsOutcome.Found found -> {
                 Map<String, String> lines = new TreeMap<>();
                 found.metrics().forEach((name, value) -> lines.put(name, String.valueOf(value)));
-                found.perTableOffset().forEach((table, position) -> lines.put("perTableOffset." + table, position));
+                found.targetAckedPosition().forEach(
+                        (table, position) -> lines.put(TARGET_ACKED_POSITION + "." + table, position));
                 if (lines.isEmpty()) {
                     out.println("no metrics");
                 } else {
+                    // Nothing is wired at all in the branch above, so no position is on screen to be read as
+                    // the wrong one; here one is, and that is where naming the rest starts earning its line.
+                    if (found.targetAckedPosition().isEmpty()) {
+                        lines.put(TARGET_ACKED_POSITION, NOTHING_ACKED_YET);
+                    }
+                    found.positionsNotCollected().forEach(name -> lines.put(name, NOT_COLLECTED));
                     lines.forEach((name, value) -> out.println(name + "  " + value));
                     // The names above are not a compatibility promise yet. Saying so here, next to them, is
                     // the difference between a user who knowingly accepts the churn and one who wires a
@@ -4481,6 +4515,64 @@ final class Repl {
     private static boolean hasUnboundName(String rendered) {
         int open = rendered.indexOf('{');
         return open >= 0 && rendered.indexOf('}', open + 1) > open;
+    }
+
+    /**
+     * The one answer, printed under the state: what the checklist concluded, the face and value it read to
+     * conclude it, and where to look next.
+     *
+     * <p>Printed on every status, not only a failing one. A checklist that came up empty prints its
+     * readings and what it could not decide, because "nothing matched" and "everything is fine" are
+     * different claims and only the first one is true.
+     *
+     * <p>The other two faces are read only when the status face has not already answered. A run whose
+     * publisher has gone silent is the clearest case of that: every other face would be re-reading the same
+     * old observation, so asking them costs two round trips to learn nothing.
+     */
+    private void renderDiagnosis(PrintWriter out, String id, StatusOutcome.Found found) {
+        StatusDiagnosis.Answer answer = StatusDiagnosis
+                .fromStatusAlone(id, found.state(), found.failureCode(), found.observedAgeMillis())
+                .orElseGet(() -> StatusDiagnosis.of(id, found.state(), found.failureCode(),
+                        found.failureMessage(), found.observedAgeMillis(),
+                        metricsFacts(id), snapshotRowsLoaded(id)));
+        out.println(Ansi.AUTO.string("@|bold why:|@") + " " + answer.conclusion());
+        answer.readings().forEach(reading -> out.println("  read       " + reading));
+        if (answer.next() != null) {
+            out.println("  next       " + answer.next());
+        }
+        answer.cannotSay().forEach(unanswerable -> out.println("  cannot say " + unanswerable));
+    }
+
+    /**
+     * The metrics face's readings for the diagnosis, or null when that face did not answer.
+     *
+     * <p>No failover here, deliberately: the status read just picked the node, and a supplementary read
+     * that cannot be answered becomes "could not be read" in the answer rather than a second round of node
+     * hunting. Null is carried all the way into the answer, because a face nobody could read and a face
+     * with nothing wrong in it are the two readings this command exists to keep apart.
+     */
+    private MetricsFacts metricsFacts(String id) {
+        return controlPlane.metrics(session.landingNode(), session.credential(), id)
+                        instanceof MetricsOutcome.Found found
+                ? MetricsFacts.of(found.metrics())
+                : null;
+    }
+
+    /**
+     * How many rows the snapshot face reports loaded across every table it carries, or null when that face
+     * did not answer.
+     *
+     * <p>Rows, not tables. That face holds one entry per selected table from the moment a run starts and
+     * keeps it for the life of the run, so its size answers how many tables were selected -- the same
+     * number for a run that has loaded nothing and for one whose load finished hours ago. It reports no
+     * total for a table either, so it cannot be asked whether a load is still in flight; what it can be
+     * asked is how much has been loaded, which is the reading the checklist actually wants.
+     */
+    private Long snapshotRowsLoaded(String id) {
+        return controlPlane.snapshot(session.landingNode(), session.credential(), id)
+                        instanceof SnapshotOutcome.Found found
+                ? found.tables().values().stream().mapToLong(RemoteTableSnapshot::rowsDone).sum()
+                : null;
     }
 
     /**

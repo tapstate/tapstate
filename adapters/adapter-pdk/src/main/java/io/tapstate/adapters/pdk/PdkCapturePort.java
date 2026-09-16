@@ -3,6 +3,7 @@ package io.tapstate.adapters.pdk;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureBatch;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
@@ -183,7 +184,7 @@ public final class PdkCapturePort implements CapturePort {
      * so the full load and the change tail of one run file under one name and read each other's.
      */
     private PdkConnector open(CaptureConfig config) {
-        return open(config, ConnectorStateNamespace.of(config.node()));
+        return open(config, config.node());
     }
 
     /**
@@ -197,9 +198,9 @@ public final class PdkCapturePort implements CapturePort {
         return open(config, null);
     }
 
-    private PdkConnector open(CaptureConfig config, String stateNamespace) {
+    private PdkConnector open(CaptureConfig config, PipelineNode node) {
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                stateNamespace, stateStore);
+                node, stateStore);
     }
 
     /**

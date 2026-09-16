@@ -71,7 +71,7 @@ class PipelinePositionServiceTest {
         assertThat(chain.resumeFrom())
                 .isEqualTo(new PipelinePosition.Point("mysql-bin.000004:154", 3L, 91201L));
         assertThat(chain.recordedAt()).isEqualTo("2026-09-03T10:12:44Z");
-        assertThat(chain.sinkAcked())
+        assertThat(chain.targetAcked())
                 .isEqualTo(new PipelinePosition.Point("mysql-bin.000004:100", 3L, 91100L));
         // The other pipeline on the chain is named, because a write-back moves the chain for it too.
         assertThat(chain.sharedWith()).containsExactly("orders_audit");
@@ -86,7 +86,7 @@ class PipelinePositionServiceTest {
         assertThat(chain.chainId()).isEqualTo(CHAIN);
         assertThat(chain.resumeFrom()).isNull();
         assertThat(chain.recordedAt()).isNull();
-        assertThat(chain.sinkAcked()).isNull();
+        assertThat(chain.targetAcked()).isNull();
     }
 
     /**
@@ -246,7 +246,7 @@ class PipelinePositionServiceTest {
                                 null, PipelinePosition.Point.at("mysql-bin.000009:1"), List.of())))));
 
         assertThat(refused.code()).isEqualTo(PositionError.FIELD_NOT_EDITABLE);
-        assertThat(refused.args()).containsEntry("field", "sinkAcked");
+        assertThat(refused.args()).containsEntry("field", "targetAcked");
         assertThat(meta.rewinds).isEmpty();
     }
 

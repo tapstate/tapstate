@@ -46,9 +46,12 @@ public record PipelinePosition(String pipelineId, List<Chain> chains) {
      *                   a moment because it is read and echoed and never computed on, and because this
      *                   document crosses two Jackson configurations that would each need teaching a time
      *                   type
-     * @param sinkAcked  how far this pipeline's own sink has confirmed writes, or null before its first
-     *                   ack. Not editable, and here because it is the bound the chain's own advance is
-     *                   held under: a resume point ahead of it is one this pipeline has not landed yet
+     * @param targetAcked how far this pipeline's own target has confirmed writes, or null before its
+     *                    first ack. Named for what it is: it is not how far the source could be read to
+     *                    and not how far this pipeline has processed, and on a run whose target has
+     *                    stopped accepting writes those three stand in three different places. Not
+     *                    editable, and here because it is the bound the chain's own advance is held
+     *                    under: a resume point ahead of it is one this pipeline has not landed yet
      * @param sharedWith the other pipelines recorded on this chain, sorted; empty when it is this
      *                   pipeline's alone
      */
@@ -58,7 +61,7 @@ public record PipelinePosition(String pipelineId, List<Chain> chains) {
             List<String> tables,
             Point resumeFrom,
             String recordedAt,
-            Point sinkAcked,
+            Point targetAcked,
             List<String> sharedWith) {
 
         public Chain {

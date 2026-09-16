@@ -50,6 +50,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.SpringBootConfiguration;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
+import org.springframework.boot.jackson.autoconfigure.JsonMapperBuilderCustomizer;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -103,7 +104,7 @@ class PipelineObservationApiTest {
             Map.of("recordCount", 42L, "errorCount", 0L),
             Map.of("orders", new TableSnapshot(10, 100L, 10)));
 
-    /** One running pipeline whose sink-acked source positions have advanced, to exercise perTableOffset. */
+    /** One running pipeline whose target-acked source positions have advanced, to exercise that field. */
     private static final Observation PL_POS = new Observation("pl2", PipelineState.RUNNING,
             Map.of("recordCount", 6L, "errorCount", 0L),
             Map.of(),
@@ -200,30 +201,60 @@ class PipelineObservationApiTest {
     }
 
     @Test
-    void metricsExposesPerTableOffsetWhenPositionsArePublished() {
+    void metricsExposesTheTargetAckedPositionWhenPositionsArePublished() {
         Map<String, Object> body = client().get().uri("/api/pipelines/pl2/metrics")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
 
         assertThat(body.get("pipelineId")).isEqualTo("pl2");
         // A source position is a string, and the metrics map is numeric run statistics. Carrying the
-        // positions as a sibling rather than nested inside that map keeps every metrics cell a number,
+        // position as a sibling rather than nested inside that map keeps every metrics cell a number,
         // so a reader never has to type-test a cell before using it.
-        assertThat(body.get("perTableOffset")).isEqualTo(Map.of("orders", "w7"));
+        assertThat(body.get("targetAckedPosition")).isEqualTo(Map.of("orders", "w7"));
         Map<String, Object> metrics = (Map<String, Object>) body.get("metrics");
-        assertThat(metrics).doesNotContainKey("perTableOffset");
+        assertThat(metrics).doesNotContainKey("targetAckedPosition");
         assertThat(metrics.get("recordCount")).isNotNull();
     }
 
     @Test
-    void metricsOmitsPerTableOffsetWhenNoPositionsArePublished() {
+    void metricsNamesThePositionItCarriesRatherThanCallingItAnOffset() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl2/metrics")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        // The old name said where, not which. Three different positions could have sat under it, they move
+        // at three different times, and a caller that guessed wrong read a stalled target as an idle source
+        // — so the field says which one it is and the ambiguous name is gone rather than kept beside it.
+        assertThat(body).containsKey("targetAckedPosition");
+        assertThat(body).doesNotContainKey("perTableOffset");
+    }
+
+    @Test
+    void metricsNamesThePositionsThisProductDoesNotCollect() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl2/metrics")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        // A position that is simply missing from the document reads exactly like one the product has no
+        // concept of, and a caller cannot act on a difference it cannot see. Naming them makes "not
+        // measured" a reading, and makes a later wiring of one an absence from this list rather than a
+        // field that quietly begins appearing.
+        assertThat(body.get("positionsNotCollected"))
+                .isEqualTo(List.of("sourceHeadPosition", "processedPosition"));
+    }
+
+    @Test
+    void metricsOmitsTheTargetAckedPositionWhenNoPositionsArePublished() {
         Map<String, Object> body = client().get().uri("/api/pipelines/pl1/metrics")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
 
         // Absent, not an empty object: no position has been acked, which is the same never-faked rule the
-        // numeric metrics follow.
-        assertThat(body).doesNotContainKey("perTableOffset");
+        // numeric metrics follow. The names of what is not collected still travel — this pipeline's target
+        // position is recorded and empty, which is not what those two are.
+        assertThat(body).doesNotContainKey("targetAckedPosition");
+        assertThat(body.get("positionsNotCollected"))
+                .isEqualTo(List.of("sourceHeadPosition", "processedPosition"));
     }
 
     @Test
@@ -325,6 +356,14 @@ class PipelineObservationApiTest {
         @Bean
         Clock clock() {
             return Clock.fixed(NOW, ZoneOffset.UTC);
+        }
+
+        @Bean
+        JsonMapperBuilderCustomizer strictRequestShape() {
+            // The production customizer itself, not a copy of it. Without it this context binds request
+            // bodies more leniently than the running server does, so every reading it takes of what a
+            // write-back accepts or refuses is a reading of the harness rather than of the product.
+            return new ControlHttpFace().sourceJsonContract();
         }
 
         @Bean
@@ -517,6 +556,29 @@ class PipelineObservationApiTest {
         // Moved, and reported with no ring coordinate: nothing here observed that token go past.
         assertThat(((Map<?, ?>) chain.get("resumeFrom")).get("token")).isEqualTo("mysql-bin.000001:4");
         assertThat(((Map<?, ?>) chain.get("resumeFrom")).get("epoch")).isNull();
+    }
+
+    @Test
+    void aWriteBackCarryingTheFieldsFormerNameIsRefusedRatherThanIgnored() {
+        // A client that read this document from an older server hands it back carrying the name that
+        // server used. The field is not editable either way, so the only question is whether an edit that
+        // cannot be honoured is refused or dropped in silence -- and a dropped one reads to the caller
+        // exactly like an accepted one.
+        ApiError body = client().put().uri("/api/pipelines/pl1/position")
+                .header("Authorization", "Bearer " + machineToken(Scope.WRITE))
+                .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                .body("{\"chains\":[{\"chainId\":\"shop@mysql-1\","
+                        + "\"resumeFrom\":{\"token\":\"mysql-bin.000001:4\"},"
+                        + "\"sinkAcked\":{\"token\":\"mysql-bin.000009:12\"}}]}")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode().is4xxClientError())
+                            .as("an unknown field is refused, not accepted with that field dropped")
+                            .isTrue();
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body).isNotNull();
+        assertThat(body.code()).isNotBlank();
     }
 
     @Test
