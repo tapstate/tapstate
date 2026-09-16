@@ -152,7 +152,11 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.status", "status"),
             Map.entry("pipeline.metrics", "metrics"),
             Map.entry("pipeline.snapshot", "snapshot"),
-            Map.entry("pipeline.logs", "logs"));
+            Map.entry("pipeline.logs", "logs"),
+            Map.entry("pipeline.position", "position"),
+            Map.entry("pipeline.set-position", "position"),
+            Map.entry("pipeline.derived-schema", "derived-schema"),
+            Map.entry("pipeline.accept-derived-schema", "derived-schema"));
 
     /**
      * Verbs that chain several registered operations rather than projecting one ({@code run} is apply
@@ -226,8 +230,8 @@ public final class Cli implements Runnable {
                     "Remove one stored artifact for good; --if-match pins the version removed.")),
             Map.entry("connectors", new VerbHelp("[-o text|json|yaml]",
                     "List the connectors registered on the server.")),
-            Map.entry("register", new VerbHelp("<path> [-o text|json|yaml]",
-                    "Upload a connector artifact, or a directory of them.")),
+            Map.entry("register", new VerbHelp("<path|connector-id> [-o text|json|yaml]",
+                    "Upload local connector artifacts, or fetch a published connector by id.")),
             Map.entry("test", new VerbHelp("<id> [-o text|json|yaml]",
                     "Try a connection's configuration against the live endpoint.")),
             Map.entry("test-result", new VerbHelp("<id> [-o text|json|yaml]",
@@ -240,8 +244,10 @@ public final class Cli implements Runnable {
                     "Create, list, or revoke machine tokens.")),
             Map.entry("start", new VerbHelp("<pipeline-id>",
                     "Start a pipeline.")),
-            Map.entry("stop", new VerbHelp("<pipeline-id>",
-                    "Stop a pipeline.")),
+            Map.entry("stop", new VerbHelp("<pipeline-id> [--keep-state] [-y]",
+                    "Stop a pipeline and clear what it accumulated; --keep-state keeps it.")),
+            Map.entry("restart", new VerbHelp("<pipeline-id> [--rerun] [-y]",
+                    "Cycle a pipeline and carry on; --rerun reads the whole source again.")),
             Map.entry("pause", new VerbHelp("<pipeline-id>",
                     "Pause a running pipeline, holding its position.")),
             Map.entry("resume", new VerbHelp("<pipeline-id>",
@@ -252,8 +258,12 @@ public final class Cli implements Runnable {
                     "Show a pipeline's counters and per-table positions.")),
             Map.entry("snapshot", new VerbHelp("<pipeline-id>",
                     "Show a pipeline's per-table snapshot progress.")),
+            Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
+                    "Compare a join's recorded and current columns; --accept re-reads the sources.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",
                     "Tail a pipeline's log on its node; --follow streams until Ctrl-C.")),
+            Map.entry("position", new VerbHelp("<pipeline-id> [-f <file>]",
+                    "Show or set a pipeline's resume position by chain.")),
             // The summary is one line because picocli wraps a longer one, and a wrapped line is a line the
             // help guard cannot pin. The call grammar lives where it is needed instead: in the usage this
             // verb prints when it cannot read a call.

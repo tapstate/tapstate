@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.model.Resource;
@@ -52,6 +53,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
@@ -123,6 +125,13 @@ final class Repl {
     /** How often a wait wakes to notice the user interrupted it. */
     private static final Duration CANCEL_POLL = Duration.ofMillis(200);
 
+    private static final Duration PAUSE_SETTLE_POLL = Duration.ofMillis(500);
+    private static final Duration PAUSE_SETTLE_BOUND = Duration.ofSeconds(30);
+    private static final String PAUSE_SETTLE_BOUND_ENV = "TAPSTATE_RESTART_PAUSE_TIMEOUT_MS";
+    private static final String KEEP_STATE = "--keep-state";
+    private static final Set<String> STOP_OPTIONS = Set.of(KEEP_STATE, "-y", "--non-interactive");
+    private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--non-interactive");
+
     /** The server's own code for a connector that is not registered. */
     private static final String CONNECTOR_NOT_REGISTERED = "connector.not-registered";
 
@@ -147,14 +156,17 @@ final class Repl {
             Set.of("connector.instances-busy", "connector.instance-limit-reached");
 
     private static final List<String> ONLINE_VERBS = List.of(
-            "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "status", "metrics",
-            "snapshot", "logs", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "token");
+            "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status",
+            "metrics", "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema",
+            "register", "connectors", "token", "derived-schema");
 
     private final CommandLine commandLine;
 
     /** The transport seam to a server; a network-free fake is injected in tests. */
     private final ControlPlaneClient controlPlane;
+
+    /** Fetches a released connector artifact when {@code register} receives its published id. */
+    private PublishedConnectorArtifacts.Fetcher connectorFetcher;
 
     /** The one shared lazy target resolver; absent only in legacy unit seams that exercise no contexts. */
     private final ContextResolver contextResolver;
@@ -263,6 +275,7 @@ final class Repl {
         this.controlPlane = controlPlane;
         this.prompter = prompter;
         this.env = env;
+        this.connectorFetcher = PublishedConnectorArtifacts.Fetcher.http(env);
         this.contextResolver = contextResolver;
         this.explicitContext = explicitContext;
         this.authService = authService;
@@ -293,6 +306,11 @@ final class Repl {
     /** Answers whether this process has a terminal; overridden so both branches can be exercised. */
     void terminalCheck(BooleanSupplier check) {
         this.terminal = check;
+    }
+
+    /** Replaces published-artifact downloads without changing registration transport; used by tests. */
+    void connectorFetcher(PublishedConnectorArtifacts.Fetcher fetcher) {
+        this.connectorFetcher = fetcher;
     }
 
     /** The current session workspace. */
@@ -1465,6 +1483,18 @@ final class Repl {
         if (words.get(0).equals("apply")) {
             return applyOnline(words);
         }
+        if (words.get(0).equals("restart")) {
+            return restartOnline(words);
+        }
+        if (words.get(0).equals("stop")) {
+            return stopOnline(words);
+        }
+        if (words.get(0).equals("position")) {
+            return positionOnline(words);
+        }
+        if (words.get(0).equals("derived-schema")) {
+            return derivedSchemaOnline(words);
+        }
         // The two streaming sugars ride the read verbs over the websocket channel: `status --watch` and
         // `logs --follow`. They are the only dash-options a connected verb accepts, and only on their verb.
         if (words.get(0).equals("status") && words.contains("--watch")) {
@@ -2066,10 +2096,25 @@ final class Repl {
             err.flush();
             return Cli.EXIT_USAGE;
         }
-        String id = words.get(1);
-        LifecycleOutcome outcome = withFailover(() ->
-                controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb, null),
-                o -> o instanceof LifecycleOutcome.Unreachable);
+        if (words.size() > 2) {
+            err.println(verb + ": options are not supported on a connected verb yet");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        return lifecycleOnline(verb, words.get(1), null);
+    }
+
+    private int lifecycleOnline(String verb, String id, Boolean purgeState) {
+        return renderLifecycle(driveLifecycle(verb, id, purgeState));
+    }
+
+    private LifecycleOutcome driveLifecycle(String verb, String id, Boolean purgeState) {
+        return withFailover(() -> controlPlane.lifecycle(
+                session.landingNode(), session.credential(), id, verb, purgeState),
+                candidate -> candidate instanceof LifecycleOutcome.Unreachable);
+    }
+
+    private int renderLifecycle(LifecycleOutcome outcome) {
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case LifecycleOutcome.Accepted accepted -> {
@@ -2080,6 +2125,152 @@ final class Repl {
             case LifecycleOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case LifecycleOutcome.Unreachable ignored -> reportRequestFailed();
         };
+    }
+
+    private int stopOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        boolean keepState = words.contains(KEEP_STATE);
+        List<String> operands = words.stream().filter(word -> !STOP_OPTIONS.contains(word)).toList();
+        if (operands.size() != 2 || operands.get(1).isBlank()) {
+            err.println("stop: usage: stop <pipeline-id> [--keep-state] [-y]");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        for (int i = 1; i < operands.size(); i++) {
+            if (operands.get(i).startsWith("-")) {
+                err.println("stop: unknown option " + operands.get(i));
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        String id = operands.get(1);
+        announcePipelineState(keepState);
+        if (!keepState && !words.contains("-y") && !words.contains("--non-interactive")) {
+            if (!terminal.getAsBoolean() || prompter == null) {
+                Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", "stop"));
+                err.flush();
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+            String answer = prompter.ask("Clear " + id + "? Type yes to go ahead", "no");
+            if (answer == null || !(answer.trim().equalsIgnoreCase("yes") || answer.trim().equalsIgnoreCase("y"))) {
+                PrintWriter out = commandLine.getOut();
+                out.println("stop: cancelled; " + id + " was left as it is");
+                out.flush();
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+        }
+        return lifecycleOnline("stop", id, !keepState);
+    }
+
+    private void announcePipelineState(boolean keepState) {
+        PipelineStateInventory.lines(!keepState, PipelineStateInventory.vocabulary())
+                .forEach(commandLine.getOut()::println);
+        commandLine.getOut().flush();
+    }
+
+    private int restartOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        boolean rerun = words.contains("--rerun");
+        List<String> operands = words.stream().filter(word -> !RESTART_OPTIONS.contains(word)).toList();
+        if (operands.size() != 2 || operands.get(1).isBlank()) {
+            err.println("restart: usage: restart <pipeline-id> [--rerun] [-y]");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        for (int i = 1; i < operands.size(); i++) {
+            if (operands.get(i).startsWith("-")) {
+                err.println("restart: unknown option " + operands.get(i));
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        String id = operands.get(1);
+        if (rerun) {
+            return rerunFromStart(id, words);
+        }
+        StatusOutcome outcome = withFailover(() -> controlPlane.status(
+                session.landingNode(), session.credential(), id),
+                candidate -> candidate instanceof StatusOutcome.Unreachable);
+        return switch (outcome) {
+            case StatusOutcome.Found found -> restartFromState(id, found.state());
+            case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case StatusOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    private int rerunFromStart(String id, List<String> words) {
+        announcePipelineState(false);
+        if (!words.contains("-y") && !words.contains("--non-interactive")) {
+            PrintWriter err = commandLine.getErr();
+            if (!terminal.getAsBoolean() || prompter == null) {
+                Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", "restart"));
+                err.flush();
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+            String answer = prompter.ask("Clear " + id + "? Type yes to go ahead", "no");
+            if (answer == null || !(answer.trim().equalsIgnoreCase("yes") || answer.trim().equalsIgnoreCase("y"))) {
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+        }
+        int stopped = lifecycleOnline("stop", id, Boolean.TRUE);
+        return stopped == Cli.EXIT_OK ? lifecycleOnline("start", id, null) : stopped;
+    }
+
+    private int restartFromState(String id, String state) {
+        String normalized = state == null ? "" : state.toUpperCase(Locale.ROOT);
+        return switch (normalized) {
+            case "RUNNING" -> restartRunning(id);
+            case "PAUSED" -> lifecycleOnline("resume", id, null);
+            case "NEW", "STOPPED", "COMPLETED" -> lifecycleOnline("start", id, null);
+            case "FAILED" -> restartFailed(id);
+            default -> {
+                PrintWriter err = commandLine.getErr();
+                err.println("restart: " + id + " is " + normalized.toLowerCase(Locale.ROOT)
+                        + ", which restart does not know how to carry on from");
+                err.flush();
+                yield Cli.EXIT_VERB_UNAVAILABLE;
+            }
+        };
+    }
+
+    private int restartRunning(String id) {
+        int paused = lifecycleOnline("pause", id, null);
+        if (paused != Cli.EXIT_OK) {
+            return paused;
+        }
+        long deadline = System.nanoTime() + pauseSettleBound().toNanos();
+        while (System.nanoTime() < deadline && sleepUnlessCancelled(PAUSE_SETTLE_POLL)) {
+            StatusOutcome outcome = withFailover(() -> controlPlane.status(
+                    session.landingNode(), session.credential(), id),
+                    candidate -> candidate instanceof StatusOutcome.Unreachable);
+            if (outcome instanceof StatusOutcome.Found found && "PAUSED".equalsIgnoreCase(found.state())) {
+                return lifecycleOnline("resume", id, null);
+            }
+            if (outcome instanceof StatusOutcome.Rejected rejected) {
+                return renderRejection(rejected.code(), rejected.message());
+            }
+        }
+        PrintWriter err = commandLine.getErr();
+        err.println("restart: " + id + " was asked to pause but has not reached paused; it was not resumed");
+        err.flush();
+        return Cli.EXIT_VERB_UNAVAILABLE;
+    }
+
+    private int restartFailed(String id) {
+        int stopped = lifecycleOnline("stop", id, Boolean.FALSE);
+        return stopped == Cli.EXIT_OK ? lifecycleOnline("start", id, null) : stopped;
+    }
+
+    private Duration pauseSettleBound() {
+        String configured = env == null ? null : env.apply(PAUSE_SETTLE_BOUND_ENV);
+        if (configured == null || configured.isBlank()) {
+            return PAUSE_SETTLE_BOUND;
+        }
+        try {
+            return Duration.ofMillis(Long.parseLong(configured.trim()));
+        } catch (NumberFormatException ignored) {
+            return PAUSE_SETTLE_BOUND;
+        }
     }
 
     /**
@@ -2684,7 +2875,7 @@ final class Repl {
     }
 
     /**
-     * {@code register <path> [-o text|json|yaml]} — registers a local connector artifact with the server. A
+     * {@code register <path|connector-id> [-o text|json|yaml]} — registers a connector artifact with the server. A
      * file path uploads that one jar; a directory path uploads every {@code *.jar} directly under it as a
      * batch. The server introspects each artifact and stores it content-hash idempotently, then reports what
      * was registered (newly, or an already-registered no-op). A missing operand or unknown option is a benign
@@ -2701,15 +2892,33 @@ final class Repl {
             return registerDirectory(artifactPath, parsed.format());
         }
         PrintWriter err = commandLine.getErr();
+        boolean publishedId = !Files.exists(artifactPath) && PublishedConnectorArtifacts.contains(parsed.path());
         byte[] artifact;
-        try {
-            artifact = Files.readAllBytes(artifactPath);
-        } catch (IOException e) {
-            err.println("register: cannot read " + artifactPath + ": " + e.getMessage());
-            err.flush();
-            return Cli.EXIT_USAGE;
+        String artifactName;
+        if (publishedId) {
+            try {
+                URI source = PublishedConnectorArtifacts.artifact(parsed.path(), env);
+                artifactName = PublishedConnectorArtifacts.jarName(parsed.path());
+                artifact = PublishedConnectorArtifacts.download(parsed.path(), source, connectorFetcher);
+            } catch (IOException | IllegalArgumentException failed) {
+                String reason = failed.getMessage() == null || failed.getMessage().isBlank()
+                        ? failed.getClass().getSimpleName() : failed.getMessage();
+                MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(
+                        CliError.CONNECTOR_DOWNLOAD_FAILED, Map.of("connector", parsed.path(), "reason", reason));
+                renderRegisterRejection(CliError.CONNECTOR_DOWNLOAD_FAILED.code(), rendered.message(), parsed.format());
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+        } else {
+            try {
+                artifact = Files.readAllBytes(artifactPath);
+            } catch (IOException e) {
+                err.println("register: cannot read " + artifactPath + ": " + e.getMessage());
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+            artifactName = artifactPath.getFileName().toString();
         }
-        echoUploading(artifactPath.getFileName().toString(), artifact.length, parsed.format());
+        echoUploading(artifactName, artifact.length, parsed.format());
         ConnectorRegisterOutcome outcome = withFailover(() -> controlPlane.register(
                 session.landingNode(), session.credential(), artifact),
                 o -> o instanceof ConnectorRegisterOutcome.Unreachable);
@@ -2757,13 +2966,13 @@ final class Repl {
             } else if (path == null) {
                 path = word;
             } else {
-                err.println("register: too many operands (usage: register <path> [-o text|json|yaml])");
+                err.println("register: too many operands (usage: register <path|connector-id> [-o text|json|yaml])");
                 err.flush();
                 return null;
             }
         }
         if (path == null || path.isBlank()) {
-            err.println("register: missing operand (usage: register <path> [-o text|json|yaml])");
+            err.println("register: missing operand (usage: register <path|connector-id> [-o text|json|yaml])");
             err.flush();
             return null;
         }
@@ -3644,6 +3853,126 @@ final class Repl {
             case SnapshotOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case SnapshotOutcome.Unreachable ignored -> reportRequestFailed();
         };
+    }
+
+    /** Reads a pipeline resume-position document, or writes back an edited document from {@code -f}. */
+    private int positionOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        String file = null;
+        List<String> operands = new ArrayList<>();
+        for (int i = 0; i < words.size(); i++) {
+            String word = words.get(i);
+            if (i > 0 && word.equals("-f")) {
+                if (i + 1 >= words.size()) {
+                    err.println("position: -f needs a file (usage: position <pipeline-id> [-f <file>])");
+                    err.flush();
+                    return Cli.EXIT_USAGE;
+                }
+                file = words.get(++i);
+            } else if (i > 0 && word.startsWith("-")) {
+                err.println("position: unknown option " + word + " (usage: position <pipeline-id> [-f <file>])");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            } else {
+                operands.add(word);
+            }
+        }
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("position: missing operand (usage: position <pipeline-id> [-f <file>])");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String body = null;
+        if (file != null) {
+            try {
+                body = Files.readString(Path.of(file));
+            } catch (IOException | RuntimeException unreadable) {
+                err.println("position: cannot read " + file + " (" + unreadable.getMessage() + ")");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        String document = body;
+        String id = operands.get(1);
+        PositionOutcome outcome = withFailover(() -> document == null
+                        ? controlPlane.position(session.landingNode(), session.credential(), id)
+                        : controlPlane.setPosition(session.landingNode(), session.credential(), id, document),
+                candidate -> candidate instanceof PositionOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case PositionOutcome.Found found -> {
+                if (document == null) {
+                    out.println(found.document());
+                } else {
+                    out.println("position written back for " + id);
+                    found.chains().forEach(chain -> out.println("  " + chain.chainId() + "  ->  "
+                            + (chain.token() == null ? "(nothing recorded)" : chain.token())
+                            + (chain.sharedWith().isEmpty() ? "" : "   also read by: "
+                                    + String.join(", ", chain.sharedWith()))));
+                }
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case PositionOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case PositionOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /** Shows a pipeline's recorded, current, and target derived columns; {@code --accept} refreshes them. */
+    private int derivedSchemaOnline(List<String> words) {
+        String id = readTargetId(words);
+        if (id == null) {
+            return Cli.EXIT_USAGE;
+        }
+        boolean accept = words.size() > 2 && "--accept".equals(words.get(2));
+        if (words.size() > 3 || (words.size() == 3 && !accept)) {
+            PrintWriter err = commandLine.getErr();
+            err.println("derived-schema: usage: derived-schema <pipeline-id> [--accept]");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        DerivedSchemaOutcome outcome = accept
+                ? withFailover(() -> controlPlane.acceptDerivedSchema(
+                        session.landingNode(), session.credential(), id),
+                        candidate -> candidate instanceof DerivedSchemaOutcome.Unreachable)
+                : withFailover(() -> controlPlane.derivedSchema(
+                        session.landingNode(), session.credential(), id),
+                        candidate -> candidate instanceof DerivedSchemaOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case DerivedSchemaOutcome.Found found -> {
+                if (found.steps().isEmpty()) {
+                    out.println("no derived columns");
+                } else {
+                    found.steps().forEach(step -> renderDerivedStep(out, step));
+                }
+                if (accept) {
+                    out.println("accepted: the sources were re-read, and the columns above are what the next start is held to");
+                }
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case DerivedSchemaOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case DerivedSchemaOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    private static void renderDerivedStep(PrintWriter out, RemoteDerivedStep step) {
+        out.println(step.step() + "  ->  " + step.targetTable()
+                + (step.targetKnown() ? "" : "  (target columns unknown: nothing has discovered it)"));
+        out.println("  column                          recorded              derived               target");
+        step.columns().forEach(column -> out.println("  "
+                + padDerivedCell(column.column(), 32) + padDerivedCell(column.recorded(), 22)
+                + padDerivedCell(column.derived(), 22) + derivedCell(column.target())));
+    }
+
+    private static String padDerivedCell(String value, int width) {
+        String cell = derivedCell(value);
+        return cell.length() >= width ? cell + " " : cell + " ".repeat(width - cell.length());
+    }
+
+    private static String derivedCell(String value) {
+        return value == null ? "-" : value;
     }
 
     private int logsOnline(List<String> words) {
