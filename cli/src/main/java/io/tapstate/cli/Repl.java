@@ -3812,7 +3812,7 @@ final class Repl {
         return outcome;
     }
 
-+    private record UpOptions(String server, Path workdir, OutputFormat format, boolean startLocal, String user,
+    private record UpOptions(String server, Path workdir, OutputFormat format, boolean startLocal, String user,
                              boolean yes) {
     }
 
