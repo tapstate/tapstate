@@ -1368,10 +1368,13 @@ final class Repl {
 
     /** Resolves and reaches a target only after dispatch has established that the verb is online. */
     private int resolveTarget(List<String> words) {
-        String verb = words.get(0);
+        return resolveTarget(words.get(0), null, workspaceFor(words));
+    }
+
+    /** Resolves a named verb against either an explicit temporary target or the workspace binding. */
+    private int resolveTarget(String verb, String connect, Path workspace) {
         try {
-            Optional<ResolvedContext> resolution = contextResolver.resolve(null, explicitContext,
-                    workspaceFor(words));
+            Optional<ResolvedContext> resolution = contextResolver.resolve(connect, explicitContext, workspace);
             if (resolution.isEmpty()) {
                 Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
                 return Cli.EXIT_VERB_UNAVAILABLE;
