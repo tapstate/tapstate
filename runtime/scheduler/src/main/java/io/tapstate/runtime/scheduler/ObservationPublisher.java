@@ -156,25 +156,29 @@ public final class ObservationPublisher {
     /**
      * The name the metric contract gives each of this engine's change kinds.
      *
-     * <p><strong>A snapshot read is an insert.</strong> What the engine calls a read is a whole row being
-     * carried across for the first time, and what that does at the target is exactly what an insert does;
-     * naming it anything else describes where the row came from rather than what happened to it. It is not
-     * "other" either: that name is for a change kind nothing here recognises, and a reader who meets it on
-     * a chart has been told only that somebody gave up. A quantity a reader cannot interpret is worse than
-     * one they cannot see, because they will interpret it anyway.
+     * <p><strong>A snapshot read keeps its own name.</strong> This attribute carries the operation the
+     * <em>source</em> performed, never what the target did with the row afterwards, and at the source
+     * nothing was inserted: an existing row was read. Calling it an insert would describe the far end of
+     * the pipeline under a field defined by the near end, and it would add a row that was already there to
+     * the same total as a row that has just come into existence — two quantities an operator sizing a
+     * source apart from its change rate needs kept apart. It is the name every change-data consumer
+     * already expects for this, alongside the three row mutations.
      *
-     * <p><strong>Whether a row arrived during the initial load or afterwards is a different question, and
-     * it belongs in an attribute of its own.</strong> Folding it into this one would make the operation
-     * mean two things at once — what happened to the row, and which phase produced it — so a consumer
-     * grouping by operation would be grouping by a mixture. Nothing publishes that attribute yet; it lands
-     * with the first reader that needs the distinction, alongside the snapshot instruments that answer the
-     * same question directly.
+     * <p>It is emphatically not "other". That name is for a change kind nothing here recognises, and a
+     * reader who meets it on a chart has been told only that somebody gave up — which they will interpret
+     * anyway, and wrongly. A quantity a reader cannot interpret is worse than one they cannot see.
+     *
+     * <p>Which <em>phase</em> a row arrived in remains a separate question from what happened to it, and
+     * an attribute of its own is where it belongs. That the two happen to coincide today — a source
+     * produces reads only while it is loading — is a consequence rather than a definition, and it stops
+     * being true of every operation but this one the moment the load ends.
      *
      * <p>The fallback covers a symbol nothing here recognises, which is the one case "other" is for: the
      * closed set of operation names exists so that nothing arriving from the data can add a value to it.
+     * Two unrecognised symbols therefore land on one name, which is what the summing below is for.
      */
     private static final Map<String, String> OP_NAMES = Map.of(
-            "i", "insert", "u", "update", "d", "delete", "ddl", "ddl", "r", "insert");
+            "i", "insert", "u", "update", "d", "delete", "ddl", "ddl", "r", "read");
 
     private final StateStore state;
     private final ObservationStore observations;
@@ -595,12 +599,11 @@ public final class ObservationPublisher {
         // totals count from, so the stream has the start identity every other family on this face still
         // lacks. Without it this would have to be a reading like the rest.
         reading.start().ifPresent(start -> {
-            // Summed into one point per attribute set, not one per symbol the engine reported. Two of the
-            // engine's change kinds share an operation name - a row carried across by the initial load and
-            // one inserted afterwards are both inserts - so a table that has been loaded and then tailed
-            // reports both, and two points carrying identical attributes are two values of one series,
-            // which a fact refuses outright. Adding them is what the counter means: both are rows that
-            // reached the target.
+            // Summed into one point per attribute set, not one per symbol the engine reported. The map
+            // above is not injective: every symbol it does not recognise lands on one name, so two
+            // unrecognised kinds reaching one table produce two points carrying identical attributes -
+            // two values of one series, which a fact refuses outright. Adding them is what the counter
+            // means: both are rows that reached the target.
             Map<Map<String, String>, Long> rowsByAttributes = new LinkedHashMap<>();
             reading.rowsByTableAndOp().forEach((table, byOp) -> byOp.forEach((symbol, count) ->
                     rowsByAttributes.merge(Map.of(

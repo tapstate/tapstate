@@ -119,40 +119,56 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     }
 
     @Test
-    @DisplayName("a row carried across by the initial load is an insert, like any other row appearing")
-    void aSnapshotReadIsAnInsertBecauseThatIsWhatItDoesAtTheTarget() {
+    @DisplayName("a snapshot read keeps its own operation, because that is what the source did")
+    void aSnapshotReadIsNotFoldedIntoTheInsertsBesideIt() {
         DeliveryReading loading = new DeliveryReading(Map.of("orders", Map.of("r", 5_000L)),
                 Map.of("orders", AT.toEpochMilli()), STARTED);
 
         MetricFact records = factNamed(facts(loading, AT), "tapstate.pipeline.records");
 
-        // Not "other". That name is for a change kind nothing recognises, and a reader who meets it has
-        // been told only that somebody gave up - which they will interpret anyway, and wrongly. What the
-        // engine calls a read is a whole row crossing for the first time, and at the target that is an
-        // insert.
+        // This attribute carries what the source did, never what the target did with the row afterwards,
+        // and at the source nothing was inserted - a row that was already there was read. Not "other"
+        // either: that is for a kind nothing recognises, and a reader meeting it has been told only that
+        // somebody gave up.
         assertThat(records.points()).singleElement()
-                .satisfies(point -> assertThat(point.attributes().get("op")).isEqualTo("insert"));
+                .satisfies(point -> assertThat(point.attributes().get("op")).isEqualTo("read"));
     }
 
     @Test
-    @DisplayName("loading and tailing the same table add up under one operation, and none of them is lost")
-    void theInitialLoadAndTheChangesAfterItShareTheOperationTheyBothAre() {
+    @DisplayName("loading a table and tailing it are two series, so either can be read on its own")
+    void theInitialLoadAndTheChangesAfterItStayApart() {
         DeliveryReading both = new DeliveryReading(Map.of("orders", Map.of("r", 5_000L, "i", 7L)),
                 Map.of("orders", AT.toEpochMilli()), STARTED);
 
         MetricFact records = factNamed(facts(both, AT), "tapstate.pipeline.records");
 
-        // One series, because they are one operation. Which phase a row arrived in is a different question
-        // and belongs in an attribute of its own - folded into this one, the operation would mean two
-        // things at once and grouping by it would group by a mixture.
+        // Added together, an operator sizing a source could not tell five thousand rows that were already
+        // there from seven that have just come into existence - and the second number is the one that says
+        // what this pipeline will be doing for the rest of its life.
+        assertThat(records.points())
+                .extracting(point -> point.attributes().get("op"), MetricPoint::value)
+                .containsExactlyInAnyOrder(tuple2("read", 5_000L), tuple2("insert", 7L));
+    }
+
+    @Test
+    @DisplayName("two kinds nobody recognises share the one name kept for them, and are added up")
+    void unrecognisedKindsLandOnOneNameAndTheirRowsAreSummed() {
+        DeliveryReading strange = new DeliveryReading(Map.of("orders", Map.of("zzz", 3L, "qqq", 4L)),
+                Map.of("orders", AT.toEpochMilli()), STARTED);
+
+        MetricFact records = factNamed(facts(strange, AT), "tapstate.pipeline.records");
+
+        // The name map is deliberately not injective, so this is the shape that produces two points with
+        // identical attributes - two values of one series, which a fact refuses outright. Summing them is
+        // what the counter means; without it this throws rather than publishing anything at all.
         assertThat(records.points()).singleElement().satisfies(point -> {
-            assertThat(point.attributes().get("op")).isEqualTo("insert");
-            assertThat(point.value()).isEqualTo(5_007L);
+            assertThat(point.attributes().get("op")).isEqualTo("other");
+            assertThat(point.value()).isEqualTo(7L);
         });
     }
 
     @Test
-    @DisplayName("a change kind nobody here knows still lands inside the closed set of names")
+    @DisplayName("one kind nobody recognises is carried under the name kept for exactly that")
     void anUnknownChangeKindDoesNotLeakOntoTheFaceAsItsOwnName() {
         DeliveryReading strange = new DeliveryReading(Map.of("orders", Map.of("zzz", 3L)),
                 Map.of("orders", AT.toEpochMilli()), STARTED);
@@ -161,8 +177,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
 
         // The whole point of the operation being a closed set is that nothing arriving from the data can
         // add a value to it. A symbol passed through as its own name would put the number of series this
-        // metric has in the hands of whatever produced the symbol - which is the one thing the closed set
-        // was closed to prevent.
+        // metric has in the hands of whatever produced the symbol.
         assertThat(records.points()).singleElement()
                 .satisfies(point -> assertThat(point.attributes().get("op")).isEqualTo("other"));
     }
