@@ -42,14 +42,41 @@ as. An `ObjectId` primary key read from one MongoDB and written to another is an
 and a binary column is binary, byte for byte.
 
 This works because the row carries the name the source's schema gave the column, and the target's own
-connector rebuilds from that. Two consequences follow, and both are visible rather than silent:
+connector rebuilds from that. What follows from it is visible rather than silent:
 
 - **A target of a different kind gets the value as it reads above** - a hex string, base64 - because
   it has no such type to rebuild into. That is the right answer for it.
-- **The schema has to name the column.** It names a field inside a document by its path, so a key
-  nested one level down is restored like a top-level one. It names an array and stops, so a value
-  inside an array arrives as its text form. There is no way to state "the type of this array's
-  elements" in a schema, which is why this one is a limit rather than an oversight.
+- **Where the schema names the value, its word is what the target rebuilds from.** It names a field
+  inside a document by its path, so a key nested one level down is restored like a top-level one, and
+  what it says there is used even where the value's own type would suggest something else.
+- **Where it names nothing, the value's own type answers instead.** Two places it commonly names
+  nothing for: an array's elements, which are positional and may each be a different type, so "the
+  type of this array's elements" is not something a schema can state at all; and a field - at any
+  depth, including a top-level one - that discovery never described, because a schemaless source's
+  field map is the fields it met in the documents it sampled rather than a census of the collection.
+  Neither absence says anything about the type, so both are answered the same way: from what your
+  source's schema calls that type elsewhere in the same row. An `ObjectId` inside an array, or in a
+  field that first appeared after discovery ran, is written back as an `ObjectId` because the
+  collection's `_id` is one and the schema names it. Answering only the array would let one document
+  land two ways, with the better-described place getting the worse answer.
+- **That reading is taken one change at a time**, off the values that change itself carries.
+  Where it holds no such column - the schema names none, or the one it names is absent or null
+  there - or where it holds two columns of that type the schema spells differently, the value
+  arrives as its text form. Both readings work that way, the second one included: a change that
+  carries only one of two differently spelled columns does not show the ambiguity and is restored
+  from the spelling it carries. So one collection can land with these values restored in some
+  documents and as text in others; either way it is visible in the target rather than silently the
+  wrong type.
+- **A change is not a whole document, so one field can land both ways over time.** A snapshot row
+  carries every column, but a change stream reports the key plus what changed. An update that
+  touches only an array therefore carries no other column of that type, nothing names it, and the
+  elements are written back as text - over the values the snapshot had already restored for that
+  same document, with the write reporting success. The target shows the text, so this is visible
+  rather than silent, but it is a field changing type on a later update rather than a fixed split
+  across documents. An `_id` rides along on every change, which is why an `ObjectId` is the reliable
+  case; a binary, decimal or regular-expression value named only by a column an update does not
+  touch is not. Where the type matters at the target, re-snapshot the collection rather than relying
+  on the change stream to hold it.
 
 ## Limits worth knowing before you rely on this
 
