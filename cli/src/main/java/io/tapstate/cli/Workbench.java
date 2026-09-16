@@ -367,6 +367,7 @@ final class Workbench {
                     }
                     if (runtime.state().workspaceView().focus()
                             == WorkbenchWorkspaceState.Focus.FILES
+                            && runtime.state().workspaceView().document().isPresent()
                             && isWorkspaceFileNavigation(key)) {
                         runtime.updateState(state -> state.reduce(key, visibleRows()));
                         return previewSelectedWorkspaceFile();
