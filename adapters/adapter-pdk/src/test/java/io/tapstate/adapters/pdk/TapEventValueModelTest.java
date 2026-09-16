@@ -493,9 +493,11 @@ class TapEventValueModelTest {
 
     @Test
     void aDriverTypeTheSchemaSpellsTwoWaysLeavesItsArrayElementsAlone() {
-        // Two named columns of one driver type, declared differently - which a schema is free to do.
+        // Two named columns of one driver type, declared differently - which a schema is free to do -
+        // and this change holds a value under each, which is what makes the disagreement visible here.
         // There is then no single answer to what this source calls that type, and picking either
-        // spelling would rebuild every element as one of them and report success.
+        // spelling would rebuild every element as one of them and report success. The case below is
+        // the same schema with only one of the two columns in the change, which is not this case.
         DriverKey key = new DriverKey("64f0c0de");
         Envelope decoded = insert(
                 row("id", key, "ref", key, "arr", List.of(key)),
@@ -510,6 +512,36 @@ class TapEventValueModelTest {
         // The named halves are untouched by the ambiguity: each is looked up by its own place.
         assertThat(encoded.getAfter().get("id")).isEqualTo(key);
         assertThat(encoded.getAfter().get("ref")).isEqualTo("64f0c0de");
+    }
+
+    @Test
+    void anAmbiguousSchemaOnlyRefusesTheChangesThatActuallyShowTheAmbiguity() {
+        // The same two-way schema as above, and a change that carries only one of the two columns -
+        // which is the ordinary shape of a sparse field, so it is the common case rather than the
+        // corner one. The reading is taken off the change: a column that is not in it, or is null in
+        // it, attaches its name to no class and so contradicts nothing, and the element is restored
+        // from the one spelling on offer. Pinned because the refusal reads as an absolute and is not
+        // one - nothing in a field map says which declared name belongs to which driver class until a
+        // value arrives holding the two together, so no reading of the schema alone could do better.
+        DriverKey key = new DriverKey("64f0c0de");
+
+        Envelope missing = insert(
+                row("id", key, "arr", List.of(key)),
+                CODECS,
+                Map.of("id", KEY_COLUMN, "ref", "OTHER_KEY", "arr", "ARRAY"));
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(missing, CODECS)).getAfter().get("arr"))
+                .as("the second spelling's column is not in this change, so it contradicts nothing")
+                .isEqualTo(List.of(key));
+
+        Map<String, Object> withNull = row("id", key, "arr", List.of(key));
+        withNull.put("ref", null);
+        Envelope nulled = insert(withNull, CODECS,
+                Map.of("id", KEY_COLUMN, "ref", "OTHER_KEY", "arr", "ARRAY"));
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(nulled, CODECS)).getAfter().get("arr"))
+                .as("present but null names no class either, which is the same answer")
+                .isEqualTo(List.of(key));
     }
 
     @Test

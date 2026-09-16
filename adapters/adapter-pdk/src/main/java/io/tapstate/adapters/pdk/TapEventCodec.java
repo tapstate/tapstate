@@ -282,9 +282,17 @@ public final class TapEventCodec {
      * lending it the array's own declared name, which would rebuild every element as whatever the array
      * is declared to be and report success.
      *
-     * <p><b>A type this schema spells two ways has no answer and gets none.</b> Picking either spelling
+     * <p><b>A type this change spells two ways has no answer and gets none.</b> Picking either spelling
      * would rebuild elements as one of them and succeed; the elements stay portable instead, which is
-     * the visible second-best rather than a silent wrong one.
+     * the visible second-best rather than a silent wrong one. <b>Two ways is what the values this change
+     * carries say, not what the whole schema says.</b> A declared name reaches a driver type only through
+     * a value that has both, so a second spelling whose column is absent or null here is not seen at all
+     * and the one spelling on offer is used — a change is ambiguous only where it shows the ambiguity.
+     * A collection whose schema really does spell one type two ways therefore lands its elements
+     * portable in the documents that carry both columns and rebuilt in the ones that carry only one,
+     * which is the same per-change reading the naming column itself gets and visible in the target
+     * either way. The schema alone cannot do better: nothing in a field map says which declared name
+     * belongs to which driver class until a value arrives holding the two together.
      *
      * <p><b>Taken off the whole row at once, never as the walk reaches each value.</b> Read as the walk
      * went, an array that happened to sit before the named column would restore and the same array after
@@ -385,6 +393,11 @@ public final class TapEventCodec {
             if (codecs.getCustomToTapValueCodec(value.getClass()) != null) {
                 String declared = byPath.get(path);
                 if (declared != null) {
+                    // Two spellings are seen only where this change holds a value under each of them:
+                    // a column the change does not carry, or carries as null, attaches its name to no
+                    // class here and so cannot contradict one. A change that shows one spelling is
+                    // therefore answered with it, which is the reading being taken off the change
+                    // rather than off the schema - the same as everything else here.
                     String already = named.putIfAbsent(value.getClass(), declared);
                     if (already != null && !already.equals(declared)) {
                         spelledTwoWays.add(value.getClass());

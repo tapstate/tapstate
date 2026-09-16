@@ -54,10 +54,12 @@ connector rebuilds from that. Two consequences follow, and both are visible rath
   `ObjectId` because the collection's `_id` is one and the schema names it. That reading is taken
   one document at a time, off the values that document itself carries. Where the document holds no
   such column - the schema names none, or the one it names is absent or null in that document - or
-  the schema spells that type two different ways, the element arrives as its text form. So one
-  collection can land with its elements restored in the documents that carry the naming column and
-  as text in the ones that do not; either way it is visible in the target rather than silently the
-  wrong type. An `_id` is always there, which is why an `ObjectId` element is the reliable case.
+  where it holds two columns of that type the schema spells differently, the element arrives as its
+  text form. Both readings are per document, the second one included: a document that carries only
+  one of two differently spelled columns does not show the ambiguity and is restored from the
+  spelling it carries. So one collection can land with its elements restored in some documents and
+  as text in others; either way it is visible in the target rather than silently the wrong type. An
+  `_id` is always there, which is why an `ObjectId` element is the reliable case.
 
 ## Limits worth knowing before you rely on this
 
