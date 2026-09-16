@@ -4,6 +4,7 @@ import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapdata.entity.codec.TapCodecsRegistry;
+import io.tapdata.entity.codec.ToTapValueCodec;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
 import io.tapdata.entity.schema.value.ByteData;
@@ -584,6 +585,79 @@ class TapEventValueModelTest {
         assertThat(((TapInsertRecordEvent) TapEventCodec.encode(nulled, CODECS)).getAfter().get("arr"))
                 .as("present but null names no class either, which is the same answer")
                 .isEqualTo(List.of(key));
+    }
+
+    @Test
+    void aRowTheSchemaNamesThroughoutIsNotWalkedASecondTime() {
+        // What this source calls a driver type is only ever asked for where the schema names no place,
+        // so a row it names throughout has no use for the answer - and that is most rows on the hottest
+        // path this adapter has, walked once per change and twice per update. Measured by counting the
+        // conversion lookups one driver type takes: one, the walk's own. Taken up front instead, the
+        // reading would walk this row a second time and look that same type up again, for an answer
+        // nothing here ever asks for.
+        CountingCodecs codecs = countingCodecs();
+
+        Envelope decoded = insert(row("stamp", new DriverStamp(7), "qty", 5), codecs,
+                Map.of("stamp", "STAMP", "qty", "INT64"));
+
+        assertThat(decoded.after().get("qty")).as("the row decodes as it always did").isEqualTo(5L);
+        assertThat(codecs.lookupsOf(DriverStamp.class))
+                .as("the walk's own lookup, with no reading taken on top of it")
+                .isEqualTo(1);
+    }
+
+    @Test
+    void theReadingIsTakenOnceHoweverManyValuesTheSchemaNamesNoPlaceFor() {
+        // Three array elements, none of which the schema names a place for, so each of them asks. The
+        // answer is taken off the whole change either way, so it is taken on the first ask and kept:
+        // the named column's own type is looked up once more, not once per element.
+        DriverKey key = new DriverKey("64f0c0de");
+        CountingCodecs codecs = countingCodecs();
+
+        Envelope decoded = insert(
+                row("id", key, "stamp", new DriverStamp(7), "arr", List.of(key, key, key)),
+                codecs,
+                Map.of("id", KEY_COLUMN, "stamp", "STAMP", "arr", "ARRAY"));
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(decoded, codecs)).getAfter().get("arr"))
+                .as("the reading ran and answered, which is what makes the count below mean anything")
+                .isEqualTo(List.of(key, key, key));
+        assertThat(codecs.lookupsOf(DriverStamp.class))
+                .as("the walk's own lookup plus one reading, whatever the number of elements asking")
+                .isEqualTo(2);
+    }
+
+    /**
+     * The same registrations the cases above run against, counting what the decode asks it - which is
+     * the one thing that says how many times a row was walked, since a walk cannot reach a value
+     * without asking whether the connector converts its type.
+     */
+    private static final class CountingCodecs extends TapCodecsRegistry {
+
+        private final Map<Class<?>, Integer> lookups = new LinkedHashMap<>();
+
+        @Override
+        public ToTapValueCodec<?> getCustomToTapValueCodec(Class<?> clazz) {
+            lookups.merge(clazz, 1, Integer::sum);
+            return super.getCustomToTapValueCodec(clazz);
+        }
+
+        int lookupsOf(Class<?> type) {
+            return lookups.getOrDefault(type, 0);
+        }
+    }
+
+    private static CountingCodecs countingCodecs() {
+        CountingCodecs codecs = new CountingCodecs();
+        codecs.registerToTapValue(DriverKey.class, (value, tapType) ->
+                new TapStringValue(((DriverKey) value).hex()));
+        codecs.registerToTapValue(DriverStamp.class, (value, tapType) ->
+                new TapStringValue(Long.toString(((DriverStamp) value).seconds())));
+        codecs.registerFromTapValue(TapStringValue.class, tapValue ->
+                KEY_COLUMN.equals(tapValue.getOriginType())
+                        ? new DriverKey(tapValue.getValue())
+                        : tapValue.getValue());
+        return codecs;
     }
 
     @Test
