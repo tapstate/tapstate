@@ -1,5 +1,6 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
@@ -39,10 +40,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
 
     private static final Instant STARTED = Instant.parse("2026-09-16T12:00:00Z");
+    /** Strictly before the target side: the sources are opened before the job that writes to them. */
+    private static final Instant READING_SINCE = Instant.parse("2026-09-16T11:59:58Z");
     private static final Instant AT = Instant.parse("2026-09-16T12:05:00Z");
 
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final CapturingObservationStore observations = new CapturingObservationStore();
+
+    /** What the capture side reports: rows taken from the sources, counted from when it opened. */
+    private static CaptureReading readSoFar() {
+        return new CaptureReading(
+                Map.of("orders", Map.of("i", 1_400L, "u", 20L), "items", Map.of("d", 180L)),
+                READING_SINCE);
+    }
 
     /** What a two-table run reports: rows confirmed by their targets, and how recent the newest are. */
     private static DeliveryReading twoTables() {
@@ -237,8 +247,98 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
                 .doesNotContain("tapstate.pipeline.records", "tapstate.pipeline.lag");
     }
 
+    @Test
+    @DisplayName("what a source handed over and what a target confirmed are one counter, told apart by direction")
+    void bothEndsOfTheCrossingArriveAsOneMeasurement() {
+        MetricFact records = factNamed(facts(readSoFar(), twoTables(), AT), "tapstate.pipeline.records");
+
+        // One metric with an attribute, not two metrics. What a reader wants from these is the difference
+        // between them - everything read and not yet confirmed is in flight - and two separate names could
+        // be defined, counted or published differently without anything noticing.
+        assertThat(records.points())
+                .extracting(point -> point.attributes().get("direction"),
+                        point -> point.attributes().get("tapstate.table.id"),
+                        point -> point.attributes().get("op"),
+                        MetricPoint::value)
+                .contains(org.assertj.core.groups.Tuple.tuple("in", "orders", "insert", 1_400L),
+                        org.assertj.core.groups.Tuple.tuple("out", "orders", "insert", 1_180L));
+    }
+
+    @Test
+    @DisplayName("each end counts from its own start, because they did not begin at the same moment")
+    void theTwoDirectionsCarryTheirOwnStarts() {
+        MetricFact records = factNamed(facts(readSoFar(), twoTables(), AT), "tapstate.pipeline.records");
+
+        // The capture opens its account when the sources are opened; the targets open theirs when the job
+        // that writes to them starts, which is strictly later. One start over both would misdate whichever
+        // it was not taken from, and a rate is computed against exactly this.
+        assertThat(records.points()).filteredOn(point -> "in".equals(point.attributes().get("direction")))
+                .allSatisfy(point -> assertThat(point.startTime()).isEqualTo(READING_SINCE));
+        assertThat(records.points()).filteredOn(point -> "out".equals(point.attributes().get("direction")))
+                .allSatisfy(point -> assertThat(point.startTime()).isEqualTo(STARTED));
+    }
+
+    @Test
+    @DisplayName("a pipeline reading steadily and confirming nothing says so on the face")
+    void whatIsBeingReadIsVisibleWithNothingConfirmedYet() {
+        state.create("orders", PipelineState.RUNNING.name(), AT);
+
+        publisherAt(readSoFar(), DeliveryReading.NONE, AT).publish("orders");
+
+        Observation published = observations.read("orders").orElseThrow();
+        // The whole reason both ends are measured. On the target side alone this pipeline is
+        // indistinguishable from one whose source has nothing to send; here it is plainly reading and
+        // plainly landing none of it.
+        assertThat(published.metrics()).contains(Map.entry("records.in", 1_600L));
+        assertThat(published.metrics()).doesNotContainKey("records.out");
+    }
+
+    @Test
+    @DisplayName("the flat view carries a total for each direction")
+    void theFlatFaceKeepsTheDirectionsApartAfterCollapsingEverythingElse() {
+        state.create("orders", PipelineState.RUNNING.name(), AT);
+
+        publisherAt(readSoFar(), twoTables(), AT).publish("orders");
+
+        Observation published = observations.read("orders").orElseThrow();
+        // Table and operation collapse into the pipeline's own throughput; direction does not, because the
+        // two numbers subtract and a single total would answer a question nobody asked.
+        assertThat(published.metrics()).contains(
+                Map.entry("records.in", 1_600L), Map.entry("records.out", 1_238L));
+    }
+
+    @Test
+    @DisplayName("a capture that has opened its account and read nothing publishes no count")
+    void aCaptureWithAStartAndNoRowsPublishesNoCount() {
+        CaptureReading openedOnly = new CaptureReading(Map.of(), READING_SINCE);
+
+        // Symmetrical with the target side, and for the same reason: a start on its own is not an arrival,
+        // and a published zero spells "has read nothing" the same way as "is not being measured".
+        assertThat(facts(openedOnly, DeliveryReading.NONE, AT)).extracting(MetricFact::name)
+                .doesNotContain("tapstate.pipeline.records");
+    }
+
+    @Test
+    @DisplayName("a load counts on the source side as the read it was there too")
+    void theOperationIsTheSourcesOwnOnTheWayInAsWell() {
+        CaptureReading loading = new CaptureReading(Map.of("orders", Map.of("r", 5_000L)), READING_SINCE);
+
+        MetricFact records = factNamed(facts(loading, DeliveryReading.NONE, AT), "tapstate.pipeline.records");
+
+        // One name map serves both ends. Were the two to spell an operation differently, the subtraction
+        // the directions exist for would be between series that do not line up.
+        assertThat(records.points()).singleElement().satisfies(point -> {
+            assertThat(point.attributes().get("op")).isEqualTo("read");
+            assertThat(point.attributes().get("direction")).isEqualTo("in");
+        });
+    }
+
     private List<MetricFact> facts(DeliveryReading reading, Instant at) {
-        return publisherAt(reading, at).facts("orders", PipelineState.RUNNING, at,
+        return facts(CaptureReading.NONE, reading, at);
+    }
+
+    private List<MetricFact> facts(CaptureReading captured, DeliveryReading delivered, Instant at) {
+        return publisherAt(captured, delivered, at).facts("orders", PipelineState.RUNNING, at,
                 Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
     }
 
@@ -249,6 +349,11 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     }
 
     private ObservationPublisher publisherAt(DeliveryReading reading, Instant at) {
+        return publisherAt(CaptureReading.NONE, reading, at);
+    }
+
+    private ObservationPublisher publisherAt(
+            CaptureReading captured, DeliveryReading delivered, Instant at) {
         return new ObservationPublisher(state, observations,
                 id -> OptionalLong.of(128_500L),
                 id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
@@ -256,7 +361,8 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
                 id -> Map.of(), id -> Map.of(), id -> Map.of(),
-                id -> reading,
+                id -> captured,
+                id -> delivered,
                 Clock.fixed(at, ZoneOffset.UTC));
     }
 

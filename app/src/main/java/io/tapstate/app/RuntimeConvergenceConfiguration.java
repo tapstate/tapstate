@@ -74,6 +74,10 @@ class RuntimeConvergenceConfiguration {
                 // running total means nothing without what it counts from, and a count of rows says
                 // nothing about whether they are current -- which is the question a pipeline quietly
                 // falling behind answers with a perfectly healthy count.
+                // The near end of the same crossing, read from the capture side rather than the engine:
+                // rows counted where a source handed them over. On its own it says a pipeline is reading;
+                // beside the far end it says whether what it reads is arriving, which neither answers.
+                captureCoordinator::capturedRows,
                 id -> deliveredBy(engine, id),
                 Clock.systemUTC());
     }

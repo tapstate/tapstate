@@ -1,5 +1,6 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FlatReduction;
@@ -135,6 +136,7 @@ public final class ObservationPublisher {
     private static final String TABLE_ID_ATTRIBUTE = "tapstate.table.id";
     private static final String DIRECTION_ATTRIBUTE = "direction";
     private static final String OP_ATTRIBUTE = "op";
+    private static final String INBOUND = "in";
     private static final String OUTBOUND = "out";
 
     /**
@@ -191,6 +193,7 @@ public final class ObservationPublisher {
     private final Function<String, Map<String, Long>> nestDeadLetters;
     private final Function<String, Map<String, Long>> joinRecomputeDone;
     private final Function<String, Map<String, Long>> joinRecomputeExpected;
+    private final Function<String, CaptureReading> captures;
     private final Function<String, DeliveryReading> deliveries;
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
@@ -401,6 +404,35 @@ public final class ObservationPublisher {
             Function<String, Map<String, Long>> joinRecomputeExpected,
             Function<String, DeliveryReading> deliveries,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, id -> CaptureReading.NONE, deliveries, clock);
+    }
+
+    /**
+     * A publisher wired to both ends of the crossing: {@code captures} yields what the pipeline's sources
+     * have handed over, {@code deliveries} what its targets have confirmed.
+     *
+     * <p>Two ports and not one, because the two are read from different places and can be wired
+     * independently — and because the difference between them is the reading that matters. Everything read
+     * and not yet confirmed sits between the two totals, so a pipeline whose reading is healthy and whose
+     * writing has stopped looks exactly like a healthy one on either number alone.
+     */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, Map<String, TableSnapshot>> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries,
+            Clock clock) {
+        this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.joinRecomputeDone = Objects.requireNonNull(joinRecomputeDone, "joinRecomputeDone");
@@ -576,57 +608,80 @@ public final class ObservationPublisher {
                 readAt(JOIN_RECOMPUTE_DONE_PREFIX + subject, "{row}", at, rows)));
         rebuildExpected.forEach((subject, rows) -> facts.add(
                 readAt(JOIN_RECOMPUTE_EXPECTED_PREFIX + subject, "{row}", at, rows)));
-        delivered(pipelineId, at, deliveries.apply(pipelineId)).forEach(facts::add);
+        movement(pipelineId, at, captures.apply(pipelineId), deliveries.apply(pipelineId))
+                .forEach(facts::add);
         return facts;
     }
 
     /**
-     * The two facts a run's deliveries make: how many rows of each table and operation reached a target,
-     * and how old the newest row of each table is. Empty for a pipeline whose run reports nothing, so a
-     * pipeline that is not running is absent from both rather than present at zero.
+     * The facts a pipeline's movement makes: how many rows of each table and operation crossed each end of
+     * it, and how old the newest row of each table to reach a target is. Empty for a pipeline reporting
+     * nothing on both ends, so a pipeline that is not running is absent rather than present at zero.
      *
-     * <p>That emptiness is decided per fact and not once up front. A run may have a start and nothing
-     * settled, or rows for one table and a recency reading for another, and each fact is left out on its
-     * own account; a check covering both would be a second place for the same decision to be made, and
-     * one of the two would eventually stop agreeing with it.
+     * <p>The two directions are one measurement with an attribute telling them apart, not two measurements.
+     * What a reader wants from them is a comparison — everything read and not yet confirmed is the
+     * difference — and two names could be defined, counted or published differently without anything
+     * noticing.
+     *
+     * <p>Each direction carries its own start, because they are not counted from the same moment: the
+     * capture opens its account when the run's sources are opened, and the targets theirs when the job that
+     * writes to them starts, which is strictly later. One start over both would misdate whichever it was
+     * not taken from.
+     *
+     * <p>Emptiness is decided per fact and per direction, never once up front. A run may have a start and
+     * nothing counted, rows on one end and none on the other, or rows for one table and a recency reading
+     * for another; each is left out on its own account, and a check covering several would be a second
+     * place for the same decision to be made.
      */
-    private List<MetricFact> delivered(String pipelineId, Instant at, DeliveryReading reading) {
-        if (reading == null) {
-            return List.of();
-        }
+    private List<MetricFact> movement(
+            String pipelineId, Instant at, CaptureReading captured, DeliveryReading delivered) {
         List<MetricFact> facts = new ArrayList<>();
-        // The one measurement here that accumulates, and the first that can: the run reports what its
-        // totals count from, so the stream has the start identity every other family on this face still
-        // lacks. Without it this would have to be a reading like the rest.
-        reading.start().ifPresent(start -> {
-            // Summed into one point per attribute set, not one per symbol the engine reported. The map
-            // above is not injective: every symbol it does not recognise lands on one name, so two
-            // unrecognised kinds reaching one table produce two points carrying identical attributes -
-            // two values of one series, which a fact refuses outright. Adding them is what the counter
-            // means: both are rows that reached the target.
-            Map<Map<String, String>, Long> rowsByAttributes = new LinkedHashMap<>();
-            reading.rowsByTableAndOp().forEach((table, byOp) -> byOp.forEach((symbol, count) ->
-                    rowsByAttributes.merge(Map.of(
-                            PIPELINE_ID_ATTRIBUTE, pipelineId,
-                            TABLE_ID_ATTRIBUTE, table,
-                            DIRECTION_ATTRIBUTE, OUTBOUND,
-                            OP_ATTRIBUTE, OP_NAMES.getOrDefault(symbol, "other")),
-                            count, Long::sum)));
-            List<MetricPoint> rows = new ArrayList<>();
-            rowsByAttributes.forEach(
-                    (attributes, count) -> rows.add(MetricPoint.accumulated(attributes, start, at, count)));
-            if (!rows.isEmpty()) {
-                facts.add(new MetricFact(RECORDS_METRIC, MetricType.COUNTER, "{record}", rows));
-            }
-        });
+        List<MetricPoint> rows = new ArrayList<>();
+        if (captured != null) {
+            captured.start().ifPresent(start ->
+                    crossings(pipelineId, INBOUND, captured.rowsByTableAndOp(), start, at, rows));
+        }
+        if (delivered != null) {
+            delivered.start().ifPresent(start ->
+                    crossings(pipelineId, OUTBOUND, delivered.rowsByTableAndOp(), start, at, rows));
+        }
+        if (!rows.isEmpty()) {
+            facts.add(new MetricFact(RECORDS_METRIC, MetricType.COUNTER, "{record}", rows));
+        }
+        if (delivered == null) {
+            return facts;
+        }
         List<MetricPoint> ages = new ArrayList<>();
-        reading.newestEventTimeByTable().forEach((table, eventTime) -> ages.add(MetricPoint.reading(
+        delivered.newestEventTimeByTable().forEach((table, eventTime) -> ages.add(MetricPoint.reading(
                 Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, TABLE_ID_ATTRIBUTE, table),
                 at, ageInSeconds(at, eventTime))));
         if (!ages.isEmpty()) {
             facts.add(new MetricFact(LAG_METRIC, MetricType.GAUGE, "s", ages));
         }
         return facts;
+    }
+
+    /**
+     * Adds one accumulating point per attribute set for what crossed one end of the pipeline.
+     *
+     * <p>Summed into one point per attribute set, not one per symbol the run reported. The name map is not
+     * injective: every symbol it does not recognise lands on one name, so two unrecognised kinds reaching
+     * one table produce two points carrying identical attributes — two values of one series, which a fact
+     * refuses outright. Adding them is what the counter means: both are rows that crossed.
+     */
+    private static void crossings(String pipelineId, String direction,
+            Map<String, Map<String, Long>> rowsByTableAndOp, Instant start, Instant at,
+            List<MetricPoint> into) {
+        Map<Map<String, String>, Long> byAttributes = new LinkedHashMap<>();
+        rowsByTableAndOp.forEach((table, byOp) -> byOp.forEach((symbol, count) ->
+                byAttributes.merge(Map.of(
+                        PIPELINE_ID_ATTRIBUTE, pipelineId,
+                        TABLE_ID_ATTRIBUTE, table,
+                        DIRECTION_ATTRIBUTE, direction,
+                        OP_ATTRIBUTE, OP_NAMES.getOrDefault(symbol, "other")),
+                        count, Long::sum)));
+        byAttributes.forEach(
+                (attributes, count) -> into.add(MetricPoint.accumulated(attributes, start, at, count)));
     }
 
     /**

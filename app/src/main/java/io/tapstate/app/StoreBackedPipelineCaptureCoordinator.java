@@ -7,6 +7,7 @@ import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureError;
 import io.tapstate.runtime.srs.CaptureRunSpec;
@@ -18,7 +19,10 @@ import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
+
+import java.time.Instant;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -187,6 +191,36 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     @Override
     public Map<String, TableSnapshot> snapshotProgress(String pipelineId) {
         return snapshotsByPipeline.getOrDefault(pipelineId, Map.of());
+    }
+
+    /**
+     * What this pipeline's source runs have taken in, added together. A pipeline reads through one run per
+     * source and each counts its own tables, so the sum is over runs that do not overlap -- except where two
+     * sources name a table the same, and there the sum is still the answer: both arrivals are rows this
+     * pipeline read.
+     *
+     * <p>The <strong>latest</strong> start among the runs, for the reason the target side takes the latest
+     * of its own. A start is how a consumer is told the series began again, and a total that falls with no
+     * such signal beside it is a counter going backwards; a run that is replaced resets its own count, and
+     * moving this instant forward with it makes the fall read as the restart it is.
+     */
+    @Override
+    public CaptureReading capturedRows(String pipelineId) {
+        List<CaptureRun> runs = runsByPipeline.get(pipelineId);
+        if (runs == null || runs.isEmpty()) {
+            return CaptureReading.NONE;
+        }
+        Map<String, Map<String, Long>> rows = new LinkedHashMap<>();
+        Instant since = null;
+        for (CaptureRun run : runs) {
+            CaptureHealth health = run.health();
+            health.receivedRows().forEach((table, byOp) -> byOp.forEach((symbol, count) ->
+                    rows.computeIfAbsent(table, ignored -> new LinkedHashMap<>())
+                            .merge(symbol, count, Long::sum)));
+            Instant start = health.countingSince();
+            since = since == null || start.isAfter(since) ? start : since;
+        }
+        return new CaptureReading(rows, since);
     }
 
     /**

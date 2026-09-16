@@ -358,10 +358,16 @@ public final class Engine {
      * The moment the pipeline's live job began counting what it has delivered, as epoch milliseconds;
      * empty when it has no live job or nothing has counted yet.
      *
-     * <p>The <strong>latest</strong> start among its sinks, not the earliest. The counts beside it are
-     * summed across sinks, and a sum is only true of a window every one of its terms was counting through
-     * — so the instant the whole total accumulates from is the one the last sink to start began at. Taking
-     * the earliest would describe the total as covering ground the later sink was not yet counting.
+     * <p>The <strong>latest</strong> start among its sinks, not the earliest, and the choice is a trade
+     * rather than a plain reading. A total summed over sinks that began at different moments is not exactly
+     * true of either instant: the earliest is the only window that contains every term, so on containment
+     * alone it would win. What decides it the other way is what a start is read for. It is how a consumer
+     * is told the series began again, and the one reading that corrupts a rate is a total that drops with
+     * no such signal beside it. A sink that restarts resets its own count, so the sum drops; taking the
+     * latest moves this instant forward in the same breath and the drop reads as the restart it is, while
+     * taking the earliest would leave it as a counter going backwards, which is the one thing a start time
+     * exists to make impossible. A sink joining a running pipeline is read as a restart too, which loses
+     * the history before it rather than reporting a rate that never happened.
      */
     public OptionalLong countingSince(String pipelineId) {
         Job job = liveJob(pipelineId);

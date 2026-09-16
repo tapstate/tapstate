@@ -18,6 +18,7 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.srs.CaptureHealth;
+import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
@@ -29,6 +30,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.StorePort;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -286,6 +288,129 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("'p'")
                 .hasMessageContaining("'orders_src'");
+    }
+
+    // ---- what the sources handed over ------------------------------------------------------------
+
+    /**
+     * Drives rows into a run's account the way a connector does — through the one seam every capture path
+     * is started with — so what is asserted below is the coordinator's arithmetic and not a second way of
+     * counting invented for the test.
+     */
+    private static void handOver(CaptureHealth health, Envelope... events) {
+        health.recording((batch, position) -> { }).onBatch(List.of(events), Optional.empty());
+    }
+
+    private static CaptureHealth healthStrictlyAfter(CaptureHealth earlier) {
+        Instant open = earlier.countingSince();
+        CaptureHealth later = new CaptureHealth();
+        while (!later.countingSince().isAfter(open)) {
+            later = new CaptureHealth();
+        }
+        return later;
+    }
+
+    @Test
+    void everySourcesArrivalsAreAddedUpForTheOnePipeline() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(cdcSource("items_src", "items", null));
+        artifacts.save(twoSourcePipeline("p", "orders_src", "items_src"));
+        CaptureHealth orders = new CaptureHealth();
+        CaptureHealth items = new CaptureHealth();
+        handOver(orders, Envelope.insert(1L, "orders", Map.of("id", 1), Map.of()),
+                Envelope.update(2L, "orders", Map.of("id", 1), Map.of("id", 1), Map.of()));
+        handOver(items, Envelope.delete(3L, "items", Map.of("id", 9), Map.of()));
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                coordinatorOver(artifacts, List.of(orders, items));
+
+        coordinator.startCapture("p");
+
+        // A pipeline reads through one run per source and each counts its own tables, so what a reader
+        // asked "how much is this pipeline taking in" wants is the runs added together.
+        assertThat(coordinator.capturedRows("p").rowsByTableAndOp()).containsOnly(
+                entry("orders", Map.of("i", 1L, "u", 1L)), entry("items", Map.of("d", 1L)));
+    }
+
+    @Test
+    void twoSourcesNamingOneTableAreAddedRatherThanOneWinning() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(cdcSource("archive_src", "orders", null));
+        artifacts.save(twoSourcePipeline("p", "orders_src", "archive_src"));
+        CaptureHealth live = new CaptureHealth();
+        CaptureHealth archive = new CaptureHealth();
+        handOver(live, Envelope.insert(1L, "orders", Map.of("id", 1), Map.of()));
+        handOver(archive, Envelope.insert(2L, "orders", Map.of("id", 2), Map.of()));
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                coordinatorOver(artifacts, List.of(live, archive));
+
+        coordinator.startCapture("p");
+
+        // Both arrivals are rows this pipeline read. Keyed by table alone the two runs collide, and the
+        // shape that loses one of them reads as a source that has gone half quiet.
+        assertThat(coordinator.capturedRows("p").rowsByTableAndOp())
+                .containsExactly(entry("orders", Map.of("i", 2L)));
+    }
+
+    @Test
+    void theLatestStartAmongTheRunsIsTheOneReported() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(cdcSource("items_src", "items", null));
+        artifacts.save(twoSourcePipeline("p", "orders_src", "items_src"));
+        CaptureHealth first = new CaptureHealth();
+        CaptureHealth second = healthStrictlyAfter(first);
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                coordinatorOver(artifacts, List.of(first, second));
+
+        coordinator.startCapture("p");
+
+        // The witness the assertion below needs: two accounts opened at genuinely different moments, or
+        // earliest and latest would be the same value and this would hold either way.
+        assertThat(second.countingSince()).isAfter(first.countingSince());
+        // A run that is replaced resets its own count, so the sum falls; moving this instant forward with
+        // it is what makes the fall read as the restart it is rather than as a counter going backwards.
+        assertThat(coordinator.capturedRows("p").countingSince()).isEqualTo(second.countingSince());
+    }
+
+    @Test
+    void aPipelineWithNoCaptureRunningReportsNothingRatherThanZero() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src"));
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                coordinatorOver(artifacts, List.of(new CaptureHealth()));
+
+        CaptureReading before = coordinator.capturedRows("p");
+
+        // Absent, not zero, and it has to be absent before the start as well as after a stop: a pipeline
+        // nobody is capturing and one capturing nothing want opposite responses.
+        assertThat(before).isEqualTo(CaptureReading.NONE);
+        assertThat(before.start()).isEmpty();
+
+        coordinator.startCapture("p");
+        assertThat(coordinator.capturedRows("p").start()).isPresent();
+
+        coordinator.stopCapture("p", true);
+        assertThat(coordinator.capturedRows("p")).isEqualTo(CaptureReading.NONE);
+    }
+
+    /** A coordinator whose runs hand back the given accounts, one per source, in declaration order. */
+    private static StoreBackedPipelineCaptureCoordinator coordinatorOver(
+            InMemoryArtifactStore artifacts, List<CaptureHealth> healths) {
+        SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
+        java.util.Iterator<CaptureHealth> next = healths.iterator();
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(
+                    spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(),
+                    Optional.of(() -> { }), next.next());
+        };
+        return new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, srsCoordinator, new SnapshotBuffer());
     }
 
     // ---- handle lifecycle ------------------------------------------------------------------------
