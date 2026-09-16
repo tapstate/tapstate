@@ -28,8 +28,10 @@ import java.util.stream.Collectors;
  * <p>The answer is saved as a registered context bound to the workspace directory, so the question is
  * not asked again there, and it is signed in to, so that later runs go there without being told
  * anything. Registration goes through {@link ContextManager}, the session through {@link AuthService},
- * and both happen only after the server answered its health probe; the binding is written last, after
- * the sign-in, so an abort, an unreachable server or a refused login leaves the directory unbound.
+ * and neither is written until the server has answered its health probe and accepted the sign-in: a
+ * refused login registers no server, so the registry lists only servers somebody has signed in to.
+ * The binding is written last of all, so an abort, an unreachable server or a refused login leaves
+ * the directory unbound.
  *
  * <p>The default answer, when nothing is listening on it, starts the local development stack in
  * Docker ({@link LocalStack}) — at a terminal after saying so and being told to go on, and from a
@@ -184,18 +186,23 @@ final class ServerBinding {
     }
 
     /**
-     * Registers the context when it is new, signs in through the same service every other sign-in
-     * uses, and only then binds the directory. {@code justStarted} says the server is a stack that came
-     * up a moment ago: its bootstrap creates the admin right after the server first answers, so a
-     * refused login there is retried for as long as the stack was given to answer at all - and once
-     * signed in, the binding waits for the stack's boot-time sweep to register the bundled connectors,
-     * so the first {@code up} never lands in the seconds between the server listening and them existing.
+     * Signs in through the same service every other sign-in uses, registers the context when it is new
+     * and the sign-in succeeded, and only then binds the directory. Both refusals name what the person
+     * already has - the principal, or the server - and never the context: until the sign-in succeeds
+     * that name is settled but unwritten, so a remedy addressed to it would look for a context no
+     * later command can find.
+     *
+     * <p>{@code justStarted} says the server is a stack that came up a moment ago: its bootstrap
+     * creates the admin right after the server first answers, so a refused login there is retried for
+     * as long as the stack was given to answer at all - and once signed in, the binding waits for the
+     * stack's boot-time sweep to register the bundled connectors, so the first {@code up} never lands
+     * in the seconds between the server listening and them existing.
      */
     private void signInAndBind(Path workspace, URI server, Credentials credentials, boolean justStarted, String user)
             throws IOException {
-        ContextManager.ContextChoice choice = contextFor(server);
-        String name = choice.name();
-        ContextDefinition definition = choice.definition();
+        Registration registration = registrationFor(server);
+        String name = registration.name();
+        ContextDefinition definition = registration.definition();
         ResolvedContext.Named context = new ResolvedContext.Named(name, definition, ResolvedContext.Source.EXPLICIT);
         Supplier<AuthService.LoginResult> attempt =
                 () -> auth.login(context, credentials.user(), credentials.password(), false);
@@ -204,6 +211,9 @@ final class ServerBinding {
                 : attempt.get();
         switch (result) {
             case AuthService.LoginResult.Success success -> {
+                if (!registration.registered()) {
+                    registerOrSignOut(context, name, definition);
+                }
                 if (justStarted) {
                     stack.awaitConnectors(() -> registeredConnectors(success.session()));
                 }
@@ -219,11 +229,37 @@ final class ServerBinding {
                         Map.of("code", rejected.code(), "principal", rejected.principal()), null);
             }
             case AuthService.LoginResult.Unreachable ignored -> throw new TapstateException(
-                    CliError.AUTH_LOGIN_UNREACHABLE, Map.of("context", name), null);
+                    CliError.SIGN_IN_UNUSABLE, Map.of("server", server.toString()), null);
         }
         // the binding is keyed by the directory's real path, so the directory has to be there first
         Files.createDirectories(workspace);
         contexts.bind(workspace, name);
+    }
+
+    /**
+     * Writes the context the sign-in just succeeded through, and takes the saved session back out
+     * again when that write cannot happen. The name was settled from a snapshot read before the
+     * login and reserves nothing, so another run can register it while the login is in flight - and
+     * by then a session has been saved, addressed by the identity that was going to be written under
+     * that name. Left behind, that record is one no context names and no later run ever looks up
+     * again, which is the state this whole path exists not to produce; it goes out with the
+     * registration that never landed, and the caller still sees what actually refused the run.
+     *
+     * <p>Only the copy on this machine is removed. Revoking the session on the server would take a
+     * second call that can be refused or go unanswered, and a server that cannot be reached must not
+     * be the reason the unreachable record stays on disk; the session expires there on its own.
+     */
+    private void registerOrSignOut(ResolvedContext.Named context, String name, ContextDefinition definition) {
+        try {
+            contexts.register(name, definition);
+        } catch (RuntimeException unwritten) {
+            try {
+                auth.logout(context, true);
+            } catch (RuntimeException alsoFailed) {
+                unwritten.addSuppressed(alsoFailed);
+            }
+            throw unwritten;
+        }
     }
 
     /**
@@ -255,12 +291,10 @@ final class ServerBinding {
     }
 
     /**
-     * A username and password on their way to one login call; never printed. The rendering redacts the
-     * secret rather than naming it in the shape of an assignment, which is what a credential scanner
-     * reads as one - the redaction is the point of this method, and it should not read like the leak.
+     * Finds an exact-server context or settles the first free name derived from that server, defining
+     * what would be registered under it without writing anything yet.
      */
-    /** Finds an exact-server context or claims the first free name derived from that server. */
-    private ContextManager.ContextChoice contextFor(URI server) {
+    private Registration registrationFor(URI server) {
         String base = server.equals(DEFAULT_SERVER) ? LOCAL_CONTEXT : contextNameFor(server);
         List<ContextManager.ContextChoice> choices = contexts.suggestions();
         for (int suffix = 1; ; suffix++) {
@@ -270,15 +304,27 @@ final class ServerBinding {
                     .findFirst()
                     .orElse(null);
             if (existing == null) {
-                ContextDefinition created = contexts.create(name, List.of(server), true);
-                return new ContextManager.ContextChoice(name, created, false);
+                return new Registration(name, contexts.define(name, List.of(server), true), false);
             }
             if (existing.definition().seeds().equals(List.of(server))) {
-                return existing;
+                return new Registration(name, existing.definition(), true);
             }
         }
     }
 
+    /**
+     * The context a workspace will be bound through: one the registry already holds, or a name and an
+     * identity claimed for a server nobody has signed in to yet. The second is written only once the
+     * sign-in through it succeeded, so a refusal leaves the registry exactly as it was.
+     */
+    private record Registration(String name, ContextDefinition definition, boolean registered) {
+    }
+
+    /**
+     * A username and password on their way to one login call; never printed. The rendering redacts the
+     * secret rather than naming it in the shape of an assignment, which is what a credential scanner
+     * reads as one - the redaction is the point of this method, and it should not read like the leak.
+     */
     private record Credentials(String user, String password, boolean savedLocalAdmin) {
         @Override
         public String toString() {

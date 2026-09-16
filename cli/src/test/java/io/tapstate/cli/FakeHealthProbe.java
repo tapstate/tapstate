@@ -13,7 +13,9 @@ import java.util.Map;
  * probed and every login attempted, so a test can assert the order and the credentials. The one call
  * after sign-in it answers is the connector list, which a stack that just came up is polled for: the
  * staged connectors are listed as {@code bundled} from the first answer and flip to {@code registered}
- * after as many lists as the test scripted, or never. Every other call fails
+ * after as many lists as the test scripted, or never. The login also runs whatever the test hung on
+ * {@link #duringLogin}, which is how a test puts something else's write inside the window a real
+ * login is open for. Every other call fails
  * the test: the first run has no business talking to the server beyond these, so another call is a
  * defect, not something to stub.
  */
@@ -36,6 +38,8 @@ final class FakeHealthProbe implements ControlPlaneClient {
     boolean connectorsNeverSeeded;
     /** How many times the connector list was asked for. */
     int connectorLists;
+    /** Run inside the login, standing in for whatever else touched this machine while it was in flight. */
+    Runnable duringLogin = () -> { };
 
     FakeHealthProbe(boolean healthy) {
         this.healthy = healthy;
@@ -56,6 +60,7 @@ final class FakeHealthProbe implements ControlPlaneClient {
     @Override
     public LoginOutcome login(URI baseUrl, String username, String password, boolean createSession) {
         logins.add(username + ":" + password);
+        duringLogin.run();
         if (loginOutcome != null) {
             return loginOutcome;
         }
