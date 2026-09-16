@@ -119,17 +119,36 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     }
 
     @Test
-    @DisplayName("a snapshot read lands under the name the contract keeps for an op it does not name")
-    void aSnapshotReadIsCarriedAsTheContractsOtherRatherThanANameInventedHere() {
+    @DisplayName("a row carried across by the initial load is an insert, like any other row appearing")
+    void aSnapshotReadIsAnInsertBecauseThatIsWhatItDoesAtTheTarget() {
         DeliveryReading loading = new DeliveryReading(Map.of("orders", Map.of("r", 5_000L)),
                 Map.of("orders", AT.toEpochMilli()), STARTED);
 
         MetricFact records = factNamed(facts(loading, AT), "tapstate.pipeline.records");
 
-        // The engine's set of change kinds is closed at five and so is the contract's, but they are not
-        // the same five. Giving it a name here would be this layer deciding a contract it implements.
+        // Not "other". That name is for a change kind nothing recognises, and a reader who meets it has
+        // been told only that somebody gave up - which they will interpret anyway, and wrongly. What the
+        // engine calls a read is a whole row crossing for the first time, and at the target that is an
+        // insert.
         assertThat(records.points()).singleElement()
-                .satisfies(point -> assertThat(point.attributes().get("op")).isEqualTo("other"));
+                .satisfies(point -> assertThat(point.attributes().get("op")).isEqualTo("insert"));
+    }
+
+    @Test
+    @DisplayName("loading and tailing the same table add up under one operation, and none of them is lost")
+    void theInitialLoadAndTheChangesAfterItShareTheOperationTheyBothAre() {
+        DeliveryReading both = new DeliveryReading(Map.of("orders", Map.of("r", 5_000L, "i", 7L)),
+                Map.of("orders", AT.toEpochMilli()), STARTED);
+
+        MetricFact records = factNamed(facts(both, AT), "tapstate.pipeline.records");
+
+        // One series, because they are one operation. Which phase a row arrived in is a different question
+        // and belongs in an attribute of its own - folded into this one, the operation would mean two
+        // things at once and grouping by it would group by a mixture.
+        assertThat(records.points()).singleElement().satisfies(point -> {
+            assertThat(point.attributes().get("op")).isEqualTo("insert");
+            assertThat(point.value()).isEqualTo(5_007L);
+        });
     }
 
     @Test
