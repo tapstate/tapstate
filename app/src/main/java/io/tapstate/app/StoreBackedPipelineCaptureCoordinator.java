@@ -207,9 +207,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     @Override
     public CaptureReading capturedRows(String pipelineId) {
         List<CaptureRun> runs = runsByPipeline.get(pipelineId);
-        if (runs == null || runs.isEmpty()) {
+        if (runs == null) {
             return CaptureReading.NONE;
         }
+        // No second guard for a run list that is empty: nothing would be summed and no start taken, which
+        // is what nothing reported already is. A guard for it would be a branch no case can enter, and a
+        // branch nothing can enter is where a different answer hides.
         Map<String, Map<String, Long>> rows = new LinkedHashMap<>();
         Instant since = null;
         for (CaptureRun run : runs) {
