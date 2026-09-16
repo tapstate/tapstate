@@ -25,12 +25,16 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -152,6 +156,39 @@ public final class ObservationPublisher {
     private static final String SNAPSHOT_ROWS_METRIC = "tapstate.pipeline.snapshot.rows";
     private static final String SNAPSHOT_ROWS_TOTAL_METRIC = "tapstate.pipeline.snapshot.rows.total";
 
+    /**
+     * How many failures this pipeline has had, by the code that names each one. A counter, and a real one:
+     * what stood here before was the pipeline's own state written as a number - one while it was FAILED
+     * and nought otherwise - which is a state wearing a count's name. It could not answer how many times
+     * anything had happened, and it went back down when the pipeline recovered.
+     *
+     * <p>Counted once per failure the converge side witnesses, which is once per death: the pass that saw
+     * it is the only one handed the cause, and every later pass while the state stays FAILED is handed
+     * nothing and adds nothing.
+     *
+     * <p>The code is the attribute because it is the only part of a failure worth grouping by. "How many
+     * errors" is a number nobody can act on; "which kind of failure is rising" is the question an operator
+     * actually has, and it is the one the shape that stood here could not be asked at all.
+     */
+    private static final String ERRORS_METRIC = "tapstate.pipeline.errors";
+
+    /**
+     * How many convergence passes in a row have thrown for this pipeline, published only while that streak
+     * is running. Kept apart from the counter above, and it is not a second spelling of it.
+     *
+     * <p><strong>It is a streak, not a total.</strong> One clean pass returns it to nothing, so it goes
+     * down, and a counter that goes down is a counter every consumer reads as a restart. It also counts a
+     * different thing: a pass that keeps throwing never reaches a publish at all, so there is no witnessed
+     * failure to attribute a code to - what is observable is only that the attempt is not getting through.
+     *
+     * <p>It says streak in its name because the one reader it has needs it to be one: the command line
+     * reports "N passes in a row have thrown", and a name that said total would have that sentence quietly
+     * start lying the day somebody made it one.
+     */
+    private static final String RECONCILE_STREAK_METRIC = "reconcileFailuresInARow";
+
+    private static final String CODE_ATTRIBUTE = "code";
+
     private static final String PIPELINE_ID_ATTRIBUTE = "tapstate.pipeline.id";
     private static final String TABLE_ID_ATTRIBUTE = "tapstate.table.id";
     private static final String DIRECTION_ATTRIBUTE = "direction";
@@ -173,7 +210,13 @@ public final class ObservationPublisher {
      */
     private static final Map<String, FlatReduction> FLAT_REDUCTIONS = Map.of(
             RECORDS_METRIC, attributes -> "records." + attributes.get(DIRECTION_ATTRIBUTE),
-            LAG_METRIC, attributes -> "lag." + attributes.get(TABLE_ID_ATTRIBUTE));
+            LAG_METRIC, attributes -> "lag." + attributes.get(TABLE_ID_ATTRIBUTE),
+            // Reduced and not dropped, which is the opposite of what the load's two measurements get, and
+            // for the reason that decides between them: a drop is only honest when another face carries
+            // the metric, and the load has one - this observation's own snapshot dataset. Failures have
+            // none. Dropped here they would be measured and readable nowhere at all until an exporter
+            // exists, which is a gate away.
+            ERRORS_METRIC, attributes -> "errors." + attributes.get(CODE_ATTRIBUTE));
 
     /**
      * The name the metric contract gives each of this engine's change kinds.
@@ -224,6 +267,23 @@ public final class ObservationPublisher {
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
     private final Clock clock;
+
+    /**
+     * How many failures each pipeline has had, by code, since this publisher opened its account.
+     *
+     * <p>Held here because this is where the input already arrives: the converge side hands a coded cause
+     * to {@link #publish(String, ObservationFailure)} on the one pass that witnesses a death, so counting
+     * it needs no port of its own and cannot be fed twice for one failure.
+     *
+     * <p><strong>It does not survive a restart, and that is the answer rather than a shortfall.</strong>
+     * A new process opens a new account and says so through a later start, which is what lets a consumer
+     * tell a restart from a total that went backwards. Carrying totals across restarts and keeping
+     * restarts visible cannot both be had, and every counter on this face has already chosen the second.
+     */
+    private final Map<String, Map<String, Long>> failuresByPipelineAndCode = new ConcurrentHashMap<>();
+
+    /** When this publisher opened the failure account above; every failure point accumulates from it. */
+    private final Instant countingFailuresSince;
 
     /**
      * A publisher with no metric, position or snapshot source: recordCount stays absent and positions and
@@ -463,6 +523,9 @@ public final class ObservationPublisher {
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
         this.clock = Objects.requireNonNull(clock, "clock");
+        // Read from the injected clock and not the system one, so a test that drives time can say what
+        // the failure counter accumulates from instead of asserting against whenever it happened to run.
+        this.countingFailuresSince = observedNow();
         this.joinRecomputeDone = Objects.requireNonNull(joinRecomputeDone, "joinRecomputeDone");
         this.joinRecomputeExpected =
                 Objects.requireNonNull(joinRecomputeExpected, "joinRecomputeExpected");
@@ -500,6 +563,13 @@ public final class ObservationPublisher {
             ObservationFailure carried = failure;
             if (carried == null && actual == PipelineState.FAILED) {
                 carried = observations.read(pipelineId).map(Observation::failure).orElse(null);
+            }
+            // Counted on the pass that witnesses it, which is the only pass handed a cause. A later pass
+            // over a pipeline still FAILED is handed null and adds nothing, so one death is one count.
+            if (failure != null) {
+                failuresByPipelineAndCode
+                        .computeIfAbsent(pipelineId, id -> new ConcurrentHashMap<>())
+                        .merge(failure.code(), 1L, Long::sum);
             }
             Map<String, NestStateReading> readings = nestStateReadings.apply(pipelineId);
             // Both frontier readings are taken once and used twice - published as metrics and judged by
@@ -552,7 +622,8 @@ public final class ObservationPublisher {
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
         Instant at = observedNow();
         observations.save(new Observation(pipelineId, lastState,
-                FlatMetricProjection.of(List.of(readAt("errorCount", "{error}", at, consecutiveFailures)))
+                FlatMetricProjection.of(
+                        List.of(readAt(RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures)))
                         .metrics(),
                 null, lastPositions, lastFailure, at));
     }
@@ -600,7 +671,7 @@ public final class ObservationPublisher {
             Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
             SnapshotReading loaded) {
         List<MetricFact> facts = new ArrayList<>();
-        facts.add(readAt("errorCount", "{error}", at, actual == PipelineState.FAILED ? 1L : 0L));
+        failures(pipelineId, at).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
                 .ifPresent(count -> facts.add(readAt("recordCount", "{record}", at, count)));
         // One fact per chain that reported a reading, so a chain keeping up and a chain that has stalled
@@ -645,6 +716,47 @@ public final class ObservationPublisher {
                 .forEach(facts::add);
         load(pipelineId, at, loaded).forEach(facts::add);
         return facts;
+    }
+
+    /**
+     * How many failures this pipeline has had, by code, or empty for one that has had none.
+     *
+     * <p>Absent rather than present at zero, like every other quantity here whose quiet state and whose
+     * unwired state would otherwise be spelled the same way. What that costs is worth naming: a reader
+     * cannot tell "nothing has failed" from "nobody is counting", and the flat face this reduces onto
+     * gives them the same empty answer for both. The alternative costs more - a zero published for every
+     * code nothing has produced is a row per code per pipeline, and the set of codes a connector can
+     * contribute is open.
+     */
+    private Optional<MetricFact> failures(String pipelineId, Instant at) {
+        Map<String, Long> byCode = failuresByPipelineAndCode.get(pipelineId);
+        if (byCode == null || byCode.isEmpty()) {
+            return Optional.empty();
+        }
+        List<MetricPoint> counted = new ArrayList<>();
+        byCode.forEach((code, count) -> counted.add(MetricPoint.accumulated(
+                Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, CODE_ATTRIBUTE, code),
+                countingFailuresSince, at, count)));
+        return Optional.of(new MetricFact(ERRORS_METRIC, MetricType.COUNTER, "{error}", counted));
+    }
+
+    /**
+     * Drops the failure account of every pipeline outside {@code live}, which is the set that still has a
+     * stored intent. Called once per convergence pass by the side that already has that set in hand.
+     *
+     * <p><strong>A pipeline leaves that set only when it is deleted.</strong> An intent is removed by the
+     * reclaim of the pipeline itself and by nothing else, so this forgets a pipeline that no longer
+     * exists and never one that is merely stopped - a stopped pipeline keeps its intent, and keeping its
+     * count is the point: the gap either side of a stop is the stretch somebody most wants to compare.
+     *
+     * <p>It is swept from here rather than cleared by whoever deletes the pipeline because nobody on that
+     * side may reach in: the control ring's synchronous surface into this one is a closed set, and a
+     * seventh way in would have to widen it. The set that is already crossing between them once a tick
+     * carries the same answer.
+     */
+    public void forgetPipelinesOutside(Collection<String> live) {
+        Objects.requireNonNull(live, "live");
+        failuresByPipelineAndCode.keySet().retainAll(Set.copyOf(live));
     }
 
     /**

@@ -33,7 +33,9 @@ class StatusSaysWhatItCannotDecideTest {
     private static final long FRESH = 2_000;
 
     private static MetricsFacts moving() {
-        return new MetricsFacts(0L, 128L, Map.of());
+        // No streak rather than a streak of nought: the cell is published only while passes are throwing,
+        // so a healthy pipeline has no such key and this reads as not published.
+        return new MetricsFacts(null, 128L, Map.of());
     }
 
     @Test
@@ -54,7 +56,7 @@ class StatusSaysWhatItCannotDecideTest {
         assertThat(answer.readings()).contains(
                 "status.observedAt = 2s ago",
                 "status.failure = none",
-                "metrics.errorCount = 0",
+                "metrics.reconcileFailuresInARow = not published",
                 "metrics.recordCount = 128",
                 "metrics.frontierStalledMillis = none above zero",
                 "snapshot = 1 row(s) loaded");

@@ -86,12 +86,26 @@ class ControlPlaneTest {
     }
 
     // The metrics face is read the same way, so the same distinctions are pinned here: only no-observation
-    // reads as "nothing yet", and a published observation is required to carry the errorCount the runtime
-    // derives from the state, so an answer missing it is a contract regression, surfaced rather than waited out.
+    // reads as "nothing yet", and every other refusal stays loud. How many errors a pipeline has counted is
+    // the sum over the codes it counted them under, so this face has no single cell to require any more --
+    // which costs a guard, pinned below.
 
     @Test
     void readsThePublishedErrorCount() {
         assertThat(ControlPlane.interpretErrorCount(200, metrics(1), PIPELINE)).contains(1L);
+    }
+
+    @Test
+    void addsUpTheFailuresOfEveryCodeThePipelineCountedThemUnder() {
+        // The product publishes one cell per code; a specification asks how many errors there were. So the
+        // answer is their sum, and a reading that took one cell would under-report whenever a pipeline
+        // failed two ways -- which is the ordinary case for anything that fails more than once.
+        String body = JsonWriter.write(Map.of("pipelineId", PIPELINE, "metrics", Map.of(
+                "errors.connector.write-failed", 2L,
+                "errors.engine.job-failed", 1L,
+                "recordCount", 500L)));
+
+        assertThat(ControlPlane.interpretErrorCount(200, body, PIPELINE)).contains(3L);
     }
 
     @Test
@@ -128,18 +142,19 @@ class ControlPlaneTest {
     }
 
     @Test
-    void refusesAPublishedObservationThatCarriesNoErrorCount() {
-        // The runtime derives errorCount from the actual state, so a published observation always carries it;
-        // an answer that does not is the metric wiring having regressed, and the harness says so loudly rather
-        // than sitting out its whole bound as though the pipeline were slow to converge.
-        assertThatThrownBy(
-                        () ->
-                                ControlPlane.interpretErrorCount(
-                                        200,
-                                        JsonWriter.write(Map.of("pipelineId", PIPELINE, "metrics", Map.of())),
-                                        PIPELINE))
-                .isInstanceOf(AssertionError.class)
-                .hasMessageContaining("carried no errorCount");
+    void aPipelineThatCountedNoFailureReadsAsNoneRatherThanBeingRefused() {
+        // The inversion of what this case used to assert, and the guard it costs is worth stating rather
+        // than discovering. There used to be one errorCount cell the runtime derived from the state, so it
+        // was always published and a missing one was a regression worth throwing over. A counter is absent
+        // until something is counted, so a pipeline that has failed nothing has no cell here at all, and
+        // the honest total over no cells is nought.
+        //
+        // What that gives up: "nothing has failed" and "the publisher stopped" are now the same reading.
+        // A specification must therefore assert a positive number -- error_count: 0 is satisfied by both,
+        // and is the shape of assertion that passes for a reason unrelated to what it was written to hold.
+        assertThat(ControlPlane.interpretErrorCount(
+                        200, JsonWriter.write(Map.of("pipelineId", PIPELINE, "metrics", Map.of())), PIPELINE))
+                .contains(0L);
     }
 
     /**
@@ -319,7 +334,8 @@ class ControlPlaneTest {
     }
 
     private static String metrics(long errorCount) {
-        return JsonWriter.write(Map.of("pipelineId", PIPELINE, "metrics", Map.of("errorCount", errorCount)));
+        return JsonWriter.write(Map.of("pipelineId", PIPELINE,
+                "metrics", Map.of("errors.connector.write-failed", errorCount)));
     }
 
     /** A structured coded error body, as the product's shared advice renders one. */

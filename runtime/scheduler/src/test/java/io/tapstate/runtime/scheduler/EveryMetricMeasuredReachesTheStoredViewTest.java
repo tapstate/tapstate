@@ -81,9 +81,11 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 Map.of("chain-a", 4L), Map.of("chain-b", 61_000L),
                 Map.of("nest.orders.doc.$root", 3L), Map.of("orders.region", 120L),
                 Map.of("orders.region", 1_000L), loaded());
-        // Every family is actually in play, so this is not an empty set agreeing with an empty set: the
-        // count is asserted before the two are compared.
-        assertThat(measured).hasSize(15);
+        // Every family with a source is actually in play, so this is not an empty set agreeing with an
+        // empty set: the count is asserted before the two are compared. Failures are the one family with
+        // no source to wire -- they are counted from a cause handed over on a witnessing pass, so they are
+        // absent here and are covered by the case that feeds one.
+        assertThat(measured).hasSize(14);
         // The load's two measurements are the only ones this face cannot carry, and it says so rather than
         // letting them go missing. They are not lost with them: the same observation carries the same load
         // as its own snapshot dataset, asserted below, which is the face this drop points at. Putting them

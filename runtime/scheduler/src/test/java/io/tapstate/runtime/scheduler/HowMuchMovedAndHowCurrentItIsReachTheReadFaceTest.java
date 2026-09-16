@@ -222,8 +222,10 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
                 Map.entry("records.out", 1_238L),
                 Map.entry("lag.orders", 2L),
                 Map.entry("lag.items", 47L));
-        // The families that were already here are untouched by any of it.
-        assertThat(published.metrics()).containsKeys("errorCount", "recordCount");
+        // The families that were already here are untouched by any of it. errorCount is not among them
+        // any more: a state written as a number is not a count, and the failures it stood in for are
+        // counted per code where one is witnessed.
+        assertThat(published.metrics()).containsKeys("recordCount");
     }
 
     @Test

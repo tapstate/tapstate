@@ -38,7 +38,7 @@ import static org.assertj.core.api.Assertions.entry;
  * the in-memory store the assembly wires the same way. It drives a pipeline through the four verbs (and a
  * re-dig) and witnesses, at each step, that the mapped Jet operation actually took effect, that the actual
  * state converged with a strictly increasing fencing epoch, and that the store-backed read faces serve the
- * converged state. The errorCount metric reads 0 for the healthy run here; the remaining metrics and the
+ * converged state. A healthy run publishes no failure metric at all here; the remaining metrics and the
  * snapshot face are honestly empty, their sources being the capture and transform planes, which merge
  * later. The artificial-failover fencing witness (epoch monotonic under a
  * competing writer, a stale write rejected) lives in the converger and core unit tests; this integration
@@ -104,8 +104,8 @@ class SingleNodeLifecycleE2ETest {
                 .as("the converge pass records when it observed the pipeline")
                 .isNotNull();
         assertThat(readFaces.metrics(PIPE).metrics())
-                .as("errorCount is wired: a healthy run reports zero errors")
-                .containsOnly(entry("errorCount", 0L));
+                .as("a healthy run has counted no failure, so it publishes none -- absent, not zero")
+                .isEmpty();
         assertThat(readFaces.snapshot(PIPE).snapshot()).as("snapshot source is not wired yet").isEmpty();
 
         desire(PAUSED);

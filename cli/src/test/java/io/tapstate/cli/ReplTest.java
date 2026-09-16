@@ -4191,7 +4191,8 @@ class ReplTest {
     void statusThatMatchesNothingReadsTheOtherFacesAndSaysWhatItCannotDecide() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
-        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 128L));
+        client.metricsOutcome = new MetricsOutcome.Found(
+                "pl1", Map.of("errors.connector.write-failed", 1L, "recordCount", 128L));
         client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -4216,7 +4217,7 @@ class ReplTest {
         // on a pipeline like this one.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
-        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 0L));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 0L));
         client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
                 "orders", new RemoteTableSnapshot(0L, null, null),
                 "items", new RemoteTableSnapshot(0L, null, null),
@@ -4238,7 +4239,7 @@ class ReplTest {
     void statusCountsWhatTheSnapshotLoadedWhenItHasLoadedSomething() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
-        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 0L));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 0L));
         client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
                 "orders", new RemoteTableSnapshot(900L, null, null),
                 "items", new RemoteTableSnapshot(124L, null, null)));
@@ -4612,12 +4613,14 @@ class ReplTest {
     @Test
     void metricsWhileAuthenticatedPrintsEachStat() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 42L, "errorCount", 0L));
+        client.metricsOutcome = new MetricsOutcome.Found(
+                "pl1", Map.of("recordCount", 42L, "errors.engine.job-failed", 2L));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("recordCount").contains("42").contains("errorCount");
+        assertThat(out).contains("recordCount").contains("42")
+                .contains("errors.engine.job-failed");
         assertThat(client.metricsCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
     }
 

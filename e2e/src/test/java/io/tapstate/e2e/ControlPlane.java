@@ -69,6 +69,13 @@ final class ControlPlane {
      */
     private static final String RECORDS_OUT_METRIC = "records.out";
 
+    /**
+     * How the failure counter lands on the flat face: one key per code, the code after the dot. Summed
+     * rather than read by an exact name, because how many codes a pipeline has failed under is up to the
+     * pipeline and the connectors it drives.
+     */
+    private static final String ERRORS_PREFIX = "errors.";
+
     private final URI baseUrl;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
 
@@ -991,9 +998,19 @@ final class ControlPlane {
     /**
      * What a metrics answer is allowed to mean, read exactly the way a status answer is: only the product's
      * own {@code monitor.no-observation} code reads as "nothing published yet", and every other refusal stays
-     * loud. A published observation always carries the errorCount metric - the runtime derives it from the
-     * actual state - so a 200 that omits it is a regression of that contract, surfaced rather than waited out
-     * as though the pipeline were merely slow to converge.
+     * loud.
+     *
+     * <p>How many errors a pipeline has counted, over every code it has counted one under. The product
+     * publishes a failure counter broken out by code, collapsed onto this face as one key per code, so
+     * "how many altogether" is their sum rather than a cell of its own.
+     *
+     * <p><strong>A pipeline that has failed nothing has no such key, and this reports nought for it.</strong>
+     * That is the honest total -- the sum of nothing -- but it means an assertion of nought here is
+     * satisfied by a publisher that stopped publishing just as well as by a pipeline that is fine.
+     * <strong>So assert a positive number, never nought.</strong> This used to read a single
+     * {@code errorCount} cell that the runtime derived from the pipeline's state and always published, and
+     * a missing cell was therefore a regression worth throwing over; there is no such cell any more,
+     * because a state written as a number was never a count of anything.
      */
     static Optional<Long> interpretErrorCount(int status, String body, String pipelineId) {
         if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
@@ -1007,10 +1024,14 @@ final class ControlPlane {
         if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("metrics") instanceof Map<?, ?> metrics)) {
             throw new AssertionError("metrics answer carried no metrics: " + body);
         }
-        if (!(metrics.get("errorCount") instanceof Number errorCount)) {
-            throw new AssertionError("metrics carried no errorCount: " + body);
+        long counted = 0L;
+        for (Map.Entry<?, ?> entry : metrics.entrySet()) {
+            if (entry.getKey() instanceof String name && name.startsWith(ERRORS_PREFIX)
+                    && entry.getValue() instanceof Number count) {
+                counted += count.longValue();
+            }
         }
-        return Optional.of(errorCount.longValue());
+        return Optional.of(counted);
     }
 
     /**

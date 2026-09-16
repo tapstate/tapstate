@@ -19,17 +19,28 @@ import java.util.Map;
  * the second into the first would report a run as having moved nothing on the strength of a metric that was
  * never wired.
  *
- * @param errorCount    times the run reported an error, or null when the cell is not published
+ * @param reconcileFailuresInARow how many convergence passes in a row have thrown, or null when no
+ *                      streak is running -- which is the ordinary state and is not the same as nought.
+ *                      It is a streak and not a total: one clean pass ends it. What used to stand in this
+ *                      slot was a cell named errorCount that carried this streak *and* the pipeline's own
+ *                      state written as a number, and the rule below always wanted this half
  * @param recordCount   records the live job has driven to its sinks, or null when there is no live job to
  *                      ask — which is a different answer from nought and is kept apart from it
  * @param stalledChains chains whose durable position has not advanced, mapped to how long, in milliseconds.
  *                      Only entries above zero are kept: zero is the healthy reading and carrying it would
  *                      make "a chain is stuck" true of every running pipeline
  */
-record MetricsFacts(Long errorCount, Long recordCount, Map<String, Long> stalledChains) {
+record MetricsFacts(Long reconcileFailuresInARow, Long recordCount, Map<String, Long> stalledChains) {
 
-    /** How many errors the run has reported. */
-    private static final String ERROR_COUNT = "errorCount";
+    /**
+     * How many convergence passes in a row have thrown, published only while a streak is running.
+     *
+     * <p>Not "errorCount", which is what this key used to be called while it carried two different
+     * quantities: this streak, and the pipeline's state as a one-or-nought. The second is now a real
+     * counter of its own under a dimensioned name, and a key left called count while holding only a
+     * streak would have the sentence the rule below prints start lying the day somebody trusted the name.
+     */
+    private static final String RECONCILE_STREAK = "reconcileFailuresInARow";
 
     /** Records the live job has driven to its sinks; absent when the pipeline has no live job. */
     private static final String RECORD_COUNT = "recordCount";
@@ -49,6 +60,6 @@ record MetricsFacts(Long errorCount, Long recordCount, Map<String, Long> stalled
                 stalled.put(name.substring(STALLED_PREFIX.length()), value);
             }
         });
-        return new MetricsFacts(metrics.get(ERROR_COUNT), metrics.get(RECORD_COUNT), stalled);
+        return new MetricsFacts(metrics.get(RECONCILE_STREAK), metrics.get(RECORD_COUNT), stalled);
     }
 }

@@ -83,8 +83,14 @@ final class ConvergenceDriver {
                 MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
             }
         }
-        // Forget streaks for pipelines that are no longer desired, so a deleted-while-failing pipeline does
-        // not leak a counter that nothing will ever clear.
+        // Forget what is kept per pipeline for pipelines that are no longer desired, so a
+        // deleted-while-failing pipeline does not leak a counter that nothing will ever clear. Both live
+        // here rather than one at each end: it is one question -- which of these still exist -- and an
+        // intent is removed only by the reclaim of the pipeline itself, so a merely stopped pipeline keeps
+        // its intent and keeps both. The publisher's own account cannot be cleared by whoever deletes the
+        // pipeline: the control ring's synchronous surface into the runtime is a closed set, and this set
+        // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
+        publisher.forgetPipelinesOutside(pipelineIds);
     }
 }
