@@ -292,6 +292,9 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
               <mainClass>${mainClass}</mainClass>
               <buildArgs>
                 <buildArg>--no-fallback</buildArg>
+                <!-- The native image must run on AMD64 CPUs without AVX2/BMI2/FMA. The compatibility
+                     baseline is valid for every published architecture and is enforced by installer smoke. -->
+                <buildArg>-march=compatibility</buildArg>
                 <buildArg>--install-exit-handlers</buildArg>
                 <!-- bundled resources read via getResourceAsStream, declared so the image keeps them -->
                 <buildArg>-H:IncludeResources=catalog/.*\.json</buildArg>

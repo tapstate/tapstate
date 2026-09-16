@@ -99,7 +99,7 @@ public final class RingBufferLogSink implements LogSink {
             from = 0;
         } else {
             long oldest = retained.getFirst().sequence();
-            if (after.sequence() < oldest - 1) {
+            if (after.sequence() < oldest) {
                 truncated = true;
                 from = 0;
             } else {
