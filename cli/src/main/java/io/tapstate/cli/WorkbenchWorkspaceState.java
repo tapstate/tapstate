@@ -26,6 +26,12 @@ record WorkbenchWorkspaceState(Focus focus, Optional<Document> document) {
                 Focus.VIEWER, Optional.of(Document.open(relativePath, content)));
     }
 
+    /** Replaces the passive preview while keeping keyboard navigation in the Files pane. */
+    WorkbenchWorkspaceState preview(Path relativePath, String content) {
+        return new WorkbenchWorkspaceState(
+                Focus.FILES, Optional.of(Document.open(relativePath, content)));
+    }
+
     WorkbenchWorkspaceState toggleFocus() {
         if (document.isEmpty() || document.orElseThrow().editing()) {
             return this;

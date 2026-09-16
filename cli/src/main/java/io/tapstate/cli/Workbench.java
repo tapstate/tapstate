@@ -365,6 +365,12 @@ final class Workbench {
                         return runtime.updateState(state -> state.withWorkspaceView(
                                 state.workspaceView().back()));
                     }
+                    if (runtime.state().workspaceView().focus()
+                            == WorkbenchWorkspaceState.Focus.FILES
+                            && isWorkspaceFileNavigation(key)) {
+                        runtime.updateState(state -> state.reduce(key, visibleRows()));
+                        return previewSelectedWorkspaceFile();
+                    }
                 }
                 if (key.isCharIgnoreCase('c')) {
                     return openContextEntry();
@@ -542,6 +548,28 @@ final class Workbench {
                 });
                 case WorkbenchActionGateway.FileReadResult.Unavailable ignored -> true;
             };
+        }
+
+        private boolean previewSelectedWorkspaceFile() {
+            if (actionGateway == null) {
+                return false;
+            }
+            Optional<WorkbenchArtifactRow> selected = selectedWorkspaceRow();
+            if (selected.isEmpty() || selected.orElseThrow().local().isEmpty()) {
+                return true;
+            }
+            Path relativePath = selected.orElseThrow().local().getFirst().relativePath();
+            return switch (actionGateway.readWorkspaceFile(relativePath)) {
+                case WorkbenchActionGateway.FileReadResult.Loaded loaded -> runtime.updateState(state ->
+                        state.withWorkspaceView(state.workspaceView().preview(
+                                loaded.relativePath(), loaded.content())));
+                case WorkbenchActionGateway.FileReadResult.Unavailable ignored -> true;
+            };
+        }
+
+        private static boolean isWorkspaceFileNavigation(KeyEvent key) {
+            return key.isUp() || key.isDown() || key.isPageUp() || key.isPageDown()
+                    || key.isCharIgnoreCase('j') || key.isCharIgnoreCase('k');
         }
 
         private Optional<WorkbenchArtifactRow> selectedWorkspaceRow() {
