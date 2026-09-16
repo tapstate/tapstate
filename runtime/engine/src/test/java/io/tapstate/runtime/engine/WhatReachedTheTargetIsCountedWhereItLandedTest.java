@@ -6,7 +6,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
@@ -132,6 +134,28 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
 
         // Absent, not present at zero. A table with nothing delivered yet and a sink whose counting is not
         // wired are different states, and a published zero spells them the same way.
+        assertThat(delivery.rows).isEmpty();
+        assertThat(delivery.eventTimes).isEmpty();
+    }
+
+    @Test
+    void reports_nothing_for_a_batch_that_settled_without_a_single_row() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        SinkProcessor processor = init(new ImmediateWriter(), delivery);
+
+        // A drain of nothing but word that a chain got past some changes with nothing to deliver for them.
+        // That is the ordinary shape on a stream whose changes are absorbed upstream, not an edge case:
+        // the write settles at once because there is nothing to write, so this path runs on every such
+        // drain of every such pipeline.
+        TestInbox inbox = new TestInbox();
+        inbox.add(new SettledPositions(
+                Map.of("orders", new ChainPosition(new SourceOrder(1, 7), "p7"))));
+        processor.process(0, inbox);
+        drain(processor);
+
+        // Nothing reported at all, rather than a reading of nothing. Downstream both are a map, and one of
+        // them says "this sink has delivered no rows" while the other says "no sink has said anything yet"
+        // -- and a pipeline filtering everything out is the case where telling them apart is the answer.
         assertThat(delivery.rows).isEmpty();
         assertThat(delivery.eventTimes).isEmpty();
     }
