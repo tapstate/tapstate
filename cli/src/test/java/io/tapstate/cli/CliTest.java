@@ -74,17 +74,18 @@ class CliTest {
     void connectedVerbsAreRegisteredNotMissing() {
         // connect is a REPL builtin (session-scoped), not a one-shot subcommand
         assertThat(Cli.newCommandLine().getSubcommands().keySet())
-                .contains("apply")
+                .contains("apply", "up")
                 .doesNotContain("connect");
     }
 
     @Test
-    void theCompositeVerbRemainsReservedUntilItIsImplemented() {
-        // `run` composes apply and start but has no one-shot implementation yet, so it remains visible
-        // as an unavailable command rather than masquerading as a projected operation.
-        assertThat(Cli.UNIMPLEMENTED_COMPOSITE_VERBS).contains("run");
-        assertThat(Cli.newCommandLine().getSubcommands().keySet()).contains("run").doesNotContain("up");
-        assertThat(Cli.VERB_BY_OPERATION.values()).doesNotContain("run");
+    void theCompositeVerbIsUpAndNoLongerAReservedRun() {
+        // `run` was the placeholder for apply-then-start; the verb shipped as `up`, so the placeholder
+        // is gone rather than kept beside the real thing, and `up` is a real command on the table.
+        assertThat(Cli.UNIMPLEMENTED_COMPOSITE_VERBS).doesNotContain("run", "up");
+        assertThat(Cli.COMPOSITE_VERBS).contains("up");
+        assertThat(Cli.newCommandLine().getSubcommands().keySet()).contains("up").doesNotContain("run");
+        assertThat(Cli.VERB_BY_OPERATION.values()).doesNotContain("up");
     }
 
     @Test
@@ -187,6 +188,7 @@ class CliTest {
         // a composed verb projects no operation of its own -- it is a sequence of ones that do -- so it
         // is not in the connected list either, and it is the opposite of offline: every verb it composes
         // needs a server
+        registeredOffline.removeAll(Cli.COMPOSITE_VERBS);
         // the live views project no operation, so they are not in the connected list, but they are the
         // opposite of offline: each is a loop over reads that only a server can answer
         registeredOffline.removeAll(Cli.LIVE_VIEW_VERBS);
@@ -685,6 +687,7 @@ class CliTest {
         // does — this pins the entries to the registered names, in both directions
         TreeSet<String> registered = new TreeSet<>(Cli.CONNECTED_VERBS);
         registered.addAll(Cli.UNIMPLEMENTED_COMPOSITE_VERBS);
+        registered.addAll(Cli.COMPOSITE_VERBS);
         registered.addAll(Cli.LIVE_VIEW_VERBS);
         assertThat(new TreeSet<>(Cli.VERB_HELP.keySet())).isEqualTo(registered);
     }

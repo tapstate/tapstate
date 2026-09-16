@@ -160,7 +160,16 @@ public final class Cli implements Runnable {
      * report that they do not exist yet — not that a connection is missing, which would be false in both
      * states: connecting does not implement them.
      */
-    static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("run", "export", "diff", "edit");
+    static final List<String> UNIMPLEMENTED_COMPOSITE_VERBS = List.of("export", "diff", "edit");
+
+    /**
+     * Verbs this face composes out of registered operations rather than projecting one. They need a
+     * connection like any other online verb, and they are listed apart from the projection because the
+     * projection is checked against the operation registry in both directions -- a composed verb has no
+     * operation of its own to be checked against, and putting one there to satisfy the check is exactly
+     * the thing composing it was meant to avoid.
+     */
+    static final List<String> COMPOSITE_VERBS = List.of("up", "restart");
 
     /**
      * The live views over a collection. They project no registered operation and never will: each is a
@@ -256,10 +265,13 @@ public final class Cli implements Runnable {
                     "Watch one row in place until Ctrl-C; needs a terminal.")),
             Map.entry("tail", new VerbHelp("<source>.<collection> [<filter>]",
                     "Follow a whole collection's changes until Ctrl-C; pipes fine.")),
+            // The composite that ships. The operands are the flags it takes, since it names no resource:
+            // the bound workspace is the operand.
+            Map.entry("up", new VerbHelp(
+                    "[--server <url>] [-u <name>] [--start-local] [--yes] [-o text|json|yaml] [-w <dir>]",
+                    "Bring the bound workspace to running: apply, discover, apply, start.")),
             // The reserved verbs. Each says what it is reserved for: "not implemented yet" answers the
             // question only once the reader knows what was going to be there.
-            Map.entry("run", new VerbHelp("[<path>]",
-                    "Apply a workspace and start its pipelines in one step.")),
             Map.entry("export", new VerbHelp("<id>",
                     "Write a stored artifact back out as canonical YAML.")),
             Map.entry("diff", new VerbHelp("<file>",
@@ -327,9 +339,15 @@ public final class Cli implements Runnable {
         for (String verb : LIVE_VIEW_VERBS) {
             commandLine.addSubcommand(verb, new ConnectedVerb());
         }
+        for (String verb : COMPOSITE_VERBS) {
+            if (!verb.equals("up")) {
+                commandLine.addSubcommand(verb, new ConnectedVerb());
+            }
+        }
         for (String verb : UNIMPLEMENTED_COMPOSITE_VERBS) {
             commandLine.addSubcommand(verb, new UnimplementedVerb());
         }
+        commandLine.addSubcommand(new UpCmd());
         // The version belongs to the binary, not to any one verb, so every verb reports the same one.
         // Set centrally rather than annotated per class: the standard help mixin registers -V wherever
         // it is applied, and a spec with no version answers that advertised option with an empty line
