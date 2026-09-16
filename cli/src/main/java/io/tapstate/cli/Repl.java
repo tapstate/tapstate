@@ -8,9 +8,9 @@ import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.ViewBlock;
-import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.schema.SchemaNavigator;
 import io.tapstate.messages.MessageCatalog;
@@ -434,7 +434,7 @@ final class Repl {
                                     "cli.pipeline-apply-unreadable", "A remote Pipeline cannot be read for safe update");
                         } else {
                             guarded.add(new LocalDraft(entry.getValue().source(), entry.getValue().content(),
-                                    CanonicalHash.of(remote.canonicalForm())));
+                                    remote.contentHash()));
                         }
                     }
                     ApplyOutcome outcome = withFailover(() -> controlPlane.apply(
@@ -461,7 +461,7 @@ final class Repl {
                     return new PipelineLifecycleResult.Unavailable();
                 }
                 LifecycleOutcome outcome = withFailover(() -> controlPlane.lifecycle(
-                        session.landingNode(), session.credential(), request.pipelineId(), request.verb()),
+                        session.landingNode(), session.credential(), request.pipelineId(), request.verb(), null),
                         value -> value instanceof LifecycleOutcome.Unreachable);
                 return switch (outcome) {
                     case LifecycleOutcome.Accepted accepted -> new PipelineLifecycleResult.Changed(accepted.targetState());
@@ -566,7 +566,7 @@ final class Repl {
                                     "cli.source-apply-unreadable", "A remote Source cannot be read for safe update");
                         } else {
                             guarded.add(new LocalDraft(entry.getValue().source(), entry.getValue().content(),
-                                    CanonicalHash.of(remote.canonicalForm())));
+                                    remote.contentHash()));
                         }
                     }
                     ApplyOutcome outcome = withFailover(() -> controlPlane.apply(
@@ -598,7 +598,7 @@ final class Repl {
     }
 
     private String canonicalPipeline(WorkbenchActionGateway.PipelineDraft draft) {
-        PipelineResource pipeline = new PipelineResource(draft.id(), null, List.of(draft.sourceId()), null,
+        PipelineResource pipeline = new PipelineResource(draft.id(), null, List.of(SourceRef.bare(draft.sourceId())), null,
                 new ViewBlock.Inline("view", FromRef.regex(".*"), null, null, null), null, null, null);
         return new CanonicalWriter().write(pipeline);
     }
@@ -2024,7 +2024,7 @@ final class Repl {
         }
         String id = words.get(1);
         LifecycleOutcome outcome = withFailover(() ->
-                controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb),
+                controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb, null),
                 o -> o instanceof LifecycleOutcome.Unreachable);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
@@ -2216,7 +2216,7 @@ final class Repl {
                     o -> o instanceof GetOutcome.Unreachable);
             switch (read) {
                 case GetOutcome.Found found -> {
-                    ifMatch = CanonicalHash.of(found.artifact().canonicalForm());
+                    ifMatch = found.artifact().contentHash();
                     kind = found.artifact().kind();
                 }
                 case GetOutcome.Absent ignored -> {
@@ -4007,14 +4007,22 @@ final class Repl {
      */
     private int version() {
         String serverLine;
+        String dslLine = null;
+        String dataLine = null;
         if (!session.isConnected()) {
             serverLine = "not connected";
         } else {
-            String reported = controlPlane.serverVersion(session.landingNode());
-            serverLine = (reported == null ? "not reported" : reported)
+            ControlPlaneClient.ServerVersion reported = controlPlane.serverVersionDetail(session.landingNode());
+            serverLine = (reported == null || reported.version() == null ? "not reported" : reported.version())
                     + " (" + hostPort(session.landingNode()) + ")";
+            if (reported != null && reported.dslVersions() != null) {
+                dslLine = String.join(", ", reported.dslVersions());
+            }
+            if (reported != null && reported.dataVersion() != null) {
+                dataLine = String.valueOf(reported.dataVersion());
+            }
         }
-        VersionCmd.render(commandLine.getOut(), serverLine);
+        VersionCmd.render(commandLine.getOut(), serverLine, dslLine, dataLine);
         return Cli.EXIT_OK;
     }
 

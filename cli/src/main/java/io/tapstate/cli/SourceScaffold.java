@@ -57,7 +57,7 @@ final class SourceScaffold {
         SourceMode sourceMode = resolveMode(catalog, connector, mode);
         String resolvedId = id == null || id.isBlank() ? suggestedId(connector) : id;
         return new SourceResource(
-                resolvedId, null, connector, new LinkedHashMap<>(config), sourceMode, tables, null, null, null);
+                resolvedId, null, connector, new LinkedHashMap<>(config), sourceMode, tables, null, null);
     }
 
     static List<TableRef> tableRefs(String tables, SourceMode mode) {
