@@ -1877,6 +1877,10 @@ final class WorkbenchRenderer {
                     new FooterHint("↑↓", "navigate", Optional.empty()),
                     new FooterHint("Enter", "run", Optional.empty()),
                     new FooterHint("Esc", "back", Optional.empty()));
+            case WorkbenchOverlayState.LogLevel ignored -> List.of(
+                    new FooterHint("↑↓", "navigate", Optional.empty()),
+                    new FooterHint("Enter", "select", Optional.empty()),
+                    new FooterHint("Esc", "back", Optional.empty()));
             case WorkbenchOverlayState.Help ignored -> List.of(
                     new FooterHint("Esc", "back", Optional.empty()));
         };
