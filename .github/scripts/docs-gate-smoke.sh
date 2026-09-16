@@ -52,7 +52,20 @@ pr() {   # number, draft field, public field, labels, [author]
     "$(printf '%s' "$4" | awk -F, 'NF{for(i=1;i<=NF;i++){printf "%s{\"name\":\"%s\"}", (i>1?",":""), $i}}')" \
     "${5:-someone}" "$1" > "$scratch/pr/$1"
 }
-followup() { printf '[{"number":7,"state":"%s"}]\n' "$2" > "$scratch/issue/$1"; }
+# One element of what `gh issue list` answers. A follow-up is identified by the link in its body:
+# `docs-followup.yml` opens every one of them with a line naming the merged pull request's URL, and
+# that link is the only thing about the issue nobody edits into pointing somewhere else.
+entry() {   # issue number, state, the pull request its body links
+  printf '{"number":%s,"state":"%s","body":"Documentation follow-up for merged PR https://github.com/tapstate/tapstate/pull/%s -- Title"}' \
+    "$1" "$2" "$3"
+}
+# An issue the search returns that is somebody else's follow-up: it came back because its prose
+# mentions the queried number, which is what a tokenized search matches on.
+decoy() {   # issue number, state, the pull request its body links, the number it merely mentions
+  printf '{"number":%s,"state":"%s","body":"Documentation follow-up for merged PR https://github.com/tapstate/tapstate/pull/%s -- the original feature PR #%s has also been corrected"}' \
+    "$1" "$2" "$3" "$4"
+}
+followup() { printf '[%s]\n' "$(entry 7 "$2" "$1")" > "$scratch/issue/$1"; }
 
 prompt='<!-- path under docs/, or "none" -->'
 
@@ -160,6 +173,37 @@ expect "an empty range passes and says it was empty" minor 0 "no pull requests"
 git -C "$repo" reset -q --hard v0.3.0
 seed "Bump (#99)"
 expect "a number that is not a pull request here is skipped" minor 0 "clean:"
+
+# Which issue is "the follow-up" is decided by the link in its body, never by where the search put
+# it. The lookup is a tokenized full-text search, so it answers with every issue that mentions the
+# number -- another follow-up whose prose refers back to this pull request, a body quoting a
+# `SHA-256` digest against pull request 256 -- ranked by relevance, which is a different question.
+# The pair below is what makes it two questions: same stranger ranked first both times, opposite
+# verdicts, and neither of them is the stranger's own state.
+git -C "$repo" reset -q --hard v0.3.0
+seed "Assemble across sources (#23)"
+
+# The expensive direction. Reading the first one here says the pages were written, and a minor
+# release goes out over a follow-up nobody has started.
+printf '[%s,%s]\n' "$(decoy 65 CLOSED 368 23)" "$(entry 7 OPEN 23)" > "$scratch/issue/23"
+expect "a closed stranger ranked first still blocks a minor" minor 1 "still open"
+expect "and the refusal names the issue that links here"     minor 1 "tapstate/docs#7"
+refute "not the one the search ranked first"                 minor "tapstate/docs#65"
+
+# The other direction, which is what a fix that simply preferred a closed issue would get wrong.
+printf '[%s,%s]\n' "$(decoy 65 OPEN 368 23)" "$(entry 7 CLOSED 23)" > "$scratch/issue/23"
+expect "an open stranger ranked first does not block a minor" minor 0 "clean:"
+
+# `/pull/23` is a prefix of `/pull/231`, and 231's follow-up is not this pull request's.
+printf '[%s]\n' "$(entry 81 CLOSED 231)" > "$scratch/issue/23"
+expect "a longer number is not this pull request's follow-up" minor 1 "no follow-up issue"
+
+# More than one issue can link one pull request, and the pages exist when every one of them is
+# closed. Reading whichever came back first is how the closed half answers for the open half.
+printf '[%s,%s]\n' "$(entry 7 CLOSED 23)" "$(entry 9 OPEN 23)" > "$scratch/issue/23"
+expect "of two links, the open one is what blocks and is named" minor 1 "tapstate/docs#9"
+
+followup 23 OPEN
 
 expect "an unknown bump is a usage error"          sideways 2 "--bump"
 

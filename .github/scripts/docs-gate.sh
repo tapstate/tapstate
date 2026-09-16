@@ -82,7 +82,7 @@ for n in $numbers; do
 
   # The issue `docs-followup.yml` opens on merge, found by the link back to this pull request that it
   # writes into the body. Looked up by that link rather than by title: a title is edited.
-  if ! issue="$(gh issue list --repo "$docs_repo" --state all --search "$url" --json number,state 2>&1)"; then
+  if ! issue="$(gh issue list --repo "$docs_repo" --state all --search "$url" --json number,state,body 2>&1)"; then
     # Not the same thing as finding no issue, and reported as itself. The credential that can read
     # that repository is a separate one; without it this call fails, and folded into "no follow-up
     # issue" it would send somebody to open an issue that is already there.
@@ -91,15 +91,27 @@ for n in $numbers; do
     fail=1
     continue
   fi
-  number="$(printf '%s' "${issue:-[]}" | jq -r 'first(.[].number) // empty' 2>/dev/null)"
+  # `--search` is a tokenized full-text search, so the answer is every issue that *mentions* this
+  # number anywhere -- another follow-up whose prose refers back to this pull request, a body
+  # quoting a `SHA-256` digest against pull request 256 -- ranked by relevance, which is not the
+  # same question as "which issue links here". Taking the first one reads a stranger's state, and
+  # the expensive direction is a closed stranger ranked above the real follow-up: the release then
+  # hears "the documentation has landed" for pages nobody wrote. So keep only the issues whose body
+  # actually carries this pull request's URL. The character after the link is checked because
+  # `/pull/23` is a prefix of `/pull/231`.
+  linked="$(printf '%s' "${issue:-[]}" | jq -c --arg u "$url" \
+              'map(select((.body // "") | split($u) | .[1:] | map(.[0:1] | test("^[0-9]") | not) | any))' 2>/dev/null)"
+  number="$(printf '%s' "${linked:-[]}" | jq -r 'first(.[].number) // empty' 2>/dev/null)"
   if [ -z "$number" ]; then
     echo "::error::#${n} carries \`docs-needed\` and has no follow-up issue in ${docs_repo} — the label is what opens it, so the documentation owner was never told — ${url}"
     fail=1
     continue
   fi
-  state="$(printf '%s' "$issue" | jq -r 'first(.[].state) // empty' | tr '[:lower:]' '[:upper:]')"
-  if [ "$bump" != "patch" ] && [ "$state" != "CLOSED" ]; then
-    echo "::error::#${n}'s follow-up ${docs_repo}#${number} is still open, and a ${bump} release ships with the pages that explain what it added — ${url}"
+  # Several issues can link one pull request, and the documentation is written when every one of
+  # them is closed -- so the open one is what gets named, not whichever came back first.
+  open_issue="$(printf '%s' "${linked:-[]}" | jq -r '[.[] | select((.state // "" | ascii_upcase) != "CLOSED") | .number] | first // empty' 2>/dev/null)"
+  if [ "$bump" != "patch" ] && [ -n "$open_issue" ]; then
+    echo "::error::#${n}'s follow-up ${docs_repo}#${open_issue} is still open, and a ${bump} release ships with the pages that explain what it added — ${url}"
     fail=1
   fi
 done
