@@ -735,6 +735,26 @@ class TapEventValueModelTest {
                 .isEqualTo(1);
     }
 
+    @Test
+    void aValueIsLookedUpOnceHoweverManyQuestionsItsOwnClassAnswers() {
+        // One reading of the registry settles both things a value's own class settles here: whether the
+        // connector converts it at all, and - where the schema names no place - whether the type
+        // reading has anything to say about it. Asked as two, every element of an ordinary array paid
+        // for a second lookup only to be told what the first already knew, on the one path this whole
+        // guard exists to keep cheap.
+        CountingCodecs codecs = countingCodecs();
+
+        Envelope decoded = insert(
+                row("tags", List.of("red", "blue", "green")), codecs, Map.of("tags", "ARRAY"));
+
+        assertThat(decoded.after().get("tags"))
+                .as("the array decodes as it always did, which is what makes the count below mean anything")
+                .isEqualTo(List.of("red", "blue", "green"));
+        assertThat(codecs.lookupsOf(String.class))
+                .as("one lookup per element, not one per element per question")
+                .isEqualTo(3);
+    }
+
     /**
      * The same registrations the cases above run against, counting what the decode asks it - which is
      * the one thing that says how many times a row was walked, since a walk cannot reach a value

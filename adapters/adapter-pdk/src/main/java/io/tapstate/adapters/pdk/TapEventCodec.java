@@ -225,9 +225,17 @@ public final class TapEventCodec {
      */
     private static Object converted(Object value, TapCodecsRegistry codecs,
             SchemaNames names, String path, boolean toNamespaceWidths) {
-        Object registered = registered(value, codecs, names.of(value, path));
-        if (registered != null) {
-            return registered;
+        // The one reading of the registry this value takes. Its own class settles two questions - is
+        // there a conversion to take, and has the type reading anything to say where the schema names
+        // no place - and both are settled from this answer rather than each asking the registry again.
+        // Null is the ordinary answer, and the whole of what a plain value costs here.
+        ToTapValueCodec<?> codec =
+                value == null ? null : codecs.getCustomToTapValueCodec(value.getClass());
+        if (codec != null) {
+            Object registered = registered(value, codec, names.of(value, path));
+            if (registered != null) {
+                return registered;
+            }
         }
         if (toNamespaceWidths) {
             if (value instanceof ZonedDateTime zonedDateTime) {
@@ -368,19 +376,23 @@ public final class TapEventCodec {
          * What this schema calls the value at {@code path}, or — where it names no place there, the
          * path having ended beneath an array or never been described — what it calls that value's own
          * driver type. Null when it names neither.
+         *
+         * <p>Asked only about a value the connector registered a conversion for, which the caller has
+         * already read off the value's own class to know there was a conversion to take. Only such a
+         * class can ever be in the reading, so anything else would be answered null anyway — but it
+         * would first make the plain text and numbers no schema happens to name, which is most of what
+         * an unnamed place holds, walk the whole change to be told nothing, on the hottest path this
+         * adapter has. Keeping that guard where the registry is already being read means the value
+         * pays for one lookup rather than one per question.
          */
         String of(Object value, String path) {
             String declared = path == null ? null : byPath.get(path);
             if (declared != null) {
                 return declared;
             }
-            // Only a class the connector registered a conversion for can ever be in the reading, so a
-            // value of any other kind is answered without taking one. Without this the plain text and
-            // numbers no schema happens to name - which is most of what an unnamed place holds - make
-            // the first one the walk reaches walk the whole change a second time to be told nothing, on
-            // the hottest path this adapter has.
-            if (value == null || codecs == null
-                    || codecs.getCustomToTapValueCodec(value.getClass()) == null) {
+            // No declared types were supplied at all, which is every read face: nothing is named here
+            // and no reading is ever taken.
+            if (codecs == null) {
                 return null;
             }
             if (byType == null) {
@@ -438,13 +450,15 @@ public final class TapEventCodec {
     }
 
     /**
-     * The connector's own conversion of {@code value}, or null when it registered none for that type —
-     * which is the ordinary case, and the signal to take the bare lane instead.
+     * The result of taking {@code codec} — the conversion the connector registered for this value's own
+     * class, already read off the registry by the caller — or null when that conversion answers
+     * nothing, which is the signal to take the bare lane instead. A value the connector registered no
+     * conversion for, which is the ordinary case, never reaches here at all.
      *
-     * <p>Only conversions the connector itself registered are consulted. The frozen surface also ships
-     * a fallback that wraps anything unrecognized in a raw carrier; reaching for that here would put
-     * every driver type nobody taught us about into a wrapper the rest of the pipeline would have to
-     * unwrap for no gain, and would put the ordinary Java boxes in one too.
+     * <p>Only conversions the connector itself registered are ever passed in. The frozen surface also
+     * ships a fallback that wraps anything unrecognized in a raw carrier; reaching for that here would
+     * put every driver type nobody taught us about into a wrapper the rest of the pipeline would have
+     * to unwrap for no gain, and would put the ordinary Java boxes in one too.
      *
      * <p>The driver's own object rides along with the result. It is what lets a sink of the same kind
      * put the value back the way it arrived — a key converted to text for travel is written back as a
@@ -459,14 +473,7 @@ public final class TapEventCodec {
      * value's own class, and every conversion a connector registers is free to be handed no declared
      * type, which is already what happens for a column the schema did not describe.
      */
-    private static Object registered(Object value, TapCodecsRegistry codecs, String originType) {
-        if (value == null) {
-            return null;
-        }
-        ToTapValueCodec<?> codec = codecs.getCustomToTapValueCodec(value.getClass());
-        if (codec == null) {
-            return null;
-        }
+    private static Object registered(Object value, ToTapValueCodec<?> codec, String originType) {
         TapValue<?, ?> converted = codec.toTapValue(value, null);
         if (converted == null || converted.getValue() == null) {
             return null;
