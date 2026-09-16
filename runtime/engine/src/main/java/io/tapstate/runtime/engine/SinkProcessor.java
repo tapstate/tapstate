@@ -149,8 +149,8 @@ public final class SinkProcessor extends AbstractProcessor {
             SupplierEx<? extends SinkWriter> writerFactory) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
-        SupplierEx<Processor> supplier =
-                () -> new SinkProcessor(writerFactory.get(), DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE);
+        SupplierEx<Processor> supplier = () -> new SinkProcessor(writerFactory.get(), null, null,
+                DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, FrontierGauge.none(), new JetDeliveryGauge());
         return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 
@@ -460,7 +460,8 @@ public final class SinkProcessor extends AbstractProcessor {
                 // A gauge per processor, not one shared: the handles it keeps belong to the sink that took
                 // the reading, and a shared one would have each sink's readings land under the other's.
                 processors.add(new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
-                        DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, new JetFrontierGauge()));
+                        DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, new JetFrontierGauge(),
+                        new JetDeliveryGauge()));
             }
             return processors;
         }

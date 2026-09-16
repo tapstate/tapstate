@@ -324,6 +324,52 @@ public final class Engine {
     }
 
     /**
+     * How many rows of each table the pipeline's live job has had confirmed by its targets, broken out by
+     * the source operation that produced them: table, then operation symbol, then the running total. Empty
+     * when it has no live job, and a table with nothing confirmed is absent rather than present at zero.
+     *
+     * <p>Counts from two sinks over the same table are <strong>added</strong>, unlike the per-chain
+     * readings above which are kept at their widest. The difference is what each one measures: a distance
+     * is one fact two sinks each have a view of, so a pipeline is as far behind as its furthest-behind
+     * sink; a delivery is work done, and a row written to two targets was written twice. That is also what
+     * the record count this sits beside has always reported, summed over the output sinks.
+     */
+    public Map<String, Map<String, Long>> recordsDelivered(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) {
+            return Map.of();
+        }
+        JobMetrics collected = job.getMetrics();
+        Map<String, Map<String, Long>> byTable = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            JetDeliveryGauge.Delivered delivered = JetDeliveryGauge.deliveredOf(metric);
+            if (delivered == null) {
+                continue;
+            }
+            for (Measurement measurement : collected.get(metric)) {
+                byTable.computeIfAbsent(delivered.table(), ignored -> new HashMap<>())
+                        .merge(delivered.op(), measurement.value(), Long::sum);
+            }
+        }
+        return byTable;
+    }
+
+    /**
+     * The event time of the newest row of each table the pipeline's live job has had confirmed, as epoch
+     * milliseconds; empty when it has no live job, and absent for a table with nothing confirmed.
+     *
+     * <p>A reading, not a distance. How far behind a table is has to be worked out against the clock at the
+     * moment somebody asks, because it goes on growing while nothing arrives -- a distance recorded in the
+     * run would stand still for exactly as long as the pipeline did.
+     *
+     * <p>Two sinks over one table keep the newer reading: a row confirmed by either is a row that reached a
+     * target, and the question this answers is how recent the newest such row is.
+     */
+    public Map<String, Long> newestDeliveredEventTime(String pipelineId) {
+        return byChain(pipelineId, JetDeliveryGauge::reachedTableOf);
+    }
+
+    /**
      * The pipeline's per-chain readings whose metric names {@code chainOf} recognises, each kept at its
      * highest across every sink that reported it. A metric name it does not recognise is skipped, so the
      * readings that share this shape stay separate despite riding the same collection.
