@@ -82,14 +82,21 @@ public final class DslParser {
     private static final String VERSION_FIELD = "version";
     private static final String METADATA_FIELD = "metadata";
     private static final String EXPERIMENTAL_FIELD = "experimental";
+    private static final String CONNECTOR_FIELD = "connector";
+    private static final String OPTIONS_FIELD = "options";
+    private static final String SOURCE_TOKEN = "source";
+    private static final String TRANSFORMS_FIELD = "transforms";
+    private static final String SERVE_TOKEN = "serve";
     private static final String PRIMARY_KEY_FIELD = "primary_key";
     private static final String STORAGE_FIELD = "storage";
+    private static final String FILTER_TOKEN = "filter";
+    private static final String FORMAT_FIELD = "format";
 
     static final Set<String> SOURCE_KEYS = Set.of(
-            VERSION_FIELD, "kind", "id", METADATA_FIELD, "connector", "config", "mode",
-            "tables", "options", "srs", EXPERIMENTAL_FIELD);
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, CONNECTOR_FIELD, "config", "mode",
+            "tables", OPTIONS_FIELD, "srs", EXPERIMENTAL_FIELD);
     static final Set<String> PIPELINE_KEYS = Set.of(
-            VERSION_FIELD, "kind", "id", METADATA_FIELD, "source", "transforms", "view", "serve",
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, SOURCE_TOKEN, TRANSFORMS_FIELD, "view", SERVE_TOKEN,
             "settings", EXPERIMENTAL_FIELD);
     static final Set<String> METADATA_KEYS = Set.of("labels", "description");
     static final Set<String> SRS_KEYS = Set.of("key", "retention", "schema_evolution", "queryable", "enabled");
@@ -101,9 +108,9 @@ public final class DslParser {
      * engine option means adding a typed component to the owning record and naming it here.
      */
     private static final Set<String> NO_ENGINE_OPTIONS = Set.of();
-    static final Set<String> TABLE_SPEC_KEYS = Set.of("name", "filter", "pk", "options");
-    static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", "options", EXPERIMENTAL_FIELD);
-    static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", "options");
+    static final Set<String> TABLE_SPEC_KEYS = Set.of("name", FILTER_TOKEN, "pk", OPTIONS_FIELD);
+    static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
+    static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", OPTIONS_FIELD);
     private static final Set<String> NEST_ROOT_KEYS =
             Set.of("from", "key", "mode", "trackKeyChanges", "embed");
     private static final Set<String> EMBED_KEYS = Set.of(
@@ -117,14 +124,14 @@ public final class DslParser {
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
     static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
-    static final Set<String> SYNC_KEYS = Set.of("id", "source", "write_mode", "rename", "ddl", "on_full_load", "options");
+    static final Set<String> SYNC_KEYS = Set.of("id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD);
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
-    static final Set<String> PUSH_KEYS = Set.of("id", "source", "topic", "format", "options");
+    static final Set<String> PUSH_KEYS = Set.of("id", SOURCE_TOKEN, "topic", FORMAT_FIELD, OPTIONS_FIELD);
     private static final Set<String> SETTINGS_KEYS = Set.of(
             "error_policy", "batch_size", "parallelism", "schedule", "read_mode", "start_from");
     static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
-            VERSION_FIELD, "kind", "id", METADATA_FIELD, "type", "options", EXPERIMENTAL_FIELD);
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, "type", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> VIEW_DEF_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> SERVE_DEF_KEYS = Set.of(
@@ -139,8 +146,8 @@ public final class DslParser {
      * record and names the parser-supplied exceptions, so a component that becomes required without
      * reaching this list turns red there instead of becoming a NullPointerException at the boundary.
      */
-    static final Set<String> REQUIRED_SOURCE_KEYS = Set.of("id", "connector");
-    static final Set<String> REQUIRED_PIPELINE_KEYS = Set.of("id", "source");
+    static final Set<String> REQUIRED_SOURCE_KEYS = Set.of("id", CONNECTOR_FIELD);
+    static final Set<String> REQUIRED_PIPELINE_KEYS = Set.of("id", SOURCE_TOKEN);
     /** Every definition body: the rest of what they require is supplied or checked by shape. */
     static final Set<String> REQUIRED_DEFINITION_KEYS = Set.of("id");
     // A view carries a key of its own; the other two definition bodies do not, so they cannot share
@@ -150,8 +157,8 @@ public final class DslParser {
     // order, so neither is required of the document even though the model requires both.
     static final Set<String> REQUIRED_VIEW_INLINE_KEYS = Set.of(PRIMARY_KEY_FIELD);
     static final Set<String> REQUIRED_TABLE_SPEC_KEYS = Set.of("name");
-    static final Set<String> REQUIRED_SYNC_KEYS = Set.of("source");
-    static final Set<String> REQUIRED_PUSH_KEYS = Set.of("source");
+    static final Set<String> REQUIRED_SYNC_KEYS = Set.of(SOURCE_TOKEN);
+    static final Set<String> REQUIRED_PUSH_KEYS = Set.of(SOURCE_TOKEN);
     static final Set<String> REQUIRED_QUERY_KEYS = Set.of("type");
     static final Set<String> REQUIRED_HOT_KEYS = Set.of("ttl");
     static final Set<String> REQUIRED_WARM_KEYS = Set.of("collection");
@@ -233,11 +240,11 @@ public final class DslParser {
         requireSupportedVersion(doc, mapping);
         String kind = doc.string("kind");
         return switch (kind) {
-            case "source" -> source(doc);
+            case SOURCE_TOKEN -> source(doc);
             case "pipeline" -> pipeline(doc);
             case "transform" -> transformDefinition(doc);
             case "view" -> viewDefinition(doc);
-            case "serve" -> serveDefinition(doc);
+            case SERVE_TOKEN -> serveDefinition(doc);
             case null, default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "kind", mapping,
                     Map.of("value", kind == null ? "(absent)" : kind,
                             "expected", "one of: source, pipeline, transform, view, serve"));
@@ -275,7 +282,7 @@ public final class DslParser {
         return new SourceResource(
                 m.require("id", idOf(m)),
                 metadata(m),
-                m.requireString("connector"),
+                m.requireString(CONNECTOR_FIELD),
                 m.freeMap("config"),
                 mode(m, "mode"),
                 tables(m.seq("tables")),
@@ -289,7 +296,7 @@ public final class DslParser {
      * worse accepted than rejected: it looks configured and does nothing, and no run reports it.
      */
     private static void requireKnownOptions(YamlMap owner, Set<String> allowed) {
-        YamlMap options = owner.mapping("options");
+        YamlMap options = owner.mapping(OPTIONS_FIELD);
         if (options != null) {
             options.requireOnly(allowed);
         }
@@ -313,7 +320,7 @@ public final class DslParser {
                 // not the event envelope. Its type environment is the source schema, unknown
                 // offline — so its compile / type-check is deferred to the engine, unlike the
                 // envelope-rooted expressions (filter node / map / push) checked at parse time.
-                refs.add(TableRef.spec(ts.requireString("name"), ts.string("filter"),
+                refs.add(TableRef.spec(ts.requireString("name"), ts.string(FILTER_TOKEN),
                         scalarList(ts.seq("pk"), "tables.pk")));
             }
         }
@@ -336,7 +343,7 @@ public final class DslParser {
     private PipelineResource pipeline(YamlMap m) {
         m.requireOnly(PIPELINE_KEYS);
         m.requirePresent(REQUIRED_PIPELINE_KEYS);
-        List<Step> transforms = transforms(m.seq("transforms"));
+        List<Step> transforms = transforms(m.seq(TRANSFORMS_FIELD));
         String lastTransform = lastId(transforms);
         ViewBlock view = view(m, lastTransform);
         String beforeServe = view != null ? viewId(view) : lastTransform;
@@ -347,7 +354,7 @@ public final class DslParser {
     }
 
     private static List<SourceRef> sources(YamlMap m) {
-        Node n = m.node("source");
+        Node n = m.node(SOURCE_TOKEN);
         if (n instanceof ScalarNode sc) {
             return List.of(SourceRef.bare(sc.getValue()));
         }
@@ -364,7 +371,7 @@ public final class DslParser {
         if (item instanceof ScalarNode sc) {
             return SourceRef.bare(sc.getValue());
         }
-        YamlMap ref = YamlMap.requireMapping(item, "source");
+        YamlMap ref = YamlMap.requireMapping(item, SOURCE_TOKEN);
         ref.requireOnly(SOURCE_REF_KEYS);
         Boolean srs = boolValue(ref, "srs");
         // An object written without the switch says exactly what a bare id says, so it normalizes
@@ -429,7 +436,7 @@ public final class DslParser {
         return switch (type) {
             case "js" -> Set.of("script");
             case "map" -> Set.of("fields");
-            case "filter" -> Set.of("expr");
+            case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path", "include_array_index",
                     "preserve_null_and_empty_arrays", "element_key", "element_type");
             case "union" -> Set.of();
@@ -449,7 +456,7 @@ public final class DslParser {
         return switch (type) {
             case "js" -> Set.of("script");
             case "map" -> Set.of("fields");
-            case "filter" -> Set.of("expr");
+            case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path");
             case "nest" -> Set.of("root");
             case "join" -> Set.of("engine", "sql");
@@ -462,7 +469,7 @@ public final class DslParser {
             case "js" -> new TransformBody.Js(s.requireString("script"));
             case "map" -> new TransformBody.MapProjection(
                     fieldRules(s.require("fields", s.mapping("fields"))));
-            case "filter" -> {
+            case FILTER_TOKEN -> {
                 String expr = s.requireString("expr");
                 checkPredicate(s, "expr", expr);
                 yield new TransformBody.Filter(expr);
@@ -605,14 +612,14 @@ public final class DslParser {
     }
 
     private ServeBlock serve(YamlMap m, String prevId) {
-        Node n = m.node("serve");
+        Node n = m.node(SERVE_TOKEN);
         if (n == null) {
             return null;
         }
         if (n instanceof ScalarNode sc) {
             return new ServeBlock.Use(null, sc.getValue(), naturalFrom(prevId, n));
         }
-        YamlMap s = m.mapping("serve");
+        YamlMap s = m.mapping(SERVE_TOKEN);
         if (s.has("use")) {
             s.requireOnly(SERVE_USE_KEYS);
             return new ServeBlock.Use(idOf(s), s.string("use"), serveFrom(s, prevId, n));
@@ -620,7 +627,7 @@ public final class DslParser {
         s.requireOnly(SERVE_INLINE_KEYS);
         String id = idOf(s);
         return new ServeBlock.Inline(
-                id != null ? id : "serve",     // anonymous serve block -> 'serve' (2026-06-15)
+                id != null ? id : SERVE_TOKEN,     // anonymous serve block -> 'serve' (2026-06-15)
                 serveFrom(s, prevId, n),
                 syncList(s.seq("sync"), "serve."),
                 queryList(s.seq("query"), "serve."),
@@ -640,7 +647,7 @@ public final class DslParser {
             String id = s.string("id");
             out.add(new SyncElement(
                     id != null ? id : "sync_" + (i + 1),     // anonymous sync element -> sync_<N> (2026-06-15)
-                    s.requireString("source"),
+                    s.requireString(SOURCE_TOKEN),
                     enumByYaml(WriteMode.values(), WriteMode::yaml, s, "write_mode"),
                     rename(s.mapping("rename")),
                     enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl"),
@@ -691,24 +698,24 @@ public final class DslParser {
             String id = p.string("id");
             out.add(new PushElement(
                     id != null ? id : "push_" + (i + 1),     // anonymous push element -> push_<N> (2026-06-15)
-                    p.requireString("source"), p.string("topic"),
+                    p.requireString(SOURCE_TOKEN), p.string("topic"),
                     pushFormat(p)));
         }
         return out;
     }
 
     private PushFormat pushFormat(YamlMap owner) {
-        Node n = owner.node("format");
+        Node n = owner.node(FORMAT_FIELD);
         if (n == null) {
             return null;
         }
         if (n instanceof ScalarNode sc) {
             String v = sc.getValue();
             String expr = v.startsWith("=") ? v.substring(1) : v;   // optional '=' marker (X11)
-            checkValue(owner, "format", expr);
+            checkValue(owner, FORMAT_FIELD, expr);
             return PushFormat.cel(expr);
         }
-        return PushFormat.fields(fieldRules(YamlMap.requireMapping(n, owner.childPath("format"))));
+        return PushFormat.fields(fieldRules(YamlMap.requireMapping(n, owner.childPath(FORMAT_FIELD))));
     }
 
     private Settings settings(YamlMap m) {
@@ -834,7 +841,7 @@ public final class DslParser {
 
     private static FromClause naturalFrom(String prevId, Node at) {
         if (prevId == null) {
-            throw YamlMap.error(DslError.COMPOSITION, "transforms", at,
+            throw YamlMap.error(DslError.COMPOSITION, TRANSFORMS_FIELD, at,
                     Map.of("detail", "the first transforms step must declare from: (no predecessor to wire from)"));
         }
         return FromClause.list(FromRef.literal(prevId));
