@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
@@ -179,6 +180,42 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         Assertions.assertThatCode(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
                 .doesNotThrowAnyException();
+    }
+
+    @Test
+    void a_view_key_overwritten_after_its_unique_source_identity_is_refused() {
+        InMemoryStorePort store = mappedUniqueEmail("email", FieldRule.literal("same"));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(code("actuation.view-key-not-feed-identity"));
+    }
+
+    @Test
+    void a_unique_view_key_left_unchanged_by_a_transform_is_still_accepted() {
+        InMemoryStorePort store = mappedUniqueEmail("status", FieldRule.literal("ready"));
+
+        Assertions.assertThatCode(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .doesNotThrowAnyException();
+    }
+
+    private static InMemoryStorePort mappedUniqueEmail(String output, FieldRule rule) {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(managedStore());
+        Step mapFields = Step.inline("replace_email", FromClause.list(FromRef.literal("orders")),
+                new TransformBody.MapProjection(Map.of(output, rule)), null);
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)),
+                List.of(mapFields),
+                new ViewBlock.Inline("order_state", FromRef.literal("replace_email"), "email", null, null),
+                null, settings(), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
+                new SourceTable("orders",
+                        List.of(new SourceField("id", "int"), new SourceField("email", "string")),
+                        List.of("id"), List.of(new SourceIndex("email_unique", List.of("email"), true)))))));
+        return store;
     }
 
     @Test

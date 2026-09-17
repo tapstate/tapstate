@@ -221,6 +221,7 @@ final class StoreBackedDagSource implements DagSource {
                 assembledTargets(pipeline, bySourceTable, sourceVertices, compiledJoins);
         Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
         targets.putAll(assembled);
+        Map<String, TargetTable> viewTargets = new LinkedHashMap<>(targets);
         Set<String> serveStreams = pipeline.serve() instanceof ServeBlock.Inline serve
                 && serve.sync() != null && !serve.sync().isEmpty()
                 ? streamsReaching(pipeline, serve.from(), sourceKeyByTable, sourceKeysById,
@@ -231,18 +232,24 @@ final class StoreBackedDagSource implements DagSource {
                         sourceVertices, stepIds)
                 : Set.of();
         // Each stream a sink receives, narrowed to what the pipeline actually publishes on it rather
-        // than to what its source table holds. Only the serve terminal is narrowed here: a view
-        // composes its own descriptor around the key it names, and a stream reaching both terminals
-        // would otherwise be answered twice with nothing saying which answer the map holds.
+        // than to what its source table holds. The two terminals keep independent maps because the
+        // same stream can reach them through different transform paths.
         if (pipeline.serve() instanceof ServeBlock.Inline serving && !serveStreams.isEmpty()) {
             targets.putAll(publishedTargets(pipelineId, pipeline, serving.from(), serveStreams,
+                    bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
+        }
+        // A view validates and binds against the rows at its own input, not against the source model
+        // those rows started from.
+        if (pipeline.view() instanceof ViewBlock.Inline viewing && !viewStreams.isEmpty()) {
+            viewTargets.putAll(publishedTargets(pipelineId, pipeline,
+                    FromClause.list(viewing.from()), viewStreams,
                     bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
         }
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
         FrontierBinding frontier = frontierBinding(sourceVertices);
         return PipelineDagBuilder.build(
                 pipeline,
-                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets,
+                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins),
                 sinkAckFactory(pipeline, pipelineId), frontier);
     }
@@ -1147,6 +1154,7 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, String> sourceKeyByTable,
             Map<String, List<String>> sourceKeysById,
             Map<String, TargetTable> targets,
+            Map<String, TargetTable> viewTargets,
             Set<String> serveStreams,
             Set<String> viewStreams,
             Set<String> stepIds,
@@ -1161,7 +1169,7 @@ final class StoreBackedDagSource implements DagSource {
                 element -> sinkWriter(pipeline, element, targets, serveStreams),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
-                view -> viewSink(pipeline, view, targets, viewStreams, sourceKeysById),
+                view -> viewSink(pipeline, view, viewTargets, viewStreams, sourceKeysById),
                 nestBinding(pipeline, sourceIdByTable(sourceVertices)),
                 joinBinding(compiledJoins));
     }
