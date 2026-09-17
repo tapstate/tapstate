@@ -138,6 +138,28 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
     }
 
     @Test
+    void a_nonmatching_key_is_refused_against_the_only_discovered_unique_identity() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(managedStore());
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
+                null, settings(), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
+                new SourceTable("orders",
+                        List.of(new SourceField("email", "string"), new SourceField("customer", "string")),
+                        List.of(), List.of(new SourceIndex("email_unique", List.of("email"), true)))))));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(code("actuation.view-key-not-feed-identity"))
+                .satisfies(error -> Assertions.assertThat(((TapstateException) error).args())
+                        .containsEntry("identity", "email"));
+    }
+
+    @Test
     void an_explicit_view_key_can_select_a_different_discovered_unique_identity() {
         // Discovery's primary key remains a default, not an override. The explicit customer key is safe
         // here because discovery independently records that it identifies one source row.
