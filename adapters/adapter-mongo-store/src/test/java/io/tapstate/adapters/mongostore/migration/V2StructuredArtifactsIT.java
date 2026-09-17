@@ -87,6 +87,40 @@ class V2StructuredArtifactsIT {
                 ttl: P1D
             """;
 
+    /** Both view schema positions emitted by the released writer, before bodies became structured. */
+    private static final String RELEASED_PIPELINE_WITH_VIEW_SCHEMA = """
+            version: tapstate/v1
+            kind: pipeline
+            id: orders
+            source: orders_src
+            view:
+              id: order_state
+              from: orders_src
+              primary_key: order_id
+              schema:
+                enforce: true
+                evolution: additive
+            """;
+
+    private static final String RELEASED_VIEW_WITH_SCHEMA = """
+            version: tapstate/v1
+            kind: view
+            id: enforced_view
+            primary_key: id
+            schema:
+              enforce: true
+              evolution: additive
+            """;
+
+    private static final String RELEASED_SOURCE_WITH_CONNECTOR_SCHEMA = """
+            version: tapstate/v1
+            kind: source
+            id: orders_src
+            connector: postgres
+            config:
+              schema: public
+            """;
+
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
@@ -182,6 +216,32 @@ class V2StructuredArtifactsIT {
                 .as("everything else survives the drop")
                 .isEqualTo("src_ora");
         assertThat(body.getString("connector")).isEqualTo("oracle");
+    }
+
+    @Test
+    void startupRetiresReleasedTextViewSchemasWithoutTouchingAConnectorSchema() {
+        MongoDatabase database = freshDatabase("v2_view_schemas");
+        MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
+        seedAsWritten(artifacts, "orders", "pipeline", RELEASED_PIPELINE_WITH_VIEW_SCHEMA);
+        seedAsWritten(artifacts, "enforced_view", "view", RELEASED_VIEW_WITH_SCHEMA);
+        seedAsWritten(artifacts, "orders_src", "source", RELEASED_SOURCE_WITH_CONNECTOR_SCHEMA);
+
+        MigrationRunner.migrate(database);
+
+        Document pipeline = artifacts.find(new Document("_id", "orders")).first();
+        Document view = artifacts.find(new Document("_id", "enforced_view")).first();
+        Document source = artifacts.find(new Document("_id", "orders_src")).first();
+        assertThat(pipeline).isNotNull();
+        assertThat(view).isNotNull();
+        assertThat(source).isNotNull();
+        assertThat(pipeline.getEmbedded(List.of("body", "view", "schema"), Object.class)).isNull();
+        assertThat(view.getEmbedded(List.of("body", "schema"), Object.class)).isNull();
+        assertThat(source.getEmbedded(List.of("body", "config", "schema"), String.class))
+                .as("schema is connector-owned below config, not a retired view policy")
+                .isEqualTo("public");
+        assertThat(List.of(pipeline, view, source))
+                .allSatisfy(document -> assertThat(document.get("canonical")).isNull());
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(8);
     }
 
     @Test

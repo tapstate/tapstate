@@ -189,10 +189,41 @@ public final class DslParser {
      * and the refusal names the field.
      */
     public Resource parseDropping(String yaml, Set<String> retiredKeys) {
+        return parseDropping(yaml, retiredKeys, Map.of());
+    }
+
+    /**
+     * As {@link #parseDropping(String, Set)}, also dropping exact paths retired from particular
+     * artifact kinds. Qualifying a path by kind keeps a spelling that belongs elsewhere -- for
+     * example a connector-owned {@code config.schema} -- in the document that is bound.
+     */
+    public Resource parseDropping(String yaml, Set<String> retiredKeys,
+            Map<String, Set<List<String>>> retiredPathsByKind) {
         Objects.requireNonNull(retiredKeys, "retiredKeys");
+        Objects.requireNonNull(retiredPathsByKind, "retiredPathsByKind");
         MappingNode mapping = rootMapping(yaml);
+        String kind = scalarValue(mapping, "kind");
         drop(mapping, Set.copyOf(retiredKeys));
+        Set<List<String>> retiredPaths = kind == null
+                ? Set.of() : retiredPathsByKind.getOrDefault(kind, Set.of());
+        for (List<String> retiredPath : retiredPaths) {
+            if (retiredPath.isEmpty()) {
+                throw new IllegalArgumentException("a retired field path must not be empty");
+            }
+            drop(mapping, List.copyOf(retiredPath), 0);
+        }
         return bind(mapping);
+    }
+
+    /** Reads a discriminator without validating it before the ordinary binding order reaches it. */
+    private static String scalarValue(MappingNode mapping, String wanted) {
+        for (NodeTuple tuple : mapping.getValue()) {
+            if (tuple.getKeyNode() instanceof ScalarNode key && key.getValue().equals(wanted)
+                    && tuple.getValueNode() instanceof ScalarNode value) {
+                return value.getValue();
+            }
+        }
+        return null;
     }
 
     private static MappingNode rootMapping(String yaml) {
@@ -219,6 +250,24 @@ public final class DslParser {
         } else if (node instanceof SequenceNode sequence) {
             sequence.getValue().forEach(item -> drop(item, keys));
         }
+    }
+
+    /** Removes one exact mapping path, leaving the same key at every other position untouched. */
+    private static void drop(Node node, List<String> path, int depth) {
+        if (!(node instanceof MappingNode mapping)) {
+            return;
+        }
+        List<NodeTuple> kept = new ArrayList<>(mapping.getValue().size());
+        for (NodeTuple tuple : mapping.getValue()) {
+            if (tuple.getKeyNode() instanceof ScalarNode key && key.getValue().equals(path.get(depth))) {
+                if (depth == path.size() - 1) {
+                    continue;
+                }
+                drop(tuple.getValueNode(), path, depth + 1);
+            }
+            kept.add(tuple);
+        }
+        mapping.setValue(kept);
     }
 
     /**
