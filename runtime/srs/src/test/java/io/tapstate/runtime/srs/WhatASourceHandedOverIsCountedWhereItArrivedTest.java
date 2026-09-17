@@ -21,6 +21,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * which is when the number is being read, so a case here drives a handler that throws and one that is
  * handed the same rows twice - the two shapes under which a count taken further downstream would quietly
  * report less than arrived.
+ *
+ * <p>What those rows weighed is pinned in the same cases and against the same boundary, because it is one
+ * account taken in one place: every case that says a row arrived says what it weighed, so the two cannot
+ * be wired to different sets of arrivals. The figures are the product's own definition of a row's payload
+ * -- a field's name plus its value, a whole number at one declared width -- worked out here by hand so
+ * that a change to that definition shows up as a number in a test rather than as a shift in a chart.
  */
 class WhatASourceHandedOverIsCountedWhereItArrivedTest {
 
@@ -42,6 +48,28 @@ class WhatASourceHandedOverIsCountedWhereItArrivedTest {
         assertThat(health.receivedRows()).containsOnly(
                 Map.entry("orders", Map.of("i", 2L, "u", 1L)),
                 Map.entry("items", Map.of("d", 1L, "ddl", 1L)));
+        // orders: two inserts of {id: <number>} at ten bytes each -- two for the name, eight for the
+        // number -- and an update carrying both halves of one such row, at twenty. items: a delete
+        // carrying one, at ten, and a schema change carrying no row at all, at nothing.
+        assertThat(health.receivedBytes()).containsOnly(
+                Map.entry("orders", 40L), Map.entry("items", 10L));
+    }
+
+    @Test
+    @DisplayName("a schema change arrives and is counted, and weighs nothing, because it carries no row")
+    void aSchemaChangeIsCountedAtNoWeightRatherThanNotCountedAtAll() {
+        CaptureHealth health = new CaptureHealth();
+        CaptureListener listener = health.recording((events, position) -> { });
+
+        listener.onBatch(List.of(
+                Envelope.ddl(1L, "orders", Map.of("cols", List.of("id", "region", "total")))),
+                Optional.empty());
+
+        // Nought here is measured and not absent, and the two differ in what they say about the table:
+        // something arrived for it, and what arrived was not data. A pipeline doing nothing but schema
+        // work therefore shows its rows rising while its payload stays flat, which is the truth about it.
+        assertThat(health.receivedRows()).containsEntry("orders", Map.of("ddl", 1L));
+        assertThat(health.receivedBytes()).containsEntry("orders", 0L);
     }
 
     @Test
@@ -60,6 +88,7 @@ class WhatASourceHandedOverIsCountedWhereItArrivedTest {
         // instead, a run whose ring is refusing writes would report a source that had gone quiet - which
         // is the reading somebody would be looking at this number to rule out.
         assertThat(health.receivedRows()).containsEntry("orders", Map.of("i", 1L));
+        assertThat(health.receivedBytes()).containsEntry("orders", 10L);
     }
 
     @Test
@@ -75,6 +104,7 @@ class WhatASourceHandedOverIsCountedWhereItArrivedTest {
         // A count of arrivals, not of distinct rows. De-duplicating here would make this number disagree
         // with every other account of the same traffic, and would hide a source replaying its log.
         assertThat(health.receivedRows()).containsEntry("orders", Map.of("i", 2L));
+        assertThat(health.receivedBytes()).containsEntry("orders", 20L);
     }
 
     @Test
@@ -89,6 +119,7 @@ class WhatASourceHandedOverIsCountedWhereItArrivedTest {
         // A stream nobody is reading and a stream with nothing to say want opposite responses, and a zero
         // published for both spells them the same way.
         assertThat(health.receivedRows()).containsOnlyKeys("orders");
+        assertThat(health.receivedBytes()).containsOnlyKeys("orders");
     }
 
     @Test
@@ -102,6 +133,7 @@ class WhatASourceHandedOverIsCountedWhereItArrivedTest {
         // and "nothing is being measured" are the same reading, and a totals stream with no start hands a
         // consumer one in which a restart and a decrease cannot be told apart.
         assertThat(health.receivedRows()).isEmpty();
+        assertThat(health.receivedBytes()).isEmpty();
         assertThat(health.countingSince()).isBetween(before, Instant.now());
     }
 

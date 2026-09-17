@@ -9,6 +9,7 @@ import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.PayloadBytes;
 import io.tapstate.runtime.engine.SinkFrontier.ChainEntry;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -73,6 +74,10 @@ public final class SinkProcessor extends AbstractProcessor {
     // derived from them: a count says how much arrived and this says how current it is, and a table that
     // is being written steadily with hours-old events reads healthy on the first and not on the second.
     private final Map<String, Long> newestSettledEventTime = new LinkedHashMap<>();
+    // Payload bytes settled per table, kept beside the counts for the reason the event times are: how
+    // many rows arrived and how much data they were are different questions, and a table whose rows
+    // doubled in width answers the first identically.
+    private final Map<String, Long> settledBytes = new LinkedHashMap<>();
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();
@@ -347,7 +352,7 @@ public final class SinkProcessor extends AbstractProcessor {
             // succeeded, which is the boundary the count is defined at. A row counted on hand-off would be
             // counted again when a failed write was retried, and would already have been counted for a
             // write that never succeeded at all.
-            batch.delivered().foldInto(deliveredByTableAndOp, newestSettledEventTime);
+            batch.delivered().foldInto(deliveredByTableAndOp, settledBytes, newestSettledEventTime);
             reportDelivered();
             return true;
         });
@@ -375,6 +380,7 @@ public final class SinkProcessor extends AbstractProcessor {
             return;
         }
         delivery.delivered(deliveredByTableAndOp);
+        delivery.carried(settledBytes);
         delivery.reached(newestSettledEventTime);
         // Published with them and never alone: a total is readable only against what it accumulates from,
         // and the two arriving by different routes is how they come to disagree.
@@ -428,23 +434,31 @@ public final class SinkProcessor extends AbstractProcessor {
      * operation it holds, and the newest event time among them per table. Taken when the batch is formed
      * and applied when the write succeeds, so nothing here depends on the envelopes still being reachable.
      */
-    private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> newestEventTime) {
+    private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> bytes,
+            Map<String, Long> newestEventTime) {
 
         static DeliveredRows of(List<Envelope> batch) {
             Map<String, Map<String, Long>> rows = new LinkedHashMap<>();
+            Map<String, Long> bytes = new LinkedHashMap<>();
             Map<String, Long> newest = new LinkedHashMap<>();
             for (Envelope event : batch) {
                 rows.computeIfAbsent(event.src(), table -> new LinkedHashMap<>())
                         .merge(event.op().symbol(), 1L, Long::sum);
+                // Weighed while the batch still holds the envelopes, alongside the count, so that what
+                // settles later adds a figure taken from the rows themselves rather than from whatever
+                // is still reachable by then.
+                bytes.merge(event.src(), PayloadBytes.of(event), Long::sum);
                 newest.merge(event.src(), event.ts(), Math::max);
             }
-            return new DeliveredRows(rows, newest);
+            return new DeliveredRows(rows, bytes, newest);
         }
 
-        void foldInto(Map<String, Map<String, Long>> totals, Map<String, Long> newestByTable) {
+        void foldInto(Map<String, Map<String, Long>> totals, Map<String, Long> bytesByTable,
+                Map<String, Long> newestByTable) {
             rows.forEach((table, byOp) -> byOp.forEach((op, count) ->
                     totals.computeIfAbsent(table, ignored -> new LinkedHashMap<>())
                             .merge(op, count, Long::sum)));
+            bytes.forEach((table, size) -> bytesByTable.merge(table, size, Long::sum));
             newestEventTime.forEach((table, ts) -> newestByTable.merge(table, ts, Math::max));
         }
     }

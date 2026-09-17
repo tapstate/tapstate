@@ -55,6 +55,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     private static CaptureReading readSoFar() {
         return new CaptureReading(
                 Map.of("orders", Map.of("i", 1_400L, "u", 20L), "items", Map.of("d", 180L)),
+                Map.of("orders", 260_000L, "items", 9_000L),
                 READING_SINCE);
     }
 
@@ -62,6 +63,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     private static DeliveryReading twoTables() {
         return new DeliveryReading(
                 Map.of("orders", Map.of("i", 1_180L, "u", 20L), "items", Map.of("d", 38L)),
+                Map.of("orders", 218_000L, "items", 1_900L),
                 Map.of("orders", AT.minusSeconds(2).toEpochMilli(),
                         "items", AT.minusSeconds(47).toEpochMilli()),
                 STARTED);
@@ -96,6 +98,80 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     }
 
     @Test
+    @DisplayName("the payload that crossed arrives as a counter of bytes, per table and direction")
+    void thePayloadThatCrossedArrivesAsACounterBrokenOutByTableAndDirection() {
+        MetricFact bytes = factNamed(facts(twoTables(), AT), "tapstate.pipeline.bytes");
+
+        assertThat(bytes.type()).isEqualTo(MetricType.COUNTER);
+        assertThat(bytes.unit()).isEqualTo("By");
+        // No operation among the attributes, unlike the counter beside it. What a reader does with bytes
+        // is compare the ends or divide by the rows, and which operation produced a row says nothing
+        // about how much of it there was -- a dimension nothing reads is one nothing would notice going
+        // wrong. Asserted as the whole attribute map rather than as a missing key, so an operation added
+        // later fails here instead of quietly multiplying the series.
+        assertThat(bytes.points()).extracting(MetricPoint::attributes)
+                .containsExactlyInAnyOrder(
+                        Map.of("tapstate.pipeline.id", "orders", "tapstate.table.id", "orders",
+                                "direction", "out"),
+                        Map.of("tapstate.pipeline.id", "orders", "tapstate.table.id", "items",
+                                "direction", "out"));
+        assertThat(bytes.points()).extracting(
+                        point -> point.attributes().get("tapstate.table.id"), MetricPoint::value)
+                .containsExactlyInAnyOrder(tuple2("orders", 218_000L), tuple2("items", 1_900L));
+    }
+
+    @Test
+    @DisplayName("both ends of the payload are one measurement told apart by an attribute")
+    void thePayloadAtEachEndIsOneMeasurementRatherThanTwo() {
+        MetricFact bytes = factNamed(facts(readSoFar(), twoTables(), AT), "tapstate.pipeline.bytes");
+
+        // One name for both ends, for the reason the rows have one: what a reader wants is the comparison,
+        // and two names could be defined or counted differently without anything noticing.
+        assertThat(bytes.points()).extracting(point -> point.attributes().get("direction"))
+                .containsExactlyInAnyOrder("in", "in", "out", "out");
+    }
+
+    @Test
+    @DisplayName("each end's payload accumulates from the same moment as the rows counted there")
+    void thePayloadSharesTheStartOfTheCountsTakenAtItsOwnEnd() {
+        List<MetricFact> facts = facts(readSoFar(), twoTables(), AT);
+        MetricFact bytes = factNamed(facts, "tapstate.pipeline.bytes");
+
+        // The two ends do not share a start with each other -- the sources open before the job that
+        // writes to them -- but each end's two totals must share one, or bytes per row works out over a
+        // window that is not either total's window.
+        assertThat(bytes.points()).allSatisfy(point -> assertThat(point.startTime()).isEqualTo(
+                "in".equals(point.attributes().get("direction")) ? READING_SINCE : STARTED));
+    }
+
+    @Test
+    @DisplayName("a table whose rows carried no payload is present at nought, not absent")
+    void aTableThatMovedRowsOfNoPayloadSaysSoRatherThanGoingMissing() {
+        DeliveryReading schemaOnly = new DeliveryReading(Map.of("orders", Map.of("ddl", 3L)),
+                Map.of("orders", 0L), Map.of("orders", AT.toEpochMilli()), STARTED);
+
+        // Nought here is measured, not absent, and the difference is the whole of what absence means on
+        // this face: a table nothing arrived for is missing, and a table whose arrivals carried no row --
+        // which is what a stream of schema changes is -- arrived and weighed nothing.
+        assertThat(valueFor(factNamed(facts(schemaOnly, AT), "tapstate.pipeline.bytes"), "orders"))
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("the flat view carries the payload per direction, collapsed over the tables")
+    void theFlatFaceKeepsThePayloadsDirectionsApart() {
+        state.create("orders", PipelineState.RUNNING.name(), AT);
+
+        publisherAt(readSoFar(), twoTables(), AT).publish("orders");
+
+        Observation published = observations.read("orders").orElseThrow();
+        // 260000 + 9000 in, 218000 + 1900 out: the tables collapse the way they do for the rows, and the
+        // direction does not, because these two numbers are meant to be subtracted.
+        assertThat(published.metrics()).contains(
+                Map.entry("bytes.in", 269_000L), Map.entry("bytes.out", 219_900L));
+    }
+
+    @Test
     @DisplayName("how far behind a table is, is worked out at the moment it is asked")
     void theAgeIsTakenAgainstTheClockOfWhoeverAsks() {
         MetricFact lag = factNamed(facts(twoTables(), AT), "tapstate.pipeline.lag");
@@ -126,7 +202,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     @Test
     @DisplayName("a source clock ahead of ours reads as caught up, never as a negative age")
     void anEventFromTheFutureIsNotANegativeAge() {
-        DeliveryReading ahead = new DeliveryReading(Map.of("orders", Map.of("i", 1L)),
+        DeliveryReading ahead = new DeliveryReading(Map.of("orders", Map.of("i", 1L)), Map.of(),
                 Map.of("orders", AT.plusSeconds(90).toEpochMilli()), STARTED);
 
         assertThat(valueFor(factNamed(facts(ahead, AT), "tapstate.pipeline.lag"), "orders")).isZero();
@@ -135,7 +211,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     @Test
     @DisplayName("a snapshot read keeps its own operation, because that is what the source did")
     void aSnapshotReadIsNotFoldedIntoTheInsertsBesideIt() {
-        DeliveryReading loading = new DeliveryReading(Map.of("orders", Map.of("r", 5_000L)),
+        DeliveryReading loading = new DeliveryReading(Map.of("orders", Map.of("r", 5_000L)), Map.of(),
                 Map.of("orders", AT.toEpochMilli()), STARTED);
 
         MetricFact records = factNamed(facts(loading, AT), "tapstate.pipeline.records");
@@ -152,7 +228,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     @DisplayName("loading a table and tailing it are two series, so either can be read on its own")
     void theInitialLoadAndTheChangesAfterItStayApart() {
         DeliveryReading both = new DeliveryReading(Map.of("orders", Map.of("r", 5_000L, "i", 7L)),
-                Map.of("orders", AT.toEpochMilli()), STARTED);
+                Map.of(), Map.of("orders", AT.toEpochMilli()), STARTED);
 
         MetricFact records = factNamed(facts(both, AT), "tapstate.pipeline.records");
 
@@ -168,7 +244,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     @DisplayName("two kinds nobody recognises share the one name kept for them, and are added up")
     void unrecognisedKindsLandOnOneNameAndTheirRowsAreSummed() {
         DeliveryReading strange = new DeliveryReading(Map.of("orders", Map.of("zzz", 3L, "qqq", 4L)),
-                Map.of("orders", AT.toEpochMilli()), STARTED);
+                Map.of(), Map.of("orders", AT.toEpochMilli()), STARTED);
 
         MetricFact records = factNamed(facts(strange, AT), "tapstate.pipeline.records");
 
@@ -184,7 +260,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     @Test
     @DisplayName("one kind nobody recognises is carried under the name kept for exactly that")
     void anUnknownChangeKindDoesNotLeakOntoTheFaceAsItsOwnName() {
-        DeliveryReading strange = new DeliveryReading(Map.of("orders", Map.of("zzz", 3L)),
+        DeliveryReading strange = new DeliveryReading(Map.of("orders", Map.of("zzz", 3L)), Map.of(),
                 Map.of("orders", AT.toEpochMilli()), STARTED);
 
         MetricFact records = factNamed(facts(strange, AT), "tapstate.pipeline.records");
@@ -199,13 +275,14 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     @Test
     @DisplayName("a run that started but has settled nothing publishes no count at all")
     void aRunWithAStartAndNoRowsPublishesNoCount() {
-        DeliveryReading startedOnly = new DeliveryReading(Map.of(), Map.of(), STARTED);
+        DeliveryReading startedOnly = new DeliveryReading(Map.of(), Map.of(), Map.of(), STARTED);
 
         // A start on its own is not a delivery. Publishing the counter here would put a pipeline that has
         // moved nothing on the face as one whose total happens to be zero, and the two differ by whether
         // anybody should be worried.
         assertThat(facts(startedOnly, AT)).extracting(MetricFact::name)
-                .doesNotContain("tapstate.pipeline.records", "tapstate.pipeline.lag");
+                .doesNotContain("tapstate.pipeline.records", "tapstate.pipeline.bytes",
+                        "tapstate.pipeline.lag");
     }
 
     @Test
@@ -233,8 +310,8 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     void theCollapseIsOnTheRecordAndIsNotADrop() {
         FlatMetricProjection projected = projectionOf(facts(twoTables(), AT));
 
-        assertThat(projected.reduced())
-                .containsExactlyInAnyOrder("tapstate.pipeline.records", "tapstate.pipeline.lag");
+        assertThat(projected.reduced()).containsExactlyInAnyOrder("tapstate.pipeline.records",
+                "tapstate.pipeline.bytes", "tapstate.pipeline.lag");
         assertThat(projected.dropped()).isEmpty();
     }
 
@@ -316,7 +393,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     @Test
     @DisplayName("a capture that has opened its account and read nothing publishes no count")
     void aCaptureWithAStartAndNoRowsPublishesNoCount() {
-        CaptureReading openedOnly = new CaptureReading(Map.of(), READING_SINCE);
+        CaptureReading openedOnly = new CaptureReading(Map.of(), Map.of(), READING_SINCE);
 
         // Symmetrical with the target side, and for the same reason: a start on its own is not an arrival,
         // and a published zero spells "has read nothing" the same way as "is not being measured".
@@ -327,7 +404,8 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     @Test
     @DisplayName("a load counts on the source side as the read it was there too")
     void theOperationIsTheSourcesOwnOnTheWayInAsWell() {
-        CaptureReading loading = new CaptureReading(Map.of("orders", Map.of("r", 5_000L)), READING_SINCE);
+        CaptureReading loading =
+                new CaptureReading(Map.of("orders", Map.of("r", 5_000L)), Map.of(), READING_SINCE);
 
         MetricFact records = factNamed(facts(loading, DeliveryReading.NONE, AT), "tapstate.pipeline.records");
 
@@ -346,7 +424,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
         int checked = 0;
         for (Op op : Op.values()) {
             CaptureReading one =
-                    new CaptureReading(Map.of("orders", Map.of(op.symbol(), 1L)), READING_SINCE);
+                    new CaptureReading(Map.of("orders", Map.of(op.symbol(), 1L)), Map.of(), READING_SINCE);
 
             MetricFact records =
                     factNamed(facts(one, DeliveryReading.NONE, AT), "tapstate.pipeline.records");
@@ -379,6 +457,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     private static FlatMetricProjection projectionOf(List<MetricFact> facts) {
         return FlatMetricProjection.of(facts, Map.of(
                 "tapstate.pipeline.records", attributes -> "records." + attributes.get("direction"),
+                "tapstate.pipeline.bytes", attributes -> "bytes." + attributes.get("direction"),
                 "tapstate.pipeline.lag", attributes -> "lag." + attributes.get("tapstate.table.id")));
     }
 

@@ -38,14 +38,46 @@ class ATotalArrivesWithWhatItCountsFromTest {
     private static List<Reading> readings() {
         return List.of(
                 new Reading("CaptureReading",
-                        () -> new CaptureReading(Map.of("orders", Map.of("i", 3L)), null),
-                        () -> new CaptureReading(Map.of(), null)),
+                        () -> new CaptureReading(Map.of("orders", Map.of("i", 3L)), Map.of(), null),
+                        () -> new CaptureReading(Map.of(), Map.of(), null)),
                 new Reading("DeliveryReading",
-                        () -> new DeliveryReading(Map.of("orders", Map.of("i", 3L)), Map.of(), null),
-                        () -> new DeliveryReading(Map.of(), Map.of(), null)),
+                        () -> new DeliveryReading(
+                                Map.of("orders", Map.of("i", 3L)), Map.of(), Map.of(), null),
+                        () -> new DeliveryReading(Map.of(), Map.of(), Map.of(), null)),
                 new Reading("SnapshotReading",
                         () -> new SnapshotReading(Map.of("orders", new TableSnapshot(3L, null, null)), null),
                         () -> new SnapshotReading(Map.of(), null)));
+    }
+
+    /**
+     * The readings that carry a second total beside the rows: how many bytes of payload crossed. Listed
+     * apart from the three above rather than folded into them, because the rule has to hold of each total
+     * on its own -- a check that only ever passes rows in would let a reading accept bytes with no start,
+     * which is the same unreadable stream by a different route.
+     */
+    private static List<Reading> readingsCarryingBytes() {
+        return List.of(
+                new Reading("CaptureReading",
+                        () -> new CaptureReading(Map.of(), Map.of("orders", 512L), null),
+                        () -> new CaptureReading(Map.of(), Map.of(), null)),
+                new Reading("DeliveryReading",
+                        () -> new DeliveryReading(
+                                Map.of(), Map.of("orders", 512L), Map.of(), null),
+                        () -> new DeliveryReading(Map.of(), Map.of(), Map.of(), null)));
+    }
+
+    @Test
+    @DisplayName("a reading that weighed a payload cannot be built without what it weighed it from")
+    void bytesWithoutAStartAreRefusedByEveryReadingThatCarriesThem() {
+        List<Reading> all = readingsCarryingBytes();
+        // Asserted before the loop, for the reason the one above is: an emptied list passes every check.
+        assertThat(all).hasSize(2);
+        for (Reading reading : all) {
+            assertThatIllegalArgumentException()
+                    .as("%s must refuse a payload total with no start", reading.name())
+                    .isThrownBy(() -> reading.rowsWithNoStart().get())
+                    .withMessageContaining("says what it counted them from");
+        }
     }
 
     @Test

@@ -9,7 +9,11 @@ import java.util.Optional;
  * What a pipeline's run reports about rows that reached their target durably: how many of each table and
  * source operation, how recent the newest of them is per table, and the moment the counting began.
  *
- * <p>The three travel together because none of them is readable without the others. A running total means
+ * <p>The bytes are broken out by table and not also by operation, unlike the rows: what a reader does with
+ * them is compare ends or divide by rows, and the operation a row came from says nothing about how much of
+ * it there was.
+ *
+ * <p>The four travel together because none of them is readable without the others. A running total means
  * nothing without what it accumulates from — a restart and a decrease are the same observation otherwise —
  * and how many rows arrived says nothing about whether they are current, which is the question a pipeline
  * that is quietly falling behind answers with a healthy-looking count.
@@ -23,10 +27,12 @@ import java.util.Optional;
  * apart in the one place a reader could still act on the difference.
  */
 public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
-        Map<String, Long> newestEventTimeByTable, Instant countingSince) {
+        Map<String, Long> bytesByTable, Map<String, Long> newestEventTimeByTable,
+        Instant countingSince) {
 
     /** A reading from a run reporting nothing — no live job, or one that has settled nothing yet. */
-    public static final DeliveryReading NONE = new DeliveryReading(Map.of(), Map.of(), null);
+    public static final DeliveryReading NONE =
+            new DeliveryReading(Map.of(), Map.of(), Map.of(), null);
 
     public DeliveryReading {
         Map<String, Map<String, Long>> rows = new LinkedHashMap<>();
@@ -34,11 +40,12 @@ public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
             rowsByTableAndOp.forEach((table, byOp) -> rows.put(table, Map.copyOf(byOp)));
         }
         rowsByTableAndOp = Map.copyOf(rows);
+        bytesByTable = bytesByTable == null ? Map.of() : Map.copyOf(bytesByTable);
         newestEventTimeByTable =
                 newestEventTimeByTable == null ? Map.of() : Map.copyOf(newestEventTimeByTable);
-        if (!rowsByTableAndOp.isEmpty() && countingSince == null) {
+        if ((!rowsByTableAndOp.isEmpty() || !bytesByTable.isEmpty()) && countingSince == null) {
             throw new IllegalArgumentException(
-                    "a reading that counted rows says what it counted them from: totals without a start"
+                    "a reading with totals in it says what it counted them from: totals without a start"
                             + " hand every consumer a stream in which a restart and a decrease are the"
                             + " same observation");
         }
@@ -51,6 +58,7 @@ public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
 
     /** Whether this run reported nothing at all, as opposed to reporting nothing delivered. */
     public boolean isEmpty() {
-        return rowsByTableAndOp.isEmpty() && newestEventTimeByTable.isEmpty();
+        return rowsByTableAndOp.isEmpty() && bytesByTable.isEmpty()
+                && newestEventTimeByTable.isEmpty();
     }
 }

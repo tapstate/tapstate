@@ -283,16 +283,20 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // is what nothing reported already is. A guard for it would be a branch no case can enter, and a
         // branch nothing can enter is where a different answer hides.
         Map<String, Map<String, Long>> rows = new LinkedHashMap<>();
+        Map<String, Long> bytes = new LinkedHashMap<>();
         Instant since = null;
         for (CaptureRun run : runs) {
             CaptureHealth health = run.health();
             health.receivedRows().forEach((table, byOp) -> byOp.forEach((symbol, count) ->
                     rows.computeIfAbsent(table, ignored -> new LinkedHashMap<>())
                             .merge(symbol, count, Long::sum)));
+            // Added across this pipeline's runs like the counts, and for the same reason: two sources
+            // reading one table is twice the work and twice the payload, not one of them.
+            health.receivedBytes().forEach((table, size) -> bytes.merge(table, size, Long::sum));
             Instant start = health.countingSince();
             since = since == null || start.isAfter(since) ? start : since;
         }
-        return new CaptureReading(rows, since);
+        return new CaptureReading(rows, bytes, since);
     }
 
     /**

@@ -93,6 +93,7 @@ class RuntimeConvergenceConfiguration {
             return DeliveryReading.NONE;
         }
         return new DeliveryReading(engine.recordsDelivered(pipelineId),
+                engine.bytesDelivered(pipelineId),
                 engine.newestDeliveredEventTime(pipelineId), Instant.ofEpochMilli(since.getAsLong()));
     }
 

@@ -16,15 +16,23 @@ import java.util.Optional;
  * permanently empty on this one, which is an invitation to fill it with the nearest number to hand.
  *
  * <p>The start travels with the totals for the reason it does there: a running total without what it counts
- * from hands every consumer a stream in which a restart and a decrease are the same observation.
+ * from hands every consumer a stream in which a restart and a decrease are the same observation. It covers
+ * the bytes as well as the rows, because they are one account taken at one point: two starts could not
+ * disagree usefully, and one start over two accounts taken at different points would misdate one of them.
+ *
+ * <p>The bytes are broken out by table and not also by operation, unlike the rows. What a reader does with
+ * them is compare ends or divide by rows, and the operation a row came from says nothing about how much of
+ * it there was -- a dimension carried because the neighbour has it would be one nothing reads and nothing
+ * checks.
  *
  * <p>An empty reading is a capture with nothing to report, and is not the same as a table present at zero:
  * a table this pipeline has read nothing from is absent, so "not measured" and "measured empty" stay apart.
  */
-public record CaptureReading(Map<String, Map<String, Long>> rowsByTableAndOp, Instant countingSince) {
+public record CaptureReading(Map<String, Map<String, Long>> rowsByTableAndOp,
+        Map<String, Long> bytesByTable, Instant countingSince) {
 
     /** A reading from a pipeline capturing nothing — no live capture, or one that has taken nothing yet. */
-    public static final CaptureReading NONE = new CaptureReading(Map.of(), null);
+    public static final CaptureReading NONE = new CaptureReading(Map.of(), Map.of(), null);
 
     public CaptureReading {
         Map<String, Map<String, Long>> rows = new LinkedHashMap<>();
@@ -32,9 +40,10 @@ public record CaptureReading(Map<String, Map<String, Long>> rowsByTableAndOp, In
             rowsByTableAndOp.forEach((table, byOp) -> rows.put(table, Map.copyOf(byOp)));
         }
         rowsByTableAndOp = Map.copyOf(rows);
-        if (!rowsByTableAndOp.isEmpty() && countingSince == null) {
+        bytesByTable = bytesByTable == null ? Map.of() : Map.copyOf(bytesByTable);
+        if ((!rowsByTableAndOp.isEmpty() || !bytesByTable.isEmpty()) && countingSince == null) {
             throw new IllegalArgumentException(
-                    "a reading that counted rows says what it counted them from: totals without a start"
+                    "a reading with totals in it says what it counted them from: totals without a start"
                             + " hand every consumer a stream in which a restart and a decrease are the"
                             + " same observation");
         }

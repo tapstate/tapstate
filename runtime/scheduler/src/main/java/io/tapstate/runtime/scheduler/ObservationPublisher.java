@@ -134,11 +134,12 @@ public final class ObservationPublisher {
     private static final String JOIN_RECOMPUTE_EXPECTED_PREFIX = "joinRecomputeRowsExpected.";
 
     /**
-     * The two measurements that carry their dimensions as attributes rather than in their names. Their
-     * names are the canonical ones a monitoring backend sees; how the flat face below spells them is that
-     * face's business and is decided in {@link #FLAT_REDUCTIONS}.
+     * The three measurements of a pipeline's movement that carry their dimensions as attributes rather
+     * than in their names. Their names are the canonical ones a monitoring backend sees; how the flat
+     * face below spells them is that face's business and is decided in {@link #FLAT_REDUCTIONS}.
      */
     private static final String RECORDS_METRIC = "tapstate.pipeline.records";
+    private static final String BYTES_METRIC = "tapstate.pipeline.bytes";
     private static final String LAG_METRIC = "tapstate.pipeline.lag";
 
     /**
@@ -210,6 +211,7 @@ public final class ObservationPublisher {
      */
     private static final Map<String, FlatReduction> FLAT_REDUCTIONS = Map.of(
             RECORDS_METRIC, attributes -> "records." + attributes.get(DIRECTION_ATTRIBUTE),
+            BYTES_METRIC, attributes -> "bytes." + attributes.get(DIRECTION_ATTRIBUTE),
             LAG_METRIC, attributes -> "lag." + attributes.get(TABLE_ID_ATTRIBUTE),
             // Reduced and not dropped, which is the opposite of what the load's two measurements get, and
             // for the reason that decides between them: a drop is only honest when another face carries
@@ -821,16 +823,24 @@ public final class ObservationPublisher {
             String pipelineId, Instant at, CaptureReading captured, DeliveryReading delivered) {
         List<MetricFact> facts = new ArrayList<>();
         List<MetricPoint> rows = new ArrayList<>();
+        List<MetricPoint> payload = new ArrayList<>();
         if (captured != null) {
-            captured.start().ifPresent(start ->
-                    crossings(pipelineId, INBOUND, captured.rowsByTableAndOp(), start, at, rows));
+            captured.start().ifPresent(start -> {
+                crossings(pipelineId, INBOUND, captured.rowsByTableAndOp(), start, at, rows);
+                carried(pipelineId, INBOUND, captured.bytesByTable(), start, at, payload);
+            });
         }
         if (delivered != null) {
-            delivered.start().ifPresent(start ->
-                    crossings(pipelineId, OUTBOUND, delivered.rowsByTableAndOp(), start, at, rows));
+            delivered.start().ifPresent(start -> {
+                crossings(pipelineId, OUTBOUND, delivered.rowsByTableAndOp(), start, at, rows);
+                carried(pipelineId, OUTBOUND, delivered.bytesByTable(), start, at, payload);
+            });
         }
         if (!rows.isEmpty()) {
             facts.add(new MetricFact(RECORDS_METRIC, MetricType.COUNTER, "{record}", rows));
+        }
+        if (!payload.isEmpty()) {
+            facts.add(new MetricFact(BYTES_METRIC, MetricType.COUNTER, "By", payload));
         }
         if (delivered == null) {
             return facts;
@@ -866,6 +876,27 @@ public final class ObservationPublisher {
                         count, Long::sum)));
         byAttributes.forEach(
                 (attributes, count) -> into.add(MetricPoint.accumulated(attributes, start, at, count)));
+    }
+
+    /**
+     * Adds one accumulating point per table for the payload that crossed one end of the pipeline.
+     *
+     * <p>No summing step, unlike the crossings above: what arrives here is already one figure per table,
+     * because the operation a row came from is not a dimension of this measurement. Two points carrying
+     * identical attributes cannot arise, so there is nothing for an attribute-keyed merge to do and a
+     * merge written anyway would be a step no case could enter.
+     *
+     * <p>It shares the start with the counts taken at the same end, which is what makes the pair
+     * divisible: a bytes-per-row worked out from two totals accumulated from different moments is not a
+     * figure about any window at all.
+     */
+    private static void carried(String pipelineId, String direction,
+            Map<String, Long> bytesByTable, Instant start, Instant at, List<MetricPoint> into) {
+        bytesByTable.forEach((table, bytes) -> into.add(MetricPoint.accumulated(Map.of(
+                PIPELINE_ID_ATTRIBUTE, pipelineId,
+                TABLE_ID_ATTRIBUTE, table,
+                DIRECTION_ATTRIBUTE, direction),
+                start, at, bytes)));
     }
 
     /**

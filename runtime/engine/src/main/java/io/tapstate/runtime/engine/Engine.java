@@ -355,6 +355,33 @@ public final class Engine {
     }
 
     /**
+     * How many bytes of payload the pipeline's live job has had confirmed by its targets, by table; empty
+     * when it has no live job, and absent for a table with nothing confirmed.
+     *
+     * <p>Added over sinks like the counts beside it and unlike the per-chain distances, for the reason
+     * that decides between them: a row written to two targets was written twice, and its payload crossed
+     * twice.
+     */
+    public Map<String, Long> bytesDelivered(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) {
+            return Map.of();
+        }
+        JobMetrics collected = job.getMetrics();
+        Map<String, Long> byTable = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            String table = JetDeliveryGauge.carriedTableOf(metric);
+            if (table == null) {
+                continue;
+            }
+            for (Measurement measurement : collected.get(metric)) {
+                byTable.merge(table, measurement.value(), Long::sum);
+            }
+        }
+        return byTable;
+    }
+
+    /**
      * The moment the pipeline's live job began counting what it has delivered, as epoch milliseconds;
      * empty when it has no live job or nothing has counted yet.
      *

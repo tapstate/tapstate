@@ -30,6 +30,18 @@ interface DeliveryGauge {
     void delivered(Map<String, Map<String, Long>> rowsByTableAndOp);
 
     /**
+     * Takes the reading beside that one: how many bytes of payload have settled, by table. Cumulative in
+     * the same way, taken at the same moment and off the same batch, so the two cannot come to cover
+     * different writes.
+     *
+     * <p>Broken out by the table alone and not also by operation, unlike the counts. What a reader does
+     * with bytes is compare the two ends or divide by the rows, and the operation a row came from says
+     * nothing about how much of it there was -- a dimension carried because the neighbour has one is a
+     * dimension nothing reads and nothing would notice going wrong.
+     */
+    void carried(Map<String, Long> bytesByTable);
+
+    /**
      * Takes the other reading: for each table, the event time of the newest row of it that has settled, as
      * epoch milliseconds. Tables with nothing settled are absent.
      */
@@ -67,6 +79,10 @@ interface DeliveryGauge {
 
             @Override
             public void delivered(Map<String, Map<String, Long>> rowsByTableAndOp) {
+            }
+
+            @Override
+            public void carried(Map<String, Long> bytesByTable) {
             }
 
             @Override

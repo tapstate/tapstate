@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.PayloadBytes;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.SourcePosition;
 
@@ -28,6 +29,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * ring or forward to a consumer afterwards. A batch that arrives and then fails to be stored has crossed it,
  * and a batch the source sends a second time crosses it a second time and is counted again -- which is what
  * a count of arrivals means, as against a count of distinct rows.
+ *
+ * <p>The payload those rows carried is measured at that same point and off those same events, so the two
+ * readings cannot come to cover different arrivals. How many rows arrived and how much data they were are
+ * different questions: a table of wide rows and a table of narrow ones answer the first identically.
  */
 public final class CaptureHealth {
 
@@ -39,6 +44,13 @@ public final class CaptureHealth {
      * load on top of it -- and read on the thread that polls the run.
      */
     private final Map<String, Map<String, Long>> received = new ConcurrentHashMap<>();
+
+    /**
+     * Payload bytes received, by source table. One level of concurrency rather than two, because a byte
+     * count is broken out by the table alone -- the operation a row came from says nothing about how much
+     * of it there was, and a dimension nothing reads is a dimension that goes wrong unnoticed.
+     */
+    private final Map<String, Long> bytesReceived = new ConcurrentHashMap<>();
 
     /**
      * When this account was opened, which is what its totals count from. Taken here rather than at the first
@@ -77,10 +89,27 @@ public final class CaptureHealth {
         return Map.copyOf(snapshot);
     }
 
-    /** Counts one row this run received. Called at every point a source hands one over, and nowhere else. */
+    /**
+     * How many bytes of payload this run has taken from its source, by table. A table absent here is one
+     * nothing has arrived for, as with the counts beside it; a table present at nought is one whose rows
+     * carried no payload, which is what a stream of schema changes alone is.
+     */
+    public Map<String, Long> receivedBytes() {
+        return Map.copyOf(bytesReceived);
+    }
+
+    /**
+     * Counts one row this run received, and what its payload weighed. Called at every point a source hands
+     * one over, and nowhere else.
+     *
+     * <p>Both readings are taken off the one event in the one call, so neither can drift onto a different
+     * set of arrivals than the other. What is added for weight is the product's own definition of a row's
+     * payload and not a figure read off a driver or a serializer, so it does not move when either does.
+     */
     void received(Envelope event) {
         received.computeIfAbsent(event.src(), table -> new ConcurrentHashMap<>())
                 .merge(event.op().symbol(), 1L, Long::sum);
+        bytesReceived.merge(event.src(), PayloadBytes.of(event), Long::sum);
     }
 
     /**

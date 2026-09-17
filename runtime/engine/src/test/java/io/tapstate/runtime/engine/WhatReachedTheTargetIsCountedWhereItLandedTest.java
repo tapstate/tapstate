@@ -27,6 +27,11 @@ import org.junit.jupiter.api.Test;
  * come apart exactly when somebody is looking — while writes are piling up unacknowledged, or after one
  * failed — which is why the boundary is written down rather than left to whoever wires the counter.
  *
+ * <p>What those rows weighed is held to the same boundary in the same cases, because it is one account
+ * taken in one place: the payload is weighed while the batch is formed and applied when the write is known
+ * to have succeeded, so a failed write leaves no weight behind any more than it leaves a count. Asserting
+ * it beside the count is what keeps the two from being wired to different sets of writes.
+ *
  * <p>The recency reading is here for the same reason. What the sink reports is the newest event time it
  * has settled, never how far behind that is: the distance keeps growing while nothing arrives, so a
  * distance worked out here would be frozen at the last settle and would read as healthy for exactly as
@@ -47,11 +52,14 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         // Handed to the writer and not yet written. A count taken here runs ahead of the target by
         // whatever is in flight, and the write can still fail.
         assertThat(delivery.rows).isEmpty();
+        assertThat(delivery.bytes).isEmpty();
 
         writer.completeAll();
         drain(processor);
 
         assertThat(delivery.latestRows()).isEqualTo(Map.of("orders", Map.of("i", 2L)));
+        // Two rows of {id: <number>} at ten bytes each: two for the field's name, eight for the number.
+        assertThat(delivery.latestBytes()).isEqualTo(Map.of("orders", 20L));
     }
 
     @Test
@@ -69,6 +77,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         // The rows never reached the target, so nothing counted them. Counting on hand-off would have
         // reported them delivered, and a pipeline whose every write fails would read as one moving data.
         assertThat(delivery.rows).isEmpty();
+        assertThat(delivery.bytes).isEmpty();
         assertThat(delivery.eventTimes).isEmpty();
     }
 
@@ -86,6 +95,9 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         assertThat(delivery.latestRows()).isEqualTo(Map.of(
                 "orders", Map.of("i", 1L, "u", 1L),
                 "items", Map.of("i", 1L, "d", 2L)));
+        // The weight is broken out by table alone: one insert at ten and one update at twenty, since an
+        // update carries both halves of its row and both of them crossed. items: three rows at ten each.
+        assertThat(delivery.latestBytes()).isEqualTo(Map.of("orders", 30L, "items", 30L));
     }
 
     @Test
@@ -99,6 +111,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         // Cumulative rather than per-batch: a rate over any window the reader chooses is a subtraction of
         // two totals, and a delta only ever answers for the window whoever published it happened to pick.
         assertThat(delivery.latestRows()).isEqualTo(Map.of("orders", Map.of("i", 3L)));
+        assertThat(delivery.latestBytes()).isEqualTo(Map.of("orders", 30L));
     }
 
     @Test
@@ -136,6 +149,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         // Absent, not present at zero. A table with nothing delivered yet and a sink whose counting is not
         // wired are different states, and a published zero spells them the same way.
         assertThat(delivery.rows).isEmpty();
+        assertThat(delivery.bytes).isEmpty();
         assertThat(delivery.eventTimes).isEmpty();
     }
 
@@ -158,6 +172,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         // them says "this sink has delivered no rows" while the other says "no sink has said anything yet"
         // -- and a pipeline filtering everything out is the case where telling them apart is the answer.
         assertThat(delivery.rows).isEmpty();
+        assertThat(delivery.bytes).isEmpty();
         assertThat(delivery.eventTimes).isEmpty();
     }
 
@@ -248,6 +263,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
     /** Keeps every reading handed to it, so a test can assert both what was reported and when. */
     private static final class RecordingDelivery implements DeliveryGauge {
         private final List<Map<String, Map<String, Long>>> rows = new ArrayList<>();
+        private final List<Map<String, Long>> bytes = new ArrayList<>();
         private final List<Map<String, Long>> eventTimes = new ArrayList<>();
         private final List<Long> starts = new ArrayList<>();
 
@@ -256,6 +272,11 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
             Map<String, Map<String, Long>> copy = new LinkedHashMap<>();
             rowsByTableAndOp.forEach((table, byOp) -> copy.put(table, Map.copyOf(byOp)));
             rows.add(copy);
+        }
+
+        @Override
+        public void carried(Map<String, Long> bytesByTable) {
+            bytes.add(Map.copyOf(bytesByTable));
         }
 
         @Override
@@ -270,6 +291,10 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
 
         Map<String, Map<String, Long>> latestRows() {
             return rows.get(rows.size() - 1);
+        }
+
+        Map<String, Long> latestBytes() {
+            return bytes.get(bytes.size() - 1);
         }
 
         Map<String, Long> latestEventTimes() {

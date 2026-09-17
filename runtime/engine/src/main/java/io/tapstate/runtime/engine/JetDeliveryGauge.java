@@ -29,6 +29,9 @@ final class JetDeliveryGauge implements DeliveryGauge {
     /** What a per-table, per-operation delivery count is named, with {@code <op>.<table>} appended. */
     static final String DELIVERED_PREFIX = "recordsOut.";
 
+    /** What a per-table settled payload size is named, with the table appended. */
+    static final String CARRIED_PREFIX = "bytesOut.";
+
     /** What a per-table newest-settled event time is named, with the table appended. */
     static final String REACHED_PREFIX = "outEventTime.";
 
@@ -36,6 +39,7 @@ final class JetDeliveryGauge implements DeliveryGauge {
     static final String SINCE_METRIC = "outCountingSince";
 
     private final Map<String, Metric> deliveredByKey = new HashMap<>();
+    private final Map<String, Metric> carriedByTable = new HashMap<>();
     private final Map<String, Metric> reachedByTable = new HashMap<>();
     private Metric since;
 
@@ -44,6 +48,12 @@ final class JetDeliveryGauge implements DeliveryGauge {
         rowsByTableAndOp.forEach((table, byOp) -> byOp.forEach((op, rows) ->
                 deliveredByKey.computeIfAbsent(op + "." + table, JetDeliveryGauge::deliveredMetricFor)
                         .set(rows)));
+    }
+
+    @Override
+    public void carried(Map<String, Long> bytesByTable) {
+        bytesByTable.forEach((table, bytes) ->
+                carriedByTable.computeIfAbsent(table, JetDeliveryGauge::carriedMetricFor).set(bytes));
     }
 
     @Override
@@ -82,6 +92,19 @@ final class JetDeliveryGauge implements DeliveryGauge {
         return new Delivered(rest.substring(0, split), rest.substring(split + 1));
     }
 
+    /**
+     * The table a settled payload size named {@code metric} concerns, or {@code null} when it is not one.
+     * Everything past the prefix is the table, dots and all, for the reason the newest-settled reading
+     * beside it takes the whole remainder: a schema-qualified table name contains dots.
+     */
+    static String carriedTableOf(String metric) {
+        if (!metric.startsWith(CARRIED_PREFIX)) {
+            return null;
+        }
+        String table = metric.substring(CARRIED_PREFIX.length());
+        return table.isEmpty() ? null : table;
+    }
+
     /** The table a newest-settled reading named {@code metric} concerns, or {@code null} when it is not one. */
     static String reachedTableOf(String metric) {
         if (!metric.startsWith(REACHED_PREFIX)) {
@@ -97,6 +120,10 @@ final class JetDeliveryGauge implements DeliveryGauge {
 
     private static Metric deliveredMetricFor(String opAndTable) {
         return Metrics.metric(DELIVERED_PREFIX + opAndTable);
+    }
+
+    private static Metric carriedMetricFor(String table) {
+        return Metrics.metric(CARRIED_PREFIX + table);
     }
 
     private static Metric reachedMetricFor(String table) {
