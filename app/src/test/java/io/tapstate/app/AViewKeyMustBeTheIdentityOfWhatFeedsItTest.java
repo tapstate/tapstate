@@ -77,7 +77,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                 List.of(TableRef.literal("orders"), TableRef.literal("invoices")), null, null));
         artifacts.save(managedStore());
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("src"), "id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("src"), "id", null),
                 null, settings(), null));
 
         assertThatThrownBy(() -> dagFor(artifacts))
@@ -98,7 +98,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                 Map.of("host", "the-users-own-warehouse"), SourceMode.CDC,
                 List.of(TableRef.literal("facts")), null, null));
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
                 null, settings(), null));
 
         assertThatThrownBy(() -> dagFor(artifacts))
@@ -125,7 +125,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                 List.of(TableRef.literal("orders")), null, null));
         artifacts.save(managedStore());
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null),
                 null, settings(), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
@@ -229,7 +229,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                 List.of(TableRef.literal("orders")), null, null));
         artifacts.save(managedStore());
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null),
                 null, settings(), null));
 
         Assertions.assertThatCode(() -> dagFor(artifacts)).doesNotThrowAnyException();
@@ -275,7 +275,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src_orders", true), SourceRef.spec("src_items", true)),
                 List.of(step),
-                new ViewBlock.Inline("order_state", FromRef.literal(STEP), viewKey, null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal(STEP), viewKey, null),
                 null, settings(), null));
         return artifacts;
     }

@@ -28,7 +28,6 @@ import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
-import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 import org.junit.jupiter.api.Test;
 
@@ -122,8 +121,7 @@ class PipelineRepresentationTest {
                         "storage", Map.of(
                                 "hot", Map.of("ttl", "15m"),
                                 "warm", Map.of("collection", "orders", "indexes", List.of("customer_id")),
-                                "cold", Map.of("partitionBy", List.of("region"))),
-                        "schema", Map.of("enforce", true, "evolution", "additive")),
+                                "cold", Map.of("partitionBy", List.of("region")))),
                 Map.of(
                         "from", List.of("view", "/backfill_.*/"),
                         "sync", List.of(Map.of(
@@ -201,8 +199,7 @@ class PipelineRepresentationTest {
                 new Storage(
                         new Storage.Hot("15m"),
                         new Storage.Warm("orders", List.of("customer_id")),
-                        new Storage.Cold(List.of("region"))),
-                new ViewSchema(true, "additive")));
+                        new Storage.Cold(List.of("region")))));
         assertThat(model.serve()).isEqualTo(new ServeBlock.Inline(
                 "serve",
                 FromClause.list(FromRef.literal("view"), FromRef.regex("backfill_.*")),
@@ -644,7 +641,7 @@ class PipelineRepresentationTest {
                 null,
                 refs("mysql_feynman"),
                 null,
-                new ViewBlock.Inline("players_view", FromRef.literal("Player"), null, null, null),
+                new ViewBlock.Inline("players_view", FromRef.literal("Player"), null, null),
                 new ServeBlock.Inline(
                         "serve",
                         FromRef.literal("players_view"),

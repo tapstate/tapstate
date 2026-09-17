@@ -52,7 +52,7 @@ public final class MigrationRunner {
     private static final List<ChangeSet> CHANGE_SETS =
             List.of(new V1BaselineIndexes(), new V2StructuredArtifacts(), new V3RecordedSrsSwitches(),
                     new V4DiscardInventedPositions(), new V5SplitSourceSchemas(), new V6SplitDerivedSchemas(),
-                    new V7RepairBlankPipelines());
+                    new V7RepairBlankPipelines(), new V8DiscardViewSchemaPolicies());
 
     /**
      * The highest version this build knows. A store above it is one this build must not open: it was

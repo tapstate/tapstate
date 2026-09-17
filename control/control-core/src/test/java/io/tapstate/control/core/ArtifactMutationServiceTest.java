@@ -714,7 +714,7 @@ class ArtifactMutationServiceTest {
     }
 
     private static ViewResource view(String id) {
-        return new ViewResource(id, null, null, null, null, null);
+        return new ViewResource(id, null, null, null, null);
     }
 
     private static ServeResource serve(String id) {

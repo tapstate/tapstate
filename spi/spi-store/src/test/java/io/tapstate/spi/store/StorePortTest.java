@@ -245,7 +245,7 @@ class StorePortTest {
     void artifactListReturnsEverySaved() {
         ArtifactStore artifacts = new InMemoryStore().artifacts();
         artifacts.save(source("orders", "mysql"));
-        artifacts.save(new ViewResource("mdm", null, null, null, null, null));
+        artifacts.save(new ViewResource("mdm", null, null, null, null));
 
         assertThat(artifacts.list()).extracting(Resource::id).containsExactlyInAnyOrder("orders", "mdm");
     }
@@ -254,7 +254,7 @@ class StorePortTest {
     void artifactSaveAllUpsertsEveryResourceById() {
         ArtifactStore artifacts = new InMemoryStore().artifacts();
 
-        artifacts.saveAll(List.of(source("orders", "mysql"), new ViewResource("mdm", null, null, null, null, null)));
+        artifacts.saveAll(List.of(source("orders", "mysql"), new ViewResource("mdm", null, null, null, null)));
 
         assertThat(artifacts.list()).extracting(Resource::id).containsExactlyInAnyOrder("orders", "mdm");
         // A second batch upserts by id in place rather than accumulating documents.

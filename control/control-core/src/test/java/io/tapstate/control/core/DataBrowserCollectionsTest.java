@@ -190,7 +190,6 @@ class DataBrowserCollectionsTest {
                 description == null ? null : new Metadata(null, description),
                 null,
                 new Storage(null, new Storage.Warm(collection, null), null),
-                null,
                 null);
     }
 

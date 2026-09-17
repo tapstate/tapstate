@@ -222,7 +222,7 @@ final class NestedJsonRecipe {
         NestRoot root = new NestRoot(answers.rootTable(), List.of(answers.key()), null, null, embeds);
         Step assemble = Step.inline("assemble", FromClause.aliases(aliases),
                 new TransformBody.Nest(null, null, root), null);
-        ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal("assemble"), answers.key(), null, null);
+        ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal("assemble"), answers.key(), null);
         PipelineResource pipeline = new PipelineResource(RecipeSupport.identifier(answers.rootTable()) + "_sync", null,
                 sources.stream().<SourceRef>map(s -> SourceRef.bare(s.resource().id())).toList(),
                 List.of(assemble), view, null, null, null);
