@@ -11,6 +11,8 @@ import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
@@ -19,6 +21,8 @@ import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMetricNames;
 import io.tapstate.spi.store.KeyedStateStore;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -403,6 +407,72 @@ public final class Engine {
                 byTable.merge(table, measurement.value(), Long::sum);
             }
         }
+        return byTable;
+    }
+
+    /**
+     * How long the rows of each table have taken to reach a target, from the source's stamp to the
+     * confirmed write, as one distribution per table over the registered bounds; empty when the pipeline
+     * has no live job, and absent for a table with nothing confirmed.
+     *
+     * <p>Added over sinks, bucket by bucket, like the counts and unlike the per-chain distances: a row
+     * written to two targets was delivered twice, and each delivery took as long as it took.
+     */
+    public Map<String, HistogramValue> deliveryDurations(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? Map.of() : settledDurationsIn(job.getMetrics());
+    }
+
+    /**
+     * The delivery-duration distributions in {@code collected}, by table. A table is read back only when
+     * all three of its parts are present and its buckets are as many as the registered bounds need: a
+     * distribution with a bucket missing is not a distribution short one bucket, it is a collection that
+     * caught a sink half-way through reporting, and it is left out rather than read as a shape.
+     */
+    static Map<String, HistogramValue> settledDurationsIn(JobMetrics collected) {
+        HistogramBounds bounds = HistogramBounds.RECORD_DELIVERY_DURATION;
+        Map<String, Long> counts = new HashMap<>();
+        Map<String, Long> sums = new HashMap<>();
+        Map<String, long[]> buckets = new HashMap<>();
+        Map<String, Integer> bucketsSeen = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            String countTable = JetDeliveryGauge.durationCountTableOf(metric);
+            if (countTable != null) {
+                for (Measurement measurement : collected.get(metric)) {
+                    counts.merge(countTable, measurement.value(), Long::sum);
+                }
+                continue;
+            }
+            String sumTable = JetDeliveryGauge.durationSumTableOf(metric);
+            if (sumTable != null) {
+                for (Measurement measurement : collected.get(metric)) {
+                    sums.merge(sumTable, measurement.value(), Long::sum);
+                }
+                continue;
+            }
+            JetDeliveryGauge.DurationBucket bucket = JetDeliveryGauge.durationBucketOf(metric);
+            if (bucket == null || bucket.index() < 0 || bucket.index() >= bounds.buckets()) {
+                continue;
+            }
+            long[] perBucket = buckets.computeIfAbsent(bucket.table(), ignored -> new long[bounds.buckets()]);
+            for (Measurement measurement : collected.get(metric)) {
+                perBucket[bucket.index()] += measurement.value();
+            }
+            bucketsSeen.merge(bucket.table(), 1, Integer::sum);
+        }
+        Map<String, HistogramValue> byTable = new HashMap<>();
+        counts.forEach((table, count) -> {
+            long[] perBucket = buckets.get(table);
+            if (perBucket == null || bucketsSeen.getOrDefault(table, 0) != bounds.buckets()
+                    || !sums.containsKey(table)) {
+                return;
+            }
+            List<Long> bucketCounts = new ArrayList<>(perBucket.length);
+            for (long bucketCount : perBucket) {
+                bucketCounts.add(bucketCount);
+            }
+            byTable.put(table, bounds.value(count, sums.get(table) / 1000.0, bucketCounts));
+        });
         return byTable;
     }
 

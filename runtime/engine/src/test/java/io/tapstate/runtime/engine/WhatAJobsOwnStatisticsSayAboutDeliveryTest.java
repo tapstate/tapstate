@@ -2,6 +2,8 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.HistogramValue;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -120,5 +122,82 @@ class WhatAJobsOwnStatisticsSayAboutDeliveryTest {
         assertThat(Engine.settledBytesIn(collected)).isEmpty();
         assertThat(Engine.deliveredRowsIn(collected)).isEmpty();
         assertThat(Engine.highestIn(collected, JetDeliveryGauge::reachedTableOf)).isEmpty();
+    }
+
+    // ---- the delivery-duration distribution travels as its count, its sum and one number per bucket ----
+
+    private static Map<String, List<Long>> aDistribution(String table, long count, long sumMillis, int inBucket,
+            List<Long> perSink) {
+        Map<String, List<Long>> statistics = new LinkedHashMap<>();
+        statistics.put("outDeliveryCount." + table, perSink.stream().map(share -> count * share).toList());
+        statistics.put("outDeliverySumMillis." + table, perSink.stream().map(share -> sumMillis * share).toList());
+        for (int index = 0; index < 16; index++) {
+            int bucket = index;
+            statistics.put("outDeliveryBucket." + index + "." + table,
+                    perSink.stream().map(share -> bucket == inBucket ? count * share : 0L).toList());
+        }
+        return statistics;
+    }
+
+    @Test
+    @DisplayName("a table's distribution is read back whole: count, sum in seconds and every bucket")
+    void theDurationReadbackReassemblesADistributionFromItsParts() {
+        JobMetrics collected = statistics(aDistribution("orders", 7L, 2_100L, 5, List.of(1L)));
+
+        Map<String, HistogramValue> read = Engine.settledDurationsIn(collected);
+
+        assertThat(read).containsOnlyKeys("orders");
+        HistogramValue orders = read.get("orders");
+        assertThat(orders.count()).isEqualTo(7L);
+        assertThat(orders.sum()).isEqualTo(2.1);
+        assertThat(orders.bounds()).isEqualTo(HistogramBounds.RECORD_DELIVERY_DURATION.bounds());
+        assertThat(orders.bucketCounts()).hasSize(16);
+        assertThat(orders.bucketCounts().get(5)).isEqualTo(7L);
+        assertThat(orders.bucketCounts().stream().mapToLong(Long::longValue).sum()).isEqualTo(7L);
+    }
+
+    @Test
+    @DisplayName("two sinks over one table have their distributions added bucket by bucket")
+    void twoSinksDistributionsAreAddedBucketByBucket() {
+        // Each sink reports its own running totals; the second delivered twice as many rows as the first.
+        JobMetrics collected = statistics(aDistribution("orders", 3L, 900L, 8, List.of(1L, 2L)));
+
+        HistogramValue orders = Engine.settledDurationsIn(collected).get("orders");
+
+        assertThat(orders.count()).isEqualTo(9L);
+        assertThat(orders.sum()).isEqualTo(2.7);
+        assertThat(orders.bucketCounts().get(8)).isEqualTo(9L);
+    }
+
+    @Test
+    @DisplayName("a distribution caught with a bucket missing is left out rather than read as a shape")
+    void aHalfReportedDistributionIsLeftOut() {
+        Map<String, List<Long>> parts = aDistribution("orders", 7L, 2_100L, 5, List.of(1L));
+        parts.remove("outDeliveryBucket.15.orders");
+        JobMetrics collected = statistics(parts);
+
+        // Fifteen buckets are not a distribution short one bucket: a consumer given them cannot tell an
+        // overflow bucket that was dropped from one that never existed, and reads a tail that is not there.
+        assertThat(Engine.settledDurationsIn(collected)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("a dotted table name is not split by the duration readback either")
+    void aDottedTableNameSurvivesTheDurationReadback() {
+        JobMetrics collected = statistics(aDistribution("shop.orders", 1L, 40L, 2, List.of(1L)));
+
+        assertThat(Engine.settledDurationsIn(collected)).containsOnlyKeys("shop.orders");
+    }
+
+    @Test
+    @DisplayName("the neighbouring delivery names are not read as parts of a distribution")
+    void theDurationReadbackTakesItsOwnFamilyOfNames() {
+        JobMetrics collected = statistics(new LinkedHashMap<>(Map.of(
+                "bytesOut.orders", List.of(4_000L),
+                "outEventTime.orders", List.of(1_700_000_000_000L),
+                "recordsOut.i.orders", List.of(7L),
+                "outCountingSince", List.of(1_700_000_000_000L))));
+
+        assertThat(Engine.settledDurationsIn(collected)).isEmpty();
     }
 }

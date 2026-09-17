@@ -4,6 +4,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
@@ -102,5 +103,22 @@ class ATotalArrivesWithWhatItCountsFromTest {
                     .as("%s with nothing counted is a legitimate reading", reading.name())
                     .doesNotThrowAnyException();
         }
+    }
+
+    @Test
+    @DisplayName("a reading that timed deliveries cannot be built without what it timed them from")
+    void durationsWithoutAStartAreRefused() {
+        HistogramBounds bounds = HistogramBounds.RECORD_DELIVERY_DURATION;
+        List<Long> buckets = new ArrayList<>();
+        for (int index = 0; index < bounds.buckets(); index++) {
+            buckets.add(index == 3 ? 1L : 0L);
+        }
+        HistogramValue took = bounds.value(1L, 0.08, buckets);
+
+        // A distribution accumulates from the same start as the counts beside it, and is as unreadable
+        // without one: a restart empties it, and a consumer with no start reads the emptying as a drop.
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> new DeliveryReading(Map.of(), Map.of(), Map.of(), null, Map.of("orders", took)))
+                .withMessageContaining("says what it counted them from");
     }
 }

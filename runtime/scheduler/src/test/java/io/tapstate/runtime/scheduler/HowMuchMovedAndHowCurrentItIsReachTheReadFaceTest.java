@@ -5,6 +5,8 @@ import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
@@ -21,6 +23,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -66,7 +69,37 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
                 Map.of("orders", 218_000L, "items", 1_900L),
                 Map.of("orders", AT.minusSeconds(2).toEpochMilli(),
                         "items", AT.minusSeconds(47).toEpochMilli()),
-                STARTED);
+                STARTED,
+                Map.of("orders", ORDERS_TOOK));
+    }
+
+    /** Twelve hundred orders rows, all of them between a quarter and half a second from stamp to confirmation. */
+    private static final HistogramValue ORDERS_TOOK = HistogramBounds.RECORD_DELIVERY_DURATION.value(
+            1_200L, 420.0, bucketsWith(5, 1_200L));
+
+    private static List<Long> bucketsWith(int bucket, long count) {
+        List<Long> counts = new ArrayList<>();
+        for (int index = 0; index < HistogramBounds.RECORD_DELIVERY_DURATION.buckets(); index++) {
+            counts.add(index == bucket ? count : 0L);
+        }
+        return counts;
+    }
+
+    @Test
+    @DisplayName("how long rows took arrives as a distribution per table, over the registered bounds")
+    void howLongRowsTookArrivesAsAHistogramPerTable() {
+        MetricFact took = factNamed(facts(twoTables(), AT), "tapstate.pipeline.record.delivery.duration");
+
+        assertThat(took.type()).isEqualTo(MetricType.HISTOGRAM);
+        assertThat(took.unit()).isEqualTo("s");
+        assertThat(took.points()).singleElement().satisfies(point -> {
+            assertThat(point.attributes()).isEqualTo(
+                    Map.of("tapstate.pipeline.id", "orders", "tapstate.table.id", "orders"));
+            // Accumulated from the same start as the counts: it is over the same rows.
+            assertThat(point.startTime()).isEqualTo(STARTED);
+            assertThat(point.observedAt()).isEqualTo(AT);
+            assertThat(point.histogram()).isEqualTo(ORDERS_TOOK);
+        });
     }
 
     @Test
@@ -316,7 +349,10 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
         // change to this list, never a quiet drop.
         assertThat(projected.reduced()).containsExactlyInAnyOrder("tapstate.pipeline.records",
                 "tapstate.pipeline.bytes", "tapstate.pipeline.lag", "tapstate.pipeline.records.driven");
-        assertThat(projected.dropped()).isEmpty();
+        // The one measurement this face cannot carry: a distribution has no single number to be, and the
+        // flat face refuses it a rule rather than squeezing it. It is read on the facts, which travel on
+        // the same document, so the drop is a drop from this projection and not from what was measured.
+        assertThat(projected.dropped()).containsExactly("tapstate.pipeline.record.delivery.duration");
     }
 
     @Test

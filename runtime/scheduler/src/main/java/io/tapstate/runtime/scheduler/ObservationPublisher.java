@@ -6,6 +6,7 @@ import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FlatReduction;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -162,6 +163,14 @@ public final class ObservationPublisher {
     private static final String RECORDS_METRIC = "tapstate.pipeline.records";
     private static final String BYTES_METRIC = "tapstate.pipeline.bytes";
     private static final String LAG_METRIC = "tapstate.pipeline.lag";
+
+    /**
+     * How long settled rows took, per table, as a distribution over the registered bounds. It has no
+     * single number to be on the flat face, which refuses it a rule rather than squeezing it, so it is
+     * read on the facts alone -- which is where a percentile is a number somebody computes rather than one
+     * that was averaged away before they saw it.
+     */
+    private static final String RECORD_DELIVERY_DURATION_METRIC = "tapstate.pipeline.record.delivery.duration";
 
     /**
      * The bounded load's two measurements, which carry their table as an attribute the way the pair above
@@ -953,6 +962,16 @@ public final class ObservationPublisher {
         if (!ages.isEmpty()) {
             facts.add(new MetricFact(LAG_METRIC, MetricType.GAUGE, "s", ages));
         }
+        // The distribution accumulates from the same start as the counts: it is over the same rows.
+        delivered.start().ifPresent(start -> {
+            List<MetricPoint> took = new ArrayList<>();
+            delivered.deliveryDurationByTable().forEach((table, histogram) -> took.add(MetricPoint.distribution(
+                    Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, TABLE_ID_ATTRIBUTE, table), start, at, histogram)));
+            if (!took.isEmpty()) {
+                facts.add(new MetricFact(RECORD_DELIVERY_DURATION_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.UNIT, took));
+            }
+        });
         return facts;
     }
 

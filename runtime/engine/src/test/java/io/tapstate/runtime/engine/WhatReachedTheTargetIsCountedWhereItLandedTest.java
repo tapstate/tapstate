@@ -10,6 +10,8 @@ import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
@@ -18,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -79,6 +82,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         assertThat(delivery.rows).isEmpty();
         assertThat(delivery.bytes).isEmpty();
         assertThat(delivery.eventTimes).isEmpty();
+        assertThat(delivery.durations).isEmpty();
     }
 
     @Test
@@ -112,6 +116,94 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         // two totals, and a delta only ever answers for the window whoever published it happened to pick.
         assertThat(delivery.latestRows()).isEqualTo(Map.of("orders", Map.of("i", 3L)));
         assertThat(delivery.latestBytes()).isEqualTo(Map.of("orders", 30L));
+    }
+
+    @Test
+    void buckets_each_settled_rows_age_at_the_moment_its_write_was_confirmed() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(new ImmediateWriter(), delivery, () -> now);
+
+        // One row stamped three tenths of a second before it settles, one three seconds before.
+        pump(processor, row("orders", now - 300L), row("orders", now - 3_000L));
+
+        HistogramValue orders = delivery.latestDurations().get("orders");
+        assertThat(orders.count()).isEqualTo(2L);
+        assertThat(orders.sum()).isEqualTo(3.3);
+        assertThat(orders.bounds()).isEqualTo(HistogramBounds.RECORD_DELIVERY_DURATION.bounds());
+        // 0.3 s falls in the bucket bounded by 0.5 s and 3 s in the one bounded by 5 s; nothing elsewhere.
+        assertThat(orders.bucketCounts().get(5)).isEqualTo(1L);
+        assertThat(orders.bucketCounts().get(8)).isEqualTo(1L);
+        assertThat(orders.bucketCounts().stream().mapToLong(Long::longValue).sum()).isEqualTo(2L);
+    }
+
+    @Test
+    void a_row_exactly_on_a_bound_lands_in_the_bucket_that_bound_closes() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(new ImmediateWriter(), delivery, () -> now);
+
+        // Half a second exactly: the bound is an upper bound and inclusive, the way every consumer of an
+        // explicit-bucket distribution reads one. Counted above it, the same row would move a bucket
+        // between two readers who agree on the bounds.
+        pump(processor, row("orders", now - 500L));
+
+        HistogramValue orders = delivery.latestDurations().get("orders");
+        assertThat(orders.bucketCounts().get(5)).isEqualTo(1L);
+        assertThat(orders.bucketCounts().get(6)).isEqualTo(0L);
+    }
+
+    @Test
+    void measures_a_row_against_the_moment_it_settled_not_the_moment_it_was_handed_over() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        long[] now = {1_700_000_000_000L};
+        SinkProcessor processor = init(writer, delivery, () -> now[0]);
+
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(row("orders", now[0] - 100L)));
+        processor.process(0, inbox);
+        // The write sits at the target for two seconds before it is confirmed. That wait is part of how
+        // long the row took to be delivered: a duration taken on hand-off would report a slow target as
+        // a fast one, on exactly the occasion anybody is looking.
+        now[0] += 2_000L;
+        writer.completeAll();
+        drain(processor);
+
+        HistogramValue orders = delivery.latestDurations().get("orders");
+        assertThat(orders.sum()).isEqualTo(2.1);
+        assertThat(orders.bucketCounts().get(7)).isEqualTo(1L);
+    }
+
+    @Test
+    void keeps_a_running_distribution_across_batches_and_apart_per_table() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(new ImmediateWriter(), delivery, () -> now);
+
+        pump(processor, row("orders", now - 20L));
+        pump(processor, row("orders", now - 30L), row("items", now - 40_000L));
+
+        Map<String, HistogramValue> latest = delivery.latestDurations();
+        assertThat(latest).containsOnlyKeys("orders", "items");
+        assertThat(latest.get("orders").count()).isEqualTo(2L);
+        assertThat(latest.get("orders").sum()).isEqualTo(0.05);
+        assertThat(latest.get("items").count()).isEqualTo(1L);
+        assertThat(latest.get("items").bucketCounts().get(11)).isEqualTo(1L);
+    }
+
+    @Test
+    void reads_a_row_stamped_ahead_of_this_clock_as_taking_no_time_rather_than_negative_time() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(new ImmediateWriter(), delivery, () -> now);
+
+        pump(processor, row("orders", now + 5_000L));
+
+        HistogramValue orders = delivery.latestDurations().get("orders");
+        assertThat(orders.count()).isEqualTo(1L);
+        assertThat(orders.sum()).isEqualTo(0.0);
+        assertThat(orders.bucketCounts().get(0)).isEqualTo(1L);
     }
 
     @Test
@@ -238,8 +330,13 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
     }
 
     private static SinkProcessor init(SinkWriter writer, DeliveryGauge delivery) throws Exception {
+        return init(writer, delivery, System::currentTimeMillis);
+    }
+
+    private static SinkProcessor init(SinkWriter writer, DeliveryGauge delivery, LongSupplier clock)
+            throws Exception {
         SinkProcessor processor =
-                new SinkProcessor(writer, null, null, 1, 1024, FrontierGauge.none(), delivery);
+                new SinkProcessor(writer, null, null, 1, 1024, FrontierGauge.none(), delivery, clock);
         processor.init(new TestOutbox(new int[] {}, 128), new TestProcessorContext());
         return processor;
     }
@@ -265,6 +362,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         private final List<Map<String, Map<String, Long>>> rows = new ArrayList<>();
         private final List<Map<String, Long>> bytes = new ArrayList<>();
         private final List<Map<String, Long>> eventTimes = new ArrayList<>();
+        private final List<Map<String, HistogramValue>> durations = new ArrayList<>();
         private final List<Long> starts = new ArrayList<>();
 
         @Override
@@ -285,8 +383,17 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         }
 
         @Override
+        public void took(Map<String, HistogramValue> durationByTable) {
+            durations.add(Map.copyOf(durationByTable));
+        }
+
+        @Override
         public void countingSince(long epochMillis) {
             starts.add(epochMillis);
+        }
+
+        Map<String, HistogramValue> latestDurations() {
+            return durations.get(durations.size() - 1);
         }
 
         Map<String, Map<String, Long>> latestRows() {

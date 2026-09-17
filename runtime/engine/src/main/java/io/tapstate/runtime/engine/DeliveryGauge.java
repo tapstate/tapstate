@@ -1,5 +1,7 @@
 package io.tapstate.runtime.engine;
 
+import io.tapstate.core.lifecycle.HistogramValue;
+
 import java.util.Map;
 
 /**
@@ -48,6 +50,17 @@ interface DeliveryGauge {
     void reached(Map<String, Long> newestEventTimeByTable);
 
     /**
+     * Takes the reading of how long settled rows took, per table: from the moment the source stamped a
+     * row to the moment its write was confirmed, bucketed over the registered bounds, accumulated since
+     * the run began. Taken at the same moment as the counts and off the same rows, so a row is in this
+     * distribution exactly when it is in the count beside it.
+     *
+     * <p>A distribution rather than an average, because an average is where the slow rows disappear, and
+     * the slow rows are what anybody reading a delivery time came to see.
+     */
+    void took(Map<String, HistogramValue> durationByTable);
+
+    /**
      * Takes the reading the two above are only readable against: the moment this sink began counting, as
      * epoch milliseconds. A running total with no start is a stream in which a restart and a decrease are
      * the same observation, so whoever reads the counts needs to know what they accumulate from — and the
@@ -87,6 +100,10 @@ interface DeliveryGauge {
 
             @Override
             public void reached(Map<String, Long> newestEventTimeByTable) {
+            }
+
+            @Override
+            public void took(Map<String, HistogramValue> durationByTable) {
             }
 
             @Override

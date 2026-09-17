@@ -94,7 +94,8 @@ class RuntimeConvergenceConfiguration {
         }
         return new DeliveryReading(engine.recordsDelivered(pipelineId),
                 engine.bytesDelivered(pipelineId),
-                engine.newestDeliveredEventTime(pipelineId), Instant.ofEpochMilli(since.getAsLong()));
+                engine.newestDeliveredEventTime(pipelineId), Instant.ofEpochMilli(since.getAsLong()),
+                engine.deliveryDurations(pipelineId));
     }
 
     @Bean

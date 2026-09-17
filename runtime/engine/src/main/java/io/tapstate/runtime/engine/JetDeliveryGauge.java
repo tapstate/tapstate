@@ -2,7 +2,9 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.jet.core.metrics.Metric;
 import com.hazelcast.jet.core.metrics.Metrics;
+import io.tapstate.core.lifecycle.HistogramValue;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -38,9 +40,20 @@ final class JetDeliveryGauge implements DeliveryGauge {
     /** What the moment this sink began counting is named. One per sink, with nothing appended. */
     static final String SINCE_METRIC = "outCountingSince";
 
+    /**
+     * What the three parts of a table's delivery-duration distribution are named. A run's statistics hold
+     * one number per name, so a distribution travels as its count, its sum in milliseconds and one number
+     * per bucket, {@code <index>.<table>} appended to the bucket prefix — the index in front for the reason
+     * the operation goes in front of the table above: the table is the one part that may hold a dot.
+     */
+    static final String DURATION_COUNT_PREFIX = "outDeliveryCount.";
+    static final String DURATION_SUM_PREFIX = "outDeliverySumMillis.";
+    static final String DURATION_BUCKET_PREFIX = "outDeliveryBucket.";
+
     private final Map<String, Metric> deliveredByKey = new HashMap<>();
     private final Map<String, Metric> carriedByTable = new HashMap<>();
     private final Map<String, Metric> reachedByTable = new HashMap<>();
+    private final Map<String, Metric> durationParts = new HashMap<>();
     private Metric since;
 
     @Override
@@ -60,6 +73,22 @@ final class JetDeliveryGauge implements DeliveryGauge {
     public void reached(Map<String, Long> newestEventTimeByTable) {
         newestEventTimeByTable.forEach((table, eventTime) ->
                 reachedByTable.computeIfAbsent(table, JetDeliveryGauge::reachedMetricFor).set(eventTime));
+    }
+
+    @Override
+    public void took(Map<String, HistogramValue> durationByTable) {
+        durationByTable.forEach((table, histogram) -> {
+            part(DURATION_COUNT_PREFIX + table).set(histogram.count());
+            part(DURATION_SUM_PREFIX + table).set(Math.round(histogram.sum() * 1000.0));
+            List<Long> buckets = histogram.bucketCounts();
+            for (int index = 0; index < buckets.size(); index++) {
+                part(DURATION_BUCKET_PREFIX + index + "." + table).set(buckets.get(index));
+            }
+        });
+    }
+
+    private Metric part(String name) {
+        return durationParts.computeIfAbsent(name, Metrics::metric);
     }
 
     @Override
@@ -114,8 +143,51 @@ final class JetDeliveryGauge implements DeliveryGauge {
         return table.isEmpty() ? null : table;
     }
 
+    /** The table a duration count named {@code metric} concerns, or {@code null} when it is not one. */
+    static String durationCountTableOf(String metric) {
+        return tableAfter(metric, DURATION_COUNT_PREFIX);
+    }
+
+    /** The table a duration sum named {@code metric} concerns, or {@code null} when it is not one. */
+    static String durationSumTableOf(String metric) {
+        return tableAfter(metric, DURATION_SUM_PREFIX);
+    }
+
+    /**
+     * The bucket index and table a duration bucket named {@code metric} concerns, or {@code null} when it
+     * is not one. Split at the first dot after the prefix and nowhere else: the index never holds a dot,
+     * the table may.
+     */
+    static DurationBucket durationBucketOf(String metric) {
+        if (!metric.startsWith(DURATION_BUCKET_PREFIX)) {
+            return null;
+        }
+        String rest = metric.substring(DURATION_BUCKET_PREFIX.length());
+        int split = rest.indexOf('.');
+        if (split <= 0 || split == rest.length() - 1) {
+            return null;
+        }
+        try {
+            return new DurationBucket(Integer.parseInt(rest.substring(0, split)), rest.substring(split + 1));
+        } catch (NumberFormatException notAnIndex) {
+            return null;
+        }
+    }
+
+    private static String tableAfter(String metric, String prefix) {
+        if (!metric.startsWith(prefix)) {
+            return null;
+        }
+        String table = metric.substring(prefix.length());
+        return table.isEmpty() ? null : table;
+    }
+
     /** What one delivery count is about: the source operation, and the table it was taken over. */
     record Delivered(String op, String table) {
+    }
+
+    /** What one duration bucket is about: which bucket, of which table's distribution. */
+    record DurationBucket(int index, String table) {
     }
 
     private static Metric deliveredMetricFor(String opAndTable) {
