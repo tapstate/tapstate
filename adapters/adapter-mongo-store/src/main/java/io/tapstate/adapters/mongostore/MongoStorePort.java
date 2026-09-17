@@ -13,6 +13,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SrsLogStore;
@@ -20,6 +21,7 @@ import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
 
+import java.time.Duration;
 import java.util.Objects;
 
 /**
@@ -45,6 +47,8 @@ public final class MongoStorePort implements StorePort {
     public static final String PIPELINE_DESIRED = "pipeline_desired";
     /** The collection holding one plain-upsert observation doc per pipeline. */
     public static final String PIPELINE_OBSERVATION = "pipeline_observation";
+    /** One document per movement sample, left to expire by the server; the one series among these. */
+    public static final String PIPELINE_RATE_HISTORY = "pipeline_rate_history";
     /** The collection holding one editor-only canvas layout per pipeline. */
     public static final String PIPELINE_LAYOUTS = "pipeline_layouts";
     /** The collection holding the registered connection configurations. */
@@ -124,6 +128,7 @@ public final class MongoStorePort implements StorePort {
     private final ConnectorSpecStore connectorSpecs;
     private final ConnectionTestResultStore connectionTestResults;
     private final ObservationStore observations;
+    private final RateHistoryStore rateHistory;
     private final PipelineLayoutStore layouts;
     private final SrsMetaStore meta;
     private final SrsLogStore srsLog;
@@ -138,6 +143,14 @@ public final class MongoStorePort implements StorePort {
      * client and are closed with it when the connection closes.
      */
     public MongoStorePort(MongoConnection connection) {
+        this(connection, MongoRateHistoryStore.DEFAULT_RETENTION);
+    }
+
+    /**
+     * A port whose sample history keeps samples for {@code rateHistoryRetention}: the one store here with
+     * a configured bound, written onto its expiring index at construction.
+     */
+    public MongoStorePort(MongoConnection connection, Duration rateHistoryRetention) {
         Objects.requireNonNull(connection, "connection");
         MongoDatabase database = connection.database();
         this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
@@ -151,6 +164,8 @@ public final class MongoStorePort implements StorePort {
         this.connectionTestResults =
                 new MongoConnectionTestResultStore(SystemCollections.CONNECTION_TEST_RESULTS.on(database));
         this.observations = new MongoObservationStore(SystemCollections.PIPELINE_OBSERVATION.on(database));
+        this.rateHistory = new MongoRateHistoryStore(
+                database, SystemCollections.PIPELINE_RATE_HISTORY.on(database), rateHistoryRetention);
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
         this.meta = new MongoSrsMetaStore(SystemCollections.SRS_META.on(database));
         this.srsLog = new MongoSrsLogStore(SystemCollections.SRS_LOG.on(database));
@@ -212,6 +227,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public ObservationStore observations() {
         return observations;
+    }
+
+    @Override
+    public RateHistoryStore rateHistory() {
+        return rateHistory;
     }
 
     @Override

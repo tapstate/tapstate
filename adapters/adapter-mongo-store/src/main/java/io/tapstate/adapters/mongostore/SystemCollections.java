@@ -119,6 +119,18 @@ public enum SystemCollections {
     DERIVED_SCHEMAS(MongoStorePort.DERIVED_SCHEMAS, Database.STORE, MongoDerivedSchemaStore.class,
             Strategy.MIGRATED, 0),
 
+    /**
+     * The per-pipeline history of movement samples, one document per sample. The first index is what lets
+     * the samples leave: the server drops a document once its {@code observedAt} is older than the expiry,
+     * on a sweep of its own, so a pipeline that stopped writing still has its history bounded. The expiry
+     * declared here is the default retention; a configured one is written over it at startup, in place.
+     * The second index is the one read shape this collection allows -- one pipeline, one time range.
+     */
+    PIPELINE_RATE_HISTORY(MongoStorePort.PIPELINE_RATE_HISTORY, Database.STORE, MongoRateHistoryStore.class,
+            Strategy.MIGRATED, 8,
+            new IndexSpec(List.of("observedAt"), false, MongoRateHistoryStore.DEFAULT_RETENTION.toSeconds()),
+            new IndexSpec(List.of("pipelineId", "observedAt"), false)),
+
     // ---- the operator-state database: not versioned here, but still taken from here ----
 
     OPERATOR_STATE(MongoStorePort.OPERATOR_STATE, Database.NEST, MongoKeyedStateStore.class,
@@ -151,9 +163,18 @@ public enum SystemCollections {
      * An index a query shape needs. Keys are in order and all ascending: nothing here sorts, and a
      * descending key would only matter to a query that did.
      */
-    public record IndexSpec(List<String> keys, boolean unique) {
+    public record IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds) {
         public IndexSpec {
             keys = List.copyOf(keys);
+            if (expireAfterSeconds != null && (expireAfterSeconds < 0 || keys.size() != 1)) {
+                throw new IllegalArgumentException("an expiring index is over one date field and a non-negative"
+                        + " number of seconds: " + keys + " / " + expireAfterSeconds);
+            }
+        }
+
+        /** An index with no expiry, which is every index but the one the sample history expires on. */
+        public IndexSpec(List<String> keys, boolean unique) {
+            this(keys, unique, null);
         }
 
         /** The index name, derived from the keys so two declarations of the same index cannot differ. */
@@ -294,7 +315,8 @@ public enum SystemCollections {
             return "-";
         }
         return indexes.stream()
-                .map(index -> String.join("+", index.keys()) + (index.unique() ? " (unique)" : ""))
+                .map(index -> String.join("+", index.keys()) + (index.unique() ? " (unique)" : "")
+                        + (index.expireAfterSeconds() == null ? "" : " (ttl " + index.expireAfterSeconds() + "s)"))
                 .reduce((a, b) -> a + ", " + b)
                 .orElseThrow();
     }
