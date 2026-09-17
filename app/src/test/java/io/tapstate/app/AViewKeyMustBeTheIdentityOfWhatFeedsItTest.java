@@ -145,7 +145,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                 List.of(TableRef.literal("orders")), null, null));
         artifacts.save(managedStore());
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null),
                 null, settings(), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
@@ -170,7 +170,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                 List.of(TableRef.literal("orders")), null, null));
         artifacts.save(managedStore());
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null),
                 null, settings(), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
@@ -209,7 +209,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                 new TransformBody.MapProjection(Map.of(output, rule)), null);
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)),
                 List.of(mapFields),
-                new ViewBlock.Inline("order_state", FromRef.literal("replace_email"), "email", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("replace_email"), "email", null),
                 null, settings(), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(

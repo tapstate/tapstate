@@ -31,7 +31,7 @@ class AnExplicitViewKeyOverridesDiscoveryTest {
                 Map.of("host", "d"), null, null, null, null));
         artifacts.save(new PipelineResource("orders_pipeline", null,
                 List.of(SourceRef.spec("src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
                 null, new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
