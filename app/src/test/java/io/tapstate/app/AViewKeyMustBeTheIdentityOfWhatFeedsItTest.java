@@ -176,11 +176,39 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
                 new SourceTable("orders",
                         List.of(new SourceField("id", "int"), new SourceField("customer", "string")),
-                        List.of("id"), List.of(new SourceIndex(
-                                "customer_unique", List.of("customer"), true)))))));
+                        List.of("id"), List.of(new SourceIndex("__t__{\"v\": 2, "
+                                + "\"key\": {\"customer\": 1}, \"name\": \"customer_unique\", "
+                                + "\"unique\": true}", List.of("customer"), true)))))));
 
         Assertions.assertThatCode(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
                 .doesNotThrowAnyException();
+    }
+
+    @Test
+    void a_qualified_unique_index_cannot_be_selected_as_the_view_identity() {
+        for (String descriptor : List.of(
+                "__t__{\"v\": 2, \"key\": {\"email\": 1}, \"name\": \"email_sparse\", "
+                        + "\"unique\": true, \"sparse\": true}",
+                "__t__{\"v\": 2, \"key\": {\"email\": 1}, \"name\": \"active_email\", "
+                        + "\"unique\": true, \"partialFilterExpression\": {\"active\": true}}")) {
+            InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+            artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
+                    List.of(TableRef.literal("orders")), null, null));
+            artifacts.save(managedStore());
+            artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                    new ViewBlock.Inline("order_state", FromRef.literal("orders"), "email", null),
+                    null, settings(), null));
+            InMemoryStorePort store = new InMemoryStorePort(artifacts);
+            store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
+                    new SourceTable("orders",
+                            List.of(new SourceField("_id", "objectId"), new SourceField("email", "string")),
+                            List.of("_id"), List.of(new SourceIndex(descriptor, List.of("email"), true)))))));
+
+            assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                    .as(descriptor)
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(code("actuation.view-key-not-feed-identity"));
+        }
     }
 
     @Test

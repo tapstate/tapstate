@@ -9,11 +9,14 @@ import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetIndex;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -146,9 +149,101 @@ final class TargetModelResolver {
             indexes.add(new TargetIndex(primaryKey, true));
         }
         source.indexes().stream().filter(index -> !index.fields().isEmpty())
-                .map(index -> new TargetIndex(index.fields(), index.unique()))
+                .map(index -> new TargetIndex(index.fields(), constrainsEveryRow(index)))
                 .filter(index -> !indexes.contains(index)).forEach(indexes::add);
         return new TargetTable(source.name(), fields, indexes);
+    }
+
+    /**
+     * Whether a discovered index constrains every row rather than only the rows qualifying for it.
+     *
+     * <p>The frozen PDK index type has no sparse or partial-index fields. The Mongo connector therefore
+     * retains its complete index descriptor under the {@code __t__} name prefix. Preserve ordinary
+     * unique indexes, but do not turn a sparse or partial unique index into the global row identity that
+     * {@link TargetIndex#unique()} promises. Parsing here also protects models persisted before this
+     * normalization existed; requiring a new discovery would leave those models unsafe after upgrade.
+     */
+    private static boolean constrainsEveryRow(SourceIndex index) {
+        if (!index.unique()) {
+            return false;
+        }
+        String name = index.name();
+        return !name.startsWith("__t__") || unqualifiedMongoDescriptor(name.substring(5));
+    }
+
+    /** Reads only top-level qualifier members from the Mongo connector's retained JSON descriptor. */
+    private static boolean unqualifiedMongoDescriptor(String descriptor) {
+        int first = skipWhitespace(descriptor, 0);
+        if (first >= descriptor.length() || descriptor.charAt(first) != '{') {
+            return false;
+        }
+        Deque<Character> containers = new ArrayDeque<>();
+        for (int i = first; i < descriptor.length(); i++) {
+            char current = descriptor.charAt(i);
+            if (current == '"') {
+                int end = jsonStringEnd(descriptor, i);
+                if (end < 0) {
+                    return false;
+                }
+                if (containers.size() == 1 && containers.peek() == '{') {
+                    int colon = skipWhitespace(descriptor, end + 1);
+                    if (colon < descriptor.length() && descriptor.charAt(colon) == ':') {
+                        String member = descriptor.substring(i + 1, end);
+                        if (member.equals("partialFilterExpression")) {
+                            return false;
+                        }
+                        if (member.equals("sparse")) {
+                            int value = skipWhitespace(descriptor, colon + 1);
+                            if (descriptor.startsWith("true", value)) {
+                                return false;
+                            }
+                            if (!descriptor.startsWith("false", value)) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                i = end;
+                continue;
+            }
+            if (current == '{' || current == '[') {
+                containers.push(current);
+                continue;
+            }
+            if (current == '}' || current == ']') {
+                char opening = current == '}' ? '{' : '[';
+                if (containers.isEmpty() || containers.pop() != opening) {
+                    return false;
+                }
+                if (containers.isEmpty()) {
+                    return skipWhitespace(descriptor, i + 1) == descriptor.length();
+                }
+            }
+        }
+        return false;
+    }
+
+    private static int jsonStringEnd(String value, int openingQuote) {
+        boolean escaped = false;
+        for (int i = openingQuote + 1; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (escaped) {
+                escaped = false;
+            } else if (current == '\\') {
+                escaped = true;
+            } else if (current == '"') {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static int skipWhitespace(String value, int from) {
+        int cursor = from;
+        while (cursor < value.length() && Character.isWhitespace(value.charAt(cursor))) {
+            cursor++;
+        }
+        return cursor;
     }
 
     /**
