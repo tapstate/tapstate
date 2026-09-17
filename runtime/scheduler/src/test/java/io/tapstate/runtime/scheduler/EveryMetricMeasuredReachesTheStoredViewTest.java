@@ -26,15 +26,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.entry;
 
 /**
- * The publisher measures a set of facts and the stored observation carries a flat view of them. This
- * pins the relationship between the two: today the view carries every one, so a metric that stops
- * appearing on it stopped because somebody changed what is measured, not because the view quietly
- * had no room.
+ * The publisher measures a set of facts and the stored observation carries them twice: whole, and as a
+ * flat view. This pins the relationship between the three. The facts on the document are the facts that
+ * were measured, every one of them; the flat view carries what it can and says which it could not; and a
+ * metric that stops appearing on the flat view stopped because somebody changed what is measured or what
+ * that view shows, not because the view quietly had no room.
  *
- * <p>The day that stops being true is the day a metric arrives with dimensions, which no
- * {@code name -> value} map can hold. That is a decision about what the face shows, and this test is
- * what makes somebody take it: without it the first such metric is simply absent for every reader of
- * this face, and absent here is indistinguishable from never wired.
+ * <p>A metric with dimensions or a distribution is what no {@code name -> value} map can hold. That is a
+ * decision about what the flat face shows, and this test is what makes somebody take it: without it the
+ * first such metric is simply absent from that face for every reader, and absent there is
+ * indistinguishable from never wired. The facts beside it are where such a metric is read whole.
  */
 class EveryMetricMeasuredReachesTheStoredViewTest {
 
@@ -100,6 +101,12 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                         .toList());
         assertThat(published.snapshot())
                 .containsOnly(entry("orders", new TableSnapshot(90_000L, 120_000L, 75)));
+        // The facts on the document are the measured facts, all of them and as measured: what the flat
+        // view dropped is here whole, with its table attribute, and what the flat view squeezed is here
+        // with every point it squeezed. A projection may carry less; the document does not.
+        assertThat(published.facts()).containsExactlyInAnyOrderElementsOf(measured);
+        assertThat(published.facts()).extracting(MetricFact::name)
+                .contains("tapstate.pipeline.snapshot.rows", "tapstate.pipeline.snapshot.rows.total");
     }
 
     @Test

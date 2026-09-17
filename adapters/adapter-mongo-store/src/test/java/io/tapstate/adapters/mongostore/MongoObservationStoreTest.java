@@ -1,6 +1,10 @@
 package io.tapstate.adapters.mongostore;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -10,7 +14,9 @@ import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -292,5 +298,131 @@ class MongoObservationStoreTest {
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+    }
+
+    // ---- the measured facts travel with the document, as the fact type lays them out ----
+
+    private static final Instant TAKEN = Instant.parse("2026-09-17T10:00:00.250Z");
+    private static final Instant COUNTING_SINCE = Instant.parse("2026-09-17T09:00:00Z");
+
+    /** One of each kind, with the shapes a reader of the store meets: attributes, a start, a distribution. */
+    private static List<MetricFact> threeFacts() {
+        MetricFact records = new MetricFact("tapstate.pipeline.records", MetricType.COUNTER, "{record}", List.of(
+                MetricPoint.accumulated(Map.of("tapstate.pipeline.id", "orders_sync", "tapstate.table.id", "orders",
+                        "direction", "in", "op", "insert"), COUNTING_SINCE, TAKEN, 100L),
+                MetricPoint.accumulated(Map.of("tapstate.pipeline.id", "orders_sync", "tapstate.table.id", "orders",
+                        "direction", "out", "op", "insert"), COUNTING_SINCE, TAKEN, 98L)));
+        MetricFact count = MetricFact.single("recordCount", MetricType.GAUGE, "{record}",
+                MetricPoint.reading(Map.of(), TAKEN, 98L));
+        HistogramBounds bounds = HistogramBounds.RECORD_DELIVERY_DURATION;
+        List<Long> buckets = new ArrayList<>();
+        for (int i = 0; i < bounds.buckets(); i++) {
+            buckets.add(i == 3 ? 7L : 0L);
+        }
+        MetricFact delivery = MetricFact.single(bounds.instrument(), MetricType.HISTOGRAM, HistogramBounds.UNIT,
+                MetricPoint.distribution(Map.of("tapstate.pipeline.id", "orders_sync", "tapstate.table.id", "orders"),
+                        COUNTING_SINCE, TAKEN, bounds.value(7, 0.63, buckets)));
+        return List.of(records, count, delivery);
+    }
+
+    @Test
+    void documentCarriesEachFactWithItsPointsAsTheFactTypeLaysThemOut() {
+        Observation obs = new Observation("orders_sync", PipelineState.RUNNING, Map.of("recordCount", 98L),
+                Map.of(), Map.of(), null, TAKEN, threeFacts());
+
+        Document document = MongoObservationStore.toDocument(obs);
+
+        List<?> facts = (List<?>) document.get("facts");
+        assertThat(facts).hasSize(3);
+        Document records = (Document) facts.get(0);
+        assertThat(records.getString("name")).isEqualTo("tapstate.pipeline.records");
+        assertThat(records.getString("type")).isEqualTo("COUNTER");
+        assertThat(records.getString("unit")).isEqualTo("{record}");
+        Document inbound = (Document) ((List<?>) records.get("points")).get(0);
+        // Attributes sorted by key, instants as BSON dates, a single value and no distribution fields.
+        assertThat(((Document) inbound.get("attributes")).keySet())
+                .containsExactly("direction", "op", "tapstate.pipeline.id", "tapstate.table.id");
+        assertThat(inbound.get("startTime")).isEqualTo(Date.from(COUNTING_SINCE));
+        assertThat(inbound.get("observedAt")).isEqualTo(Date.from(TAKEN));
+        assertThat(inbound.get("value")).isEqualTo(100L);
+        assertThat(inbound).doesNotContainKeys("count", "sum", "bounds", "bucketCounts");
+        Document gauge = (Document) ((List<?>) ((Document) facts.get(1)).get("points")).get(0);
+        // A reading has no start, and the field is absent rather than null.
+        assertThat(gauge).doesNotContainKey("startTime");
+        Document distribution = (Document) ((List<?>) ((Document) facts.get(2)).get("points")).get(0);
+        assertThat(distribution).doesNotContainKey("value");
+        assertThat(distribution.get("count")).isEqualTo(7L);
+        assertThat(distribution.get("sum")).isEqualTo(0.63);
+        assertThat((List<?>) distribution.get("bounds")).hasSize(15);
+        assertThat((List<?>) distribution.get("bucketCounts")).hasSize(16);
+    }
+
+    @Test
+    void roundTripReconstructsEveryFactAsItWasMeasured() {
+        Observation obs = new Observation("orders_sync", PipelineState.RUNNING, Map.of("recordCount", 98L),
+                Map.of(), Map.of(), null, TAKEN, threeFacts());
+
+        assertThat(MongoObservationStore.toObservation(MongoObservationStore.toDocument(obs))).isEqualTo(obs);
+    }
+
+    @Test
+    void toObservationOnADocumentWithoutFactsReadsNone() {
+        // Written before facts travelled: none carried, and none invented from the flat map beside it.
+        Document document = new Document("_id", "orders_sync").append("state", "RUNNING")
+                .append("metrics", new Document("recordCount", 98L));
+
+        Observation obs = MongoObservationStore.toObservation(document);
+
+        assertThat(obs.facts()).isEmpty();
+        assertThat(obs.metrics()).containsEntry("recordCount", 98L);
+    }
+
+    @Test
+    void toObservationOnFactsStoredAsSomethingOtherThanAnArrayIsDocumentUnreadable() {
+        Document document = new Document("_id", "orders_sync").append("state", "RUNNING")
+                .append("facts", "not-a-list");
+
+        Throwable thrown = catchThrowable(() -> MongoObservationStore.toObservation(document));
+
+        assertThat(thrown).isInstanceOf(TapstateException.class);
+        assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+        assertThat(((TapstateException) thrown).args()).containsEntry("field", "facts");
+    }
+
+    @Test
+    void toObservationOnAFactThisVersionRefusesIsDocumentUnreadableNotABareCrash() {
+        // A distribution stored over bounds that are not the registered ones: the fact type refuses to
+        // build it, and that refusal reaches the reader as corruption of the facts field rather than as a
+        // bare IllegalArgumentException from the middle of a document read.
+        Document point = new Document("attributes", new Document("tapstate.pipeline.id", "orders_sync"))
+                .append("observedAt", Date.from(TAKEN))
+                .append("count", 1L).append("sum", 0.5)
+                .append("bounds", List.of(1.0)).append("bucketCounts", List.of(1L, 0L));
+        Document fact = new Document("name", "tapstate.pipeline.record.delivery.duration")
+                .append("type", "HISTOGRAM").append("unit", "s").append("points", List.of(point));
+        Document document = new Document("_id", "orders_sync").append("state", "RUNNING")
+                .append("facts", List.of(fact));
+
+        Throwable thrown = catchThrowable(() -> MongoObservationStore.toObservation(document));
+
+        assertThat(thrown).isInstanceOf(TapstateException.class);
+        assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+        assertThat(((TapstateException) thrown).args()).containsEntry("field", "facts");
+        assertThat(thrown.getCause()).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("registered bounds");
+    }
+
+    @Test
+    void toObservationOnAPointStoredWithNeitherAValueNorADistributionIsDocumentUnreadable() {
+        Document point = new Document("attributes", new Document()).append("observedAt", Date.from(TAKEN));
+        Document fact = new Document("name", "recordCount").append("type", "GAUGE").append("unit", "{record}")
+                .append("points", List.of(point));
+        Document document = new Document("_id", "orders_sync").append("state", "RUNNING")
+                .append("facts", List.of(fact));
+
+        Throwable thrown = catchThrowable(() -> MongoObservationStore.toObservation(document));
+
+        assertThat(thrown).isInstanceOf(TapstateException.class);
+        assertThat(((TapstateException) thrown).args()).containsEntry("field", "facts");
     }
 }

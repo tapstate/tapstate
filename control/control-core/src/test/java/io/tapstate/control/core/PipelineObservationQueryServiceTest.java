@@ -3,6 +3,9 @@ package io.tapstate.control.core;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.LifecycleError;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -12,6 +15,7 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -122,6 +126,17 @@ class PipelineObservationQueryServiceTest {
                 Map.of("recordCount", 5L), Map.of("orders", new TableSnapshot(10L, 20L, 50)));
     }
 
+    private static final Instant TAKEN = Instant.parse("2026-09-17T10:00:00Z");
+
+    private static final MetricFact RECORDS_MEASURED = new MetricFact("tapstate.pipeline.records",
+            MetricType.COUNTER, "{record}", List.of(MetricPoint.accumulated(
+                    Map.of("tapstate.pipeline.id", "orders_sync", "direction", "in"), TAKEN, TAKEN, 100L)));
+
+    private static Observation runningWithFacts() {
+        return new Observation("orders_sync", PipelineState.RUNNING,
+                Map.of("records.in", 100L), Map.of(), Map.of(), null, TAKEN, List.of(RECORDS_MEASURED));
+    }
+
     private static Observation runningWithPositions() {
         return new Observation("orders_sync", PipelineState.RUNNING,
                 Map.of("recordCount", 5L), Map.of("orders", new TableSnapshot(10L, 20L, 50)),
@@ -167,6 +182,23 @@ class PipelineObservationQueryServiceTest {
         var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()));
 
         assertThat(service.metrics("orders_sync").metrics()).containsEntry("recordCount", 5L);
+    }
+
+    @Test
+    void metricsProjectsThePublishedFactsBesideTheFlatMap() {
+        var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(runningWithFacts()));
+
+        // The facts are carried through as the store holds them; this face adds nothing and drops nothing,
+        // so what the wire renders is what the runtime measured.
+        assertThat(service.metrics("orders_sync").facts()).containsExactly(RECORDS_MEASURED);
+        assertThat(service.metrics("orders_sync").metrics()).containsEntry("records.in", 100L);
+    }
+
+    @Test
+    void metricsFactsAreEmptyWhenTheObservationCarriesNone() {
+        var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()));
+
+        assertThat(service.metrics("orders_sync").facts()).isEmpty();
     }
 
     @Test

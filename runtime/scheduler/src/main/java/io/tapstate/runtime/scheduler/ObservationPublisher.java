@@ -586,10 +586,12 @@ public final class ObservationPublisher {
             // computing a rate across two passes would divide by a difference that is partly this
             // publisher's own loop.
             Instant at = observedNow();
-            // The stored document carries the flat numeric view of these facts. It is a projection and it
-            // drops what it cannot hold; nothing it drops today, which is what this publisher's own test
-            // pins, so that the first metric with dimensions is a decision somebody makes rather than a
-            // metric that quietly fails to appear on this face.
+            // The stored document carries these facts twice, from this one measurement: whole, as the
+            // facts themselves, and as the flat numeric view of them. The flat view is a projection and it
+            // drops what it cannot hold; what it drops is still on the document as a fact, so a reader who
+            // finds a metric missing from the flat view finds it whole next to it rather than nowhere. What
+            // the flat view drops today is pinned by this publisher's own test, so that the first metric it
+            // cannot carry is a decision somebody makes rather than a metric that quietly fails to appear.
             // Taken once and used twice, like the frontier readings above: the load is published as two
             // metrics and as the observation's own snapshot dataset, and asking its source again for the
             // second use would let the two faces of one load describe different passes of it.
@@ -599,7 +601,7 @@ public final class ObservationPublisher {
                     joinRecomputeExpected.apply(pipelineId), loaded);
             observations.save(new Observation(pipelineId, actual,
                     FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                    loaded.byTable(), positions.apply(pipelineId), carried, at));
+                    loaded.byTable(), positions.apply(pipelineId), carried, at, measured));
             // Fed after the observation is written and never before. The observation is the contract and
             // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
             // cost a pipeline the read face that says it is alive at all.
@@ -624,11 +626,10 @@ public final class ObservationPublisher {
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
         Instant at = observedNow();
+        List<MetricFact> measured = List.of(readAt(RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
         observations.save(new Observation(pipelineId, lastState,
-                FlatMetricProjection.of(
-                        List.of(readAt(RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures)))
-                        .metrics(),
-                null, lastPositions, lastFailure, at));
+                FlatMetricProjection.of(measured).metrics(),
+                null, lastPositions, lastFailure, at, measured));
     }
 
     /**

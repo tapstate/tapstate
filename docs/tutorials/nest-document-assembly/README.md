@@ -467,8 +467,8 @@ tapstate -c http://127.0.0.1:8080 -u admin metrics order_doc
 
 | Reading | Means |
 |---|---|
-| `nestStateEntries.<ns>` | how many keys this level holds in total, not how many are resident |
-| `nestStateStored.<ns>` | how many are behind memory |
+| `nestStateEntries.<ns>` | how many keys this level holds in memory right now - not how many there are; past the memory budget the rest live behind memory and still belong to the level |
+| `nestStateStored.<ns>` | how many keys this level holds in total, the resident ones included - every write reaches the layer behind memory, so this is the whole; absent, not 0, when the run has no such layer to ask. Entries over stored is the share served from memory |
 | `nestStateBackfills.<ns>` | reads that had to go behind memory - the one that tells you the cold layer is really in use |
 | `nestStatePendingHighWater.<ns>` | the deepest one key's pending queue has ever got; a high-water mark, it does not fall back |
 
