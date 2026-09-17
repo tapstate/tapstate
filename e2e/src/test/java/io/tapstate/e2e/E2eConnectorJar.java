@@ -70,7 +70,9 @@ final class E2eConnectorJar {
             "{\"properties\":{\"id\":\"%s\"},"
                     + "\"configOptions\":{\"connection\":{\"type\":\"object\","
                     + "\"properties\":{\"password\":{\"type\":\"string\","
-                    + "\"title\":\"Password\",\"x-component\":\"Password\"}}}},"
+                    + "\"title\":\"Password\",\"x-component\":\"Password\"}}},"
+                    + "\"node\":{\"type\":\"object\",\"properties\":{\"fail_cdc\":{"
+                    + "\"type\":\"boolean\",\"title\":\"Fail CDC\",\"x-component\":\"Switch\"}}}},"
                     + "\"dataTypes\":{\"string\":{\"to\":\"TapString\",\"byte\":65535}}}";
 
     /**

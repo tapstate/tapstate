@@ -91,11 +91,12 @@ public class CsvConnector implements TapConnector {
     private static final String FAIL_WRITES = "fail_writes";
 
     /**
-     * A test affordance on the read side, the mirror of {@link #FAIL_WRITES}: when set truthy on a source
-     * connection, the cdc tail starts and then throws. It exists so a specification can drive a source whose
-     * change stream dies and assert the product surfaces it as an observable error - a dead cdc tail becoming
-     * a FAILED state and an error count - even though the tail runs on its own thread and the job reading the
-     * ring it fills keeps running over a ring gone quiet. A tail that never fails cannot witness that path.
+     * A test affordance on the read side, the mirror of {@link #FAIL_WRITES}: when set truthy for one source
+     * use, the cdc tail starts and then throws. The connector declares it on its node form and reads it only
+     * from the node config, so the published failure case also witnesses that node parameters cross the host
+     * boundary. It then asserts the product surfaces the failure as a FAILED state and an error count, even
+     * though the tail runs on its own thread and the job reading the ring it fills keeps running over a ring
+     * gone quiet. A tail that never fails cannot witness that path.
      */
     private static final String FAIL_CDC = "fail_cdc";
 
@@ -727,11 +728,11 @@ public class CsvConnector implements TapConnector {
         return flag != null && Boolean.parseBoolean(String.valueOf(flag));
     }
 
-    /** Whether this connection is configured to fail its cdc stream. Off unless a source opts in. */
+    /** Whether this source use is configured to fail its cdc stream. Off unless its node opts in. */
     private static boolean cdcRejected(TapConnectionContext context) {
-        Object flag = context.getConnectionConfig() == null
+        Object flag = context.getNodeConfig() == null
                 ? null
-                : context.getConnectionConfig().getObject(FAIL_CDC);
+                : context.getNodeConfig().getObject(FAIL_CDC);
         return flag != null && Boolean.parseBoolean(String.valueOf(flag));
     }
 
