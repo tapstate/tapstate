@@ -117,7 +117,7 @@ job die and reporting it as failed would be a guess. What `status` adds is that 
 ```
 order_pipeline  running
 why: the server keeps failing to bring this pipeline up: 12 passes in a row have thrown
-  read       metrics.errorCount = 12
+  read       metrics.reconcileFailuresInARow = 12
   read       status.state = running
   next       read the server's own log -- the reason is printed there once per pass
   cannot say whether the job itself is still alive: nothing here has seen it die, so the state
