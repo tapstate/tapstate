@@ -52,9 +52,25 @@ final class MongoEndpoints implements Endpoints {
             // a collection on first write, so absence has to be asked for - otherwise a later valued
             // insert against this legitimately seeded table would read as never-seeded and be refused.
             database(address).createCollection(table);
-            return;
+        } else {
+            collection.insertMany(documents);
         }
-        collection.insertMany(documents);
+        configureBeforeImages(address, table, true);
+    }
+
+    /**
+     * A seeded table supplies complete earlier rows unless a specification explicitly asks otherwise.
+     * MongoDB needs that promise made on the collection itself as well as in the connector settings;
+     * arranging it here keeps every specification's seed contract true before discovery and apply.
+     */
+    private void configureBeforeImages(EndpointAddress address, String table, boolean enabled) {
+        database(address).runCommand(new Document("collMod", table)
+                .append("changeStreamPreAndPostImages", new Document("enabled", enabled)));
+    }
+
+    @Override
+    public void withoutBeforeImages(EndpointAddress address, String table) {
+        configureBeforeImages(address, table, false);
     }
 
     /**
