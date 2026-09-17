@@ -14,6 +14,7 @@ import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.spi.store.StorePort;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableScheduling;
@@ -31,6 +32,7 @@ import java.time.Clock;
  * brings up neither the store nor the convergence loop.
  */
 @Configuration
+@EnableConfigurationProperties(MetricsHistoryProperties.class)
 @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
 @EnableScheduling
 class RuntimeConvergenceConfiguration {
