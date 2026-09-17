@@ -301,29 +301,49 @@ public final class ArtifactMutationService {
      * neither of which this store port offers.
      */
     private void reclaim(String id) {
+        List<ReclaimStep> steps = reclaimStepsOf(id);
         if (!isAtRest(id)) {
-            throw reclaimIncomplete(id, "pipeline-live",
-                    List.of("mining-chain-consumer", "desired", "state", "observation", "layout", "derived-schema",
-                            "rate-history"),
+            throw reclaimIncomplete(id, "pipeline-live", steps.stream().map(ReclaimStep::name).toList(),
                     List.of());
         }
         List<RuntimeException> failures = new ArrayList<>();
         List<String> residue = new ArrayList<>();
-        attempt(failures, residue, "mining-chain-consumer", () -> detachFromEveryChain(id));
-        attempt(failures, residue, "desired", () -> desired.delete(id));
-        attempt(failures, residue, "state", () -> state.delete(id));
-        attempt(failures, residue, "observation", () -> observations.delete(id));
-        attempt(failures, residue, "layout", () -> layouts.delete(id));
-        // Left behind, this record would be read as the derivation history of whatever is applied under
-        // the id next, and would refuse to start it over a difference against a schema belonging to
-        // something that no longer exists.
-        attempt(failures, residue, "derived-schema", () -> derivedSchemas.delete(id));
-        // The samples the pipeline took while it ran. Nothing else bounds them but their age, and a
-        // history left behind would be read as the past of whatever is applied under the id next.
-        attempt(failures, residue, "rate-history", () -> rateHistory.deleteAll(id));
+        for (ReclaimStep step : steps) {
+            attempt(failures, residue, step.name(), step.action());
+        }
         if (!failures.isEmpty()) {
             throw reclaimIncomplete(id, "step-failed", residue, failures);
         }
+    }
+
+    /**
+     * One step of the reclaim: the name a report calls it by, and what it does. The name is what a
+     * failed reclaim, and the refusal over a pipeline that is live, both put in front of the person who
+     * has to clear the residue by hand; a name that did not match a step would send them looking for
+     * something the reclaim never touched, or leave them unaware of something it did.
+     */
+    private record ReclaimStep(String name, Runnable action) {
+    }
+
+    /**
+     * Everything a removed pipeline owns, in the order it is reclaimed. One list serves both the reclaim
+     * and the report of what a live pipeline would have lost, so a step cannot be added to the one and
+     * left out of the other. Nothing runs while the list is built.
+     */
+    private List<ReclaimStep> reclaimStepsOf(String id) {
+        return List.of(
+                new ReclaimStep("mining-chain-consumer", () -> detachFromEveryChain(id)),
+                new ReclaimStep("desired", () -> desired.delete(id)),
+                new ReclaimStep("state", () -> state.delete(id)),
+                new ReclaimStep("observation", () -> observations.delete(id)),
+                new ReclaimStep("layout", () -> layouts.delete(id)),
+                // Left behind, this record would be read as the derivation history of whatever is applied
+                // under the id next, and would refuse to start it over a difference against a schema
+                // belonging to something that no longer exists.
+                new ReclaimStep("derived-schema", () -> derivedSchemas.delete(id)),
+                // The samples the pipeline took while it ran. Nothing else bounds them but their age, and
+                // a history left behind would be read as the past of whatever is applied under the id next.
+                new ReclaimStep("rate-history", () -> rateHistory.deleteAll(id)));
     }
 
     /**

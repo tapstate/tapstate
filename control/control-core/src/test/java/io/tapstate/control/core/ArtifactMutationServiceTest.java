@@ -614,6 +614,12 @@ class ArtifactMutationServiceTest {
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code()).isEqualTo(ArtifactError.RECLAIM_INCOMPLETE);
                     assertThat(error.args()).containsEntry("reason", "pipeline-live");
+                    // Everything the reclaim would have taken, by the names it takes them under: the
+                    // person clearing up by hand works from this list, so a step missing from it is a
+                    // residue they are never told about.
+                    assertThat(error.args().get("residue")).isEqualTo(List.of(
+                            "mining-chain-consumer", "desired", "state", "observation", "layout",
+                            "derived-schema", "rate-history"));
                 });
 
         // The artifact is gone — the removal is not undone — and none of the live pipeline's own
@@ -623,6 +629,7 @@ class ArtifactMutationServiceTest {
         assertThat(desired.read("flow")).isPresent();
         assertThat(observations.read("flow")).isPresent();
         assertThat(srsMeta.consumerIds("chain-a")).containsExactly("flow");
+        assertThat(rateHistory.deleted).as("the live pipeline's samples are left alone too").isEmpty();
     }
 
     @Test

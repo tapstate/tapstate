@@ -42,8 +42,10 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
     /** How long a sample is kept when nothing says otherwise. */
     public static final Duration DEFAULT_RETENTION = Duration.ofDays(15);
 
-    static final String PIPELINE_ID = "pipelineId";
-    static final String OBSERVED_AT = "observedAt";
+    /** The field a sample names its pipeline under; published so a reader of the raw collection spells it once. */
+    public static final String PIPELINE_ID = "pipelineId";
+    /** The field a sample is dated by, and the one the expiring index is over. */
+    public static final String OBSERVED_AT = "observedAt";
     static final String COUNTERS = "counters";
     static final String LAG = "lag";
     static final String COUNTING_SINCE = "countingSince";
@@ -100,8 +102,11 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
         return retention;
     }
 
-    /** Maps a sample to its stored document; the two instants are BSON dates. */
-    static Document toDocument(RateSample sample) {
+    /**
+     * Maps a sample to its stored document; the two instants are BSON dates. Published so a fixture can
+     * lay down a history in the shape the product writes, rather than in one spelled beside it.
+     */
+    public static Document toDocument(RateSample sample) {
         Document counters = new Document();
         sample.counters().forEach(counters::append);
         Document lag = new Document();

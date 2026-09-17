@@ -750,7 +750,9 @@ pipeline and keep all of it — so the next start carries on from where this run
 reading the whole source again — use `stop order_pipeline --keep-state`, which asks nothing because
 nothing is going. In a script or a CI step, where there is no terminal to answer at, a plain `stop`
 is refused rather than either waiting on input that never arrives or clearing unasked: add `-y` to
-go ahead, or use `--keep-state`.
+go ahead, or use `--keep-state`. Neither spelling touches the pipeline's sampled metrics history:
+the samples stay through a stop, and leave only by age — fifteen days unless configured — or when
+the pipeline is deleted.
 
 Then stop the stack and delete its data:
 

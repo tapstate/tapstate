@@ -936,6 +936,13 @@ final class ControlPlane {
         return response.statusCode() + " " + response.body();
     }
 
+    /** The overview of every pipeline, verbatim - the list a console draws first. */
+    String pipelines() {
+        HttpResponse<String> response = send(authedGet("/api/pipelines"));
+        expect(response, 200, "list the pipelines");
+        return response.body();
+    }
+
     /**
      * The canonical code of the published failure, or empty when the pipeline has published none — it is
      * healthy, or no convergence pass has reached it yet.
