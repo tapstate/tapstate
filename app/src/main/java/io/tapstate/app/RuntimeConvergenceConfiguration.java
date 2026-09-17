@@ -12,6 +12,8 @@ import io.tapstate.runtime.scheduler.NestColdLayerWatch;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.adapters.otel.OtelMetricsExport;
+import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.StorePort;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -32,10 +34,25 @@ import java.time.Clock;
  * brings up neither the store nor the convergence loop.
  */
 @Configuration
-@EnableConfigurationProperties(MetricsHistoryProperties.class)
+@EnableConfigurationProperties({MetricsHistoryProperties.class, MetricsExportProperties.class})
 @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
 @EnableScheduling
 class RuntimeConvergenceConfiguration {
+
+    /**
+     * The metrics export the convergence loop offers every published observation's facts to. Opt-in: with
+     * no OTLP endpoint and no Prometheus port configured this is the port's no-op, and the SDK, its
+     * listener and its push thread are never started. The read faces are the same either way; export is
+     * a second projection of the facts, never a change to the first.
+     */
+    @Bean(destroyMethod = "close")
+    MetricsExport metricsExport(MetricsExportProperties export) {
+        return metricsExportFor(export);
+    }
+
+    static MetricsExport metricsExportFor(MetricsExportProperties export) {
+        return export.settings().exportsAnything() ? OtelMetricsExport.start(export.settings()) : MetricsExport.none();
+    }
 
     @Bean
     PipelineConverger pipelineConverger(StorePort storePort, LifecycleActuator lifecycleActuator, Clock clock) {
@@ -116,7 +133,8 @@ class RuntimeConvergenceConfiguration {
 
     @Bean
     ConvergenceDriver convergenceDriver(PipelineConverger pipelineConverger, StorePort storePort,
-            ObservationPublisher observationPublisher, RateSampler rateSampler) {
-        return new ConvergenceDriver(pipelineConverger, storePort.desired(), observationPublisher, rateSampler);
+            ObservationPublisher observationPublisher, RateSampler rateSampler, MetricsExport metricsExport) {
+        return new ConvergenceDriver(pipelineConverger, storePort.desired(), observationPublisher, rateSampler,
+                metricsExport);
     }
 }

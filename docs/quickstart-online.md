@@ -628,6 +628,18 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   behind each table stands. `status --watch` prints a `moving` line every five seconds beside the
   state changes it streams, the first of which is `not known yet` for the same reason.
 - `metrics` is the signal for progress: `records.out` climbing and no `errors.<code>` key appearing.
+- **The same facts can go to your monitoring.** Export is off unless you turn it on, and turning it on
+  changes nothing the CLI reads. To serve a Prometheus scrape endpoint, start the server with
+  `--tapstate.metrics.export.prometheus.port=9464` and point Prometheus at `/metrics` on that port; to
+  push to an OpenTelemetry collector, set `--tapstate.metrics.export.otlp.endpoint=http://collector:4318/v1/metrics`
+  (`--tapstate.metrics.export.otlp.protocol=grpc` with a `host:port` endpoint for gRPC; the push interval
+  defaults to a minute). What arrives is what `metrics` shows: counters such as
+  `tapstate.pipeline.records` with `direction`, `tapstate.table.id` and `op` as attributes, gauges such as
+  `tapstate.pipeline.lag`, histograms such as `tapstate.pipeline.record.delivery.duration` with their
+  buckets, and `tapstate.pipeline.state` as one series per state with the current one at 1. A pipeline
+  wider than the per-metric budget folds its extra tables into one series marked `otel.metric.overflow`,
+  so totals stay right while the busiest thousand tables keep their names. The names are not a
+  compatibility promise yet, the same as on the `metrics` face.
   Failures are counted per error code, and a pipeline that has failed nothing carries no such key.
 - **`status` answers "why is it not working" itself**, under the state line: it walks a short fixed
   checklist over the same four faces you can read by hand and prints what it concluded, the face and

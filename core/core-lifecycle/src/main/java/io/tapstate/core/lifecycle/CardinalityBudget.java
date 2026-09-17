@@ -175,56 +175,59 @@ public enum CardinalityBudget {
             if (folded.isEmpty()) {
                 return fact;
             }
-            folded.forEach((attributes, points) -> kept.add(merged(fact.type(), attributes, points)));
+            folded.forEach((attributes, points) -> kept.add(merge(fact.type(), attributes, points)));
             return new MetricFact(fact.name(), fact.type(), fact.unit(), kept);
         }
+    }
 
-        /**
-         * One series holding what {@code points} held together, combined the way the metric's type allows:
-         * a counter's points add up, a gauge's keep the highest reading, and a distribution's buckets are
-         * added bucket by bucket — every point of one histogram instrument carries the same bounds, which is
-         * what makes that addition meaningful. An accumulation that combines several begins when the
-         * earliest of them began.
-         */
-        private static MetricPoint merged(MetricType type, Map<String, String> attributes,
-                List<MetricPoint> points) {
-            Instant start = null;
-            Instant observed = null;
-            for (MetricPoint point : points) {
-                if (point.startTime() != null && (start == null || point.startTime().isBefore(start))) {
-                    start = point.startTime();
-                }
-                if (observed == null || point.observedAt().isAfter(observed)) {
-                    observed = point.observedAt();
-                }
+    /**
+     * One series holding what {@code points} held together, combined the way the metric's type allows: a
+     * counter's points add up, a gauge's keep the highest reading, and a distribution's buckets are added
+     * bucket by bucket — every point of one histogram instrument carries the same bounds, which is what
+     * makes that addition meaningful. An accumulation that combines several begins when the earliest of
+     * them began.
+     *
+     * <p>Public because it is the one statement of how series combine: the fold above uses it for the
+     * dimension a pipeline's data grows, and an exporter uses it again for the series beyond
+     * {@link #EXPORT_SERIES_LIMIT}. Two copies of these rules would be two answers to one question.
+     */
+    public static MetricPoint merge(MetricType type, Map<String, String> attributes, List<MetricPoint> points) {
+        Instant start = null;
+        Instant observed = null;
+        for (MetricPoint point : points) {
+            if (point.startTime() != null && (start == null || point.startTime().isBefore(start))) {
+                start = point.startTime();
             }
-            if (type == MetricType.HISTOGRAM) {
-                HistogramValue first = points.get(0).histogram();
-                long count = 0L;
-                double sum = 0.0;
-                long[] buckets = new long[first.bucketCounts().size()];
-                for (MetricPoint point : points) {
-                    HistogramValue histogram = point.histogram();
-                    count += histogram.count();
-                    sum += histogram.sum();
-                    for (int bucket = 0; bucket < buckets.length; bucket++) {
-                        buckets[bucket] += histogram.bucketCounts().get(bucket);
-                    }
-                }
-                List<Long> bucketCounts = new ArrayList<>(buckets.length);
-                for (long bucket : buckets) {
-                    bucketCounts.add(bucket);
-                }
-                return MetricPoint.distribution(attributes, start, observed,
-                        new HistogramValue(count, sum, first.bounds(), bucketCounts));
+            if (observed == null || point.observedAt().isAfter(observed)) {
+                observed = point.observedAt();
             }
-            long value = type == MetricType.COUNTER ? 0L : Long.MIN_VALUE;
-            for (MetricPoint point : points) {
-                value = type == MetricType.COUNTER ? value + point.value() : Math.max(value, point.value());
-            }
-            return type == MetricType.COUNTER
-                    ? MetricPoint.accumulated(attributes, start, observed, value)
-                    : MetricPoint.reading(attributes, observed, value);
         }
+        if (type == MetricType.HISTOGRAM) {
+            HistogramValue first = points.get(0).histogram();
+            long count = 0L;
+            double sum = 0.0;
+            long[] buckets = new long[first.bucketCounts().size()];
+            for (MetricPoint point : points) {
+                HistogramValue histogram = point.histogram();
+                count += histogram.count();
+                sum += histogram.sum();
+                for (int bucket = 0; bucket < buckets.length; bucket++) {
+                    buckets[bucket] += histogram.bucketCounts().get(bucket);
+                }
+            }
+            List<Long> bucketCounts = new ArrayList<>(buckets.length);
+            for (long bucket : buckets) {
+                bucketCounts.add(bucket);
+            }
+            return MetricPoint.distribution(attributes, start, observed,
+                    new HistogramValue(count, sum, first.bounds(), bucketCounts));
+        }
+        long value = type == MetricType.COUNTER ? 0L : Long.MIN_VALUE;
+        for (MetricPoint point : points) {
+            value = type == MetricType.COUNTER ? value + point.value() : Math.max(value, point.value());
+        }
+        return type == MetricType.COUNTER
+                ? MetricPoint.accumulated(attributes, start, observed, value)
+                : MetricPoint.reading(attributes, observed, value);
     }
 }

@@ -276,6 +276,24 @@ class RingDependencyRulesTest {
     }
 
     @Test
+    @DisplayName("R3 (OpenTelemetry lock): only adapter-otel may depend on OpenTelemetry or the Prometheus client")
+    void r3_openTelemetryLockedToAdapterOtel() {
+        // The runtime keeps its own instrument types and the CLI ships as a single offline binary; both
+        // are held to that by R4 and R6 above, and this names the library those rules keep out, so a
+        // dependency added to any other module -- the control ring, the store adapter, the assembly's
+        // own classes -- is caught by name rather than by whichever ring rule happens to cover it.
+        noClasses().that().resideOutsideOfPackage("io.tapstate.adapters.otel..")
+                .should().dependOnClassesThat().resideInAnyPackage(
+                        "io.opentelemetry..",
+                        "io.prometheus..")
+                .allowEmptyShould(true)
+                .because("the OpenTelemetry SDK, its exporters and the Prometheus client are locked to "
+                        + "adapter-otel; the runtime offers facts through the metrics port and the CLI "
+                        + "carries none of it")
+                .check(tapstateClasses);
+    }
+
+    @Test
     @DisplayName("R3 (Mongo lock): only adapter-mongo-store may depend on the Mongo driver")
     void r3_mongoDriverLockedToAdapterMongoStore() {
         noClasses().that().resideOutsideOfPackage("io.tapstate.adapters.mongostore..")

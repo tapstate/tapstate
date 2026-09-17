@@ -129,6 +129,12 @@
       <version>${revision}</version>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>spi-metrics</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
 
     <!-- adapters ring: registered so the R3 rule scans the adapter classes -->
     <dependency>
@@ -146,6 +152,12 @@
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>adapter-transform</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>adapter-otel</artifactId>
       <version>${revision}</version>
       <scope>test</scope>
     </dependency>
