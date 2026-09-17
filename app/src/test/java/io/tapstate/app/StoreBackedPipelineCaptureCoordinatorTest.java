@@ -354,6 +354,11 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         // shape that loses one of them reads as a source that has gone half quiet.
         assertThat(coordinator.capturedRows("p").rowsByTableAndOp())
                 .containsExactly(entry("orders", Map.of("i", 2L)));
+        // And what they weighed is added the same way, which is a separate decision in a separate line:
+        // the two runs' payloads collide on this table exactly as their counts do, and overwriting
+        // instead of adding leaves a figure that is neither run's and looks like either.
+        assertThat(coordinator.capturedRows("p").bytesByTable())
+                .containsExactly(entry("orders", 20L));
     }
 
     @Test

@@ -336,10 +336,16 @@ public final class Engine {
      */
     public Map<String, Map<String, Long>> recordsDelivered(String pipelineId) {
         Job job = liveJob(pipelineId);
-        if (job == null) {
-            return Map.of();
-        }
-        JobMetrics collected = job.getMetrics();
+        return job == null ? Map.of() : deliveredRowsIn(job.getMetrics());
+    }
+
+    /**
+     * The delivery counts in {@code collected}, by table and source operation. Separated from finding
+     * the job because that is the half with no behaviour in it: which names are read, which are passed
+     * over, and how two sinks' figures combine are decisions, and a decision reachable only through a
+     * running job is a decision nothing checks.
+     */
+    static Map<String, Map<String, Long>> deliveredRowsIn(JobMetrics collected) {
         Map<String, Map<String, Long>> byTable = new HashMap<>();
         for (String metric : collected.metrics()) {
             JetDeliveryGauge.Delivered delivered = JetDeliveryGauge.deliveredOf(metric);
@@ -364,10 +370,14 @@ public final class Engine {
      */
     public Map<String, Long> bytesDelivered(String pipelineId) {
         Job job = liveJob(pipelineId);
-        if (job == null) {
-            return Map.of();
-        }
-        JobMetrics collected = job.getMetrics();
+        return job == null ? Map.of() : settledBytesIn(job.getMetrics());
+    }
+
+    /**
+     * The settled payload sizes in {@code collected}, by table. Added over the sinks like the counts and
+     * unlike the distances: a row written to two targets was written twice and its payload crossed twice.
+     */
+    static Map<String, Long> settledBytesIn(JobMetrics collected) {
         Map<String, Long> byTable = new HashMap<>();
         for (String metric : collected.metrics()) {
             String table = JetDeliveryGauge.carriedTableOf(metric);
@@ -433,10 +443,15 @@ public final class Engine {
      */
     private Map<String, Long> byChain(String pipelineId, Function<String, String> chainOf) {
         Job job = liveJob(pipelineId);
-        if (job == null) {
-            return Map.of();
-        }
-        JobMetrics collected = job.getMetrics();
+        return job == null ? Map.of() : highestIn(job.getMetrics(), chainOf);
+    }
+
+    /**
+     * The widest reading in {@code collected} for each key {@code chainOf} names. Kept at its widest and
+     * not added, unlike the two above: a distance is one fact several sinks each have a view of, so the
+     * answer is the furthest-behind of them, while a delivery is work done by each.
+     */
+    static Map<String, Long> highestIn(JobMetrics collected, Function<String, String> chainOf) {
         Map<String, Long> highest = new HashMap<>();
         for (String metric : collected.metrics()) {
             String chain = chainOf.apply(metric);
