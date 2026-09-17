@@ -28,6 +28,7 @@ import io.tapstate.runtime.engine.FrontierBinding;
 import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.engine.PipelineDagBuilder;
 import io.tapstate.runtime.engine.SinkAckFactory;
+import io.tapstate.runtime.engine.ViewSinkWriters;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinBinding;
 import io.tapstate.runtime.engine.join.JoinStoresBinding;
@@ -1396,7 +1397,8 @@ final class StoreBackedDagSource implements DagSource {
         // key has nothing for the identity gate to compare. Review found the reverse order turning the
         // coded missing-key refusal into a bare NullPointerException inside the gate.
         ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(inline);
-        requireKeyIsTheFeedIdentity(pipeline, inline, targets, tablesBySourceId);
+        boolean alternateKey = requireKeyIsTheFeedIdentity(
+                pipeline, inline, targets, tablesBySourceId);
         // Coded rather than bare, unlike a source the author named: this store is the deployment's, so
         // its absence is a condition an operator acts on rather than a defect on this side.
         SourceResource store = artifacts().get(target.sourceId())
@@ -1427,9 +1429,18 @@ final class StoreBackedDagSource implements DagSource {
             bySourceTable.put(sourceTable,
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
-        return sinkWriterBinder.bind(
+        SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bind(
                 store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable,
                 new PipelineNode(pipeline.id(), inline.id()));
+        String viewId = inline.id();
+        String viewKey = inline.primaryKey();
+        // A unique current value says nothing about what the capture stream puts in an earlier image.
+        // Guard only an accepted alternate identity: the discovered primary identity is the capture
+        // contract already used throughout the pipeline, while an alternate has no such guarantee.
+        return alternateKey
+                ? () -> ViewSinkWriters.requireAlternateKeyInBeforeImage(
+                        writer.get(), viewId, viewKey)
+                : writer;
     }
 
     /**
@@ -1447,8 +1458,10 @@ final class StoreBackedDagSource implements DagSource {
      * tables, anything else is one table. A regex names many upstreams by construction and is refused
      * as such. A discovered primary key is only a default; an explicitly selected view key may use a
      * different discovered unique identity, but cannot name a column whose uniqueness is not known.
+     * The return value says that the accepted identity is such an alternate, so its writer can require
+     * the key in update and delete before images before applying either change.
      */
-    private static void requireKeyIsTheFeedIdentity(PipelineResource pipeline, ViewBlock.Inline view,
+    private static boolean requireKeyIsTheFeedIdentity(PipelineResource pipeline, ViewBlock.Inline view,
             Map<String, TargetTable> targets, Map<String, List<String>> tablesBySourceId) {
         List<String> streams = new ArrayList<>();
         List<TransformBody.Nest> assemblies = new ArrayList<>();
@@ -1459,7 +1472,7 @@ final class StoreBackedDagSource implements DagSource {
         }
         if (assemblies.size() == 1) {
             requireKeyIs(view, assemblies.getFirst().root().key());
-            return;
+            return false;
         }
         // An undiscovered table has no identity claim to compare, so the view remains usable before
         // discovery. Once discovery has supplied a model, the selected key must be one of its unique
@@ -1471,14 +1484,16 @@ final class StoreBackedDagSource implements DagSource {
                 List<String> selected = List.of(view.primaryKey());
                 List<List<String>> identities = model.indexes().stream()
                         .filter(TargetIndex::unique).map(TargetIndex::fields).toList();
+                List<String> defaultIdentity = model.fields().stream()
+                        .filter(TargetField::primaryKey).map(TargetField::name).toList();
                 if (!identities.contains(selected)) {
-                    List<String> defaultIdentity = model.fields().stream()
-                            .filter(TargetField::primaryKey).map(TargetField::name).toList();
                     requireKeyIs(view, defaultIdentity.isEmpty() && !identities.isEmpty()
                             ? identities.getFirst() : defaultIdentity);
                 }
+                return !selected.equals(defaultIdentity);
             }
         }
+        return false;
     }
 
     /** One refusal for every feed shape: the view's single key must be exactly this identity. */

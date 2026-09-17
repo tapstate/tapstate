@@ -162,8 +162,9 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
 
     @Test
     void an_explicit_view_key_can_select_a_different_discovered_unique_identity() {
-        // Discovery's primary key remains a default, not an override. The explicit customer key is safe
-        // here because discovery independently records that it identifies one source row.
+        // Discovery's primary key remains a default, not an override. The explicit customer key is
+        // accepted because discovery records that its current value identifies one source row; the
+        // materialized view's writer separately requires that alternate key in CDC before images.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal("orders")), null, null));
