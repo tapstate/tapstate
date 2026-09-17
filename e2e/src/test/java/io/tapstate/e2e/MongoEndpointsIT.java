@@ -80,6 +80,13 @@ class MongoEndpointsIT {
     }
 
     @Test
+    void aSeededCollectionConstrainsTheIdentityEverySpecificationUses() {
+        endpoints.seed(at(), TABLE, SeedRows.generated(1));
+
+        assertThat(identityIsUnique()).isTrue();
+    }
+
+    @Test
     void aSpecificationCanTurnBeforeImagesOffAfterSeeding() {
         endpoints.seed(at(), TABLE, SeedRows.generated(1));
 
@@ -294,6 +301,15 @@ class MongoEndpointsIT {
             Document options = collection.get("options", Document.class);
             Document beforeImages = options.get("changeStreamPreAndPostImages", Document.class);
             return beforeImages != null && Boolean.TRUE.equals(beforeImages.getBoolean("enabled"));
+        }
+    }
+
+    private boolean identityIsUnique() {
+        try (MongoClient client = MongoClients.create(uri)) {
+            List<Document> indexes = client.getDatabase("e2e_mongo_endpoints")
+                    .getCollection(TABLE).listIndexes().into(new ArrayList<>());
+            return indexes.stream().anyMatch(index -> Boolean.TRUE.equals(index.getBoolean("unique"))
+                    && new Document("id", 1).equals(index.get("key", Document.class)));
         }
     }
 

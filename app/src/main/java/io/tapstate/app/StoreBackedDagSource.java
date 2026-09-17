@@ -1388,7 +1388,7 @@ final class StoreBackedDagSource implements DagSource {
         // key has nothing for the identity gate to compare. Review found the reverse order turning the
         // coded missing-key refusal into a bare NullPointerException inside the gate.
         ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(inline);
-        requireKeyIsTheFeedIdentity(pipeline, inline, tablesBySourceId);
+        requireKeyIsTheFeedIdentity(pipeline, inline, targets, tablesBySourceId);
         // Coded rather than bare, unlike a source the author named: this store is the deployment's, so
         // its absence is a condition an operator acts on rather than a defect on this side.
         SourceResource store = artifacts().get(target.sourceId())
@@ -1437,11 +1437,11 @@ final class StoreBackedDagSource implements DagSource {
      * <p>What feeds the view is resolved by walking its from-reference down to leaves: a nest step is
      * one assembled stream carrying its explicitly declared root key, a source id is each of its
      * tables, anything else is one table. A regex names many upstreams by construction and is refused
-     * as such. A discovered table key is only a default; it cannot override the view key the author
-     * explicitly declared.
+     * as such. A discovered primary key is only a default; an explicitly selected view key may use a
+     * different discovered unique identity, but cannot name a column whose uniqueness is not known.
      */
     private static void requireKeyIsTheFeedIdentity(PipelineResource pipeline, ViewBlock.Inline view,
-            Map<String, List<String>> tablesBySourceId) {
+            Map<String, TargetTable> targets, Map<String, List<String>> tablesBySourceId) {
         List<String> streams = new ArrayList<>();
         List<TransformBody.Nest> assemblies = new ArrayList<>();
         collectFeed(pipeline, view.from(), tablesBySourceId, streams, assemblies, new HashSet<>());
@@ -1451,6 +1451,25 @@ final class StoreBackedDagSource implements DagSource {
         }
         if (assemblies.size() == 1) {
             requireKeyIs(view, assemblies.getFirst().root().key());
+            return;
+        }
+        // An undiscovered table has no identity claim to compare, so the view remains usable before
+        // discovery. Once discovery has supplied a model, the selected key must be one of its unique
+        // identities. The primary key is present in the same index list as secondary unique keys, which
+        // lets an explicit key override that default without turning an unconstrained column into one.
+        if (streams.size() == 1 && targets != null) {
+            TargetTable model = targets.get(streams.getFirst());
+            if (model != null) {
+                List<String> selected = List.of(view.primaryKey());
+                List<List<String>> identities = model.indexes().stream()
+                        .filter(TargetIndex::unique).map(TargetIndex::fields).toList();
+                if (!identities.contains(selected)) {
+                    List<String> defaultIdentity = model.fields().stream()
+                            .filter(TargetField::primaryKey).map(TargetField::name).toList();
+                    requireKeyIs(view, defaultIdentity.isEmpty() && !identities.isEmpty()
+                            ? identities.getFirst() : defaultIdentity);
+                }
+            }
         }
     }
 

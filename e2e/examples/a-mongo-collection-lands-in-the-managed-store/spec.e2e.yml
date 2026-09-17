@@ -1,6 +1,7 @@
-# Mongo discovery records its internal _id as the source identity, while the view explicitly chooses
-# the document's id field. The declared view key must win: reverting that precedence refuses the
-# pipeline before it starts. Its destination is the managed store, keeping this source witness
+# Mongo discovery records its internal _id as the primary identity and the seeded collection constrains
+# its id field uniquely, while the view explicitly chooses id. The declared view key must win between
+# those valid identities: reverting that precedence refuses the pipeline before it starts. Its destination
+# is the managed store, keeping this source witness
 # independent of a JDBC sink. Snapshot, insert, update and delete are separate delivery witnesses.
 # The changed sequence is read back: counts alone cannot detect a discarded update.
 #

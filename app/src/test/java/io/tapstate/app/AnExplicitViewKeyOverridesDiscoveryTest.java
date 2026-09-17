@@ -13,6 +13,7 @@ import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import java.util.List;
@@ -37,7 +38,8 @@ class AnExplicitViewKeyOverridesDiscoveryTest {
         store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
                 new SourceTable("orders",
                         List.of(new SourceField("_id", "objectId"), new SourceField("id", "int")),
-                        List.of("_id"), List.of())))));
+                        List.of("_id"), List.of(new SourceIndex(
+                                "id_unique", List.of("id"), true)))))));
 
         assertThatCode(() -> new StoreBackedDagSource(store).dagFor("orders_pipeline"))
                 .doesNotThrowAnyException();

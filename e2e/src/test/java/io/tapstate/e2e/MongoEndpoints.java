@@ -5,6 +5,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.IndexOptions;
 import com.mongodb.client.model.Updates;
 import org.bson.Document;
 
@@ -23,7 +24,8 @@ import java.util.Optional;
  * The product's own sink writes it that way - a document it lands carries {@code id} as a field and
  * leaves {@code _id} to the store - and the driver seeds and reads the same shape, so one where
  * clause means one thing whether the document was seeded by the harness or landed by the product.
- * The store's internal {@code _id} never crosses this seam in either direction.
+ * Seeding constrains that field uniquely, so both the harness and discovery can rely on the identity
+ * this vocabulary promises. The store's internal {@code _id} never crosses this seam in either direction.
  */
 final class MongoEndpoints implements Endpoints {
 
@@ -55,6 +57,10 @@ final class MongoEndpoints implements Endpoints {
         } else {
             collection.insertMany(documents);
         }
+        // Every specification addresses a row by id, so the store must enforce the same identity the
+        // harness promises. Besides catching an invalid seed immediately, discovery can now distinguish
+        // that explicit identity from MongoDB's internal _id default.
+        collection.createIndex(new Document(IDENTITY_FIELD, 1), new IndexOptions().unique(true));
         configureBeforeImages(address, table, true);
     }
 

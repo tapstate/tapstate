@@ -20,6 +20,7 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import java.util.LinkedHashMap;
@@ -115,9 +116,9 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
     }
 
     @Test
-    void an_explicit_view_key_overrides_the_discovered_tables_key() {
-        // Discovery supplies a default identity; it does not overrule the key the author explicitly
-        // chose for the materialized view.
+    void a_view_keyed_off_a_column_without_a_unique_source_identity_is_refused() {
+        // The same collapse as the nest case, in the shape the gate must also cover: one table, its key
+        // discovered as id, the view upserting - and uniquely indexing - a customer value rows can share.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal("orders")), null, null));
@@ -130,6 +131,29 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                 new SourceTable("orders",
                         List.of(new SourceField("id", "int"), new SourceField("customer", "string")),
                         List.of("id"), List.of())))));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(code("actuation.view-key-not-feed-identity"));
+    }
+
+    @Test
+    void an_explicit_view_key_can_select_a_different_discovered_unique_identity() {
+        // Discovery's primary key remains a default, not an override. The explicit customer key is safe
+        // here because discovery independently records that it identifies one source row.
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(managedStore());
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
+                null, settings(), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
+                new SourceTable("orders",
+                        List.of(new SourceField("id", "int"), new SourceField("customer", "string")),
+                        List.of("id"), List.of(new SourceIndex(
+                                "customer_unique", List.of("customer"), true)))))));
 
         Assertions.assertThatCode(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
                 .doesNotThrowAnyException();
