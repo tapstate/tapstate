@@ -35,7 +35,11 @@ public final class PipelineViewService {
 
     /** Lists stored Pipelines in stable id order. */
     public List<PipelineView> list() {
-        return artifacts.listResources().stream()
+        return artifacts.list("pipeline").stream()
+                .filter(ArtifactListEntry::readable)
+                .map(ArtifactListEntry::id)
+                .map(artifacts::getResource)
+                .flatMap(Optional::stream)
                 .filter(stored -> stored.resource() instanceof PipelineResource)
                 .sorted(Comparator.comparing(stored -> stored.resource().id()))
                 .map(this::view)
