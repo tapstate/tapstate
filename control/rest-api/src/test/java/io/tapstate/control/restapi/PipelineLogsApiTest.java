@@ -280,9 +280,11 @@ class PipelineLogsApiTest {
     /** An in-memory, seedable node-local log sink: append-ordered lines per pipeline id. */
     static final class FakeLogSink implements LogSink {
         private final Map<String, List<LogLine>> byId = new LinkedHashMap<>();
+        private final Map<String, PipelineLogLevel> levels = new LinkedHashMap<>();
 
         void clear() {
             byId.clear();
+            levels.clear();
         }
 
         @Override
@@ -293,6 +295,16 @@ class PipelineLogsApiTest {
         @Override
         public List<LogLine> tail(String pipelineId) {
             return List.copyOf(byId.getOrDefault(pipelineId, List.of()));
+        }
+
+        @Override
+        public void level(String pipelineId, PipelineLogLevel level) {
+            levels.put(pipelineId, level);
+        }
+
+        @Override
+        public PipelineLogLevel level(String pipelineId) {
+            return levels.getOrDefault(pipelineId, PipelineLogLevel.INFO);
         }
     }
 
