@@ -85,6 +85,24 @@ class PipelineRepresentationMalformedInputTest {
                         assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
     }
 
+    @Test
+    void refusesAViewSchemaPolicy() {
+        PipelineInput input = new PipelineInput(
+                "probe", null, List.of("src"), null,
+                Map.of(
+                        "from", "src",
+                        "primaryKey", "id",
+                        "schema", Map.of("enforce", true, "evolution", "additive")),
+                null, null, null);
+
+        assertThatThrownBy(() -> representation.toModel(input, null))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(error.args())
+                            .containsEntry("reason", "view.schema is not supported; remove the field");
+                });
+    }
+
     /**
      * The discriminator for the three above: the same documents without the option are accepted, so
      * a refusal there can only be the option and never a malformed seed.

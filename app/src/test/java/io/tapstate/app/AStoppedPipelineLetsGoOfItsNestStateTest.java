@@ -637,7 +637,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
     private static PipelineResource pipelineWithView() {
         return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true)), List.of(),
-                new ViewBlock.Inline("orders_view", FromRef.literal(PARENT_SOURCE), "id", null, null), null,
+                new ViewBlock.Inline("orders_view", FromRef.literal(PARENT_SOURCE), "id", null), null,
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
     }
 

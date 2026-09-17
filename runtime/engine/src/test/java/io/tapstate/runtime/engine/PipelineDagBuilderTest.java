@@ -507,7 +507,7 @@ class PipelineDagBuilderTest {
     }
 
     private static ViewBlock view(String id, FromRef from) {
-        return new ViewBlock.Inline(id, from, "order_id", null, null);
+        return new ViewBlock.Inline(id, from, "order_id", null);
     }
 
     private static ServeBlock serve(FromRef from, SyncElement... sync) {

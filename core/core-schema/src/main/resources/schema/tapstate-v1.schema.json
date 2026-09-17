@@ -1242,10 +1242,6 @@
         "storage": {
           "description": "Storage backend used to persist this view.",
           "$ref": "#/$defs/Storage"
-        },
-        "schema": {
-          "description": "Schema policy for this view: whether its shape is enforced and how it may evolve.",
-          "$ref": "#/$defs/ViewSchema"
         }
       },
       "required": [
@@ -1306,10 +1302,6 @@
           "description": "Where and how the view's data is materialized.",
           "$ref": "#/$defs/Storage"
         },
-        "schema": {
-          "description": "Column definitions of the view's output schema.",
-          "$ref": "#/$defs/ViewSchema"
-        },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",
           "type": "object",
@@ -1322,21 +1314,6 @@
         "id",
         "primary_key"
       ],
-      "additionalProperties": false
-    },
-    "ViewSchema": {
-      "type": "object",
-      "description": "Schema policy for a view: whether the schema is enforced and how it is allowed to evolve.",
-      "properties": {
-        "enforce": {
-          "description": "Whether the declared view schema is strictly enforced at runtime.",
-          "type": "boolean"
-        },
-        "evolution": {
-          "description": "How the view schema is allowed to evolve over time, such as additive-only.",
-          "type": "string"
-        }
-      },
       "additionalProperties": false
     },
     "WriteMode": {

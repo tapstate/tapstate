@@ -38,7 +38,6 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewResource;
-import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 import org.yaml.snakeyaml.DumperOptions;
 import org.yaml.snakeyaml.LoaderOptions;
@@ -103,13 +102,12 @@ public final class DslParser {
             Set.of("from", "key", "mode", "trackKeyChanges", "embed");
     private static final Set<String> EMBED_KEYS = Set.of(
             "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
-    private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", "primary_key", "storage", "schema");
+    private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", "primary_key", "storage");
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> STORAGE_KEYS = Set.of("hot", "warm", "cold");
     private static final Set<String> HOT_KEYS = Set.of("ttl");
     private static final Set<String> WARM_KEYS = Set.of("collection", "indexes");
     private static final Set<String> COLD_KEYS = Set.of("partition_by");
-    private static final Set<String> VIEW_SCHEMA_KEYS = Set.of("enforce", "evolution");
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
     static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
@@ -122,7 +120,7 @@ public final class DslParser {
     static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
             "version", "kind", "id", "metadata", "type", "options", "experimental");
     private static final Set<String> VIEW_DEF_KEYS = Set.of(
-            "version", "kind", "id", "metadata", "primary_key", "storage", "schema", "experimental");
+            "version", "kind", "id", "metadata", "primary_key", "storage", "experimental");
     private static final Set<String> SERVE_DEF_KEYS = Set.of(
             "version", "kind", "id", "metadata", "sync", "query", "push", "experimental");
 
@@ -571,8 +569,7 @@ public final class DslParser {
                 id != null ? id : "view",
                 blockFrom(v, prevId, n),
                 v.string("primary_key"),
-                storage(v.mapping("storage")),
-                viewSchema(v.mapping("schema")));
+                storage(v.mapping("storage")));
     }
 
     private Storage storage(YamlMap st) {
@@ -599,14 +596,6 @@ public final class DslParser {
             cold = new Storage.Cold(scalarList(c.seq("partition_by"), "partition_by"));
         }
         return new Storage(hot, warm, cold);
-    }
-
-    private ViewSchema viewSchema(YamlMap sc) {
-        if (sc == null) {
-            return null;
-        }
-        sc.requireOnly(VIEW_SCHEMA_KEYS);
-        return new ViewSchema(boolValue(sc, "enforce"), sc.string("evolution"));
     }
 
     private ServeBlock serve(YamlMap m, String prevId) {
@@ -767,7 +756,7 @@ public final class DslParser {
         m.requirePresent(REQUIRED_VIEW_DEF_KEYS);
         return new ViewResource(
                 m.require("id", idOf(m)), metadata(m), m.string("primary_key"),
-                storage(m.mapping("storage")), viewSchema(m.mapping("schema")), m.freeMap("experimental"));
+                storage(m.mapping("storage")), m.freeMap("experimental"));
     }
 
     /** A reusable publish-surface definition (§8, X19): sync / query / push, no wiring. */

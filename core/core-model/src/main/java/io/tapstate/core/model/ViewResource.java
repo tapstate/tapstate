@@ -19,8 +19,6 @@ public record ViewResource(
         String primaryKey,
         @Doc("Where and how the view's data is materialized.")
         Storage storage,
-        @Doc("Column definitions of the view's output schema.")
-        ViewSchema schema,
         @Doc("Experimental fields, exempt from the v1 compatibility freeze.")
         Map<String, Object> experimental)
         implements Resource {
