@@ -30,18 +30,6 @@
   ],
   "facts" : [
     {
-      "name" : "recordCount",
-      "type" : "gauge",
-      "unit" : "{record}",
-      "points" : [
-        {
-          "attributes" : { },
-          "observedAt" : "2026-09-17T10:00:00.250Z",
-          "value" : 98
-        }
-      ]
-    },
-    {
       "name" : "tapstate.pipeline.errors",
       "type" : "counter",
       "unit" : "{error}",
@@ -170,6 +158,20 @@
             "tapstate.table.id" : "orders"
           },
           "startTime" : "2026-09-17T09:00:00Z",
+          "observedAt" : "2026-09-17T10:00:00.250Z",
+          "value" : 98
+        }
+      ]
+    },
+    {
+      "name" : "tapstate.pipeline.records.driven",
+      "type" : "gauge",
+      "unit" : "{record}",
+      "points" : [
+        {
+          "attributes" : {
+            "tapstate.pipeline.id" : "orders_sync"
+          },
           "observedAt" : "2026-09-17T10:00:00.250Z",
           "value" : 98
         }

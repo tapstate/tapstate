@@ -71,7 +71,10 @@ public enum CardinalityBudget {
     NEST_STORED("tapstate.pipeline.nest.stored", MetricAttributes.NEST_NAMESPACE, 1_000),
     NEST_DEAD_LETTERED("tapstate.pipeline.nest.dead_lettered", MetricAttributes.NEST_NAMESPACE, 1_000),
     JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000),
-    JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE, 1_000);
+    JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE, 1_000),
+    /** Two readings about the pipeline as a whole: the pipeline is their only attribute, so nothing grows and nothing folds. */
+    RECORDS_DRIVEN("tapstate.pipeline.records.driven", null, 1),
+    RECONCILE_FAILURES_STREAK("tapstate.pipeline.reconcile.failures.streak", null, 1);
 
     /**
      * The series one instrument may hold across every pipeline of a process, which is where an exporter

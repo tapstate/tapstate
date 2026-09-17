@@ -80,8 +80,8 @@ class MetricsFaceWireGateTest {
     /**
      * One pipeline's metrics with one of everything the face carries: the flat map with a squeezed family
      * and a bare key, an acked position, a counter broken down by table, direction and operation, a gauge
-     * with no attributes, a gauge per table, a counter per code, a distribution over the registered bounds,
-     * and the overflow series a cardinality budget folds the rest into.
+     * about the pipeline as a whole, a gauge per table, a counter per code, a distribution over the
+     * registered bounds, and the overflow series a cardinality budget folds the rest into.
      */
     private static PipelineMetrics fixture() {
         Map<String, String> orders = Map.of(MetricAttributes.PIPELINE_ID, PIPELINE,
@@ -96,8 +96,8 @@ class MetricsFaceWireGateTest {
                 MetricPoint.accumulated(Map.of(MetricAttributes.PIPELINE_ID, PIPELINE, MetricAttributes.DIRECTION,
                         "in", MetricAttributes.OP, "update", MetricAttributes.OVERFLOW, "true"),
                         COUNTING_SINCE, TAKEN, 12L)));
-        MetricFact count = MetricFact.single("recordCount", MetricType.GAUGE, "{record}",
-                MetricPoint.reading(Map.of(), TAKEN, 98L));
+        MetricFact count = MetricFact.single("tapstate.pipeline.records.driven", MetricType.GAUGE, "{record}",
+                MetricPoint.reading(Map.of(MetricAttributes.PIPELINE_ID, PIPELINE), TAKEN, 98L));
         MetricFact lag = MetricFact.single("tapstate.pipeline.lag", MetricType.GAUGE, "s",
                 MetricPoint.reading(orders, TAKEN, 4L));
         MetricFact errors = MetricFact.single("tapstate.pipeline.errors", MetricType.COUNTER, "{error}",

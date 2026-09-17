@@ -95,7 +95,9 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.nest.stored",
                         "tapstate.pipeline.nest.dead_lettered",
                         "tapstate.pipeline.join.recompute.rows",
-                        "tapstate.pipeline.join.recompute.rows.total");
+                        "tapstate.pipeline.join.recompute.rows.total",
+                        "tapstate.pipeline.records.driven",
+                        "tapstate.pipeline.reconcile.failures.streak");
         for (CardinalityBudget budget : List.of(CardinalityBudget.RECORDS, CardinalityBudget.BYTES,
                 CardinalityBudget.LAG, CardinalityBudget.RECORD_DELIVERY_DURATION,
                 CardinalityBudget.SNAPSHOT_ROWS, CardinalityBudget.SNAPSHOT_ROWS_TOTAL)) {
@@ -123,8 +125,15 @@ class WhatHappensPastTheCardinalityBudgetTest {
         assertThat(CardinalityBudget.ERRORS.distinctValues()).isEqualTo(200);
         assertThat(CardinalityBudget.PROCESS_DURATION.openDimension()).isEmpty();
         assertThat(CardinalityBudget.PROCESS_DURATION.distinctValues()).isEqualTo(Stage.values().length);
+        for (CardinalityBudget budget : List.of(CardinalityBudget.RECORDS_DRIVEN,
+                CardinalityBudget.RECONCILE_FAILURES_STREAK)) {
+            assertThat(budget.openDimension()).as(budget.name()).isEmpty();
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1);
+        }
         assertThat(CardinalityBudget.EXPORT_SERIES_LIMIT).isEqualTo(10_000);
+        // The flat spellings are keys of a face, not instruments: none of them declares a budget.
         assertThat(CardinalityBudget.forInstrument("reconcileFailuresInARow")).isEmpty();
+        assertThat(CardinalityBudget.forInstrument("recordCount")).isEmpty();
     }
 
     @Test

@@ -207,7 +207,19 @@ public final class ObservationPublisher {
      * reports "N passes in a row have thrown", and a name that said total would have that sentence quietly
      * start lying the day somebody made it one.
      */
-    private static final String RECONCILE_STREAK_METRIC = "reconcileFailuresInARow";
+    private static final String RECONCILE_STREAK_METRIC = "tapstate.pipeline.reconcile.failures.streak";
+
+    /** How the flat face has always spelled the streak, and still does. */
+    private static final String RECONCILE_STREAK_FLAT = "reconcileFailuresInARow";
+
+    /**
+     * Records the live job has driven to its sinks, read off the job's own statistics: what reached the
+     * sink, which is not what the target confirmed and is not the rows counted as delivered. It predates
+     * the delivered count and its one reader on the command line still reads it; the canonical name says
+     * what it is, and the flat face keeps spelling it the way that reader was built against.
+     */
+    private static final String RECORDS_DRIVEN_METRIC = "tapstate.pipeline.records.driven";
+    private static final String RECORDS_DRIVEN_FLAT = "recordCount";
 
     private static final String CODE_ATTRIBUTE = MetricAttributes.CODE;
 
@@ -265,7 +277,11 @@ public final class ObservationPublisher {
             Map.entry(JOIN_RECOMPUTE_ROWS_METRIC,
                     attributes -> JOIN_RECOMPUTE_DONE_PREFIX + attributes.get(JOIN_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_TOTAL_METRIC,
-                    attributes -> JOIN_RECOMPUTE_EXPECTED_PREFIX + attributes.get(JOIN_NAMESPACE_ATTRIBUTE)));
+                    attributes -> JOIN_RECOMPUTE_EXPECTED_PREFIX + attributes.get(JOIN_NAMESPACE_ATTRIBUTE)),
+            // The two per-pipeline readings carry only the pipeline as an attribute, the way every
+            // canonical fact does, and the flat face keeps their bare keys.
+            Map.entry(RECORDS_DRIVEN_METRIC, attributes -> RECORDS_DRIVEN_FLAT),
+            Map.entry(RECONCILE_STREAK_METRIC, attributes -> RECONCILE_STREAK_FLAT));
 
     /**
      * The name the metric contract gives each of this engine's change kinds.
@@ -672,9 +688,10 @@ public final class ObservationPublisher {
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
         Instant at = observedNow();
-        List<MetricFact> measured = List.of(readAt(RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
+        List<MetricFact> measured = List.of(
+                readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
         observations.save(new Observation(pipelineId, lastState,
-                FlatMetricProjection.of(measured).metrics(),
+                FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                 null, lastPositions, lastFailure, at, measured));
     }
 
@@ -688,9 +705,13 @@ public final class ObservationPublisher {
         return Instant.now(clock).truncatedTo(ChronoUnit.MILLIS);
     }
 
-    /** One metric read at {@code at}, with no dimensions: the shape of a quantity with nothing to break out. */
-    private static MetricFact readAt(String name, String unit, Instant at, long value) {
-        return MetricFact.single(name, MetricType.GAUGE, unit, MetricPoint.reading(Map.of(), at, value));
+    /**
+     * One metric read at {@code at} about the pipeline as a whole: one point, carrying the pipeline as its
+     * only attribute, the way every canonical fact names the pipeline it is about.
+     */
+    private static MetricFact readAt(String pipelineId, String name, String unit, Instant at, long value) {
+        return MetricFact.single(name, MetricType.GAUGE, unit,
+                MetricPoint.reading(Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId), at, value));
     }
 
     /**
@@ -739,7 +760,7 @@ public final class ObservationPublisher {
         List<MetricFact> facts = new ArrayList<>();
         failures(pipelineId, at).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
-                .ifPresent(count -> facts.add(readAt("recordCount", "{record}", at, count)));
+                .ifPresent(count -> facts.add(readAt(pipelineId, RECORDS_DRIVEN_METRIC, "{record}", at, count)));
         // One point per chain that reported a reading, so a chain keeping up and a chain that has stalled
         // stay distinguishable; a chain that reported none is absent rather than zero, which would read as
         // the healthy end of the same scale. The distance is dimensionless: what it counts is a position's

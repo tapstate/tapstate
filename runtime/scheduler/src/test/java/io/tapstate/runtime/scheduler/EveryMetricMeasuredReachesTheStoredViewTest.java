@@ -103,7 +103,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 "tapstate.pipeline.nest.backfills", "tapstate.pipeline.nest.backfill.time",
                 "tapstate.pipeline.nest.pending.high_water", "tapstate.pipeline.nest.stored",
                 "tapstate.pipeline.nest.dead_lettered",
-                "tapstate.pipeline.join.recompute.rows", "tapstate.pipeline.join.recompute.rows.total");
+                "tapstate.pipeline.join.recompute.rows", "tapstate.pipeline.join.recompute.rows.total",
+                "tapstate.pipeline.records.driven");
 
         Observation published = observations.read("orders").orElseThrow();
         // The flat keys, letter for letter. Every reader of this face -- the command line, the end-to-end
@@ -154,7 +155,7 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                             .containsEntry("tapstate.chain.id", "chain-b")
                             .containsEntry("tapstate.pipeline.id", "orders"));
                 });
-        assertThat(measured).filteredOn(fact -> fact.name().equals("recordCount"))
+        assertThat(measured).filteredOn(fact -> fact.name().equals("tapstate.pipeline.records.driven"))
                 .singleElement()
                 .satisfies(fact -> assertThat(fact.unit()).isEqualTo("{record}"));
     }
