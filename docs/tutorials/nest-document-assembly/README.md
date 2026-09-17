@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/tutorials/nest-document-assembly
+---
+
 # Assembling one document out of many tables
 
 A relational shop keeps an order in nine tables. An application that wants to show one order wants
