@@ -523,8 +523,12 @@ final class SpecGenerator {
                     + "what makes 'the right rows crossed' assertable rather than only 'rows crossed'. "
                     + "The last of the three is the only one a wider document fails: every value and "
                     + "length is satisfied by a document carrying extra fields beside them.";
-            case ERROR_COUNT -> "The pipeline's published error count, read from the metrics face: one "
-                    + "while it is FAILED, zero otherwise.";
+            case ERROR_COUNT -> "How many failures the pipeline has counted, added up over the codes it "
+                    + "counted them under, read from the metrics face. A count of failed operations, "
+                    + "one each, rather than a reading derived from the state the pipeline is in. A "
+                    + "nought asserted here is satisfied by a publisher that has stopped, because the "
+                    + "face carries no entry for a pipeline that has failed at nothing: pair it with a "
+                    + "word that has to read a live observation, such as a state awaited ahead of it.";
             case FAILURE_CODE -> "The canonical code of the failure the pipeline published, read from the "
                     + "status face: what killed the run, not just that it died.";
             case RECORDS_OUT -> "How many rows the pipeline has had confirmed by its targets, added up "

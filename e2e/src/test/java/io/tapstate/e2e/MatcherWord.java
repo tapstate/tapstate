@@ -30,10 +30,15 @@ enum MatcherWord {
     DOC,
 
     /**
-     * The count of observable errors the pipeline has published. Its source is the metrics read face,
-     * which the runtime derives from the pipeline's actual state - one while it is FAILED, zero otherwise -
-     * so a dead data-plane job is an assertable statistic and not only a log line. The other run
-     * statistics have no source wired yet, so no word offers them.
+     * How many failures the pipeline has counted, added up over the codes it counted them under. Its
+     * source is the metrics read face, which counts a failed operation once each - a count of things
+     * that happened, not a reading derived from the state the pipeline is in, which is what this word
+     * used to be given and what made "how many" unanswerable.
+     *
+     * <p>A nought asserted here is satisfied by a publisher that has stopped, because the face carries
+     * no entry for a pipeline that has failed at nothing. It still discriminates whenever a sibling in
+     * the same specification has to read a live observation - a state awaited ahead of it, say - since
+     * that sibling is what rules out a face nobody is writing to. On its own it rules out nothing.
      */
     ERROR_COUNT,
 

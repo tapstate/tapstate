@@ -16,7 +16,7 @@
     },
     {
       "word": "error_count",
-      "description": "The pipeline's published error count, read from the metrics face: one while it is FAILED, zero otherwise."
+      "description": "How many failures the pipeline has counted, added up over the codes it counted them under, read from the metrics face. A count of failed operations, one each, rather than a reading derived from the state the pipeline is in. A nought asserted here is satisfied by a publisher that has stopped, because the face carries no entry for a pipeline that has failed at nothing: pair it with a word that has to read a live observation, such as a state awaited ahead of it."
     },
     {
       "word": "failure_code",
