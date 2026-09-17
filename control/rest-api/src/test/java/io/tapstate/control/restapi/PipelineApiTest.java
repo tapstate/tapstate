@@ -418,6 +418,28 @@ class PipelineApiTest {
     }
 
     @Test
+    void createReturnsCodedValidationWhenItsReferencedSourceIsUnreadable() {
+        context.getBean(FakeArtifactStore.class).putUnreadable("unreadable_source", "source");
+        String mutation = """
+                {"id":"pipeline_with_unreadable_source","sources":["unreadable_source"],
+                 "transforms":[],"view":null,"serve":{"from":"/.*/"},
+                 "settings":null,"experimental":null}
+                """;
+
+        ApiError error = client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(mutation)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(error.code()).isEqualTo("dsl.missing-reference");
+        assertThat(error.params()).containsEntry("ref", "unreadable_source");
+    }
+
+    @Test
     void listAndGetExposeTheStaticPipelineViewWithoutCanonicalYamlOrObservationState() {
         context.getBean(FakeArtifactStore.class).seed(SOURCE_X);
 
@@ -1157,6 +1179,9 @@ class PipelineApiTest {
 
         @Override
         public List<Resource> list() {
+            if (!unreadableById.isEmpty()) {
+                throw new IllegalStateException("strict resource listing must not be used for dirty rows");
+            }
             return List.copyOf(byId.values());
         }
 
