@@ -310,8 +310,12 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
     void theCollapseIsOnTheRecordAndIsNotADrop() {
         FlatMetricProjection projected = projectionOf(facts(twoTables(), AT));
 
+        // The driven count is squeezed too: it names the pipeline it is about, as every canonical fact does,
+        // and reaches the flat face under its bare key through the same reductions as the three movement
+        // measurements. Listed here so that a fact arriving with an attribute and no flat spelling is a
+        // change to this list, never a quiet drop.
         assertThat(projected.reduced()).containsExactlyInAnyOrder("tapstate.pipeline.records",
-                "tapstate.pipeline.bytes", "tapstate.pipeline.lag");
+                "tapstate.pipeline.bytes", "tapstate.pipeline.lag", "tapstate.pipeline.records.driven");
         assertThat(projected.dropped()).isEmpty();
     }
 
@@ -454,11 +458,12 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
                 Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), SnapshotReading.NONE);
     }
 
+    /**
+     * The publisher's own reductions, not a copy of them: a copy kept here answered for three families
+     * while the publisher had grown a fourth, and reported that fourth as dropped when it was squeezed.
+     */
     private static FlatMetricProjection projectionOf(List<MetricFact> facts) {
-        return FlatMetricProjection.of(facts, Map.of(
-                "tapstate.pipeline.records", attributes -> "records." + attributes.get("direction"),
-                "tapstate.pipeline.bytes", attributes -> "bytes." + attributes.get("direction"),
-                "tapstate.pipeline.lag", attributes -> "lag." + attributes.get("tapstate.table.id")));
+        return FlatMetricProjection.of(facts, ObservationPublisher.FLAT_REDUCTIONS);
     }
 
     private ObservationPublisher publisherAt(DeliveryReading reading, Instant at) {
