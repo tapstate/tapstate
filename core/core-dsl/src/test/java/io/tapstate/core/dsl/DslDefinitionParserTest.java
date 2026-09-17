@@ -143,8 +143,7 @@ class DslDefinitionParserTest {
     }
 
     @Test
-    void viewDefinitionCarriesSchema() {
-        // Pins viewDefinition()'s schema/storage wiring beyond the bare s11 v_cust doc.
+    void viewDefinitionRefusesSchemaPolicy() {
         String yaml = """
                 version: tapstate/v1
                 kind: view
@@ -153,11 +152,12 @@ class DslDefinitionParserTest {
                 schema: { enforce: true, evolution: additive }
                 """;
 
-        ViewResource v = (ViewResource) parser.parse(yaml);
+        Throwable thrown = catchThrowable(() -> parser.parse(yaml));
 
-        assertThat(v.schema().enforce()).isTrue();
-        assertThat(v.schema().evolution()).isEqualTo("additive");
-        assertThat(writer.write(parser.parse(writer.write(v)))).isEqualTo(writer.write(v));
+        assertThat(thrown).isInstanceOf(DslException.class);
+        DslException refused = (DslException) thrown;
+        assertThat(refused.code()).isEqualTo(DslError.UNKNOWN_FIELD);
+        assertThat(refused.path()).isEqualTo("schema");
     }
 
     @Test

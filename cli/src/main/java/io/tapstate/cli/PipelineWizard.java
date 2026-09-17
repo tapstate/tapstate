@@ -187,7 +187,7 @@ final class PipelineWizard {
         // prompt always settles on a valid distinct id and the re-prompt loop terminates
         String viewId = askId("View id", freshId("view", reserved), reserved);
         String primaryKey = WizardPrompts.askPrimaryKey(prompter);
-        return new ViewBlock.Inline(viewId, from, primaryKey, null, null);
+        return new ViewBlock.Inline(viewId, from, primaryKey, null);
     }
 
     /** {@code base}, else {@code base_2}, {@code base_3}, … — the first id not already in {@code taken}. */

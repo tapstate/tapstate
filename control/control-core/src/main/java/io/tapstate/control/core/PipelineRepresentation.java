@@ -30,7 +30,6 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
-import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 
 import java.util.ArrayList;
@@ -383,7 +382,6 @@ public final class PipelineRepresentation {
             value.put("from", fromRefValue(inline.from()));
             value.put("primaryKey", inline.primaryKey());
             value.put("storage", storageValue(inline.storage()));
-            value.put("schema", viewSchemaValue(inline.schema()));
         }
         return Collections.unmodifiableMap(value);
     }
@@ -407,16 +405,6 @@ public final class PipelineRepresentation {
         } else {
             value.put("cold", Collections.singletonMap("partitionBy", storage.cold().partitionBy()));
         }
-        return Collections.unmodifiableMap(value);
-    }
-
-    private static Map<String, Object> viewSchemaValue(ViewSchema schema) {
-        if (schema == null) {
-            return null;
-        }
-        Map<String, Object> value = new LinkedHashMap<>();
-        value.put("enforce", schema.enforce());
-        value.put("evolution", schema.evolution());
         return Collections.unmodifiableMap(value);
     }
 
@@ -549,6 +537,9 @@ public final class PipelineRepresentation {
             return null;
         }
         String path = "view";
+        if (value.containsKey("schema")) {
+            throw malformed("view.schema is not supported; remove the field");
+        }
         String use = textOrNull(value.get("use"), path + ".use");
         FromRef from = fromRef(value(value, "from"), path + ".from");
         String id = textOrNull(value.get("id"), path + ".id");
@@ -559,8 +550,7 @@ public final class PipelineRepresentation {
                 id == null ? "view" : id,
                 from,
                 textOrNull(value(value, "primary_key", "primaryKey"), path + ".primary_key"),
-                storage(objectOrNull(value.get("storage"), path + ".storage")),
-                viewSchema(objectOrNull(value.get("schema"), path + ".schema")));
+                storage(objectOrNull(value.get("storage"), path + ".storage")));
     }
 
     private static ServeBlock serve(Map<String, Object> value) {
@@ -672,12 +662,6 @@ public final class PipelineRepresentation {
                         stringsOrNull(warm.get("indexes"), "storage.warm.indexes")),
                 cold == null ? null : new Storage.Cold(
                         stringsOrNull(value(cold, "partition_by", "partitionBy"), "storage.cold.partitionBy")));
-    }
-
-    private static ViewSchema viewSchema(Map<String, Object> value) {
-        return value == null ? null : new ViewSchema(
-                booleanOrNull(value.get("enforce"), "schema.enforce"),
-                textOrNull(value.get("evolution"), "schema.evolution"));
     }
 
     private static Settings settings(Map<String, Object> value) {

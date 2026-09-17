@@ -27,7 +27,6 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewResource;
-import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.OnFullLoad;
@@ -192,9 +191,6 @@ public final class CanonicalWriter {
         b.scalar("primary_key", v.primaryKey());
         if (v.storage() != null) {
             b.put("storage", storage(v.storage()));
-        }
-        if (v.schema() != null) {
-            b.put("schema", viewSchema(v.schema()));
         }
         b.freeMap("experimental", v.experimental());
         return b.build();
@@ -419,9 +415,6 @@ public final class CanonicalWriter {
                 if (v.storage() != null) {
                     b.put("storage", storage(v.storage()));
                 }
-                if (v.schema() != null) {
-                    b.put("schema", viewSchema(v.schema()));
-                }
             }
             case ViewBlock.Use u -> {
                 if (!u.id().equals(u.use())) {
@@ -575,13 +568,6 @@ public final class CanonicalWriter {
             t.scalarSeq("partition_by", st.cold().partitionBy());
             b.put("cold", t.build());
         }
-        return b.build();
-    }
-
-    private Node viewSchema(ViewSchema schema) {
-        B b = new B();
-        b.scalar("enforce", schema.enforce());
-        b.scalar("evolution", schema.evolution());
         return b.build();
     }
 
