@@ -41,11 +41,17 @@ class WhatHappensPastTheCardinalityBudgetTest {
 
     /** Rows of {@code tables} tables, in and out, each table's count being its index. */
     private static MetricFact rowsOver(int tables, String pipeline) {
+        return rowsOver(tables, pipeline, "t");
+    }
+
+    /** The same, with every table's name starting with {@code prefix}, for two pipelines over different tables. */
+    private static MetricFact rowsOver(int tables, String pipeline, String prefix) {
         List<MetricPoint> points = new ArrayList<>();
         for (int index = 1; index <= tables; index++) {
             for (String direction : List.of("in", "out")) {
-                points.add(MetricPoint.accumulated(Map.of(PIPELINE_ID, pipeline, TABLE_ID, table(index),
-                        DIRECTION, direction, OP, "insert"), STARTED, OBSERVED, index));
+                points.add(MetricPoint.accumulated(Map.of(PIPELINE_ID, pipeline, TABLE_ID,
+                        prefix + String.format("%04d", index), DIRECTION, direction, OP, "insert"),
+                        STARTED, OBSERVED, index));
             }
         }
         return new MetricFact("tapstate.pipeline.records", MetricType.COUNTER, "{record}", points);
@@ -166,8 +172,10 @@ class WhatHappensPastTheCardinalityBudgetTest {
     @DisplayName("the budget is per pipeline, so one wide pipeline cannot crowd another out")
     void theBudgetIsPerPipeline() {
         CardinalityBudget.Folder folder = CardinalityBudget.folder();
-        MetricFact first = rowsOver(1_000, "a");
-        MetricFact second = rowsOver(1_000, "b");
+        // Two pipelines over two disjoint sets of tables: a budget kept per process would have the
+        // second pipeline's every table arrive to a set the first had already filled.
+        MetricFact first = rowsOver(1_000, "a", "t");
+        MetricFact second = rowsOver(1_000, "b", "u");
 
         assertThat(folder.fold(first)).isSameAs(first);
         assertThat(folder.fold(second)).isSameAs(second);
