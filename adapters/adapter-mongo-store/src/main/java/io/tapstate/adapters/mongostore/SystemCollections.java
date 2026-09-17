@@ -127,7 +127,7 @@ public enum SystemCollections {
      * The second index is the one read shape this collection allows -- one pipeline, one time range.
      */
     PIPELINE_RATE_HISTORY(MongoStorePort.PIPELINE_RATE_HISTORY, Database.STORE, MongoRateHistoryStore.class,
-            Strategy.MIGRATED, 8,
+            Strategy.MIGRATED, 9,
             new IndexSpec(List.of("observedAt"), false, MongoRateHistoryStore.DEFAULT_RETENTION.toSeconds()),
             new IndexSpec(List.of("pipelineId", "observedAt"), false)),
 

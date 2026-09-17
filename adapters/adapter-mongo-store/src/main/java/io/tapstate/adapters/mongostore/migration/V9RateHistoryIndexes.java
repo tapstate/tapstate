@@ -17,13 +17,13 @@ import java.util.List;
  * differs, left alone when it matches — so a store whose startup already wrote a configured retention
  * onto the index is not refused here for having done so.
  */
-public final class V8RateHistoryIndexes implements ChangeSet {
+public final class V9RateHistoryIndexes implements ChangeSet {
 
     private static final SystemCollections ROW = SystemCollections.PIPELINE_RATE_HISTORY;
 
     @Override
     public int version() {
-        return 8;
+        return 9;
     }
 
     @Override
