@@ -241,7 +241,9 @@ class V2StructuredArtifactsIT {
                 .isEqualTo("public");
         assertThat(List.of(pipeline, view, source))
                 .allSatisfy(document -> assertThat(document.get("canonical")).isNull());
-        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(8);
+        // Installed to whatever this build supports: the assertion is that startup ran the whole
+        // ladder, not which rung happens to be the top one today.
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
     }
 
     @Test
