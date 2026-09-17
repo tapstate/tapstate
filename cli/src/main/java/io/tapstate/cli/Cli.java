@@ -260,7 +260,7 @@ public final class Cli implements Runnable {
             Map.entry("resume", new VerbHelp("<pipeline-id>",
                     "Resume a paused pipeline from where it stopped.")),
             Map.entry("status", new VerbHelp("<pipeline-id> [--watch]",
-                    "Show a pipeline's current state; --watch streams it until Ctrl-C.")),
+                    "Show a pipeline's state, rate and lag; --watch streams them until Ctrl-C.")),
             Map.entry("metrics", new VerbHelp("<pipeline-id>",
                     "Show a pipeline's counters and per-table positions.")),
             Map.entry("snapshot", new VerbHelp("<pipeline-id>",

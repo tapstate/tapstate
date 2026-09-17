@@ -1,7 +1,10 @@
 package io.tapstate.cli;
 
+import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * The cells of the metrics face the status answer reads, pulled out of the open map in the one place their
@@ -29,8 +32,12 @@ import java.util.Map;
  * @param stalledChains chains whose durable position has not advanced, mapped to how long, in milliseconds.
  *                      Only entries above zero are kept: zero is the healthy reading and carrying it would
  *                      make "a chain is stuck" true of every running pipeline
+ * @param movement      what the run had moved and how far behind it stood, read off the measured facts
+ *                      rather than the open map, or null when the face carried neither -- which is how a
+ *                      pipeline with no live job reads, and is kept apart from a run that moved nothing
  */
-record MetricsFacts(Long reconcileFailuresInARow, Long recordCount, Map<String, Long> stalledChains) {
+record MetricsFacts(Long reconcileFailuresInARow, Long recordCount, Map<String, Long> stalledChains,
+        MovementReading movement) {
 
     /**
      * How many convergence passes in a row have thrown, published only while a streak is running.
@@ -48,18 +55,76 @@ record MetricsFacts(Long reconcileFailuresInARow, Long recordCount, Map<String, 
     /** How long one chain's durable position has stood still, keyed by chain after the dot. */
     private static final String STALLED_PREFIX = "frontierStalledMillis.";
 
+    /**
+     * Rows the run has moved, as the measured fact rather than the open map's cell: one point per table
+     * and direction, each stamped with when it was observed, which is what a rate needs and the map has
+     * not got. Its points are summed over tables, per direction.
+     */
+    static final String RECORDS_FACT = "tapstate.pipeline.records";
+
+    /** How far behind each table stands, in seconds, one point per table. */
+    static final String LAG_FACT = "tapstate.pipeline.lag";
+
+    /** The attribute a records point carries its direction under, and the one a lag point names its table under. */
+    static final String DIRECTION_ATTRIBUTE = "direction";
+    static final String TABLE_ATTRIBUTE = "tapstate.table.id";
+
     MetricsFacts {
         stalledChains = stalledChains == null ? Map.of() : Map.copyOf(stalledChains);
     }
 
+    MetricsFacts(Long reconcileFailuresInARow, Long recordCount, Map<String, Long> stalledChains) {
+        this(reconcileFailuresInARow, recordCount, stalledChains, null);
+    }
+
     /** Reads the three cells out of one metrics answer; every one of them may legitimately be absent. */
     static MetricsFacts of(Map<String, Long> metrics) {
+        return of(metrics, List.of());
+    }
+
+    /** The same, with the movement read off the measured facts beside the map. */
+    static MetricsFacts of(Map<String, Long> metrics, List<MetricsOutcome.FactPoint> facts) {
         Map<String, Long> stalled = new LinkedHashMap<>();
         metrics.forEach((name, value) -> {
             if (name.startsWith(STALLED_PREFIX) && value != null && value > 0) {
                 stalled.put(name.substring(STALLED_PREFIX.length()), value);
             }
         });
-        return new MetricsFacts(metrics.get(RECONCILE_STREAK), metrics.get(RECORD_COUNT), stalled);
+        return new MetricsFacts(metrics.get(RECONCILE_STREAK), metrics.get(RECORD_COUNT), stalled, movementOf(facts));
+    }
+
+    /**
+     * The movement reading off the facts, or null when they carry neither a records point nor a lag point.
+     * Records are summed over every table per direction -- the overflow point a folded table set carries
+     * counts too, since it is the remainder and not a duplicate. The reading's time is the latest any of
+     * its points was observed; they are one observation, so this is that observation's time.
+     */
+    static MovementReading movementOf(List<MetricsOutcome.FactPoint> facts) {
+        Map<String, Long> records = new TreeMap<>();
+        Map<String, Long> lag = new TreeMap<>();
+        Instant observedAt = null;
+        boolean any = false;
+        for (MetricsOutcome.FactPoint point : facts) {
+            if (RECORDS_FACT.equals(point.name())) {
+                String direction = point.attributes().get(DIRECTION_ATTRIBUTE);
+                if (direction == null || point.value() == null) {
+                    continue;
+                }
+                records.merge(direction, point.value(), Long::sum);
+            } else if (LAG_FACT.equals(point.name())) {
+                String table = point.attributes().get(TABLE_ATTRIBUTE);
+                if (table == null || point.value() == null) {
+                    continue;
+                }
+                lag.put(table, point.value());
+            } else {
+                continue;
+            }
+            any = true;
+            if (point.observedAt() != null && (observedAt == null || point.observedAt().isAfter(observedAt))) {
+                observedAt = point.observedAt();
+            }
+        }
+        return any ? new MovementReading(observedAt, records, lag) : null;
     }
 }

@@ -619,6 +619,14 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   what you asked for rather than changing with the command. Immediately after `start`
   the first `status`/`metrics` may report no observation yet, and a `status` right
   after `stop` can still say `running`. Use `--watch`, or retry after a second.
+- Under the answer, `status` prints two more lines. `moving` is how fast the pipeline moves, in rows
+  per second per direction, measured between two readings of the pipeline's own observation time —
+  never this machine's clock, which keeps running while a stalled publisher's reading stands still. A
+  one-shot `status` takes the second reading itself, waiting up to a few seconds for a newer
+  observation; while there is only one reading it says `not known`, not `0`, because a pipeline
+  observed once and a pipeline that moved nothing call for different next steps. `lag` is how far
+  behind each table stands. `status --watch` prints a `moving` line every five seconds beside the
+  state changes it streams, the first of which is `not known yet` for the same reason.
 - `metrics` is the signal for progress: `records.out` climbing and no `errors.<code>` key appearing.
   Failures are counted per error code, and a pipeline that has failed nothing carries no such key.
 - **`status` answers "why is it not working" itself**, under the state line: it walks a short fixed

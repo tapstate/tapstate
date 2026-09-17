@@ -1727,6 +1727,30 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void metricsReadsTheSingleValuedPointsOffTheFactsAndPassesADistributionOver() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1/metrics", 200,
+                "{\"pipelineId\":\"pl1\",\"metrics\":{\"records.out\":42},\"facts\":["
+                        + "{\"name\":\"tapstate.pipeline.records\",\"type\":\"counter\",\"unit\":\"{record}\",\"points\":["
+                        + "{\"attributes\":{\"direction\":\"out\",\"tapstate.pipeline.id\":\"pl1\",\"tapstate.table.id\":\"orders\"},"
+                        + "\"startTime\":\"2026-09-17T09:59:00Z\",\"observedAt\":\"2026-09-17T10:00:00Z\",\"value\":42}]},"
+                        + "{\"name\":\"tapstate.pipeline.record.delivery.duration\",\"type\":\"histogram\",\"unit\":\"s\",\"points\":["
+                        + "{\"attributes\":{\"tapstate.table.id\":\"orders\"},\"observedAt\":\"2026-09-17T10:00:00Z\","
+                        + "\"count\":3,\"sum\":1.5,\"bounds\":[1.0],\"bucketCounts\":[3,0]}]}]}", seen);
+        try {
+            MetricsOutcome outcome = new HttpControlPlaneClient().metrics(baseOf(server), "tok-abc", "pl1");
+            assertThat(outcome).isInstanceOf(MetricsOutcome.Found.class);
+            MetricsOutcome.Found found = (MetricsOutcome.Found) outcome;
+            assertThat(found.facts()).containsExactly(new MetricsOutcome.FactPoint(
+                    "tapstate.pipeline.records",
+                    Map.of("direction", "out", "tapstate.pipeline.id", "pl1", "tapstate.table.id", "orders"),
+                    java.time.Instant.parse("2026-09-17T10:00:00Z"), 42L));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void metricsCapturesTheTargetAckedPositionFromTheOpenMap() throws Exception {
         // The position is a sibling of the metrics map, not a cell inside it: a source position is a
         // string and every metrics cell is a number, so the two never share a container.
