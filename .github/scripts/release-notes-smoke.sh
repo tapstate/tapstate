@@ -66,6 +66,15 @@ note() {
   fi
 }
 
+# A body that ENDS at its release note, with what `pr.sh` appends after the template's last section.
+# The helper above always writes `## Checks` afterwards and any heading stops the reader, so every
+# fixture in this file was the one shape that cannot reproduce what actually shipped: two v0.5.0
+# bullets carried this trailer into the public notes. The trailer opens with a rule rather than a
+# heading, and that is the whole of it.
+trailer() {   # sentence, kind -- as a body whose last heading is the section itself
+  printf '## What changed\n\nx\n\n### Release note\n\n**Kind:** %s\n\n%s\n\n\n---\n\nRefs #99\n\n**Issues filed while working this line** -- a live query, so it includes\nany filed after this body was written:\nhttps://github.com/tapstate/tapstate/issues\n\nMerging this does not close the execution issue for some-line. That happens at\nthe closeout, once every repository this workstream declares has merged.\n\n**Maintainer: run the closeout for some-line after merging.**\n' "$2" "$1"
+}
+
 body 11 "$(note 'You can assemble tables from MySQL and PostgreSQL into one object, without creating a view.' new)"
 body 12 "$(note 'none')"
 body 13 "$(printf '## What changed\n\nInternal only.\n\n## Checks\n\n- [ ] x\n')"
@@ -73,6 +82,7 @@ body 14 "$(note 'none -- build configuration only.')"
 body 15 "$(note 'You can read a task write-back position from the CLI, so that a stalled task can be told apart from a slow one.' new)"
 body 16 "$(note 'Rows deleted at the source while a task was down no longer survive a reload, so that a purge is not needed by hand.' fix)"
 body 17 "$(note 'You can pass a workspace directory to the CLI, so that a demo need not run from the current directory.')"
+body 18 "$(trailer 'You can name a workspace on the command line, so that two demos need not share one directory.' new)"
 
 seed "Assemble across sources (#11)"
 seed "Refactor the registry (#12)"
@@ -81,6 +91,7 @@ seed "CI: cache maven (#14)"
 seed "Merge pull request #15 from contributor/write-back-position"
 seed "Delete-during-downtime survives a reload (#16)"
 seed "Take a workspace directory (#17)"
+seed "Name a workspace (#18)"
 
 out="$(cd "$repo" && bash "$script" --version 0.4.0 --base v0.3.0 --sha HEAD \
   --macos-req 'Recommended macOS: 15.0 or newer.' --glibc-req 'Recommended glibc: 2.34 or newer.' 2>&1)"
@@ -121,17 +132,26 @@ has  "the measured glibc floor is in"      "Recommended glibc: 2.34 or newer."
 has  "a written note is carried over verbatim" "* You can assemble tables from MySQL and PostgreSQL into one object, without creating a view."
 has  "a merge-commit subject is harvested too" "* You can read a task write-back position from the CLI"
 hasnt "the section's next heading is not swallowed" "## Checks"
+# The other end of the same question, and the one that was never asked: what stops the reader when
+# there is no next heading. Both halves are needed -- a reader that stopped at nothing would pass the
+# line above by swallowing everything, and a reader that stopped at everything would fail it.
+has   "a body that ends at its release note still carries the sentence" \
+      "so that two demos need not share one directory."
+hasnt "and not what pr.sh appends after it"       "Issues filed while working this line"
+hasnt "nor the reminder meant for the maintainer" "run the closeout for"
+hasnt "nor the reference it opens with"           "Refs #99"
 # The three that must produce nothing, counted rather than searched for. Their absence cannot be
 # checked by looking for their text -- a pull request that contributes no entry contributes no text
-# at all, so "the body does not contain it" is true before the script has done anything. Two entries
-# from five pull requests is the assertion; anything that leaks one of the three makes it three.
+# at all, so "the body does not contain it" is true before the script has done anything. Three
+# entries from six pull requests is the assertion; anything that leaks one of the three makes it
+# four.
 whats_new="$(printf '%s\n' "$out" | awk '/^## What.s new$/ { inside = 1; next } /^## / { inside = 0 } /^<!--/ { inside = 0 } inside')"
 bullets="$(printf '%s\n' "$whats_new" | grep -c '^\* ')"
-if [ "$bullets" = 2 ]; then
-  printf '  ok    %s\n' "the three that say nothing produce no entries (2 bullets from 5 pull requests)"
+if [ "$bullets" = 3 ]; then
+  printf '  ok    %s\n' "the three that say nothing produce no entries (3 bullets from 6 pull requests)"
   passed=$((passed + 1))
 else
-  printf '  FAIL  %s\n        wanted 2 bullets, got %s:\n%s\n' \
+  printf '  FAIL  %s\n        wanted 3 bullets, got %s:\n%s\n' \
     "the three that say nothing produce no entries" "$bullets" "$whats_new"
   failed=$((failed + 1))
 fi
@@ -157,7 +177,7 @@ ck_bucket() {
   if [ "$got" = "$want" ]; then printf '  ok    %s\n' "$name"; passed=$((passed + 1))
   else printf '  FAIL  %s\n        wanted %s bullet(s) under "## %s", got %s\n' "$name" "$want" "$heading" "$got"; failed=$((failed + 1)); fi
 }
-ck_bucket "the two new capabilities are under What's new" "What's new" 2
+ck_bucket "the three new capabilities are under What's new" "What's new" 3
 ck_bucket "the fix is under its own heading"              "Fixes"      1
 ck_bucket "an unclassified note is filed as neither"      "Other changes" 1
 has  "the fix's sentence is carried"      "* Rows deleted at the source while a task was down"
