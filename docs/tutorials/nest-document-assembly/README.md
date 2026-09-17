@@ -309,7 +309,7 @@ The reason follows directly from the rule. `on: { id: product_id }` declares tha
 identified by `product_id`, and `order_items` is keyed by `id`. Were it allowed to run, there would be
 600 lines but only 20 distinct products, so 600 lines would collapse into 20 identity slots and each
 product would attach to exactly one line: **20 of 600 lines coming back with a `product` and the other
-580 with none, while `errorCount` stayed at 0 throughout**. That is the shape this refusal exists to
+580 with none, and not a single failure counted anywhere**. That is the shape this refusal exists to
 prevent - it is the one failure here that no counter would have shown you.
 
 **So: a nest embeds children that belong to a parent. It does not look up rows a parent refers to.**

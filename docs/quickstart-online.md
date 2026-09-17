@@ -611,7 +611,7 @@ tool for stopping its own process.
 ```console
 tapstate(admin@127.0.0.1:8080)> status order_pipeline             # state, and why if it is not working
 tapstate(admin@127.0.0.1:8080)> status order_pipeline --watch    # live state; Ctrl-C to stop
-tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # recordCount / errorCount / positions
+tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # records.out / errors.<code> / positions
 tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local operational log tail
 ```
 
@@ -619,7 +619,8 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   what you asked for rather than changing with the command. Immediately after `start`
   the first `status`/`metrics` may report no observation yet, and a `status` right
   after `stop` can still say `running`. Use `--watch`, or retry after a second.
-- `metrics` is the signal for progress: `recordCount` climbing, `errorCount` at 0.
+- `metrics` is the signal for progress: `records.out` climbing and no `errors.<code>` key appearing.
+  Failures are counted per error code, and a pipeline that has failed nothing carries no such key.
 - **`status` answers "why is it not working" itself**, under the state line: it walks a short fixed
   checklist over the same four faces you can read by hand and prints what it concluded, the face and
   value it read, and where to look next. When nothing on the checklist matches it does **not** report
