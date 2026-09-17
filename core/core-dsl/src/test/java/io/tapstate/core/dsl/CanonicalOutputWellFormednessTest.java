@@ -69,7 +69,7 @@ class CanonicalOutputWellFormednessTest {
                                                         EmbedAs.ARRAY, "policies",
                                                         List.of("POLICY_ID"), null, null, null)))), null)),
                 new ViewBlock.Inline("customer_360", FromRef.literal("c360"), "customer_id",
-                        new Storage(new Storage.Hot("1h"), null, null), null),
+                        new Storage(new Storage.Hot("1h"), null, null)),
                 new ServeBlock.Inline(null, FromRef.literal("customer_360"), null,
                         List.of(new QueryElement(QueryType.REST, null)), null),
                 null, null);

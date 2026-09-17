@@ -36,7 +36,6 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewResource;
-import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -386,8 +385,7 @@ class CanonicalWriterTest {
                                                                     null)))))), null)),
                     new ViewBlock.Inline("customer_360", FromRef.literal("c360"), "customer_id",
                             new Storage(new Storage.Hot("1h"),
-                                    new Storage.Warm("customer_360", List.of("customer_id")), null),
-                            null),
+                                    new Storage.Warm("customer_360", List.of("customer_id")), null)),
                     new ServeBlock.Inline(null, FromRef.literal("customer_360"), null,
                             List.of(new QueryElement(QueryType.REST, null)), null),
                     null, null);
@@ -461,7 +459,7 @@ class CanonicalWriterTest {
                             null)),
                     new ViewBlock.Inline("cust_stats", FromRef.literal("cust_orders"),
                             "customer_id",
-                            new Storage(null, new Storage.Warm("cust_stats", null), null), null),
+                            new Storage(null, new Storage.Warm("cust_stats", null), null)),
                     null, null, null);
 
             assertThat(writer.write(p)).isEqualTo("""
@@ -689,8 +687,7 @@ class CanonicalWriterTest {
         @Test
         void writesViewDefinitionBody() {
             ViewResource v = new ViewResource("v_cust", null, "customer_id",
-                    new Storage(null, new Storage.Warm("cust", null), null),
-                    new ViewSchema(true, "additive"), null);
+                    new Storage(null, new Storage.Warm("cust", null), null), null);
 
             assertThat(writer.write(v)).isEqualTo("""
                     version: tapstate/v1
@@ -700,9 +697,6 @@ class CanonicalWriterTest {
                     storage:
                       warm:
                         collection: cust
-                    schema:
-                      enforce: true
-                      evolution: additive
                     """);
         }
 

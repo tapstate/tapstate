@@ -485,7 +485,7 @@ final class NewCmd extends SingleResourceOptions implements Callable<Integer> {
         }
         try {
             Resource resource =
-                    interactive ? runViewWizard() : new ViewResource(id, null, primaryKey, null, null, null);
+                    interactive ? runViewWizard() : new ViewResource(id, null, primaryKey, null, null);
             return emit(resource);
         } catch (TapstateException e) {
             return emitDiagnostic(e);

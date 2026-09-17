@@ -657,7 +657,6 @@ class DataBrowserApiTest {
                             new Metadata(null, "One row per order, shipments inlined"),
                             null,
                             new Storage(null, new Storage.Warm("order_state", null), null),
-                            null,
                             null));
         }
 

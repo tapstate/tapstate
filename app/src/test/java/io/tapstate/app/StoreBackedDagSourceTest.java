@@ -316,7 +316,7 @@ class StoreBackedDagSourceTest {
                 List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
                                 new TransformBody.MapProjection(Map.of("region", FieldRule.drop())), null),
                         filter("keep_even", "row.id % 2 == 0", FromRef.literal("trimmed"))),
-                new ViewBlock.Inline("order_state", FromRef.literal("keep_even"), "id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("keep_even"), "id", null),
                 null, null, null));
         store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
                 new SourceModel(List.of(new SourceTable("orders",
@@ -406,7 +406,7 @@ class StoreBackedDagSourceTest {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(cdcSource("orders_src", "orders"));
         store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
-        store.artifacts().save(new ViewResource("order_state", null, "order_id", null, null, null));
+        store.artifacts().save(new ViewResource("order_state", null, "order_id", null, null));
         store.artifacts().save(new PipelineResource(
                 "p", null, List.of(SourceRef.spec("orders_src", true)), null,
                 new ViewBlock.Use(null, "order_state", FromRef.literal("orders_src")),
@@ -445,7 +445,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(cdcSource("orders_src", "orders"));
         store.artifacts().save(new PipelineResource(
                 "p", null, List.of(SourceRef.spec("orders_src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null),
                 null, null, null));
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
@@ -465,7 +465,7 @@ class StoreBackedDagSourceTest {
                 "p", null,
                 List.of(SourceRef.spec("orders_src", true)),
                 null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null),
                 null, null, null));
 
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
@@ -553,7 +553,7 @@ class StoreBackedDagSourceTest {
                 List.of(SourceRef.spec("orders_src", true)),
                 List.of(Step.inline("trimmed", FromClause.list(FromRef.literal("orders_src")),
                         new TransformBody.MapProjection(dropRegion), null)),
-                new ViewBlock.Inline("order_state", FromRef.literal("trimmed"), "id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("trimmed"), "id", null),
                 null, null, null));
         store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
                 new SourceModel(List.of(new SourceTable("orders",
@@ -683,7 +683,7 @@ class StoreBackedDagSourceTest {
         store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
         store.artifacts().save(new PipelineResource(
                 "p", null, List.of(SourceRef.spec("orders_src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null),
                 null, null, null));
         return store;
     }

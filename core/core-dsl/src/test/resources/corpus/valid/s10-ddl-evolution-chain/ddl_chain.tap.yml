@@ -14,7 +14,6 @@ view:
   from: norm
   primary_key: emp_id
   storage: { warm: { collection: emp_mirror } }
-  schema: { enforce: true, evolution: additive }
 serve:
   from: emp_mirror
   sync:

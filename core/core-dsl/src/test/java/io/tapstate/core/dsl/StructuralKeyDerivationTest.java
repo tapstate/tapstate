@@ -22,7 +22,6 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewResource;
-import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.YamlFlatten;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -242,7 +241,7 @@ class StructuralKeyDerivationTest {
     private static final Set<Class<?>> MODEL_RECORDS = Set.of(
             SourceResource.class, PipelineResource.class, TransformResource.class, ViewResource.class,
             ServeResource.class, Metadata.class, Srs.class, Settings.class, Storage.Hot.class,
-            Storage.Warm.class, Storage.Cold.class, ViewSchema.class, RenameSpec.class,
+            Storage.Warm.class, Storage.Cold.class, RenameSpec.class,
             TableRef.Literal.class, TableRef.Regex.class, TableRef.Spec.class, SyncElement.class,
             PushElement.class, QueryElement.class, NestRoot.class, Embed.class, Step.Inline.class,
             Step.Use.class, ViewBlock.Inline.class, ViewBlock.Use.class, ServeBlock.Inline.class,
@@ -280,7 +279,7 @@ class StructuralKeyDerivationTest {
      */
     private static final Set<String> NOT_RECORD_BACKED = Set.of(
             "NO_ENGINE_OPTIONS", "NEST_ROOT_KEYS", "EMBED_KEYS", "VIEW_INLINE_KEYS", "VIEW_USE_KEYS",
-            "STORAGE_KEYS", "HOT_KEYS", "WARM_KEYS", "COLD_KEYS", "VIEW_SCHEMA_KEYS",
+            "STORAGE_KEYS", "HOT_KEYS", "WARM_KEYS", "COLD_KEYS",
             "SERVE_USE_KEYS", "SERVE_INLINE_KEYS", "RENAME_KEYS", "QUERY_KEYS", "SETTINGS_KEYS",
             "VIEW_DEF_KEYS", "SERVE_DEF_KEYS");
 

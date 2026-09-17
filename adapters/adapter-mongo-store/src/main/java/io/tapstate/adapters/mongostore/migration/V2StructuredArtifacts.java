@@ -14,6 +14,7 @@ import io.tapstate.core.model.canonical.CanonicalWriter;
 import org.bson.Document;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -56,6 +57,11 @@ public final class V2StructuredArtifacts implements ChangeSet {
      */
     private static final Set<String> RETIRED_KEYS = Set.of("options");
 
+    /** View policy positions the released writer emitted before stored bodies became structured. */
+    private static final Map<String, Set<List<String>>> RETIRED_PATHS_BY_KIND = Map.of(
+            "pipeline", Set.of(List.of("view", "schema")),
+            "view", Set.of(List.of("schema")));
+
     @Override
     public int version() {
         return 2;
@@ -77,7 +83,8 @@ public final class V2StructuredArtifacts implements ChangeSet {
                 Document document = cursor.next();
                 String id = String.valueOf(document.get("_id"));
                 try {
-                    Resource resource = PARSER.parseDropping(document.getString("canonical"), RETIRED_KEYS);
+                    Resource resource = PARSER.parseDropping(document.getString("canonical"), RETIRED_KEYS,
+                            RETIRED_PATHS_BY_KIND);
                     converted.put(id, new Document("body", new Document(WRITER.tree(resource)))
                             .append("contentHash", CanonicalHash.of(resource)));
                 } catch (RuntimeException unparsable) {
