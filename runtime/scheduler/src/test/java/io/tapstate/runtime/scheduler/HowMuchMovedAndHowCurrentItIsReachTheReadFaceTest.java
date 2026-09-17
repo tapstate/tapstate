@@ -126,7 +126,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
 
         // Without this a consumer cannot tell a restart from a count going backwards, and every family
         // already on this face is a reading rather than a counter for exactly that want.
-        assertThat(records.points()).allSatisfy(
+        assertThat(records.points()).isNotEmpty().allSatisfy(
                 point -> assertThat(point.startTime()).isEqualTo(STARTED));
     }
 
@@ -173,7 +173,7 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
         // The two ends do not share a start with each other -- the sources open before the job that
         // writes to them -- but each end's two totals must share one, or bytes per row works out over a
         // window that is not either total's window.
-        assertThat(bytes.points()).allSatisfy(point -> assertThat(point.startTime()).isEqualTo(
+        assertThat(bytes.points()).isNotEmpty().allSatisfy(point -> assertThat(point.startTime()).isEqualTo(
                 "in".equals(point.attributes().get("direction")) ? READING_SINCE : STARTED));
     }
 

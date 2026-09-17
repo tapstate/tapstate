@@ -113,7 +113,9 @@ class WhichKindOfFailureIsRisingReachesTheReadFaceTest {
         // Absent, not nought -- and the cell that used to be here unconditionally, errorCount, is gone
         // rather than renamed: it was the pipeline's state wearing a count's name.
         assertThat(observations.read("orders").orElseThrow().metrics()).doesNotContainKey("errorCount");
-        assertThat(facts(publisher)).extracting(MetricFact::name).doesNotContain(ERRORS);
+        // Nothing else is measured in this fixture either, so "no failure metric" is "no facts at all";
+        // an absence asserted over an empty list would hold on every implementation, this does not.
+        assertThat(facts(publisher)).isEmpty();
     }
 
     @Test

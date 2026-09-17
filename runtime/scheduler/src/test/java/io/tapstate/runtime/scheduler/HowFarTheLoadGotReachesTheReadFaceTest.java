@@ -105,7 +105,9 @@ class HowFarTheLoadGotReachesTheReadFaceTest {
     void noLoadPublishesNothingAtAll() {
         List<MetricFact> measured = facts(SnapshotReading.NONE);
 
-        assertThat(measured).extracting(MetricFact::name).doesNotContain(ROWS, TOTAL);
+        // Nothing else is measured in this fixture, so "neither measurement" is "no facts at all"; an
+        // absence asserted over an empty list would hold on every implementation, this does not.
+        assertThat(measured).isEmpty();
     }
 
     @Test
