@@ -55,7 +55,23 @@ public enum CardinalityBudget {
     SNAPSHOT_ROWS("tapstate.pipeline.snapshot.rows", MetricAttributes.TABLE_ID, 1_000),
     SNAPSHOT_ROWS_TOTAL("tapstate.pipeline.snapshot.rows.total", MetricAttributes.TABLE_ID, 1_000),
     /** Codes come from a catalog and from connectors, not from rows, but a connector may contribute any number. */
-    ERRORS("tapstate.pipeline.errors", MetricAttributes.CODE, 200);
+    ERRORS("tapstate.pipeline.errors", MetricAttributes.CODE, 200),
+    /**
+     * The families below carry a dimension the pipeline's definition draws — a chain, a nest level, a join
+     * dimension — and are budgeted like the table for the same reason: a definition can name as many of them
+     * as it names tables, and nothing that flows through the pipeline can add one.
+     */
+    FRONTIER_GAP("tapstate.pipeline.frontier.gap", MetricAttributes.CHAIN_ID, 1_000),
+    FRONTIER_STALL("tapstate.pipeline.frontier.stall", MetricAttributes.CHAIN_ID, 1_000),
+    NEST_ENTRIES("tapstate.pipeline.nest.entries", MetricAttributes.NEST_NAMESPACE, 1_000),
+    NEST_ACCESSES("tapstate.pipeline.nest.accesses", MetricAttributes.NEST_NAMESPACE, 1_000),
+    NEST_BACKFILLS("tapstate.pipeline.nest.backfills", MetricAttributes.NEST_NAMESPACE, 1_000),
+    NEST_BACKFILL_TIME("tapstate.pipeline.nest.backfill.time", MetricAttributes.NEST_NAMESPACE, 1_000),
+    NEST_PENDING_HIGH_WATER("tapstate.pipeline.nest.pending.high_water", MetricAttributes.NEST_NAMESPACE, 1_000),
+    NEST_STORED("tapstate.pipeline.nest.stored", MetricAttributes.NEST_NAMESPACE, 1_000),
+    NEST_DEAD_LETTERED("tapstate.pipeline.nest.dead_lettered", MetricAttributes.NEST_NAMESPACE, 1_000),
+    JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000),
+    JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE, 1_000);
 
     /**
      * The series one instrument may hold across every pipeline of a process, which is where an exporter

@@ -84,11 +84,39 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.process.duration",
                         "tapstate.pipeline.snapshot.rows",
                         "tapstate.pipeline.snapshot.rows.total",
-                        "tapstate.pipeline.errors");
+                        "tapstate.pipeline.errors",
+                        "tapstate.pipeline.frontier.gap",
+                        "tapstate.pipeline.frontier.stall",
+                        "tapstate.pipeline.nest.entries",
+                        "tapstate.pipeline.nest.accesses",
+                        "tapstate.pipeline.nest.backfills",
+                        "tapstate.pipeline.nest.backfill.time",
+                        "tapstate.pipeline.nest.pending.high_water",
+                        "tapstate.pipeline.nest.stored",
+                        "tapstate.pipeline.nest.dead_lettered",
+                        "tapstate.pipeline.join.recompute.rows",
+                        "tapstate.pipeline.join.recompute.rows.total");
         for (CardinalityBudget budget : List.of(CardinalityBudget.RECORDS, CardinalityBudget.BYTES,
                 CardinalityBudget.LAG, CardinalityBudget.RECORD_DELIVERY_DURATION,
                 CardinalityBudget.SNAPSHOT_ROWS, CardinalityBudget.SNAPSHOT_ROWS_TOTAL)) {
             assertThat(budget.openDimension()).as(budget.name()).contains(TABLE_ID);
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
+        }
+        // The families a definition draws are budgeted like the table: the definition names them, rows cannot.
+        for (CardinalityBudget budget : List.of(CardinalityBudget.FRONTIER_GAP, CardinalityBudget.FRONTIER_STALL)) {
+            assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.CHAIN_ID);
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
+        }
+        for (CardinalityBudget budget : List.of(CardinalityBudget.NEST_ENTRIES, CardinalityBudget.NEST_ACCESSES,
+                CardinalityBudget.NEST_BACKFILLS, CardinalityBudget.NEST_BACKFILL_TIME,
+                CardinalityBudget.NEST_PENDING_HIGH_WATER, CardinalityBudget.NEST_STORED,
+                CardinalityBudget.NEST_DEAD_LETTERED)) {
+            assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.NEST_NAMESPACE);
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
+        }
+        for (CardinalityBudget budget : List.of(CardinalityBudget.JOIN_RECOMPUTE_ROWS,
+                CardinalityBudget.JOIN_RECOMPUTE_ROWS_TOTAL)) {
+            assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.JOIN_NAMESPACE);
             assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
         }
         assertThat(CardinalityBudget.ERRORS.openDimension()).contains(CODE);

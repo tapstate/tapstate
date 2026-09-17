@@ -25,6 +25,14 @@ import java.util.Set;
  *       engine draws a vertex with, see {@link Stage}.</li>
  * </ul>
  *
+ * <p>Three more keys name a thing the pipeline's own definition draws: the chain a frontier reading is
+ * about, the namespace a nest keeps its state under, and the namespace a join rebuilds a dimension in.
+ * Like the table, each is a name the definition gives rather than a stable identity the product mints —
+ * rename the thing and its series ends where a new one begins — and, like the table, how many of them
+ * there are is decided by the definition and not by the rows that flow through it. What a point may
+ * never carry is a value read out of a row: the key a rebuild is about, say, would be one, and it stays
+ * out of the attributes for that reason.
+ *
  * <p>{@link #OVERFLOW} is not a dimension. It marks the one series per remaining combination that holds
  * what a cardinality budget would not name individually, under the key every OpenTelemetry consumer
  * already knows for exactly that series.
@@ -33,6 +41,12 @@ public final class MetricAttributes {
 
     public static final String PIPELINE_ID = "tapstate.pipeline.id";
     public static final String TABLE_ID = "tapstate.table.id";
+    /** The chain — one source's change log — a frontier reading is about. */
+    public static final String CHAIN_ID = "tapstate.chain.id";
+    /** The namespace a nest step keeps one level of its state under. */
+    public static final String NEST_NAMESPACE = "tapstate.nest.namespace";
+    /** The namespace a join step mirrors one dimension in. */
+    public static final String JOIN_NAMESPACE = "tapstate.join.namespace";
     public static final String DIRECTION = "direction";
     public static final String OP = "op";
     public static final String CODE = "code";

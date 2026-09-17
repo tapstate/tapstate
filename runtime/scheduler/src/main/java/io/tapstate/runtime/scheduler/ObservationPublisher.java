@@ -135,6 +135,23 @@ public final class ObservationPublisher {
     private static final String JOIN_RECOMPUTE_EXPECTED_PREFIX = "joinRecomputeRowsExpected.";
 
     /**
+     * The canonical names of the per-chain and per-namespace readings above, under which they travel as
+     * facts with the chain or the namespace as an attribute. The prefixes above are how the flat face
+     * spells the same readings, one key per chain or namespace, and {@link #FLAT_REDUCTIONS} is where the
+     * two are tied together: every reader of the flat face keeps its key, and a reader of the facts gets
+     * the dimension as a dimension.
+     */
+    private static final String FRONTIER_GAP_METRIC = "tapstate.pipeline.frontier.gap";
+    private static final String FRONTIER_STALL_METRIC = "tapstate.pipeline.frontier.stall";
+    private static final String NEST_ENTRIES_METRIC = "tapstate.pipeline.nest.entries";
+    private static final String NEST_ACCESSES_METRIC = "tapstate.pipeline.nest.accesses";
+    private static final String NEST_BACKFILLS_METRIC = "tapstate.pipeline.nest.backfills";
+    private static final String NEST_BACKFILL_TIME_METRIC = "tapstate.pipeline.nest.backfill.time";
+    private static final String NEST_PENDING_HIGH_WATER_METRIC = "tapstate.pipeline.nest.pending.high_water";
+    private static final String NEST_STORED_METRIC = "tapstate.pipeline.nest.stored";
+    private static final String NEST_DEAD_LETTERED_METRIC = "tapstate.pipeline.nest.dead_lettered";
+
+    /**
      * The three measurements of a pipeline's movement that carry their dimensions as attributes rather
      * than in their names. Their names are the canonical ones a monitoring backend sees; how the flat
      * face below spells them is that face's business and is decided in {@link #FLAT_REDUCTIONS}.
@@ -193,6 +210,8 @@ public final class ObservationPublisher {
 
     private static final String PIPELINE_ID_ATTRIBUTE = MetricAttributes.PIPELINE_ID;
     private static final String TABLE_ID_ATTRIBUTE = MetricAttributes.TABLE_ID;
+    private static final String CHAIN_ID_ATTRIBUTE = MetricAttributes.CHAIN_ID;
+    private static final String NEST_NAMESPACE_ATTRIBUTE = MetricAttributes.NEST_NAMESPACE;
     private static final String DIRECTION_ATTRIBUTE = MetricAttributes.DIRECTION;
     private static final String OP_ATTRIBUTE = MetricAttributes.OP;
     private static final String INBOUND = "in";
@@ -210,16 +229,35 @@ public final class ObservationPublisher {
      * <p>Collapsing is not the same as dropping and is recorded separately by the projection, so what a
      * reader of this face is actually looking at stays answerable.
      */
-    private static final Map<String, FlatReduction> FLAT_REDUCTIONS = Map.of(
-            RECORDS_METRIC, attributes -> "records." + attributes.get(DIRECTION_ATTRIBUTE),
-            BYTES_METRIC, attributes -> "bytes." + attributes.get(DIRECTION_ATTRIBUTE),
-            LAG_METRIC, attributes -> "lag." + attributes.get(TABLE_ID_ATTRIBUTE),
+    static final Map<String, FlatReduction> FLAT_REDUCTIONS = Map.ofEntries(
+            Map.entry(RECORDS_METRIC, attributes -> "records." + attributes.get(DIRECTION_ATTRIBUTE)),
+            Map.entry(BYTES_METRIC, attributes -> "bytes." + attributes.get(DIRECTION_ATTRIBUTE)),
+            Map.entry(LAG_METRIC, attributes -> "lag." + attributes.get(TABLE_ID_ATTRIBUTE)),
             // Reduced and not dropped, which is the opposite of what the load's two measurements get, and
             // for the reason that decides between them: a drop is only honest when another face carries
             // the metric, and the load has one - this observation's own snapshot dataset. Failures have
             // none. Dropped here they would be measured and readable nowhere at all until an exporter
             // exists, which is a gate away.
-            ERRORS_METRIC, attributes -> "errors." + attributes.get(CODE_ATTRIBUTE));
+            Map.entry(ERRORS_METRIC, attributes -> "errors." + attributes.get(CODE_ATTRIBUTE)),
+            // The per-chain and per-namespace families keep the flat keys they have always had, letter for
+            // letter: one key per chain or namespace, the dimension appended to a fixed prefix. That is the
+            // spelling every reader of this face was built against, and the facts beside it are where the
+            // dimension became an attribute -- the change is in what is carried, not in what anybody reads.
+            Map.entry(FRONTIER_GAP_METRIC, attributes -> FRONTIER_GAP_PREFIX + attributes.get(CHAIN_ID_ATTRIBUTE)),
+            Map.entry(FRONTIER_STALL_METRIC,
+                    attributes -> FRONTIER_STALLED_PREFIX + attributes.get(CHAIN_ID_ATTRIBUTE)),
+            Map.entry(NEST_ENTRIES_METRIC, attributes -> NEST_ENTRIES_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_ACCESSES_METRIC,
+                    attributes -> NEST_ACCESSES_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_BACKFILLS_METRIC,
+                    attributes -> NEST_BACKFILLS_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_BACKFILL_TIME_METRIC,
+                    attributes -> NEST_BACKFILL_MILLIS_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_PENDING_HIGH_WATER_METRIC,
+                    attributes -> NEST_PENDING_HIGH_WATER_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_STORED_METRIC, attributes -> NEST_STORED_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_DEAD_LETTERED_METRIC,
+                    attributes -> NEST_DEAD_LETTERED_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)));
 
     /**
      * The name the metric contract gives each of this engine's change kinds.
@@ -642,12 +680,26 @@ public final class ObservationPublisher {
         return Instant.now(clock).truncatedTo(ChronoUnit.MILLIS);
     }
 
-    /**
-     * One metric read at {@code at}, with no dimensions broken out of its name. Every statistic this
-     * publisher produces is of that shape today, which is why the helper offers no other.
-     */
+    /** One metric read at {@code at}, with no dimensions: the shape of a quantity with nothing to break out. */
     private static MetricFact readAt(String name, String unit, Instant at, long value) {
         return MetricFact.single(name, MetricType.GAUGE, unit, MetricPoint.reading(Map.of(), at, value));
+    }
+
+    /**
+     * One metric read at {@code at} with one point per value of {@code dimension}, each point carrying the
+     * pipeline and that value as attributes; empty when nothing reported, so that a family with no reading
+     * stays absent rather than present with no points. The dimension is an attribute here and a suffix on
+     * the flat face, and {@link #FLAT_REDUCTIONS} is what keeps the two spellings of one reading in step.
+     */
+    private static Optional<MetricFact> readingsAt(String pipelineId, String name, String unit, Instant at,
+            String dimension, Map<String, Long> byValue) {
+        if (byValue.isEmpty()) {
+            return Optional.empty();
+        }
+        List<MetricPoint> points = new ArrayList<>();
+        byValue.forEach((value, reading) -> points.add(MetricPoint.reading(
+                Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, dimension, value), at, reading)));
+        return Optional.of(new MetricFact(name, MetricType.GAUGE, unit, points));
     }
 
     /**
@@ -666,9 +718,11 @@ public final class ObservationPublisher {
      * restart onward. So they are readings until the engine reports a start alongside them. That is a gap
      * in what is measured, and describing them as anything else here would only hide it.
      *
-     * <p>Each family still carries its one dimension inside its name, appended to a fixed prefix, which is
-     * why every point below is attribute-free. That is what a flat numeric face can carry; the facts exist
-     * first so that changing it has one place to happen instead of one per consumer.
+     * <p>The per-chain and per-namespace families carry their dimension as an attribute, one fact per family
+     * with a point per chain or namespace; the flat face spells each point back out under the key it has
+     * always used, so nothing that reads that face moved. The rebuild pair still carries its subject inside
+     * its name: the tail of that subject is a value out of a row, which no attribute may carry, and how the
+     * pair travels without it is decided where it is migrated rather than assumed here.
      */
     List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
@@ -678,36 +732,52 @@ public final class ObservationPublisher {
         failures(pipelineId, at).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
                 .ifPresent(count -> facts.add(readAt("recordCount", "{record}", at, count)));
-        // One fact per chain that reported a reading, so a chain keeping up and a chain that has stalled
+        // One point per chain that reported a reading, so a chain keeping up and a chain that has stalled
         // stay distinguishable; a chain that reported none is absent rather than zero, which would read as
         // the healthy end of the same scale. The distance is dimensionless: what it counts is a position's
         // worth of ground, which is neither a row nor a second, and naming it either would be a guess a
         // reader would then threshold on.
-        gaps.forEach((chain, gap) -> facts.add(readAt(FRONTIER_GAP_PREFIX + chain, "1", at, gap)));
-        // One fact per chain that is pinned, and none for a chain that is not. The two readings do not
+        readingsAt(pipelineId, FRONTIER_GAP_METRIC, "1", at, CHAIN_ID_ATTRIBUTE, gaps).ifPresent(facts::add);
+        // One point per chain that is pinned, and none for a chain that is not. The two readings do not
         // cover the same chains and neither is the other's default: a chain that caught up has a distance
         // and no pin, and a chain that never advanced has a pin and no distance.
-        pinned.forEach(
-                (chain, millis) -> facts.add(readAt(FRONTIER_STALLED_PREFIX + chain, "ms", at, millis)));
-        // One set per namespace that reported, so a resolver thrashing against its cold layer stays
+        readingsAt(pipelineId, FRONTIER_STALL_METRIC, "ms", at, CHAIN_ID_ATTRIBUTE, pinned).ifPresent(facts::add);
+        // One point per namespace that reported, so a resolver thrashing against its cold layer stays
         // distinguishable from an assembler that is not; a namespace reporting nothing is absent rather
-        // than present at zero, which would read as a state layer that had emptied.
+        // than present at zero, which would read as a state layer that had emptied. Six quantities, six
+        // facts: each is its own instrument, read against the others rather than added to them.
+        Map<String, Long> entries = new LinkedHashMap<>();
+        Map<String, Long> accesses = new LinkedHashMap<>();
+        Map<String, Long> backfills = new LinkedHashMap<>();
+        Map<String, Long> backfillMillis = new LinkedHashMap<>();
+        Map<String, Long> pendingHighWater = new LinkedHashMap<>();
+        Map<String, Long> stored = new LinkedHashMap<>();
         nestReadings.forEach((namespace, reading) -> {
-            facts.add(readAt(NEST_ENTRIES_PREFIX + namespace, "{entry}", at, reading.entries()));
-            facts.add(readAt(NEST_ACCESSES_PREFIX + namespace, "{access}", at, reading.accesses()));
-            facts.add(readAt(NEST_BACKFILLS_PREFIX + namespace, "{backfill}", at, reading.backfills()));
-            facts.add(readAt(NEST_BACKFILL_MILLIS_PREFIX + namespace, "ms", at, reading.backfillMillis()));
-            facts.add(readAt(NEST_PENDING_HIGH_WATER_PREFIX + namespace, "{record}", at,
-                    reading.pendingHighWater()));
-            reading.stored().ifPresent(
-                    stored -> facts.add(readAt(NEST_STORED_PREFIX + namespace, "{entry}", at, stored)));
+            entries.put(namespace, reading.entries());
+            accesses.put(namespace, reading.accesses());
+            backfills.put(namespace, reading.backfills());
+            backfillMillis.put(namespace, reading.backfillMillis());
+            pendingHighWater.put(namespace, reading.pendingHighWater());
+            reading.stored().ifPresent(whole -> stored.put(namespace, whole));
         });
-        // One fact per namespace that discarded something, and none for a namespace that discarded
+        readingsAt(pipelineId, NEST_ENTRIES_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, entries)
+                .ifPresent(facts::add);
+        readingsAt(pipelineId, NEST_ACCESSES_METRIC, "{access}", at, NEST_NAMESPACE_ATTRIBUTE, accesses)
+                .ifPresent(facts::add);
+        readingsAt(pipelineId, NEST_BACKFILLS_METRIC, "{backfill}", at, NEST_NAMESPACE_ATTRIBUTE, backfills)
+                .ifPresent(facts::add);
+        readingsAt(pipelineId, NEST_BACKFILL_TIME_METRIC, "ms", at, NEST_NAMESPACE_ATTRIBUTE, backfillMillis)
+                .ifPresent(facts::add);
+        readingsAt(pipelineId, NEST_PENDING_HIGH_WATER_METRIC, "{record}", at, NEST_NAMESPACE_ATTRIBUTE,
+                pendingHighWater).ifPresent(facts::add);
+        readingsAt(pipelineId, NEST_STORED_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, stored)
+                .ifPresent(facts::add);
+        // One point per namespace that discarded something, and none for a namespace that discarded
         // nothing. The absence is load-bearing here rather than merely tidy: rows that never reach a
         // document leave no other trace, so a reader has only this to go on, and a zero published on every
         // pass is what an unwired count would look like too.
-        discarded.forEach((namespace, count) -> facts.add(
-                readAt(NEST_DEAD_LETTERED_PREFIX + namespace, "{change}", at, count)));
+        readingsAt(pipelineId, NEST_DEAD_LETTERED_METRIC, "{change}", at, NEST_NAMESPACE_ATTRIBUTE, discarded)
+                .ifPresent(facts::add);
         // One pair per rebuild large enough to be worth telling anybody about, and nothing at all for a
         // pipeline where none is running. Both halves are published from their own map rather than one
         // being defaulted from the other: a rebuild whose size arrived without its progress would read as

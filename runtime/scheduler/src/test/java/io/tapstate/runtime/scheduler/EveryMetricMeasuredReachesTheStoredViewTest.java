@@ -87,18 +87,46 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
         // no source to wire -- they are counted from a cause handed over on a witnessing pass, so they are
         // absent here and are covered by the case that feeds one.
         assertThat(measured).hasSize(14);
+        FlatMetricProjection flat = FlatMetricProjection.of(measured, ObservationPublisher.FLAT_REDUCTIONS);
         // The load's two measurements are the only ones this face cannot carry, and it says so rather than
         // letting them go missing. They are not lost with them: the same observation carries the same load
         // as its own snapshot dataset, asserted below, which is the face this drop points at. Putting them
         // on this one as well would spell one number two ways in one document.
-        assertThat(FlatMetricProjection.of(measured).dropped()).containsExactlyInAnyOrder(
+        assertThat(flat.dropped()).containsExactlyInAnyOrder(
                 "tapstate.pipeline.snapshot.rows", "tapstate.pipeline.snapshot.rows.total");
+        // The families that carry a chain or a namespace as an attribute reach this face squeezed back to
+        // one key per value, and the projection says so: a reader of this face is told what they are
+        // reading, and a family added with an attribute and no flat spelling lands in the list above.
+        assertThat(flat.reduced()).containsExactlyInAnyOrder(
+                "tapstate.pipeline.frontier.gap", "tapstate.pipeline.frontier.stall",
+                "tapstate.pipeline.nest.entries", "tapstate.pipeline.nest.accesses",
+                "tapstate.pipeline.nest.backfills", "tapstate.pipeline.nest.backfill.time",
+                "tapstate.pipeline.nest.pending.high_water", "tapstate.pipeline.nest.stored",
+                "tapstate.pipeline.nest.dead_lettered");
 
         Observation published = observations.read("orders").orElseThrow();
-        assertThat(published.metrics().keySet()).containsExactlyInAnyOrderElementsOf(
-                measured.stream().map(MetricFact::name)
-                        .filter(name -> !name.startsWith("tapstate.pipeline.snapshot.rows"))
-                        .toList());
+        // The flat keys, letter for letter. Every reader of this face -- the command line, the end-to-end
+        // helpers, the tutorials -- was built against these spellings, and a family whose dimension moved
+        // into an attribute keeps the key it had: the change is in what the facts carry, not in what this
+        // face says.
+        assertThat(published.metrics()).containsOnlyKeys(
+                "recordCount",
+                "frontierGap.chain-a",
+                "frontierStalledMillis.chain-b",
+                "nestStateEntries.nest.orders.doc.$root",
+                "nestStateAccesses.nest.orders.doc.$root",
+                "nestStateBackfills.nest.orders.doc.$root",
+                "nestStateBackfillMillis.nest.orders.doc.$root",
+                "nestStatePendingHighWater.nest.orders.doc.$root",
+                "nestStateStored.nest.orders.doc.$root",
+                "nestDeadLettered.nest.orders.doc.$root",
+                "joinRecomputeRowsDone.orders.region",
+                "joinRecomputeRowsExpected.orders.region");
+        assertThat(published.metrics())
+                .containsEntry("frontierGap.chain-a", 4L)
+                .containsEntry("frontierStalledMillis.chain-b", 61_000L)
+                .containsEntry("nestStateStored.nest.orders.doc.$root", 400_000L)
+                .containsEntry("nestDeadLettered.nest.orders.doc.$root", 3L);
         assertThat(published.snapshot())
                 .containsOnly(entry("orders", new TableSnapshot(90_000L, 120_000L, 75)));
         // The facts on the document are the measured facts, all of them and as measured: what the flat
@@ -116,9 +144,15 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 Map.of("nest.orders.doc.$root", new NestStateReading(4_000L, 900L, 30L, 210L)),
                 Map.of("chain-a", 4L), Map.of("chain-b", 61_000L), Map.of(), Map.of(), Map.of(), loaded());
 
-        assertThat(measured).filteredOn(fact -> fact.name().equals("frontierStalledMillis.chain-b"))
+        assertThat(measured).filteredOn(fact -> fact.name().equals("tapstate.pipeline.frontier.stall"))
                 .singleElement()
-                .satisfies(fact -> assertThat(fact.unit()).isEqualTo("ms"));
+                .satisfies(fact -> {
+                    assertThat(fact.unit()).isEqualTo("ms");
+                    // The chain is an attribute of the point, and the name carries no chain at all.
+                    assertThat(fact.points()).singleElement().satisfies(point -> assertThat(point.attributes())
+                            .containsEntry("tapstate.chain.id", "chain-b")
+                            .containsEntry("tapstate.pipeline.id", "orders"));
+                });
         assertThat(measured).filteredOn(fact -> fact.name().equals("recordCount"))
                 .singleElement()
                 .satisfies(fact -> assertThat(fact.unit()).isEqualTo("{record}"));
