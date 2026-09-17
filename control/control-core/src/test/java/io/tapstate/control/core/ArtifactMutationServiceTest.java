@@ -64,8 +64,9 @@ class ArtifactMutationServiceTest {
     private final List<String> reclaimOrder = new ArrayList<>();
     private final RecordingAuditStore auditStore = new RecordingAuditStore();
     private final List<String> followsStopped = new ArrayList<>();
+    private final RecordingRateHistory rateHistory = new RecordingRateHistory();
     private final ArtifactMutationService service = new ArtifactMutationService(
-            store, desired, state, observations, layouts, srsMeta, derivedSchemas,
+            store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
             new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add);
 
     private static final Clock FIXED_CLOCK =
@@ -310,8 +311,10 @@ class ArtifactMutationServiceTest {
         assertThat(srsMeta.consumerIds("chain-a")).containsExactly("other");
         // Shared first: it is the only residue that stalls a different pipeline, so a process that dies
         // mid-reclaim has already contained the damage that was not this pipeline's alone to suffer.
+        assertThat(rateHistory.deleted).containsExactly("flow");
         assertThat(reclaimOrder)
-                .containsExactly("srs", "desired", "state", "observation", "layout", "derived-schema");
+                .containsExactly("srs", "desired", "state", "observation", "layout", "derived-schema",
+                        "rate-history");
     }
 
     @Test
@@ -789,6 +792,33 @@ class ArtifactMutationServiceTest {
         reclaimOrder.add(name);
         if (failure != null) {
             throw failure;
+        }
+    }
+
+    /** The samples a pipeline left behind, reclaimed last: nothing else bounds them but their age. */
+    private final class RecordingRateHistory implements io.tapstate.spi.store.RateHistoryStore {
+        private final List<String> deleted = new ArrayList<>();
+
+        @Override
+        public void append(io.tapstate.core.lifecycle.RateSample sample) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public List<io.tapstate.core.lifecycle.RateSample> readBetween(
+                String pipelineId, java.time.Instant from, java.time.Instant to) {
+            return List.of();
+        }
+
+        @Override
+        public void deleteAll(String pipelineId) {
+            step("rate-history", null);
+            deleted.add(pipelineId);
+        }
+
+        @Override
+        public java.time.Duration retention() {
+            return java.time.Duration.ofDays(15);
         }
     }
 

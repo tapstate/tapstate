@@ -652,9 +652,12 @@ public final class ObservationPublisher {
         this.frontierStall = Objects.requireNonNull(frontierStall, "frontierStall");
     }
 
-    /** Publishes the pipeline's latest observation from its actual state; a no-op if it has no checkpoint. */
-    public void publish(String pipelineId) {
-        publish(pipelineId, null);
+    /**
+     * Publishes the pipeline's latest observation from its actual state; a no-op, answering empty, if it
+     * has no checkpoint.
+     */
+    public Optional<Observation> publish(String pipelineId) {
+        return publish(pipelineId, null);
     }
 
     /**
@@ -666,9 +669,9 @@ public final class ObservationPublisher {
      * saying why. Any other state publishes exactly what the caller passed, so a recovered pipeline drops
      * the reason its previous run died of the moment it leaves FAILED.
      */
-    public void publish(String pipelineId, ObservationFailure failure) {
+    public Optional<Observation> publish(String pipelineId, ObservationFailure failure) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        state.read(pipelineId).ifPresent(checkpoint -> {
+        return state.read(pipelineId).map(checkpoint -> {
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
             ObservationFailure carried = failure;
             if (carried == null && actual == PipelineState.FAILED) {
@@ -706,14 +709,18 @@ public final class ObservationPublisher {
             List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
                     nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
                     joinRecomputeExpected.apply(pipelineId), loaded);
-            observations.save(new Observation(pipelineId, actual,
+            Observation published = new Observation(pipelineId, actual,
                     FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                    loaded.byTable(), positions.apply(pipelineId), carried, at, measured));
+                    loaded.byTable(), positions.apply(pipelineId), carried, at, measured);
+            observations.save(published);
             // Fed after the observation is written and never before. The observation is the contract and
             // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
             // cost a pipeline the read face that says it is alive at all.
             coldLayer.saw(pipelineId, readings);
             frontierStall.saw(pipelineId, pinned, gaps);
+            // Handed back so that whoever runs the pass can take a sample off exactly what was published,
+            // at the time it was published, rather than reading it back or measuring it again.
+            return published;
         });
     }
 

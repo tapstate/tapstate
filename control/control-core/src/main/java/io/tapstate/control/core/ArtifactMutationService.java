@@ -13,6 +13,7 @@ import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 
@@ -68,6 +69,7 @@ public final class ArtifactMutationService {
     private final StateStore state;
     private final ObservationStore observations;
     private final PipelineLayoutStore layouts;
+    private final RateHistoryStore rateHistory;
     private final SrsMetaStore srsMeta;
     private final DerivedSchemaStore derivedSchemas;
     private final AuditGate auditGate;
@@ -148,11 +150,46 @@ public final class ArtifactMutationService {
             DerivedSchemaStore derivedSchemas,
             AuditGate auditGate,
             DataBrowserFollows follows) {
+        this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, new RateHistoryStore() {
+            @Override
+            public void append(io.tapstate.core.lifecycle.RateSample sample) {
+                throw new UnsupportedOperationException("rate history is not configured");
+            }
+
+            @Override
+            public java.util.List<io.tapstate.core.lifecycle.RateSample> readBetween(
+                    String pipelineId, java.time.Instant from, java.time.Instant to) {
+                return java.util.List.of();
+            }
+
+            @Override
+            public void deleteAll(String pipelineId) {
+            }
+
+            @Override
+            public java.time.Duration retention() {
+                return java.time.Duration.ZERO;
+            }
+        }, auditGate, follows);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            PipelineLayoutStore layouts,
+            SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
+            RateHistoryStore rateHistory,
+            AuditGate auditGate,
+            DataBrowserFollows follows) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.layouts = Objects.requireNonNull(layouts, "layouts");
+        this.rateHistory = Objects.requireNonNull(rateHistory, "rateHistory");
         this.srsMeta = Objects.requireNonNull(srsMeta, "srsMeta");
         this.derivedSchemas = Objects.requireNonNull(derivedSchemas, "derivedSchemas");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -266,7 +303,8 @@ public final class ArtifactMutationService {
     private void reclaim(String id) {
         if (!isAtRest(id)) {
             throw reclaimIncomplete(id, "pipeline-live",
-                    List.of("mining-chain-consumer", "desired", "state", "observation", "layout", "derived-schema"),
+                    List.of("mining-chain-consumer", "desired", "state", "observation", "layout", "derived-schema",
+                            "rate-history"),
                     List.of());
         }
         List<RuntimeException> failures = new ArrayList<>();
@@ -280,6 +318,9 @@ public final class ArtifactMutationService {
         // the id next, and would refuse to start it over a difference against a schema belonging to
         // something that no longer exists.
         attempt(failures, residue, "derived-schema", () -> derivedSchemas.delete(id));
+        // The samples the pipeline took while it ran. Nothing else bounds them but their age, and a
+        // history left behind would be read as the past of whatever is applied under the id next.
+        attempt(failures, residue, "rate-history", () -> rateHistory.deleteAll(id));
         if (!failures.isEmpty()) {
             throw reclaimIncomplete(id, "step-failed", residue, failures);
         }

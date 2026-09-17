@@ -10,6 +10,7 @@ import io.tapstate.runtime.scheduler.FrontierStallWatch;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.NestColdLayerWatch;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
+import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.spi.store.StorePort;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -101,9 +102,19 @@ class RuntimeConvergenceConfiguration {
                 engine.deliveryDurations(pipelineId));
     }
 
+    /**
+     * Takes one sample per interval off what each pass publishes, into the history the store keeps for a
+     * bounded time. Its own bean so the interval is bound once, here, and the driver only hands it what
+     * was published.
+     */
     @Bean
-    ConvergenceDriver convergenceDriver(
-            PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher) {
-        return new ConvergenceDriver(pipelineConverger, storePort.desired(), observationPublisher);
+    RateSampler rateSampler(StorePort storePort, MetricsHistoryProperties history) {
+        return new RateSampler(storePort.rateHistory(), history.getSampleInterval());
+    }
+
+    @Bean
+    ConvergenceDriver convergenceDriver(PipelineConverger pipelineConverger, StorePort storePort,
+            ObservationPublisher observationPublisher, RateSampler rateSampler) {
+        return new ConvergenceDriver(pipelineConverger, storePort.desired(), observationPublisher, rateSampler);
     }
 }
