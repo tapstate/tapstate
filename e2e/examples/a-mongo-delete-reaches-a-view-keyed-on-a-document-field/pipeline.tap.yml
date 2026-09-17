@@ -1,9 +1,0 @@
-version: tapstate/v1
-kind: pipeline
-id: field_keyed_crossing
-source: src_store
-settings: { read_mode: snapshot_and_cdc }
-view:
-  id: order_state
-  from: orders
-  primary_key: id
