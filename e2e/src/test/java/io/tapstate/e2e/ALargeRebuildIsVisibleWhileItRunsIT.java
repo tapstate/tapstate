@@ -9,7 +9,9 @@ import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -222,7 +224,35 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
                     .as("the size reported for the dimension is the loud rebuild's alone; three rows added "
                             + "to it would say the quiet customer's rebuild was reported after all")
                     .isEqualTo(settled.get(EXPECTED + subject));
+
+            // The same two readings as facts: the dimension's namespace is an attribute a point is selected
+            // by, the name carries none of it, and the number on the point is the number under the flat key.
+            assertThat(pointOf(control, "tapstate.pipeline.join.recompute.rows", subject))
+                    .as("the rows-sent reading is a point selected by the namespace attribute, carrying the "
+                            + "same number the flat face shows under its key")
+                    .contains(finished.get(DONE + subject));
+            assertThat(pointOf(control, "tapstate.pipeline.join.recompute.rows.total", subject))
+                    .contains(finished.get(EXPECTED + subject));
+            assertThat(control.metricFacts(PIPELINE_ID))
+                    .extracting(fact -> (String) fact.get("name"))
+                    .as("and no fact carries the namespace, let alone a row's key, in its name")
+                    .noneMatch(name -> name.contains(subject) || name.contains("/"));
         }
+    }
+
+    /**
+     * The value of the point of the fact named {@code name} whose join namespace attribute is
+     * {@code namespace}, or empty when no such fact or point is published.
+     */
+    @SuppressWarnings("unchecked")
+    private static Optional<Long> pointOf(ControlPlane control, String name, String namespace) {
+        return control.metricFacts(PIPELINE_ID).stream()
+                .filter(fact -> name.equals(fact.get("name")))
+                .flatMap(fact -> ((List<Map<String, Object>>) fact.get("points")).stream())
+                .filter(point -> point.get("attributes") instanceof Map<?, ?> attributes
+                        && namespace.equals(attributes.get("tapstate.join.namespace")))
+                .map(point -> ((Number) point.get("value")).longValue())
+                .findFirst();
     }
 
     /** Every reading published about a rebuild, whichever of the two numbers it is. */

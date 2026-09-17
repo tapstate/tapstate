@@ -894,6 +894,42 @@ final class ControlPlane {
     record ConnectionTest(String outcome, Map<String, String> statusByCheck) {
     }
 
+    /**
+     * The facts the metrics face carries beside its flat map, each as the wire lays it out: a map with the
+     * metric's {@code name}, {@code type} and {@code unit}, and its {@code points}, each point a map with its
+     * {@code attributes} and either a {@code value} or the parts of a distribution. Read as maps rather than
+     * into a type on purpose: what a specification asserts here is the wire, and a type would answer for the
+     * wire it was written against.
+     *
+     * <p>Empty when the pipeline has published no observation yet, on the same terms as {@link #metricsNamed}:
+     * not yet is a reading, and a specification asserting a fact waits for it.
+     */
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> metricFacts(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        int status = response.statusCode();
+        String body = response.body();
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return List.of();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the metrics of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("facts") instanceof List<?> facts)) {
+            throw new AssertionError("metrics answer carried no facts: " + body);
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Object fact : facts) {
+            if (!(fact instanceof Map<?, ?> shaped)) {
+                throw new AssertionError("a fact that is not an object: " + fact);
+            }
+            out.add((Map<String, Object>) shaped);
+        }
+        return out;
+    }
+
     /** The published metrics body verbatim, for the same diagnostic use and on the same terms as {@link #logs}. */
     String metrics(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
