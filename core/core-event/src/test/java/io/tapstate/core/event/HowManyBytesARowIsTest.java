@@ -49,9 +49,9 @@ class HowManyBytesARowIsTest {
     private static List<Charge> theDefinition() {
         List<Charge> charges = new ArrayList<>();
         charges.add(new Charge("ascii text", "abc", TapstateType.STRING, 3));
-        charges.add(new Charge("two-byte text", "é", TapstateType.STRING, 2));
-        charges.add(new Charge("three-byte text", "中", TapstateType.STRING, 3));
-        charges.add(new Charge("a surrogate pair", "😀", TapstateType.STRING, 4));
+        charges.add(new Charge("two-byte text", "\u00e9", TapstateType.STRING, 2));
+        charges.add(new Charge("three-byte text", "\u4e2d", TapstateType.STRING, 3));
+        charges.add(new Charge("a surrogate pair", "\uD83D\uDE00", TapstateType.STRING, 4));
         charges.add(new Charge("an unpaired surrogate", "\uD83D", TapstateType.STRING, 3));
         charges.add(new Charge("empty text", "", TapstateType.STRING, 0));
         charges.add(new Charge("an exact decimal", new BigDecimal("12.3400"), TapstateType.DECIMAL, 7));
