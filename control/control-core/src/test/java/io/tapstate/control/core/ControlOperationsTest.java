@@ -188,7 +188,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(51);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(50);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }
