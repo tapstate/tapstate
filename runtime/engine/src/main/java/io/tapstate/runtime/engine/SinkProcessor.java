@@ -96,6 +96,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // The clock a row's delivery is measured against, at the moment its write is confirmed. A seam so a
     // duration can be witnessed at a known instant rather than by waiting for real time to pass.
     private final LongSupplier clock;
+    // Times each batch this sink forms and issues, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.SINK);
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();
@@ -223,6 +225,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      */
     @Override
     protected void init(Processor.Context context) {
+        this.timer = StageTimer.of(stage(), context);
         this.pipelineId = context.jobConfig().getName();
         this.countingSince = clock.getAsLong();
         HazelcastInstance instance = context.hazelcastInstance();
@@ -237,8 +240,22 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
     }
 
+    /** What this stage has timed so far, for a witness driving it by hand. */
+    StageTimer timing() {
+        return timer;
+    }
+
     @Override
     public void process(int ordinal, Inbox inbox) {
+        long started = timer.begin();
+        try {
+            processTimed(inbox);
+        } finally {
+            timer.end(started);
+        }
+    }
+
+    private void processTimed(Inbox inbox) {
         reapSettled();
         while (!inbox.isEmpty() && inFlight.size() < maxInFlight) {
             List<Envelope> batch = new ArrayList<>();

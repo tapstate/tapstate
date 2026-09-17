@@ -1,5 +1,7 @@
 package io.tapstate.runtime.engine.join;
 
+import com.hazelcast.jet.core.Processor;
+import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import io.tapstate.core.event.Envelope;
@@ -26,8 +28,25 @@ final class JoinProjectionProcessor extends AbstractProcessor implements Staged 
         this.projection = projection;
     }
 
+    // Times each drain of arrivals, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.JOIN);
+
+    @Override
+    protected void init(Processor.Context context) {
+        this.timer = StageTimer.of(stage(), context);
+    }
+
     @Override
     public void process(int ordinal, Inbox inbox) {
+        long started = timer.begin();
+        try {
+            processTimed(inbox);
+        } finally {
+            timer.end(started);
+        }
+    }
+
+    private void processTimed(Inbox inbox) {
         if (!taken) {
             List<JoinUpdate> arrivals = new ArrayList<>(inbox.size());
             for (Object item : inbox) {

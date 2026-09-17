@@ -43,6 +43,9 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
 
     private final FlatMapper<Envelope, Envelope> flatMapper;
     private final LevelBounds bounds;
+    // Times each row through the port, which is this stage's unit of work. Counts for nobody until init
+    // says whether there is a job to report into.
+    private StageTimer timer = StageTimer.none(Stage.TRANSFORM);
 
     // Resolved at init from the running job — see reapSettled's counterpart in SinkProcessor and
     // JobFailureRegistry for why this is captured here rather than reconstructed after the job fails.
@@ -65,9 +68,17 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
         // event covered is stamped back onto everything it produced. The whole of it travels, not the
         // token alone: a downstream frontier decides what it may pass on the order, and an output that
         // arrived with a token but no order is one the frontier can only ignore.
-        this.flatMapper = flatMapper(event ->
-                Traversers.traverseIterable(port.transform(event))
-                        .map(out -> out.withPositions(event.positions())));
+        this.flatMapper = flatMapper(event -> {
+            // The port's own work on one row is the unit timed; what it produced is drained afterwards at
+            // the outbox's pace, which is the substrate's time and not this stage's.
+            long started = timer.begin();
+            try {
+                return Traversers.traverseIterable(port.transform(event))
+                        .map(out -> out.withPositions(event.positions()));
+            } finally {
+                timer.end(started);
+            }
+        });
     }
 
     /** A meta-supplier for a vertex that propagates no frontier, for a job built without one. */
@@ -79,6 +90,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
     /** Resolves this pipeline's id and the shared failure registry; see {@link SinkProcessor#init}. */
     @Override
     protected void init(Processor.Context context) {
+        this.timer = StageTimer.of(stage(), context);
         this.pipelineId = context.jobConfig().getName();
         HazelcastInstance instance = context.hazelcastInstance();
         this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
@@ -113,6 +125,11 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
                 : () -> new TransformProcessor(portFactory.get(),
                         new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
         return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
+    }
+
+    /** What this stage has timed so far, for a witness driving it by hand. */
+    StageTimer timing() {
+        return timer;
     }
 
     @Override

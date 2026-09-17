@@ -13,6 +13,7 @@ import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
@@ -21,6 +22,7 @@ import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMetricNames;
 import io.tapstate.spi.store.KeyedStateStore;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.HashMap;
@@ -474,6 +476,76 @@ public final class Engine {
             byTable.put(table, bounds.value(count, sums.get(table) / 1000.0, bucketCounts));
         });
         return byTable;
+    }
+
+    /**
+     * Where the pipeline's live job spends its time: one distribution per stage of how long that stage's
+     * units of work took, over the registered bounds, with the moment timing began; nothing when it has
+     * no live job or no stage has timed anything yet.
+     *
+     * <p>Added over the processors of one stage, bucket by bucket: a vertex may run as several processors
+     * and each times its own share of the work, so the stage's distribution is the sum of theirs. The
+     * start is the latest of theirs, for the reason the delivery start is the latest of its sinks'.
+     */
+    public StageReading stageDurations(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? StageReading.NONE : stageDurationsIn(job.getMetrics());
+    }
+
+    /**
+     * The stage distributions in {@code collected}. A stage is read back only when its count, its sum and
+     * every bucket are present — a distribution caught with a bucket missing is a collection that caught a
+     * processor half-way through reporting, and it is left out rather than read as a shape.
+     */
+    static StageReading stageDurationsIn(JobMetrics collected) {
+        HistogramBounds bounds = HistogramBounds.PROCESS_DURATION;
+        Map<String, Long> counts = new HashMap<>();
+        Map<String, Long> sums = new HashMap<>();
+        Map<String, long[]> buckets = new HashMap<>();
+        Map<String, Integer> bucketsSeen = new HashMap<>();
+        long since = Long.MIN_VALUE;
+        for (String metric : collected.metrics()) {
+            JetStageGauge.Part part = JetStageGauge.partOf(metric);
+            if (part == null) {
+                continue;
+            }
+            for (Measurement measurement : collected.get(metric)) {
+                switch (part.kind()) {
+                    case JetStageGauge.COUNT -> counts.merge(part.stage(), measurement.value(), Long::sum);
+                    case JetStageGauge.SUM_MICROS -> sums.merge(part.stage(), measurement.value(), Long::sum);
+                    case JetStageGauge.SINCE -> since = Math.max(since, measurement.value());
+                    case JetStageGauge.BUCKET -> {
+                        if (part.bucket() < 0 || part.bucket() >= bounds.buckets()) {
+                            continue;
+                        }
+                        buckets.computeIfAbsent(part.stage(), ignored -> new long[bounds.buckets()])[part.bucket()]
+                                += measurement.value();
+                    }
+                    default -> {
+                    }
+                }
+            }
+            if (JetStageGauge.BUCKET.equals(part.kind()) && part.bucket() >= 0 && part.bucket() < bounds.buckets()) {
+                bucketsSeen.merge(part.stage(), 1, Integer::sum);
+            }
+        }
+        Map<String, HistogramValue> byStage = new HashMap<>();
+        counts.forEach((stage, count) -> {
+            long[] perBucket = buckets.get(stage);
+            if (perBucket == null || bucketsSeen.getOrDefault(stage, 0) != bounds.buckets()
+                    || !sums.containsKey(stage)) {
+                return;
+            }
+            List<Long> bucketCounts = new ArrayList<>(perBucket.length);
+            for (long bucketCount : perBucket) {
+                bucketCounts.add(bucketCount);
+            }
+            byStage.put(stage, bounds.value(count, sums.get(stage) / 1_000_000.0, bucketCounts));
+        });
+        if (byStage.isEmpty() || since == Long.MIN_VALUE) {
+            return StageReading.NONE;
+        }
+        return new StageReading(byStage, Instant.ofEpochMilli(since));
     }
 
     /**

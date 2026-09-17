@@ -207,6 +207,20 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
     }
 
     @Test
+    void times_each_batch_it_issues_as_one_unit_of_its_stage_and_nothing_else() throws Exception {
+        SinkProcessor processor = init(new ImmediateWriter(), new RecordingDelivery());
+
+        pump(processor, row("orders", 1L));
+        pump(processor, row("orders", 2L), row("orders", 3L));
+        // Reaping settled writes on an idle call is not a unit: nothing arrived to be processed.
+        drain(processor);
+        drain(processor);
+
+        assertThat(processor.timing().stage()).isEqualTo(io.tapstate.core.lifecycle.Stage.SINK);
+        assertThat(processor.timing().value().count()).isEqualTo(2L);
+    }
+
+    @Test
     void reports_the_newest_event_time_of_a_table_not_the_last_one_it_saw() throws Exception {
         RecordingDelivery delivery = new RecordingDelivery();
         SinkProcessor processor = init(new ImmediateWriter(), delivery);

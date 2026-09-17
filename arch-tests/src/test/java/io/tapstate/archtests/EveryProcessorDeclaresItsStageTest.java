@@ -8,6 +8,7 @@ import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.runtime.engine.StageTimer;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -82,6 +83,20 @@ class EveryProcessorDeclaresItsStageTest {
 
         assertThat(declared).containsExactlyInAnyOrderElementsOf(
                 Arrays.stream(Stage.values()).map(Enum::name).collect(Collectors.toList()));
+    }
+
+    @Test
+    @DisplayName("every processor family that declares a stage also times it")
+    void everyStagedProcessorTimesItsStage() {
+        // Declaring a stage says where a processor's time would be reported; timing it is what puts a number
+        // there. A family that declares and does not time reports its stage as a name with an empty
+        // distribution behind it, which reads as a stage that costs nothing.
+        assertThat(processors())
+                .filteredOn(processor -> processor.isAssignableTo(Staged.class))
+                .allSatisfy(processor -> assertThat(processor.getMethodCallsFromSelf())
+                        .as("%s obtains a stage timer for its stage", processor.getName())
+                        .anyMatch(call -> call.getTargetOwner().isEquivalentTo(StageTimer.class)
+                                && call.getTarget().getName().equals("of")));
     }
 
     /**

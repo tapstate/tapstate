@@ -60,15 +60,15 @@
       <artifactId>hazelcast</artifactId>
     </dependency>
 
-    <!-- The execution engine (DAG builder + generic sink adapter): a test-scope dependency for the
-         source-to-DAG composition test only. The engine never depends on this source ring in either
-         direction at compile scope; this edge exists solely so a test can wire the projected source
-         into a builder-assembled DAG and run it. -->
+    <!-- The execution engine (DAG builder + generic sink adapter + the stage timing seam). The source
+         processor is one stage of the engine's graph and reports how long its units of work take
+         through the same seam every other stage uses, which is what makes this a compile-scope edge;
+         before that it was test scope, for the source-to-DAG composition test alone. The edge has one
+         direction: the engine never depends on this module, so nothing here can form a cycle. -->
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>engine</artifactId>
       <version>${revision}</version>
-      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>

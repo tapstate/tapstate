@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine.nest;
 
+import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
@@ -255,6 +256,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
     @Override
     protected void init(Processor.Context context) {
         this.failures = NestFailureRecording.of(context);
+        this.timer = StageTimer.of(stage(), context);
     }
 
     @Override
@@ -350,12 +352,20 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         return false;
     }
 
+    // Times each drain of arrivals, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.NEST);
+
     @Override
     public void process(int ordinal, Inbox inbox) {
-        failures.recording(() -> {
-            processRecording(ordinal, inbox);
-            return null;
-        });
+        long started = timer.begin();
+        try {
+            failures.recording(() -> {
+                processRecording(ordinal, inbox);
+                return null;
+            });
+        } finally {
+            timer.end(started);
+        }
     }
 
     private void processRecording(int ordinal, Inbox inbox) {

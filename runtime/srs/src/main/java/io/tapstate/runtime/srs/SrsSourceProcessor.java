@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Processor;
@@ -81,8 +82,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         this.stamp = stamp;
     }
 
+    // Times each read of the ring that produced something, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.SOURCE);
+
     @Override
     protected void init(Context context) {
+        this.timer = StageTimer.of(stage(), context);
         // Take what the capture side has already buffered for this ring before opening the ring reader, so
         // the source emits every snapshot row (op r, no source position) ahead of the first cdc change -- the
         // ordering that keeps a stale snapshot from landing at the sink after a newer change of the same key.
@@ -128,6 +133,10 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                 return false;
             }
         }
+        // Reading and projecting what arrived is this stage's unit of work; a pass that finds nothing is
+        // not a unit and is not timed, or the distribution would be swamped by the idle polls between rows.
+        long started = timer.begin();
+        int pendingBefore = pending.size();
         // Whatever the capture has handed over since the last pass, ahead of the ring as always.
         drainBuffered();
         // The ring's sequence pairs with the generation this reader runs under to give each change its
@@ -138,6 +147,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             pending.add(SrsProjection.toEnvelope(item, src, order));
             read = order;
         }, FILL_BATCH);
+        if (pending.size() > pendingBefore) {
+            timer.end(started);
+        }
         if (emitPending()) {
             stampWhatHasLeft();
             announce();

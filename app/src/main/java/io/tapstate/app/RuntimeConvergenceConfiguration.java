@@ -79,6 +79,9 @@ class RuntimeConvergenceConfiguration {
                 // beside the far end it says whether what it reads is arriving, which neither answers.
                 captureCoordinator::capturedRows,
                 id -> deliveredBy(engine, id),
+                // Where the run spends its time, per stage of the graph, as the processors time their own
+                // units of work; a run that has timed nothing yet reports nothing rather than a stage at zero.
+                engine::stageDurations,
                 Clock.systemUTC());
     }
 

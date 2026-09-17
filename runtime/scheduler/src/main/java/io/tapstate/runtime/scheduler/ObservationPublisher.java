@@ -17,6 +17,7 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
@@ -171,6 +172,15 @@ public final class ObservationPublisher {
      * that was averaged away before they saw it.
      */
     private static final String RECORD_DELIVERY_DURATION_METRIC = "tapstate.pipeline.record.delivery.duration";
+
+    /**
+     * Where in the graph time is spent: one distribution per stage of how long its units of work took. Read
+     * on the facts alone, like the delivery time, and for the same reason. What a unit is belongs to the
+     * stage: a row through a transform, a drain through a nest or a join, a batch issued by a sink, a read
+     * of the ring by a source.
+     */
+    private static final String PROCESS_DURATION_METRIC = "tapstate.pipeline.process.duration";
+    private static final String STAGE_ATTRIBUTE = MetricAttributes.STAGE;
 
     /**
      * The bounded load's two measurements, which carry their table as an attribute the way the pair above
@@ -338,6 +348,7 @@ public final class ObservationPublisher {
     private final Function<String, Map<String, Long>> joinRecomputeExpected;
     private final Function<String, CaptureReading> captures;
     private final Function<String, DeliveryReading> deliveries;
+    private final Function<String, StageReading> stages;
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
     private final Clock clock;
@@ -594,8 +605,33 @@ public final class ObservationPublisher {
             Function<String, CaptureReading> captures,
             Function<String, DeliveryReading> deliveries,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, id -> StageReading.NONE, clock);
+    }
+
+    /**
+     * A publisher also wired to where the run spends its time: {@code stages} yields, per stage of the
+     * graph, the distribution of how long its units of work took.
+     */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries,
+            Function<String, StageReading> stages,
+            Clock clock) {
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
+        this.stages = Objects.requireNonNull(stages, "stages");
         this.clock = Objects.requireNonNull(clock, "clock");
         // Read from the injected clock and not the system one, so a test that drives time can say what
         // the failure counter accumulates from instead of asserting against whenever it happened to run.
@@ -826,8 +862,24 @@ public final class ObservationPublisher {
                 rebuildExpected).ifPresent(facts::add);
         movement(pipelineId, at, captures.apply(pipelineId), deliveries.apply(pipelineId))
                 .forEach(facts::add);
+        spent(pipelineId, at, stages.apply(pipelineId)).ifPresent(facts::add);
         load(pipelineId, at, loaded).forEach(facts::add);
         return facts;
+    }
+
+    /**
+     * Where the run's time went, as one distribution per stage; empty for a run reporting none. The stage
+     * is a closed set, so every point here is one of five and nothing arriving from the data can add one.
+     */
+    private static Optional<MetricFact> spent(String pipelineId, Instant at, StageReading spent) {
+        if (spent == null || spent.isEmpty() || spent.start().isEmpty()) {
+            return Optional.empty();
+        }
+        List<MetricPoint> points = new ArrayList<>();
+        spent.durationByStage().forEach((stage, histogram) -> points.add(MetricPoint.distribution(
+                Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, STAGE_ATTRIBUTE, stage), spent.start().get(), at,
+                histogram)));
+        return Optional.of(new MetricFact(PROCESS_DURATION_METRIC, MetricType.HISTOGRAM, HistogramBounds.UNIT, points));
     }
 
     /**

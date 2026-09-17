@@ -1,5 +1,7 @@
 package io.tapstate.runtime.engine.join;
 
+import com.hazelcast.jet.core.Processor;
+import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import io.tapstate.core.event.Envelope;
@@ -68,8 +70,25 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
      * from being absorbed a second time. Nothing new is added to what is being offered in the
      * meantime - the substrate refills only once it has been emptied - so the two cannot interleave.
      */
+    // Times each drain of arrivals, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.JOIN);
+
+    @Override
+    protected void init(Processor.Context context) {
+        this.timer = StageTimer.of(stage(), context);
+    }
+
     @Override
     public void process(int ordinal, Inbox inbox) {
+        long started = timer.begin();
+        try {
+            processTimed(ordinal, inbox);
+        } finally {
+            timer.end(started);
+        }
+    }
+
+    private void processTimed(int ordinal, Inbox inbox) {
         String source = sourceByOrdinal.get(ordinal);
         if (source == null) {
             throw new IllegalStateException(
