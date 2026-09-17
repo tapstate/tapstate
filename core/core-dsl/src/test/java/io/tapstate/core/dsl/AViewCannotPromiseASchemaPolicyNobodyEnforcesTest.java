@@ -24,7 +24,9 @@ class AViewCannotPromiseASchemaPolicyNobodyEnforcesTest {
                     evolution: additive
                 """;
 
-        Throwable thrown = catchThrowable(() -> new DslParser().parse(yaml));
+        DslParser parser = new DslParser();
+
+        Throwable thrown = catchThrowable(() -> parser.parse(yaml));
 
         assertThat(thrown).isInstanceOf(DslException.class);
         DslException refused = (DslException) thrown;
