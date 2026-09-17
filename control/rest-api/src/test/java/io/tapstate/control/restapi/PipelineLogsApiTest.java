@@ -15,6 +15,7 @@ import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.core.logging.LogSink;
+import io.tapstate.core.logging.PipelineLogLevel;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
 import org.junit.jupiter.api.AfterAll;
@@ -29,6 +30,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
@@ -179,6 +181,19 @@ class PipelineLogsApiTest {
         assertThat(body.code()).isEqualTo("control.unauthenticated");
     }
 
+    @Test
+    void logLevelChangesTheMinimumSeverityForFuturePipelineLines() {
+        PipelineLogLevel level = client().post().uri("/api/pipelines/pl1:log-level")
+                .header("Authorization", "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("level", "WARN"))
+                .retrieve().toEntity(PipelineLogLevel.class).getBody();
+
+        assertThat(level).isEqualTo(PipelineLogLevel.WARN);
+        assertThat(context.getBean(PipelineLogQueryService.class).level("pl1"))
+                .isEqualTo(PipelineLogLevel.WARN);
+    }
+
     // ---- the logs endpoint is a derivation of the registry ----
 
     @Test
@@ -203,7 +218,7 @@ class PipelineLogsApiTest {
 
         assertThat(projected)
                 .as("only the logs face projects onto this focused context")
-                .containsExactly("pipeline.logs");
+                .containsExactly("pipeline.logs", "pipeline.log-level");
     }
 
     /**
