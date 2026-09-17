@@ -291,9 +291,10 @@ public final class Engine {
     }
 
     /**
-     * How many rows each large rebuild of the pipeline has sent so far, keyed by the namespace and
-     * dimension key it is about; empty when it has no live job and while no rebuild large enough to
-     * report is under way.
+     * How many rows the large rebuilds of the pipeline have sent so far, keyed by the namespace the
+     * rebuilt dimension lives in; empty when it has no live job and while no rebuild large enough to
+     * report is under way. Two rebuilds under way in one namespace are added together: the key each one
+     * is about is a value out of a row, and a reading that leaves the engine is not keyed by one.
      *
      * <p>Read beside {@link #joinRecomputeExpected}, which says how many rows that rebuild has
      * altogether. The distance between the two is the whole of what this says: while it is open the
@@ -304,11 +305,12 @@ public final class Engine {
      * running, or the one running is small enough that nobody needs telling. Both are the quiet state.
      * A rebuild that has finished keeps its last reading, which is the number it ended on.
      *
-     * <p>Kept at its highest per subject rather than summed, because a rebuild belongs to whichever
-     * processor owns the key's partition and every collection of it reports that same running total.
+     * <p>Kept at its highest per rebuild before namespaces are added up, because a rebuild belongs to
+     * whichever processor owns the key's partition and every collection of it reports that same running
+     * total.
      */
     public Map<String, Long> joinRecomputeDone(String pipelineId) {
-        return byChain(pipelineId, JoinRecomputeMetricNames::doneSubjectOf);
+        return byNamespace(pipelineId, JoinRecomputeMetricNames::doneSubjectOf);
     }
 
     /**
@@ -320,7 +322,20 @@ public final class Engine {
      * exists to warn about.
      */
     public Map<String, Long> joinRecomputeExpected(String pipelineId) {
-        return byChain(pipelineId, JoinRecomputeMetricNames::expectedSubjectOf);
+        return byNamespace(pipelineId, JoinRecomputeMetricNames::expectedSubjectOf);
+    }
+
+    /**
+     * The rebuild readings {@code subjectOf} names, at their highest per rebuild and then added per
+     * namespace. Two steps because the two are different facts: one rebuild is reported by every
+     * processor at the same running total, so the highest of those is the reading; two rebuilds in one
+     * namespace are two pieces of work, so their readings add.
+     */
+    private Map<String, Long> byNamespace(String pipelineId, Function<String, String> subjectOf) {
+        Map<String, Long> perNamespace = new HashMap<>();
+        byChain(pipelineId, subjectOf).forEach((subject, reading) ->
+                perNamespace.merge(JoinRecomputeMetricNames.namespaceOf(subject), reading, Long::sum));
+        return perNamespace;
     }
 
     /**

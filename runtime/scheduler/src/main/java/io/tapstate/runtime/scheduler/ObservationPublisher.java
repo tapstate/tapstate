@@ -120,9 +120,10 @@ public final class ObservationPublisher {
     private static final String NEST_DEAD_LETTERED_PREFIX = "nestDeadLettered.";
 
     /**
-     * How far a rebuild of one dimension key's fan-out has got, and about how far it has to go, with the
-     * namespace and the key it is about appended. Two numbers because the whole of what a rebuild says is
-     * the distance between them; either alone is a number with nothing to be read against.
+     * How far the large rebuilds in one dimension's namespace have got, and about how far they have to go,
+     * with the namespace appended. Two numbers because the whole of what a rebuild says is the distance
+     * between them; either alone is a number with nothing to be read against. The key a rebuild is about
+     * is a value out of a row and travels in no reading here: rebuilds in one namespace are added together.
      *
      * <p>Published only while a rebuild large enough to be a wait is under way, so an absence here is the
      * quiet state rather than an unwired one. That is the opposite choice from the readings above, and it
@@ -150,6 +151,8 @@ public final class ObservationPublisher {
     private static final String NEST_PENDING_HIGH_WATER_METRIC = "tapstate.pipeline.nest.pending.high_water";
     private static final String NEST_STORED_METRIC = "tapstate.pipeline.nest.stored";
     private static final String NEST_DEAD_LETTERED_METRIC = "tapstate.pipeline.nest.dead_lettered";
+    private static final String JOIN_RECOMPUTE_ROWS_METRIC = "tapstate.pipeline.join.recompute.rows";
+    private static final String JOIN_RECOMPUTE_ROWS_TOTAL_METRIC = "tapstate.pipeline.join.recompute.rows.total";
 
     /**
      * The three measurements of a pipeline's movement that carry their dimensions as attributes rather
@@ -212,6 +215,7 @@ public final class ObservationPublisher {
     private static final String TABLE_ID_ATTRIBUTE = MetricAttributes.TABLE_ID;
     private static final String CHAIN_ID_ATTRIBUTE = MetricAttributes.CHAIN_ID;
     private static final String NEST_NAMESPACE_ATTRIBUTE = MetricAttributes.NEST_NAMESPACE;
+    private static final String JOIN_NAMESPACE_ATTRIBUTE = MetricAttributes.JOIN_NAMESPACE;
     private static final String DIRECTION_ATTRIBUTE = MetricAttributes.DIRECTION;
     private static final String OP_ATTRIBUTE = MetricAttributes.OP;
     private static final String INBOUND = "in";
@@ -257,7 +261,11 @@ public final class ObservationPublisher {
                     attributes -> NEST_PENDING_HIGH_WATER_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_STORED_METRIC, attributes -> NEST_STORED_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_DEAD_LETTERED_METRIC,
-                    attributes -> NEST_DEAD_LETTERED_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)));
+                    attributes -> NEST_DEAD_LETTERED_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(JOIN_RECOMPUTE_ROWS_METRIC,
+                    attributes -> JOIN_RECOMPUTE_DONE_PREFIX + attributes.get(JOIN_NAMESPACE_ATTRIBUTE)),
+            Map.entry(JOIN_RECOMPUTE_ROWS_TOTAL_METRIC,
+                    attributes -> JOIN_RECOMPUTE_EXPECTED_PREFIX + attributes.get(JOIN_NAMESPACE_ATTRIBUTE)));
 
     /**
      * The name the metric contract gives each of this engine's change kinds.
@@ -720,9 +728,9 @@ public final class ObservationPublisher {
      *
      * <p>The per-chain and per-namespace families carry their dimension as an attribute, one fact per family
      * with a point per chain or namespace; the flat face spells each point back out under the key it has
-     * always used, so nothing that reads that face moved. The rebuild pair still carries its subject inside
-     * its name: the tail of that subject is a value out of a row, which no attribute may carry, and how the
-     * pair travels without it is decided where it is migrated rather than assumed here.
+     * always used, so nothing that reads that face moved. The rebuild pair is keyed by the namespace its
+     * dimension lives in and not by the row it is about: that key is a value out of a row, which no
+     * attribute may carry, so the engine adds the rebuilds of one namespace together before they get here.
      */
     List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
@@ -778,14 +786,14 @@ public final class ObservationPublisher {
         // pass is what an unwired count would look like too.
         readingsAt(pipelineId, NEST_DEAD_LETTERED_METRIC, "{change}", at, NEST_NAMESPACE_ATTRIBUTE, discarded)
                 .ifPresent(facts::add);
-        // One pair per rebuild large enough to be worth telling anybody about, and nothing at all for a
-        // pipeline where none is running. Both halves are published from their own map rather than one
-        // being defaulted from the other: a rebuild whose size arrived without its progress would read as
-        // one that has sent no rows, which is the shape of a rebuild that is stuck.
-        rebuildDone.forEach((subject, rows) -> facts.add(
-                readAt(JOIN_RECOMPUTE_DONE_PREFIX + subject, "{row}", at, rows)));
-        rebuildExpected.forEach((subject, rows) -> facts.add(
-                readAt(JOIN_RECOMPUTE_EXPECTED_PREFIX + subject, "{row}", at, rows)));
+        // One pair per namespace with a rebuild large enough to be worth telling anybody about, and nothing
+        // at all for a pipeline where none is running. Both halves are published from their own map rather
+        // than one being defaulted from the other: a rebuild whose size arrived without its progress would
+        // read as one that has sent no rows, which is the shape of a rebuild that is stuck.
+        readingsAt(pipelineId, JOIN_RECOMPUTE_ROWS_METRIC, "{row}", at, JOIN_NAMESPACE_ATTRIBUTE, rebuildDone)
+                .ifPresent(facts::add);
+        readingsAt(pipelineId, JOIN_RECOMPUTE_ROWS_TOTAL_METRIC, "{row}", at, JOIN_NAMESPACE_ATTRIBUTE,
+                rebuildExpected).ifPresent(facts::add);
         movement(pipelineId, at, captures.apply(pipelineId), deliveries.apply(pipelineId))
                 .forEach(facts::add);
         load(pipelineId, at, loaded).forEach(facts::add);

@@ -102,7 +102,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 "tapstate.pipeline.nest.entries", "tapstate.pipeline.nest.accesses",
                 "tapstate.pipeline.nest.backfills", "tapstate.pipeline.nest.backfill.time",
                 "tapstate.pipeline.nest.pending.high_water", "tapstate.pipeline.nest.stored",
-                "tapstate.pipeline.nest.dead_lettered");
+                "tapstate.pipeline.nest.dead_lettered",
+                "tapstate.pipeline.join.recompute.rows", "tapstate.pipeline.join.recompute.rows.total");
 
         Observation published = observations.read("orders").orElseThrow();
         // The flat keys, letter for letter. Every reader of this face -- the command line, the end-to-end

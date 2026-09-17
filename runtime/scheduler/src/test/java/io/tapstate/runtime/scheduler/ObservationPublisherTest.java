@@ -330,7 +330,9 @@ class ObservationPublisherTest {
     @Test
     void publishWiresHowFarALargeRebuildHasGotAndHowFarItHasToGo() {
         state.seed("orders", PipelineState.RUNNING);
-        String subject = "join.orders.widen.index.customers/17";
+        // The engine hands over one reading per namespace: which row is being rebuilt is a value out of a
+        // row, and travels in no reading that leaves it.
+        String subject = "join.orders.widen.index.customers";
         ObservationPublisher wired = new ObservationPublisher(state, observations,
                 id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
