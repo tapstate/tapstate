@@ -14,13 +14,26 @@
 
 # The text under one heading, comments removed and blank lines dropped. The level defaults to "##";
 # pass "###" for a subsection. A section ends at the next heading of the same level or shallower, so
-# a subsection nested inside one is part of it and does not cut it short.
+# a subsection nested inside one is part of it and does not cut it short -- or at a thematic break,
+# which is a break between parts of a document wherever it appears.
+#
+# The break matters because a body does not end where its last section does. `pr.sh` appends a block
+# to every pull request it opens -- the issue reference, a live query for what that line filed, a
+# reminder about the closeout -- and that block opens with a `---` rule rather than a heading. A body
+# whose last heading is `### Release note` therefore used to hand all of it to whoever asked for that
+# section, and the release notes are read by people outside this project. Measured on v0.5.0: two
+# "What's new" bullets went out ending in "Maintainer: run the closeout for ... after merging".
+#
+# Stopping at the break rather than teaching `pr.sh` to write a heading is what also fixes the bodies
+# that are already merged: a release harvests from pull requests that were written before any change
+# here, and those are the ones this was measured on.
 section_body() {
   local marker="${2:-##}"
   printf '%s\n' "$body" | awk -v want="$marker $1" -v depth="${#marker}" '
     { heading = $0; sub(/[ \t\r]+$/, "", heading) }
     heading == want { inside = 1; next }
     inside && match(heading, /^#+ /) && RLENGTH - 1 <= depth { inside = 0 }
+    inside && heading ~ /^(-{3,}|\*{3,}|_{3,})$/ { inside = 0 }
     inside { print }
   ' | strip_comments
 }
