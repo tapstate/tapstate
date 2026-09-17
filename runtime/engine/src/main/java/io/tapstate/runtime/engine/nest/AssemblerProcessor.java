@@ -8,6 +8,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.ReplayFloor;
@@ -41,7 +43,12 @@ import java.util.Set;
  * nothing later removes. A root that is deleted is the one thing that still goes out, because the sink
  * has a document to remove; it carries the key and nothing else, and is not an assembled document.
  */
-public final class AssemblerProcessor extends AbstractProcessor {
+public final class AssemblerProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.NEST;
+    }
 
     /**
      * The shortest gap between two sweeps for changes that may stop being held.

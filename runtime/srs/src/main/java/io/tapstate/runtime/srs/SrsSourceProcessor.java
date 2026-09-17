@@ -10,6 +10,8 @@ import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import java.util.ArrayDeque;
 import java.util.Objects;
 
@@ -38,7 +40,12 @@ import java.util.Objects;
  * replayed from the durable source offset. The ring and the read-cursor sink are resolved on the member the
  * processor runs on, so nothing but serializable coordinates crosses the wire.
  */
-public final class SrsSourceProcessor extends AbstractProcessor {
+public final class SrsSourceProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.SOURCE;
+    }
 
     /** The most changes one fill drains before yielding - a bounded batch that lets Jet pace the source. */
     private static final int FILL_BATCH = 256;

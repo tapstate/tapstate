@@ -4,6 +4,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -68,11 +70,18 @@ class AFlatViewSaysWhatItCouldNotCarryTest {
         FlatMetricProjection projected = FlatMetricProjection.of(List.of(
                 MetricFact.single("tapstate.pipeline.record.delivery.duration", MetricType.HISTOGRAM,
                         "s", MetricPoint.distribution(Map.of(), STARTED, OBSERVED,
-                                new HistogramValue(3, 1.5, List.of(1.0), List.of(2L, 1L))))));
+                                threeObservations(HistogramBounds.RECORD_DELIVERY_DURATION)))));
 
         assertThat(projected.metrics()).isEmpty();
         assertThat(projected.dropped())
                 .containsExactly("tapstate.pipeline.record.delivery.duration");
+    }
+
+    /** A distribution over the instrument's registered bounds, with three observations in its first bucket. */
+    private static HistogramValue threeObservations(HistogramBounds bounds) {
+        List<Long> counts = new ArrayList<>(Collections.nCopies(bounds.buckets(), 0L));
+        counts.set(0, 3L);
+        return bounds.value(3, 1.5, counts);
     }
 
     @Test

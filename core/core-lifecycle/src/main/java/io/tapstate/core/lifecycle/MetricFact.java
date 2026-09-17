@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * One metric as the runtime measured it: a name, what kind of measurement it is, its unit, and the
@@ -25,11 +26,18 @@ import java.util.Set;
  * never measured is gone. That is the reason this type exists rather than each consumer assembling
  * numbers for itself.
  *
- * <p><strong>What this deliberately does not check yet.</strong> Attribute keys have a naming
- * discipline of their own, and it is not enforced here, because nothing yet produces a point with
- * attributes: several metric families still carry their one dimension inside the name, appended to a
- * fixed prefix. Enforcing a rule with no input would make a check that has never once run look like
- * a check that keeps passing. The rule lands with the first producer that has attributes to name.
+ * <p><strong>Three things a dimensioned or bucketed fact is held to here, beyond its shape.</strong> A
+ * distribution carries the bucket bounds registered for its instrument ({@link HistogramBounds}) and no
+ * other; a value of a closed attribute — direction, operation, stage — is one of that set's members
+ * ({@link MetricAttributes}); and an instrument that carries any attribute at all has a cardinality budget
+ * on record ({@link CardinalityBudget}). Each of these is a decision somebody has to make once, and each is
+ * silent when skipped: the wrong buckets read as a quantity that never varies, an open value set grows a
+ * series per symbol the data invents, and an unbudgeted instrument is capped by whatever exports it.
+ *
+ * <p><strong>What this deliberately does not check yet.</strong> Attribute <em>keys</em> have a naming
+ * discipline of their own — lower-case, dotted, namespaced — and it is not enforced here, because several
+ * metric families still carry their one dimension inside the name, appended to a fixed prefix, and the
+ * rule lands with their migration rather than ahead of it.
  */
 public record MetricFact(String name, MetricType type, String unit, List<MetricPoint> points) {
 
@@ -72,6 +80,50 @@ public record MetricFact(String name, MetricType type, String unit, List<MetricP
                                 + "Without that start a consumer cannot tell an accumulation that "
                                 + "began again from one that went backwards.");
             }
+        }
+        // After the points' own shape, so that a point of the wrong kind is reported as that and never as
+        // one of these three.
+        if (type == MetricType.HISTOGRAM) {
+            HistogramBounds registered = HistogramBounds.forInstrument(name).orElseThrow(() ->
+                    new IllegalArgumentException(
+                            "'" + name + "' publishes a distribution, and no bucket bounds are registered"
+                                    + " for it. Bounds taken from whatever library is in the path measure"
+                                    + " that library's idea of the range, not the quantity's."));
+            if (!HistogramBounds.UNIT.equals(unit)) {
+                throw new IllegalArgumentException(
+                        "'" + name + "' is measured in '" + unit + "' over bounds that are given in '"
+                                + HistogramBounds.UNIT + "'; a bucket layout is only meaningful in its"
+                                + " own unit");
+            }
+            for (MetricPoint point : points) {
+                if (!point.histogram().bounds().equals(registered.bounds())) {
+                    throw new IllegalArgumentException(
+                            "'" + name + "' carries a distribution over bounds " + point.histogram().bounds()
+                                    + " where its registered bounds are " + registered.bounds()
+                                    + "; a percentile read across two bucket layouts is a number from"
+                                    + " neither");
+                }
+            }
+        }
+        boolean dimensioned = false;
+        for (MetricPoint point : points) {
+            for (Map.Entry<String, String> attribute : point.attributes().entrySet()) {
+                dimensioned = true;
+                Set<String> domain = MetricAttributes.closedDomain(attribute.getKey()).orElse(null);
+                if (domain != null && !domain.contains(attribute.getValue())) {
+                    throw new IllegalArgumentException(
+                            "'" + name + "' carries " + attribute.getKey() + "=" + attribute.getValue()
+                                    + ", which is outside that attribute's closed set "
+                                    + new TreeSet<>(domain) + ". A value the data can add is a series"
+                                    + " the data can add.");
+                }
+            }
+        }
+        if (dimensioned && CardinalityBudget.forInstrument(name).isEmpty()) {
+            throw new IllegalArgumentException(
+                    "'" + name + "' carries attributes and declares no cardinality budget: how many series"
+                            + " it may hold, and on which dimension, is decided by the data until somebody"
+                            + " writes the number down.");
         }
     }
 

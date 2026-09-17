@@ -6,6 +6,7 @@ import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FlatReduction;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
@@ -188,12 +189,12 @@ public final class ObservationPublisher {
      */
     private static final String RECONCILE_STREAK_METRIC = "reconcileFailuresInARow";
 
-    private static final String CODE_ATTRIBUTE = "code";
+    private static final String CODE_ATTRIBUTE = MetricAttributes.CODE;
 
-    private static final String PIPELINE_ID_ATTRIBUTE = "tapstate.pipeline.id";
-    private static final String TABLE_ID_ATTRIBUTE = "tapstate.table.id";
-    private static final String DIRECTION_ATTRIBUTE = "direction";
-    private static final String OP_ATTRIBUTE = "op";
+    private static final String PIPELINE_ID_ATTRIBUTE = MetricAttributes.PIPELINE_ID;
+    private static final String TABLE_ID_ATTRIBUTE = MetricAttributes.TABLE_ID;
+    private static final String DIRECTION_ATTRIBUTE = MetricAttributes.DIRECTION;
+    private static final String OP_ATTRIBUTE = MetricAttributes.OP;
     private static final String INBOUND = "in";
     private static final String OUTBOUND = "out";
 

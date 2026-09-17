@@ -6,6 +6,8 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.SettledPositions;
 import java.util.ArrayDeque;
@@ -44,7 +46,12 @@ import java.util.Set;
  * The second kind is for the rows that word goes to nobody about: filed, named by no document, and so
  * carried to a sink by nothing - see {@link #sayWhatOwesNothing()} for why a chain needs telling.
  */
-final class LookupProcessor extends AbstractProcessor {
+final class LookupProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.NEST;
+    }
 
     /** The edge carrying the rows this namespace holds. */
     static final int ROWS = 0;

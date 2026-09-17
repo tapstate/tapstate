@@ -10,6 +10,8 @@ import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.SinkFrontier.ChainEntry;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -51,7 +53,12 @@ import java.util.concurrent.CompletionException;
  * durable offset is the source's, not Jet's, so a restart replays from the source rather than
  * resuming a sink snapshot.
  */
-public final class SinkProcessor extends AbstractProcessor {
+public final class SinkProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.SINK;
+    }
 
     // One write in flight by default: a batch is applied to completion before the next is issued, so a
     // key's events can never be applied out of their arrival order. Raising this pipelines writes and

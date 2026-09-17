@@ -4,6 +4,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -27,6 +29,13 @@ class AReducedViewNeverCollapsesQuietlyTest {
 
     private static final Instant STARTED = Instant.parse("2026-09-16T00:00:00Z");
     private static final Instant OBSERVED = Instant.parse("2026-09-16T00:05:00Z");
+
+    /** A distribution over the instrument's registered bounds, with three observations in its first bucket. */
+    private static HistogramValue threeObservations(HistogramBounds bounds) {
+        List<Long> counts = new ArrayList<>(Collections.nCopies(bounds.buckets(), 0L));
+        counts.set(0, 3L);
+        return bounds.value(3, 1.5, counts);
+    }
 
     /** Rows crossing a boundary, broken out the way the engine really reports them. */
     private static MetricFact records(long ordersIn, long ordersOut, long itemsIn) {
@@ -124,8 +133,8 @@ class AReducedViewNeverCollapsesQuietlyTest {
     void aRuleCannotRescueAHistogram() {
         FlatMetricProjection projected = FlatMetricProjection.of(
                 List.of(MetricFact.single("tapstate.pipeline.process.duration", MetricType.HISTOGRAM, "s",
-                        MetricPoint.distribution(Map.of("stage", "write"), STARTED, OBSERVED,
-                                new HistogramValue(3, 1.5, List.of(1.0), List.of(2L, 1L))))),
+                        MetricPoint.distribution(Map.of("stage", "sink"), STARTED, OBSERVED,
+                                threeObservations(HistogramBounds.PROCESS_DURATION)))),
                 Map.of("tapstate.pipeline.process.duration", attributes -> "processDuration"));
 
         assertThat(projected.metrics()).isEmpty();

@@ -3,6 +3,8 @@ package io.tapstate.runtime.engine.join;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -34,7 +36,12 @@ import java.util.Objects;
  * remove. The re-offer rule is unchanged and simply applies to the delivery: it is absorbed once, and
  * the items stay where they are until everything they meant has gone out.
  */
-public final class JoinProcessor extends AbstractProcessor {
+public final class JoinProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.JOIN;
+    }
 
     private final JoinDriver driver;
     private final Map<Integer, String> sourceByOrdinal;

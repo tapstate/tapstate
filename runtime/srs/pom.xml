@@ -33,6 +33,13 @@
       <artifactId>core-model</artifactId>
       <version>${revision}</version>
     </dependency>
+    <!-- The stage vocabulary: the source processor declares which stage of the graph its time is
+         measured under, and the closed set of stages lives with the metric fact model. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-lifecycle</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>spi-capture</artifactId>

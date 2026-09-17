@@ -8,6 +8,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.ReplayFloor;
@@ -47,7 +49,12 @@ import java.util.Set;
  * batch is done: an entry evicted mid-drain is still the clean one already on disk, and the events that
  * would have changed it have not been acknowledged, so a crash replays them.
  */
-public final class ResolverProcessor extends AbstractProcessor {
+public final class ResolverProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.NEST;
+    }
 
     /**
      * The shortest gap between two passes over the tombstones that may stop being kept.

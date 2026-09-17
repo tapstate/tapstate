@@ -3,6 +3,8 @@ package io.tapstate.runtime.engine.join;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -10,7 +12,12 @@ import java.util.Deque;
 import java.util.List;
 
 /** Publishes each fact key from one ordered processor, after reading its current joined value. */
-final class JoinProjectionProcessor extends AbstractProcessor {
+final class JoinProjectionProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.JOIN;
+    }
     private final JoinProjection projection;
     private final Deque<Envelope> pending = new ArrayDeque<>();
     private boolean taken;

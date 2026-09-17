@@ -9,6 +9,8 @@ import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.spi.transform.TransformPort;
 import java.util.List;
 import java.util.Map;
@@ -32,7 +34,12 @@ import java.util.Objects;
  * <p>The vertex runs at total parallelism one: a sink downstream acks an ordered position stream, and
  * a parallelism-greater-than-one transform would re-lane events and break that order.
  */
-public final class TransformProcessor extends AbstractProcessor {
+public final class TransformProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.TRANSFORM;
+    }
 
     private final FlatMapper<Envelope, Envelope> flatMapper;
     private final LevelBounds bounds;
