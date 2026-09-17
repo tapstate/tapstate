@@ -115,9 +115,9 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
     }
 
     @Test
-    void a_view_keyed_off_a_column_that_is_not_the_discovered_tables_key_is_refused() {
-        // The same collapse as the nest case, in the shape the gate did not cover: one table, its key
-        // discovered as id, the view upserting - and uniquely indexing - a column rows can share.
+    void an_explicit_view_key_overrides_the_discovered_tables_key() {
+        // Discovery supplies a default identity; it does not overrule the key the author explicitly
+        // chose for the materialized view.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal("orders")), null, null));
@@ -131,9 +131,8 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                         List.of(new SourceField("id", "int"), new SourceField("customer", "string")),
                         List.of("id"), List.of())))));
 
-        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
-                .isInstanceOf(TapstateException.class)
-                .satisfies(code("actuation.view-key-not-feed-identity"));
+        Assertions.assertThatCode(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .doesNotThrowAnyException();
     }
 
     @Test

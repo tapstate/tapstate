@@ -48,8 +48,8 @@ actuation.view-store-unreachable:
   message: "The managed state store `{store}` a view materializes into did not answer: {reason}"
   solution: "Check that the state store is running and reachable from the server, then start the pipeline again."
 actuation.view-key-not-feed-identity:
-  message: "View `{view}` declares key `{key}`, but what feeds it is identified by `{identity}`."
-  solution: "Declare the view's primaryKey as that identity column. An identity spanning several columns cannot be served by a view today - a view's key is a single column, and materializing on fewer columns than the identity collapses distinct records."
+  message: "View `{view}` declares key `{key}`, but its assembled input is identified by `{identity}`."
+  solution: "Declare the view's primaryKey as the nest root's identity column. An assembled identity spanning several columns cannot be served by a view today - a view's key is a single column, and materializing on fewer columns than the identity collapses distinct records."
 actuation.view-fed-by-many-tables:
   message: "View `{view}` is fed by more than one stream: {tables}."
   solution: "Feed the view from a single table, or assemble the streams into one document with a nest step and feed the view from that."

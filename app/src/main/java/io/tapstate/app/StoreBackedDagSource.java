@@ -1388,7 +1388,7 @@ final class StoreBackedDagSource implements DagSource {
         // key has nothing for the identity gate to compare. Review found the reverse order turning the
         // coded missing-key refusal into a bare NullPointerException inside the gate.
         ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(inline);
-        requireKeyIsTheFeedIdentity(pipeline, inline, targets, tablesBySourceId);
+        requireKeyIsTheFeedIdentity(pipeline, inline, tablesBySourceId);
         // Coded rather than bare, unlike a source the author named: this store is the deployment's, so
         // its absence is a condition an operator acts on rather than a defect on this side.
         SourceResource store = artifacts().get(target.sourceId())
@@ -1425,7 +1425,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * Refuses a view whose single key is not the identity of what feeds it, before anything binds.
+     * Refuses a view whose single key cannot safely identify what feeds it, before anything binds.
      *
      * <p>The view sink upserts every stream on the view's declared key and indexes it uniquely, so the
      * key has to be what the feed converges on. Two shapes break that and neither says anything at
@@ -1435,11 +1435,13 @@ final class StoreBackedDagSource implements DagSource {
      * any single snapshot, which is why they are refused here by name instead.
      *
      * <p>What feeds the view is resolved by walking its from-reference down to leaves: a nest step is
-     * one assembled stream carrying its root's key, a source id is each of its tables, anything else
-     * is one table. A regex names many upstreams by construction and is refused as such.
+     * one assembled stream carrying its explicitly declared root key, a source id is each of its
+     * tables, anything else is one table. A regex names many upstreams by construction and is refused
+     * as such. A discovered table key is only a default; it cannot override the view key the author
+     * explicitly declared.
      */
     private static void requireKeyIsTheFeedIdentity(PipelineResource pipeline, ViewBlock.Inline view,
-            Map<String, TargetTable> targets, Map<String, List<String>> tablesBySourceId) {
+            Map<String, List<String>> tablesBySourceId) {
         List<String> streams = new ArrayList<>();
         List<TransformBody.Nest> assemblies = new ArrayList<>();
         collectFeed(pipeline, view.from(), tablesBySourceId, streams, assemblies, new HashSet<>());
@@ -1449,20 +1451,6 @@ final class StoreBackedDagSource implements DagSource {
         }
         if (assemblies.size() == 1) {
             requireKeyIs(view, assemblies.getFirst().root().key());
-            return;
-        }
-        // A single table: its identity is whatever discovery recorded. An undiscovered table has no
-        // identity on record, and the view's own key is then the only identity there is - which is the
-        // path that lets materialization run before any discovery has.
-        if (streams.size() == 1 && targets != null) {
-            TargetTable model = targets.get(streams.getFirst());
-            if (model != null) {
-                List<String> identity = model.fields().stream()
-                        .filter(TargetField::primaryKey).map(TargetField::name).toList();
-                if (!identity.isEmpty()) {
-                    requireKeyIs(view, identity);
-                }
-            }
         }
     }
 
