@@ -31,12 +31,21 @@ public final class PipelineConverger {
     private final StateStore state;
     private final LifecycleActuator actuator;
     private final Clock clock;
+    private final RebuildAdmission rebuilds;
 
+    /** A converge loop that never rebuilds a failed run, which is every run on a single node. */
     public PipelineConverger(DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock) {
+        this(desired, state, actuator, clock, RebuildAdmission.never());
+    }
+
+    public PipelineConverger(
+            DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
+            RebuildAdmission rebuilds) {
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
         this.actuator = Objects.requireNonNull(actuator, "actuator");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.rebuilds = Objects.requireNonNull(rebuilds, "rebuilds");
     }
 
     /** Drives the pipeline's actual state toward its current desired target, seeding it if new. */
@@ -104,8 +113,16 @@ public final class PipelineConverger {
         }
 
         if (target == PipelineState.RUNNING && actual == PipelineState.FAILED && !rebuildOwed) {
-            // A failed run stays failed: re-driving it toward RUNNING would restart the dead job on
-            // every tick. The user recovers by stopping it then starting a fresh run -- which arrives
+            // A run that died because the cluster changed under it is the one death this loop may answer
+            // by itself, and it is asked here rather than where the death was observed so that the
+            // failure is recorded and published first: whatever is decided next, nobody is left reading a
+            // healthy pipeline over a dead job while it is being decided. The admission bounds itself --
+            // a yes that never runs out is a restart loop wearing the word "recovery".
+            if (rebuilds.admits(pipelineId)) {
+                return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false);
+            }
+            // Otherwise a failed run stays failed: re-driving it toward RUNNING would restart the dead job
+            // on every tick. The user recovers by stopping it then starting a fresh run -- which arrives
             // as the one instruction above, and that is let through: it is somebody saying so once,
             // which is the whole difference from this loop noticing the same death every second.
             // actual is FAILED only when the checkpoint was read and parsed, so

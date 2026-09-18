@@ -7,6 +7,7 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.spi.store.StorePort;
 import java.time.Clock;
 import org.junit.jupiter.api.Test;
@@ -33,6 +34,7 @@ class RuntimeConvergenceStartupTest {
             // configuration, which this context does not bring up -- it is the convergence loop alone.
             .withBean(ClusterMembershipGate.class, () -> new ClusterMembershipGate(new ClusterProperties()))
             .withBean(PipelineActuationOwnership.class, PipelineActuationOwnership::single)
+            .withBean(RebuildAdmission.class, RebuildAdmission::never)
             .withUserConfiguration(RuntimeConvergenceConfiguration.class);
 
     @Test

@@ -8,6 +8,7 @@ import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.NestColdLayerWatch;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.spi.store.StorePort;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -32,8 +33,11 @@ import java.time.Clock;
 class RuntimeConvergenceConfiguration {
 
     @Bean
-    PipelineConverger pipelineConverger(StorePort storePort, LifecycleActuator lifecycleActuator, Clock clock) {
-        return new PipelineConverger(storePort.desired(), storePort.state(), lifecycleActuator, clock);
+    PipelineConverger pipelineConverger(
+            StorePort storePort, LifecycleActuator lifecycleActuator, Clock clock,
+            RebuildAdmission rebuildAdmission) {
+        return new PipelineConverger(
+                storePort.desired(), storePort.state(), lifecycleActuator, clock, rebuildAdmission);
     }
 
     @Bean

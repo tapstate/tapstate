@@ -240,6 +240,53 @@ class PipelineConvergerTest {
     }
 
     @Test
+    @DisplayName("a failed run the admission allows is replaced; the state is recorded failed first")
+    void anAdmittedFailedRunIsRebuiltRatherThanLeftFailed() {
+        RecordingAdmission admission = new RecordingAdmission();
+        PipelineConverger rebuilding = new PipelineConverger(
+                desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC), admission);
+        converge(RUNNING);
+        actuator.failWith(new IllegalStateException("its member left"));
+        rebuilding.converge("p1");
+        assertThat(StateJson.parse(state.read("p1").orElseThrow().stateJson()))
+                .as("the death is recorded and publishable before anything is decided about replacing it")
+                .isEqualTo(FAILED);
+        actuator.reset();
+
+        admission.answer(true);
+        ConvergeResult rebuilt = rebuilding.converge("p1");
+
+        assertThat(actuator.calls())
+                .as("the dead run is ended and a fresh one begun -- one stop, one start, nothing repeated")
+                .containsExactly("stop:p1:keep", "start:p1");
+        assertThat(rebuilt.status()).isEqualTo(CONVERGED);
+        assertThat(StateJson.parse(state.read("p1").orElseThrow().stateJson())).isEqualTo(RUNNING);
+        assertThat(admission.asked())
+                .as("asked once, on the pass that found it failed -- not on the pass that failed it")
+                .containsExactly("p1");
+    }
+
+    @Test
+    @DisplayName("a failed run the admission refuses stays failed and is not re-driven every tick")
+    void aRefusedFailedRunStaysFailed() {
+        RecordingAdmission admission = new RecordingAdmission();
+        PipelineConverger rebuilding = new PipelineConverger(
+                desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC), admission);
+        converge(RUNNING);
+        actuator.failWith(new IllegalStateException("the connector gave up"));
+        rebuilding.converge("p1");
+        actuator.reset();
+
+        rebuilding.converge("p1");
+        rebuilding.converge("p1");
+
+        assertThat(actuator.calls())
+                .as("nothing is actuated for a death this loop is not allowed to answer")
+                .isEmpty();
+        assertThat(StateJson.parse(state.read("p1").orElseThrow().stateJson())).isEqualTo(FAILED);
+    }
+
+    @Test
     @DisplayName("a start that threw is driven again next pass, not left as RUNNING over no job")
     void aStartThatThrewOnOnePassIsDrivenAgainOnTheNext() {
         desired.save(new DesiredState("p1", RUNNING, REV));
@@ -606,4 +653,24 @@ class PipelineConvergerTest {
         }
     }
 
+    /** An admission a test drives, recording what it was asked about so the loop's own half is visible. */
+    private static final class RecordingAdmission implements RebuildAdmission {
+
+        private final java.util.List<String> asked = new java.util.ArrayList<>();
+        private boolean answer;
+
+        @Override
+        public boolean admits(String pipelineId) {
+            asked.add(pipelineId);
+            return answer;
+        }
+
+        void answer(boolean admits) {
+            this.answer = admits;
+        }
+
+        java.util.List<String> asked() {
+            return java.util.List.copyOf(asked);
+        }
+    }
 }

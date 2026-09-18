@@ -6,6 +6,7 @@ import io.tapstate.adapters.pdk.PdkCapturePort;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
@@ -119,6 +120,28 @@ class DataPlaneActuationConfiguration {
                 clusterProperties.getWorkloadClaimRenewInterval());
         hazelcastMember.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
         return authorization;
+    }
+
+    /**
+     * The one way a failed run is replaced with nobody asking. It is here rather than beside the converge
+     * loop because the question it answers is about members and claims, which is what this configuration
+     * knows: the loop is only told yes or no.
+     *
+     * <p>A single-node run never rebuilds anything. There is no member whose leaving could have ended the
+     * run, so every death there is the pipeline's own and stays recorded as one.
+     *
+     * <p>The spacing between attempts is one claim lease. That is already this cluster's own answer to
+     * "how long before ownership has settled", so a rebuild that waits it out is rebuilding into a
+     * membership that has stopped moving rather than into the middle of a handover.
+     */
+    @Bean
+    RebuildAdmission rebuildAdmission(
+            ClusterProperties clusterProperties, PipelineActuationOwnership pipelineActuationOwnership) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return RebuildAdmission.never();
+        }
+        return new ClusterRebuildAdmission(
+                pipelineActuationOwnership, clusterProperties.getWorkloadClaimTtl());
     }
 
     /**

@@ -66,6 +66,13 @@ final class PipelineActuationOwnership {
         private WorkloadClaim claim;
         private long nextContactNanos;
         private boolean contacted;
+        /**
+         * The committed topology revision the run this member last submitted was fenced under, or null
+         * while it has submitted none. Kept apart from the claim's own revision because that one moves
+         * forward the moment this member re-acquires under a changed cluster, which is exactly when the
+         * difference between the two becomes the thing worth knowing.
+         */
+        private Long runTopologyRevision;
     }
 
     private PipelineActuationOwnership() {
@@ -182,8 +189,32 @@ final class PipelineActuationOwnership {
             return Execution.refused();
         }
         state.claim = advanced.get();
+        state.runTopologyRevision = state.claim.topologyRevision();
         return new Execution(true, new ExecutionFence(
                 pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()));
+    }
+
+    /**
+     * Whether the cluster changed under the run this member last submitted for {@code pipelineId}.
+     *
+     * <p>This is the product's own answer to "did a member leave", and it is its own rather than the
+     * engine's for a measured reason: a run ended by a member leaving and a run ended by a connector
+     * giving up reach this process as the same exception class with the same absent cause, differing
+     * only in text inside a message. The committed membership revision is a number this cluster keeps
+     * for itself, compared against the one the run was fenced under.
+     *
+     * <p>False while this member has submitted no run, while nothing is committed, and on a single node
+     * -- one member cannot lose a member, it can only be the one that went.
+     */
+    boolean clusterChangedUnderTheRun(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        if (!fenced) {
+            return false;
+        }
+        Held state = held.get(pipelineId);
+        ClusterMembership current = membership.committed();
+        return state != null && state.runTopologyRevision != null && current != null
+                && current.revision() != state.runTopologyRevision;
     }
 
     /**
