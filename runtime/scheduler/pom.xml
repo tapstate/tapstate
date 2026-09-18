@@ -27,6 +27,15 @@
       <artifactId>spi-store</artifactId>
       <version>${revision}</version>
     </dependency>
+    <!-- The change-kind enum the metrics face names its operations from, so the closed set has one owner
+         and a kind added to it cannot quietly publish as the name kept for kinds nothing recognises
+         (rule R4: core only). Already on this classpath through the ports above; declared because it is
+         used here. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-event</artifactId>
+      <version>${revision}</version>
+    </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>

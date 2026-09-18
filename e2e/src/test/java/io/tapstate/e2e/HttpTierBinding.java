@@ -234,6 +234,11 @@ final class HttpTierBinding implements TierBinding {
     }
 
     @Override
+    public Optional<Long> recordsOut(String pipelineId) {
+        return control.recordsOut(pipelineId);
+    }
+
+    @Override
     public Optional<String> failureCode(String pipelineId) {
         return control.failureCode(pipelineId);
     }

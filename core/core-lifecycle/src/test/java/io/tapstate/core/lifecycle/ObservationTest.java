@@ -2,7 +2,10 @@ package io.tapstate.core.lifecycle;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -87,6 +90,57 @@ class ObservationTest {
 
         assertThat(obs.positions()).containsEntry("t", "pos-1");
         assertThatThrownBy(() -> obs.positions().put("x", "y")).isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void carriesTheMeasuredFactsBesideTheFlatView() {
+        // The flat map is one number per name; the fact under it keeps the dimensions, the kind of
+        // measurement and the unit the map has nowhere to put. Both travel, from one measurement.
+        Instant at = Instant.parse("2026-09-17T10:00:00Z");
+        MetricFact records = new MetricFact("tapstate.pipeline.records", MetricType.COUNTER, "{record}",
+                List.of(MetricPoint.accumulated(
+                        Map.of("tapstate.pipeline.id", "orders_sync", "direction", "in"), at, at, 100L)));
+        Observation obs = new Observation("orders_sync", PipelineState.RUNNING,
+                Map.of("records.in", 100L), Map.of(), Map.of(), null, at, List.of(records));
+
+        assertThat(obs.facts()).containsExactly(records);
+        assertThat(obs.metrics()).containsEntry("records.in", 100L);
+    }
+
+    @Test
+    void factsDefaultToEmptyAndAreDefensivelyCopied() {
+        // Every older constructor and a null list read as "no facts carried" — never as facts derived
+        // from the flat map, which would be a measurement nobody took.
+        assertThat(new Observation("p1", PipelineState.NEW, null, null).facts()).isEmpty();
+        assertThat(new Observation("p1", PipelineState.NEW, Map.of(), Map.of(), Map.of(), null,
+                Instant.EPOCH).facts()).isEmpty();
+        assertThat(new Observation("p1", PipelineState.NEW, Map.of(), Map.of(), Map.of(), null,
+                Instant.EPOCH, null).facts()).isEmpty();
+
+        List<MetricFact> facts = new ArrayList<>(List.of(MetricFact.single("recordCount", MetricType.GAUGE,
+                "{record}", MetricPoint.reading(Map.of(), Instant.EPOCH, 1L))));
+        Observation obs = new Observation("p1", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null,
+                Instant.EPOCH, facts);
+        facts.clear();
+
+        assertThat(obs.facts()).hasSize(1);
+        assertThatThrownBy(() -> obs.facts().clear()).isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void refusesTwoFactsUnderOneName() {
+        // Two facts for one instrument are two answers to one question; a reader taking either takes one
+        // arbitrarily, which is the same failure a fact refuses for two points on the same attributes.
+        MetricFact first = MetricFact.single("recordCount", MetricType.GAUGE, "{record}",
+                MetricPoint.reading(Map.of(), Instant.EPOCH, 1L));
+        MetricFact second = MetricFact.single("recordCount", MetricType.GAUGE, "{record}",
+                MetricPoint.reading(Map.of(), Instant.EPOCH, 2L));
+
+        assertThatThrownBy(() -> new Observation("p1", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+                null, Instant.EPOCH, List.of(first, second)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("recordCount")
+                .hasMessageContaining("twice");
     }
 
     @Test

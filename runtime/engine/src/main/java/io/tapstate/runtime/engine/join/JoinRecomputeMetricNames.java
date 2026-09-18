@@ -13,10 +13,13 @@ package io.tapstate.runtime.engine.join;
  * distance between them, and a run's statistics carry numbers alone, so the pair has to travel as a pair
  * of numbers. What they are about travels in the name.
  *
- * <p><b>The subject is not taken apart again, and that is what lets both halves of it be arbitrary.</b>
- * The namespace is a map name with separators of its own, and the dimension key is a value out of the
- * user's table, so no split could tell where one ended and the other began. A reader wanting the key
- * reads the tail of the subject; nothing here promises to do it for them.
+ * <p><b>The namespace can be read back out of the subject; the key cannot, and is not meant to be.</b>
+ * The namespace is a map name with separators of its own but never the one used here, so the head of the
+ * subject up to the first separator is the namespace whatever the key holds. The key is a value out of the
+ * user's table: it names the rebuild on the run's own statistics, where a reading is a bare number and
+ * needs a name to be about anything, and it goes no further than that. A metric attribute never carries a
+ * value read out of a row, so what leaves the engine is keyed by the namespace alone, with the rebuilds in
+ * one namespace added together.
  */
 public final class JoinRecomputeMetricNames {
 
@@ -64,6 +67,15 @@ public final class JoinRecomputeMetricNames {
     /** The name the rows that rebuild has altogether are left under. */
     public static String expectedNameOf(String namespace, String dimensionKey) {
         return EXPECTED_PREFIX + subjectOf(namespace, dimensionKey);
+    }
+
+    /**
+     * The namespace a subject is in: its head up to the first separator, which a map name never holds and
+     * a key may. A subject with no separator is taken as a namespace whole.
+     */
+    public static String namespaceOf(String subject) {
+        int split = subject.indexOf(SEPARATOR);
+        return split < 0 ? subject : subject.substring(0, split);
     }
 
     /** The subject a rows-sent reading named {@code metric} is about, or {@code null} when it is not one. */

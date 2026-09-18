@@ -28,6 +28,7 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -230,6 +231,20 @@ class CaptureRunUnitTest {
 
         assertThat(accepted).containsExactly(
                 SourceOrder.snapshotRow(1L), SourceOrder.snapshotRow(2L));
+    }
+
+    @Test
+    @DisplayName("what the load read is on the run's own account, under the operation the source performed")
+    void theLoadsRowsAreCountedOnTheRunsAccountAsReads() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1), row(2), row(3)), List.of());
+
+        CaptureRun run = runUnit(port, meta).start(spec(ReadMode.SNAPSHOT_ONLY, true), event -> { });
+
+        // The account is opened before the load, not with the tail that follows it. Opened after, a run
+        // would report having read nothing until its first change arrived - and for a snapshot_only run,
+        // which never opens a tail at all, for ever.
+        assertThat(run.health().receivedRows()).containsExactly(Map.entry("orders", Map.of("r", 3L)));
     }
 
     /**

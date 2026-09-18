@@ -11,6 +11,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SrsLogStore;
@@ -29,6 +30,7 @@ final class InMemoryStorePort implements StorePort {
     private final InMemoryDesiredStore desired = new InMemoryDesiredStore();
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final InMemoryObservationStore observations = new InMemoryObservationStore();
+    private final InMemoryRateHistoryStore rateHistory = new InMemoryRateHistoryStore();
     private final InMemoryArtifactStore artifacts;
     private final InMemorySrsMetaStore meta = new InMemorySrsMetaStore();
     private final InMemorySrsLogStore srsLog = new InMemorySrsLogStore();
@@ -58,6 +60,11 @@ final class InMemoryStorePort implements StorePort {
     @Override
     public DesiredStore desired() {
         return desired;
+    }
+
+    @Override
+    public RateHistoryStore rateHistory() {
+        return rateHistory;
     }
 
     @Override

@@ -5,8 +5,8 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Accumulators;
 import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
-import com.mongodb.client.model.IndexOptions;
 import io.tapstate.adapters.mongostore.ChangeSet;
+import io.tapstate.adapters.mongostore.IndexEnsure;
 import io.tapstate.adapters.mongostore.ChangeSet.Fence;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import org.bson.Document;
@@ -52,7 +52,7 @@ public final class V1BaselineIndexes implements ChangeSet {
             }
             for (SystemCollections.IndexSpec index : row.indexes()) {
                 fence.requireStillHeld();
-                build(row.indexTargetOn(database), index);
+                build(database, row.indexTargetOn(database), index);
             }
         }
     }
@@ -89,15 +89,20 @@ public final class V1BaselineIndexes implements ChangeSet {
      * through it is the one a future declaration takes, and a guard nothing can put into its failing
      * state is a guard nobody knows still works.
      */
+    static void build(MongoDatabase database, MongoCollection<Document> collection,
+            SystemCollections.IndexSpec index) {
+        if (index.unique()) {
+            refuseOnDuplicates(collection, index);
+        }
+        IndexEnsure.ensure(database, collection, index);
+    }
+
+    /** The same build for a caller holding only the collection: created when absent, never altered. */
     static void build(MongoCollection<Document> collection, SystemCollections.IndexSpec index) {
         if (index.unique()) {
             refuseOnDuplicates(collection, index);
         }
-        Document keys = new Document();
-        for (String key : index.keys()) {
-            keys.append(key, 1);
-        }
-        collection.createIndex(keys, new IndexOptions().name(index.indexName()).unique(index.unique()));
+        IndexEnsure.createIfAbsent(collection, index);
     }
 
     /** Reports the values that would collide, rather than letting the index build report one and stop. */

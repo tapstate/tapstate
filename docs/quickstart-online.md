@@ -611,7 +611,7 @@ tool for stopping its own process.
 ```console
 tapstate(admin@127.0.0.1:8080)> status order_pipeline             # state, and why if it is not working
 tapstate(admin@127.0.0.1:8080)> status order_pipeline --watch    # live state; Ctrl-C to stop
-tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # recordCount / errorCount / positions
+tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # records.out / errors.<code> / positions
 tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local operational log tail
 ```
 
@@ -619,7 +619,35 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   what you asked for rather than changing with the command. Immediately after `start`
   the first `status`/`metrics` may report no observation yet, and a `status` right
   after `stop` can still say `running`. Use `--watch`, or retry after a second.
-- `metrics` is the signal for progress: `recordCount` climbing, `errorCount` at 0.
+- Under the answer, `status` prints two more lines. `moving` is how fast the pipeline moves, in rows
+  per second per direction, measured between two readings of the pipeline's own observation time —
+  never this machine's clock, which keeps running while a stalled publisher's reading stands still. A
+  one-shot `status` takes the second reading itself, waiting up to a few seconds for a newer
+  observation; while there is only one reading it says `not known`, not `0`, because a pipeline
+  observed once and a pipeline that moved nothing call for different next steps. `lag` is how far
+  behind each table stands. `status --watch` prints a `moving` line every five seconds beside the
+  state changes it streams, the first of which is `not known yet` for the same reason. A rate needs two
+  readings, so `status` waits about a second for the second one when you are at a terminal; run from a
+  script it answers at once and says the rate is not known, unless you ask for it with `status <id>
+  --rate`.
+- `metrics` is the signal for progress: `records.out` climbing and no `errors.<code>` key appearing.
+- **The same facts can go to your monitoring.** Export is off unless you turn it on, and turning it on
+  changes nothing the CLI reads. To serve a Prometheus scrape endpoint, start the server with
+  `--tapstate.metrics.export.prometheus.port=9464` and point Prometheus at `/metrics` on that port. It
+  listens on `127.0.0.1` unless you widen it with `--tapstate.metrics.export.prometheus.host=0.0.0.0`,
+  which a scraper running outside this container needs; what it serves is an inventory of pipeline,
+  table and namespace ids, and a scrape endpoint carries no authentication, so widen it to a network the
+  scraper is already inside. To
+  push to an OpenTelemetry collector, set `--tapstate.metrics.export.otlp.endpoint=http://collector:4318/v1/metrics`
+  (`--tapstate.metrics.export.otlp.protocol=grpc` with a `host:port` endpoint for gRPC; the push interval
+  defaults to a minute). What arrives is what `metrics` shows: counters such as
+  `tapstate.pipeline.records` with `direction`, `tapstate.table.id` and `op` as attributes, gauges such as
+  `tapstate.pipeline.lag`, histograms such as `tapstate.pipeline.record.delivery.duration` with their
+  buckets, and `tapstate.pipeline.state` as one series per state with the current one at 1. A pipeline
+  wider than the per-metric budget folds its extra tables into one series marked `otel.metric.overflow`,
+  so totals stay right while the busiest thousand tables keep their names. The names are not a
+  compatibility promise yet, the same as on the `metrics` face.
+  Failures are counted per error code, and a pipeline that has failed nothing carries no such key.
 - **`status` answers "why is it not working" itself**, under the state line: it walks a short fixed
   checklist over the same four faces you can read by hand and prints what it concluded, the face and
   value it read, and where to look next. When nothing on the checklist matches it does **not** report
@@ -749,7 +777,9 @@ pipeline and keep all of it — so the next start carries on from where this run
 reading the whole source again — use `stop order_pipeline --keep-state`, which asks nothing because
 nothing is going. In a script or a CI step, where there is no terminal to answer at, a plain `stop`
 is refused rather than either waiting on input that never arrives or clearing unasked: add `-y` to
-go ahead, or use `--keep-state`.
+go ahead, or use `--keep-state`. Neither spelling touches the pipeline's sampled metrics history:
+the samples stay through a stop, and leave only by age — fifteen days unless configured — or when
+the pipeline is deleted.
 
 Then stop the stack and delete its data:
 

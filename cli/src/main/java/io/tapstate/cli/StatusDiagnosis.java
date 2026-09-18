@@ -113,14 +113,15 @@ final class StatusDiagnosis {
         if (early.isPresent()) {
             return early.get();
         }
-        if (metrics != null && metrics.errorCount() != null && metrics.errorCount() > 0 && converging(state)) {
+        if (metrics != null && metrics.reconcileFailuresInARow() != null
+                && metrics.reconcileFailuresInARow() > 0 && converging(state)) {
             // Deliberately not "cannot reach the store": this count rises whenever a convergence pass
             // throws, and a plan that cannot be built throws exactly the same way a store that cannot be
             // reached does. Naming one of the causes would send a reader to check a database that is fine.
             return new Answer(
-                    "the server keeps failing to bring this pipeline up: " + metrics.errorCount()
-                            + " passes in a row have thrown",
-                    List.of("metrics.errorCount = " + metrics.errorCount(),
+                    "the server keeps failing to bring this pipeline up: "
+                            + metrics.reconcileFailuresInARow() + " passes in a row have thrown",
+                    List.of("metrics.reconcileFailuresInARow = " + metrics.reconcileFailuresInARow(),
                             "status.state = " + lower(state)),
                     "read the server's own log -- the reason is printed there once per pass",
                     List.of("whether the job itself is still alive: nothing here has seen it die, so the "
@@ -175,8 +176,9 @@ final class StatusDiagnosis {
         if (metrics == null) {
             readings.add("metrics = could not be read");
         } else {
-            readings.add("metrics.errorCount = "
-                    + (metrics.errorCount() == null ? "not published" : metrics.errorCount()));
+            readings.add("metrics.reconcileFailuresInARow = "
+                    + (metrics.reconcileFailuresInARow() == null
+                            ? "not published" : metrics.reconcileFailuresInARow()));
             readings.add("metrics.recordCount = "
                     + (metrics.recordCount() == null ? "not published" : metrics.recordCount()));
             readings.add("metrics.frontierStalledMillis = none above zero");

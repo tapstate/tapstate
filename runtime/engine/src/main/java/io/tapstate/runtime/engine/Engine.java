@@ -11,6 +11,10 @@ import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
@@ -19,6 +23,9 @@ import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMetricNames;
 import io.tapstate.spi.store.KeyedStateStore;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -291,9 +298,10 @@ public final class Engine {
     }
 
     /**
-     * How many rows each large rebuild of the pipeline has sent so far, keyed by the namespace and
-     * dimension key it is about; empty when it has no live job and while no rebuild large enough to
-     * report is under way.
+     * How many rows the large rebuilds of the pipeline have sent so far, keyed by the namespace the
+     * rebuilt dimension lives in; empty when it has no live job and while no rebuild large enough to
+     * report is under way. Two rebuilds under way in one namespace are added together: the key each one
+     * is about is a value out of a row, and a reading that leaves the engine is not keyed by one.
      *
      * <p>Read beside {@link #joinRecomputeExpected}, which says how many rows that rebuild has
      * altogether. The distance between the two is the whole of what this says: while it is open the
@@ -304,11 +312,12 @@ public final class Engine {
      * running, or the one running is small enough that nobody needs telling. Both are the quiet state.
      * A rebuild that has finished keeps its last reading, which is the number it ended on.
      *
-     * <p>Kept at its highest per subject rather than summed, because a rebuild belongs to whichever
-     * processor owns the key's partition and every collection of it reports that same running total.
+     * <p>Kept at its highest per rebuild before namespaces are added up, because a rebuild belongs to
+     * whichever processor owns the key's partition and every collection of it reports that same running
+     * total.
      */
     public Map<String, Long> joinRecomputeDone(String pipelineId) {
-        return byChain(pipelineId, JoinRecomputeMetricNames::doneSubjectOf);
+        return byNamespace(pipelineId, JoinRecomputeMetricNames::doneSubjectOf);
     }
 
     /**
@@ -320,7 +329,276 @@ public final class Engine {
      * exists to warn about.
      */
     public Map<String, Long> joinRecomputeExpected(String pipelineId) {
-        return byChain(pipelineId, JoinRecomputeMetricNames::expectedSubjectOf);
+        return byNamespace(pipelineId, JoinRecomputeMetricNames::expectedSubjectOf);
+    }
+
+    /**
+     * The rebuild readings {@code subjectOf} names, at their highest per rebuild and then added per
+     * namespace. Two steps because the two are different facts: one rebuild is reported by every
+     * processor at the same running total, so the highest of those is the reading; two rebuilds in one
+     * namespace are two pieces of work, so their readings add.
+     */
+    private Map<String, Long> byNamespace(String pipelineId, Function<String, String> subjectOf) {
+        Map<String, Long> perNamespace = new HashMap<>();
+        byChain(pipelineId, subjectOf).forEach((subject, reading) ->
+                perNamespace.merge(JoinRecomputeMetricNames.namespaceOf(subject), reading, Long::sum));
+        return perNamespace;
+    }
+
+    /**
+     * How many rows of each table the pipeline's live job has had confirmed by its targets, broken out by
+     * the source operation that produced them: table, then operation symbol, then the running total. Empty
+     * when it has no live job, and a table with nothing confirmed is absent rather than present at zero.
+     *
+     * <p>Counts from two sinks over the same table are <strong>added</strong>, unlike the per-chain
+     * readings above which are kept at their widest. The difference is what each one measures: a distance
+     * is one fact two sinks each have a view of, so a pipeline is as far behind as its furthest-behind
+     * sink; a delivery is work done, and a row written to two targets was written twice. That is also what
+     * the record count this sits beside has always reported, summed over the output sinks.
+     */
+    public Map<String, Map<String, Long>> recordsDelivered(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? Map.of() : deliveredRowsIn(job.getMetrics());
+    }
+
+    /**
+     * The delivery counts in {@code collected}, by table and source operation. Separated from finding
+     * the job because that is the half with no behaviour in it: which names are read, which are passed
+     * over, and how two sinks' figures combine are decisions, and a decision reachable only through a
+     * running job is a decision nothing checks.
+     */
+    static Map<String, Map<String, Long>> deliveredRowsIn(JobMetrics collected) {
+        Map<String, Map<String, Long>> byTable = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            JetDeliveryGauge.Delivered delivered = JetDeliveryGauge.deliveredOf(metric);
+            if (delivered == null) {
+                continue;
+            }
+            for (Measurement measurement : collected.get(metric)) {
+                byTable.computeIfAbsent(delivered.table(), ignored -> new HashMap<>())
+                        .merge(delivered.op(), measurement.value(), Long::sum);
+            }
+        }
+        return byTable;
+    }
+
+    /**
+     * How many bytes of payload the pipeline's live job has had confirmed by its targets, by table; empty
+     * when it has no live job, and absent for a table with nothing confirmed.
+     *
+     * <p>Added over sinks like the counts beside it and unlike the per-chain distances, for the reason
+     * that decides between them: a row written to two targets was written twice, and its payload crossed
+     * twice.
+     */
+    public Map<String, Long> bytesDelivered(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? Map.of() : settledBytesIn(job.getMetrics());
+    }
+
+    /**
+     * The settled payload sizes in {@code collected}, by table. Added over the sinks like the counts and
+     * unlike the distances: a row written to two targets was written twice and its payload crossed twice.
+     */
+    static Map<String, Long> settledBytesIn(JobMetrics collected) {
+        Map<String, Long> byTable = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            String table = JetDeliveryGauge.carriedTableOf(metric);
+            if (table == null) {
+                continue;
+            }
+            for (Measurement measurement : collected.get(metric)) {
+                byTable.merge(table, measurement.value(), Long::sum);
+            }
+        }
+        return byTable;
+    }
+
+    /**
+     * How long the rows of each table have taken to reach a target, from the source's stamp to the
+     * confirmed write, as one distribution per table over the registered bounds; empty when the pipeline
+     * has no live job, and absent for a table with nothing confirmed.
+     *
+     * <p>Added over sinks, bucket by bucket, like the counts and unlike the per-chain distances: a row
+     * written to two targets was delivered twice, and each delivery took as long as it took.
+     */
+    public Map<String, HistogramValue> deliveryDurations(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? Map.of() : settledDurationsIn(job.getMetrics());
+    }
+
+    /**
+     * The delivery-duration distributions in {@code collected}, by table. A table is read back only when
+     * all three of its parts are present and its buckets are as many as the registered bounds need: a
+     * distribution with a bucket missing is not a distribution short one bucket, it is a collection that
+     * caught a sink half-way through reporting, and it is left out rather than read as a shape.
+     */
+    static Map<String, HistogramValue> settledDurationsIn(JobMetrics collected) {
+        HistogramBounds bounds = HistogramBounds.RECORD_DELIVERY_DURATION;
+        Map<String, Long> counts = new HashMap<>();
+        Map<String, Long> sums = new HashMap<>();
+        Map<String, long[]> buckets = new HashMap<>();
+        Map<String, Integer> bucketsSeen = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            String countTable = JetDeliveryGauge.durationCountTableOf(metric);
+            if (countTable != null) {
+                for (Measurement measurement : collected.get(metric)) {
+                    counts.merge(countTable, measurement.value(), Long::sum);
+                }
+                continue;
+            }
+            String sumTable = JetDeliveryGauge.durationSumTableOf(metric);
+            if (sumTable != null) {
+                for (Measurement measurement : collected.get(metric)) {
+                    sums.merge(sumTable, measurement.value(), Long::sum);
+                }
+                continue;
+            }
+            JetDeliveryGauge.DurationBucket bucket = JetDeliveryGauge.durationBucketOf(metric);
+            if (bucket == null || bucket.index() < 0 || bucket.index() >= bounds.buckets()) {
+                continue;
+            }
+            long[] perBucket = buckets.computeIfAbsent(bucket.table(), ignored -> new long[bounds.buckets()]);
+            for (Measurement measurement : collected.get(metric)) {
+                perBucket[bucket.index()] += measurement.value();
+            }
+            bucketsSeen.merge(bucket.table(), 1, Integer::sum);
+        }
+        Map<String, HistogramValue> byTable = new HashMap<>();
+        counts.forEach((table, count) -> {
+            long[] perBucket = buckets.get(table);
+            if (perBucket == null || bucketsSeen.getOrDefault(table, 0) != bounds.buckets()
+                    || !sums.containsKey(table)) {
+                return;
+            }
+            List<Long> bucketCounts = new ArrayList<>(perBucket.length);
+            for (long bucketCount : perBucket) {
+                bucketCounts.add(bucketCount);
+            }
+            byTable.put(table, bounds.value(count, sums.get(table) / 1000.0, bucketCounts));
+        });
+        return byTable;
+    }
+
+    /**
+     * Where the pipeline's live job spends its time: one distribution per stage of how long that stage's
+     * units of work took, over the registered bounds, with the moment timing began; nothing when it has
+     * no live job or no stage has timed anything yet.
+     *
+     * <p>Added over the processors of one stage, bucket by bucket: a vertex may run as several processors
+     * and each times its own share of the work, so the stage's distribution is the sum of theirs. The
+     * start is the latest of theirs, for the reason the delivery start is the latest of its sinks'.
+     */
+    public StageReading stageDurations(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? StageReading.NONE : stageDurationsIn(job.getMetrics());
+    }
+
+    /**
+     * The stage distributions in {@code collected}. A stage is read back only when its count, its sum and
+     * every bucket are present — a distribution caught with a bucket missing is a collection that caught a
+     * processor half-way through reporting, and it is left out rather than read as a shape.
+     */
+    static StageReading stageDurationsIn(JobMetrics collected) {
+        HistogramBounds bounds = HistogramBounds.PROCESS_DURATION;
+        Map<String, Long> counts = new HashMap<>();
+        Map<String, Long> sums = new HashMap<>();
+        Map<String, long[]> buckets = new HashMap<>();
+        Map<String, Integer> bucketsSeen = new HashMap<>();
+        long since = Long.MIN_VALUE;
+        for (String metric : collected.metrics()) {
+            JetStageGauge.Part part = JetStageGauge.partOf(metric);
+            // A statistic named for something that is not a stage of this build's graph is skipped here,
+            // the way a bucket index out of range is skipped below. The job's statistics are aggregated
+            // across members, so a rolling upgrade puts a stage word this build has never heard of in
+            // front of this loop; carrying it into the reading, whose constructor exists to refuse a
+            // stage outside the closed set, would throw out of the publish that called this. The driver
+            // reads a throw from there as a failure to converge, so a pipeline running perfectly well
+            // would be reported, once a second, as one the server keeps failing to bring up.
+            if (part == null || !Stage.attributeValues().contains(part.stage())) {
+                continue;
+            }
+            for (Measurement measurement : collected.get(metric)) {
+                switch (part.kind()) {
+                    case JetStageGauge.COUNT -> counts.merge(part.stage(), measurement.value(), Long::sum);
+                    case JetStageGauge.SUM_MICROS -> sums.merge(part.stage(), measurement.value(), Long::sum);
+                    case JetStageGauge.SINCE -> since = Math.max(since, measurement.value());
+                    case JetStageGauge.BUCKET -> {
+                        if (part.bucket() < 0 || part.bucket() >= bounds.buckets()) {
+                            continue;
+                        }
+                        buckets.computeIfAbsent(part.stage(), ignored -> new long[bounds.buckets()])[part.bucket()]
+                                += measurement.value();
+                    }
+                    default -> {
+                    }
+                }
+            }
+            if (JetStageGauge.BUCKET.equals(part.kind()) && part.bucket() >= 0 && part.bucket() < bounds.buckets()) {
+                bucketsSeen.merge(part.stage(), 1, Integer::sum);
+            }
+        }
+        Map<String, HistogramValue> byStage = new HashMap<>();
+        counts.forEach((stage, count) -> {
+            long[] perBucket = buckets.get(stage);
+            if (perBucket == null || bucketsSeen.getOrDefault(stage, 0) != bounds.buckets()
+                    || !sums.containsKey(stage)) {
+                return;
+            }
+            List<Long> bucketCounts = new ArrayList<>(perBucket.length);
+            for (long bucketCount : perBucket) {
+                bucketCounts.add(bucketCount);
+            }
+            byStage.put(stage, bounds.value(count, sums.get(stage) / 1_000_000.0, bucketCounts));
+        });
+        if (byStage.isEmpty() || since == Long.MIN_VALUE) {
+            return StageReading.NONE;
+        }
+        return new StageReading(byStage, Instant.ofEpochMilli(since));
+    }
+
+    /**
+     * The moment the pipeline's live job began counting what it has delivered, as epoch milliseconds;
+     * empty when it has no live job or nothing has counted yet.
+     *
+     * <p>The <strong>latest</strong> start among its sinks, not the earliest, and the choice is a trade
+     * rather than a plain reading. A total summed over sinks that began at different moments is not exactly
+     * true of either instant: the earliest is the only window that contains every term, so on containment
+     * alone it would win. What decides it the other way is what a start is read for. It is how a consumer
+     * is told the series began again, and the one reading that corrupts a rate is a total that drops with
+     * no such signal beside it. A sink that restarts resets its own count, so the sum drops; taking the
+     * latest moves this instant forward in the same breath and the drop reads as the restart it is, while
+     * taking the earliest would leave it as a counter going backwards, which is the one thing a start time
+     * exists to make impossible. A sink joining a running pipeline is read as a restart too, which loses
+     * the history before it rather than reporting a rate that never happened.
+     */
+    public OptionalLong countingSince(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) {
+            return OptionalLong.empty();
+        }
+        JobMetrics collected = job.getMetrics();
+        OptionalLong latest = OptionalLong.empty();
+        for (Measurement measurement : collected.get(JetDeliveryGauge.SINCE_METRIC)) {
+            latest = latest.isPresent()
+                    ? OptionalLong.of(Math.max(latest.getAsLong(), measurement.value()))
+                    : OptionalLong.of(measurement.value());
+        }
+        return latest;
+    }
+
+    /**
+     * The event time of the newest row of each table the pipeline's live job has had confirmed, as epoch
+     * milliseconds; empty when it has no live job, and absent for a table with nothing confirmed.
+     *
+     * <p>A reading, not a distance. How far behind a table is has to be worked out against the clock at the
+     * moment somebody asks, because it goes on growing while nothing arrives -- a distance recorded in the
+     * run would stand still for exactly as long as the pipeline did.
+     *
+     * <p>Two sinks over one table keep the newer reading: a row confirmed by either is a row that reached a
+     * target, and the question this answers is how recent the newest such row is.
+     */
+    public Map<String, Long> newestDeliveredEventTime(String pipelineId) {
+        return byChain(pipelineId, JetDeliveryGauge::reachedTableOf);
     }
 
     /**
@@ -330,10 +608,15 @@ public final class Engine {
      */
     private Map<String, Long> byChain(String pipelineId, Function<String, String> chainOf) {
         Job job = liveJob(pipelineId);
-        if (job == null) {
-            return Map.of();
-        }
-        JobMetrics collected = job.getMetrics();
+        return job == null ? Map.of() : highestIn(job.getMetrics(), chainOf);
+    }
+
+    /**
+     * The widest reading in {@code collected} for each key {@code chainOf} names. Kept at its widest and
+     * not added, unlike the two above: a distance is one fact several sinks each have a view of, so the
+     * answer is the furthest-behind of them, while a delivery is work done by each.
+     */
+    static Map<String, Long> highestIn(JobMetrics collected, Function<String, String> chainOf) {
         Map<String, Long> highest = new HashMap<>();
         for (String metric : collected.metrics()) {
             String chain = chainOf.apply(metric);

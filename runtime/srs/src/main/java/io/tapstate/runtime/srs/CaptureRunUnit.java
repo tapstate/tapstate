@@ -131,6 +131,9 @@ public final class CaptureRunUnit {
                 chainCreated = !merged;
             }
 
+            // Opened before the load, not with the tail: the load's rows are this run's too, and an
+            // account opened after them would report a run that had read nothing until its first change.
+            CaptureHealth health = new CaptureHealth();
             long snapshotCount = 0;
             // The seam this run's own load began at, for the tail that follows it -- null when no load ran
             // here. Carried from the phase rather than read back off the chain, because the chain records
@@ -147,7 +150,12 @@ public final class CaptureRunUnit {
             // first's answer and skip a load it never did.
             if (plan.snapshot()) {
                 Consumer<Envelope> snapshotPassthrough = event -> {
+                    // Two tallies of rows that overlap, kept apart because they answer different
+                    // questions: this one is what the load read, reported once it finishes and used to
+                    // say which tables it covered; the other is what the run has received at all, which
+                    // goes on climbing over the tail that follows.
                     snapshotCounts.merge(event.src(), 1L, Long::sum);
+                    health.received(event);
                     passthrough.accept(event);
                 };
                 // A chainless read has no ring generation, but its rows still enter the same stateful graph.
@@ -166,7 +174,6 @@ public final class CaptureRunUnit {
                 }
             }
 
-            CaptureHealth health = new CaptureHealth();
             Optional<StreamSource<SrsItem>> ringSource = Optional.empty();
             if (plan.sharedRing()) {
                 String cid = chainId.value();

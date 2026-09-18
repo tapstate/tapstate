@@ -202,6 +202,10 @@ class ReplTest {
          */
         final Deque<StatusOutcome> statusOutcomes = new ArrayDeque<>();
         MetricsOutcome metricsOutcome = new MetricsOutcome.Unreachable();
+        /** The readings successive metrics reads answer, in order; the last one sticks, as for status. */
+        final Deque<MetricsOutcome> metricsOutcomes = new ArrayDeque<>();
+        /** How long each metrics read takes to answer -- a slow wire, for a case about whose clock a rate is over. */
+        long metricsDelayMillis;
         PositionOutcome positionOutcome = new PositionOutcome.Unreachable();
         SnapshotOutcome snapshotOutcome = new SnapshotOutcome.Unreachable();
         LogsOutcome logsOutcome = new LogsOutcome.Unreachable();
@@ -475,7 +479,20 @@ class ReplTest {
         @Override
         public MetricsOutcome metrics(URI baseUrl, String credential, String pipelineId) {
             metricsCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
-            return healthy.contains(baseUrl) ? metricsOutcome : new MetricsOutcome.Unreachable();
+            if (metricsDelayMillis > 0) {
+                try {
+                    Thread.sleep(metricsDelayMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            if (!healthy.contains(baseUrl)) {
+                return new MetricsOutcome.Unreachable();
+            }
+            if (metricsOutcomes.isEmpty()) {
+                return metricsOutcome;
+            }
+            return metricsOutcomes.size() == 1 ? metricsOutcomes.peek() : metricsOutcomes.poll();
         }
 
         @Override
@@ -4191,7 +4208,8 @@ class ReplTest {
     void statusThatMatchesNothingReadsTheOtherFacesAndSaysWhatItCannotDecide() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
-        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 128L));
+        client.metricsOutcome = new MetricsOutcome.Found(
+                "pl1", Map.of("errors.connector.write-failed", 1L, "recordCount", 128L));
         client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -4207,6 +4225,164 @@ class ReplTest {
         assertThat(client.snapshotCalls).hasSize(1);
     }
 
+    /** A metrics reading whose facts say the run has moved {@code out} rows across two tables, observed at {@code at}. */
+    private static MetricsOutcome.Found moved(java.time.Instant at, long out, long lagSeconds) {
+        return new MetricsOutcome.Found("pl1", Map.of("recordCount", out), Map.of(), List.of(), List.of(
+                new MetricsOutcome.FactPoint("tapstate.pipeline.records",
+                        Map.of("direction", "out", "tapstate.table.id", "orders"), at, out - out / 3),
+                new MetricsOutcome.FactPoint("tapstate.pipeline.records",
+                        Map.of("direction", "out", "tapstate.table.id", "items"), at, out / 3),
+                new MetricsOutcome.FactPoint("tapstate.pipeline.lag",
+                        Map.of("tapstate.table.id", "orders"), at, lagSeconds)));
+    }
+
+    @Test
+    void statusShowsHowFastThePipelineMovesOffTwoReadingsOfItsOwnTime() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        java.time.Instant at = java.time.Instant.parse("2026-09-17T10:00:00Z");
+        client.metricsOutcomes.add(moved(at, 300, 3));
+        client.metricsOutcomes.add(moved(at.plusSeconds(1), 330, 2));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> true);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // Thirty rows over the one second between the two observations, summed over both tables; the
+        // lag is the later reading's, since it is a level and not a difference.
+        assertThat(out).contains("moving     out 30.0 rows/s (over 1.0s of the pipeline's own time)");
+        assertThat(out).contains("lag        orders 2s");
+        assertThat(client.metricsCalls).hasSize(2);
+    }
+
+    @Test
+    void statusMeasuresTheRateOverThePipelinesOwnTimeNotThisMachinesClock() {
+        // The second reading arrives late by the wall -- a slow wire, a busy server -- while the two
+        // observations are one second apart by their own stamps. Thirty rows over that one second is the
+        // rate; thirty over however long this machine happened to wait is a number about the wire.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        java.time.Instant at = java.time.Instant.parse("2026-09-17T10:00:00Z");
+        client.metricsOutcomes.add(moved(at, 300, 3));
+        client.metricsOutcomes.add(moved(at.plusSeconds(1), 330, 2));
+        client.metricsDelayMillis = 400;
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> true);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        assertThat(h.sink().toString().substring(mark))
+                .contains("moving     out 30.0 rows/s (over 1.0s of the pipeline's own time)");
+    }
+
+    @Test
+    void statusSaysTheRateIsNotKnownWhileThereIsOnlyOneReading() {
+        // The publisher has stalled: every read answers the same observation, however long the wall
+        // says has passed. That is one reading, and one reading is not a rate of nought -- a pipeline
+        // observed once and a pipeline that moved nothing call for different next steps.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = moved(java.time.Instant.parse("2026-09-17T10:00:00Z"), 300, 3);
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> true);
+        h.repl().rateWait(java.time.Duration.ofMillis(300));
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("moving     not known -- the reading did not advance in 0.3s; one reading gives no rate");
+        assertThat(out).doesNotContain("rows/s");
+        assertThat(out).contains("lag        orders 3s");
+        assertThat(client.metricsCalls).hasSizeGreaterThan(1);
+    }
+
+    @Test
+    void statusWithoutATerminalAnswersAtOnceRatherThanWaitingForASecondReading() {
+        // This is the verb people run in a loop over every pipeline they have, and from cron. A rate is
+        // two readings apart in the pipeline's own time, so waiting for the second costs about a second
+        // per pipeline against a healthy publisher and the whole bound against a stalled one -- seconds
+        // nothing in the script asked for, to print a number nothing in the script reads.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        java.time.Instant at = java.time.Instant.parse("2026-09-17T10:00:00Z");
+        client.metricsOutcomes.add(moved(at, 300, 3));
+        client.metricsOutcomes.add(moved(at.plusSeconds(1), 330, 2));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("moving     not known -- one reading, and not a terminal to wait for a"
+                + " second; --rate waits for it, --watch streams them");
+        assertThat(out).doesNotContain("rows/s");
+        // The distance behind is a level rather than a difference, so the one reading answers it.
+        assertThat(out).contains("lag        orders 3s");
+        // One read of the metrics face: what this verb cost before a rate was put under it.
+        assertThat(client.metricsCalls).hasSize(1);
+    }
+
+    @Test
+    void statusWaitsForTheSecondReadingWithoutATerminalWhenRateIsAskedFor() {
+        // The other half of the default above: a script that does want the number says so. Without this
+        // the rate would be unavailable to every non-interactive caller, which includes the end-to-end
+        // case that witnesses the CLI computing one at all.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        java.time.Instant at = java.time.Instant.parse("2026-09-17T10:00:00Z");
+        client.metricsOutcomes.add(moved(at, 300, 3));
+        client.metricsOutcomes.add(moved(at.plusSeconds(1), 330, 2));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1 --rate");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("moving     out 30.0 rows/s (over 1.0s of the pipeline's own time)");
+        assertThat(client.metricsCalls).hasSize(2);
+    }
+
+    @Test
+    void statusSaysTheRateIsNotKnownWhenNoCounterIsPublishedAndDoesNotWaitForOne() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "STOPPED", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of());
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("moving     not known -- no records counter is published (no live job)");
+        assertThat(out).contains("lag        not published");
+        assertThat(client.metricsCalls).hasSize(1);
+    }
+
+    @Test
+    void statusThatTheStatusFaceAnsweredSaysTheMovementIsNotKnownWithoutMeasuringIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 252_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        assertThat(h.sink().toString().substring(mark)).contains("moving     not known -- this reading is old");
+        assertThat(client.metricsCalls).isEmpty();
+    }
+
     @Test
     void statusTakesRowsLoadedOffTheSnapshotFaceRatherThanCountingItsEntries() {
         // Three tables selected, none of which has loaded a row -- a snapshot pipeline stuck at the start,
@@ -4216,7 +4392,7 @@ class ReplTest {
         // on a pipeline like this one.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
-        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 0L));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 0L));
         client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
                 "orders", new RemoteTableSnapshot(0L, null, null),
                 "items", new RemoteTableSnapshot(0L, null, null),
@@ -4238,7 +4414,7 @@ class ReplTest {
     void statusCountsWhatTheSnapshotLoadedWhenItHasLoadedSomething() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
-        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("errorCount", 0L, "recordCount", 0L));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 0L));
         client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
                 "orders", new RemoteTableSnapshot(900L, null, null),
                 "items", new RemoteTableSnapshot(124L, null, null)));
@@ -4612,12 +4788,14 @@ class ReplTest {
     @Test
     void metricsWhileAuthenticatedPrintsEachStat() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 42L, "errorCount", 0L));
+        client.metricsOutcome = new MetricsOutcome.Found(
+                "pl1", Map.of("recordCount", 42L, "errors.engine.job-failed", 2L));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("recordCount").contains("42").contains("errorCount");
+        assertThat(out).contains("recordCount").contains("42")
+                .contains("errors.engine.job-failed");
         assertThat(client.metricsCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
     }
 
@@ -4803,6 +4981,23 @@ class ReplTest {
         assertThat(out).contains("running").contains("paused");
         assertThat(out.indexOf("running")).isLessThan(out.indexOf("paused"));
         assertThat(client.watchCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
+    }
+
+    @Test
+    void statusWatchOpensWithOneReadingAndSaysARateFollows() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.watchStates = List.of("RUNNING");
+        client.metricsOutcome = moved(java.time.Instant.parse("2026-09-17T10:00:00Z"), 300, 3);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("status pl1 --watch")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        // One reading is what a watch has when it opens, and it says so rather than printing nought.
+        assertThat(out).contains("pl1  moving  not known yet -- one reading; a rate follows in 5s");
+        assertThat(out).contains("pl1  running");
+        assertThat(out).doesNotContain("rows/s");
     }
 
     @Test

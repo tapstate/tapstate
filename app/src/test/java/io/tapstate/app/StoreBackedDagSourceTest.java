@@ -1005,6 +1005,11 @@ class StoreBackedDagSourceTest {
         }
 
         @Override
+        public io.tapstate.spi.store.RateHistoryStore rateHistory() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
         public PipelineLayoutStore layouts() {
             throw new UnsupportedOperationException();
         }

@@ -69,7 +69,8 @@ class StatusExplainsWhereItIsStuckTest {
         // the one place the cause is actually written down.
         assertThat(answer.conclusion()).contains("3 passes in a row have thrown");
         assertThat(answer.next()).contains("server's own log");
-        assertThat(answer.readings()).contains("metrics.errorCount = 3", "status.state = running");
+        assertThat(answer.readings())
+                .contains("metrics.reconcileFailuresInARow = 3", "status.state = running");
         // And it says what it is not claiming: the state is left alone on purpose, because nothing here has
         // seen the job die and reporting it as failed would be this product guessing.
         assertThat(answer.cannotSay()).anyMatch(line -> line.contains("still alive"));

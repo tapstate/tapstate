@@ -1156,9 +1156,55 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     }
                 }
             }
-            return new MetricsOutcome.Found(id, stats, targetAckedPosition, notCollected);
+            return new MetricsOutcome.Found(id, stats, targetAckedPosition, notCollected, factPoints(m.get("facts")));
         }
         return null;
+    }
+
+    /**
+     * The single-valued points of the body's {@code facts}, or none from a server that sends no facts. A
+     * point without a value is a distribution, which nothing here reads, and is passed over; a point whose
+     * time does not parse keeps its value and loses its time, which the reader of the time treats as "not
+     * said" rather than as now.
+     */
+    private static List<MetricsOutcome.FactPoint> factPoints(Object rawFacts) {
+        List<MetricsOutcome.FactPoint> points = new ArrayList<>();
+        if (!(rawFacts instanceof List<?> facts)) {
+            return points;
+        }
+        for (Object rawFact : facts) {
+            if (!(rawFact instanceof Map<?, ?> fact) || !(fact.get("name") instanceof String name)
+                    || !(fact.get("points") instanceof List<?> rawPoints)) {
+                continue;
+            }
+            for (Object rawPoint : rawPoints) {
+                if (!(rawPoint instanceof Map<?, ?> point) || !(point.get("value") instanceof Number value)) {
+                    continue;
+                }
+                Map<String, String> attributes = new LinkedHashMap<>();
+                if (point.get("attributes") instanceof Map<?, ?> rawAttributes) {
+                    for (Map.Entry<?, ?> attribute : rawAttributes.entrySet()) {
+                        if (attribute.getKey() instanceof String key && attribute.getValue() instanceof String text) {
+                            attributes.put(key, text);
+                        }
+                    }
+                }
+                points.add(new MetricsOutcome.FactPoint(name, attributes, instantOrNull(point.get("observedAt")),
+                        value.longValue()));
+            }
+        }
+        return points;
+    }
+
+    private static Instant instantOrNull(Object text) {
+        if (!(text instanceof String iso)) {
+            return null;
+        }
+        try {
+            return Instant.parse(iso);
+        } catch (java.time.format.DateTimeParseException malformed) {
+            return null;
+        }
     }
 
     /**

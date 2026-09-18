@@ -4,6 +4,7 @@ import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import org.bson.Document;
 
@@ -51,6 +52,16 @@ final class StoreDocuments implements AutoCloseable {
     /** Whether {@code collection} holds a document under {@code id}. */
     boolean holds(String collection, String id) {
         return database.getCollection(collection).find(new Document("_id", id)).first() != null;
+    }
+
+    /**
+     * How many samples of {@code pipelineId} the rate history holds. A history is one document per sample
+     * under the pipeline's id rather than one document per pipeline, so "still there" is a count, and the
+     * count is taken off the collection because the history has no read face of its own.
+     */
+    long rateSamplesOf(String pipelineId) {
+        return database.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY)
+                .countDocuments(new Document(MongoRateHistoryStore.PIPELINE_ID, pipelineId));
     }
 
     /** Every {@code _id} in {@code collection} - the reconciliation set a converger would work from. */

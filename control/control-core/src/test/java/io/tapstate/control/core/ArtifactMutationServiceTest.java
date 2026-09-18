@@ -64,8 +64,9 @@ class ArtifactMutationServiceTest {
     private final List<String> reclaimOrder = new ArrayList<>();
     private final RecordingAuditStore auditStore = new RecordingAuditStore();
     private final List<String> followsStopped = new ArrayList<>();
+    private final RecordingRateHistory rateHistory = new RecordingRateHistory();
     private final ArtifactMutationService service = new ArtifactMutationService(
-            store, desired, state, observations, layouts, srsMeta, derivedSchemas,
+            store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
             new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add);
 
     private static final Clock FIXED_CLOCK =
@@ -310,8 +311,10 @@ class ArtifactMutationServiceTest {
         assertThat(srsMeta.consumerIds("chain-a")).containsExactly("other");
         // Shared first: it is the only residue that stalls a different pipeline, so a process that dies
         // mid-reclaim has already contained the damage that was not this pipeline's alone to suffer.
+        assertThat(rateHistory.deleted).containsExactly("flow");
         assertThat(reclaimOrder)
-                .containsExactly("srs", "desired", "state", "observation", "layout", "derived-schema");
+                .containsExactly("srs", "desired", "state", "observation", "layout", "derived-schema",
+                        "rate-history");
     }
 
     @Test
@@ -341,6 +344,24 @@ class ArtifactMutationServiceTest {
 
         assertThat(derivedSchemas.holdsAnythingFor("flow")).isFalse();
         assertThat(derivedSchemas.holdsAnythingFor("other")).isTrue();
+    }
+
+    @Test
+    void aServiceBuiltWithoutARateHistoryStoreReportsThatStepRatherThanACleanSweep() {
+        // The shape that keeps an older call site working substitutes a store for the one it was not
+        // given. A substitute that deletes nothing and says nothing has the reclaim run every step and
+        // report the pipeline reclaimed whole, while every sample it ever took stays in the collection to
+        // be read as the past of whatever is applied under that id next.
+        ArtifactMutationService withoutHistory = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add);
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+
+        assertThatThrownBy(() -> withoutHistory.delete(PRINCIPAL, "flow", hash(flow)))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.args()).containsEntry("residue", List.of("rate-history")));
+        assertThat(store.get("flow")).isEmpty();
     }
 
     @Test
@@ -611,6 +632,12 @@ class ArtifactMutationServiceTest {
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code()).isEqualTo(ArtifactError.RECLAIM_INCOMPLETE);
                     assertThat(error.args()).containsEntry("reason", "pipeline-live");
+                    // Everything the reclaim would have taken, by the names it takes them under: the
+                    // person clearing up by hand works from this list, so a step missing from it is a
+                    // residue they are never told about.
+                    assertThat(error.args().get("residue")).isEqualTo(List.of(
+                            "mining-chain-consumer", "desired", "state", "observation", "layout",
+                            "derived-schema", "rate-history"));
                 });
 
         // The artifact is gone — the removal is not undone — and none of the live pipeline's own
@@ -620,6 +647,7 @@ class ArtifactMutationServiceTest {
         assertThat(desired.read("flow")).isPresent();
         assertThat(observations.read("flow")).isPresent();
         assertThat(srsMeta.consumerIds("chain-a")).containsExactly("flow");
+        assertThat(rateHistory.deleted).as("the live pipeline's samples are left alone too").isEmpty();
     }
 
     @Test
@@ -789,6 +817,33 @@ class ArtifactMutationServiceTest {
         reclaimOrder.add(name);
         if (failure != null) {
             throw failure;
+        }
+    }
+
+    /** The samples a pipeline left behind, reclaimed last: nothing else bounds them but their age. */
+    private final class RecordingRateHistory implements io.tapstate.spi.store.RateHistoryStore {
+        private final List<String> deleted = new ArrayList<>();
+
+        @Override
+        public void append(io.tapstate.core.lifecycle.RateSample sample) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public List<io.tapstate.core.lifecycle.RateSample> readBetween(
+                String pipelineId, java.time.Instant from, java.time.Instant to) {
+            return List.of();
+        }
+
+        @Override
+        public void deleteAll(String pipelineId) {
+            step("rate-history", null);
+            deleted.add(pipelineId);
+        }
+
+        @Override
+        public java.time.Duration retention() {
+            return java.time.Duration.ofDays(15);
         }
     }
 

@@ -88,4 +88,18 @@ class JoinRecomputeMetricNamesTest {
         assertThat(JoinRecomputeMetricNames.worthReporting(
                 JoinRecomputeMetricNames.REPORT_FANOUT_ABOVE * 10)).isTrue();
     }
+
+    @Test
+    void theNamespaceIsTheHeadOfTheSubjectWhateverTheKeyHolds() {
+        // A map name never holds the separator and a key may, so the split is at the first one; a subject
+        // that never had a key reads as a namespace whole.
+        assertThat(JoinRecomputeMetricNames.namespaceOf(
+                JoinRecomputeMetricNames.subjectOf("join.orders.widen.index.customers", "17")))
+                .isEqualTo("join.orders.widen.index.customers");
+        assertThat(JoinRecomputeMetricNames.namespaceOf(
+                JoinRecomputeMetricNames.subjectOf("join.orders.widen.index.customers", "a/b")))
+                .isEqualTo("join.orders.widen.index.customers");
+        assertThat(JoinRecomputeMetricNames.namespaceOf("join.orders.widen.index.customers"))
+                .isEqualTo("join.orders.widen.index.customers");
+    }
 }

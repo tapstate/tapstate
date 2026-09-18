@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/tutorials/nest-document-assembly
+---
+
 # Assembling one document out of many tables
 
 A relational shop keeps an order in nine tables. An application that wants to show one order wants
@@ -309,7 +315,7 @@ The reason follows directly from the rule. `on: { id: product_id }` declares tha
 identified by `product_id`, and `order_items` is keyed by `id`. Were it allowed to run, there would be
 600 lines but only 20 distinct products, so 600 lines would collapse into 20 identity slots and each
 product would attach to exactly one line: **20 of 600 lines coming back with a `product` and the other
-580 with none, while `errorCount` stayed at 0 throughout**. That is the shape this refusal exists to
+580 with none, and not a single failure counted anywhere**. That is the shape this refusal exists to
 prevent - it is the one failure here that no counter would have shown you.
 
 **So: a nest embeds children that belong to a parent. It does not look up rows a parent refers to.**
@@ -467,8 +473,8 @@ tapstate -c http://127.0.0.1:8080 -u admin metrics order_doc
 
 | Reading | Means |
 |---|---|
-| `nestStateEntries.<ns>` | how many keys this level holds in total, not how many are resident |
-| `nestStateStored.<ns>` | how many are behind memory |
+| `nestStateEntries.<ns>` | how many keys this level holds in memory right now - not how many there are; past the memory budget the rest live behind memory and still belong to the level |
+| `nestStateStored.<ns>` | how many keys this level holds in total, the resident ones included - every write reaches the layer behind memory, so this is the whole; absent, not 0, when the run has no such layer to ask. Entries over stored is the share served from memory |
 | `nestStateBackfills.<ns>` | reads that had to go behind memory - the one that tells you the cold layer is really in use |
 | `nestStatePendingHighWater.<ns>` | the deepest one key's pending queue has ever got; a high-water mark, it does not fall back |
 

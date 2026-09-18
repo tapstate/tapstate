@@ -68,8 +68,8 @@ class AssemblyObservationPublisherTest {
                 .as("the factory binds the position port and the publisher projects it, keyed by table")
                 .containsExactly(entry(TABLE, "w7"));
         assertThat(observed.metrics())
-                .as("recordCount is absent with no live job (present-only); errorCount stays present at 0")
-                .containsEntry("errorCount", 0L)
+                .as("recordCount is absent with no live job (present-only), and so is any failure count")
+                .doesNotContainKey("errorCount")
                 .doesNotContainKey("recordCount");
     }
 

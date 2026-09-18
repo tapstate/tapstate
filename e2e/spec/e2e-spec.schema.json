@@ -535,6 +535,20 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
+            "records_out"
+          ],
+          "properties": {
+            "records_out": {
+              "type": "integer",
+              "description": "How many rows this pipeline is expected to have had confirmed by its targets, added up over its tables and the operations its sources performed. Nought asserted here is only an assertion beside a sibling asserting a real total: the face publishes no entry until something settles, so nought is also what a pipeline publishing nothing at all would read.",
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
             "state"
           ],
           "properties": {

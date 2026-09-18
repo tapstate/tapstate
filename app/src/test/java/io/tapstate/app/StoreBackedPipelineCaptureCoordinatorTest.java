@@ -18,6 +18,7 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.srs.CaptureHealth;
+import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
@@ -27,8 +28,12 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.StorePort;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -289,6 +294,134 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 .hasMessageContaining("'orders_src'");
     }
 
+    // ---- what the sources handed over ------------------------------------------------------------
+
+    /**
+     * Drives rows into a run's account the way a connector does — through the one seam every capture path
+     * is started with — so what is asserted below is the coordinator's arithmetic and not a second way of
+     * counting invented for the test.
+     */
+    private static void handOver(CaptureHealth health, Envelope... events) {
+        health.recording((batch, position) -> { }).onBatch(List.of(events), Optional.empty());
+    }
+
+    private static CaptureHealth healthStrictlyAfter(CaptureHealth earlier) {
+        Instant open = earlier.countingSince();
+        CaptureHealth later = new CaptureHealth();
+        while (!later.countingSince().isAfter(open)) {
+            later = new CaptureHealth();
+        }
+        return later;
+    }
+
+    @Test
+    void everySourcesArrivalsAreAddedUpForTheOnePipeline() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(cdcSource("items_src", "items", null));
+        artifacts.save(twoSourcePipeline("p", "orders_src", "items_src"));
+        CaptureHealth orders = new CaptureHealth();
+        CaptureHealth items = new CaptureHealth();
+        handOver(orders, Envelope.insert(1L, "orders", Map.of("id", 1), Map.of()),
+                Envelope.update(2L, "orders", Map.of("id", 1), Map.of("id", 1), Map.of()));
+        handOver(items, Envelope.delete(3L, "items", Map.of("id", 9), Map.of()));
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                coordinatorOver(artifacts, List.of(orders, items));
+
+        coordinator.startCapture("p");
+
+        // A pipeline reads through one run per source and each counts its own tables, so what a reader
+        // asked "how much is this pipeline taking in" wants is the runs added together.
+        assertThat(coordinator.capturedRows("p").rowsByTableAndOp()).containsOnly(
+                entry("orders", Map.of("i", 1L, "u", 1L)), entry("items", Map.of("d", 1L)));
+    }
+
+    @Test
+    void twoSourcesNamingOneTableAreAddedRatherThanOneWinning() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(cdcSource("archive_src", "orders", null));
+        artifacts.save(twoSourcePipeline("p", "orders_src", "archive_src"));
+        CaptureHealth live = new CaptureHealth();
+        CaptureHealth archive = new CaptureHealth();
+        handOver(live, Envelope.insert(1L, "orders", Map.of("id", 1), Map.of()));
+        handOver(archive, Envelope.insert(2L, "orders", Map.of("id", 2), Map.of()));
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                coordinatorOver(artifacts, List.of(live, archive));
+
+        coordinator.startCapture("p");
+
+        // Both arrivals are rows this pipeline read. Keyed by table alone the two runs collide, and the
+        // shape that loses one of them reads as a source that has gone half quiet.
+        assertThat(coordinator.capturedRows("p").rowsByTableAndOp())
+                .containsExactly(entry("orders", Map.of("i", 2L)));
+        // And what they weighed is added the same way, which is a separate decision in a separate line:
+        // the two runs' payloads collide on this table exactly as their counts do, and overwriting
+        // instead of adding leaves a figure that is neither run's and looks like either.
+        assertThat(coordinator.capturedRows("p").bytesByTable())
+                .containsExactly(entry("orders", 20L));
+    }
+
+    @Test
+    void theLatestStartAmongTheRunsIsTheOneReported() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(cdcSource("items_src", "items", null));
+        artifacts.save(twoSourcePipeline("p", "orders_src", "items_src"));
+        CaptureHealth first = new CaptureHealth();
+        CaptureHealth second = healthStrictlyAfter(first);
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                coordinatorOver(artifacts, List.of(first, second));
+
+        coordinator.startCapture("p");
+
+        // The witness the assertion below needs: two accounts opened at genuinely different moments, or
+        // earliest and latest would be the same value and this would hold either way.
+        assertThat(second.countingSince()).isAfter(first.countingSince());
+        // A run that is replaced resets its own count, so the sum falls; moving this instant forward with
+        // it is what makes the fall read as the restart it is rather than as a counter going backwards.
+        assertThat(coordinator.capturedRows("p").countingSince()).isEqualTo(second.countingSince());
+    }
+
+    @Test
+    void aPipelineWithNoCaptureRunningReportsNothingRatherThanZero() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src"));
+        StoreBackedPipelineCaptureCoordinator coordinator =
+                coordinatorOver(artifacts, List.of(new CaptureHealth()));
+
+        CaptureReading before = coordinator.capturedRows("p");
+
+        // Absent, not zero, and it has to be absent before the start as well as after a stop: a pipeline
+        // nobody is capturing and one capturing nothing want opposite responses.
+        assertThat(before).isEqualTo(CaptureReading.NONE);
+        assertThat(before.start()).isEmpty();
+
+        coordinator.startCapture("p");
+        assertThat(coordinator.capturedRows("p").start()).isPresent();
+
+        coordinator.stopCapture("p", true);
+        assertThat(coordinator.capturedRows("p")).isEqualTo(CaptureReading.NONE);
+    }
+
+    /** A coordinator whose runs hand back the given accounts, one per source, in declaration order. */
+    private static StoreBackedPipelineCaptureCoordinator coordinatorOver(
+            InMemoryArtifactStore artifacts, List<CaptureHealth> healths) {
+        SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
+        java.util.Iterator<CaptureHealth> next = healths.iterator();
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srsCoordinator.provisionSource(
+                    spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(),
+                    Optional.of(() -> { }), next.next());
+        };
+        return new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, srsCoordinator, new SnapshotBuffer());
+    }
+
     // ---- handle lifecycle ------------------------------------------------------------------------
 
     @Test
@@ -482,7 +615,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         coordinator.startCapture("p");
 
-        assertThat(coordinator.snapshotProgress("p")).containsOnly(
+        assertThat(coordinator.snapshotProgress("p").byTable()).containsOnly(
                 entry("orders", new TableSnapshot(1L, null, null)),
                 entry("customers", new TableSnapshot(1L, null, null)));
         SourceCaptureResolution resolution = SourceCaptureResolution.of(source);
@@ -553,10 +686,128 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.startCapture("p");
 
         // The rows a table loaded are known only once its bounded read has drained, so this is the finished
-        // load rather than a live position in it. The total is not reported by any source, so it stays null
-        // and the percentage with it -- progress with no total is honest partial data, never a faked 100%.
-        assertThat(coordinator.snapshotProgress("p"))
+        // load rather than a live position in it. This source was never discovered, so nothing counted its
+        // table and the total stays null with the percentage -- progress with no total is honest partial
+        // data, never a faked 100%.
+        assertThat(coordinator.snapshotProgress("p").byTable())
                 .containsOnly(entry("orders", new TableSnapshot(500L, null, null)));
+        // A total without what it accumulates from cannot be read, so the load says when it opened.
+        assertThat(coordinator.snapshotProgress("p").start()).isPresent();
+    }
+
+    @Test
+    void theLoadCarriesTheRowCountTheLastDiscoveryTookOfTheTable() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        InMemoryStorePort store = discoveredAs(artifacts, "orders", 120_000L);
+        StoreBackedPipelineCaptureCoordinator coordinator = coordinatorLoading(store, 90_000L);
+
+        coordinator.startCapture("p");
+
+        // About how many rows there are comes from the source's own count, taken at discovery -- the one
+        // place anybody counted. It is an estimate and stays one: nothing maintains it afterwards, and the
+        // percentage below is derived from it rather than measured.
+        assertThat(coordinator.snapshotProgress("p").byTable())
+                .containsOnly(entry("orders", new TableSnapshot(90_000L, 120_000L, 75)));
+    }
+
+    @Test
+    void aTableNobodyCountedLeavesBothTheTotalAndThePercentageAbsent() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        // The same shape as the case above, discovered by a connector that cannot count: the control group
+        // for it. Without this pair, a total wired to a constant would pass the case above unnoticed.
+        InMemoryStorePort store = discoveredAs(artifacts, "orders", null);
+        StoreBackedPipelineCaptureCoordinator coordinator = coordinatorLoading(store, 90_000L);
+
+        coordinator.startCapture("p");
+
+        assertThat(coordinator.snapshotProgress("p").byTable())
+                .containsOnly(entry("orders", new TableSnapshot(90_000L, null, null)));
+    }
+
+    @Test
+    void aLoadThatReadPastAStaleEstimateReportsCompleteRatherThanOverFull() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        // The table grew between the discovery that counted it and the load that read it -- ordinary, since
+        // nothing maintains that count. The load is finished by the time this is asked, so it is complete;
+        // a progress figure above full is not a state anything can be in.
+        InMemoryStorePort store = discoveredAs(artifacts, "orders", 1_000L);
+        StoreBackedPipelineCaptureCoordinator coordinator = coordinatorLoading(store, 1_500L);
+
+        coordinator.startCapture("p");
+
+        assertThat(coordinator.snapshotProgress("p").byTable())
+                .containsOnly(entry("orders", new TableSnapshot(1_500L, 1_000L, 100)));
+    }
+
+    @Test
+    void aTableCountedAsEmptyKeepsItsTotalAndHasNoPercentage() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        // Counted as empty and then read for rows: the count is stale, and no share of nothing describes
+        // that. The zero is kept, because it is what discovery actually counted -- dropping it would say
+        // nobody counted, which is a different and also real state.
+        InMemoryStorePort store = discoveredAs(artifacts, "orders", 0L);
+        StoreBackedPipelineCaptureCoordinator coordinator = coordinatorLoading(store, 7L);
+
+        coordinator.startCapture("p");
+
+        assertThat(coordinator.snapshotProgress("p").byTable())
+                .containsOnly(entry("orders", new TableSnapshot(7L, 0L, null)));
+    }
+
+    @Test
+    void theLoadIsCountedFromBeforeItsFirstSourceRanRatherThanFromWhenItFinished() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        AtomicReference<Instant> whenTheSourceRan = new AtomicReference<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            whenTheSourceRan.set(Instant.now());
+            // Held until the clock has actually moved on. Both candidate moments are a few microseconds
+            // apart otherwise, and an assertion between them would pass or fail by whether the clock
+            // happened to tick -- which is a flake, not a witness.
+            Instant moved = whenTheSourceRan.get().plusMillis(5);
+            while (Instant.now().isBefore(moved)) {
+                Thread.onSpinWait();
+            }
+            return new CaptureRun(
+                    Optional.empty(), false, 3L, Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()),
+                new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+
+        // The rows are counted from when the load opened, not from when it returned. Stamped afterwards,
+        // the whole load would be dated to the moment it ended -- and a rate taken across the first two
+        // scrapes of the counter would divide by a window that had already closed.
+        assertThat(coordinator.snapshotProgress("p").start()).isPresent();
+        assertThat(coordinator.snapshotProgress("p").start().orElseThrow())
+                .isBeforeOrEqualTo(whenTheSourceRan.get());
+    }
+
+    /** A store whose schema layer holds one discovered table, counted at {@code rows} or not at all. */
+    private static InMemoryStorePort discoveredAs(InMemoryArtifactStore artifacts, String table, Long rows) {
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        store.schemaStore().save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable(table, List.of(), List.of(), List.of(), rows)))));
+        return store;
+    }
+
+    /** A coordinator whose one source run reports {@code loaded} rows from its bounded read. */
+    private static StoreBackedPipelineCaptureCoordinator coordinatorLoading(StorePort store, long loaded) {
+        CaptureStarter starter = (spec, passthrough) -> new CaptureRun(
+                Optional.empty(), false, loaded, Optional.empty(), Optional.empty(), new CaptureHealth());
+        return new StoreBackedPipelineCaptureCoordinator(
+                store, starter, new SrsCoordinator(new InMemorySrsMetaStore()), new SnapshotBuffer());
     }
 
     @Test
@@ -575,7 +826,10 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         coordinator.startCapture("p");
 
-        assertThat(coordinator.snapshotProgress("p")).isEmpty();
+        assertThat(coordinator.snapshotProgress("p").byTable()).isEmpty();
+        // No load ran, so there is no moment to have counted from either. A start with no rows would say a
+        // load ran and read nothing, which is a different and real state.
+        assertThat(coordinator.snapshotProgress("p").start()).isEmpty();
     }
 
     @Test
@@ -599,7 +853,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         coordinator.startCapture("p");
 
-        assertThat(coordinator.snapshotProgress("p")).containsOnly(
+        assertThat(coordinator.snapshotProgress("p").byTable()).containsOnly(
                 entry("src_a.orders", new TableSnapshot(100L, null, null)),
                 entry("src_b.orders", new TableSnapshot(200L, null, null)));
     }
@@ -616,7 +870,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         // Empty is a reading: nothing has been loaded because nothing is running, which the read face
         // publishes as an unavailable snapshot rather than a table that loaded zero rows.
-        assertThat(coordinator.snapshotProgress("never-started")).isEmpty();
+        assertThat(coordinator.snapshotProgress("never-started").byTable()).isEmpty();
     }
 
     @Test
@@ -817,7 +1071,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.startCapture("p");
 
         // Both reads have returned -- the read face has an entry for every table ...
-        assertThat(coordinator.snapshotProgress("p")).containsOnlyKeys("orders", "customers");
+        assertThat(coordinator.snapshotProgress("p").byTable()).containsOnlyKeys("orders", "customers");
         // ... and the target has confirmed none of it, which is where a hold part way through a load lands.
         assertThat(coordinator.loadDelivered("p")).as("read but not written is not delivered").isFalse();
 
