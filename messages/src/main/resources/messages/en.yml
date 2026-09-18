@@ -120,6 +120,12 @@ boot.node-session-renew-interval-invalid:
 boot.node-session-ttl-invalid:
   message: "The node-session lease lifetime must be positive."
   solution: "Set tapstate.cluster.node-session-ttl to a positive duration."
+boot.workload-claim-renew-interval-invalid:
+  message: "The workload-claim renewal interval must be positive and shorter than its lease."
+  solution: "Set tapstate.cluster.workload-claim-renew-interval below tapstate.cluster.workload-claim-ttl."
+boot.workload-claim-ttl-invalid:
+  message: "The workload-claim lease must be positive."
+  solution: "Set tapstate.cluster.workload-claim-ttl to a positive duration."
 capture.start-from-unparsable:
   message: "Cannot start consuming from `{value}`; expected `earliest`, `latest`, or an ISO-8601 timestamp."
   solution: "Set start_from to earliest, latest, or an ISO-8601 timestamp like 2026-07-11T00:00:00Z."
@@ -129,6 +135,9 @@ capture.start-from-outside-window:
 capture.event-table-not-selected:
   message: "The capture stream emitted table `{table}`, which this pipeline did not select."
   solution: "Update the source table selection or verify the connector emits the configured table names."
+capture.claim-lost:
+  message: "Capture `{captureId}` lost its cluster ownership claim."
+  solution: "Let the current owner continue from the durable position; do not restart the fenced process."
 capture.snapshot-reports-no-seam:
   message: "The snapshot of chain `{chain}` reported no position for the change tail to resume from."
   solution: "This source cannot hand its full load over to an incremental tail; read it as snapshot only, or use a connector build that reports a stream position."
@@ -405,6 +414,9 @@ io.store-unavailable:
 io.store-unauthorized:
   message: "The store rejected the credentials for the operation."
   solution: "Check the store username and password in the connection settings."
+io.workload-claim-fenced:
+  message: "The store rejected a write from an expired or superseded workload owner."
+  solution: "Let the current cluster owner continue the workload; do not retry from the fenced generation."
 io.document-unreadable:
   message: "A stored document with id '{id}' could not be read back; the fault is in '{field}'."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."

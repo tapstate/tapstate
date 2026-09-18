@@ -44,6 +44,8 @@ The defaults are deliberately two separate clocks:
 | `tapstate.hz.maximum-no-heartbeat` | `30s` | How long membership waits before declaring a member lost. |
 | `tapstate.cluster.node-session-renew-interval` | `10s` | How often a stable node renews its reservation. |
 | `tapstate.cluster.node-session-ttl` | `30s` | How long the reservation remains valid without renewal. |
+| `tapstate.cluster.workload-claim-renew-interval` | `10s` | How often a business owner renews its claim. |
+| `tapstate.cluster.workload-claim-ttl` | `30s` | How long a business claim remains valid without renewal. |
 
 The maximum no-heartbeat duration must be longer than the heartbeat interval. Recovery waits for
 both topology loss detection and the relevant workload lease boundary; it is not an instantaneous

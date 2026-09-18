@@ -24,7 +24,11 @@ import java.util.List;
  * @param chainId  the mining-chain id both the writer and the reader key the ring under
  */
 record SourceCaptureResolution(
-        String sourceId, CaptureConfig config, List<String> tables, String srsKey, MiningChainId chainId) {
+        String sourceId,
+        CaptureConfig config,
+        List<String> tables,
+        String srsKey,
+        MiningChainId chainId) {
 
     static SourceCaptureResolution of(SourceResource source) {
         return of(source, null);
@@ -34,7 +38,8 @@ record SourceCaptureResolution(
         List<String> tables = SourceTableSelection.resolve(source, discovered);
         CaptureConfig config = new CaptureConfig(source.connector(), source.config(), tables);
         String srsKey = source.srs() != null ? source.srs().key() : null;
-        return new SourceCaptureResolution(source.id(), config, tables, srsKey, MiningChainId.resolve(config, srsKey));
+        return new SourceCaptureResolution(
+                source.id(), config, tables, srsKey, MiningChainId.resolve(config, srsKey));
     }
 
     /** Returns the first selected table; callers that need the full selection must use {@link #tables()}. */

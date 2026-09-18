@@ -37,10 +37,10 @@ final class ClusterMemberPreflight {
         }
         if (cluster.getProfile() == null
                 || cluster.getProfile() == ClusterProperties.Profile.SINGLE
-                || cluster.getProfile() == ClusterProperties.Profile.PRODUCTION_HA
-                        && cluster.getBootstrapMinMembers() < 3
-                || cluster.getProfile() == ClusterProperties.Profile.PROCESS_FAILURE_ONLY
-                        && cluster.getBootstrapMinMembers() != 2) {
+                || (cluster.getProfile() == ClusterProperties.Profile.PRODUCTION_HA
+                        && cluster.getBootstrapMinMembers() < 3)
+                || (cluster.getProfile() == ClusterProperties.Profile.PROCESS_FAILURE_ONLY
+                        && cluster.getBootstrapMinMembers() != 2)) {
             throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
         }
         String clusterId = required(cluster.getId(), BootError.CLUSTER_ID_REQUIRED);
@@ -73,6 +73,17 @@ final class ClusterMemberPreflight {
                 || cluster.getNodeSessionRenewInterval().isZero()
                 || cluster.getNodeSessionRenewInterval().compareTo(cluster.getNodeSessionTtl()) >= 0) {
             throw new TapstateException(BootError.NODE_SESSION_RENEW_INTERVAL_INVALID, Map.of(), null);
+        }
+        if (cluster.getWorkloadClaimTtl() == null
+                || cluster.getWorkloadClaimTtl().isNegative()
+                || cluster.getWorkloadClaimTtl().isZero()) {
+            throw new TapstateException(BootError.WORKLOAD_CLAIM_TTL_INVALID, Map.of(), null);
+        }
+        if (cluster.getWorkloadClaimRenewInterval() == null
+                || cluster.getWorkloadClaimRenewInterval().isNegative()
+                || cluster.getWorkloadClaimRenewInterval().isZero()
+                || cluster.getWorkloadClaimRenewInterval().compareTo(cluster.getWorkloadClaimTtl()) >= 0) {
+            throw new TapstateException(BootError.WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID, Map.of(), null);
         }
         if (cluster.getMembershipReconcileInterval() == null
                 || cluster.getMembershipReconcileInterval().isNegative()

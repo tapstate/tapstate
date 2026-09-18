@@ -478,13 +478,15 @@ class HazelcastConfiguration {
         return config;
     }
 
-    private static void configureClusterProtection(Config config, ClusterMembershipGate gate) {
+    static void configureClusterProtection(Config config, ClusterMembershipGate gate) {
         config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(
                 ClusterMembershipGate.PROTECTION_NAME, true)
                 .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
                 .setFunctionImplementation(gate));
-        config.getRingbufferConfigs().values().forEach(ring ->
-                ring.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME));
+        config.getRingbufferConfigs().values().forEach(ring -> {
+            ring.setBackupCount(Math.max(1, ring.getBackupCount()));
+            ring.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME);
+        });
         config.getMapConfigs().values().forEach(map ->
                 map.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME));
     }

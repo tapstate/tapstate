@@ -101,6 +101,18 @@ class HazelcastMemberTest {
     }
 
     @Test
+    void clusteredChangeRingsKeepOneSynchronousBackup() {
+        Config config = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+        ClusterProperties cluster = new ClusterProperties();
+        cluster.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+
+        HazelcastConfiguration.configureClusterProtection(config, new ClusterMembershipGate(cluster));
+
+        assertThat(config.getRingbufferConfig("srs.*").getBackupCount()).isEqualTo(1);
+        assertThat(config.getRingbufferConfig("srs.*").getAsyncBackupCount()).isZero();
+    }
+
+    @Test
     void tcpIpModeEnablesOnlyTcpIpDiscoveryAndPinsTheConfiguredPort() {
         HazelcastProperties properties = bind(Map.of(
                 "tapstate.hz.cluster-name", "cluster-red",

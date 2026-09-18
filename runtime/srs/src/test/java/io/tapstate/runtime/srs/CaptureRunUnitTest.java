@@ -622,6 +622,21 @@ class CaptureRunUnitTest {
     }
 
     @Test
+    void anAttachedPipelineDoesNotOpenASecondTailForTheCaptureOwner() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = new CaptureRunUnit(port, new SrsCoordinator(meta), meta, hz);
+
+        CaptureRun owner = unit.start(specFor("pipe-a", ReadMode.CDC_ONLY, "chain-owned"), e -> { }, true);
+        CaptureRun attached = unit.start(specFor("pipe-b", ReadMode.CDC_ONLY, "chain-owned"), e -> { }, false);
+
+        assertThat(port.cdcStarts).isEqualTo(1);
+        assertThat(owner.cdcSubscription()).isPresent();
+        assertThat(attached.cdcSubscription()).isEmpty();
+        assertThat(attached.chainId()).isEqualTo(owner.chainId());
+    }
+
+    @Test
     void routesAMultiTableSharedRingRunToOneSubscriptionAndTwoRings() throws Exception {
         InMemoryMeta meta = new InMemoryMeta();
         CaptureConfig multi = new CaptureConfig("mysql", Map.of(), List.of("orders", "customers"));
@@ -807,6 +822,7 @@ class CaptureRunUnitTest {
         private final String seam;
         private Throwable cdcError;
         boolean cdcStarted;
+        int cdcStarts;
         /** Where the run asked this source to begin -- the whole of what a resume is observable as. */
         CaptureStart cdcStart;
         boolean cdcClosed;
@@ -841,6 +857,7 @@ class CaptureRunUnitTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             cdcStarted = true;
+            cdcStarts++;
             cdcStart = start;
             if (cdcError != null) {
                 listener.onError(cdcError);

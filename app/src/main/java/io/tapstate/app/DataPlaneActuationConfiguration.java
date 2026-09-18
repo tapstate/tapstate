@@ -14,6 +14,7 @@ import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaim;
 import java.time.Duration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -78,11 +79,35 @@ class DataPlaneActuationConfiguration {
     }
 
     @Bean
+    CaptureOwnership captureOwnership(
+            HazelcastInstance hazelcastMember,
+            ClusterProperties clusterProperties,
+            ClusterMembershipGate membershipGate,
+            ClusterWorkloadClaims workloadClaims) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return CaptureOwnership.single();
+        }
+        Object stored = hazelcastMember.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
+        if (!(stored instanceof WorkloadClaim nodeSession)) {
+            throw new IllegalStateException("cluster member started without its node-session identity");
+        }
+        return new CaptureOwnership(
+                clusterProperties.getId(), nodeSession.owner(), membershipGate,
+                workloadClaims, clusterProperties.getWorkloadClaimTtl());
+    }
+
+    @Bean
     PipelineCaptureCoordinator pipelineCaptureCoordinator(
             StorePort storePort, CaptureRunUnit captureRunUnit, SrsCoordinator srsCoordinator,
-            SnapshotBuffer snapshotBuffer) {
+            SnapshotBuffer snapshotBuffer, CaptureOwnership captureOwnership,
+            ClusterProperties clusterProperties) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return new StoreBackedPipelineCaptureCoordinator(
+                    storePort, captureRunUnit::start, srsCoordinator, snapshotBuffer);
+        }
         return new StoreBackedPipelineCaptureCoordinator(
-                storePort, captureRunUnit::start, srsCoordinator, snapshotBuffer);
+                storePort, captureRunUnit::start, srsCoordinator, snapshotBuffer,
+                captureOwnership, clusterProperties.getWorkloadClaimRenewInterval());
     }
 
     @Bean

@@ -208,7 +208,8 @@ public final class CdcPhase {
             // last, and a run interrupted between them would resume past changes never delivered.
             SourcePosition pos = i == last ? position.orElse(null) : null;
             byTable.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(new SrsItem(
-                    pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer()));
+                    pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer(),
+                    route.chain().captureFence()));
         }
         String closingTable = events.get(last).src();
         long closingSeq = -1;

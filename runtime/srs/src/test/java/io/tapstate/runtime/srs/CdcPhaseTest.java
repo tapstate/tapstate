@@ -25,6 +25,10 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -150,6 +154,23 @@ class CdcPhaseTest {
         assertThat(third.op()).isEqualTo(Op.DELETE);
         assertThat(third.srcPos()).isEqualTo(new SourcePosition("w3"));
         assertThat(third.before()).containsEntry("id", 1);
+    }
+
+    @Test
+    void everyBufferedChangeCarriesTheCaptureGenerationToTheStoreBoundary() throws Exception {
+        Ringbuffer<SrsItem> ring = hz.getRingbuffer("srs.chain.capture-fence");
+        WorkloadClaimFence fence = new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-orders"),
+                new WorkloadOwner("node-a", "boot-a"), 9, 0, 4);
+        CdcChain chain = new CdcChain(
+                new SrsWriteGate(new SrsRingbuffer(ring)), new RecordingMeta(),
+                "chain", RING_GENERATION, 0L, fence);
+
+        CdcPhase.run(
+                new FakeCdcPort(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of()))),
+                config(), chain, () -> List.of(keepingUp()), new CaptureHealth());
+
+        assertThat(ring.readOne(0).captureFence()).isEqualTo(fence);
     }
 
     @Test

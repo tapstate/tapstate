@@ -3,6 +3,7 @@ package io.tapstate.runtime.srs;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
+import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.util.Objects;
 
@@ -19,6 +20,8 @@ import java.util.Objects;
  *   <li>{@code startFrom} — where this pipeline enters the incremental tail; {@code retention} — the
  *       pass-through retention config seeded on a new chain (may be null).</li>
  *   <li>{@code schemaVer} — the schema version stamped on ring items.</li>
+ *   <li>{@code captureFence} — the cluster claim generation a durable append must still match, or null on
+ *       the unchanged single-member path.</li>
  * </ul>
  *
  * <p>No position of any kind is carried here. Both a run's seam and its per-change positions are the
@@ -35,7 +38,28 @@ public record CaptureRunSpec(
         String pipelineId,
         StartFrom startFrom,
         String retention,
-        long schemaVer) {
+        long schemaVer,
+        WorkloadClaimFence captureFence) {
+
+    public CaptureRunSpec(
+            CaptureConfig config,
+            ReadMode readMode,
+            String srsKey,
+            boolean srsEnabled,
+            String sourceId,
+            String pipelineId,
+            StartFrom startFrom,
+            String retention,
+            long schemaVer) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, null);
+    }
+
+    public CaptureRunSpec withCaptureFence(WorkloadClaimFence fence) {
+        return new CaptureRunSpec(
+                config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, fence);
+    }
 
     public CaptureRunSpec {
         Objects.requireNonNull(config, "config");

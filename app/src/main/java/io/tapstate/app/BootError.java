@@ -54,6 +54,12 @@ enum BootError implements TapstateErrorCode {
     /** Renewal must happen before the node-session lease expires. */
     NODE_SESSION_RENEW_INTERVAL_INVALID("boot.node-session-renew-interval-invalid", Set.of()),
 
+    /** A business workload claim needs a positive server-time lease. */
+    WORKLOAD_CLAIM_TTL_INVALID("boot.workload-claim-ttl-invalid", Set.of()),
+
+    /** Business ownership must renew before its lease expires. */
+    WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID("boot.workload-claim-renew-interval-invalid", Set.of()),
+
     /** Cluster mode cannot reserve identities without the Mongo-backed coordination ports. */
     COORDINATION_STORE_REQUIRED("boot.coordination-store-required", Set.of()),
 

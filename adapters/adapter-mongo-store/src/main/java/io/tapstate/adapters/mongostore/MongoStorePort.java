@@ -164,7 +164,9 @@ public final class MongoStorePort implements StorePort {
         this.clusterMembership =
                 new MongoClusterMembershipStore(SystemCollections.CLUSTER_MEMBERSHIP.on(database));
         this.meta = new MongoSrsMetaStore(SystemCollections.SRS_META.on(database));
-        this.srsLog = new MongoSrsLogStore(SystemCollections.SRS_LOG.on(database));
+        this.srsLog = new MongoSrsLogStore(
+                connection.client(), SystemCollections.SRS_LOG.on(database),
+                SystemCollections.WORKLOAD_CLAIMS.on(database));
         this.derivedSchemas = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(database));
         // Operator state alone sits in its own database on the same client, for the reasons on the
         // constant. Same connection, same credentials, same lifecycle - a different database. What that

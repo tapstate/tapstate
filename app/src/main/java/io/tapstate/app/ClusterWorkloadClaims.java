@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -31,7 +32,11 @@ final class ClusterWorkloadClaims {
     }
 
     Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
-        if (expected.key().type() != WorkloadClaimType.NODE_SESSION && !membership.businessEligible()) {
+        ClusterMembership current = membership.committed();
+        if (expected.key().type() != WorkloadClaimType.NODE_SESSION
+                && (!membership.businessEligible()
+                        || current == null
+                        || current.revision() != expected.topologyRevision())) {
             return Optional.empty();
         }
         return store.renew(expected, ttl);

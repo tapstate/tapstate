@@ -47,6 +47,9 @@ boot.node-id-in-use
 boot.node-id-required
 boot.node-session-renew-interval-invalid
 boot.node-session-ttl-invalid
+boot.workload-claim-renew-interval-invalid
+boot.workload-claim-ttl-invalid
+capture.claim-lost
 capture.event-table-not-selected
 capture.snapshot-reports-no-seam
 capture.start-from-outside-window
@@ -188,6 +191,7 @@ io.schema-read-contention
 io.schema-write-contention
 io.store-unauthorized
 io.store-unavailable
+io.workload-claim-fenced
 lifecycle.illegal-transition
 lifecycle.incompatible-revision
 lifecycle.pipeline-not-runnable

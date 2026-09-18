@@ -55,6 +55,23 @@ class ClusterWorkloadClaimsTest {
         assertThat(raw.calls).hasValue(1);
     }
 
+    @Test
+    void aTopologyRevisionChangeFencesRenewalUntilTheWorkloadIsReacquired() {
+        ClusterMembershipGate gate = productionGate();
+        gate.install(new ClusterMembership("cluster-a", 1, Set.of("a", "b", "c")));
+        gate.canCommit(Set.of("a", "b"));
+        RecordingClaims raw = new RecordingClaims();
+        ClusterWorkloadClaims claims = new ClusterWorkloadClaims(raw, gate);
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-a");
+        WorkloadClaim revisionOne = raw.claim(key);
+
+        gate.install(new ClusterMembership("cluster-a", 2, Set.of("a", "b", "c")));
+        gate.canCommit(Set.of("a", "b"));
+
+        assertThat(claims.renew(revisionOne, TTL)).isEmpty();
+        assertThat(raw.calls).hasValue(0);
+    }
+
     private static ClusterMembershipGate productionGate() {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);

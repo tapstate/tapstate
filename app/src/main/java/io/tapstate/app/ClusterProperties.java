@@ -20,6 +20,8 @@ class ClusterProperties {
     private int bootstrapMinMembers = 3;
     private Duration nodeSessionTtl = Duration.ofSeconds(30);
     private Duration nodeSessionRenewInterval = Duration.ofSeconds(10);
+    private Duration workloadClaimTtl = Duration.ofSeconds(30);
+    private Duration workloadClaimRenewInterval = Duration.ofSeconds(10);
     private Duration membershipReconcileInterval = Duration.ofSeconds(1);
 
     String getId() {
@@ -68,6 +70,22 @@ class ClusterProperties {
 
     void setNodeSessionRenewInterval(Duration nodeSessionRenewInterval) {
         this.nodeSessionRenewInterval = nodeSessionRenewInterval;
+    }
+
+    Duration getWorkloadClaimTtl() {
+        return workloadClaimTtl;
+    }
+
+    void setWorkloadClaimTtl(Duration workloadClaimTtl) {
+        this.workloadClaimTtl = workloadClaimTtl;
+    }
+
+    Duration getWorkloadClaimRenewInterval() {
+        return workloadClaimRenewInterval;
+    }
+
+    void setWorkloadClaimRenewInterval(Duration workloadClaimRenewInterval) {
+        this.workloadClaimRenewInterval = workloadClaimRenewInterval;
     }
 
     Duration getMembershipReconcileInterval() {

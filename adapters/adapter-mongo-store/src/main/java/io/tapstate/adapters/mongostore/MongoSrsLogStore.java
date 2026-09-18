@@ -1,5 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.ReplaceOneModel;
@@ -10,6 +12,10 @@ import io.tapstate.core.event.Op;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.SrsLogStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import org.bson.Document;
 
 import java.util.ArrayList;
@@ -34,16 +40,35 @@ import java.util.Optional;
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A stored document that cannot be read back into its model is coded
  * {@code io.document-unreadable}.
+ *
+ * <p>A record carrying a capture fence is appended inside a transaction that first reads the matching live
+ * workload claim with Mongo server time. The claim check and log write therefore commit together: replacing
+ * the owner generation makes every later append from the old process fail even if that process is still alive.
  */
 public final class MongoSrsLogStore implements SrsLogStore {
 
     private static final String RING = "ring";
     private static final String SEQ = "seq";
 
+    private final MongoClient client;
     private final MongoCollection<Document> collection;
+    private final MongoCollection<Document> workloadClaims;
 
     public MongoSrsLogStore(MongoCollection<Document> collection) {
+        this(null, collection, null);
+    }
+
+    /** Production constructor enabling an atomic live-claim check around every fenced append. */
+    public MongoSrsLogStore(
+            MongoClient client,
+            MongoCollection<Document> collection,
+            MongoCollection<Document> workloadClaims) {
+        this.client = client;
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.workloadClaims = workloadClaims;
+        if ((client == null) != (workloadClaims == null)) {
+            throw new IllegalArgumentException("client and workloadClaims must be supplied together");
+        }
     }
 
     @Override
@@ -51,8 +76,13 @@ public final class MongoSrsLogStore implements SrsLogStore {
         Objects.requireNonNull(ring, "ring");
         Objects.requireNonNull(record, "record");
         Document key = key(ring, seq);
-        StoreIo.run(() -> collection.replaceOne(
-                new Document("_id", key), toDocument(key, record), new ReplaceOptions().upsert(true)));
+        if (record.captureFence() == null) {
+            StoreIo.run(() -> collection.replaceOne(
+                    new Document("_id", key), toDocument(key, record), new ReplaceOptions().upsert(true)));
+            return;
+        }
+        fenced(record.captureFence(), session -> collection.replaceOne(
+                session, new Document("_id", key), toDocument(key, record), new ReplaceOptions().upsert(true)));
     }
 
     @Override
@@ -62,10 +92,14 @@ public final class MongoSrsLogStore implements SrsLogStore {
         if (records.isEmpty()) {
             return;
         }
+        WorkloadClaimFence fence = records.getFirst().captureFence();
         List<WriteModel<Document>> writes = new ArrayList<>(records.size());
         long seq = firstSeq;
         for (SrsLogRecord record : records) {
             Objects.requireNonNull(record, "record");
+            if (!Objects.equals(fence, record.captureFence())) {
+                throw new IllegalArgumentException("one SRS log batch must carry one workload claim fence");
+            }
             Document key = key(ring, seq++);
             writes.add(new ReplaceOneModel<>(
                     new Document("_id", key), toDocument(key, record), new ReplaceOptions().upsert(true)));
@@ -73,7 +107,11 @@ public final class MongoSrsLogStore implements SrsLogStore {
         // Ordered, so the run lands in the order the ring assigned it rather than in whatever order the
         // driver finds convenient. The run occupies consecutive sequences, and a reader that meets a gap
         // cannot tell a write still in flight from one that failed.
-        StoreIo.run(() -> collection.bulkWrite(writes, new BulkWriteOptions().ordered(true)));
+        if (fence == null) {
+            StoreIo.run(() -> collection.bulkWrite(writes, new BulkWriteOptions().ordered(true)));
+            return;
+        }
+        fenced(fence, session -> collection.bulkWrite(session, writes, new BulkWriteOptions().ordered(true)));
     }
 
     @Override
@@ -130,6 +168,9 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 .append("op", record.op().symbol())
                 .append("ts", record.ts())
                 .append("schemaVer", record.schemaVer());
+        if (record.captureFence() != null) {
+            document.append("captureFence", fenceDocument(record.captureFence()));
+        }
         // The nullable fields are written only when present, never as explicit nulls -- the same shape the
         // meta store uses, so a reader tells "no position" from "a position that is the empty string".
         if (record.srcToken() != null) {
@@ -152,7 +193,8 @@ public final class MongoSrsLogStore implements SrsLogStore {
                     document.getLong("ts"),
                     rowImage(document, "before"),
                     rowImage(document, "after"),
-                    document.getLong("schemaVer"));
+                    document.getLong("schemaVer"),
+                    readFence(document.get("captureFence", Document.class)));
         } catch (RuntimeException e) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                     Map.of("id", String.valueOf(document.get("_id"))), e);
@@ -162,5 +204,82 @@ public final class MongoSrsLogStore implements SrsLogStore {
     private static Map<String, Object> rowImage(Document document, String field) {
         Document image = document.get(field, Document.class);
         return image == null ? null : RowImages.toRow(image);
+    }
+
+    private void fenced(WorkloadClaimFence fence, java.util.function.Consumer<ClientSession> write) {
+        if (client == null || workloadClaims == null) {
+            throw new IllegalStateException("a fenced SRS log write requires the workload-claim collection");
+        }
+        StoreIo.run(() -> {
+            try (ClientSession session = client.startSession()) {
+                session.startTransaction();
+                try {
+                    Document live = workloadClaims.find(session, liveClaim(fence))
+                            .projection(new Document("_id", 1))
+                            .first();
+                    if (live == null) {
+                        throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+                    }
+                    write.accept(session);
+                    session.commitTransaction();
+                } catch (RuntimeException failure) {
+                    if (session.hasActiveTransaction()) {
+                        try {
+                            session.abortTransaction();
+                        } catch (RuntimeException abortFailure) {
+                            failure.addSuppressed(abortFailure);
+                        }
+                    }
+                    throw failure;
+                }
+            }
+        });
+    }
+
+    private static Document liveClaim(WorkloadClaimFence fence) {
+        Document id = new Document("clusterId", fence.key().clusterId())
+                .append("resourceType", fence.key().type().name())
+                .append("resourceId", fence.key().resourceId());
+        return new Document("_id", id)
+                .append("ownerNodeId", fence.owner().nodeId())
+                .append("ownerBootId", fence.owner().bootId())
+                .append("claimGeneration", fence.claimGeneration())
+                .append("executionGeneration", fence.executionGeneration())
+                .append("topologyRevision", fence.topologyRevision())
+                .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+    }
+
+    private static Document fenceDocument(WorkloadClaimFence fence) {
+        return new Document("clusterId", fence.key().clusterId())
+                .append("resourceType", fence.key().type().name())
+                .append("resourceId", fence.key().resourceId())
+                .append("ownerNodeId", fence.owner().nodeId())
+                .append("ownerBootId", fence.owner().bootId())
+                .append("claimGeneration", fence.claimGeneration())
+                .append("executionGeneration", fence.executionGeneration())
+                .append("topologyRevision", fence.topologyRevision());
+    }
+
+    private static WorkloadClaimFence readFence(Document fence) {
+        if (fence == null) {
+            return null;
+        }
+        return new WorkloadClaimFence(
+                new WorkloadClaimKey(
+                        fence.getString("clusterId"),
+                        WorkloadClaimType.valueOf(fence.getString("resourceType")),
+                        fence.getString("resourceId")),
+                new WorkloadOwner(fence.getString("ownerNodeId"), fence.getString("ownerBootId")),
+                number(fence, "claimGeneration"),
+                number(fence, "executionGeneration"),
+                number(fence, "topologyRevision"));
+    }
+
+    private static long number(Document document, String field) {
+        Number value = document.get(field, Number.class);
+        if (value == null) {
+            throw new IllegalStateException("capture fence has no " + field);
+        }
+        return value.longValue();
     }
 }

@@ -5,7 +5,14 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsLogRecord;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -14,11 +21,13 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Witnesses the durable change log against a real Mongo: a change round-trips by (ring, sequence), a run
@@ -187,6 +196,43 @@ class MongoSrsLogStoreIT {
                     .isEqualTo(exact)
                     .isInstanceOf(BigDecimal.class);
         });
+    }
+
+    @Test
+    void aSupersededCaptureGenerationCannotAppendEvenWhenTheOldProcessStillRuns() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate_fence_" + System.nanoTime());
+            var claimsCollection = database.getCollection("workload_claims");
+            var logCollection = database.getCollection("srs_log");
+            MongoWorkloadClaimStore claims = new MongoWorkloadClaimStore(claimsCollection);
+            MongoSrsLogStore log = new MongoSrsLogStore(client, logCollection, claimsCollection);
+            WorkloadClaimKey key =
+                    new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-orders");
+
+            WorkloadClaim first = claims.acquire(
+                    key, new WorkloadOwner("node-a", "boot-a"), 7, Duration.ofSeconds(30)).claim();
+            WorkloadClaimFence stale = WorkloadClaimFence.from(first);
+            SrsLogRecord firstRecord = new SrsLogRecord(
+                    "p1", Op.INSERT, 1L, null, Map.of("id", 1), 0L, stale);
+            log.storeAll(RING, 1L, List.of(firstRecord));
+
+            assertThat(claims.release(first)).isTrue();
+            WorkloadClaim second = claims.acquire(
+                    key, new WorkloadOwner("node-b", "boot-b"), 8, Duration.ofSeconds(30)).claim();
+            assertThat(second.claimGeneration()).isEqualTo(first.claimGeneration() + 1);
+            assertThat(second.owner()).isEqualTo(new WorkloadOwner("node-b", "boot-b"));
+
+            assertThatThrownBy(() -> log.storeAll(RING, 2L, List.of(new SrsLogRecord(
+                            "p2-stale", Op.INSERT, 2L, null, Map.of("id", 2), 0L, stale))))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            coded -> assertThat(coded.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(log.load(RING, 2L)).isEmpty();
+
+            WorkloadClaimFence current = WorkloadClaimFence.from(second);
+            log.storeAll(RING, 2L, List.of(new SrsLogRecord(
+                    "p2", Op.INSERT, 2L, null, Map.of("id", 2), 0L, current)));
+            assertThat(log.load(RING, 2L).orElseThrow().captureFence()).isEqualTo(current);
+        }
     }
 
     private static void withStore(Consumer<MongoSrsLogStore> body) {

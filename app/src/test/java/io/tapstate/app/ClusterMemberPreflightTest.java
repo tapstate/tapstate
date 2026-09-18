@@ -107,6 +107,19 @@ class ClusterMemberPreflightTest {
                 coded -> assertThat(coded.code()).isEqualTo(BootError.HEARTBEAT_CONFIG_INVALID));
     }
 
+    @Test
+    void workloadClaimRenewalMustPrecedeItsPositiveLease() {
+        ClusterProperties cluster = cluster("cluster-a", "node-a");
+        cluster.setWorkloadClaimTtl(Duration.ofSeconds(10));
+        cluster.setWorkloadClaimRenewInterval(Duration.ofSeconds(10));
+
+        Throwable invalid = catchThrowable(() -> ClusterMemberPreflight.validate(
+                clusteredHazelcast(), cluster, control("https://node-a.internal:8080")));
+
+        assertThat(invalid).isInstanceOfSatisfying(TapstateException.class,
+                coded -> assertThat(coded.code()).isEqualTo(BootError.WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID));
+    }
+
     private static HazelcastProperties clusteredHazelcast() {
         HazelcastProperties properties = new HazelcastProperties();
         properties.getDiscovery().setMode(HazelcastProperties.DiscoveryMode.TCP_IP);

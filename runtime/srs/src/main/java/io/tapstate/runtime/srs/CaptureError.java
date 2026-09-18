@@ -18,6 +18,9 @@ import java.util.Set;
  */
 public enum CaptureError implements TapstateErrorCode {
 
+    /** A live capture could no longer renew the cluster ownership generation that fences its writes. */
+    CLAIM_LOST("capture.claim-lost", Set.of("captureId")),
+
     /** A {@code start_from} value that is neither the {@code earliest} / {@code latest} keyword nor a
      *  parseable ISO-8601 instant; {@code value} carries the offending token. */
     START_FROM_UNPARSABLE("capture.start-from-unparsable", Set.of("value")),
