@@ -115,6 +115,11 @@ final class FactsMetricProducer implements MetricProducer {
     void forgetPipelinesOutside(Collection<String> pipelineIds) {
         Set<String> kept = Set.copyOf(pipelineIds);
         latest.keySet().retainAll(kept);
+        // The per-pipeline fold remembers which values of each open dimension it named, and that memory
+        // has the same expiry as the names below: it belongs to a pipeline, and the pipeline is gone.
+        synchronized (folder) {
+            folder.forgetPipelinesOutside(kept);
+        }
         // The names go with the pipelines they were held for. A name is a promise to a chart: this series
         // will not begin folding while the data behind it has not changed. A pipeline that is gone has
         // neither chart nor data, and keeping its names would turn the export limit into a ratchet — a

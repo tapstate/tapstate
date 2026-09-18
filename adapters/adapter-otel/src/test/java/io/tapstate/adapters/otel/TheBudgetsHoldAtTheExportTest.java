@@ -136,6 +136,43 @@ class TheBudgetsHoldAtTheExportTest {
     }
 
     @Test
+    void thePerPipelineFoldGivesUpItsValuesWithThePipelineToo() {
+        // The fold inside offer() has its own memory of which tables it named, per pipeline. It has to be
+        // given up with the pipeline as well: an id applied again over other tables would otherwise find
+        // its budget spent on the tables of the pipeline that had the id before.
+        int tables = CardinalityBudget.RECORDS.distinctValues() + 200;
+        producer.offer("orders", PipelineState.RUNNING, AT, List.of(rowsOver("orders", tables, "t")));
+        assertThat(namedTables(recordsPoints(producer.produce(Resource.empty()))))
+                .hasSize(CardinalityBudget.RECORDS.distinctValues());
+        producer.forgetPipelinesOutside(List.of());
+
+        producer.offer("orders", PipelineState.RUNNING, AT, List.of(rowsOver("orders", tables, "u")));
+
+        assertThat(namedTables(recordsPoints(producer.produce(Resource.empty()))))
+                .hasSize(CardinalityBudget.RECORDS.distinctValues())
+                .allSatisfy(table -> assertThat(table).startsWith("u"));
+    }
+
+    /** One records fact over {@code tables} tables of {@code pipelineId}, in and out, each table named by the prefix. */
+    private static MetricFact rowsOver(String pipelineId, int tables, String prefix) {
+        List<MetricPoint> points = new ArrayList<>();
+        for (int index = 0; index < tables; index++) {
+            String table = prefix + String.format(Locale.ROOT, "%04d", index);
+            for (String direction : List.of("in", "out")) {
+                points.add(MetricPoint.accumulated(
+                        Facts.tableAndDirection(pipelineId, table, direction), START, AT, 1L));
+            }
+        }
+        return new MetricFact(RECORDS, MetricType.COUNTER, "{record}", points);
+    }
+
+    /** The distinct table ids the export named, overflow series excluded. */
+    private static List<String> namedTables(Collection<LongPointData> exported) {
+        return exported.stream().map(point -> point.getAttributes().get(TABLE))
+                .filter(table -> table != null).distinct().toList();
+    }
+
+    @Test
     void aNameIsGivenUpWithThePipelineItWasHeldFor() {
         // The limit nearly filled by pipelines that then go away.
         int wide = (CardinalityBudget.EXPORT_SERIES_LIMIT - 2) / 2;

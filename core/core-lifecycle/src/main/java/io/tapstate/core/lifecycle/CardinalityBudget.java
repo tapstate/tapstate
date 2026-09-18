@@ -2,6 +2,7 @@ package io.tapstate.core.lifecycle;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -174,6 +175,23 @@ public enum CardinalityBudget {
         private final Map<String, Map<String, Set<String>>> named = new HashMap<>();
 
         private Folder() {
+        }
+
+        /**
+         * Gives up what is remembered for every pipeline outside {@code pipelineIds}.
+         *
+         * <p>A folder lives as long as the consumer it folds for, and that outlives any one pipeline. The
+         * values named for a pipeline that is gone are not merely idle: an id applied a second time over a
+         * different set of tables finds its budget already spent on the tables of the pipeline that had
+         * the id before, and every one of the new tables folds from its first observation.
+         *
+         * <p>A series carrying no pipeline at all is kept, the way the fold keeps it: it belongs to no
+         * pipeline, so no pipeline's removal takes it away.
+         */
+        public void forgetPipelinesOutside(Collection<String> pipelineIds) {
+            Set<String> kept = Set.copyOf(pipelineIds);
+            named.values().forEach(byPipeline ->
+                    byPipeline.keySet().removeIf(pipeline -> !pipeline.isEmpty() && !kept.contains(pipeline)));
         }
 
         /**

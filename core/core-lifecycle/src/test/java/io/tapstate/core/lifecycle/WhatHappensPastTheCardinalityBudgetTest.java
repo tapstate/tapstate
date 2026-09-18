@@ -363,6 +363,24 @@ class WhatHappensPastTheCardinalityBudgetTest {
     }
 
     @Test
+    @DisplayName("an id applied again over other tables gets its budget back, because the fold gave up the old ones")
+    void aFolderGivesUpWhatItNamedForAPipelineThatIsGone() {
+        CardinalityBudget.Folder folder = CardinalityBudget.folder();
+        MetricFact before = folder.fold(rowsOver(1_200, PIPELINE));
+        assertThat(namedTables(before)).hasSize(CardinalityBudget.RECORDS.distinctValues());
+
+        folder.forgetPipelinesOutside(List.of());
+
+        // The same id, applied a second time over a different set of tables -- which is what a removed and
+        // re-applied pipeline looks like from here. Holding the old values would spend this id's whole
+        // budget on tables that no longer exist, and fold every one of the new ones from first sight.
+        MetricFact after = folder.fold(rowsOver(1_200, PIPELINE, "u"));
+
+        assertThat(namedTables(after)).hasSize(CardinalityBudget.RECORDS.distinctValues());
+        assertThat(namedTables(after)).allSatisfy(table -> assertThat(table).startsWith("u"));
+    }
+
+    @Test
     @DisplayName("a gauge of quantities that add folds by adding them, so the total past the budget is the total")
     void aGaugeOfQuantitiesThatAddFoldsByAdding() {
         int namespaces = 1_200;
