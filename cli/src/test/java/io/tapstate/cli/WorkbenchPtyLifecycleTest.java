@@ -40,6 +40,7 @@ class WorkbenchPtyLifecycleTest {
     @Test
     void explicitWorkbenchBackendWinsWhenAnotherProviderIsDiscoverable(@TempDir Path home) throws Exception {
         try (JvmPtyFixture pty = JvmPtyFixture.start(home, JvmPtyFixture.Mode.BACKEND_SELECTION)) {
+            pty.resize(100, 24);
             pty.awaitText("__TAPSTATE_BACKEND__io.tapstate.cli.WorkbenchTerminalBackend", SCREEN_TIMEOUT);
             quit(pty);
 
@@ -98,7 +99,7 @@ class WorkbenchPtyLifecycleTest {
             pty.awaitText("Terminal size too small:", SCREEN_TIMEOUT);
             pty.send("x");
             pty.awaitText("Injected", SCREEN_TIMEOUT);
-            quit(pty);
+            pty.send("q");
 
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
             assertThat(pty.childExitStatus()).isZero();
@@ -170,6 +171,8 @@ class WorkbenchPtyLifecycleTest {
     private static JvmPtyFixture startBare(Path home) throws Exception {
         JvmPtyFixture pty = JvmPtyFixture.start(home, JvmPtyFixture.Mode.BARE);
         pty.awaitText("Terminal size too small:", SCREEN_TIMEOUT);
+        pty.resize(100, 24);
+        pty.awaitText("Tapstate", SCREEN_TIMEOUT);
         return pty;
     }
 

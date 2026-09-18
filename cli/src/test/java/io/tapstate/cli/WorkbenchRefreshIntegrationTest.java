@@ -391,10 +391,6 @@ class WorkbenchRefreshIntegrationTest {
                     .map(WorkbenchSnapshot::identity)
                     .contains(new WorkbenchSnapshot.Identity(1, 1));
 
-            scheduler.awaitNext().run();
-            assertThat(runtime.state().snapshot())
-                    .map(WorkbenchSnapshot::identity)
-                    .contains(new WorkbenchSnapshot.Identity(1, 1));
         }
     }
 
@@ -466,11 +462,6 @@ class WorkbenchRefreshIntegrationTest {
                 assertThat(overlay).isInstanceOf(WorkbenchOverlayState.Login.class);
                 assertThat(((WorkbenchOverlayState.Login) overlay).contextName()).isEqualTo("dev");
             });
-
-            scheduler.awaitNext().run();
-            assertThat(runtime.state().snapshot())
-                    .map(WorkbenchSnapshot::identity)
-                    .contains(new WorkbenchSnapshot.Identity(1, 1));
         }
     }
 

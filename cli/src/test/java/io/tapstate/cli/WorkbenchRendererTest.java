@@ -73,7 +73,7 @@ class WorkbenchRendererTest {
                 .contains("1 Overview", "2 Workspace", "3 Sources", "4 Pipelines", "0 More")
                 .contains("Resources")
                 .contains("source", "pipeline", "in sync 1", "local only 1")
-                .contains("1-4  views", "c  context", "a  auth", "0  more", "r  refresh", "q  quit")
+                .contains("c  context", "a  auth", "0  more", "r  refresh", "q  quit")
                 .doesNotContain(secret, "/admin", "explicit", "Remote artifacts:",
                         "F1", "F2", "command palette",
                         "Up/Down select", "[2]", "[1]", "[0]");
@@ -134,10 +134,10 @@ class WorkbenchRendererTest {
         assertThat(compact.layout().wide()).isFalse();
         assertThat(wide.layout().wide()).isTrue();
         assertThat(compact.text())
-                .contains("IDENTIFIER▼", "STATE", "WORKSPACE")
+                .contains("IDENTIFIER▼", "SYNC", "LOCAL")
                 .doesNotContain("KIND", "REMOTE");
         assertThat(wide.text())
-                .contains("IDENTIFIER▼", "| STATE", "| WORKSPACE")
+                .contains("IDENTIFIER▼", "| SYNC", "| LOCAL")
                 .doesNotContain("KIND", "REMOTE");
         assertOccupiedToRightEdge(compact);
         assertOccupiedToRightEdge(wide);
@@ -180,10 +180,9 @@ class WorkbenchRendererTest {
         WorkbenchSnapshot snapshot = snapshot(session, new WorkbenchRemoteState.NotConfigured(), List.of());
 
         assertThat(render(100, 28, accepted(snapshot)).text())
-                .contains("No Pipeline Activity Found", "How to get started:",
-                        "Run the guided demo workspace:", "> tapstate demo -w demo", "> cd demo && tapstate",
-                        "Or connect an existing Tapstate Server:",
-                        "create or choose a context", "sign in when the context is selected");
+                .contains("No workspace selected", "How to get started:",
+                        "Connect to a Tapstate Server:", "create or choose a context", "open the sign-in form",
+                        "Create a local source:", "New Source", "New Pipeline", "> tapstate demo -w demo");
     }
 
     @Test
@@ -231,7 +230,7 @@ class WorkbenchRendererTest {
         assertThat(lineOf(rendered.buffer(), 21)).doesNotContain("Remote artifacts:");
         assertThat(lineOf(rendered.buffer(), 22)).startsWith("╰");
         assertThat(lineOf(rendered.buffer(), 23))
-                .contains("1-4  views", "c  context", "a  auth", "0  more", "r  refresh", "q  quit");
+                .contains("c  context", "a  auth", "0  more", "r  refresh", "q  quit");
         assertThat(rendered.text())
                 .contains("source", "local 7", "remote 8", "pipeline", "local 2", "remote 3");
     }
@@ -354,13 +353,13 @@ class WorkbenchRendererTest {
 
         Rendered rendered = render(157, 28, state);
         String header = lineOf(rendered.buffer(), 4);
-        assertThat(header).contains("STATE▼");
+        assertThat(header).contains("SYNC▼");
         assertThat(rendered.text().indexOf("alpha"))
                 .isLessThan(rendered.text().indexOf("zeta"));
         assertThat(rendered.text()).contains("s  sort", "Esc  back", "r  refresh");
 
         int identifierColumn = header.indexOf("IDENTIFIER");
-        int stateColumn = header.indexOf("STATE");
+        int stateColumn = header.indexOf("SYNC");
         assertThat(rendered.buffer().get(identifierColumn, 4).style().fg())
                 .isEqualTo(WorkbenchTheme.dark().base().fg());
         assertThat(rendered.buffer().get(stateColumn, 4).style().effectiveModifiers())

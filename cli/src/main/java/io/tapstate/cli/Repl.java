@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.model.Resource;
@@ -2136,6 +2137,40 @@ final class Repl {
         return lifecycleOnline(verb, words.get(1), null);
     }
 
+    private String awaitPaused(String id) {
+        streamCancelled = false;
+        long deadline = System.nanoTime() + pauseSettleBound().toNanos();
+        String seen = null;
+        while (true) {
+            StatusOutcome outcome = withFailover(() -> controlPlane.status(
+                    session.landingNode(), session.credential(), id),
+                    candidate -> candidate instanceof StatusOutcome.Unreachable);
+            if (outcome instanceof StatusOutcome.Found found) {
+                seen = found.state();
+                if ("PAUSED".equalsIgnoreCase(seen)) {
+                    return seen;
+                }
+            }
+            if (outcome instanceof StatusOutcome.Rejected
+                    || System.nanoTime() - deadline >= 0
+                    || !sleepUnlessCancelled(PAUSE_SETTLE_POLL)) {
+                return seen;
+            }
+        }
+    }
+
+    private Duration pauseSettleBound() {
+        String configured = env == null ? null : env.apply(PAUSE_SETTLE_BOUND_ENV);
+        if (configured == null || configured.isBlank()) {
+            return PAUSE_SETTLE_BOUND;
+        }
+        try {
+            return Duration.ofMillis(Long.parseLong(configured.trim()));
+        } catch (NumberFormatException notANumber) {
+            return PAUSE_SETTLE_BOUND;
+        }
+    }
+
     private int lifecycleOnline(String verb, String id, Boolean purgeState) {
         return renderLifecycle(driveLifecycle(verb, id, purgeState));
     }
@@ -2163,151 +2198,173 @@ final class Repl {
         PrintWriter err = commandLine.getErr();
         boolean keepState = words.contains(KEEP_STATE);
         List<String> operands = words.stream().filter(word -> !STOP_OPTIONS.contains(word)).toList();
-        if (operands.size() != 2 || operands.get(1).isBlank()) {
-            err.println("stop: usage: stop <pipeline-id> [--keep-state] [-y]");
-            err.flush();
-            return Cli.EXIT_USAGE;
-        }
         for (int i = 1; i < operands.size(); i++) {
             if (operands.get(i).startsWith("-")) {
-                err.println("stop: unknown option " + operands.get(i));
+                err.println("stop: unknown option " + operands.get(i) + " (usage: " + STOP_USAGE + ")");
                 err.flush();
                 return Cli.EXIT_USAGE;
             }
         }
-        String id = operands.get(1);
-        announcePipelineState(keepState);
-        if (!keepState && !words.contains("-y") && !words.contains("--non-interactive")) {
-            if (!terminal.getAsBoolean() || prompter == null) {
-                Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", "stop"));
-                err.flush();
-                return Cli.EXIT_DIAGNOSTIC;
-            }
-            String answer = prompter.ask("Clear " + id + "? Type yes to go ahead", "no");
-            if (answer == null || !(answer.trim().equalsIgnoreCase("yes") || answer.trim().equalsIgnoreCase("y"))) {
-                PrintWriter out = commandLine.getOut();
-                out.println("stop: cancelled; " + id + " was left as it is");
-                out.flush();
-                return Cli.EXIT_DIAGNOSTIC;
-            }
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("stop: missing operand (usage: " + STOP_USAGE + ")");
+            err.flush();
+            return Cli.EXIT_USAGE;
         }
-        return lifecycleOnline("stop", id, !keepState);
+        String id = operands.get(1);
+        if (keepState) {
+            sayWhatBecomesOfTheState(false);
+            return lifecycleOnline("stop", id, Boolean.FALSE);
+        }
+        OptionalInt refused = clearanceToClear("stop", id, unattended(words));
+        return refused.isPresent() ? refused.getAsInt() : lifecycleOnline("stop", id, Boolean.TRUE);
     }
 
-    private void announcePipelineState(boolean keepState) {
+    private void sayWhatBecomesOfTheState(boolean purgeState) {
         PrintWriter out = commandLine.getOut();
-        if (keepState) {
-            out.println("keeping the pipeline's accumulated state and resume position");
-        } else {
-            out.println("clearing the pipeline's accumulated state and resume position");
-        }
+        PipelineStateInventory.lines(purgeState, PipelineStateInventory.vocabulary())
+                .forEach(out::println);
         out.flush();
+    }
+
+    private boolean unattended(List<String> words) {
+        return words.contains("-y") || words.contains("--non-interactive");
+    }
+
+    private OptionalInt clearanceToClear(String verb, String id, boolean unattended) {
+        sayWhatBecomesOfTheState(true);
+        if (unattended) {
+            return OptionalInt.empty();
+        }
+        Prompter asking = terminal.getAsBoolean() ? prompter() : null;
+        if (asking == null) {
+            PrintWriter err = commandLine.getErr();
+            Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", verb));
+            err.flush();
+            return OptionalInt.of(Cli.EXIT_DIAGNOSTIC);
+        }
+        String answer = asking.ask("Clear " + id + "? Type yes to go ahead", "no");
+        String said = answer == null ? "" : answer.trim();
+        if (!said.equalsIgnoreCase("yes") && !said.equalsIgnoreCase("y")) {
+            PrintWriter out = commandLine.getOut();
+            out.println(verb + ": cancelled; " + id + " was left as it is");
+            out.flush();
+            return OptionalInt.of(Cli.EXIT_DIAGNOSTIC);
+        }
+        return OptionalInt.empty();
     }
 
     private int restartOnline(List<String> words) {
         PrintWriter err = commandLine.getErr();
         boolean rerun = words.contains("--rerun");
         List<String> operands = words.stream().filter(word -> !RESTART_OPTIONS.contains(word)).toList();
-        if (operands.size() != 2 || operands.get(1).isBlank()) {
-            err.println("restart: usage: restart <pipeline-id> [--rerun] [-y]");
-            err.flush();
-            return Cli.EXIT_USAGE;
-        }
         for (int i = 1; i < operands.size(); i++) {
             if (operands.get(i).startsWith("-")) {
-                err.println("restart: unknown option " + operands.get(i));
+                err.println("restart: unknown option " + operands.get(i)
+                        + " (usage: " + RESTART_USAGE + ")");
                 err.flush();
                 return Cli.EXIT_USAGE;
             }
         }
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("restart: missing operand (usage: " + RESTART_USAGE + ")");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
         String id = operands.get(1);
         if (rerun) {
-            return rerunFromStart(id, words);
+            OptionalInt refused = clearanceToClear("restart", id, unattended(words));
+            return refused.isPresent() ? refused.getAsInt() : rerunFromTheStart(id);
         }
         StatusOutcome outcome = withFailover(() -> controlPlane.status(
                 session.landingNode(), session.credential(), id),
                 candidate -> candidate instanceof StatusOutcome.Unreachable);
         return switch (outcome) {
-            case StatusOutcome.Found found -> restartFromState(id, found.state());
+            case StatusOutcome.Found found -> carryOnFrom(id, found.state());
             case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case StatusOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
 
-    private int rerunFromStart(String id, List<String> words) {
-        announcePipelineState(false);
-        if (!words.contains("-y") && !words.contains("--non-interactive")) {
-            PrintWriter err = commandLine.getErr();
-            if (!terminal.getAsBoolean() || prompter == null) {
-                Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", "restart"));
-                err.flush();
-                return Cli.EXIT_DIAGNOSTIC;
-            }
-            String answer = prompter.ask("Clear " + id + "? Type yes to go ahead", "no");
-            if (answer == null || !(answer.trim().equalsIgnoreCase("yes") || answer.trim().equalsIgnoreCase("y"))) {
-                return Cli.EXIT_DIAGNOSTIC;
-            }
-        }
+    private int rerunFromTheStart(String id) {
         int stopped = lifecycleOnline("stop", id, Boolean.TRUE);
-        return stopped == Cli.EXIT_OK ? lifecycleOnline("start", id, null) : stopped;
+        if (stopped != Cli.EXIT_OK) {
+            return stopped;
+        }
+        int started = lifecycleOnline("start", id, null);
+        if (started != Cli.EXIT_OK) {
+            PrintWriter err = commandLine.getErr();
+            err.println("restart: " + id + " was stopped and its state cleared, but starting it did not "
+                    + "go through; it is stopped with no position to resume from, so the next run reads "
+                    + "the whole source");
+            err.flush();
+        }
+        return started;
     }
 
-    private int restartFromState(String id, String state) {
-        String normalized = state == null ? "" : state.toUpperCase(Locale.ROOT);
-        return switch (normalized) {
-            case "RUNNING" -> restartRunning(id);
-            case "PAUSED" -> lifecycleOnline("resume", id, null);
-            case "NEW", "STOPPED", "COMPLETED" -> lifecycleOnline("start", id, null);
-            case "FAILED" -> restartFailed(id);
-            default -> {
-                PrintWriter err = commandLine.getErr();
-                err.println("restart: " + id + " is " + normalized.toLowerCase(Locale.ROOT)
+    private int carryOnFrom(String id, String state) {
+        PrintWriter out = commandLine.getOut();
+        PrintWriter err = commandLine.getErr();
+        switch (state.toUpperCase(Locale.ROOT)) {
+            case "RUNNING": {
+                int paused = lifecycleOnline("pause", id, null);
+                if (paused != Cli.EXIT_OK) {
+                    return paused;
+                }
+                String settled = awaitPaused(id);
+                if (!"PAUSED".equalsIgnoreCase(settled)) {
+                    err.println("restart: " + id + " was asked to pause, but it is still "
+                            + (settled == null ? "not reporting a state" : settled.toLowerCase(Locale.ROOT))
+                            + ", so it has not been resumed; running restart again picks it up once it "
+                            + "has paused");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                LifecycleOutcome resumed = driveLifecycle("resume", id, null);
+                if (resumed instanceof LifecycleOutcome.Rejected rejected
+                        && INCOMPATIBLE_REVISION.equals(rejected.code())) {
+                    renderRejection(rejected.code(), rejected.message());
+                    err.println("restart: " + id + " is now paused, and its definition changed while it "
+                            + "ran, so it cannot carry on as it was; 'restart " + id + " --rerun' runs "
+                            + "the new definition and reads the whole source again");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                if (resumed instanceof LifecycleOutcome.Rejected rejected) {
+                    renderRejection(rejected.code(), rejected.message());
+                    err.println("restart: " + id + " is now paused and nothing was lost; running restart "
+                            + "again picks it up");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                return renderLifecycle(resumed);
+            }
+            case "PAUSED":
+                return lifecycleOnline("resume", id, null);
+            case "NEW":
+            case "STOPPED":
+            case "COMPLETED": {
+                out.println("restart: " + id + " has no position to carry on from; this run reads "
+                        + "everything from the start");
+                out.flush();
+                return lifecycleOnline("start", id, null);
+            }
+            case "FAILED": {
+                out.println("restart: " + id + " failed; carrying on from the position it reached");
+                out.flush();
+                int stopped = lifecycleOnline("stop", id, Boolean.FALSE);
+                if (stopped != Cli.EXIT_OK) {
+                    return stopped;
+                }
+                return lifecycleOnline("start", id, null);
+            }
+            default:
+                err.println("restart: " + id + " is " + state.toLowerCase(Locale.ROOT)
                         + ", which restart does not know how to carry on from");
                 err.flush();
-                yield Cli.EXIT_VERB_UNAVAILABLE;
-            }
-        };
+                return Cli.EXIT_VERB_UNAVAILABLE;
+        }
     }
 
-    private int restartRunning(String id) {
-        int paused = lifecycleOnline("pause", id, null);
-        if (paused != Cli.EXIT_OK) {
-            return paused;
-        }
-        long deadline = System.nanoTime() + pauseSettleBound().toNanos();
-        while (System.nanoTime() < deadline && sleepUnlessCancelled(PAUSE_SETTLE_POLL)) {
-            StatusOutcome outcome = withFailover(() -> controlPlane.status(
-                    session.landingNode(), session.credential(), id),
-                    candidate -> candidate instanceof StatusOutcome.Unreachable);
-            if (outcome instanceof StatusOutcome.Found found && "PAUSED".equalsIgnoreCase(found.state())) {
-                return lifecycleOnline("resume", id, null);
-            }
-            if (outcome instanceof StatusOutcome.Rejected rejected) {
-                return renderRejection(rejected.code(), rejected.message());
-            }
-        }
-        PrintWriter err = commandLine.getErr();
-        err.println("restart: " + id + " was asked to pause but has not reached paused; it was not resumed");
-        err.flush();
-        return Cli.EXIT_VERB_UNAVAILABLE;
-    }
-
-    private int restartFailed(String id) {
-        int stopped = lifecycleOnline("stop", id, Boolean.FALSE);
-        return stopped == Cli.EXIT_OK ? lifecycleOnline("start", id, null) : stopped;
-    }
-
-    private Duration pauseSettleBound() {
-        String configured = env == null ? null : env.apply(PAUSE_SETTLE_BOUND_ENV);
-        if (configured == null || configured.isBlank()) {
-            return PAUSE_SETTLE_BOUND;
-        }
-        try {
-            return Duration.ofMillis(Long.parseLong(configured.trim()));
-        } catch (NumberFormatException ignored) {
-            return PAUSE_SETTLE_BOUND;
-        }
-    }
 
     /**
      * {@code apply [path]} — reads every {@code *.tap.yml} under the path (default: the session workspace)
