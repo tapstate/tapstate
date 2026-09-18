@@ -13,6 +13,7 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.EpochCas;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.ViewResource;
@@ -64,6 +65,7 @@ class StorePortTest {
         assertThat(store.connectorSpecs()).isNotNull();
         assertThat(store.connectionTestResults()).isNotNull();
         assertThat(store.observations()).isNotNull();
+        assertThat(store.rateHistory()).isNotNull();
         assertThat(store.meta()).isNotNull();
         assertThat(store.srsLog()).isNotNull();
         assertThat(store.keyedState()).isNotNull();
@@ -1242,6 +1244,36 @@ class StorePortTest {
                 @Override
                 public void delete(String pipelineId) {
                     desired.remove(pipelineId);
+                }
+            };
+        }
+
+        @Override
+        public RateHistoryStore rateHistory() {
+            List<RateSample> samples = new ArrayList<>();
+            return new RateHistoryStore() {
+                @Override
+                public void append(RateSample sample) {
+                    samples.add(sample);
+                }
+
+                @Override
+                public List<RateSample> readBetween(String pipelineId, Instant from, Instant to) {
+                    return samples.stream()
+                            .filter(sample -> sample.pipelineId().equals(pipelineId))
+                            .filter(sample -> !sample.observedAt().isBefore(from) && !sample.observedAt().isAfter(to))
+                            .sorted(Comparator.comparing(RateSample::observedAt))
+                            .toList();
+                }
+
+                @Override
+                public void deleteAll(String pipelineId) {
+                    samples.removeIf(sample -> sample.pipelineId().equals(pipelineId));
+                }
+
+                @Override
+                public java.time.Duration retention() {
+                    return java.time.Duration.ofDays(15);
                 }
             };
         }

@@ -97,6 +97,7 @@ reason: actuation.source-schema-not-discovered
 why: the run failed, and said why: actuation.source-schema-not-discovered
   read       status.failure = actuation.source-schema-not-discovered
   next       tapstate logs order_pipeline
+moving     not known -- the run failed
 ```
 
 Run `discover-schema` for the source it names, then start again.
@@ -117,11 +118,13 @@ job die and reporting it as failed would be a guess. What `status` adds is that 
 ```
 order_pipeline  running
 why: the server keeps failing to bring this pipeline up: 12 passes in a row have thrown
-  read       metrics.errorCount = 12
+  read       metrics.reconcileFailuresInARow = 12
   read       status.state = running
   next       read the server's own log -- the reason is printed there once per pass
   cannot say whether the job itself is still alive: nothing here has seen it die, so the state
              stays running rather than being guessed into a failure
+moving     not known -- no records counter is published (no live job)
+lag        not published
 ```
 
 The reason itself is in the server's log, once per tick:

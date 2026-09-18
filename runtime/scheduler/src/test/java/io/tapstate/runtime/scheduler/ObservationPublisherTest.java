@@ -9,6 +9,7 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
@@ -34,7 +35,8 @@ import static org.assertj.core.api.Assertions.entry;
 /**
  * The runtime observation publisher reads a pipeline's converged actual state and writes it out as the
  * pipeline's latest observation, so the control read faces have a store-backed projection to read. L1
- * wires the errorCount metric from the actual state (0 healthy, 1 when FAILED); the remaining metrics are
+ * publishes no metric derived from the state at all -- failures are counted where one is witnessed, and
+ * the state is published as the state; the remaining metrics are
  * absent and the snapshot dataset is published empty (no source yet). A pipeline with no checkpoint yet is
  * left unobserved rather than published as an empty doc.
  */
@@ -51,14 +53,14 @@ class ObservationPublisherTest {
     private ObservationPublisher withWatch(
             NestColdLayerAlert alert, Function<String, Map<String, NestStateReading>> readings) {
         return new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), readings,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), readings,
                 new NestColdLayerWatch(new NestColdLayerPressure(0.5, 100), alert));
     }
 
     /** A publisher with nothing wired but the clock it reads the observation time from. */
     private ObservationPublisher withClock(Clock clock) {
         return new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -91,10 +93,11 @@ class ObservationPublisherTest {
         Observation published = observations.read("orders").orElseThrow();
         assertThat(published.pipelineId()).isEqualTo("orders");
         assertThat(published.state()).isEqualTo(PipelineState.RUNNING);
-        // errorCount is wired from the actual state: a healthy pipeline reports zero errors. The snapshot
-        // source is not wired yet, so it is published empty (unavailable), not faked. This publisher was
-        // built with no metric or position source, so recordCount is absent and positions are empty.
-        assertThat(published.metrics()).containsOnly(entry("errorCount", 0L));
+        // A healthy pipeline publishes no metric at all here: nothing has failed, no job is reporting a
+        // record count, and nothing else is wired. What used to sit in this slot was errorCount, the
+        // pipeline's own state written as a number -- always present because a state is always something.
+        // The failures it stood in for are now counted per code and absent until one happens.
+        assertThat(published.metrics()).isEmpty();
         assertThat(published.snapshot()).isEmpty();
         assertThat(published.positions()).isEmpty();
     }
@@ -107,9 +110,9 @@ class ObservationPublisherTest {
 
         wired.publish("orders");
 
-        // recordCount rides the numeric metrics map alongside the always-present errorCount gauge.
+        // recordCount rides the numeric metrics map on its own; nothing here is always-present any more.
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errorCount", 0L), entry("recordCount", 128L));
+                .containsOnly(entry("recordCount", 128L));
     }
 
     @Test
@@ -121,15 +124,15 @@ class ObservationPublisherTest {
         wired.publish("orders");
 
         // A missing metric means the source is not wired (here: no live job), expressed by its absence
-        // rather than a zero sentinel, so only the errorCount gauge is carried.
-        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 0L));
+        // rather than a zero sentinel -- and with nothing else wired either, the map is empty.
+        assertThat(observations.read("orders").orElseThrow().metrics()).isEmpty();
     }
 
     @Test
     void publishWiresHowFarEachChainsFrontierTrailsIntoTheMetrics() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
                 id -> Map.of("orders", 0L, "order_items", 480L));
 
         wired.publish("orders");
@@ -138,7 +141,7 @@ class ObservationPublisherTest {
         // distance is what tells them apart: order_items is running ahead of positions it was ever given,
         // while orders is exactly where its bound lets it be. A zero and a large number are both readings.
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errorCount", 0L),
+                .containsOnly(
                         entry("frontierGap.orders", 0L), entry("frontierGap.order_items", 480L));
     }
 
@@ -146,7 +149,7 @@ class ObservationPublisherTest {
     void publishWiresHowLongEachChainHasBeenPinnedIntoTheMetrics() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
                 id -> Map.of("orders", 0L, "order_items", 480L),
                 id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
@@ -160,7 +163,7 @@ class ObservationPublisherTest {
         // that is not this one. order_items has a distance and is not pinned, so it has no entry here -
         // a zero would say it is pinned and has just advanced, which is the healthy end of this scale.
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errorCount", 0L),
+                .containsOnly(
                         entry("frontierGap.orders", 0L), entry("frontierGap.order_items", 480L),
                         entry("frontierStalledMillis.orders", 96_000L));
     }
@@ -169,7 +172,7 @@ class ObservationPublisherTest {
     void theTimePinnedIsAbsentFromTheMetricsWhenNoChainIsPinned() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
                 id -> Map.of("orders", 0L));
 
         wired.publish("orders");
@@ -177,27 +180,27 @@ class ObservationPublisherTest {
         // A pipeline whose chains all keep up publishes no duration at all. A zero here would be a chain
         // reporting that it is pinned and just advanced, which is a reading rather than the absence of one.
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errorCount", 0L), entry("frontierGap.orders", 0L));
+                .containsOnly(entry("frontierGap.orders", 0L));
     }
 
     @Test
     void theFrontierGapIsAbsentFromTheMetricsWhenNoSinkReportsOne() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(
-                state, observations, id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of());
+                state, observations, id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE);
 
         wired.publish("orders");
 
         // Absent means unmeasured, and a zero would read as a frontier keeping up with its bound - the
         // opposite reading, and the one an alarm over this number would stay quiet on.
-        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 0L));
+        assertThat(observations.read("orders").orElseThrow().metrics()).isEmpty();
     }
 
     @Test
     void publishWiresWhatEachNestNamespaceHoldsAndWhatItCostsIntoTheMetrics() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.$root", new NestStateReading(4_000L, 900L, 30L, 210L)));
 
         wired.publish("orders");
@@ -206,7 +209,7 @@ class ObservationPublisherTest {
         // average over the whole run, and a state layer that fell off its cliff a minute ago still reads
         // as healthy in it. Two scrapes of counts give any window a reader wants.
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errorCount", 0L),
+                .containsOnly(
                         entry("nestStateEntries.nest.orders.doc.$root", 4_000L),
                         entry("nestStateAccesses.nest.orders.doc.$root", 900L),
                         entry("nestStateBackfills.nest.orders.doc.$root", 30L),
@@ -228,7 +231,7 @@ class ObservationPublisherTest {
     void publishWiresHowDeepOneKeysWaitHasEverGotIntoTheMetrics() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.$root",
                         new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.empty())));
 
@@ -249,7 +252,7 @@ class ObservationPublisherTest {
     void publishWiresHowMuchANamespaceHoldsAltogetherBesideWhatIsInMemory() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.$root",
                         new NestStateReading(4_000L, 900L, 30L, 210L, OptionalLong.of(400_000L))));
 
@@ -269,7 +272,7 @@ class ObservationPublisherTest {
     void howMuchANamespaceHoldsAltogetherIsAbsentWhereThereIsNoColdLayerToAsk() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.$root", new NestStateReading(4_000L, 900L, 30L, 210L)));
 
         wired.publish("orders");
@@ -287,7 +290,7 @@ class ObservationPublisherTest {
     void publishWiresHowManyChangesANamespaceCouldNeverPlaceInADocument() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -308,7 +311,7 @@ class ObservationPublisherTest {
     void aNamespaceThatDiscardedNothingReportsNothingRatherThanZero() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
                 id -> Map.of("nest.orders.doc.items", new NestStateReading(4_000L, 900L, 30L, 210L)));
 
         wired.publish("orders");
@@ -327,9 +330,11 @@ class ObservationPublisherTest {
     @Test
     void publishWiresHowFarALargeRebuildHasGotAndHowFarItHasToGo() {
         state.seed("orders", PipelineState.RUNNING);
-        String subject = "join.orders.widen.index.customers/17";
+        // The engine hands over one reading per namespace: which row is being rebuilt is a value out of a
+        // row, and travels in no reading that leaves it.
+        String subject = "join.orders.widen.index.customers";
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -354,7 +359,7 @@ class ObservationPublisherTest {
     void aPipelineWithNoLargeRebuildRunningReportsNeitherNumber() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of(),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -439,13 +444,13 @@ class ObservationPublisherTest {
     void theNestStateReadingsAreAbsentFromTheMetricsWhenNoNamespaceReportsAny() {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> Map.of());
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of());
 
         wired.publish("orders");
 
         // Absent means unmeasured. Zeroes would read as a state layer holding nothing and serving every
         // read from memory - the healthy end of both scales, and the reading an alarm stays quiet on.
-        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 0L));
+        assertThat(observations.read("orders").orElseThrow().metrics()).isEmpty();
     }
 
     @Test
@@ -462,29 +467,37 @@ class ObservationPublisherTest {
     }
 
     @Test
-    void publishesAnErrorCountOfOneWhenThePipelineHasFailed() {
+    void aFailedStateOnItsOwnPublishesNoFailureMetric() {
         state.seed("orders", PipelineState.FAILED);
 
         publisher.publish("orders");
 
         Observation published = observations.read("orders").orElseThrow();
         assertThat(published.state()).isEqualTo(PipelineState.FAILED);
-        // A dead data-plane job is one observable error; every other state reports zero.
-        assertThat(published.metrics()).containsOnly(entry("errorCount", 1L));
+        // The inversion of what this case used to assert, and the point of the change. It used to read
+        // errorCount = 1 here, derived from the state alone: a state wearing a count's name, which could
+        // not say how many times anything had happened and went back down on recovery. Failures are now
+        // counted where one is witnessed, and no cause was handed over on this pass -- the state is
+        // already published as the state, one field up.
+        assertThat(published.metrics()).isEmpty();
     }
 
     @Test
-    void errorCountDropsBackToZeroWhenAFailedPipelineRecovers() {
+    void aRecoveredPipelineKeepsTheFailuresItAlreadyHad() {
         state.seed("orders", PipelineState.FAILED);
-        publisher.publish("orders");
-        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 1L));
+        publisher.publish("orders", new ObservationFailure("engine.job-failed", Map.of()));
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsOnly(entry("errors.engine.job-failed", 1L));
 
-        // Recovery goes through STOPPED (stop -> start); the gauge tracks the current state, not a running
-        // total, so a non-FAILED state reports zero rather than accumulating the earlier failure.
+        // Recovery goes through STOPPED (stop -> start). The other inversion: the number used to drop back
+        // to zero here, because it tracked the state. A counter that went down on recovery is one every
+        // consumer reads as a restart -- and it made "has this pipeline ever failed" unanswerable the
+        // moment it came back.
         state.seed("orders", PipelineState.STOPPED);
         publisher.publish("orders");
 
-        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 0L));
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsOnly(entry("errors.engine.job-failed", 1L));
     }
 
     @Test
@@ -492,7 +505,7 @@ class ObservationPublisherTest {
         state.seed("orders", PipelineState.RUNNING);
         ObservationPublisher wired = new ObservationPublisher(state, observations,
                 id -> OptionalLong.empty(), id -> Map.of(),
-                id -> Map.of("orders", new TableSnapshot(500L, null, null)));
+                id -> new SnapshotReading(Map.of("orders", new TableSnapshot(500L, null, null)), T0));
 
         wired.publish("orders");
 
@@ -595,7 +608,7 @@ class ObservationPublisherTest {
         // A pipeline that never converged witnessed no lifecycle state, so the projection is NEW rather than a
         // fabricated FAILED; the consecutive-failure count is the observable error signal.
         assertThat(published.state()).isEqualTo(PipelineState.NEW);
-        assertThat(published.metrics()).containsOnly(entry("errorCount", 3L));
+        assertThat(published.metrics()).containsOnly(entry("reconcileFailuresInARow", 3L));
         assertThat(published.snapshot()).isEmpty();
     }
 
@@ -609,7 +622,7 @@ class ObservationPublisherTest {
         Observation published = observations.read("orders").orElseThrow();
         // The last observed state is kept, not overwritten with FAILED — only the error count moves.
         assertThat(published.state()).isEqualTo(PipelineState.RUNNING);
-        assertThat(published.metrics()).containsOnly(entry("errorCount", 2L));
+        assertThat(published.metrics()).containsOnly(entry("reconcileFailuresInARow", 2L));
     }
 
     @Test
@@ -620,13 +633,14 @@ class ObservationPublisherTest {
         ObservationFailure priorFailure = new ObservationFailure("engine.job-failed", Map.of("cause", "boom"));
         Map<String, String> priorPositions = Map.of("orders", "binlog.000123:456");
         observations.save(new Observation(
-                "orders", PipelineState.FAILED, Map.of("errorCount", 1L), Map.of(), priorPositions, priorFailure));
+                "orders", PipelineState.FAILED, Map.of("reconcileFailuresInARow", 1L), Map.of(),
+                priorPositions, priorFailure));
 
         publisher.publishReconcileFailure("orders", 5L);
 
         Observation published = observations.read("orders").orElseThrow();
         assertThat(published.state()).isEqualTo(PipelineState.FAILED);
-        assertThat(published.metrics()).containsOnly(entry("errorCount", 5L));
+        assertThat(published.metrics()).containsOnly(entry("reconcileFailuresInARow", 5L));
         assertThat(published.failure()).isEqualTo(priorFailure);
         assertThat(published.positions()).isEqualTo(priorPositions);
     }

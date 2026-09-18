@@ -258,6 +258,7 @@ public final class E2eExecutor {
             case Matcher.ErrorCount errorCount -> errorCountMismatch(errorCount.expected(), pipelineId);
             case Matcher.FailureCode failureCode -> failureCodeMismatch(failureCode.expected(), pipelineId);
             case Matcher.DeadLettered discarded -> deadLetteredMismatch(discarded.expected(), pipelineId);
+            case Matcher.RecordsOut rows -> recordsOutMismatch(rows.expected(), pipelineId);
         };
     }
 
@@ -452,6 +453,25 @@ public final class E2eExecutor {
                         + " expected "
                         + expected
                         + " changes that could not be placed in a document, found "
+                        + actual.map(Object::toString).orElse("no published observation"));
+    }
+
+    /**
+     * Reads the same unobserved window the same way as the matchers above. An observed nought and an
+     * observed nothing are the same answer here, as with discarded changes: the face carries no total until
+     * something settles. What that costs is that asserting nought is only an assertion beside a sibling
+     * asserting a real total - on its own it is satisfied by a pipeline that published no totals at all.
+     */
+    private Optional<String> recordsOutMismatch(long expected, String pipelineId) {
+        Optional<Long> actual = binding.recordsOut(pipelineId);
+        if (actual.filter(published -> published == expected).isPresent()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                pipelineId
+                        + " expected "
+                        + expected
+                        + " rows confirmed by a target, found "
                         + actual.map(Object::toString).orElse("no published observation"));
     }
 

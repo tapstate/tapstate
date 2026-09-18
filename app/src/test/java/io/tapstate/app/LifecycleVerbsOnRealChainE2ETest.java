@@ -207,9 +207,10 @@ class LifecycleVerbsOnRealChainE2ETest {
         Observation observed = awaitObservation(obs -> obs.metrics().getOrDefault("recordCount", -1L) == 6L);
 
         assertThat(observed.metrics())
-                .as("recordCount is the number of records the live job drove to its serve sink; errorCount stays 0")
+                .as("recordCount is the number of records the live job drove to its serve sink; a run that"
+                        + " failed nothing publishes no failure metric")
                 .containsEntry("recordCount", 6L)
-                .containsEntry("errorCount", 0L);
+                .doesNotContainKey("errorCount");
     }
 
     @Test

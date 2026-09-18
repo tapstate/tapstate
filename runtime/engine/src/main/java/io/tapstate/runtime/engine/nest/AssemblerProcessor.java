@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine.nest;
 
+import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
@@ -8,6 +9,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.ReplayFloor;
@@ -41,7 +44,12 @@ import java.util.Set;
  * nothing later removes. A root that is deleted is the one thing that still goes out, because the sink
  * has a document to remove; it carries the key and nothing else, and is not an assembled document.
  */
-public final class AssemblerProcessor extends AbstractProcessor {
+public final class AssemblerProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.NEST;
+    }
 
     /**
      * The shortest gap between two sweeps for changes that may stop being held.
@@ -553,14 +561,23 @@ public final class AssemblerProcessor extends AbstractProcessor {
     @Override
     protected void init(Processor.Context context) {
         this.failures = NestFailureRecording.of(context);
+        this.timer = StageTimer.of(stage(), context);
     }
+
+    // Times each drain of arrivals, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.NEST);
 
     @Override
     public void process(int ordinal, Inbox inbox) {
-        failures.recording(() -> {
-            processRecording(ordinal, inbox);
-            return null;
-        });
+        long started = timer.begin();
+        try {
+            failures.recording(() -> {
+                processRecording(ordinal, inbox);
+                return null;
+            });
+        } finally {
+            timer.end(started);
+        }
     }
 
     private void processRecording(int ordinal, Inbox inbox) {

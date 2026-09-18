@@ -80,7 +80,7 @@ class V8DiscardViewSchemaPoliciesIT {
                 "d88ce94a4f440d991cdac3db9c959cdfb03c625ede0bb3c36d91698440db236d");
         assertCarried(artifacts, view, "body.schema",
                 "6e27aef5aebaaf660f7dbcf5d82cc481f01a1ac4012592cd227030ca32fae7fb");
-        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(8);
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
     }
 
     @Test

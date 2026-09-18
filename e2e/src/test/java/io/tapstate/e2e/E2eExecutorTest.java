@@ -711,10 +711,13 @@ class E2eExecutorTest {
         private final List<String> failureCodedPipelineIds = new ArrayList<>();
         private List<Optional<Long>> deadLetteredSeries = List.of(Optional.of(0L));
         private final List<String> deadLetteredPipelineIds = new ArrayList<>();
+        private List<Optional<Long>> recordsOutSeries = List.of(Optional.of(0L));
+        private final List<String> recordsOutPipelineIds = new ArrayList<>();
         private int stateReads;
         private int errorCountReads;
         private int failureCodeReads;
         private int deadLetteredReads;
+        private int recordsOutReads;
         private int countReads;
 
         void countsOverTime(TableAlias table, Long... readings) {
@@ -764,6 +767,19 @@ class E2eExecutorTest {
 
         void deadLettered(Long... readings) {
             deadLetteredSeries = Stream.of(readings).map(Optional::of).toList();
+        }
+
+        void recordsOut(Long... readings) {
+            recordsOutSeries = Stream.of(readings).map(Optional::of).toList();
+        }
+
+        /** Publishes no observation on the first read, then these totals: the window a real start opens. */
+        void recordsOutUnobservedThen(Long... readings) {
+            recordsOutSeries =
+                    Stream.concat(
+                                    Stream.of(Optional.<Long>empty()),
+                                    Stream.of(readings).map(Optional::of))
+                            .toList();
         }
 
         /** Publishes no observation on the first read, then these counts: the window a real start opens. */
@@ -927,6 +943,13 @@ class E2eExecutorTest {
             deadLetteredPipelineIds.add(pipelineId);
             int index = deadLetteredReads++;
             return deadLetteredSeries.get(Math.min(index, deadLetteredSeries.size() - 1));
+        }
+
+        @Override
+        public Optional<Long> recordsOut(String pipelineId) {
+            recordsOutPipelineIds.add(pipelineId);
+            int index = recordsOutReads++;
+            return recordsOutSeries.get(Math.min(index, recordsOutSeries.size() - 1));
         }
     }
 }
