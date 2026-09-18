@@ -81,9 +81,8 @@ public final class SrsSourceProcessor extends AbstractProcessor {
         // ordering that keeps a stale snapshot from landing at the sink after a newer change of the same key.
         // A member with no buffer bound, or a ring with none buffered, takes nothing here and is a pure ring
         // tail. Rows are preserved as-is: a null source position is what the sink-ack watermark skips.
-        // This is a streaming source: it assumes a cdc tail follows the snapshot. A snapshot-only read (no
-        // tail, a bounded source that emits the buffer then completes rather than tailing an empty ring) is a
-        // later increment; it is not driven through this vertex yet.
+        // The vertex stays live after a snapshot-only buffer drains as well. There is no writer behind that
+        // mode's empty ring, but keeping the same source shape lets a resume rebuild and refill this hand-off.
         //
         // The reference is kept, not just read: the buffer is looked at again on every pass, because a tail
         // with the shared ring switched off never stops appending to it.
@@ -253,9 +252,10 @@ public final class SrsSourceProcessor extends AbstractProcessor {
      *
      * <p>The generation is resolved when the job is assembled, not read per change: the ring is opened
      * before the job is submitted and does not change generation while it runs, so carrying it here keeps
-     * the durable store off the per-change path entirely. Zero means the source reads no chain of its own —
-     * a snapshot-only or srs-disabled read, whose rows come from the snapshot buffer and whose ring nobody
-     * fills; a change found on such a ring is rejected rather than ordered.
+     * the durable store off the per-change path entirely. A snapshot-only source is given its pipeline's
+     * chainless run generation instead; its rows come from the snapshot buffer and its ring stays empty.
+     * Zero is therefore reserved for a graph inspected before its capture was started, and a change found
+     * under it is rejected rather than ordered.
      */
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
             StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory) {

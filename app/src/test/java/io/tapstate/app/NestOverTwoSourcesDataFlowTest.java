@@ -10,6 +10,7 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.Embed;
@@ -82,9 +83,8 @@ import org.junit.jupiter.api.Test;
  * is drawn and the assembler is fed by both sources directly. Two roots rather than one, because a single
  * root is satisfied by an implementation that piles every child onto whichever root arrived first.
  *
- * <p>Read mode is {@code snapshot_and_cdc} rather than {@code snapshot_only} deliberately: a stateful node
- * needs every row to carry its order, and a source reading no chain of its own supplies none. The seeded
- * rows arrive as snapshot reads; the chain is what puts an order on them.
+ * <p>Read mode is {@code snapshot_and_cdc} because this case exercises the complete snapshot-to-tail path.
+ * The seeded rows arrive as snapshot reads and the changes behind them keep both chains live.
  */
 class NestOverTwoSourcesDataFlowTest {
 
@@ -156,6 +156,39 @@ class NestOverTwoSourcesDataFlowTest {
                 .containsExactlyInAnyOrder("sku-1", "sku-2", "sku-3");
         assertThat(elementsOf(latest.get(2L))).singleElement()
                 .satisfies(item -> assertThat(item).containsEntry("sku", "sku-4"));
+    }
+
+    /**
+     * Mutation evidence: forwarding the drain unchanged fails before the first document with "no order";
+     * pinning every run to generation one lets the first half pass and makes the second await time out with
+     * an empty sink. The snapshot-and-cdc sibling above stays green under both mutations.
+     */
+    @Test
+    @DisplayName("a snapshot-only nest assembles with no change chain behind its ordered rows")
+    void snapshotOnlyRowsAreAssembledWithoutInventingAResumePosition() {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_ONLY);
+        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+
+        actuator.start(PIPELINE);
+        try {
+            awaitAssembled();
+            Job job = member.getJet().getJob(PIPELINE);
+            assertThat(job).isNotNull();
+            assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
+            assertThat(store.meta().miningChainIdsWithConsumer(PIPELINE))
+                    .describedAs("an ordering generation is not a durable change-chain position")
+                    .isEmpty();
+
+            // Keep the assembled state and run the same bounded read again. A constant made-up order
+            // would lose every strict comparison against that state and emit no documents on this run.
+            actuator.stop(PIPELINE, false);
+            CapturingSinkWriter.reset();
+            actuator.start(PIPELINE);
+            awaitAssembled();
+            assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
+        } finally {
+            stopQuietly(actuator);
+        }
     }
 
     /**
@@ -242,6 +275,10 @@ class NestOverTwoSourcesDataFlowTest {
 
     /** The two sources, the sink connection and the nest pipeline, plus a discovered model for each source. */
     private static InMemoryStorePort seedStore() {
+        return seedStore(ReadMode.SNAPSHOT_AND_CDC);
+    }
+
+    private static InMemoryStorePort seedStore(ReadMode readMode) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source(PARENT_SOURCE, PARENT_TABLE));
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
@@ -260,7 +297,7 @@ class NestOverTwoSourcesDataFlowTest {
                 List.of(step), null,
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
-                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
+                new Settings(null, null, null, null, readMode, "earliest"), null));
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         // Both models are discovered: the parent's resolves the target the sink writes, and each supplies

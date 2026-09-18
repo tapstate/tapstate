@@ -76,6 +76,8 @@ public final class CaptureRunUnit {
     private final SrsCoordinator coordinator;
     private final SrsMetaStore meta;
     private final HazelcastInstance hz;
+    /** The fallback for direct callers that do not supply the product's durable per-pipeline generation. */
+    private final AtomicLong chainlessSnapshotEpoch = new AtomicLong();
 
     public CaptureRunUnit(CapturePort port, SrsCoordinator coordinator, SrsMetaStore meta, HazelcastInstance hz) {
         this.port = Objects.requireNonNull(port, "port");
@@ -148,15 +150,19 @@ public final class CaptureRunUnit {
                     snapshotCounts.merge(event.src(), 1L, Long::sum);
                     passthrough.accept(event);
                 };
-                // A chainless read has no ring and so no generation to order its rows against: they carry no
-                // order at all, which a stateful node downstream rejects rather than guesses at.
+                // A chainless read has no ring generation, but its rows still enter the same stateful graph.
+                // Its caller therefore assigns a run generation of its own; the drain stamps it at the one
+                // shared boundary every chainless snapshot passes through.
                 if (chainId != null) {
                     SnapshotPhase.Outcome loaded = SnapshotPhase.run(port, spec.config(), chainId.value(),
                             spec.pipelineId(), tables, epoch, meta, snapshotPassthrough);
                     snapshotCount = loaded.rows();
                     ownSeam = loaded.tailSeam();
                 } else {
-                    snapshotCount = SnapshotPhase.drain(port, spec.config(), snapshotPassthrough);
+                    long snapshotEpoch = spec.snapshotEpoch() > 0
+                            ? spec.snapshotEpoch() : chainlessSnapshotEpoch.incrementAndGet();
+                    snapshotCount = SnapshotPhase.drain(
+                            port, spec.config(), snapshotEpoch, snapshotPassthrough);
                 }
             }
 

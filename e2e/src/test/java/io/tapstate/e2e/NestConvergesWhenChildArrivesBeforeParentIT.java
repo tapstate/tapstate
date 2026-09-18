@@ -45,9 +45,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       parent is inserted, and its array is empty. So the array is read, element for element.</li>
  * </ul>
  *
- * <p>Read mode is {@code snapshot_and_cdc} rather than {@code snapshot_only} deliberately: a stateful
- * node needs every row to carry its order, and a source reading no chain of its own supplies none. It is
- * also what lets the parent arrive at all - it is inserted after the snapshot has been taken.
+ * <p>Read mode is {@code snapshot_and_cdc} because this case exercises the complete snapshot-to-tail
+ * path. The tail is also what lets the parent arrive at all - it is inserted after the snapshot.
  *
  * <p>Gated on Docker and on a directory of real connector jars, like its flat siblings
  * {@link RealMysqlToMongoSnapshotIT} and {@link RealMysqlToMongoCdcIT}. Run it with:

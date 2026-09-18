@@ -208,6 +208,8 @@ class CaptureRunUnitTest {
         // snapshot_only is a bounded pass straight to the sink: no shared chain a cdc tail resumes against,
         // so nothing is provisioned, no cdc-start is recorded, and no tail is attached.
         assertThat(passthrough).extracting(e -> e.after().get("id")).containsExactly(1, 2, 3);
+        assertThat(passthrough).extracting(event -> event.position().order())
+                .containsOnly(SourceOrder.snapshotRow(1L));
         assertThat(run.snapshotCount()).isEqualTo(3);
         assertThat(run.snapshotCounts()).containsEntry("orders", 3L);
         assertThat(run.chainId()).isEmpty();
@@ -215,6 +217,19 @@ class CaptureRunUnitTest {
         assertThat(run.cdcSubscription()).isEmpty();
         assertThat(meta.created).isEmpty();
         assertThat(port.cdcStarted).isFalse();
+    }
+
+    @Test
+    void directSnapshotOnlyRunsWithoutAnAssignedGenerationStillAdvanceLocally() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunUnit unit = runUnit(new FakeSource(List.of(row(1)), List.of()), meta);
+        List<SourceOrder> accepted = new ArrayList<>();
+
+        unit.start(spec(ReadMode.SNAPSHOT_ONLY, true), event -> accepted.add(event.position().order()));
+        unit.start(spec(ReadMode.SNAPSHOT_ONLY, true), event -> accepted.add(event.position().order()));
+
+        assertThat(accepted).containsExactly(
+                SourceOrder.snapshotRow(1L), SourceOrder.snapshotRow(2L));
     }
 
     /**

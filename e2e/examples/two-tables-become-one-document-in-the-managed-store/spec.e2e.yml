@@ -33,12 +33,13 @@
 # nothing to do with what this example is for; what an assembled array holds is this example's subject,
 # what order it holds it in is the sibling that changes one child and reads the array back.
 #
-# Read mode is snapshot_and_cdc rather than snapshot_only because a stateful node needs every row to
-# carry its order, and a source reading no chain of its own supplies none. The seeded rows still arrive
-# as snapshot reads; the change stream is what puts them on a chain.
+# Read mode is snapshot_only deliberately: there is no change tail to hide whether the chainless snapshot
+# rows themselves can cross a stateful node and assemble. Mutation evidence: forward the drain without
+# stamping its run order and both tiers time out with the pipeline FAILED on "stateful node with no order";
+# the neighboring snapshot-and-cdc nest examples remain green.
 #
-# Two single-table sources rather than one source naming both tables: that is what puts two chains into
-# one job, which is the shape a nest is for and the shape that can get the join wrong.
+# Two single-table sources rather than one source naming both tables put two independently read streams
+# into one job, which is the shape a nest is for and the shape that can get the join wrong.
 #
 # Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
 # example, naming a directory whose jars do not resolve fails it.

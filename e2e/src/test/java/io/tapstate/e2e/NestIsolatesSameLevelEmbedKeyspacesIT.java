@@ -37,9 +37,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * its children to the other root while both roots still hold the right number of elements, so counting
  * sees nothing. Only walking each path and reading which parent an element landed under does.
  *
- * <p>Read mode is {@code snapshot_and_cdc} rather than {@code snapshot_only} deliberately: a stateful
- * node needs every row to carry its order, and a source reading no chain of its own supplies none. The
- * seeded rows still arrive as snapshot reads; the change stream is what puts them on a chain.
+ * <p>Read mode is {@code snapshot_and_cdc} because this case exercises the complete snapshot-to-tail
+ * path. The seeded rows still arrive as snapshot reads and the change stream keeps the source live.
  *
  * <p>Gated on Docker and on a directory of real connector jars, like its flat siblings
  * {@link RealMysqlToMongoSnapshotIT} and {@link RealMysqlToMongoCdcIT}. Run it with:

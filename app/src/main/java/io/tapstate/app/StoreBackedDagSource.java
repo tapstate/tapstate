@@ -16,6 +16,7 @@ import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
@@ -283,7 +284,14 @@ final class StoreBackedDagSource implements DagSource {
         if (!operatorNamespaces.isEmpty()) {
             holdings.add(PipelineStateInventory.OPERATOR_STATE.in(operatorNamespaces));
         }
-        holdings.add(PipelineStateInventory.CONNECTOR_STATE.in(connectorStateNamespaces(pipeline)));
+        Set<String> driveNamespaces = new LinkedHashSet<>(connectorStateNamespaces(pipeline));
+        if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
+            // This is capture-side state kept for the next drive, just as a connector's own notes are.
+            // Clearing that state clears the generation too; keeping it lets a reread outrank operator
+            // state the prior drive left behind without adding a new user-facing kind of state.
+            driveNamespaces.add(SnapshotRunOrder.namespaceOf(pipelineId));
+        }
+        holdings.add(PipelineStateInventory.CONNECTOR_STATE.in(driveNamespaces));
         return List.copyOf(holdings);
     }
 
@@ -1123,6 +1131,12 @@ final class StoreBackedDagSource implements DagSource {
      * coordinates ship.
      */
     private SinkAckFactory sinkAckFactory(PipelineResource pipeline, String pipelineId) {
+        // A snapshot-only read deliberately has no durable change-chain position. Its order exists for
+        // stateful processing, not as a position a later tail can resume from, so settling it must not
+        // manufacture a chain acknowledgement or ask for a cdc seam that cannot exist.
+        if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
+            return SinkAckFactory.NONE;
+        }
         return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId);
     }
 
@@ -1162,10 +1176,13 @@ final class StoreBackedDagSource implements DagSource {
             FrontierBinding frontier,
             Map<String, CompiledJoin> compiledJoins) {
         ChainAxes axes = frontier.axes();
+        long snapshotEpoch = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY
+                ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id())
+                : 0L;
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         return new DagBindings(
-                key -> sourceVertex(sourceVertices.get(key), axes),
+                key -> sourceVertex(sourceVertices.get(key), axes, snapshotEpoch),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> sinkWriter(pipeline, element, targets, serveStreams),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
@@ -2062,7 +2079,7 @@ final class StoreBackedDagSource implements DagSource {
      * Resolving the same ring identity the capture side resolves is what points the reader at the ring the
      * writer fills.
      */
-    private ProcessorMetaSupplier sourceVertex(SourceVertex vertex, ChainAxes axes) {
+    private ProcessorMetaSupplier sourceVertex(SourceVertex vertex, ChainAxes axes, long snapshotEpoch) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -2073,24 +2090,27 @@ final class StoreBackedDagSource implements DagSource {
         byte axis = axes.axisOf(chain);
         return SrsSourceProcessor.metaSupplier(
                 vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
-                ringGeneration(vertex.resolution()),
+                snapshotEpoch > 0 ? snapshotEpoch : ringGeneration(vertex.resolution()),
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis));
     }
 
     /**
-     * The generation the source's ring is open under, read once while the job is assembled, and zero for a
-     * source that reads no chain of its own.
+     * The generation the source's ring is open under, read once while the job is assembled, and zero where
+     * no ring-backed tail was opened.
      *
-     * <p>Only a read with an incremental tail through the shared ring opens a chain, so a snapshot-only or
-     * srs-disabled read has no record here and no ring anyone fills — its rows reach the sink from the
-     * snapshot buffer rather than the ring, and there is no stream of changes for them to be ordered
-     * against. Reading the record rather than re-deriving the plan keeps one answer to that question: the
-     * capture run writes the record, so its presence is what "this source reads a shared ring" means.
+     * <p>A snapshot-only read does not use this value: its durable per-run generation is selected before
+     * this method is reached. Reading the record for every other mode rather than re-deriving the plan keeps
+     * one answer to which ring generation is running: the capture opens it before this job is assembled.
      */
     private long ringGeneration(SourceCaptureResolution resolution) {
         return storePort.meta().read(resolution.chainId().value()).map(SrsMeta::epoch).orElse(0L);
+    }
+
+    private static ReadMode readModeOf(PipelineResource pipeline) {
+        return pipeline.settings() != null && pipeline.settings().readMode() != null
+                ? pipeline.settings().readMode() : ReadMode.SNAPSHOT_AND_CDC;
     }
 
     /**

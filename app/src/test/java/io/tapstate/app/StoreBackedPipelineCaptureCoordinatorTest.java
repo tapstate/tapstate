@@ -29,6 +29,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.StorePort;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -104,7 +105,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     /**
-     * The run spec carries no position of any kind, and that absence is the point.
+     * The run spec carries no connector position, and that absence is the point.
      *
      * <p>A seam and a per-change position are the source's own, learned from it as the read happens. When
      * this layer supplied them instead, both were invented here: a fixed seam token, and a generator that
@@ -512,6 +513,28 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                     assertThat(exception.args()).containsEntry("table", "customers");
                 });
         assertThat(coordinator.isActive("p")).isFalse();
+    }
+
+    @Test
+    void eachSnapshotOnlyRebuildCarriesANewerOrderWithoutOpeningAChain() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_ONLY));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        List<Long> generations = new ArrayList<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            generations.add(spec.snapshotEpoch());
+            return new CaptureRun(
+                    Optional.empty(), false, 1L, Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, new SrsCoordinator(store.meta()), new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+        coordinator.stopCapture("p", false);
+        coordinator.startCapture("p");
+
+        assertThat(generations).containsExactly(1L, 2L);
     }
 
     @Test
