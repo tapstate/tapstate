@@ -137,6 +137,55 @@ final class PipelineActuationOwnership {
         return due ? acquire(pipelineId, state, now) : Permit.denied();
     }
 
+    /** Whether a run may be submitted, and the generations that fence it (none on a single node). */
+    record Execution(boolean allowed, ExecutionFence fence) {
+
+        static Execution unfenced() {
+            return new Execution(true, null);
+        }
+
+        static Execution refused() {
+            return new Execution(false, null);
+        }
+    }
+
+    /**
+     * Takes the next execution generation for a run this member is about to submit. Every submission gets
+     * one, including a resubmission by the same holder after a member left: ownership did not change, but
+     * it is a different run, and the members still carrying pieces of the previous one have to be able to
+     * tell. The generation is allocated by the store under the exact live claim, so two members cannot
+     * both believe they took it.
+     *
+     * <p>Refused when this member no longer holds the pipeline, or when the store cannot say that it
+     * does. The caller submits nothing in that case: a run that cannot be fenced is a run nothing could
+     * later stop from writing.
+     */
+    Execution beginExecution(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        if (!fenced) {
+            return Execution.unfenced();
+        }
+        Held state = held.get(pipelineId);
+        if (state == null || state.claim == null) {
+            return Execution.refused();
+        }
+        Optional<WorkloadClaim> advanced;
+        try {
+            // At the claim's own topology revision, which is the committed one: a revision change refuses
+            // the renew above, so a claim still held is a claim granted under the current topology.
+            advanced = claims.advanceExecution(state.claim, state.claim.topologyRevision());
+        } catch (RuntimeException unreachable) {
+            advanced = Optional.empty();
+        }
+        if (advanced.isEmpty()) {
+            state.claim = null;
+            return Execution.refused();
+        }
+        state.claim = advanced.get();
+        return new Execution(true, new ExecutionFence(
+                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()));
+    }
+
     /**
      * Releases the claims for pipelines that are no longer desired, so a deleted pipeline does not keep
      * this member named as its driver until the lease runs out. Releasing expires the lease and leaves the

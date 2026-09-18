@@ -113,6 +113,15 @@ public final class PipelineConverger {
             return ConvergeResult.converged(actualDoc.orElseThrow());
         }
 
+        if (target == PipelineState.RUNNING && actual == PipelineState.COMPLETED && !rebuildOwed) {
+            // A run whose bounded source ran out is over, and nobody writes an intent to say so: the
+            // desired state still reads RUNNING because that is what was asked for and it was carried
+            // out. Driving it would start the whole run again -- on this tick, and on every tick after
+            // it, since each new run reaches the same end. Running it again is a user's stop and start,
+            // which arrives as the one instruction handled above.
+            return ConvergeResult.converged(actualDoc.orElseThrow());
+        }
+
         return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild, rebuildOwed);
     }
 
@@ -180,6 +189,17 @@ public final class PipelineConverger {
             current = requireCheckpoint(pipelineId);
             if (current.stateJson().equals(targetJson)) {
                 return ConvergeResult.converged(current);
+            }
+            if (target == PipelineState.FAILED) {
+                // Every other target is an intent, and an intent survives being fenced: it is still what
+                // is wanted, so rebasing onto the fresh epoch and asking again is right. FAILED is not an
+                // intent -- it is a conclusion about the state that was read, and being fenced means that
+                // state is no longer there. Re-driving it would record a failure over whatever the other
+                // writer just landed (a user's stop, most often), actuate a second stop for it, and be
+                // corrected by the next pass: one tick of a pipeline reading failed that nothing failed,
+                // which no reader can tell from one that did. Conceding costs nothing, because a job that
+                // really is dead is still dead on the next pass and is failed then.
+                return ConvergeResult.superseded();
             }
         }
         return ConvergeResult.superseded();

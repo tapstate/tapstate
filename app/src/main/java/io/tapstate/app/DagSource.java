@@ -32,6 +32,19 @@ interface DagSource {
     DAG dagFor(String pipelineId);
 
     /**
+     * The topology to run for {@code pipelineId}, with every external effect in it held to {@code fence}'s
+     * run — so a member still carrying a piece of an earlier run stops writing rather than writing beside
+     * the current one.
+     *
+     * <p>Defaulted to the unfenced topology for the stand-ins a lifecycle test drives, whose topologies
+     * reach nothing outside the process and therefore have nothing to fence. The store-backed builder
+     * overrides it; a member of a cluster only ever reaches this one.
+     */
+    default DAG dagFor(String pipelineId, ExecutionFence fence) {
+        return dagFor(pipelineId);
+    }
+
+    /**
      * What {@code pipelineId}'s topology keeps state in — for each component that keeps any, what to call
      * it, whose it is, and the namespaces it is kept under. Empty where the pipeline keeps none.
      *

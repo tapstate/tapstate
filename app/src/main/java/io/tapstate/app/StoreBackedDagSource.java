@@ -172,6 +172,16 @@ final class StoreBackedDagSource implements DagSource {
 
     @Override
     public DAG dagFor(String pipelineId) {
+        return dagFor(pipelineId, null);
+    }
+
+    /**
+     * The topology, with every external effect in it held to {@code fence}'s run. A single-node run passes
+     * none: there is one member and one run of anything, so there is nothing for a second one to be held
+     * against.
+     */
+    @Override
+    public DAG dagFor(String pipelineId, ExecutionFence fence) {
         // Expanded before anything reads the blocks, so every later step - target resolution included -
         // sees one shape rather than having to know a reference from a body.
         PipelineResource pipeline = PipelineInlining.inline(
@@ -243,8 +253,8 @@ final class StoreBackedDagSource implements DagSource {
         return PipelineDagBuilder.build(
                 pipeline,
                 bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets,
-                        serveStreams, viewStreams, stepIds, frontier, compiledJoins),
-                sinkAckFactory(pipeline, pipelineId), frontier);
+                        serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
+                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId), fence), frontier);
     }
 
     /**
@@ -1151,17 +1161,20 @@ final class StoreBackedDagSource implements DagSource {
             Set<String> viewStreams,
             Set<String> stepIds,
             FrontierBinding frontier,
-            Map<String, CompiledJoin> compiledJoins) {
+            Map<String, CompiledJoin> compiledJoins,
+            ExecutionFence fence) {
         ChainAxes axes = frontier.axes();
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
-                element -> sinkWriter(pipeline, element, targets, serveStreams),
+                element -> FencedSinkWriterFactory.heldTo(
+                        sinkWriter(pipeline, element, targets, serveStreams), fence),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
-                view -> viewSink(pipeline, view, targets, viewStreams, sourceKeysById),
+                view -> FencedSinkWriterFactory.heldTo(
+                        viewSink(pipeline, view, targets, viewStreams, sourceKeysById), fence),
                 nestBinding(pipeline, sourceIdByTable(sourceVertices)),
                 joinBinding(compiledJoins));
     }

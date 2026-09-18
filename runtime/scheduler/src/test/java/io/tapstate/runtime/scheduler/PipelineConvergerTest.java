@@ -165,6 +165,51 @@ class PipelineConvergerTest {
     }
 
     @Test
+    @DisplayName("a dead job is not recorded as failed over a stop another writer has already landed")
+    void failedIsNotDrivenOverACompetingStop() {
+        // Two writers of one pipeline's actual state is what a handover looks like from in here: the
+        // member letting go of it is mid-pass while the member taking it over is already driving. This
+        // pass has read a dead job and concluded FAILED; by the time it writes, the pipeline has been
+        // stopped. Recording FAILED anyway states something nobody found -- and actuates a second stop
+        // for it -- before the next pass undoes it, which is a tick of a pipeline reading failed that no
+        // reader can tell from one that did.
+        state.create("p1", StateJson.of(RUNNING), T0);
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        actuator.failWith(new IllegalStateException("the job died"));
+        AtomicBoolean fired = new AtomicBoolean(false);
+        state.onBeforeSwap(() -> {
+            if (fired.compareAndSet(false, true)) {
+                state.applySwap("p1", 0L, StateJson.of(STOPPED), T0);
+            }
+        });
+
+        converger.converge("p1");
+
+        assertThat(state.read("p1").orElseThrow().stateJson())
+                .as("nobody failed this pipeline; it was stopped").isEqualTo(StateJson.of(STOPPED));
+        assertThat(actuator.calls())
+                .as("and the stop the other writer drove is not driven a second time").isEmpty();
+    }
+
+    @Test
+    @DisplayName("a run that reached the end of its source is not started again by the next pass")
+    void completedIsNotDraggedBackTowardARunningIntent() {
+        // Nobody writes an intent to say a bounded run has finished -- the desired state still says
+        // RUNNING, because that is what was asked for and it was carried out. So the pass that follows
+        // the completion is looking at a terminal actual state under a live intent, and driving it would
+        // start the whole run again, on that tick and on every tick after it.
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        converger.converge("p1");
+        converger.markCompleted("p1");
+        actuator.reset();
+
+        converger.converge("p1");
+
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+        assertThat(actuator.calls()).as("a completed run is over; it is not re-run").isEmpty();
+    }
+
+    @Test
     @DisplayName("markCompleted drives a running pipeline to the terminal COMPLETED state")
     void markCompletedDrivesToCompleted() {
         converge(RUNNING); // actual now RUNNING

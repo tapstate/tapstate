@@ -33,6 +33,17 @@ public enum EngineError implements TapstateErrorCode {
             Set.of("chain", "epoch", "seq")),
 
     /**
+     * A member was asked to act for a run it can no longer prove is the current one: {@code pipeline} is
+     * the pipeline whose run it was carrying. Either the pipeline changed hands, or a newer run of it was
+     * submitted, or this member could not reach the coordination store to check within its local window.
+     *
+     * <p>Not a defect and not the pipeline's fault — it is this member standing down. Refusing is the
+     * whole point: the batch that provoked it is not written, so nothing outside the cluster is touched
+     * twice by two runs of the same pipeline.
+     */
+    EXECUTION_NOT_AUTHORIZED("engine.execution-not-authorized", Set.of("pipeline")),
+
+    /**
      * A pipeline's data-plane job died on its own, for a reason the product had not already coded at its
      * throw site: {@code pipeline} is the pipeline whose run died and {@code cause} is what it died of.
      * A fault that does carry its own code keeps that code instead — this is the last resort, so that a

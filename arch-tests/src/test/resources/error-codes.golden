@@ -180,6 +180,7 @@ dsl.unwind-column-already-exists
 dsl.unwind-needs-an-element-key
 dsl.unwind-needs-an-upsert-target
 dsl.upsert-needs-key
+engine.execution-not-authorized
 engine.frontier-order-not-encodable
 engine.frontier-pinned
 engine.job-failed

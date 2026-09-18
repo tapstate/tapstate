@@ -141,7 +141,9 @@ class DataPlaneActuationConfiguration {
 
     @Bean
     LifecycleActuator lifecycleActuator(Engine engine, DagSource dagSource,
-            PipelineCaptureCoordinator pipelineCaptureCoordinator, NestStateTeardown nestStateTeardown) {
-        return new EngineLifecycleActuator(engine, dagSource, pipelineCaptureCoordinator, nestStateTeardown);
+            PipelineCaptureCoordinator pipelineCaptureCoordinator, NestStateTeardown nestStateTeardown,
+            PipelineActuationOwnership pipelineActuationOwnership) {
+        return new EngineLifecycleActuator(engine, dagSource, pipelineCaptureCoordinator, nestStateTeardown,
+                pipelineActuationOwnership);
     }
 }

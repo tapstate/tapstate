@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import com.hazelcast.jet.core.DAG;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
@@ -10,6 +11,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Binds the converge loop's lifecycle actuator seam to the Jet execution engine and the source-side capture
@@ -36,6 +39,8 @@ import java.util.Set;
  */
 final class EngineLifecycleActuator implements LifecycleActuator {
 
+    private static final Logger LOG = LoggerFactory.getLogger(EngineLifecycleActuator.class);
+
     /**
      * How long a stop waits for the job to actually be over before it gives up on letting go of that job's
      * state in the same breath. Long enough that an ordinary cancel finishes inside it, short enough that
@@ -48,13 +53,20 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final DagSource dagSource;
     private final PipelineCaptureCoordinator captureCoordinator;
     private final NestStateTeardown stateTeardown;
+    private final PipelineActuationOwnership actuation;
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown) {
+        this(engine, dagSource, captureCoordinator, stateTeardown, PipelineActuationOwnership.single());
+    }
+
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            NestStateTeardown stateTeardown, PipelineActuationOwnership actuation) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
         this.stateTeardown = Objects.requireNonNull(stateTeardown, "stateTeardown");
+        this.actuation = Objects.requireNonNull(actuation, "actuation");
     }
 
     @Override
@@ -62,6 +74,16 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
         dagSource.validateStart(pipelineId);
+        // The run's own generation, taken before the first side effect for the same reason: a run this
+        // member cannot fence is one nothing could later stop from writing, so it must not be half built.
+        // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any
+        // more (or cannot prove it is), and the member that is will put a run behind it.
+        PipelineActuationOwnership.Execution execution = actuation.beginExecution(pipelineId);
+        if (!execution.allowed()) {
+            LOG.warn("Not starting pipeline {} on this member: its run could not be fenced to a new "
+                    + "execution generation", pipelineId);
+            return;
+        }
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
         // what leaves a run that died without a stop with its state - and so with a shape to be held to.
@@ -75,8 +97,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
         DagSource.NestCapacity capacity = dagSource.capacityOf(pipelineId);
-        engine.submit(pipelineId, dagSource.dagFor(pipelineId),
-                capacity.mapNamespaces(), capacity.settings());
+        DAG dag = execution.fence() == null
+                ? dagSource.dagFor(pipelineId)
+                : dagSource.dagFor(pipelineId, execution.fence());
+        engine.submit(pipelineId, dag, capacity.mapNamespaces(), capacity.settings());
     }
 
     @Override
