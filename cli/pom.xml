@@ -110,12 +110,11 @@
       <artifactId>junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
-    <!-- REPL assertions verify the shared lifecycle vocabulary without bringing it into the CLI runtime. -->
+    <!-- The lifecycle vocabulary keeps stop and restart descriptions aligned with the server state model. -->
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>core-lifecycle</artifactId>
       <version>${revision}</version>
-      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.assertj</groupId>
@@ -196,6 +195,7 @@
                     <include>io.tapstate:core-dsl</include>
                     <include>io.tapstate:core-schema</include>
                     <include>io.tapstate:core-catalog</include>
+                    <include>io.tapstate:core-lifecycle</include>
                     <!-- the shared presentation catalog + renderer (zero third-party itself) -->
                     <include>io.tapstate:messages</include>
                     <include>io.tapstate:control-client</include>
