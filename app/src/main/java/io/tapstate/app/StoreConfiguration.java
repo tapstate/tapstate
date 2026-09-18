@@ -9,6 +9,7 @@ import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaimStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -75,6 +76,13 @@ class StoreConfiguration {
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
     SrsMetaStore srsMetaStore(StorePort storePort) {
         return storePort.meta();
+    }
+
+    /** The single cluster-ownership port consumed by node, pipeline, capture and recovery controllers. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    WorkloadClaimStore workloadClaimStore(StorePort storePort) {
+        return storePort.workloadClaims();
     }
 
     /**

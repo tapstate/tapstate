@@ -19,7 +19,37 @@ import java.util.Set;
 enum BootError implements TapstateErrorCode {
 
     /** The embedded Hazelcast member could not be started (e.g. its loopback port is in use). */
-    HAZELCAST_UNAVAILABLE("boot.hazelcast-unavailable", Set.of());
+    HAZELCAST_UNAVAILABLE("boot.hazelcast-unavailable", Set.of()),
+
+    /** The selected member-discovery mode is missing a required, deterministic input. */
+    DISCOVERY_CONFIG_INVALID("boot.discovery-config-invalid", Set.of("detail")),
+
+    /** Cluster mode was selected without the stable cluster id that names every coordination record. */
+    CLUSTER_ID_REQUIRED("boot.cluster-id-required", Set.of()),
+
+    /** The configured cluster id cannot be represented by the stable identity contract. */
+    CLUSTER_ID_INVALID("boot.cluster-id-invalid", Set.of()),
+
+    /** The configured cluster id disagrees with the identity already stored for this control store. */
+    CLUSTER_ID_MISMATCH("boot.cluster-id-mismatch", Set.of("configured", "stored")),
+
+    /** Cluster mode was selected without this member's stable node id. */
+    NODE_ID_REQUIRED("boot.node-id-required", Set.of()),
+
+    /** The advertised control endpoint is missing or is not an absolute HTTP(S) URL. */
+    CONTROL_ADVERTISE_URL_INVALID("boot.control-advertise-url-invalid", Set.of()),
+
+    /** A node-session lease with no positive lifetime could never protect a stable node id. */
+    NODE_SESSION_TTL_INVALID("boot.node-session-ttl-invalid", Set.of()),
+
+    /** Renewal must happen before the node-session lease expires. */
+    NODE_SESSION_RENEW_INTERVAL_INVALID("boot.node-session-renew-interval-invalid", Set.of()),
+
+    /** Cluster mode cannot reserve identities without the Mongo-backed coordination ports. */
+    COORDINATION_STORE_REQUIRED("boot.coordination-store-required", Set.of()),
+
+    /** Another live boot already holds this stable node id. */
+    NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId"));
 
     private final String code;
     private final Set<String> placeholders;

@@ -19,6 +19,7 @@ import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaimStore;
 
 import java.util.Objects;
 
@@ -45,6 +46,8 @@ public final class MongoStorePort implements StorePort {
     public static final String PIPELINE_DESIRED = "pipeline_desired";
     /** The collection holding one plain-upsert observation doc per pipeline. */
     public static final String PIPELINE_OBSERVATION = "pipeline_observation";
+    /** Cluster-scoped owner leases, one durable document per workload identity. */
+    public static final String WORKLOAD_CLAIMS = "workload_claims";
     /** The collection holding one editor-only canvas layout per pipeline. */
     public static final String PIPELINE_LAYOUTS = "pipeline_layouts";
     /** The collection holding the registered connection configurations. */
@@ -125,6 +128,7 @@ public final class MongoStorePort implements StorePort {
     private final ConnectionTestResultStore connectionTestResults;
     private final ObservationStore observations;
     private final PipelineLayoutStore layouts;
+    private final WorkloadClaimStore workloadClaims;
     private final SrsMetaStore meta;
     private final SrsLogStore srsLog;
     private final DerivedSchemaStore derivedSchemas;
@@ -152,6 +156,7 @@ public final class MongoStorePort implements StorePort {
                 new MongoConnectionTestResultStore(SystemCollections.CONNECTION_TEST_RESULTS.on(database));
         this.observations = new MongoObservationStore(SystemCollections.PIPELINE_OBSERVATION.on(database));
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
+        this.workloadClaims = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database));
         this.meta = new MongoSrsMetaStore(SystemCollections.SRS_META.on(database));
         this.srsLog = new MongoSrsLogStore(SystemCollections.SRS_LOG.on(database));
         this.derivedSchemas = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(database));
@@ -227,6 +232,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public SrsMetaStore meta() {
         return meta;
+    }
+
+    @Override
+    public WorkloadClaimStore workloadClaims() {
+        return workloadClaims;
     }
 
     @Override

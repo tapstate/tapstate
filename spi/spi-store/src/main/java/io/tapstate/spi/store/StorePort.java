@@ -48,6 +48,11 @@ public interface StorePort {
     /** The SRS meta store: one durable offset / consumer-cursor / schema record per mining chain. */
     SrsMetaStore meta();
 
+    /** Cluster-scoped owner leases for node sessions, pipeline actuation, capture and later operations. */
+    default WorkloadClaimStore workloadClaims() {
+        throw new UnsupportedOperationException("this store is not cluster-capable");
+    }
+
     /**
      * The SRS change log: every change that entered a chain's per-table ring, so the changes outlive the
      * process that read them and a ring can be rebuilt where it left off.

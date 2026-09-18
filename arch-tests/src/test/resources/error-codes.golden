@@ -33,7 +33,17 @@ artifact.pipeline-not-stopped
 artifact.precondition-required
 artifact.reclaim-incomplete
 artifact.version-conflict
+boot.cluster-id-invalid
+boot.cluster-id-mismatch
+boot.cluster-id-required
+boot.control-advertise-url-invalid
+boot.coordination-store-required
+boot.discovery-config-invalid
 boot.hazelcast-unavailable
+boot.node-id-in-use
+boot.node-id-required
+boot.node-session-renew-interval-invalid
+boot.node-session-ttl-invalid
 capture.event-table-not-selected
 capture.snapshot-reports-no-seam
 capture.start-from-outside-window

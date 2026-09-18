@@ -78,9 +78,39 @@ actuation.from-regex-invalid:
 actuation.from-regex-empty:
   message: "The pipeline `from` regex `{regex}` matches no upstream vertex."
   solution: "Use a regex matching a selected source table or an earlier transform step."
+boot.cluster-id-required:
+  message: "Cluster discovery requires an explicit stable cluster id."
+  solution: "Set tapstate.cluster.id to the same stable value on every member."
+boot.cluster-id-invalid:
+  message: "The configured cluster id is not a valid stable identity."
+  solution: "Use a non-blank cluster id that contains no colon."
+boot.cluster-id-mismatch:
+  message: "Configured cluster id `{configured}` does not match stored cluster id `{stored}`."
+  solution: "Point every member at the intended control store and configure its stored cluster id."
+boot.coordination-store-required:
+  message: "Cluster discovery requires the Mongo-backed coordination store."
+  solution: "Enable the Mongo store and configure it as a replica set before starting a cluster member."
+boot.control-advertise-url-invalid:
+  message: "Cluster discovery requires an absolute HTTP(S) control advertise URL."
+  solution: "Set tapstate.control.advertise-url to the URL other members and clients can reach."
+boot.discovery-config-invalid:
+  message: "The cluster discovery configuration is invalid: {detail}."
+  solution: "Choose one explicit discovery mode and provide all inputs required by that mode."
 boot.hazelcast-unavailable:
   message: "The embedded Hazelcast member could not start."
   solution: "Another process may already be using the member port on loopback; stop it or set a different port, then restart."
+boot.node-id-required:
+  message: "Cluster discovery requires an explicit stable node id."
+  solution: "Set tapstate.cluster.node-id to a value that remains stable across restarts and is unique in the cluster."
+boot.node-id-in-use:
+  message: "Stable node id `{nodeId}` is already held by another live process."
+  solution: "Use a unique node id or wait for the previous node-session lease to expire."
+boot.node-session-renew-interval-invalid:
+  message: "The node-session renewal interval must be positive and shorter than its lease lifetime."
+  solution: "Set tapstate.cluster.node-session-renew-interval below tapstate.cluster.node-session-ttl."
+boot.node-session-ttl-invalid:
+  message: "The node-session lease lifetime must be positive."
+  solution: "Set tapstate.cluster.node-session-ttl to a positive duration."
 capture.start-from-unparsable:
   message: "Cannot start consuming from `{value}`; expected `earliest`, `latest`, or an ISO-8601 timestamp."
   solution: "Set start_from to earliest, latest, or an ISO-8601 timestamp like 2026-07-11T00:00:00Z."

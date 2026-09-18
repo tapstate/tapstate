@@ -28,12 +28,18 @@ import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.net.ServerSocket;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -90,6 +96,70 @@ class HazelcastMemberTest {
         assertThat(config.getProperty("hazelcast.logging.type")).isEqualTo("slf4j");
         assertThat(config.getProperty("hazelcast.shutdownhook.enabled")).isEqualTo("false");
         assertThat(config.getProperty("hazelcast.phone.home.enabled")).isEqualTo("false");
+    }
+
+    @Test
+    void tcpIpModeEnablesOnlyTcpIpDiscoveryAndPinsTheConfiguredPort() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701",
+                "tapstate.hz.member-port", "5702"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+        JoinConfig join = config.getNetworkConfig().getJoin();
+
+        assertThat(join.getTcpIpConfig().isEnabled()).isTrue();
+        assertThat(join.getTcpIpConfig().getMembers()).containsExactly("127.0.0.1:5701");
+        assertThat(join.getAutoDetectionConfig().isEnabled()).isFalse();
+        assertThat(join.getMulticastConfig().isEnabled()).isFalse();
+        assertThat(join.getKubernetesConfig().isEnabled()).isFalse();
+        assertThat(config.getNetworkConfig().getPort()).isEqualTo(5702);
+        assertThat(config.getNetworkConfig().isPortAutoIncrement()).isFalse();
+    }
+
+    @Test
+    void kubernetesModePrefersHeadlessServiceDnsAndLeavesEveryOtherJoinPathOff() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "kubernetes",
+                "tapstate.hz.discovery.kubernetes.service-dns", "tapstate.default.svc.cluster.local"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+        JoinConfig join = config.getNetworkConfig().getJoin();
+
+        assertThat(join.getKubernetesConfig().isEnabled()).isTrue();
+        assertThat(join.getKubernetesConfig().getProperty("service-dns"))
+                .isEqualTo("tapstate.default.svc.cluster.local");
+        assertThat(join.getAutoDetectionConfig().isEnabled()).isFalse();
+        assertThat(join.getMulticastConfig().isEnabled()).isFalse();
+        assertThat(join.getTcpIpConfig().isEnabled()).isFalse();
+        assertThat(config.getNetworkConfig().isPortAutoIncrement()).isFalse();
+    }
+
+    @Test
+    void tcpIpDiscoveryFormsOneTwoMemberCluster() throws Exception {
+        int[] ports = twoFreePorts();
+        HazelcastProperties firstProperties = clusteredProperties(ports[0], ports[0]);
+        HazelcastProperties secondProperties = clusteredProperties(ports[1], ports[0]);
+        HazelcastInstance first = HazelcastConfiguration.startMember(
+                () -> com.hazelcast.core.Hazelcast.newHazelcastInstance(
+                        HazelcastConfiguration.memberConfig(firstProperties)));
+        HazelcastInstance second = HazelcastConfiguration.startMember(
+                () -> com.hazelcast.core.Hazelcast.newHazelcastInstance(
+                        HazelcastConfiguration.memberConfig(secondProperties)));
+        try {
+            awaitMembers(first, 2, Duration.ofSeconds(10));
+            assertThat(first.getCluster().getMembers()).hasSize(2);
+            assertThat(second.getCluster().getMembers()).hasSize(2);
+            assertThat(first.getCluster().getMembers().stream().map(member -> member.getAddress().toString()))
+                    .containsExactlyInAnyOrderElementsOf(
+                            second.getCluster().getMembers().stream()
+                                    .map(member -> member.getAddress().toString()).toList());
+        } finally {
+            second.shutdown();
+            first.shutdown();
+        }
     }
 
     @Test
@@ -445,6 +515,35 @@ class HazelcastMemberTest {
 
         assertThat(config.getMapConfigs().keySet())
                 .noneMatch(name -> name.startsWith(JoinMaps.NAMESPACE_PREFIX));
+    }
+
+    private static HazelcastProperties bind(Map<String, String> values) {
+        return new Binder(new MapConfigurationPropertySource(values))
+                .bind("tapstate.hz", Bindable.of(HazelcastProperties.class))
+                .orElseGet(HazelcastProperties::new);
+    }
+
+    private static HazelcastProperties clusteredProperties(int memberPort, int seedPort) {
+        HazelcastProperties properties = new HazelcastProperties();
+        properties.setClusterName("two-member-test");
+        properties.setMemberPort(memberPort);
+        properties.getDiscovery().setMode(HazelcastProperties.DiscoveryMode.TCP_IP);
+        properties.getDiscovery().getTcpIp().setSeeds(List.of("127.0.0.1:" + seedPort));
+        return properties;
+    }
+
+    private static int[] twoFreePorts() throws Exception {
+        try (ServerSocket first = new ServerSocket(0); ServerSocket second = new ServerSocket(0)) {
+            return new int[] {first.getLocalPort(), second.getLocalPort()};
+        }
+    }
+
+    private static void awaitMembers(HazelcastInstance member, int expected, Duration budget)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + budget.toNanos();
+        while (member.getCluster().getMembers().size() != expected && System.nanoTime() < deadline) {
+            Thread.sleep(25);
+        }
     }
 
     /** A sentinel meta store: an identity to assert the user-context binding; its facets are never invoked here. */

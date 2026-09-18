@@ -27,12 +27,16 @@ import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.store.WorkloadClaimStore;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.lang.Nullable;
 
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Supplier;
 
 /**
@@ -49,8 +53,10 @@ import java.util.function.Supplier;
  * widening the bind is a deliberate multi-node change.
  */
 @Configuration
-@EnableConfigurationProperties(HazelcastProperties.class)
+@EnableConfigurationProperties({HazelcastProperties.class, ClusterProperties.class, ControlEndpointProperties.class})
 class HazelcastConfiguration {
+
+    static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
 
     /**
      * The bounded capacity of each per-table SRS change ring. Headroom backpressure, not size, is the
@@ -60,12 +66,40 @@ class HazelcastConfiguration {
     private static final int SRS_RING_CAPACITY = 1024;
 
     @Bean(destroyMethod = "shutdown")
-    HazelcastInstance hazelcastMember(HazelcastProperties properties, @Nullable SrsMetaStore srsMetaStore,
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
+            ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
             @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
-            @Nullable NestDeadLetterStore nestDeadLetterStore, @Nullable SrsLogStore srsLogStore) {
+            @Nullable NestDeadLetterStore nestDeadLetterStore, @Nullable SrsLogStore srsLogStore,
+            ObjectProvider<ClusterIdentityStore> clusterIdentities,
+            ObjectProvider<WorkloadClaimStore> workloadClaims) {
+        ClusterMemberPreflight.Identity identity =
+                ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
+        WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
+        if (identity != null) {
+            identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
+                    clusterIdentities.getIfAvailable(), claimStore, UUID.randomUUID().toString());
+        }
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
-        HazelcastInstance member = startMember(() -> Hazelcast.newHazelcastInstance(config));
+        if (identity != null) {
+            config.setClusterName(identity.clusterId());
+        }
+        HazelcastInstance member;
+        try {
+            member = startMember(() -> Hazelcast.newHazelcastInstance(config));
+        } catch (RuntimeException startupFailure) {
+            if (identity != null && claimStore != null) {
+                claimStore.release(identity.nodeSession());
+            }
+            throw startupFailure;
+        }
+        if (identity != null) {
+            member.getUserContext().put("tapstate.cluster.id", identity.clusterId());
+            member.getUserContext().put("tapstate.cluster.node-id", identity.nodeId());
+            member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
+            member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
+            member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
+        }
         // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
         // Jet source and resolved member-side -- can reach it through the user context and publish durable
         // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
@@ -129,6 +163,58 @@ class HazelcastConfiguration {
             DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
         }
         return member;
+    }
+
+    /** Renews and releases the claim that was acquired before this member was created. */
+    @Bean(destroyMethod = "close")
+    NodeSessionLease nodeSessionLease(
+            HazelcastInstance member,
+            ClusterProperties clusterProperties,
+            ObjectProvider<WorkloadClaimStore> workloadClaims) {
+        Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);
+        if (!(stored instanceof io.tapstate.spi.store.WorkloadClaim claim)) {
+            return NodeSessionLease.inactive();
+        }
+        WorkloadClaimStore store = workloadClaims.getIfAvailable();
+        if (store == null) {
+            throw new IllegalStateException("cluster member started without its workload-claim store");
+        }
+        return new NodeSessionLease(store, claim, clusterProperties.getNodeSessionTtl(),
+                clusterProperties.getNodeSessionRenewInterval(), member::shutdown);
+    }
+
+    /** Test seam retaining the single-member call shape that predates cluster identity configuration. */
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, @Nullable SrsMetaStore srsMetaStore,
+            @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
+            @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
+            @Nullable NestDeadLetterStore nestDeadLetterStore, @Nullable SrsLogStore srsLogStore) {
+        return hazelcastMember(properties, new ClusterProperties(), new ControlEndpointProperties(),
+                srsMetaStore, connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings,
+                nestDeadLetterStore, srsLogStore, emptyProvider(), emptyProvider());
+    }
+
+    private static <T> ObjectProvider<T> emptyProvider() {
+        return new ObjectProvider<>() {
+            @Override
+            public T getObject(Object... args) {
+                throw new org.springframework.beans.factory.NoSuchBeanDefinitionException(Object.class);
+            }
+
+            @Override
+            public T getIfAvailable() {
+                return null;
+            }
+
+            @Override
+            public T getIfUnique() {
+                return null;
+            }
+
+            @Override
+            public T getObject() {
+                throw new org.springframework.beans.factory.NoSuchBeanDefinitionException(Object.class);
+            }
+        };
     }
 
     /**
@@ -252,6 +338,38 @@ class HazelcastConfiguration {
         join.getAutoDetectionConfig().setEnabled(false);
         join.getMulticastConfig().setEnabled(false);
         join.getTcpIpConfig().setEnabled(false);
+        join.getKubernetesConfig().setEnabled(false);
+        switch (properties.getDiscovery().getMode()) {
+            case NONE -> {
+                // The default path deliberately keeps every network value above byte-for-byte unchanged.
+            }
+            case TCP_IP -> {
+                if (properties.getDiscovery().getTcpIp().getSeeds().isEmpty()) {
+                    throw invalidDiscovery("tcp-ip requires at least one seed address");
+                }
+                config.getNetworkConfig().setPort(properties.getMemberPort()).setPortAutoIncrement(false);
+                join.getTcpIpConfig().setEnabled(true)
+                        .setMembers(properties.getDiscovery().getTcpIp().getSeeds());
+            }
+            case KUBERNETES -> {
+                HazelcastProperties.Kubernetes kubernetes = properties.getDiscovery().getKubernetes();
+                boolean hasDns = hasText(kubernetes.getServiceDns());
+                boolean hasApiService = hasText(kubernetes.getServiceName());
+                if (hasDns == hasApiService) {
+                    throw invalidDiscovery("kubernetes requires exactly one of service-dns or service-name");
+                }
+                config.getNetworkConfig().setPort(properties.getMemberPort()).setPortAutoIncrement(false);
+                join.getKubernetesConfig().setEnabled(true);
+                if (hasDns) {
+                    join.getKubernetesConfig().setProperty("service-dns", kubernetes.getServiceDns().trim());
+                } else {
+                    join.getKubernetesConfig().setProperty("service-name", kubernetes.getServiceName().trim());
+                    if (hasText(kubernetes.getNamespace())) {
+                        join.getKubernetesConfig().setProperty("namespace", kubernetes.getNamespace().trim());
+                    }
+                }
+            }
+        }
         config.getJetConfig().setEnabled(true);
         Integer cooperativeThreads = properties.getJet().getCooperativeThreadCount();
         if (cooperativeThreads != null) {
@@ -305,5 +423,13 @@ class HazelcastConfiguration {
         // there is nothing behind the pattern being shadowed yet - which is exactly the state the nest
         // maps were in until the day one was added.
         return config;
+    }
+
+    private static boolean hasText(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    private static TapstateException invalidDiscovery(String detail) {
+        return new TapstateException(BootError.DISCOVERY_CONFIG_INVALID, Map.of("detail", detail), null);
     }
 }
