@@ -12,8 +12,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * When a failed run may be replaced without anybody asking, driven through the real claim store and a
- * real membership change rather than a stubbed answer -- the question this decides is "did the cluster
- * move under this run", and a stub would be deciding it in the test instead of measuring it.
+ * real membership change rather than a stubbed answer -- the question this decides is "did a member
+ * this run was planned over go away", and a stub would be deciding it in the test instead of measuring
+ * it.
  */
 class ClusterRebuildAdmissionTest {
 
@@ -41,6 +42,34 @@ class ClusterRebuildAdmissionTest {
                 .as("the cluster is where it was when this run was fenced, so this death is the "
                         + "pipeline's own and stays recorded as one")
                 .isFalse();
+    }
+
+    @Test
+    void aRunAMemberJoinedUnderIsNotRebuilt() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a", "node-b", "node-c");
+
+        assertThat(admission.admits("orders"))
+                .as("a member joining takes nothing away from this run -- every member it was planned "
+                        + "over is still here -- so this death is the pipeline's own, and replacing the "
+                        + "run would restart a connector defect instead of recording it")
+                .isFalse();
+    }
+
+    @Test
+    void aMemberThatLeftAndCameBackBeforeAnybodyLookedStillCountsAsHavingLeft() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+
+        committed(8, "node-a");
+        ownership.permit("orders");
+        committed(9, "node-a", "node-b");
+
+        assertThat(admission.admits("orders"))
+                .as("the run died when that member went, and it stays dead now that it is back: asking "
+                        + "only who is here now cannot see an absence that is already over")
+                .isTrue();
     }
 
     @Test
@@ -79,22 +108,26 @@ class ClusterRebuildAdmissionTest {
     }
 
     @Test
-    void aRebuiltRunGivesTheBudgetBackByBeingFencedUnderTheClusterThatIsThereNow() {
-        committed(7, "node-a", "node-b");
+    void aRebuiltRunGivesTheBudgetBackByBeingPlannedOverTheClusterThatIsThereNow() {
+        committed(7, "node-a", "node-b", "node-c");
         submitRunUnder(7);
-        committed(8, "node-a");
+        committed(8, "node-a", "node-b");
         assertThat(admission.admits("orders")).isTrue();
 
-        // What a rebuild does: the holder takes the next execution generation, and it takes it under the
-        // membership committed now. Nothing has to clear the count -- the comparison stops being true.
+        // What a rebuild does: the holder takes the next execution generation, and the run it submits is
+        // planned over the members committed now. Nothing has to clear the count -- the member that was
+        // missing is not one of this run's, so the question stops answering yes.
         submitRunUnder(8);
 
         assertThat(admission.admits("orders")).isFalse();
 
+        // A second loss, out of the members this run does have. Written as a real one because the only
+        // membership a cluster ever commits is one whose node set differs from the last: a bare revision
+        // bump over the same members is not an input the membership controller can produce.
         committed(9, "node-a");
 
         assertThat(admission.admits("orders"))
-                .as("and the next change under it is a fresh budget, not the tail of the previous one")
+                .as("and the next loss under it is a fresh budget, not the tail of the previous one")
                 .isTrue();
     }
 

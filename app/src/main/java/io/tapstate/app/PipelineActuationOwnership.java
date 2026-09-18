@@ -11,9 +11,11 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.LongSupplier;
 
 /**
@@ -67,12 +69,19 @@ final class PipelineActuationOwnership {
         private long nextContactNanos;
         private boolean contacted;
         /**
-         * The committed topology revision the run this member last submitted was fenced under, or null
-         * while it has submitted none. Kept apart from the claim's own revision because that one moves
-         * forward the moment this member re-acquires under a changed cluster, which is exactly when the
-         * difference between the two becomes the thing worth knowing.
+         * The committed members the run this member last submitted was planned over, or null while it
+         * has submitted none. Kept apart from the claim, whose own revision moves forward the moment
+         * this member re-acquires under a changed cluster -- which is exactly when the difference
+         * between what the run was planned over and what is here now becomes the thing worth knowing.
          */
-        private Long runTopologyRevision;
+        private Set<String> runMembers;
+        /**
+         * Whether any of those members has been missing from the committed set at a moment this member
+         * looked. Remembered rather than recomputed, because a member that leaves and comes back is a
+         * member that left: the run it was carrying pieces of died either way, and by the time anybody
+         * asks, a comparison against the set committed now cannot see that it was ever gone.
+         */
+        private boolean lostAMember;
     }
 
     private PipelineActuationOwnership() {
@@ -130,6 +139,10 @@ final class PipelineActuationOwnership {
             return Permit.unfenced();
         }
         Held state = held.computeIfAbsent(pipelineId, id -> new Held());
+        // Every pass, not every round trip: this reads a local reference the membership reconciler
+        // publishes into, so it costs nothing, and the shorter the interval between looks the shorter
+        // the absence that can pass unseen between two of them.
+        observeMembership(state);
         long now = nanoTime.getAsLong();
         boolean due = !state.contacted || now - state.nextContactNanos >= 0;
         if (state.claim != null && !due) {
@@ -189,32 +202,77 @@ final class PipelineActuationOwnership {
             return Execution.refused();
         }
         state.claim = advanced.get();
-        state.runTopologyRevision = state.claim.topologyRevision();
+        // What this run is planned over. Null rather than empty when nothing is committed -- which the
+        // eligibility gate above makes unreachable -- because an empty set would read as "planned over
+        // nobody", and nobody can never go missing.
+        ClusterMembership planned = membership.committed();
+        state.runMembers = planned == null ? null : planned.activeNodeIds();
+        state.lostAMember = false;
         return new Execution(true, new ExecutionFence(
                 pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()));
     }
 
     /**
-     * Whether the cluster changed under the run this member last submitted for {@code pipelineId}.
+     * Whether a member the run this member last submitted for {@code pipelineId} was planned over has
+     * gone away since.
      *
      * <p>This is the product's own answer to "did a member leave", and it is its own rather than the
      * engine's for a measured reason: a run ended by a member leaving and a run ended by a connector
      * giving up reach this process as the same exception class with the same absent cause, differing
-     * only in text inside a message. The committed membership revision is a number this cluster keeps
-     * for itself, compared against the one the run was fenced under.
+     * only in text inside a message. The committed member set is one this cluster keeps for itself.
+     *
+     * <p>It asks who is <em>gone</em>, not whether the membership moved. A member joining moves the
+     * committed revision too, and it takes nothing away from a run already planned: treating that as a
+     * reason to replace the run would restart a connector defect that happened to die shortly after
+     * somebody started a new node.
      *
      * <p>False while this member has submitted no run, while nothing is committed, and on a single node
      * -- one member cannot lose a member, it can only be the one that went.
      */
-    boolean clusterChangedUnderTheRun(String pipelineId) {
+    boolean aMemberLeftUnderTheRun(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (!fenced) {
             return false;
         }
         Held state = held.get(pipelineId);
+        if (state == null) {
+            return false;
+        }
+        observeMembership(state);
+        return state.lostAMember;
+    }
+
+    /**
+     * What each committed member is to the run this member last submitted for {@code pipelineId} -- the
+     * ones it was planned over, and the ones that joined afterwards and are therefore carrying none of
+     * it. Empty when this member is driving no run of that pipeline, or when nothing is committed:
+     * those are "this member cannot say", which is not the same answer as "nobody is waiting".
+     */
+    Map<String, MemberRunState> runMembership(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Held state = fenced ? held.get(pipelineId) : null;
+        ClusterMembership current = fenced ? membership.committed() : null;
+        if (state == null || state.runMembers == null || current == null) {
+            return Map.of();
+        }
+        Map<String, MemberRunState> byNode = new LinkedHashMap<>();
+        for (String nodeId : current.activeNodeIds()) {
+            byNode.put(nodeId, state.runMembers.contains(nodeId)
+                    ? MemberRunState.PARTICIPATING
+                    : MemberRunState.AWAITING_REBALANCE);
+        }
+        return Map.copyOf(byNode);
+    }
+
+    /** Records an absence while it can still be seen; a member back before anybody asked still left. */
+    private void observeMembership(Held state) {
+        if (state.runMembers == null || state.lostAMember) {
+            return;
+        }
         ClusterMembership current = membership.committed();
-        return state != null && state.runTopologyRevision != null && current != null
-                && current.revision() != state.runTopologyRevision;
+        if (current != null && !current.activeNodeIds().containsAll(state.runMembers)) {
+            state.lostAMember = true;
+        }
     }
 
     /**
