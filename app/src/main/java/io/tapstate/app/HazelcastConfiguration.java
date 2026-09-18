@@ -3,9 +3,12 @@ package io.tapstate.app;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.JoinConfig;
+import com.hazelcast.config.MapConfig;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
+import com.hazelcast.config.SplitBrainProtectionConfig;
+import com.hazelcast.splitbrainprotection.SplitBrainProtectionOn;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
@@ -28,6 +31,7 @@ import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.store.ClusterMembershipStore;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -68,6 +72,11 @@ class HazelcastConfiguration {
      */
     private static final int SRS_RING_CAPACITY = 1024;
 
+    @Bean
+    ClusterMembershipGate clusterMembershipGate(ClusterProperties properties) {
+        return new ClusterMembershipGate(properties);
+    }
+
     @Bean(destroyMethod = "shutdown")
     HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
             ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
@@ -75,9 +84,11 @@ class HazelcastConfiguration {
             @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
             @Nullable NestDeadLetterStore nestDeadLetterStore, @Nullable SrsLogStore srsLogStore,
             ObjectProvider<ClusterIdentityStore> clusterIdentities,
-            ObjectProvider<WorkloadClaimStore> workloadClaims) {
+            ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ClusterMembershipGate membershipGate) {
         ClusterMemberPreflight.Identity identity =
                 ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
+        warnAboutClusterProfile(clusterProperties);
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
         if (identity != null) {
             identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
@@ -86,6 +97,13 @@ class HazelcastConfiguration {
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         if (identity != null) {
             config.setClusterName(identity.clusterId());
+            config.getMemberAttributeConfig()
+                    .setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, identity.nodeId())
+                    .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE,
+                            identity.nodeSession().owner().bootId())
+                    .setAttribute(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE,
+                            identity.controlUrl().toString());
+            configureClusterProtection(config, membershipGate);
         }
         HazelcastInstance member;
         try {
@@ -102,6 +120,9 @@ class HazelcastConfiguration {
             member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
             member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
             member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
+            member.getUserContext().put(
+                    io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
+                    ClusterMembershipGate.PROTECTION_NAME);
         }
         // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
         // Jet source and resolved member-side -- can reach it through the user context and publish durable
@@ -186,6 +207,24 @@ class HazelcastConfiguration {
                 clusterProperties.getNodeSessionRenewInterval(), member::shutdown);
     }
 
+    /** Keeps the local gate aligned with the majority-committed ACTIVE node set. */
+    @Bean(destroyMethod = "close")
+    ClusterMembershipController clusterMembershipController(
+            HazelcastInstance member,
+            ClusterProperties clusterProperties,
+            ClusterMembershipGate membershipGate,
+            ObjectProvider<ClusterMembershipStore> membershipStores) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return ClusterMembershipController.inactive();
+        }
+        ClusterMembershipStore store = membershipStores.getIfAvailable();
+        if (store == null) {
+            throw new IllegalStateException("cluster member started without its membership store");
+        }
+        return new ClusterMembershipController(clusterProperties.getId(), member, store, membershipGate,
+                clusterProperties.getMembershipReconcileInterval());
+    }
+
     /** Test seam retaining the single-member call shape that predates cluster identity configuration. */
     HazelcastInstance hazelcastMember(HazelcastProperties properties, @Nullable SrsMetaStore srsMetaStore,
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
@@ -193,7 +232,8 @@ class HazelcastConfiguration {
             @Nullable NestDeadLetterStore nestDeadLetterStore, @Nullable SrsLogStore srsLogStore) {
         return hazelcastMember(properties, new ClusterProperties(), new ControlEndpointProperties(),
                 srsMetaStore, connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings,
-                nestDeadLetterStore, srsLogStore, emptyProvider(), emptyProvider());
+                nestDeadLetterStore, srsLogStore, emptyProvider(), emptyProvider(),
+                new ClusterMembershipGate(new ClusterProperties()));
     }
 
     private static <T> ObjectProvider<T> emptyProvider() {
@@ -247,7 +287,7 @@ class HazelcastConfiguration {
         if (nestStateStore == null) {
             return;
         }
-        member.getConfig().addMapConfig(nestSettings.backedStateMaps());
+        member.getConfig().addMapConfig(protectIfCluster(member, nestSettings.backedStateMaps()));
     }
 
     /**
@@ -272,7 +312,8 @@ class HazelcastConfiguration {
         if (joinStateStore == null) {
             return;
         }
-        member.getConfig().addMapConfig(JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY));
+        member.getConfig().addMapConfig(protectIfCluster(
+                member, JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY)));
     }
 
     /**
@@ -333,6 +374,10 @@ class HazelcastConfiguration {
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
         // An embedded member of a server product must not report usage data anywhere.
         config.setProperty("hazelcast.phone.home.enabled", "false");
+        config.setProperty("hazelcast.heartbeat.interval.seconds",
+                Long.toString(properties.getHeartbeatInterval().toSeconds()));
+        config.setProperty("hazelcast.max.no.heartbeat.seconds",
+                Long.toString(properties.getMaximumNoHeartbeat().toSeconds()));
         // Loopback-only listen socket: the member port also serves the unauthenticated client
         // protocol, so a single local member must not expose it on a LAN interface.
         config.setProperty("hazelcast.socket.bind.any", "false");
@@ -430,6 +475,32 @@ class HazelcastConfiguration {
         // under the same rule, by makeJoinCapable. Join state carries no per-namespace budget today, so
         // there is nothing behind the pattern being shadowed yet - which is exactly the state the nest
         // maps were in until the day one was added.
+        return config;
+    }
+
+    private static void configureClusterProtection(Config config, ClusterMembershipGate gate) {
+        config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(
+                ClusterMembershipGate.PROTECTION_NAME, true)
+                .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
+                .setFunctionImplementation(gate));
+        config.getRingbufferConfigs().values().forEach(ring ->
+                ring.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME));
+        config.getMapConfigs().values().forEach(map ->
+                map.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME));
+    }
+
+    static void warnAboutClusterProfile(ClusterProperties properties) {
+        if (properties.getProfile() == ClusterProperties.Profile.PROCESS_FAILURE_ONLY) {
+            LOG.warn("Cluster profile process-failure-only supports process-loss recovery but does not provide "
+                    + "network-partition safety. Use production-ha with at least three members for HA.");
+        }
+    }
+
+    private static MapConfig protectIfCluster(HazelcastInstance member, MapConfig config) {
+        if (member.getConfig().getSplitBrainProtectionConfigs()
+                .containsKey(ClusterMembershipGate.PROTECTION_NAME)) {
+            config.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME);
+        }
         return config;
     }
 

@@ -4,6 +4,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.time.Duration;
 
 /**
  * Settings for the embedded Hazelcast member ({@code tapstate.hz.*}). Follows the configuration
@@ -15,6 +16,8 @@ class HazelcastProperties {
     private String clusterName = "tapstate";
     private int memberPort = 5701;
     private String bindAddress = "127.0.0.1";
+    private Duration heartbeatInterval = Duration.ofSeconds(5);
+    private Duration maximumNoHeartbeat = Duration.ofSeconds(30);
     private final Discovery discovery = new Discovery();
     private final Jet jet = new Jet();
 
@@ -40,6 +43,22 @@ class HazelcastProperties {
 
     void setBindAddress(String bindAddress) {
         this.bindAddress = bindAddress;
+    }
+
+    Duration getHeartbeatInterval() {
+        return heartbeatInterval;
+    }
+
+    void setHeartbeatInterval(Duration heartbeatInterval) {
+        this.heartbeatInterval = heartbeatInterval;
+    }
+
+    Duration getMaximumNoHeartbeat() {
+        return maximumNoHeartbeat;
+    }
+
+    void setMaximumNoHeartbeat(Duration maximumNoHeartbeat) {
+        this.maximumNoHeartbeat = maximumNoHeartbeat;
     }
 
     Discovery getDiscovery() {

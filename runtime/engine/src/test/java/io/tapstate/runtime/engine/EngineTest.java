@@ -267,6 +267,8 @@ class EngineTest {
 
         assertThat(member.getJet().getJob("orders-pipe").getConfig().getProcessingGuarantee())
                 .isEqualTo(com.hazelcast.jet.config.ProcessingGuarantee.NONE);
+        assertThat(member.getJet().getJob("orders-pipe").getConfig().isSplitBrainProtectionEnabled())
+                .isTrue();
     }
 
     @Test

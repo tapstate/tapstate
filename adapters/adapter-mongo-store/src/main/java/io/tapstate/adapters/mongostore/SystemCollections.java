@@ -50,6 +50,9 @@ public enum SystemCollections {
     WORKLOAD_CLAIMS(
             MongoStorePort.WORKLOAD_CLAIMS, Database.STORE, MongoWorkloadClaimStore.class,
             Strategy.OWNED_ELSEWHERE, 0),
+    CLUSTER_MEMBERSHIP(
+            MongoStorePort.CLUSTER_MEMBERSHIP, Database.STORE, MongoClusterMembershipStore.class,
+            Strategy.OWNED_ELSEWHERE, 0),
     CONNECTIONS(MongoStorePort.CONNECTIONS, Database.STORE, MongoCatalogStore.class, Strategy.MIGRATED, 0),
     SOURCE_SCHEMAS(MongoStorePort.SOURCE_SCHEMAS, Database.STORE, MongoSchemaStore.class, Strategy.MIGRATED, 0),
     CONNECTOR_CATALOG(

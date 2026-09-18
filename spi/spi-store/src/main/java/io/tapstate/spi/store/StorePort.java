@@ -53,6 +53,11 @@ public interface StorePort {
         throw new UnsupportedOperationException("this store is not cluster-capable");
     }
 
+    /** The majority-committed ACTIVE membership and monotonic topology revision. */
+    default ClusterMembershipStore clusterMembership() {
+        throw new UnsupportedOperationException("this store is not cluster-capable");
+    }
+
     /**
      * The SRS change log: every change that entered a chain's per-table ring, so the changes outlive the
      * process that read them and a ring can be rebuilt where it left off.

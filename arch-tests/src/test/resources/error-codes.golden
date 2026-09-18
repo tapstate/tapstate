@@ -36,10 +36,12 @@ artifact.version-conflict
 boot.cluster-id-invalid
 boot.cluster-id-mismatch
 boot.cluster-id-required
+boot.cluster-profile-invalid
 boot.control-advertise-url-invalid
 boot.coordination-store-required
 boot.discovery-config-invalid
 boot.hazelcast-unavailable
+boot.heartbeat-config-invalid
 boot.member-bind-address-invalid
 boot.node-id-in-use
 boot.node-id-required

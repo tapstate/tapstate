@@ -87,6 +87,9 @@ boot.cluster-id-invalid:
 boot.cluster-id-mismatch:
   message: "Configured cluster id `{configured}` does not match stored cluster id `{stored}`."
   solution: "Point every member at the intended control store and configure its stored cluster id."
+boot.cluster-profile-invalid:
+  message: "The selected cluster profile and bootstrap member count are not a supported combination."
+  solution: "Use single with discovery none, process-failure-only with 2 members, or production-ha with at least 3 members."
 boot.coordination-store-required:
   message: "Cluster discovery requires the Mongo-backed coordination store."
   solution: "Enable the Mongo store and configure it as a replica set before starting a cluster member."
@@ -99,6 +102,9 @@ boot.discovery-config-invalid:
 boot.hazelcast-unavailable:
   message: "The embedded Hazelcast member could not start."
   solution: "Another process may already be using the member port on loopback; stop it or set a different port, then restart."
+boot.heartbeat-config-invalid:
+  message: "The member heartbeat settings cannot detect failure safely."
+  solution: "Use whole-second positive durations and set maximum-no-heartbeat longer than heartbeat-interval."
 boot.member-bind-address-invalid:
   message: "The Hazelcast member bind address is not valid for the selected discovery mode."
   solution: "Keep loopback with discovery mode none, or choose an explicit routable interface for cluster mode."

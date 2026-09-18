@@ -24,7 +24,10 @@ class HazelcastStartupTest {
             .withPropertyValues(
                     "tapstate.hz.discovery.mode=tcp-ip",
                     "tapstate.hz.discovery.tcp-ip.seeds[0]=127.0.0.1:5781",
-                    "tapstate.hz.member-port=5781");
+                    "tapstate.hz.member-port=5781",
+                    "tapstate.hz.bind-address=10.20.0.11",
+                    "tapstate.cluster.profile=process-failure-only",
+                    "tapstate.cluster.bootstrap-min-members=2");
 
     @Test
     void clusterDiscoveryCannotStartWithoutStableIdentity() {

@@ -4,6 +4,7 @@ import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.CatalogStore;
+import io.tapstate.spi.store.ClusterMembershipStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.ConnectorCatalogStore;
@@ -24,7 +25,7 @@ import io.tapstate.spi.store.WorkloadClaimStore;
 import java.util.Objects;
 
 /**
- * The MongoDB implementation of the persistence port: it aggregates fourteen sub-stores — the artifact
+ * The MongoDB implementation of the persistence port: it aggregates the product sub-stores — the artifact
  * truth layer, the epoch-fencing pipeline state store, the plain-upsert pipeline desired-state store,
  * the connection catalog, the discovered source-schema store, the connector distribution registry, the
  * derived connector catalog rows, the latest connection-test result per connection, the plain-upsert
@@ -48,6 +49,8 @@ public final class MongoStorePort implements StorePort {
     public static final String PIPELINE_OBSERVATION = "pipeline_observation";
     /** Cluster-scoped owner leases, one durable document per workload identity. */
     public static final String WORKLOAD_CLAIMS = "workload_claims";
+    /** The last majority-committed ACTIVE node set per cluster. */
+    public static final String CLUSTER_MEMBERSHIP = "cluster_membership";
     /** The collection holding one editor-only canvas layout per pipeline. */
     public static final String PIPELINE_LAYOUTS = "pipeline_layouts";
     /** The collection holding the registered connection configurations. */
@@ -129,6 +132,7 @@ public final class MongoStorePort implements StorePort {
     private final ObservationStore observations;
     private final PipelineLayoutStore layouts;
     private final WorkloadClaimStore workloadClaims;
+    private final ClusterMembershipStore clusterMembership;
     private final SrsMetaStore meta;
     private final SrsLogStore srsLog;
     private final DerivedSchemaStore derivedSchemas;
@@ -157,6 +161,8 @@ public final class MongoStorePort implements StorePort {
         this.observations = new MongoObservationStore(SystemCollections.PIPELINE_OBSERVATION.on(database));
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
         this.workloadClaims = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database));
+        this.clusterMembership =
+                new MongoClusterMembershipStore(SystemCollections.CLUSTER_MEMBERSHIP.on(database));
         this.meta = new MongoSrsMetaStore(SystemCollections.SRS_META.on(database));
         this.srsLog = new MongoSrsLogStore(SystemCollections.SRS_LOG.on(database));
         this.derivedSchemas = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(database));
@@ -237,6 +243,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public WorkloadClaimStore workloadClaims() {
         return workloadClaims;
+    }
+
+    @Override
+    public ClusterMembershipStore clusterMembership() {
+        return clusterMembership;
     }
 
     @Override

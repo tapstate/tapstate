@@ -65,6 +65,48 @@ class ClusterMemberPreflightTest {
                 coded -> assertThat(coded.code()).isEqualTo(BootError.CONTROL_ADVERTISE_URL_INVALID));
     }
 
+    @Test
+    void productionHaRequiresAtLeastThreeBootstrapMembers() {
+        ClusterProperties cluster = cluster("cluster-a", "node-a");
+        cluster.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+
+        Throwable invalid = catchThrowable(() -> ClusterMemberPreflight.validate(
+                clusteredHazelcast(), cluster, control("https://node-a.internal:8080")));
+
+        assertThat(invalid).isInstanceOfSatisfying(TapstateException.class,
+                coded -> assertThat(coded.code()).isEqualTo(BootError.CLUSTER_PROFILE_INVALID));
+
+        cluster.setBootstrapMinMembers(3);
+        assertThat(ClusterMemberPreflight.validate(
+                clusteredHazelcast(), cluster, control("https://node-a.internal:8080")))
+                .isNotNull();
+    }
+
+    @Test
+    void processFailureOnlyNamesAnExactTwoMemberProfile() {
+        ClusterProperties cluster = cluster("cluster-a", "node-a");
+        cluster.setBootstrapMinMembers(3);
+
+        Throwable invalid = catchThrowable(() -> ClusterMemberPreflight.validate(
+                clusteredHazelcast(), cluster, control("https://node-a.internal:8080")));
+
+        assertThat(invalid).isInstanceOfSatisfying(TapstateException.class,
+                coded -> assertThat(coded.code()).isEqualTo(BootError.CLUSTER_PROFILE_INVALID));
+    }
+
+    @Test
+    void heartbeatDetectionWindowMustBeLongerThanItsPositiveInterval() {
+        HazelcastProperties hazelcast = clusteredHazelcast();
+        hazelcast.setHeartbeatInterval(Duration.ofSeconds(5));
+        hazelcast.setMaximumNoHeartbeat(Duration.ofSeconds(5));
+
+        Throwable invalid = catchThrowable(() -> ClusterMemberPreflight.validate(
+                hazelcast, cluster("cluster-a", "node-a"), control("https://node-a.internal:8080")));
+
+        assertThat(invalid).isInstanceOfSatisfying(TapstateException.class,
+                coded -> assertThat(coded.code()).isEqualTo(BootError.HEARTBEAT_CONFIG_INVALID));
+    }
+
     private static HazelcastProperties clusteredHazelcast() {
         HazelcastProperties properties = new HazelcastProperties();
         properties.getDiscovery().setMode(HazelcastProperties.DiscoveryMode.TCP_IP);
@@ -77,6 +119,8 @@ class ClusterMemberPreflightTest {
         ClusterProperties properties = new ClusterProperties();
         properties.setId(clusterId);
         properties.setNodeId(nodeId);
+        properties.setProfile(ClusterProperties.Profile.PROCESS_FAILURE_ONLY);
+        properties.setBootstrapMinMembers(2);
         return properties;
     }
 

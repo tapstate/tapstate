@@ -59,6 +59,20 @@ class HazelcastExposureWarningTest {
         assertThat(written.list).isEmpty();
     }
 
+    @Test
+    void processFailureOnlyWarnsThatItIsNotNetworkPartitionSafe() {
+        ClusterProperties properties = new ClusterProperties();
+        properties.setProfile(ClusterProperties.Profile.PROCESS_FAILURE_ONLY);
+
+        HazelcastConfiguration.warnAboutClusterProfile(properties);
+
+        assertThat(written.list).singleElement().satisfies(event ->
+                assertThat(event.getFormattedMessage())
+                        .contains("process-failure-only")
+                        .contains("does not provide network-partition safety")
+                        .contains("production-ha"));
+    }
+
     private static HazelcastProperties bind(Map<String, String> values) {
         return new Binder(new MapConfigurationPropertySource(values))
                 .bind("tapstate.hz", Bindable.of(HazelcastProperties.class))

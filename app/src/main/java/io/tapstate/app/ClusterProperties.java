@@ -8,10 +8,19 @@ import java.time.Duration;
 @ConfigurationProperties(prefix = "tapstate.cluster")
 class ClusterProperties {
 
+    enum Profile {
+        SINGLE,
+        PROCESS_FAILURE_ONLY,
+        PRODUCTION_HA
+    }
+
     private String id;
     private String nodeId;
+    private Profile profile = Profile.SINGLE;
+    private int bootstrapMinMembers = 3;
     private Duration nodeSessionTtl = Duration.ofSeconds(30);
     private Duration nodeSessionRenewInterval = Duration.ofSeconds(10);
+    private Duration membershipReconcileInterval = Duration.ofSeconds(1);
 
     String getId() {
         return id;
@@ -29,6 +38,22 @@ class ClusterProperties {
         this.nodeId = nodeId;
     }
 
+    Profile getProfile() {
+        return profile;
+    }
+
+    void setProfile(Profile profile) {
+        this.profile = profile;
+    }
+
+    int getBootstrapMinMembers() {
+        return bootstrapMinMembers;
+    }
+
+    void setBootstrapMinMembers(int bootstrapMinMembers) {
+        this.bootstrapMinMembers = bootstrapMinMembers;
+    }
+
     Duration getNodeSessionTtl() {
         return nodeSessionTtl;
     }
@@ -43,5 +68,13 @@ class ClusterProperties {
 
     void setNodeSessionRenewInterval(Duration nodeSessionRenewInterval) {
         this.nodeSessionRenewInterval = nodeSessionRenewInterval;
+    }
+
+    Duration getMembershipReconcileInterval() {
+        return membershipReconcileInterval;
+    }
+
+    void setMembershipReconcileInterval(Duration membershipReconcileInterval) {
+        this.membershipReconcileInterval = membershipReconcileInterval;
     }
 }

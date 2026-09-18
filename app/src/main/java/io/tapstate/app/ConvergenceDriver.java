@@ -9,6 +9,7 @@ import io.tapstate.spi.store.DesiredStore;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -29,6 +30,7 @@ final class ConvergenceDriver {
     private final PipelineConverger converger;
     private final DesiredStore desired;
     private final ObservationPublisher publisher;
+    private final BooleanSupplier businessEligible;
 
     // Consecutive failed-reconcile passes per pipeline, so a pipeline that keeps throwing surfaces as a
     // climbing errorCount rather than an empty read face. Reconcile runs on a single scheduler thread with a
@@ -36,13 +38,22 @@ final class ConvergenceDriver {
     private final Map<String, Long> reconcileFailures = new HashMap<>();
 
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher) {
+        this(converger, desired, publisher, () -> true);
+    }
+
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            BooleanSupplier businessEligible) {
         this.converger = converger;
         this.desired = desired;
         this.publisher = publisher;
+        this.businessEligible = businessEligible;
     }
 
     @Scheduled(fixedDelayString = "${tapstate.converge.interval-ms:1000}")
     void reconcile() {
+        if (!businessEligible.getAsBoolean()) {
+            return;
+        }
         List<String> pipelineIds = desired.pipelineIds();
         for (String pipelineId : pipelineIds) {
             // Attribute every line logged while reconciling this pipeline to it, so the logs read face can

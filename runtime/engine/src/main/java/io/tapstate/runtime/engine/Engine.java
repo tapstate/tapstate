@@ -94,7 +94,8 @@ public final class Engine {
         JobFailureRegistry.of(member).clear(pipelineId);
         JobConfig config = new JobConfig()
                 .setName(pipelineId)
-                .setProcessingGuarantee(ProcessingGuarantee.NONE);
+                .setProcessingGuarantee(ProcessingGuarantee.NONE)
+                .setSplitBrainProtection(true);
         member.getJet().newJobIfAbsent(dag, config);
     }
 

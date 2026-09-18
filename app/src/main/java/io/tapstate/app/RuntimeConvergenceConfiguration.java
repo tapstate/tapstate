@@ -70,7 +70,9 @@ class RuntimeConvergenceConfiguration {
 
     @Bean
     ConvergenceDriver convergenceDriver(
-            PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher) {
-        return new ConvergenceDriver(pipelineConverger, storePort.desired(), observationPublisher);
+            PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
+            ClusterMembershipGate membershipGate) {
+        return new ConvergenceDriver(
+                pipelineConverger, storePort.desired(), observationPublisher, membershipGate::businessEligible);
     }
 }

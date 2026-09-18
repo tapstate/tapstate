@@ -96,6 +96,8 @@ class HazelcastMemberTest {
         assertThat(config.getProperty("hazelcast.logging.type")).isEqualTo("slf4j");
         assertThat(config.getProperty("hazelcast.shutdownhook.enabled")).isEqualTo("false");
         assertThat(config.getProperty("hazelcast.phone.home.enabled")).isEqualTo("false");
+        assertThat(config.getProperty("hazelcast.heartbeat.interval.seconds")).isEqualTo("5");
+        assertThat(config.getProperty("hazelcast.max.no.heartbeat.seconds")).isEqualTo("30");
     }
 
     @Test

@@ -10,6 +10,7 @@ import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaimStore;
+import io.tapstate.spi.store.ClusterMembershipStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -83,6 +84,21 @@ class StoreConfiguration {
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
     WorkloadClaimStore workloadClaimStore(StorePort storePort) {
         return storePort.workloadClaims();
+    }
+
+    /** The last ACTIVE membership committed by the prior majority. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    ClusterMembershipStore clusterMembershipStore(StorePort storePort) {
+        return storePort.clusterMembership();
+    }
+
+    /** Business claims gated by the same committed-membership predicate as the Hazelcast data plane. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    ClusterWorkloadClaims clusterWorkloadClaims(
+            WorkloadClaimStore workloadClaimStore, ClusterMembershipGate membershipGate) {
+        return new ClusterWorkloadClaims(workloadClaimStore, membershipGate);
     }
 
     /**

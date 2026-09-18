@@ -21,15 +21,27 @@ final class ClusterMemberPreflight {
 
     static Identity validate(
             HazelcastProperties hazelcast, ClusterProperties cluster, ControlEndpointProperties control) {
+        validateHeartbeat(hazelcast);
         String bindAddress = hazelcast.getBindAddress();
         if (hazelcast.getDiscovery().getMode() == HazelcastProperties.DiscoveryMode.NONE) {
             if (!loopback(bindAddress)) {
                 throw new TapstateException(BootError.MEMBER_BIND_ADDRESS_INVALID, Map.of(), null);
             }
+            if (cluster.getProfile() != ClusterProperties.Profile.SINGLE) {
+                throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
+            }
             return null;
         }
         if (loopback(bindAddress) || unspecified(bindAddress)) {
             throw new TapstateException(BootError.MEMBER_BIND_ADDRESS_INVALID, Map.of(), null);
+        }
+        if (cluster.getProfile() == null
+                || cluster.getProfile() == ClusterProperties.Profile.SINGLE
+                || cluster.getProfile() == ClusterProperties.Profile.PRODUCTION_HA
+                        && cluster.getBootstrapMinMembers() < 3
+                || cluster.getProfile() == ClusterProperties.Profile.PROCESS_FAILURE_ONLY
+                        && cluster.getBootstrapMinMembers() != 2) {
+            throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
         }
         String clusterId = required(cluster.getId(), BootError.CLUSTER_ID_REQUIRED);
         try {
@@ -62,7 +74,22 @@ final class ClusterMemberPreflight {
                 || cluster.getNodeSessionRenewInterval().compareTo(cluster.getNodeSessionTtl()) >= 0) {
             throw new TapstateException(BootError.NODE_SESSION_RENEW_INTERVAL_INVALID, Map.of(), null);
         }
+        if (cluster.getMembershipReconcileInterval() == null
+                || cluster.getMembershipReconcileInterval().isNegative()
+                || cluster.getMembershipReconcileInterval().isZero()) {
+            throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
+        }
         return new Identity(clusterId, nodeId, controlUrl);
+    }
+
+    private static void validateHeartbeat(HazelcastProperties hazelcast) {
+        if (hazelcast.getHeartbeatInterval() == null
+                || hazelcast.getHeartbeatInterval().toSeconds() < 1
+                || hazelcast.getMaximumNoHeartbeat() == null
+                || hazelcast.getMaximumNoHeartbeat().toSeconds() < 1
+                || hazelcast.getMaximumNoHeartbeat().compareTo(hazelcast.getHeartbeatInterval()) <= 0) {
+            throw new TapstateException(BootError.HEARTBEAT_CONFIG_INVALID, Map.of(), null);
+        }
     }
 
     static Identity reserve(

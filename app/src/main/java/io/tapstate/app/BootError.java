@@ -33,6 +33,12 @@ enum BootError implements TapstateErrorCode {
     /** The configured cluster id disagrees with the identity already stored for this control store. */
     CLUSTER_ID_MISMATCH("boot.cluster-id-mismatch", Set.of("configured", "stored")),
 
+    /** The selected cluster profile and bootstrap member count cannot provide its promised safety. */
+    CLUSTER_PROFILE_INVALID("boot.cluster-profile-invalid", Set.of()),
+
+    /** Member heartbeats require positive whole-second values and a longer failure-detection window. */
+    HEARTBEAT_CONFIG_INVALID("boot.heartbeat-config-invalid", Set.of()),
+
     /** Cluster mode was selected without this member's stable node id. */
     NODE_ID_REQUIRED("boot.node-id-required", Set.of()),
 
