@@ -69,7 +69,11 @@ class RateIsUnknownUntilThereAreTwoSamplesIT {
                         .isLessThan(moved.indexOf(positiveRate(moved)));
             }
 
-            CliOnce.Run status = CliOnce.runSession(PASSWORD, "status " + pipelineId + "\nexit\n",
+            // Asked for, because this session's output is a pipe rather than a terminal: the second
+            // reading a rate is made of costs a wait, and a verb people run in a loop does not spend it
+            // unless somebody is looking or somebody asks. Both halves are witnessed here, since a flag
+            // nobody exercises is a flag that stops working.
+            CliOnce.Run status = CliOnce.runSession(PASSWORD, "status " + pipelineId + " --rate\nexit\n",
                     "-c", server.baseUrl().toString(), "-u", USER);
             assertThat(status.exitCode())
                     .as("the session must have run; stdout was:%n%s%nstderr was:%n%s", status.stdout(), status.stderr())
@@ -78,9 +82,20 @@ class RateIsUnknownUntilThereAreTwoSamplesIT {
             status.stdout().lines().filter(line -> line.startsWith("moving") || line.startsWith("lag"))
                     .forEach(line -> System.out.println("one-shot status said: " + line));
             assertThat(status.stdout())
-                    .as("a one-shot status takes its second reading itself and answers with a number")
+                    .as("a one-shot status asked for a rate takes its second reading itself")
                     .containsPattern("moving     .*\\bout \\d+\\.\\d rows/s \\(over \\d+\\.\\ds of the pipeline's own time\\)")
                     .contains("lag        ");
+
+            CliOnce.Run plain = CliOnce.runSession(PASSWORD, "status " + pipelineId + "\nexit\n",
+                    "-c", server.baseUrl().toString(), "-u", USER);
+            assertThat(plain.exitCode()).isZero();
+            plain.stdout().lines().filter(line -> line.startsWith("moving"))
+                    .forEach(line -> System.out.println("one-shot status without --rate said: " + line));
+            assertThat(plain.stdout())
+                    .as("without a terminal and without the flag it answers at once, and says how to ask")
+                    .contains("moving     not known -- one reading")
+                    .contains("--rate")
+                    .doesNotContain("rows/s");
         }
     }
 

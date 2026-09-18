@@ -626,7 +626,10 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   observation; while there is only one reading it says `not known`, not `0`, because a pipeline
   observed once and a pipeline that moved nothing call for different next steps. `lag` is how far
   behind each table stands. `status --watch` prints a `moving` line every five seconds beside the
-  state changes it streams, the first of which is `not known yet` for the same reason.
+  state changes it streams, the first of which is `not known yet` for the same reason. A rate needs two
+  readings, so `status` waits about a second for the second one when you are at a terminal; run from a
+  script it answers at once and says the rate is not known, unless you ask for it with `status <id>
+  --rate`.
 - `metrics` is the signal for progress: `records.out` climbing and no `errors.<code>` key appearing.
 - **The same facts can go to your monitoring.** Export is off unless you turn it on, and turning it on
   changes nothing the CLI reads. To serve a Prometheus scrape endpoint, start the server with

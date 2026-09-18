@@ -823,6 +823,13 @@ final class Repl {
         if (words.get(0).equals("derived-schema")) {
             return derivedSchemaOnline(words);
         }
+        // `status` carries `--rate`: wait for the second reading a rate is made of, which it does by
+        // default only at a terminal. It parses its own words for the reason `derived-schema` does -- the
+        // guard below would refuse the flag and leave the verb answering without it while reporting
+        // success.
+        if (words.get(0).equals("status")) {
+            return statusOnline(words);
+        }
         // The other connected verbs take positional operands only; a dash-option (e.g. `-o json`) is not yet
         // supported and must not be silently misread as an id / kind / path.
         for (int i = 1; i < words.size(); i++) {
@@ -3246,10 +3253,11 @@ final class Repl {
      * working.
      */
     private int statusOnline(List<String> words) {
-        String id = readTargetId(words);
+        String id = streamTargetId(words, "--rate");
         if (id == null) {
             return Cli.EXIT_USAGE;
         }
+        boolean waitForRate = words.contains("--rate");
         StatusOutcome outcome = readStatus(id);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
@@ -3261,7 +3269,7 @@ final class Repl {
                     // coded refusal on stderr.
                     renderStatusFailure(found.failureCode(), found.failureMessage());
                 }
-                renderDiagnosis(out, id, found);
+                renderDiagnosis(out, id, found, waitForRate);
                 out.flush();
                 yield Cli.EXIT_OK;
             }
@@ -4612,7 +4620,7 @@ final class Repl {
      * publisher has gone silent is the clearest case of that: every other face would be re-reading the same
      * old observation, so asking them costs two round trips to learn nothing.
      */
-    private void renderDiagnosis(PrintWriter out, String id, StatusOutcome.Found found) {
+    private void renderDiagnosis(PrintWriter out, String id, StatusOutcome.Found found, boolean waitForRate) {
         Optional<StatusDiagnosis.Answer> early = StatusDiagnosis
                 .fromStatusAlone(id, found.state(), found.failureCode(), found.observedAgeMillis());
         MetricsOutcome first = null;
@@ -4632,7 +4640,7 @@ final class Repl {
             out.println("  next       " + answer.next());
         }
         answer.cannotSay().forEach(unanswerable -> out.println("  cannot say " + unanswerable));
-        renderMovement(out, id, found, early.isPresent(), first);
+        renderMovement(out, id, found, early.isPresent(), first, waitForRate);
     }
 
     /**
@@ -4650,15 +4658,16 @@ final class Repl {
      * face is read, for the reason the answer gives, and the movement says so rather than measuring
      * across an observation the answer has already called old.
      *
-     * <p><strong>The second reading is only waited for at a terminal.</strong> A person who ran this and
-     * is looking at it will spend a second on a rate; a script will not, and this verb is the one people
-     * run in a loop over every pipeline they have. Waiting there costs about a second per pipeline
-     * against a healthy publisher and the whole bound against a stalled one, for a number nothing in the
-     * script asked for. Without a terminal the answer is the honest "one reading", with the verb that
-     * does stream rates named beside it.
+     * <p><strong>The second reading is waited for at a terminal, or when {@code --rate} asks for it.</strong>
+     * A person who ran this and is looking at it will spend a second on a rate; a script will not, and this
+     * verb is the one people run in a loop over every pipeline they have. Waiting there costs about a second
+     * per pipeline against a healthy publisher and the whole bound against a stalled one, for a number
+     * nothing in the script asked for. So the default follows the terminal, and a script that does want the
+     * number says so -- which is also what the line prints when it has to answer without one, since a flag
+     * nobody is told about is a flag nobody passes.
      */
     private void renderMovement(PrintWriter out, String id, StatusOutcome.Found found, boolean statusAnswered,
-            MetricsOutcome first) {
+            MetricsOutcome first, boolean waitForRate) {
         String moving = "moving     ";
         String lag = "lag        ";
         if (statusAnswered) {
@@ -4673,13 +4682,14 @@ final class Repl {
             out.println(lag + "not published");
             return;
         }
-        boolean atATerminal = terminal.getAsBoolean();
-        MovementReading later = atATerminal ? awaitNewerReading(id, earlier) : null;
+        boolean waited = waitForRate || terminal.getAsBoolean();
+        MovementReading later = waited ? awaitNewerReading(id, earlier) : null;
         if (later == null) {
-            out.println(moving + "not known -- " + (atATerminal
+            out.println(moving + "not known -- " + (waited
                     ? "the reading did not advance in " + MovementReading.seconds(rateWait)
                             + "; one reading gives no rate (the publisher may have stalled)"
-                    : "one reading, and not a terminal to wait at; --watch streams rates"));
+                    : "one reading, and not a terminal to wait for a second; --rate waits for it,"
+                            + " --watch streams them"));
             out.println(lag + earlier.describeLag());
             return;
         }

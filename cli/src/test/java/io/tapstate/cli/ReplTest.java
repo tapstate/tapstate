@@ -4322,13 +4322,35 @@ class ReplTest {
         h.repl().dispatch("status pl1");
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("moving     not known -- one reading, and not a terminal to wait at;"
-                + " --watch streams rates");
+        assertThat(out).contains("moving     not known -- one reading, and not a terminal to wait for a"
+                + " second; --rate waits for it, --watch streams them");
         assertThat(out).doesNotContain("rows/s");
         // The distance behind is a level rather than a difference, so the one reading answers it.
         assertThat(out).contains("lag        orders 3s");
         // One read of the metrics face: what this verb cost before a rate was put under it.
         assertThat(client.metricsCalls).hasSize(1);
+    }
+
+    @Test
+    void statusWaitsForTheSecondReadingWithoutATerminalWhenRateIsAskedFor() {
+        // The other half of the default above: a script that does want the number says so. Without this
+        // the rate would be unavailable to every non-interactive caller, which includes the end-to-end
+        // case that witnesses the CLI computing one at all.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        java.time.Instant at = java.time.Instant.parse("2026-09-17T10:00:00Z");
+        client.metricsOutcomes.add(moved(at, 300, 3));
+        client.metricsOutcomes.add(moved(at.plusSeconds(1), 330, 2));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1 --rate");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("moving     out 30.0 rows/s (over 1.0s of the pipeline's own time)");
+        assertThat(client.metricsCalls).hasSize(2);
     }
 
     @Test
