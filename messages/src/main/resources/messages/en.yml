@@ -579,6 +579,9 @@ mcp.server-rejected:
 engine.execution-not-authorized:
   message: "This member may no longer act for pipeline `{pipeline}`: its run is not the current one."
   solution: "Let the member that holds the pipeline's claim run it; check cluster connectivity to the coordination store if no member is running it."
+engine.job-still-ending:
+  message: "Pipeline {pipeline} could not be started: its previous run was still ending after {seconds}s."
+  solution: "Wait for the previous run to finish stopping and start the pipeline again; if it never does, check the member's logs for a processor that is not shutting down."
 engine.job-failed:
   message: "Pipeline {pipeline} stopped because its job failed: {cause}."
   solution: "Check the pipeline's logs for the failure, fix what it reports, then start the pipeline again."

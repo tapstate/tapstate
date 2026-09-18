@@ -240,6 +240,33 @@ class PipelineConvergerTest {
     }
 
     @Test
+    @DisplayName("a start that threw is driven again next pass, not left as RUNNING over no job")
+    void aStartThatThrewOnOnePassIsDrivenAgainOnTheNext() {
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        actuator.carryingNothing();
+        actuator.refuseStartWith(new IllegalStateException("the engine could not submit this job"));
+
+        assertThatThrownBy(() -> converger.converge("p1"))
+                .as("an uncoded throw from the job side is a defect of this process, not a state of "
+                        + "this pipeline, so it is not laundered into FAILED")
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(StateJson.parse(state.read("p1").orElseThrow().stateJson()))
+                .as("the state is recorded before the job side is driven, which is where the drift starts")
+                .isEqualTo(RUNNING);
+
+        actuator.reset();
+        actuator.stopRefusingStart();
+        ConvergeResult second = converger.converge("p1");
+
+        assertThat(actuator.calls())
+                .as("the next pass reads RUNNING with nothing carrying it and puts a job behind it, "
+                        + "rather than reading the matching state as converged and actuating nothing")
+                .containsExactly("start:p1");
+        assertThat(second.status()).isEqualTo(CONVERGED);
+        assertThat(actuator.isCarryingAJob("p1")).isTrue();
+    }
+
+    @Test
     @DisplayName("pausing a running pipeline suspends its job, and resuming it resumes the job")
     void pauseThenResumeActuatesSuspendThenResume() {
         converge(RUNNING);

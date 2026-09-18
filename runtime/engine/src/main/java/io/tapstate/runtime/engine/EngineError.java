@@ -44,6 +44,18 @@ public enum EngineError implements TapstateErrorCode {
     EXECUTION_NOT_AUTHORIZED("engine.execution-not-authorized", Set.of("pipeline")),
 
     /**
+     * A run could not be started because the previous run of the same pipeline was still ending:
+     * {@code pipeline} is the pipeline, {@code seconds} how long the wait for the old job to be over
+     * lasted before giving up.
+     *
+     * <p>Coded rather than silent because the engine's own answer here is silence: asked for a job under
+     * a name whose previous job has not finished ending, it hands that dying job back and starts nothing,
+     * without throwing. A caller taking that as a start would leave the pipeline reporting a run it does
+     * not have.
+     */
+    JOB_STILL_ENDING("engine.job-still-ending", Set.of("pipeline", "seconds")),
+
+    /**
      * A pipeline's data-plane job died on its own, for a reason the product had not already coded at its
      * throw site: {@code pipeline} is the pipeline whose run died and {@code cause} is what it died of.
      * A fault that does carry its own code keeps that code instead — this is the last resort, so that a
