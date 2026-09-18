@@ -31,6 +31,11 @@ import java.util.Set;
  * rather than each under its own. That series carries {@link MetricAttributes#OVERFLOW}, the marker every
  * OpenTelemetry consumer already reads as "the rest".
  *
+ * <p>"Added into a single series" is the counter's answer and most of the gauges', but not every gauge's:
+ * some of them are readings of one subject each, and the age of the newest row in two tables is not an
+ * age. Which of the two a gauge is cannot be read off its type, so every instrument declares it
+ * ({@link Fold}) and the fold reads it from there.
+ *
  * <p>The budget is per pipeline, not per process, so one wide pipeline cannot push another pipeline's
  * tables past the line. Which series are the named ones is decided by first sight, as the SDK decides it:
  * a table seen while there was room keeps its series for as long as the folder lives, and a table that
@@ -46,35 +51,65 @@ import java.util.Set;
  */
 public enum CardinalityBudget {
 
-    RECORDS("tapstate.pipeline.records", MetricAttributes.TABLE_ID, 1_000),
-    BYTES("tapstate.pipeline.bytes", MetricAttributes.TABLE_ID, 1_000),
-    LAG("tapstate.pipeline.lag", MetricAttributes.TABLE_ID, 1_000),
-    RECORD_DELIVERY_DURATION("tapstate.pipeline.record.delivery.duration", MetricAttributes.TABLE_ID, 1_000),
+    RECORDS("tapstate.pipeline.records", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
+    BYTES("tapstate.pipeline.bytes", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
+    /** The age of the newest row of a table: two tables' ages do not add, and the worst one is the reading. */
+    LAG("tapstate.pipeline.lag", MetricAttributes.TABLE_ID, 1_000, Fold.HIGHEST),
+    RECORD_DELIVERY_DURATION("tapstate.pipeline.record.delivery.duration", MetricAttributes.TABLE_ID, 1_000,
+            Fold.ADDED),
     /** Broken down by stage only, and the stages are a closed set: nothing here can grow, so nothing folds. */
-    PROCESS_DURATION("tapstate.pipeline.process.duration", null, Stage.values().length),
-    SNAPSHOT_ROWS("tapstate.pipeline.snapshot.rows", MetricAttributes.TABLE_ID, 1_000),
-    SNAPSHOT_ROWS_TOTAL("tapstate.pipeline.snapshot.rows.total", MetricAttributes.TABLE_ID, 1_000),
+    PROCESS_DURATION("tapstate.pipeline.process.duration", null, Stage.values().length, Fold.ADDED),
+    SNAPSHOT_ROWS("tapstate.pipeline.snapshot.rows", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
+    SNAPSHOT_ROWS_TOTAL("tapstate.pipeline.snapshot.rows.total", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
     /** Codes come from a catalog and from connectors, not from rows, but a connector may contribute any number. */
-    ERRORS("tapstate.pipeline.errors", MetricAttributes.CODE, 200),
+    ERRORS("tapstate.pipeline.errors", MetricAttributes.CODE, 200, Fold.ADDED),
     /**
      * The families below carry a dimension the pipeline's definition draws — a chain, a nest level, a join
      * dimension — and are budgeted like the table for the same reason: a definition can name as many of them
      * as it names tables, and nothing that flows through the pipeline can add one.
      */
-    FRONTIER_GAP("tapstate.pipeline.frontier.gap", MetricAttributes.CHAIN_ID, 1_000),
-    FRONTIER_STALL("tapstate.pipeline.frontier.stall", MetricAttributes.CHAIN_ID, 1_000),
-    NEST_ENTRIES("tapstate.pipeline.nest.entries", MetricAttributes.NEST_NAMESPACE, 1_000),
-    NEST_ACCESSES("tapstate.pipeline.nest.accesses", MetricAttributes.NEST_NAMESPACE, 1_000),
-    NEST_BACKFILLS("tapstate.pipeline.nest.backfills", MetricAttributes.NEST_NAMESPACE, 1_000),
-    NEST_BACKFILL_TIME("tapstate.pipeline.nest.backfill.time", MetricAttributes.NEST_NAMESPACE, 1_000),
-    NEST_PENDING_HIGH_WATER("tapstate.pipeline.nest.pending.high_water", MetricAttributes.NEST_NAMESPACE, 1_000),
-    NEST_STORED("tapstate.pipeline.nest.stored", MetricAttributes.NEST_NAMESPACE, 1_000),
-    NEST_DEAD_LETTERED("tapstate.pipeline.nest.dead_lettered", MetricAttributes.NEST_NAMESPACE, 1_000),
-    JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000),
-    JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE, 1_000),
+    FRONTIER_GAP("tapstate.pipeline.frontier.gap", MetricAttributes.CHAIN_ID, 1_000, Fold.HIGHEST),
+    FRONTIER_STALL("tapstate.pipeline.frontier.stall", MetricAttributes.CHAIN_ID, 1_000, Fold.HIGHEST),
+    NEST_ENTRIES("tapstate.pipeline.nest.entries", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    NEST_ACCESSES("tapstate.pipeline.nest.accesses", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    NEST_BACKFILLS("tapstate.pipeline.nest.backfills", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    NEST_BACKFILL_TIME("tapstate.pipeline.nest.backfill.time", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    /** A mark each namespace's own worst moment left: the peaks did not happen together, so they do not add. */
+    NEST_PENDING_HIGH_WATER("tapstate.pipeline.nest.pending.high_water", MetricAttributes.NEST_NAMESPACE,
+            1_000, Fold.HIGHEST),
+    NEST_STORED("tapstate.pipeline.nest.stored", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    NEST_DEAD_LETTERED("tapstate.pipeline.nest.dead_lettered", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000,
+            Fold.ADDED),
+    JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE,
+            1_000, Fold.ADDED),
     /** Two readings about the pipeline as a whole: the pipeline is their only attribute, so nothing grows and nothing folds. */
-    RECORDS_DRIVEN("tapstate.pipeline.records.driven", null, 1),
-    RECONCILE_FAILURES_STREAK("tapstate.pipeline.reconcile.failures.streak", null, 1);
+    RECORDS_DRIVEN("tapstate.pipeline.records.driven", null, 1, Fold.ADDED),
+    RECONCILE_FAILURES_STREAK("tapstate.pipeline.reconcile.failures.streak", null, 1, Fold.HIGHEST);
+
+    /**
+     * What several series of one instrument make when they fold into one.
+     *
+     * <p>A counter's points always add: it measures work, and work done under two names is work done. A
+     * gauge is a reading, and whether readings add is a property of the quantity and not of the metric
+     * type — entries held in two namespaces are entries held, while the age of the newest row in two
+     * tables is not an age at all. So every instrument says which of the two it is, once, here.
+     *
+     * <p>Getting it wrong in the adding direction is the dangerous one: a fold that keeps the highest of
+     * quantities that add reports the largest holder in place of the total, which reads exactly like a
+     * correct total and is short by everything else. A pipeline over two thousand namespaces each holding
+     * a thousand entries would report a million entries as a thousand.
+     */
+    public enum Fold {
+
+        /** The quantities add: the folded series carries their sum. */
+        ADDED,
+
+        /** Each is a reading of its own subject and they do not add: the folded series carries the largest. */
+        HIGHEST
+    }
 
     /**
      * The series one instrument may hold across every pipeline of a process, which is where an exporter
@@ -86,11 +121,13 @@ public enum CardinalityBudget {
     private final String instrument;
     private final String openDimension;
     private final int distinctValues;
+    private final Fold fold;
 
-    CardinalityBudget(String instrument, String openDimension, int distinctValues) {
+    CardinalityBudget(String instrument, String openDimension, int distinctValues, Fold fold) {
         this.instrument = instrument;
         this.openDimension = openDimension;
         this.distinctValues = distinctValues;
+        this.fold = fold;
     }
 
     /** The budget declared for {@code instrument}, or empty for a name that declares none. */
@@ -114,6 +151,11 @@ public enum CardinalityBudget {
     /** How many distinct values of the open dimension one pipeline may hold series for. */
     public int distinctValues() {
         return distinctValues;
+    }
+
+    /** What the series past the budget make when they fold into one. */
+    public Fold fold() {
+        return fold;
     }
 
     /** A folder that remembers, per instrument and pipeline, which values it has named. Not thread-safe. */
@@ -175,23 +217,24 @@ public enum CardinalityBudget {
             if (folded.isEmpty()) {
                 return fact;
             }
-            folded.forEach((attributes, points) -> kept.add(merge(fact.type(), attributes, points)));
+            folded.forEach((attributes, points) -> kept.add(merge(fact.name(), fact.type(), attributes, points)));
             return new MetricFact(fact.name(), fact.type(), fact.unit(), kept);
         }
     }
 
     /**
-     * One series holding what {@code points} held together, combined the way the metric's type allows: a
-     * counter's points add up, a gauge's keep the highest reading, and a distribution's buckets are added
-     * bucket by bucket — every point of one histogram instrument carries the same bounds, which is what
-     * makes that addition meaningful. An accumulation that combines several begins when the earliest of
-     * them began.
+     * One series holding what {@code points} held together, combined the way {@code instrument} allows: a
+     * counter's points add up, a gauge's add or keep the highest as its {@link Fold} declares, and a
+     * distribution's buckets are added bucket by bucket — every point of one histogram instrument carries
+     * the same bounds, which is what makes that addition meaningful. An accumulation that combines several
+     * begins when the earliest of them began.
      *
      * <p>Public because it is the one statement of how series combine: the fold above uses it for the
      * dimension a pipeline's data grows, and an exporter uses it again for the series beyond
      * {@link #EXPORT_SERIES_LIMIT}. Two copies of these rules would be two answers to one question.
      */
-    public static MetricPoint merge(MetricType type, Map<String, String> attributes, List<MetricPoint> points) {
+    public static MetricPoint merge(String instrument, MetricType type, Map<String, String> attributes,
+            List<MetricPoint> points) {
         Instant start = null;
         Instant observed = null;
         for (MetricPoint point : points) {
@@ -222,12 +265,22 @@ public enum CardinalityBudget {
             return MetricPoint.distribution(attributes, start, observed,
                     new HistogramValue(count, sum, first.bounds(), bucketCounts));
         }
-        long value = type == MetricType.COUNTER ? 0L : Long.MIN_VALUE;
+        boolean added = type == MetricType.COUNTER || foldOf(instrument) == Fold.ADDED;
+        long value = added ? 0L : Long.MIN_VALUE;
         for (MetricPoint point : points) {
-            value = type == MetricType.COUNTER ? value + point.value() : Math.max(value, point.value());
+            value = added ? value + point.value() : Math.max(value, point.value());
         }
         return type == MetricType.COUNTER
                 ? MetricPoint.accumulated(attributes, start, observed, value)
                 : MetricPoint.reading(attributes, observed, value);
+    }
+
+    /**
+     * How several series of {@code instrument} combine. A name that declares no budget never folds here —
+     * a fact declaring none is refused the moment it carries an attribute at all — and adding is the
+     * answer for the one that somehow arrives, because a total is the reading a consumer sums.
+     */
+    static Fold foldOf(String instrument) {
+        return forInstrument(instrument).map(CardinalityBudget::fold).orElse(Fold.ADDED);
     }
 }

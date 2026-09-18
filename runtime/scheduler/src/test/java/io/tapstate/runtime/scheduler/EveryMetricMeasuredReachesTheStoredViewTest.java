@@ -2,7 +2,10 @@ package io.tapstate.runtime.scheduler;
 
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.Observation;
@@ -23,6 +26,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
 
 /**
@@ -177,6 +181,32 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 .allSatisfy(fact -> assertThat(fact.points()).singleElement()
                         .satisfies(point -> assertThat(point.observedAt()).isEqualTo(AT)));
         assertThat(observations.read("orders").orElseThrow().observedAt()).isEqualTo(AT);
+    }
+
+    @Test
+    @DisplayName("a point without the dimension its flat key is spelled from is refused, not filed under the absence")
+    void aPointMissingTheDimensionItsKeyIsSpelledFromIsRefused() {
+        MetricFact records = new MetricFact("tapstate.pipeline.records", MetricType.COUNTER, "{record}",
+                List.of(MetricPoint.accumulated(Map.of(MetricAttributes.PIPELINE_ID, "orders",
+                                MetricAttributes.TABLE_ID, "orders", MetricAttributes.DIRECTION, "in",
+                                MetricAttributes.OP, "insert"), LOAD_BEGAN, AT, 12L),
+                        MetricPoint.accumulated(Map.of(MetricAttributes.PIPELINE_ID, "orders",
+                                MetricAttributes.TABLE_ID, "orders", MetricAttributes.OP, "insert"),
+                                LOAD_BEGAN, AT, 30L)));
+
+        assertThatThrownBy(() ->
+                FlatMetricProjection.of(List.of(records), ObservationPublisher.FLAT_REDUCTIONS))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("no flat key for a point of tapstate.pipeline.records");
+
+        // What the refusal is worth, spelled out: the same fact under a rule that concatenates whatever
+        // the attribute map returns. Nothing is refused, a key made of the absence appears beside the real
+        // ones, and the direction total a reader does look at is short by exactly those 30 records.
+        assertThat(FlatMetricProjection.of(List.of(records),
+                Map.of("tapstate.pipeline.records",
+                        attributes -> "records." + attributes.get(MetricAttributes.DIRECTION))).metrics())
+                .containsEntry("records.null", 30L)
+                .containsEntry("records.in", 12L);
     }
 
     /** Keeps the latest observation written, which is what a read face would find. */

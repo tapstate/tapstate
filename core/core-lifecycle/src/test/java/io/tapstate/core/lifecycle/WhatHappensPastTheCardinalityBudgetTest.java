@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import static io.tapstate.core.lifecycle.MetricAttributes.CODE;
+import static io.tapstate.core.lifecycle.MetricAttributes.NEST_NAMESPACE;
 import static io.tapstate.core.lifecycle.MetricAttributes.DIRECTION;
 import static io.tapstate.core.lifecycle.MetricAttributes.OP;
 import static io.tapstate.core.lifecycle.MetricAttributes.OVERFLOW;
@@ -340,5 +341,93 @@ class WhatHappensPastTheCardinalityBudgetTest {
 
         assertThat(folder.fold(plain)).isSameAs(plain);
         assertThat(folder.fold(narrow)).isSameAs(narrow);
+    }
+
+    /** A per-namespace reading of how many entries each namespace holds, every one of them holding {@code each}. */
+    private static MetricFact entriesOver(int namespaces, long each) {
+        List<MetricPoint> points = new ArrayList<>();
+        for (int index = 1; index <= namespaces; index++) {
+            points.add(MetricPoint.reading(Map.of(PIPELINE_ID, PIPELINE, NEST_NAMESPACE,
+                    "ns" + String.format("%04d", index)), OBSERVED, each));
+        }
+        return new MetricFact("tapstate.pipeline.nest.entries", MetricType.GAUGE, "{entry}", points);
+    }
+
+    /** A per-table reading of how far behind each table stands, in seconds, the {@code index}th by its index. */
+    private static MetricFact agesOver(int tables) {
+        List<MetricPoint> points = new ArrayList<>();
+        for (int index = 1; index <= tables; index++) {
+            points.add(MetricPoint.reading(Map.of(PIPELINE_ID, PIPELINE, TABLE_ID, table(index)), OBSERVED, index));
+        }
+        return new MetricFact("tapstate.pipeline.lag", MetricType.GAUGE, "s", points);
+    }
+
+    @Test
+    @DisplayName("a gauge of quantities that add folds by adding them, so the total past the budget is the total")
+    void aGaugeOfQuantitiesThatAddFoldsByAdding() {
+        int namespaces = 1_200;
+        long each = 1_000L;
+        MetricFact folded = CardinalityBudget.folder().fold(entriesOver(namespaces, each));
+        long past = namespaces - CardinalityBudget.NEST_ENTRIES.distinctValues();
+        System.out.printf("nest.entries namespaces=%d budget=%d folded=%d entries each=%d%n",
+                namespaces, CardinalityBudget.NEST_ENTRIES.distinctValues(), past, each);
+
+        assertThat(overflowSeries(folded)).singleElement()
+                .satisfies(series -> assertThat(series.value()).isEqualTo(past * each));
+        // The whole point of folding rather than dropping: summing the series still gives the quantity.
+        assertThat(folded.points().stream().mapToLong(MetricPoint::value).sum()).isEqualTo(namespaces * each);
+    }
+
+    @Test
+    @DisplayName("a gauge that is one reading per subject folds by keeping the worst, since two ages do not add")
+    void aGaugeOfReadingsFoldsByKeepingTheHighest() {
+        int tables = 1_200;
+        MetricFact folded = CardinalityBudget.folder().fold(agesOver(tables));
+
+        assertThat(overflowSeries(folded)).singleElement()
+                .satisfies(series -> assertThat(series.value()).isEqualTo(tables));
+        assertThat(folded.points().stream().mapToLong(MetricPoint::value).max().orElseThrow()).isEqualTo(tables);
+    }
+
+    @Test
+    @DisplayName("the load's two measurements fold the same way, so the overflow series is not several hundred percent done")
+    void aFractionOfTwoFoldedSeriesStaysAFraction() {
+        int tables = 1_200;
+        long done = 50L;
+        long total = 100L;
+        List<MetricPoint> rows = new ArrayList<>();
+        List<MetricPoint> totals = new ArrayList<>();
+        for (int index = 1; index <= tables; index++) {
+            Map<String, String> attributes = Map.of(PIPELINE_ID, PIPELINE, TABLE_ID, table(index));
+            rows.add(MetricPoint.accumulated(attributes, STARTED, OBSERVED, done));
+            totals.add(MetricPoint.reading(attributes, OBSERVED, total));
+        }
+        CardinalityBudget.Folder folder = CardinalityBudget.folder();
+        MetricFact foldedRows = folder.fold(
+                new MetricFact("tapstate.pipeline.snapshot.rows", MetricType.COUNTER, "{row}", rows));
+        MetricFact foldedTotals = folder.fold(
+                new MetricFact("tapstate.pipeline.snapshot.rows.total", MetricType.GAUGE, "{row}", totals));
+
+        long overflowDone = overflowSeries(foldedRows).get(0).value();
+        long overflowTotal = overflowSeries(foldedTotals).get(0).value();
+        System.out.printf("snapshot overflow series: rows=%d rows.total=%d (%.2f of the load)%n",
+                overflowDone, overflowTotal, overflowDone / (double) overflowTotal);
+
+        assertThat(overflowDone).isLessThanOrEqualTo(overflowTotal);
+        assertThat(overflowDone / (double) overflowTotal).isEqualTo(done / (double) total);
+    }
+
+    @Test
+    @DisplayName("the instruments that fold by keeping the highest are the readings of one subject each")
+    void onlyReadingsOfOneSubjectKeepTheHighest() {
+        assertThat(Arrays.stream(CardinalityBudget.values())
+                .filter(budget -> budget.fold() == CardinalityBudget.Fold.HIGHEST)
+                .map(CardinalityBudget::instrument))
+                .containsExactlyInAnyOrder(
+                        "tapstate.pipeline.lag",
+                        "tapstate.pipeline.frontier.gap",
+                        "tapstate.pipeline.frontier.stall",
+                        "tapstate.pipeline.nest.pending.high_water",
+                        "tapstate.pipeline.reconcile.failures.streak");
     }
 }

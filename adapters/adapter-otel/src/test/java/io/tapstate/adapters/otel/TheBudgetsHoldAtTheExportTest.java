@@ -1,6 +1,7 @@
 package io.tapstate.adapters.otel;
 
 import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.sdk.metrics.data.LongPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.resources.Resource;
@@ -97,5 +98,63 @@ class TheBudgetsHoldAtTheExportTest {
         Collection<LongPointData> again = recordsPoints(producer.produce(Resource.empty()));
         assertThat(again.stream().map(LongPointData::getAttributes).toList())
                 .containsExactlyInAnyOrderElementsOf(exported.stream().map(LongPointData::getAttributes).toList());
+    }
+
+    /** Two series (one in, one out) for each of {@code pipelines} pipelines named {@code prefix}NNNNN. */
+    private void offerPipelines(String prefix, int pipelines) {
+        for (int index = 0; index < pipelines; index++) {
+            String id = prefix + String.format(Locale.ROOT, "%05d", index);
+            producer.offer(id, PipelineState.RUNNING, AT, List.of(Facts.records(id, 1, 1)));
+        }
+    }
+
+    @Test
+    void aSeriesSeenWhileThereWasRoomKeepsItsNameWhenTheLimitIsCrossedLater() {
+        // Under the limit to begin with: 4999 pipelines, two series each, nothing folded anywhere.
+        int seenEarly = (CardinalityBudget.EXPORT_SERIES_LIMIT - 2) / 2;
+        offerPipelines("a", seenEarly);
+        List<Attributes> early = recordsPoints(producer.produce(Resource.empty())).stream()
+                .map(LongPointData::getAttributes).toList();
+        assertThat(early).hasSize(seenEarly * 2);
+
+        // Then half again as many arrive at once and the total is well past the limit.
+        offerPipelines("b", 2_500);
+        Collection<LongPointData> exported = recordsPoints(producer.produce(Resource.empty()));
+        List<LongPointData> overflow = exported.stream()
+                .filter(point -> "true".equals(point.getAttributes().get(OVERFLOW))).toList();
+        System.out.printf(Locale.ROOT, "records series seen early=%d offered=%d exported=%d (named=%d, overflow=%d)%n",
+                early.size(), seenEarly * 2 + 5_000, exported.size(), exported.size() - overflow.size(),
+                overflow.size());
+
+        // Every series that was there while there was room is still there by name. Deciding this at the
+        // crossing instead would name whichever 9999 of the 14998 the pipelines currently held happened to
+        // iterate first, and the ones offered before the crossing have no claim on that order at all.
+        assertThat(exported.stream().map(LongPointData::getAttributes).toList()).containsAll(early);
+        assertThat(exported).hasSize(CardinalityBudget.EXPORT_SERIES_LIMIT);
+        assertThat(overflow).singleElement().satisfies(series -> assertThat(series.getValue())
+                .isEqualTo(seenEarly * 2L + 5_000L - (CardinalityBudget.EXPORT_SERIES_LIMIT - 1)));
+    }
+
+    @Test
+    void aNameIsGivenUpWithThePipelineItWasHeldFor() {
+        // The limit nearly filled by pipelines that then go away.
+        int wide = (CardinalityBudget.EXPORT_SERIES_LIMIT - 2) / 2;
+        offerPipelines("gone", wide);
+        assertThat(recordsPoints(producer.produce(Resource.empty()))).hasSize(wide * 2);
+        producer.forgetPipelinesOutside(List.of());
+
+        // A fresh set, over the limit on its own: what it may name has to be the whole limit again. Held
+        // names would leave it one, and everything a running deployment exports would arrive as overflow
+        // because of pipelines that were removed.
+        offerPipelines("live", 6_000);
+        Collection<LongPointData> exported = recordsPoints(producer.produce(Resource.empty()));
+        List<LongPointData> overflow = exported.stream()
+                .filter(point -> "true".equals(point.getAttributes().get(OVERFLOW))).toList();
+        System.out.printf(Locale.ROOT, "after forgetting %d pipelines: offered=%d exported=%d (named=%d)%n",
+                wide, 12_000, exported.size(), exported.size() - overflow.size());
+
+        assertThat(exported).hasSize(CardinalityBudget.EXPORT_SERIES_LIMIT);
+        assertThat(overflow).hasSize(1);
+        assertThat(exported.size() - overflow.size()).isEqualTo(CardinalityBudget.EXPORT_SERIES_LIMIT - 1);
     }
 }

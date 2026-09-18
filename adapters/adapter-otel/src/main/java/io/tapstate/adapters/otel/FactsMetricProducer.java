@@ -113,7 +113,19 @@ final class FactsMetricProducer implements MetricProducer {
 
     /** Drops what is held for every pipeline outside {@code pipelineIds}; their series stop with the next collection. */
     void forgetPipelinesOutside(Collection<String> pipelineIds) {
-        latest.keySet().retainAll(Set.copyOf(pipelineIds));
+        Set<String> kept = Set.copyOf(pipelineIds);
+        latest.keySet().retainAll(kept);
+        // The names go with the pipelines they were held for. A name is a promise to a chart: this series
+        // will not begin folding while the data behind it has not changed. A pipeline that is gone has
+        // neither chart nor data, and keeping its names would turn the export limit into a ratchet — a
+        // process that creates and removes pipelines would spend it on pipelines that no longer exist and
+        // fold the ones that do.
+        synchronized (this) {
+            named.values().forEach(sets -> sets.removeIf(attributes -> {
+                String pipeline = attributes.get(MetricAttributes.PIPELINE_ID);
+                return pipeline != null && !kept.contains(pipeline);
+            }));
+        }
     }
 
     /** The pipelines currently held, for a reader of this producer that wants to say what it exports. */
@@ -142,15 +154,28 @@ final class FactsMetricProducer implements MetricProducer {
 
     /**
      * {@code points} with everything past the export limit folded into one overflow series. First sight
-     * decides which series stay named, and stays decided: a series named once is named for as long as this
-     * producer lives, even after its pipeline is forgotten. That is the bound's price, and the only way to
-     * hand a name back is to restart the exporter.
+     * decides which series stay named, and stays decided: a series seen while there was room keeps its
+     * name for as long as its pipeline is exported, so a chart of it does not break and mend as other
+     * pipelines come and go. Deciding it per collection instead — from whatever order the pipelines
+     * currently held happen to iterate in — is what that would do.
+     *
+     * <p>A name is given up only with the pipeline it was held for, in {@link #forgetPipelinesOutside}.
      */
     private synchronized List<MetricPoint> backstop(String instrument, MetricType type, List<MetricPoint> points) {
+        Set<Map<String, String>> namedHere = named.computeIfAbsent(instrument, name -> new LinkedHashSet<>());
         if (points.size() <= CardinalityBudget.EXPORT_SERIES_LIMIT) {
+            // Naming them here, while there is room for all of them, is what makes first sight first. Left
+            // until the limit is crossed, this set would still be empty on the collection that crosses it,
+            // and the names would go to whichever series that one collection happened to iterate first --
+            // an order that is a function of the pipelines currently held, not of when each was first seen.
+            for (MetricPoint point : points) {
+                if (namedHere.size() >= CardinalityBudget.EXPORT_SERIES_LIMIT - 1) {
+                    break;
+                }
+                namedHere.add(point.attributes());
+            }
             return points;
         }
-        Set<Map<String, String>> namedHere = named.computeIfAbsent(instrument, name -> new LinkedHashSet<>());
         List<MetricPoint> kept = new ArrayList<>();
         List<MetricPoint> overflow = new ArrayList<>();
         for (MetricPoint point : points) {
@@ -163,7 +188,8 @@ final class FactsMetricProducer implements MetricProducer {
             }
         }
         if (!overflow.isEmpty()) {
-            kept.add(CardinalityBudget.merge(type, Map.of(MetricAttributes.OVERFLOW, "true"), overflow));
+            kept.add(CardinalityBudget.merge(instrument, type, Map.of(MetricAttributes.OVERFLOW, "true"),
+                    overflow));
         }
         return kept;
     }

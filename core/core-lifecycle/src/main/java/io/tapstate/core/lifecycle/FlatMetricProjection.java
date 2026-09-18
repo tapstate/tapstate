@@ -5,6 +5,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.BinaryOperator;
 
 /**
  * The flat numeric view of a set of {@link MetricFact}s: {@code name -> value}, which is the shape the
@@ -16,11 +17,10 @@ import java.util.Objects;
  * projected another way keep both.
  *
  * <p>A caller that would rather have a squeezed number than none may supply a {@link FlatReduction} per
- * metric, naming the flat key each point belongs under. Points that land on one key are then combined the
- * way their metric's type allows: a counter measures work and its points add up, while a gauge is a
- * reading and readings do not — several of them keep the highest, which for every quantity published this
- * way is the one an operator would act on. A distribution is refused a rule outright, because no key turns
- * a shape into a number.
+ * metric, naming the flat key each point belongs under. Points that land on one key are then combined by
+ * the rule their instrument declares to {@link CardinalityBudget} — its points add up, or the largest of
+ * them stands for the rest — so that this view and an exported one cannot answer one question two ways. A
+ * distribution is refused a rule outright, because no key turns a shape into a number.
  *
  * <p>What the loss must never be is quiet, in either form. {@link #dropped()} names every metric this view
  * could not represent at all, and {@link #reduced()} names every one it could only represent by collapsing
@@ -97,8 +97,14 @@ public record FlatMetricProjection(Map<String, Long> metrics, List<String> dropp
                         + "; a reduction answers for every point, since a total short by the ones it"
                         + " skipped reads exactly like a correct one");
             }
-            flat.merge(key, point.value(),
-                    fact.type() == MetricType.COUNTER ? Long::sum : Math::max);
+            flat.merge(key, point.value(), combining(fact));
         }
+    }
+
+    /** How two points that land on one key combine, which is the rule their instrument declares. */
+    private static BinaryOperator<Long> combining(MetricFact fact) {
+        boolean added = fact.type() == MetricType.COUNTER
+                || CardinalityBudget.foldOf(fact.name()) == CardinalityBudget.Fold.ADDED;
+        return added ? Long::sum : (first, second) -> Math.max(first, second);
     }
 }

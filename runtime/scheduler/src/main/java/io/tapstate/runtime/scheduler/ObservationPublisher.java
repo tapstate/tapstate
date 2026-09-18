@@ -265,42 +265,54 @@ public final class ObservationPublisher {
      * reader of this face is actually looking at stays answerable.
      */
     static final Map<String, FlatReduction> FLAT_REDUCTIONS = Map.ofEntries(
-            Map.entry(RECORDS_METRIC, attributes -> "records." + attributes.get(DIRECTION_ATTRIBUTE)),
-            Map.entry(BYTES_METRIC, attributes -> "bytes." + attributes.get(DIRECTION_ATTRIBUTE)),
-            Map.entry(LAG_METRIC, attributes -> "lag." + attributes.get(TABLE_ID_ATTRIBUTE)),
+            Map.entry(RECORDS_METRIC, keyed("records.", DIRECTION_ATTRIBUTE)),
+            Map.entry(BYTES_METRIC, keyed("bytes.", DIRECTION_ATTRIBUTE)),
+            Map.entry(LAG_METRIC, keyed("lag.", TABLE_ID_ATTRIBUTE)),
             // Reduced and not dropped, which is the opposite of what the load's two measurements get, and
             // for the reason that decides between them: a drop is only honest when another face carries
             // the metric, and the load has one - this observation's own snapshot dataset. Failures have
             // none. Dropped here they would be measured and readable nowhere at all until an exporter
             // exists, which is a gate away.
-            Map.entry(ERRORS_METRIC, attributes -> "errors." + attributes.get(CODE_ATTRIBUTE)),
+            Map.entry(ERRORS_METRIC, keyed("errors.", CODE_ATTRIBUTE)),
             // The per-chain and per-namespace families keep the flat keys they have always had, letter for
             // letter: one key per chain or namespace, the dimension appended to a fixed prefix. That is the
             // spelling every reader of this face was built against, and the facts beside it are where the
             // dimension became an attribute -- the change is in what is carried, not in what anybody reads.
-            Map.entry(FRONTIER_GAP_METRIC, attributes -> FRONTIER_GAP_PREFIX + attributes.get(CHAIN_ID_ATTRIBUTE)),
-            Map.entry(FRONTIER_STALL_METRIC,
-                    attributes -> FRONTIER_STALLED_PREFIX + attributes.get(CHAIN_ID_ATTRIBUTE)),
-            Map.entry(NEST_ENTRIES_METRIC, attributes -> NEST_ENTRIES_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
-            Map.entry(NEST_ACCESSES_METRIC,
-                    attributes -> NEST_ACCESSES_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
-            Map.entry(NEST_BACKFILLS_METRIC,
-                    attributes -> NEST_BACKFILLS_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
-            Map.entry(NEST_BACKFILL_TIME_METRIC,
-                    attributes -> NEST_BACKFILL_MILLIS_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(FRONTIER_GAP_METRIC, keyed(FRONTIER_GAP_PREFIX, CHAIN_ID_ATTRIBUTE)),
+            Map.entry(FRONTIER_STALL_METRIC, keyed(FRONTIER_STALLED_PREFIX, CHAIN_ID_ATTRIBUTE)),
+            Map.entry(NEST_ENTRIES_METRIC, keyed(NEST_ENTRIES_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_ACCESSES_METRIC, keyed(NEST_ACCESSES_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_BACKFILLS_METRIC, keyed(NEST_BACKFILLS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_BACKFILL_TIME_METRIC, keyed(NEST_BACKFILL_MILLIS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_PENDING_HIGH_WATER_METRIC,
-                    attributes -> NEST_PENDING_HIGH_WATER_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
-            Map.entry(NEST_STORED_METRIC, attributes -> NEST_STORED_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
-            Map.entry(NEST_DEAD_LETTERED_METRIC,
-                    attributes -> NEST_DEAD_LETTERED_PREFIX + attributes.get(NEST_NAMESPACE_ATTRIBUTE)),
-            Map.entry(JOIN_RECOMPUTE_ROWS_METRIC,
-                    attributes -> JOIN_RECOMPUTE_DONE_PREFIX + attributes.get(JOIN_NAMESPACE_ATTRIBUTE)),
+                    keyed(NEST_PENDING_HIGH_WATER_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_STORED_METRIC, keyed(NEST_STORED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_DEAD_LETTERED_METRIC, keyed(NEST_DEAD_LETTERED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(JOIN_RECOMPUTE_ROWS_METRIC, keyed(JOIN_RECOMPUTE_DONE_PREFIX, JOIN_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_TOTAL_METRIC,
-                    attributes -> JOIN_RECOMPUTE_EXPECTED_PREFIX + attributes.get(JOIN_NAMESPACE_ATTRIBUTE)),
+                    keyed(JOIN_RECOMPUTE_EXPECTED_PREFIX, JOIN_NAMESPACE_ATTRIBUTE)),
             // The two per-pipeline readings carry only the pipeline as an attribute, the way every
             // canonical fact does, and the flat face keeps their bare keys.
             Map.entry(RECORDS_DRIVEN_METRIC, attributes -> RECORDS_DRIVEN_FLAT),
             Map.entry(RECONCILE_STREAK_METRIC, attributes -> RECONCILE_STREAK_FLAT));
+
+    /**
+     * A rule spelling a point's flat key as {@code prefix} and the value of {@code dimension}, and
+     * answering nothing at all for a point that does not carry that dimension.
+     *
+     * <p>The second half is the whole reason this is a method. Written inline as {@code prefix +
+     * attributes.get(dimension)}, an absent attribute does not produce no key — it produces the key
+     * {@code prefix + "null"}, which looks like every other key on this face while the totals beside it
+     * are short by exactly the points that landed there. The projection's refusal cannot see it, because
+     * a key was answered. Asking for the attribute first is what turns that into the loud failure the
+     * projection is there to make.
+     */
+    private static FlatReduction keyed(String prefix, String dimension) {
+        return attributes -> {
+            String value = attributes.get(dimension);
+            return value == null ? null : prefix + value;
+        };
+    }
 
     /**
      * The name the metric contract gives each of this engine's change kinds.
