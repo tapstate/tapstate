@@ -347,6 +347,24 @@ class ArtifactMutationServiceTest {
     }
 
     @Test
+    void aServiceBuiltWithoutARateHistoryStoreReportsThatStepRatherThanACleanSweep() {
+        // The shape that keeps an older call site working substitutes a store for the one it was not
+        // given. A substitute that deletes nothing and says nothing has the reclaim run every step and
+        // report the pipeline reclaimed whole, while every sample it ever took stays in the collection to
+        // be read as the past of whatever is applied under that id next.
+        ArtifactMutationService withoutHistory = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add);
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+
+        assertThatThrownBy(() -> withoutHistory.delete(PRINCIPAL, "flow", hash(flow)))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.args()).containsEntry("residue", List.of("rate-history")));
+        assertThat(store.get("flow")).isEmpty();
+    }
+
+    @Test
     void aDerivedSchemaThatCannotBeReclaimedIsReportedAsResidueLikeEveryOtherStep() {
         PipelineResource flow = pipeline("flow");
         store.save(flow);

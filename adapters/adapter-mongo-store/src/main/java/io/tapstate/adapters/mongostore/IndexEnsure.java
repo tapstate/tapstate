@@ -19,6 +19,13 @@ import java.util.concurrent.TimeUnit;
  * written and keep expiring, on the old schedule. Reading the existing options back first is what makes
  * a changed retention a change to the index rather than a note in a log.
  *
+ * <p>The expiry is the one option an existing index is brought into line on; every other one is
+ * compared and refused. Unconditional creation used to do that comparison for free -- the server refuses
+ * a create whose name exists with different options, loudly -- and reading the options back first would
+ * otherwise quietly accept them: a unique index that exists non-unique would be found by name, compared
+ * on its expiry alone, and left as it is. The duplicate check beside it only looks at the rows present at
+ * that moment; the constraint is what stops the duplicate that arrives next week.
+ *
  * <p>Nothing here swallows a failure: a refusal to create or alter is the caller's to see.
  */
 public final class IndexEnsure {
@@ -37,6 +44,15 @@ public final class IndexEnsure {
         if (existing == null) {
             create(collection, index);
             return;
+        }
+        boolean uniqueThere = existing.getBoolean("unique", false);
+        if (uniqueThere != index.unique()) {
+            throw new IllegalStateException("index '" + index.indexName() + "' on '"
+                    + collection.getNamespace().getFullName() + "' exists with unique=" + uniqueThere
+                    + " where it is declared unique=" + index.unique()
+                    + "; uniqueness cannot be altered in place, so the index has to be dropped and rebuilt."
+                    + " Starting over it either way would mean running without a constraint the store's"
+                    + " own declaration asks for, or with one it does not");
         }
         Long declared = index.expireAfterSeconds();
         Number found = existing.get("expireAfterSeconds", Number.class);

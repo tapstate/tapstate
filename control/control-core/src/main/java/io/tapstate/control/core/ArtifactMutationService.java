@@ -136,6 +136,7 @@ public final class ArtifactMutationService {
 
             @Override
             public void delete(String pipelineId) {
+                throw new UnsupportedOperationException("pipeline layouts are not configured");
             }
         }, srsMeta, derivedSchemas, auditGate, follows);
     }
@@ -164,6 +165,12 @@ public final class ArtifactMutationService {
 
             @Override
             public void deleteAll(String pipelineId) {
+                // Refusing, and not returning quietly like a store with nothing to delete. A reclaim
+                // through this shape runs every step and is reported whole; a step that did nothing
+                // leaves every sample the pipeline ever took in the collection, to be read as the past of
+                // whatever is applied under that id next. "This store is not configured" is what this
+                // object knows, and it is the answer to both halves.
+                throw new UnsupportedOperationException("rate history is not configured");
             }
 
             @Override

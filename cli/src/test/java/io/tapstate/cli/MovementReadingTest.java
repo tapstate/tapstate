@@ -107,7 +107,21 @@ class MovementReadingTest {
         MovementReading later = new MovementReading(AT.plusSeconds(1), Map.of("out", 40L), Map.of());
 
         assertThat(MovementReading.describe(later.since(earlier)))
-                .isEqualTo("not known -- the counter went backwards between the readings, which is a run that restarted, not a rate");
+                .isEqualTo("not known -- the out counter went backwards between the readings,"
+                        + " which is a run that restarted, not a rate");
+    }
+
+    @Test
+    void oneDirectionGoingBackwardsAnswersForTheWholeReading() {
+        // A sink that restarts resets what it has confirmed while the capture side keeps counting. Rating
+        // the direction that still adds up and dropping the other prints rows going in with no line about
+        // rows coming out at all, which reads as a target that has stopped.
+        MovementReading earlier = new MovementReading(AT, Map.of("in", 100L, "out", 90L), Map.of());
+        MovementReading later = new MovementReading(AT.plusSeconds(5), Map.of("in", 600L, "out", 40L), Map.of());
+
+        assertThat(MovementReading.describe(later.since(earlier)))
+                .isEqualTo("not known -- the out counter went backwards between the readings,"
+                        + " which is a run that restarted, not a rate");
     }
 
     @Test

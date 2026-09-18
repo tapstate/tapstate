@@ -60,6 +60,11 @@ record MovementReading(Instant observedAt, Map<String, Long> recordsByDirection,
      * first confirmed rows land between the two readings is rated from nought, not left out. A
      * counter that went backwards between the two is a run that restarted in between, and the
      * difference across a restart is not a rate.
+     *
+     * <p>One direction going backwards answers for the whole reading, and it has to. Dropping just that
+     * direction would print the other one's rate with nothing said about this one, and rows going in with
+     * no line about rows coming out reads as a target that has stopped -- the one diagnosis the restart
+     * notice exists to keep a reader from making.
      */
     Movement since(MovementReading earlier) {
         if (earlier == null) {
@@ -72,18 +77,18 @@ record MovementReading(Instant observedAt, Map<String, Long> recordsByDirection,
         if (over.isZero() || over.isNegative()) {
             return new Movement.NotKnown("the reading has not advanced, so this is still one reading");
         }
+        if (recordsByDirection.isEmpty()) {
+            return new Movement.NotKnown("no records counter is published");
+        }
         double seconds = over.toNanos() / 1_000_000_000.0;
         Map<String, Double> rates = new TreeMap<>();
-        recordsByDirection.forEach((direction, now) -> {
-            long before = earlier.recordsByDirection.getOrDefault(direction, 0L);
-            if (now >= before) {
-                rates.put(direction, (now - before) / seconds);
+        for (Map.Entry<String, Long> counted : recordsByDirection.entrySet()) {
+            long before = earlier.recordsByDirection.getOrDefault(counted.getKey(), 0L);
+            if (counted.getValue() < before) {
+                return new Movement.NotKnown("the " + counted.getKey() + " counter went backwards between the"
+                        + " readings, which is a run that restarted, not a rate");
             }
-        });
-        if (rates.isEmpty()) {
-            return new Movement.NotKnown(recordsByDirection.isEmpty()
-                    ? "no records counter is published"
-                    : "the counter went backwards between the readings, which is a run that restarted, not a rate");
+            rates.put(counted.getKey(), (counted.getValue() - before) / seconds);
         }
         return new Movement.Rate(over, rates);
     }

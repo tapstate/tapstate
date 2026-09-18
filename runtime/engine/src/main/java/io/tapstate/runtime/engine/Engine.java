@@ -13,6 +13,7 @@ import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
@@ -506,7 +507,14 @@ public final class Engine {
         long since = Long.MIN_VALUE;
         for (String metric : collected.metrics()) {
             JetStageGauge.Part part = JetStageGauge.partOf(metric);
-            if (part == null) {
+            // A statistic named for something that is not a stage of this build's graph is skipped here,
+            // the way a bucket index out of range is skipped below. The job's statistics are aggregated
+            // across members, so a rolling upgrade puts a stage word this build has never heard of in
+            // front of this loop; carrying it into the reading, whose constructor exists to refuse a
+            // stage outside the closed set, would throw out of the publish that called this. The driver
+            // reads a throw from there as a failure to converge, so a pipeline running perfectly well
+            // would be reported, once a second, as one the server keeps failing to bring up.
+            if (part == null || !Stage.attributeValues().contains(part.stage())) {
                 continue;
             }
             for (Measurement measurement : collected.get(metric)) {

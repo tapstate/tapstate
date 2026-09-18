@@ -45,6 +45,24 @@ class WhatAJobsOwnStatisticsSayAboutStagesTest {
     }
 
     @Test
+    @DisplayName("a statistic named for a stage this build does not know is skipped, not carried to the reading")
+    void aStageWordThisBuildDoesNotKnowIsSkipped() {
+        // What a rolling upgrade looks like from here: the job's statistics are aggregated across members,
+        // so a member running a build with one more stage in its graph puts that stage's numbers in front
+        // of this reader. Every part of it is well formed -- count, sum, all the buckets, a start -- so
+        // nothing else filters it out.
+        Map<String, List<Long>> statistics = new LinkedHashMap<>(
+                aStage("transform", 40L, 12_000L, 2, List.of(1L), List.of(1_700_000_000_000L)));
+        statistics.putAll(aStage("inference", 7L, 900L, 1, List.of(1L), List.of(1_700_000_000_001L)));
+
+        StageReading read = Engine.stageDurationsIn(statistics(statistics));
+
+        assertThat(read.durationByStage()).containsOnlyKeys("transform");
+        assertThat(read.durationByStage().get("transform").count()).isEqualTo(40L);
+        assertThat(read.countingSince()).isNotNull();
+    }
+
+    @Test
     @DisplayName("a stage's distribution is read back whole, with its start")
     void aStageIsReadBackWhole() {
         JobMetrics collected = statistics(aStage("transform", 40L, 12_000L, 2, List.of(1L), List.of(1_700_000_000_000L)));
