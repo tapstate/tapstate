@@ -40,6 +40,7 @@ boot.control-advertise-url-invalid
 boot.coordination-store-required
 boot.discovery-config-invalid
 boot.hazelcast-unavailable
+boot.member-bind-address-invalid
 boot.node-id-in-use
 boot.node-id-required
 boot.node-session-renew-interval-invalid

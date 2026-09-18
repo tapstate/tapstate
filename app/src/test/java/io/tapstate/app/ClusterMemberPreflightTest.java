@@ -69,6 +69,7 @@ class ClusterMemberPreflightTest {
         HazelcastProperties properties = new HazelcastProperties();
         properties.getDiscovery().setMode(HazelcastProperties.DiscoveryMode.TCP_IP);
         properties.getDiscovery().getTcpIp().setSeeds(java.util.List.of("10.20.0.11:5701"));
+        properties.setBindAddress("10.20.0.11");
         return properties;
     }
 

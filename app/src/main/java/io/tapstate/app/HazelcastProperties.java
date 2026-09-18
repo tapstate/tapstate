@@ -14,6 +14,7 @@ class HazelcastProperties {
 
     private String clusterName = "tapstate";
     private int memberPort = 5701;
+    private String bindAddress = "127.0.0.1";
     private final Discovery discovery = new Discovery();
     private final Jet jet = new Jet();
 
@@ -31,6 +32,14 @@ class HazelcastProperties {
 
     void setMemberPort(int memberPort) {
         this.memberPort = memberPort;
+    }
+
+    String getBindAddress() {
+        return bindAddress;
+    }
+
+    void setBindAddress(String bindAddress) {
+        this.bindAddress = bindAddress;
     }
 
     Discovery getDiscovery() {

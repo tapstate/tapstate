@@ -39,6 +39,9 @@ enum BootError implements TapstateErrorCode {
     /** The advertised control endpoint is missing or is not an absolute HTTP(S) URL. */
     CONTROL_ADVERTISE_URL_INVALID("boot.control-advertise-url-invalid", Set.of()),
 
+    /** Member exposure is allowed only through an explicit routable interface in cluster mode. */
+    MEMBER_BIND_ADDRESS_INVALID("boot.member-bind-address-invalid", Set.of()),
+
     /** A node-session lease with no positive lifetime could never protect a stable node id. */
     NODE_SESSION_TTL_INVALID("boot.node-session-ttl-invalid", Set.of()),
 

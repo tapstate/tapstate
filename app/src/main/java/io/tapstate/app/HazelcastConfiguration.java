@@ -34,6 +34,8 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.lang.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.UUID;
@@ -57,6 +59,7 @@ import java.util.function.Supplier;
 class HazelcastConfiguration {
 
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
+    private static final Logger LOG = LoggerFactory.getLogger(HazelcastConfiguration.class);
 
     /**
      * The bounded capacity of each per-table SRS change ring. Headroom backpressure, not size, is the
@@ -334,6 +337,11 @@ class HazelcastConfiguration {
         // protocol, so a single local member must not expose it on a LAN interface.
         config.setProperty("hazelcast.socket.bind.any", "false");
         config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        if (!"127.0.0.1".equals(properties.getBindAddress())) {
+            config.getNetworkConfig().getInterfaces().clear().addInterface(properties.getBindAddress());
+            LOG.warn("Hazelcast member port is exposed on {} and serves an unauthenticated protocol. "
+                    + "Keep it inside a private network or NetworkPolicy.", properties.getBindAddress());
+        }
         JoinConfig join = config.getNetworkConfig().getJoin();
         join.getAutoDetectionConfig().setEnabled(false);
         join.getMulticastConfig().setEnabled(false);

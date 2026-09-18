@@ -21,8 +21,15 @@ final class ClusterMemberPreflight {
 
     static Identity validate(
             HazelcastProperties hazelcast, ClusterProperties cluster, ControlEndpointProperties control) {
+        String bindAddress = hazelcast.getBindAddress();
         if (hazelcast.getDiscovery().getMode() == HazelcastProperties.DiscoveryMode.NONE) {
+            if (!loopback(bindAddress)) {
+                throw new TapstateException(BootError.MEMBER_BIND_ADDRESS_INVALID, Map.of(), null);
+            }
             return null;
+        }
+        if (loopback(bindAddress) || unspecified(bindAddress)) {
+            throw new TapstateException(BootError.MEMBER_BIND_ADDRESS_INVALID, Map.of(), null);
         }
         String clusterId = required(cluster.getId(), BootError.CLUSTER_ID_REQUIRED);
         try {
@@ -90,9 +97,14 @@ final class ClusterMemberPreflight {
     }
 
     private static boolean loopback(String host) {
-        return "localhost".equalsIgnoreCase(host)
+        return host == null
+                || "localhost".equalsIgnoreCase(host)
                 || "::1".equals(host)
                 || host.startsWith("127.");
+    }
+
+    private static boolean unspecified(String host) {
+        return "0.0.0.0".equals(host) || "::".equals(host);
     }
 
     record Identity(String clusterId, String nodeId, URI controlUrl, WorkloadClaim nodeSession) {

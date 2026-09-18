@@ -99,6 +99,9 @@ boot.discovery-config-invalid:
 boot.hazelcast-unavailable:
   message: "The embedded Hazelcast member could not start."
   solution: "Another process may already be using the member port on loopback; stop it or set a different port, then restart."
+boot.member-bind-address-invalid:
+  message: "The Hazelcast member bind address is not valid for the selected discovery mode."
+  solution: "Keep loopback with discovery mode none, or choose an explicit routable interface for cluster mode."
 boot.node-id-required:
   message: "Cluster discovery requires an explicit stable node id."
   solution: "Set tapstate.cluster.node-id to a value that remains stable across restarts and is unique in the cluster."
