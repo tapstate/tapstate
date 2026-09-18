@@ -57,6 +57,11 @@ interface DeliveryGauge {
      *
      * <p>A distribution rather than an average, because an average is where the slow rows disappear, and
      * the slow rows are what anybody reading a delivery time came to see.
+     *
+     * <p>A table absent from {@code durationByTable} is one whose distribution has not moved since the
+     * last reading, and what was taken for it stands. These are values under a name, not deltas, so a
+     * reading not taken again is the reading still there — which is what already makes a count read
+     * correctly through a lull in which nothing settles at all.
      */
     void took(Map<String, HistogramValue> durationByTable);
 

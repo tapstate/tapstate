@@ -38,9 +38,16 @@ class AStageTimesItsOwnUnitsOfWorkTest {
         private final List<Long> starts = new ArrayList<>();
 
         @Override
-        public void took(Stage stage, HistogramValue distribution, long countingSinceMillis) {
+        public void took(Stage stage, long count, long sumNanos, long[] bucketCounts, long countingSinceMillis) {
             stages.add(stage);
-            distributions.add(distribution);
+            // Copied, not kept: the array handed over is the timer's own and goes on changing. A double
+            // that kept it would show every reading as the last one, and a reading asserted against the
+            // final state of the run is a reading nobody checked.
+            List<Long> counts = new ArrayList<>(bucketCounts.length);
+            for (long bucket : bucketCounts) {
+                counts.add(bucket);
+            }
+            distributions.add(HistogramBounds.PROCESS_DURATION.value(count, sumNanos / 1_000_000_000.0, counts));
             starts.add(countingSinceMillis);
         }
 

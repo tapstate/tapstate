@@ -23,6 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.LongSupplier;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -398,7 +399,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // was from the source's stamp until its write was known to have succeeded, and the wait in
             // this processor's queue and in flight at the target is part of that, not noise around it.
             batch.delivered().foldDurationsInto(settledDurations, clock.getAsLong());
-            reportDelivered();
+            reportDelivered(batch.delivered().tables());
             return true;
         });
         if (frontier != null) {
@@ -419,8 +420,15 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         gauge.pinned(frontier.stalls());
     }
 
-    /** Hands out what has settled so far, both readings from the one set of totals this processor keeps. */
-    private void reportDelivered() {
+    /**
+     * Hands out what has settled so far, every reading from the one set of totals this processor keeps.
+     *
+     * <p>{@code touched} names the tables the batch that just settled held rows of, and the distributions
+     * handed over are theirs alone. Every other table's is the one already published and has not moved;
+     * assembling all of them would build a boxed list per table on every settle — fifty of them for a
+     * batch that touched one, a few hundred times a second.
+     */
+    private void reportDelivered(Set<String> touched) {
         if (deliveredByTableAndOp.isEmpty()) {
             return;
         }
@@ -428,7 +436,12 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         delivery.carried(settledBytes);
         delivery.reached(newestSettledEventTime);
         Map<String, HistogramValue> durations = new LinkedHashMap<>();
-        settledDurations.forEach((table, totals) -> durations.put(table, totals.value()));
+        for (String table : touched) {
+            DurationTotals totals = settledDurations.get(table);
+            if (totals != null) {
+                durations.put(table, totals.value());
+            }
+        }
         delivery.took(durations);
         // Published with them and never alone: a total is readable only against what it accumulates from,
         // and the two arriving by different routes is how they come to disagree.
@@ -484,6 +497,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      */
     private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> bytes,
             Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes) {
+
+        /** The tables this batch settled rows of, which are the ones whose readings have moved. */
+        Set<String> tables() {
+            return rows.keySet();
+        }
 
         static DeliveredRows of(List<Envelope> batch) {
             Map<String, Map<String, Long>> rows = new LinkedHashMap<>();

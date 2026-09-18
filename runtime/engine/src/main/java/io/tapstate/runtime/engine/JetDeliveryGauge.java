@@ -1,7 +1,5 @@
 package io.tapstate.runtime.engine;
 
-import com.hazelcast.jet.core.metrics.Metric;
-import com.hazelcast.jet.core.metrics.Metrics;
 import io.tapstate.core.lifecycle.HistogramValue;
 import java.util.HashMap;
 import java.util.List;
@@ -24,7 +22,9 @@ import java.util.Map;
  * <p>Readings can only be taken from the job's own threads, which is why a sink driven outside a running
  * job is given a gauge that reads nothing instead of this one. The handle for a name is kept once
  * obtained — it belongs to the sink rather than to whichever thread ran it — so a reading costs a lookup
- * and a write.
+ * and, through {@link JobStatistic}, a write only where the number moved. The readings arrive as whole
+ * maps of running totals, and a batch settling rows of one table leaves every other table's numbers
+ * exactly as they were.
  */
 final class JetDeliveryGauge implements DeliveryGauge {
 
@@ -50,11 +50,11 @@ final class JetDeliveryGauge implements DeliveryGauge {
     static final String DURATION_SUM_PREFIX = "outDeliverySumMillis.";
     static final String DURATION_BUCKET_PREFIX = "outDeliveryBucket.";
 
-    private final Map<String, Metric> deliveredByKey = new HashMap<>();
-    private final Map<String, Metric> carriedByTable = new HashMap<>();
-    private final Map<String, Metric> reachedByTable = new HashMap<>();
-    private final Map<String, Metric> durationParts = new HashMap<>();
-    private Metric since;
+    private final Map<String, JobStatistic> deliveredByKey = new HashMap<>();
+    private final Map<String, JobStatistic> carriedByTable = new HashMap<>();
+    private final Map<String, JobStatistic> reachedByTable = new HashMap<>();
+    private final Map<String, JobStatistic> durationParts = new HashMap<>();
+    private JobStatistic since;
 
     @Override
     public void delivered(Map<String, Map<String, Long>> rowsByTableAndOp) {
@@ -87,8 +87,8 @@ final class JetDeliveryGauge implements DeliveryGauge {
         });
     }
 
-    private Metric part(String name) {
-        return durationParts.computeIfAbsent(name, Metrics::metric);
+    private JobStatistic part(String name) {
+        return durationParts.computeIfAbsent(name, JobStatistic::new);
     }
 
     @Override
@@ -99,7 +99,7 @@ final class JetDeliveryGauge implements DeliveryGauge {
     @Override
     public void countingSince(long epochMillis) {
         if (since == null) {
-            since = Metrics.metric(SINCE_METRIC);
+            since = new JobStatistic(SINCE_METRIC);
         }
         since.set(epochMillis);
     }
@@ -190,15 +190,15 @@ final class JetDeliveryGauge implements DeliveryGauge {
     record DurationBucket(int index, String table) {
     }
 
-    private static Metric deliveredMetricFor(String opAndTable) {
-        return Metrics.metric(DELIVERED_PREFIX + opAndTable);
+    private static JobStatistic deliveredMetricFor(String opAndTable) {
+        return new JobStatistic(DELIVERED_PREFIX + opAndTable);
     }
 
-    private static Metric carriedMetricFor(String table) {
-        return Metrics.metric(CARRIED_PREFIX + table);
+    private static JobStatistic carriedMetricFor(String table) {
+        return new JobStatistic(CARRIED_PREFIX + table);
     }
 
-    private static Metric reachedMetricFor(String table) {
-        return Metrics.metric(REACHED_PREFIX + table);
+    private static JobStatistic reachedMetricFor(String table) {
+        return new JobStatistic(REACHED_PREFIX + table);
     }
 }

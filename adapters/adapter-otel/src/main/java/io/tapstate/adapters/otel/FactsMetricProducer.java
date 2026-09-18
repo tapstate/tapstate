@@ -120,6 +120,10 @@ final class FactsMetricProducer implements MetricProducer {
         // neither chart nor data, and keeping its names would turn the export limit into a ratchet — a
         // process that creates and removes pipelines would spend it on pipelines that no longer exist and
         // fold the ones that do.
+        // Swept on every pass rather than only when the set has changed. A pass costs one pipeline-id
+        // lookup per named series, which at the export limit is a few hundred thousand a second and a
+        // couple of milliseconds; a guard on "has anything left since last time" has to know what was
+        // named since last time as well, and a guard that gets that wrong is a name never given back.
         synchronized (this) {
             named.values().forEach(sets -> sets.removeIf(attributes -> {
                 String pipeline = attributes.get(MetricAttributes.PIPELINE_ID);

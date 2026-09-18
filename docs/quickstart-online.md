@@ -630,7 +630,11 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
 - `metrics` is the signal for progress: `records.out` climbing and no `errors.<code>` key appearing.
 - **The same facts can go to your monitoring.** Export is off unless you turn it on, and turning it on
   changes nothing the CLI reads. To serve a Prometheus scrape endpoint, start the server with
-  `--tapstate.metrics.export.prometheus.port=9464` and point Prometheus at `/metrics` on that port; to
+  `--tapstate.metrics.export.prometheus.port=9464` and point Prometheus at `/metrics` on that port. It
+  listens on `127.0.0.1` unless you widen it with `--tapstate.metrics.export.prometheus.host=0.0.0.0`,
+  which a scraper running outside this container needs; what it serves is an inventory of pipeline,
+  table and namespace ids, and a scrape endpoint carries no authentication, so widen it to a network the
+  scraper is already inside. To
   push to an OpenTelemetry collector, set `--tapstate.metrics.export.otlp.endpoint=http://collector:4318/v1/metrics`
   (`--tapstate.metrics.export.otlp.protocol=grpc` with a `host:port` endpoint for gRPC; the push interval
   defaults to a minute). What arrives is what `metrics` shows: counters such as

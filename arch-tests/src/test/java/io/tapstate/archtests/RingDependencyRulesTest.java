@@ -13,7 +13,9 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
+import static com.tngtech.archunit.base.DescribedPredicate.not;
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.assignableTo;
+import static com.tngtech.archunit.core.domain.JavaClass.Predicates.equivalentTo;
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.resideInAPackage;
 import static com.tngtech.archunit.core.domain.properties.HasName.Predicates.name;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
@@ -303,6 +305,24 @@ class RingDependencyRulesTest {
                 .allowEmptyShould(true)
                 .because("the Mongo driver is locked to adapter-mongo-store; no other module may "
                         + "depend on it")
+                .check(tapstateClasses);
+    }
+
+    @Test
+    @DisplayName("R4 (source ring): the source ring's one edge into the engine is the stage timer")
+    void r4_sourceRingTouchesOnlyTheStageTimer() {
+        // R4 lets one runtime module compile against another, and the source ring uses that for exactly
+        // one thing: a source vertex is a stage of the engine's graph and reports how long its units of
+        // work take through the same seam every other stage uses. Nothing else about the engine is the
+        // source ring's business -- not the graph builder, not the sink adapter, not the stateful
+        // operators -- and the edge that carries the timer would carry any of them without looking
+        // unusual. This is what makes the second import red instead of ordinary.
+        noClasses().that().resideInAPackage("io.tapstate.runtime.srs..")
+                .should().dependOnClassesThat(resideInAPackage("io.tapstate.runtime.engine..")
+                        .and(not(equivalentTo(io.tapstate.runtime.engine.StageTimer.class))))
+                .allowEmptyShould(true)
+                .because("the source ring reaches the engine for the stage timer and for nothing else; "
+                        + "the rest of the engine is behind an edge that exists for one class")
                 .check(tapstateClasses);
     }
 

@@ -86,17 +86,31 @@ class EveryProcessorDeclaresItsStageTest {
     }
 
     @Test
-    @DisplayName("every processor family that declares a stage also times it")
+    @DisplayName("every processor family that declares a stage obtains a timer and ends units of work with it")
     void everyStagedProcessorTimesItsStage() {
         // Declaring a stage says where a processor's time would be reported; timing it is what puts a number
         // there. A family that declares and does not time reports its stage as a name with an empty
         // distribution behind it, which reads as a stage that costs nothing.
+        //
+        // Which is why obtaining the timer is not enough to ask for: a processor that calls `of` in init,
+        // keeps the timer and never ends a unit passes that question while being exactly the failure above
+        // -- and a stage reported as fast is harder to notice than a stage reported as missing. The calls
+        // are collected across the class, its lambdas included, because a family that ends its unit inside
+        // one handed to a flat-mapper is doing it correctly.
         assertThat(processors())
                 .filteredOn(processor -> processor.isAssignableTo(Staged.class))
-                .allSatisfy(processor -> assertThat(processor.getMethodCallsFromSelf())
-                        .as("%s obtains a stage timer for its stage", processor.getName())
-                        .anyMatch(call -> call.getTargetOwner().isEquivalentTo(StageTimer.class)
-                                && call.getTarget().getName().equals("of")));
+                .allSatisfy(processor -> assertThat(stageTimerCallsFrom(processor))
+                        .as("%s obtains a stage timer and ends timed units of work with it",
+                                processor.getName())
+                        .contains("of", "end"));
+    }
+
+    /** The stage-timer methods {@code processor} calls, anywhere in the class, its lambdas included. */
+    private static Set<String> stageTimerCallsFrom(JavaClass processor) {
+        return processor.getMethodCallsFromSelf().stream()
+                .filter(call -> call.getTargetOwner().isEquivalentTo(StageTimer.class))
+                .map(call -> call.getTarget().getName())
+                .collect(Collectors.toSet());
     }
 
     /**

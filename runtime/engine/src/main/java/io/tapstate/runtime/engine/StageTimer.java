@@ -24,6 +24,11 @@ import java.util.function.LongSupplier;
  * <p>The clock is monotonic and in nanoseconds; the sum is kept in nanoseconds so it never drifts by
  * rounding and converts once on the way out. Outside a running job the gauge reads nothing and this
  * still counts, so a processor driven by hand can be shown to time its work.
+ *
+ * <p>The reading goes to the gauge as the numbers behind it rather than as a distribution object: a unit
+ * of work moves three of the nineteen numbers, and assembling the object here would allocate a list and
+ * box seventeen counts per row to carry figures this timer already holds. {@link #value()} assembles it
+ * for a reader, which is not the data path.
  */
 public final class StageTimer {
 
@@ -71,7 +76,7 @@ public final class StageTimer {
         count++;
         sumNanos += nanos;
         buckets[bucketOf(nanos / 1_000_000_000.0)]++;
-        gauge.took(stage, value(), countingSinceMillis);
+        gauge.took(stage, count, sumNanos, buckets, countingSinceMillis);
     }
 
     /** The distribution so far. */

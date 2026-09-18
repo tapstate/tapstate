@@ -1,6 +1,5 @@
 package io.tapstate.runtime.engine;
 
-import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
 
 /**
@@ -12,14 +11,21 @@ import io.tapstate.core.lifecycle.Stage;
 interface StageGauge {
 
     /**
-     * Takes the reading: {@code stage}'s distribution as it stands, over the registered bounds, and the
+     * Takes the reading: {@code stage}'s distribution as it stands, as the numbers it is made of, and the
      * epoch millisecond the timing began. Cumulative, the way every reading in a run's statistics is.
+     *
+     * <p>The numbers and not a {@code HistogramValue}, because this is called once per unit of work — for
+     * a transform, once per row on the cooperative thread. Building the value object there would allocate
+     * a list and box seventeen counts per row to carry numbers the caller already holds.
+     *
+     * <p>{@code bucketCounts} belongs to the caller and goes on changing after this returns: an
+     * implementation reads it and does not keep it.
      */
-    void took(Stage stage, HistogramValue distribution, long countingSinceMillis);
+    void took(Stage stage, long count, long sumNanos, long[] bucketCounts, long countingSinceMillis);
 
     /** A gauge nothing reads, for a processor driven outside a running job. */
     static StageGauge none() {
-        return (stage, distribution, countingSinceMillis) -> {
+        return (stage, count, sumNanos, bucketCounts, countingSinceMillis) -> {
         };
     }
 }

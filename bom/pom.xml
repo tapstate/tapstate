@@ -132,7 +132,12 @@
          older line of it; the reader needs this one, so it is pinned beside the SDK it serves. -->
     <prometheus.client.version>1.8.0</prometheus.client.version>
     <!-- The Prometheus client above requires this protobuf line; Spring Boot manages the one before it.
-         Pinned ahead of the Boot import so one version resolves for every path that reaches it. -->
+         Pinned ahead of the Boot import so one version resolves for every path that reaches it. Both
+         halves are pinned, and that is the point rather than symmetry: Boot manages them together
+         through the protobuf BOM, so pinning protobuf-java alone would move it while leaving
+         protobuf-javalite on Boot's number. The CEL expression engine brings both, and the two ship the
+         same com.google.protobuf packages: one classpath, two versions of one project, in a module that
+         has nothing to do with metrics export. -->
     <protobuf.java.version>4.35.0</protobuf.java.version>
   </properties>
 
@@ -184,6 +189,11 @@
         <version>${prometheus.client.version}</version>
         <type>pom</type>
         <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-javalite</artifactId>
+        <version>${protobuf.java.version}</version>
       </dependency>
       <dependency>
         <groupId>com.google.protobuf</groupId>

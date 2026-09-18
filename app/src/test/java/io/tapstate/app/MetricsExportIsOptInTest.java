@@ -29,6 +29,24 @@ class MetricsExportIsOptInTest {
     }
 
     @Test
+    void theScrapeEndpointListensOnTheLoopbackUnlessItIsWidenedOnPurpose() {
+        // Setting the port alone is what an operator following the commented example does. What the
+        // endpoint then serves is an inventory rather than a summary -- pipeline, table, chain and nest
+        // namespace ids all ride as attribute values -- and a scrape endpoint carries no authentication
+        // anywhere, which is why the interface it listens on is the loopback until somebody widens it.
+        MetricsExportProperties defaults = new MetricsExportProperties();
+        defaults.getPrometheus().setPort(9464);
+
+        assertThat(defaults.settings().prometheusHost()).isEqualTo("127.0.0.1");
+
+        MetricsExportProperties widened = new MetricsExportProperties();
+        widened.getPrometheus().setPort(9464);
+        widened.getPrometheus().setHost("0.0.0.0");
+
+        assertThat(widened.settings().prometheusHost()).isEqualTo("0.0.0.0");
+    }
+
+    @Test
     void aPrometheusPortAloneStartsTheAdapterOnThatPort() throws IOException {
         int port;
         try (ServerSocket socket = new ServerSocket(0)) {

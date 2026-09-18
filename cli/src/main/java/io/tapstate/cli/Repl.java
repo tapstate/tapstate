@@ -4649,6 +4649,13 @@ final class Repl {
      * <p>When the status face answered on its own -- the reading is stale, or the run failed -- no other
      * face is read, for the reason the answer gives, and the movement says so rather than measuring
      * across an observation the answer has already called old.
+     *
+     * <p><strong>The second reading is only waited for at a terminal.</strong> A person who ran this and
+     * is looking at it will spend a second on a rate; a script will not, and this verb is the one people
+     * run in a loop over every pipeline they have. Waiting there costs about a second per pipeline
+     * against a healthy publisher and the whole bound against a stalled one, for a number nothing in the
+     * script asked for. Without a terminal the answer is the honest "one reading", with the verb that
+     * does stream rates named beside it.
      */
     private void renderMovement(PrintWriter out, String id, StatusOutcome.Found found, boolean statusAnswered,
             MetricsOutcome first) {
@@ -4666,11 +4673,13 @@ final class Repl {
             out.println(lag + "not published");
             return;
         }
-        MovementReading later = awaitNewerReading(id, earlier);
+        boolean atATerminal = terminal.getAsBoolean();
+        MovementReading later = atATerminal ? awaitNewerReading(id, earlier) : null;
         if (later == null) {
-            out.println(moving + "not known -- the reading did not advance in "
-                    + MovementReading.seconds(rateWait) + "; one reading gives no rate"
-                    + " (the publisher may have stalled)");
+            out.println(moving + "not known -- " + (atATerminal
+                    ? "the reading did not advance in " + MovementReading.seconds(rateWait)
+                            + "; one reading gives no rate (the publisher may have stalled)"
+                    : "one reading, and not a terminal to wait at; --watch streams rates"));
             out.println(lag + earlier.describeLag());
             return;
         }

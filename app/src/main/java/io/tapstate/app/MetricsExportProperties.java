@@ -77,8 +77,17 @@ public class MetricsExportProperties {
         /** The port the scrape endpoint listens on; unset means none is served. */
         private Integer port;
 
-        /** The interface it listens on; all of them unless narrowed. */
-        private String host = "0.0.0.0";
+        /**
+         * The interface it listens on. The loopback, unless it is widened here on purpose.
+         *
+         * <p>What the endpoint serves is an inventory rather than a summary: pipeline ids, table ids,
+         * chain ids and nest namespaces all ride as attribute values, and there is no authentication in
+         * front of it — a scrape endpoint has none anywhere, which is why the usual place for one is a
+         * network a scraper is already inside. A Prometheus on this host reaches the loopback; one in
+         * another container reaches this process by its container address, which is what widening this
+         * is for.
+         */
+        private String host = "127.0.0.1";
 
         public Integer getPort() {
             return port;

@@ -1,11 +1,8 @@
 package io.tapstate.runtime.engine;
 
-import com.hazelcast.jet.core.metrics.Metric;
-import com.hazelcast.jet.core.metrics.Metrics;
-import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
+import java.util.EnumMap;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -18,6 +15,11 @@ import java.util.Map;
  * <p>Readings can only be taken from the job's own threads, which is why a processor driven outside a
  * running job is given a gauge that reads nothing instead of this one. The handle for a name is kept once
  * obtained — it belongs to the processor rather than to whichever thread ran it.
+ *
+ * <p>What is written is what moved. One unit of work changes the count, the sum and one bucket, so
+ * publishing the whole distribution writes sixteen numbers that already hold that value — once per row
+ * through a transform, on the cooperative thread. {@link JobStatistic} keeps the last value written under
+ * each name and skips the rest.
  */
 final class JetStageGauge implements StageGauge {
 
@@ -27,22 +29,31 @@ final class JetStageGauge implements StageGauge {
     static final String BUCKET = ".bucket.";
     static final String SINCE = ".since";
 
-    private final Map<String, Metric> parts = new HashMap<>();
+    private final Map<String, JobStatistic> parts = new HashMap<>();
+    private final Map<Stage, JobStatistic[]> bucketsByStage = new EnumMap<>(Stage.class);
 
     @Override
-    public void took(Stage stage, HistogramValue distribution, long countingSinceMillis) {
+    public void took(Stage stage, long count, long sumNanos, long[] bucketCounts, long countingSinceMillis) {
         String name = PREFIX + stage.attributeValue();
-        part(name + COUNT).set(distribution.count());
-        part(name + SUM_MICROS).set(Math.round(distribution.sum() * 1_000_000.0));
-        List<Long> buckets = distribution.bucketCounts();
-        for (int index = 0; index < buckets.size(); index++) {
-            part(name + BUCKET + index).set(buckets.get(index));
+        part(name + COUNT).set(count);
+        // Microseconds, which is what the reader adds up across processors and divides back to seconds.
+        part(name + SUM_MICROS).set(Math.round(sumNanos / 1_000.0));
+        // The bucket handles by index, so a unit of work does not build seventeen names to find them.
+        JobStatistic[] buckets = bucketsByStage.computeIfAbsent(stage, ignored -> {
+            JobStatistic[] handles = new JobStatistic[bucketCounts.length];
+            for (int index = 0; index < handles.length; index++) {
+                handles[index] = part(name + BUCKET + index);
+            }
+            return handles;
+        });
+        for (int index = 0; index < bucketCounts.length; index++) {
+            buckets[index].set(bucketCounts[index]);
         }
         part(name + SINCE).set(countingSinceMillis);
     }
 
-    private Metric part(String name) {
-        return parts.computeIfAbsent(name, Metrics::metric);
+    private JobStatistic part(String name) {
+        return parts.computeIfAbsent(name, JobStatistic::new);
     }
 
     /** What one statistic is about: which stage, and which part of its distribution. */
