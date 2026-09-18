@@ -11,8 +11,9 @@ import java.util.Objects;
  * durable delivery confirmation, so a resume conservatively reads it again. Its rows still enter stateful
  * operators whose state survives that rebuild. Giving every run the same made-up generation would make the
  * reread lose every strict ordering comparison against the state it is meant to refresh. This counter is
- * the missing order source: it rises once before each physical snapshot-only start and is kept with the
- * capture-side state a later drive reads again.
+ * the missing order source: it rises once before each physical snapshot-only start, begins above every
+ * retained change-chain generation for this pipeline, and is kept with the capture-side state a later
+ * drive reads again.
  *
  * <p>The lifecycle owner is the single writer for a pipeline. The state store therefore needs no new
  * compare-and-swap surface here; its ordinary durable keyed write has the same ownership contract as the
@@ -26,10 +27,22 @@ final class SnapshotRunOrder {
     private SnapshotRunOrder() {
     }
 
-    /** Advances and durably returns the generation for the next physical run of {@code pipelineId}. */
-    static long next(KeyedStateStore store, String pipelineId) {
+    /**
+     * Advances and durably returns the generation for the next physical run of {@code pipelineId}.
+     *
+     * <p>{@code retainedChainGeneration} is the highest generation left by a chain-backed run whose
+     * operator state this run may meet. The independent counter and that retained floor are one ordering
+     * domain here: advancing the greater of them makes a first snapshot-only run rank after either kind of
+     * predecessor, while later snapshot-only runs continue from their own durable counter.
+     */
+    static long next(KeyedStateStore store, String pipelineId, long retainedChainGeneration) {
         Objects.requireNonNull(store, "store");
-        long next = Math.incrementExact(read(store, pipelineId, 0L));
+        if (retainedChainGeneration < 0) {
+            throw new IllegalArgumentException(
+                    "retained chain generation must not be negative, got " + retainedChainGeneration);
+        }
+        long next = Math.incrementExact(Math.max(
+                read(store, pipelineId, 0L), retainedChainGeneration));
         store.save(namespaceOf(pipelineId), KEY,
                 Long.toString(next).getBytes(StandardCharsets.US_ASCII));
         return next;

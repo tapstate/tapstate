@@ -17,6 +17,7 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.core.lifecycle.TableSnapshot;
 
@@ -86,10 +87,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
         ReadMode readMode = readModeOf(pipeline.settings());
         // A snapshot-only run has no change chain to supply a generation. Advance its own durable order
-        // once for the whole pipeline run, so every source in one assembly is comparable and a rebuild's
-        // rows outrank state the run before it left behind.
+        // once for the whole pipeline run and above every retained chain generation, so every source in
+        // one assembly is comparable and the first run after a mode switch also outranks preserved state.
         long snapshotEpoch = readMode == ReadMode.SNAPSHOT_ONLY
-                ? SnapshotRunOrder.next(storePort.keyedState(), pipelineId)
+                ? SnapshotRunOrder.next(storePort.keyedState(), pipelineId, retainedChainGeneration(pipelineId))
                 : 1L;
         List<CaptureRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
@@ -122,6 +123,22 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         runsByPipeline.put(pipelineId, runs);
         snapshotsByPipeline.put(pipelineId, keyByTableOrQualifyOnCollision(attributed));
         snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
+    }
+
+    /**
+     * The highest chain generation whose durable consumer record says this pipeline reached it.
+     *
+     * <p>A stop that preserves state leaves that record beside the operator state it ordered. Looking
+     * across every such chain also covers a pipeline whose source binding changed while stopped; using
+     * only the source it names now would lose the generation of the state the earlier binding left behind.
+     */
+    private long retainedChainGeneration(String pipelineId) {
+        return storePort.meta().miningChainIdsWithConsumer(pipelineId).stream()
+                .map(storePort.meta()::read)
+                .flatMap(Optional::stream)
+                .mapToLong(SrsMeta::epoch)
+                .max()
+                .orElse(0L);
     }
 
     /** One source run's snapshot: its completion chain, if any, and the tables it covers. */

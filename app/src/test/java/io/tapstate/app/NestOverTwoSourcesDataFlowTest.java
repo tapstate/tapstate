@@ -206,6 +206,38 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     /**
+     * A bounded read that follows a chain-backed run enters the same stateful operators, so its first
+     * generation must outrank the chain generation those operators retained rather than start a second
+     * ordering domain at one. Equal generations lose the nest's strict comparison and emit nothing.
+     */
+    @Test
+    @DisplayName("a snapshot-only run outranks chain-backed state kept from the preceding run")
+    void snapshotOnlyRunOutranksRetainedChainBackedState() {
+        InMemoryStorePort store = seedStore();
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        Map<String, List<Envelope>> rowsByTable = snapshotRows();
+        LifecycleActuator actuator = wireRuntime(store, srsCoordinator, rowsByTable);
+
+        actuator.start(PIPELINE);
+        awaitAssembled();
+        actuator.stop(PIPELINE, false);
+
+        rowsByTable.put(PARENT_TABLE, List.of(
+                order(1, "order-1-after-stop"), order(2, "order-2-after-stop")));
+        store.artifacts().save(pipeline(ReadMode.SNAPSHOT_ONLY));
+        CapturingSinkWriter.reset();
+        actuator.start(PIPELINE);
+        try {
+            awaitAssembled();
+            assertThat(latestPerRoot(new ArrayList<>(CapturingSinkWriter.collected())).get(1L))
+                    .containsEntry("name", "order-1-after-stop");
+            assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
+        } finally {
+            stopQuietly(actuator);
+        }
+    }
+
+    /**
      * Both sources name the same connection, so they are one mining chain with a ring per table - which is
      * what a nest over two tables of one database is, and what the real two-source witness seeds. Stopping
      * such a pipeline must not fall over on the second source, and must still leave the chain closed.
@@ -260,6 +292,13 @@ class NestOverTwoSourcesDataFlowTest {
      * the production path.
      */
     private LifecycleActuator wireRuntime(InMemoryStorePort store, SrsCoordinator srsCoordinator) {
+        return wireRuntime(store, srsCoordinator, snapshotRows());
+    }
+
+    private LifecycleActuator wireRuntime(
+            InMemoryStorePort store,
+            SrsCoordinator srsCoordinator,
+            Map<String, List<Envelope>> rowsByTable) {
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
         member.getUserContext().put(PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY,
@@ -271,10 +310,6 @@ class NestOverTwoSourcesDataFlowTest {
 
         // One fake connector for both capture units, telling them apart by the stream each asks for -
         // which is what a single-table capture unit names.
-        Map<String, List<Envelope>> rowsByTable = new LinkedHashMap<>();
-        rowsByTable.put(PARENT_TABLE, List.of(order(1), order(2)));
-        rowsByTable.put(CHILD_TABLE, List.of(item(1, 1), item(2, 1), item(3, 1), item(4, 2)));
-
         CaptureRunUnit captureRunUnit =
                 new CaptureRunUnit(new FakeSource(rowsByTable), srsCoordinator, meta, member);
         PipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
@@ -285,6 +320,13 @@ class NestOverTwoSourcesDataFlowTest {
         return new EngineLifecycleActuator(
                 new Engine(member), new StoreBackedDagSource(store, capturingSink), coordinator,
                 new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
+    }
+
+    private static Map<String, List<Envelope>> snapshotRows() {
+        Map<String, List<Envelope>> rowsByTable = new LinkedHashMap<>();
+        rowsByTable.put(PARENT_TABLE, List.of(order(1), order(2)));
+        rowsByTable.put(CHILD_TABLE, List.of(item(1, 1), item(2, 1), item(3, 1), item(4, 2)));
+        return rowsByTable;
     }
 
     /** The two sources, the sink connection and the nest pipeline, plus a discovered model for each source. */
@@ -298,20 +340,7 @@ class NestOverTwoSourcesDataFlowTest {
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
         artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
 
-        Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, EMBED_PATH, List.of("id"),
-                null, null, null);
-        TransformBody.Nest body = new TransformBody.Nest(null, null,
-                new NestRoot("o", List.of("id"), null, null, List.of(item)));
-        Map<String, FromRef> aliases = new LinkedHashMap<>();
-        aliases.put("o", FromRef.literal(PARENT_TABLE));
-        aliases.put("i", FromRef.literal(CHILD_TABLE));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
-
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
-                List.of(step), null,
-                new ServeBlock.Inline(null, FromRef.literal(STEP),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
-                new Settings(null, null, null, null, readMode, "earliest"), null));
+        artifacts.save(pipeline(readMode));
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         // Both models are discovered: the parent's resolves the target the sink writes, and each supplies
@@ -328,6 +357,23 @@ class NestOverTwoSourcesDataFlowTest {
         return store;
     }
 
+    private static PipelineResource pipeline(ReadMode readMode) {
+        Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, EMBED_PATH, List.of("id"),
+                null, null, null);
+        TransformBody.Nest body = new TransformBody.Nest(null, null,
+                new NestRoot("o", List.of("id"), null, null, List.of(item)));
+        Map<String, FromRef> aliases = new LinkedHashMap<>();
+        aliases.put("o", FromRef.literal(PARENT_TABLE));
+        aliases.put("i", FromRef.literal(CHILD_TABLE));
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
+        return new PipelineResource(PIPELINE, null,
+                List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
+                List.of(step), null,
+                new ServeBlock.Inline(null, FromRef.literal(STEP),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
+                new Settings(null, null, null, null, readMode, "earliest"), null);
+    }
+
     private static SourceResource source(String id, String table) {
         return new SourceResource(id, null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal(table)), null, null);
@@ -338,7 +384,11 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     private static Envelope order(long id) {
-        return Envelope.read(id, PARENT_TABLE, Map.of("id", id, "name", "order-" + id), Map.of());
+        return order(id, "order-" + id);
+    }
+
+    private static Envelope order(long id, String name) {
+        return Envelope.read(id, PARENT_TABLE, Map.of("id", id, "name", name), Map.of());
     }
 
     private static Envelope item(long id, long orderId) {
