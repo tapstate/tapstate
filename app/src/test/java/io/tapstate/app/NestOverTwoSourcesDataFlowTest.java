@@ -13,6 +13,7 @@ import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
@@ -37,6 +38,7 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsRingbuffer;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -167,7 +169,19 @@ class NestOverTwoSourcesDataFlowTest {
     @DisplayName("a snapshot-only nest assembles with no change chain behind its ordered rows")
     void snapshotOnlyRowsAreAssembledWithoutInventingAResumePosition() {
         InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_ONLY);
-        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        // A neighbouring pipeline has the same physical source open and has already put a current change in
+        // its shared ring. This bounded run shares the ring name as a buffer coordinate, but must neither
+        // consume that change nor publish a durable cursor that can hold the neighbour's ring open.
+        SourceResource parent = StoredArtifacts.requireSource(store.artifacts(), PARENT_SOURCE);
+        SourceCaptureResolution shared = SourceCaptureResolution.of(parent, SourceDiscovery.model(store, parent));
+        srsCoordinator.provisionSource("neighbouring-source", shared.chainId(),
+                List.of(PARENT_TABLE, CHILD_TABLE), null);
+        srsCoordinator.attachConsumer(shared.chainId(), "neighbouring-pipeline");
+        new SrsRingbuffer(member.getRingbuffer(shared.ringName(PARENT_TABLE))).append(
+                new SrsItem(new SourcePosition("neighbour-0"), Op.UPDATE, 1L,
+                        Map.of("id", 1L, "name", "old"), Map.of("id", 1L, "name", "changed"), 0L));
+        LifecycleActuator actuator = wireRuntime(store, srsCoordinator);
 
         actuator.start(PIPELINE);
         try {

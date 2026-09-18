@@ -244,6 +244,43 @@ class SrsSourceProcessorTest {
     }
 
     @Test
+    void snapshotOnlySourceNeverReadsPastOrFutureChangesFromTheSharedRing() throws InterruptedException {
+        String ringName = "srs.chain.snapshot-only";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.append(PIPELINE, ringName, snapshotRow(100).withOrder(SourceOrder.snapshotRow(7L)));
+        fill(ringName, 2);
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+
+        DAG dag = new DAG();
+        Vertex source = dag.newVertex("source", SrsSourceProcessor.snapshotOnlyMetaSupplier(
+                PIPELINE, ringName, "orders", 7L, null));
+        Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
+                .localParallelism(1);
+        Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP("out-snapshot-only"))
+                .localParallelism(1);
+        dag.edge(between(source, project)).edge(between(project, sink));
+
+        Job job = hz.getJet().newJob(dag);
+        IList<String> out = hz.getList("out-snapshot-only");
+        try {
+            awaitSize(out, 1);
+            Thread.sleep(500);
+            assertThat(out).containsExactly("orders|null|100|7:" + SourceOrder.SNAPSHOT_SEQ);
+
+            new SrsRingbuffer(hz.getRingbuffer(ringName))
+                    .append(new SrsItem(new SourcePosition("w2"), Op.INSERT, 1L, null, Map.of("id", 2), 0L));
+            Thread.sleep(500);
+
+            assertThat(out).containsExactly("orders|null|100|7:" + SourceOrder.SNAPSHOT_SEQ);
+            assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            out.destroy();
+        }
+    }
+
+    @Test
     void refusesAChangeFoundOnARingWhoseChainHasNoGenerationOpen() throws InterruptedException {
         // A source with no generation reads no chain of its own, so its ring is one nobody fills. A change
         // sitting on it means a capture is writing a chain that was never opened -- and the alternative to

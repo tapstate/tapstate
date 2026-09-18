@@ -1176,13 +1176,14 @@ final class StoreBackedDagSource implements DagSource {
             FrontierBinding frontier,
             Map<String, CompiledJoin> compiledJoins) {
         ChainAxes axes = frontier.axes();
-        long snapshotEpoch = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY
+        boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
+        long snapshotEpoch = snapshotOnly
                 ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id())
                 : 0L;
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         return new DagBindings(
-                key -> sourceVertex(sourceVertices.get(key), axes, snapshotEpoch),
+                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> sinkWriter(pipeline, element, targets, serveStreams),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
@@ -2079,7 +2080,8 @@ final class StoreBackedDagSource implements DagSource {
      * Resolving the same ring identity the capture side resolves is what points the reader at the ring the
      * writer fills.
      */
-    private ProcessorMetaSupplier sourceVertex(SourceVertex vertex, ChainAxes axes, long snapshotEpoch) {
+    private ProcessorMetaSupplier sourceVertex(
+            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -2088,9 +2090,14 @@ final class StoreBackedDagSource implements DagSource {
         // here rather than reached for from the source.
         String chain = vertex.table();
         byte axis = axes.axisOf(chain);
+        if (snapshotOnly) {
+            return SrsSourceProcessor.snapshotOnlyMetaSupplier(
+                    vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), snapshotEpoch,
+                    order -> new Watermark(FrontierOrders.pack(chain, order), axis));
+        }
         return SrsSourceProcessor.metaSupplier(
                 vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
-                snapshotEpoch > 0 ? snapshotEpoch : ringGeneration(vertex.resolution()),
+                ringGeneration(vertex.resolution()),
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis));
