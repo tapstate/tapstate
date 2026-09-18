@@ -1456,10 +1456,16 @@ final class StoreBackedDagSource implements DagSource {
      * <p>What feeds the view is resolved by walking its from-reference down to leaves: a nest step is
      * one assembled stream carrying its explicitly declared root key, a source id is each of its
      * tables, anything else is one table. A regex names many upstreams by construction and is refused
-     * as such. A discovered primary key is only a default; an explicitly selected view key may use a
-     * different discovered unique identity, but cannot name a column whose uniqueness is not known.
-     * The return value says that the accepted identity is such an alternate, so its writer can require
-     * the key in update and delete before images before applying either change.
+     * as such.
+     *
+     * <p>A discovered primary key is only a default, and an explicitly selected view key takes
+     * precedence over it - but precedence is not a waiver of proof that the chosen key can do the job.
+     * So an alternate is accepted only from an index discovery established constrains every row. A
+     * bare unique bit is not that: stores report it for indexes that skip the rows they do not qualify
+     * and for columns whose nulls they never compare, and most discovery carries the bit with nothing
+     * beside it to tell those apart. Where nothing proved the alternate, the primary key is what the
+     * view has to key on. The return value says the accepted identity is such an alternate, so its
+     * writer can require the key in update and delete before images before applying either change.
      */
     private static boolean requireKeyIsTheFeedIdentity(PipelineResource pipeline, ViewBlock.Inline view,
             Map<String, TargetTable> targets, Map<String, List<String>> tablesBySourceId) {
@@ -1475,35 +1481,51 @@ final class StoreBackedDagSource implements DagSource {
             return false;
         }
         // An undiscovered table has no identity claim to compare, so the view remains usable before
-        // discovery. Once discovery has supplied a model, the selected key must be one of its unique
-        // identities. The primary key is present in the same index list as secondary unique keys, which
-        // lets an explicit key override that default without turning an unconstrained column into one.
+        // discovery. Once discovery has supplied a model, the selected key is either the identity that
+        // model records for every row, or an index discovery proved constrains every one of them.
         if (streams.size() == 1 && targets != null) {
             TargetTable model = targets.get(streams.getFirst());
             if (model != null) {
                 List<String> selected = List.of(view.primaryKey());
-                List<List<String>> identities = model.indexes().stream()
-                        .filter(TargetIndex::unique).map(TargetIndex::fields).toList();
-                List<String> defaultIdentity = model.fields().stream()
+                List<String> discoveredKey = model.fields().stream()
                         .filter(TargetField::primaryKey).map(TargetField::name).toList();
-                if (!identities.contains(selected)) {
-                    requireKeyIs(view, defaultIdentity.isEmpty() && !identities.isEmpty()
-                            ? identities.getFirst() : defaultIdentity);
+                if (selected.equals(discoveredKey)) {
+                    return false;
                 }
-                return !selected.equals(defaultIdentity);
+                if (model.indexes().stream().filter(TargetIndex::constrainsEveryRow)
+                        .anyMatch(index -> index.fields().equals(selected))) {
+                    return true;
+                }
+                refuseKey(view, discoveredKey.isEmpty() ? claimedIdentity(model) : discoveredKey);
             }
         }
         return false;
     }
 
+    /**
+     * What a refusal names where discovery recorded no primary key: the first uniqueness the source
+     * claimed, which is the nearest thing to an identity there is to point an author at, or nothing
+     * where it claimed none. Naming it is not accepting it - the gate above has already refused it for
+     * want of proof, and an author reading that refusal still has to be told what discovery did record.
+     */
+    private static List<String> claimedIdentity(TargetTable model) {
+        return model.indexes().stream().filter(TargetIndex::unique)
+                .map(TargetIndex::fields).findFirst().orElse(List.of());
+    }
+
     /** One refusal for every feed shape: the view's single key must be exactly this identity. */
     private static void requireKeyIs(ViewBlock.Inline view, List<String> identity) {
         if (identity == null || !identity.equals(List.of(view.primaryKey()))) {
-            throw new TapstateException(ActuationError.VIEW_KEY_NOT_FEED_IDENTITY,
-                    Map.of("view", view.id(), "key", String.valueOf(view.primaryKey()),
-                            "identity", identity == null ? "(none)" : String.join(", ", identity)),
-                    null);
+            refuseKey(view, identity);
         }
+    }
+
+    /** The refusal itself, naming the identity the view should have keyed on. */
+    private static void refuseKey(ViewBlock.Inline view, List<String> identity) {
+        throw new TapstateException(ActuationError.VIEW_KEY_NOT_FEED_IDENTITY,
+                Map.of("view", view.id(), "key", String.valueOf(view.primaryKey()),
+                        "identity", identity == null ? "(none)" : String.join(", ", identity)),
+                null);
     }
 
     /** Resolves one from-reference to the leaf streams it names; see the gate above for the reading. */

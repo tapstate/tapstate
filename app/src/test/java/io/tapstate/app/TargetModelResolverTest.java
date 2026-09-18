@@ -174,9 +174,11 @@ class TargetModelResolverTest {
         TargetTable renamed = TargetModelResolver.rename(resolved,
                 new io.tapstate.core.model.RenameSpec(null, null, "archive_", null));
         assertThat(renamed.indexes()).isEqualTo(resolved.indexes());
+        // The chosen upsert key gets the unique index it needs, stated rather than proved: the key is
+        // the caller's choice and the plain index discovery found over that column constrains nothing.
         assertThat(TargetModelResolver.keyedOn(renamed, List.of("email")).indexes())
                 .containsAll(resolved.indexes())
-                .contains(new io.tapstate.spi.sink.TargetIndex(List.of("email"), true));
+                .contains(new io.tapstate.spi.sink.TargetIndex(List.of("email"), true, false));
     }
 
     // ---- fixtures ----------------------------------------------------------------------

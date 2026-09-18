@@ -146,29 +146,57 @@ final class TargetModelResolver {
         }
         List<TargetIndex> indexes = new ArrayList<>();
         if (!primaryKey.isEmpty()) {
-            indexes.add(new TargetIndex(primaryKey, true));
+            // The one identity a source states about every row of a table: each row has it and no two
+            // share it. It is the proof the discovered indexes below can rarely offer for themselves.
+            indexes.add(new TargetIndex(primaryKey, true, true));
         }
-        source.indexes().stream().filter(index -> !index.fields().isEmpty())
-                .map(index -> new TargetIndex(index.fields(), constrainsEveryRow(index)))
-                .filter(index -> !indexes.contains(index)).forEach(indexes::add);
+        for (SourceIndex discovered : source.indexes()) {
+            // The key's own index is dropped on the covered fields rather than on the whole index: a
+            // source usually reports its primary key a second time as an ordinary index, and that copy
+            // arrives without the proof the key itself carries, so the two no longer compare equal.
+            // Keeping both would build the same index on the target twice. Every other index is matched
+            // whole, which leaves a plain index beside a unique one over the same columns as discovery
+            // found them.
+            if (discovered.fields().isEmpty() || discovered.fields().equals(primaryKey)) {
+                continue;
+            }
+            TargetIndex index = discoveredIndex(discovered);
+            if (!indexes.contains(index)) {
+                indexes.add(index);
+            }
+        }
         return new TargetTable(source.name(), fields, indexes);
     }
 
     /**
-     * Whether a discovered index constrains every row rather than only the rows qualifying for it.
+     * One discovered index as the target model states it: what the source claimed about it, and
+     * separately whether anything here established that the claim covers every row.
      *
      * <p>The frozen PDK index type has no sparse or partial-index fields. The Mongo connector therefore
-     * retains its complete index descriptor under the {@code __t__} name prefix. Preserve ordinary
-     * unique indexes, but do not turn a sparse or partial unique index into the global row identity that
-     * {@link TargetIndex#unique()} promises. Parsing here also protects models persisted before this
-     * normalization existed; requiring a new discovery would leave those models unsafe after upgrade.
+     * retains its complete index descriptor under the {@code __t__} name prefix, which is the one place
+     * a qualifier survives discovery. A descriptor naming a sparse flag or a partial filter - or one
+     * that cannot be read at all - describes an index that leaves rows out, so its unique bit is
+     * dropped rather than carried to a target that would then enforce over rows the source never
+     * constrained. A descriptor naming neither is the only uniqueness proved here.
+     *
+     * <p>Everywhere else the bit arrives alone and is carried unproven. A partial unique index in
+     * postgres is reported exactly as a whole one, and an ordinary unique index over a nullable column
+     * lets every null row past, so the claim is worth keeping for creating the index again and is
+     * worth nothing for choosing what to match a write on.
+     *
+     * <p>Reading the descriptor here also covers models persisted before this normalization existed;
+     * requiring a new discovery would leave those models unsafe after upgrade.
      */
-    private static boolean constrainsEveryRow(SourceIndex index) {
+    private static TargetIndex discoveredIndex(SourceIndex index) {
         if (!index.unique()) {
-            return false;
+            return new TargetIndex(index.fields(), false, false);
         }
         String name = index.name();
-        return !name.startsWith("__t__") || unqualifiedMongoDescriptor(name.substring(5));
+        if (!name.startsWith("__t__")) {
+            return new TargetIndex(index.fields(), true, false);
+        }
+        boolean everyRow = unqualifiedMongoDescriptor(name.substring(5));
+        return new TargetIndex(index.fields(), everyRow, everyRow);
     }
 
     /** Reads only top-level qualifier members from the Mongo connector's retained JSON descriptor. */
@@ -290,11 +318,15 @@ final class TargetModelResolver {
         }
         List<TargetIndex> indexes = new ArrayList<>(model.indexes());
         List<String> resolvedKey = fields.stream().filter(TargetField::primaryKey).map(TargetField::name).toList();
-        if (!resolvedKey.isEmpty()) {
-            TargetIndex index = new TargetIndex(resolvedKey, true);
-            if (!indexes.contains(index)) {
-                indexes.add(index);
-            }
+        // Left alone where the model already constrains those columns, so an index that carries a proof
+        // keeps it instead of being restated as this key's own bare assertion. A plain index over the
+        // same columns constrains nothing and does not stand in for the unique one the upsert needs.
+        if (!resolvedKey.isEmpty() && indexes.stream()
+                .noneMatch(index -> index.unique() && index.fields().equals(resolvedKey))) {
+            // Unproven on purpose: this key is whoever asked for it - an assembly root's declared key,
+            // or the key a published stream still carries under new names - and nothing here checked
+            // that the source constrains it.
+            indexes.add(new TargetIndex(resolvedKey, true, false));
         }
         return new TargetTable(model.name(), fields, indexes);
     }

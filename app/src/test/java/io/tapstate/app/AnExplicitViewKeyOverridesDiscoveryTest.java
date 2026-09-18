@@ -35,11 +35,15 @@ class AnExplicitViewKeyOverridesDiscoveryTest {
                 null, new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        // The index arrives as Mongo discovery reports one, descriptor and all, because that descriptor
+        // is what shows the uniqueness covering every document rather than only the ones it qualifies.
+        // The explicit key wins over the discovered identity, but only against an identity that holds.
         store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
                 new SourceTable("orders",
                         List.of(new SourceField("_id", "objectId"), new SourceField("id", "int")),
                         List.of("_id"), List.of(new SourceIndex(
-                                "id_unique", List.of("id"), true)))))));
+                                "__t__{\"v\": 2, \"key\": {\"id\": 1}, \"name\": \"id_unique\", "
+                                        + "\"unique\": true}", List.of("id"), true)))))));
 
         assertThatCode(() -> new StoreBackedDagSource(store).dagFor("orders_pipeline"))
                 .doesNotThrowAnyException();
