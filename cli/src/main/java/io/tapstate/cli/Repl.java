@@ -675,7 +675,7 @@ final class Repl {
 
     private String canonicalPipeline(WorkbenchActionGateway.PipelineDraft draft) {
         PipelineResource pipeline = new PipelineResource(draft.id(), null, List.of(SourceRef.bare(draft.sourceId())), null,
-                new ViewBlock.Inline("view", FromRef.regex(".*"), null, null, null), null, null, null);
+                new ViewBlock.Inline("view", FromRef.regex(".*"), null, null), null, null, null);
         return new CanonicalWriter().write(pipeline);
     }
 
