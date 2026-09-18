@@ -37,7 +37,7 @@ cdc read, and `srs.enabled: false`.
 | `s07-csv-batch-import` | §14.7 | CSV batch import + cleanse | `mode: file`, literal-only `tables`, map computed value (`"=CEL"`) |
 | `s08-dual-source-join` | §14.8 | Cross-database dual-source join | `source:` id list, `join` (SQL inside the supported subset), view-only output |
 | `s09-filter-fanout-pipelines` | §14.9 | Conditional fan-out, v1 form | N pipelines × `filter` over one shared source (router is out of v1, X14) |
-| `s10-ddl-evolution-chain` | §14.10 | DDL / schema evolution five-hop chain | `include_ddl`, `srs.schema_evolution: track`, map passthrough, `view.schema`, sink `ddl: apply` |
+| `s10-ddl-evolution-chain` | DDL evolution | DDL / schema evolution five-hop chain | `include_ddl`, `srs.schema_evolution: track`, map passthrough, sink `ddl: apply` |
 | `s11-reuse-assembly` | §14.11 | Definition bodies + pure-reference assembly | `kind: transform/view/serve` definitions, string = `use:` sugar, natural-order wiring (X19) |
 | `s12-cdc-snapshot-only-rerun` | §14.1 | cdc source read one-shot on a schedule | `settings.read_mode: snapshot_only` bounds a cdc read, so `settings.schedule` is legal (read amendment) |
 | `s13-srs-disabled-passthrough` | §4 | cdc with the Shared Record Store off | `srs.enabled: false` — D14 lightweight passthrough path (read amendment) |

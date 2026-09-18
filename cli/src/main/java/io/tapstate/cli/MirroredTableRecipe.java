@@ -77,7 +77,7 @@ final class MirroredTableRecipe {
         RecipeSupport.PlannedSource source = source(answers, catalog);
         // The view reads the table by name: a from: names a step or a table, never a source id, and with one
         // source reading one literal table the name resolves to exactly that table.
-        ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal(answers.table()), "id", null, null);
+        ViewBlock view = new ViewBlock.Inline(answers.view(), FromRef.literal(answers.table()), "id", null);
         PipelineResource pipeline = new PipelineResource(pipelineId(answers), null,
                 List.of(SourceRef.bare(source.resource().id())), null, view, null, null, null);
         return RecipeSupport.outputs(List.of(source), pipeline, ASSUMED_PRIMARY_KEY, workspace);

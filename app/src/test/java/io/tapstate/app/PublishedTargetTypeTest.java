@@ -48,8 +48,10 @@ class PublishedTargetTypeTest {
         NodeColumns expanded = NodeColumns.of(new io.tapstate.core.model.TransformBody.Unwind(
                 "items", "item_no", false, null, "STRING"), Map.of("in", atTheSource()), null);
         TargetTable target = StoreBackedDagSource.publishedAs(base, expanded, atTheSource());
+        // The expanded key is unique because this pipeline says so, not because anything discovered it,
+        // so it carries the claim without the proof the parent's own index had.
         assertThat(target.indexes()).containsExactly(lookup,
-                new io.tapstate.spi.sink.TargetIndex(List.of("o_id", "item_no"), true));
+                new io.tapstate.spi.sink.TargetIndex(List.of("o_id", "item_no"), true, false));
     }
 
     /** A source table as the sink sees it: the store's own type tokens, one key column. */

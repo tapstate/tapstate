@@ -167,7 +167,7 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
         // A view and no serve block: declaring the view is the whole instruction to materialize.
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
                 List.of(step),
-                new ViewBlock.Inline(VIEW, FromRef.literal(STEP), "id", null, null),
+                new ViewBlock.Inline(VIEW, FromRef.literal(STEP), "id", null),
                 null,
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
         return artifacts;

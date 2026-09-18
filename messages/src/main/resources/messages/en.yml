@@ -48,8 +48,8 @@ actuation.view-store-unreachable:
   message: "The managed state store `{store}` a view materializes into did not answer: {reason}"
   solution: "Check that the state store is running and reachable from the server, then start the pipeline again."
 actuation.view-key-not-feed-identity:
-  message: "View `{view}` declares key `{key}`, but what feeds it is identified by `{identity}`."
-  solution: "Declare the view's primaryKey as that identity column. An identity spanning several columns cannot be served by a view today - a view's key is a single column, and materializing on fewer columns than the identity collapses distinct records."
+  message: "View `{view}` declares key `{key}`, but what feeds it has no such unique identity; its recorded identity is `{identity}`."
+  solution: "Declare the view's primaryKey as a single-column identity the input declares unique. A composite identity cannot be served by a view today, and materializing on an unconstrained or partial identity collapses distinct records."
 actuation.view-fed-by-many-tables:
   message: "View `{view}` is fed by more than one stream: {tables}."
   solution: "Feed the view from a single table, or assemble the streams into one document with a nest step and feed the view from that."
@@ -540,6 +540,9 @@ engine.no-such-job:
 engine.frontier-order-not-encodable:
   message: "Chain {chain} reached generation {epoch} position {seq}, past what the engine encodes an ordering value in."
   solution: "Report this with the pipeline: the range is a build-time width, and no configuration widens it."
+engine.view-key-missing-from-before-image:
+  message: "View {view} cannot apply a {operation} because its earlier row does not carry the selected alternate key {key}."
+  solution: "Configure the source so update and delete before images carry {key}, then start the pipeline again."
 engine.frontier-pinned:
   message: "Chain {chain} has not advanced its durable position for {minutes} minutes ({cause}; the bound combined for it has run {gap} ahead)."
   solution: "The source keeps its log from that position onwards, so act before the log's retention passes it: if the chain is waiting on changes still pending upstream, find what is holding them; if it is starved of positions, the sink has nothing to advance to and the source must supply them."

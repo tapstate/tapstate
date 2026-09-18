@@ -4,7 +4,9 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.runtime.scheduler.ConvergeResult;
 import io.tapstate.runtime.scheduler.ConvergeStatus;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
+import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.DesiredStore;
 import java.util.HashMap;
 import java.util.List;
@@ -35,10 +37,28 @@ final class ConvergenceDriver {
     // fixed delay (passes never overlap), so a plain map needs no synchronization.
     private final Map<String, Long> reconcileFailures = new HashMap<>();
 
+    private final RateSampler sampler;
+
+    /** The second projection of the facts, offered right after the first is stored; none() when nobody listens. */
+    private final MetricsExport export;
+
+    /** A driver that keeps no history, for the cases that are about convergence alone. */
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher) {
+        this(converger, desired, publisher, null);
+    }
+
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            RateSampler sampler) {
+        this(converger, desired, publisher, sampler, MetricsExport.none());
+    }
+
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            RateSampler sampler, MetricsExport export) {
         this.converger = converger;
         this.desired = desired;
         this.publisher = publisher;
+        this.sampler = sampler;
+        this.export = export == null ? MetricsExport.none() : export;
     }
 
     @Scheduled(fixedDelayString = "${tapstate.converge.interval-ms:1000}")
@@ -61,7 +81,10 @@ final class ConvergenceDriver {
                     LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
                             failure.code(), result.failure().orElse(null));
                 }
-                publisher.publish(pipelineId, failure);
+                publisher.publish(pipelineId, failure).ifPresent(published -> {
+                    sample(published);
+                    export(published);
+                });
                 // A clean pass ends the failure streak; the next throw starts counting from one again.
                 reconcileFailures.remove(pipelineId);
             } catch (RuntimeException e) {
@@ -83,8 +106,49 @@ final class ConvergenceDriver {
                 MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
             }
         }
-        // Forget streaks for pipelines that are no longer desired, so a deleted-while-failing pipeline does
-        // not leak a counter that nothing will ever clear.
+        // Forget what is kept per pipeline for pipelines that are no longer desired, so a
+        // deleted-while-failing pipeline does not leak a counter that nothing will ever clear. Both live
+        // here rather than one at each end: it is one question -- which of these still exist -- and an
+        // intent is removed only by the reclaim of the pipeline itself, so a merely stopped pipeline keeps
+        // its intent and keeps both. The publisher's own account cannot be cleared by whoever deletes the
+        // pipeline: the control ring's synchronous surface into the runtime is a closed set, and this set
+        // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
+        publisher.forgetPipelinesOutside(pipelineIds);
+        if (sampler != null) {
+            sampler.forgetPipelinesOutside(pipelineIds);
+        }
+        export.forgetPipelinesOutside(pipelineIds);
+    }
+
+    /**
+     * Offers the facts just published to the export, which holds them for whatever backend it carries them
+     * to. The same facts the observation was stored from, offered after it: the two projections read one
+     * measurement, and neither reads the other. A backend that refuses is the export's to report; it does
+     * not fail the pass that measured.
+     */
+    private void export(io.tapstate.core.lifecycle.Observation published) {
+        try {
+            export.offer(published.pipelineId(), published.state(), published.observedAt(), published.facts());
+        } catch (RuntimeException unexported) {
+            LOG.warn("Could not offer the facts of pipeline {} for export", published.pipelineId(), unexported);
+        }
+    }
+
+    /**
+     * Takes a sample off exactly what was published, at the time it was published, so the history and the
+     * latest state never describe different passes of the run. The observation is the contract and the
+     * history a record kept beside it: a history that cannot be written must not cost a pipeline the read
+     * face that says it is alive at all.
+     */
+    private void sample(io.tapstate.core.lifecycle.Observation published) {
+        if (sampler == null) {
+            return;
+        }
+        try {
+            sampler.offer(published);
+        } catch (RuntimeException unsampled) {
+            LOG.warn("Could not sample the history of pipeline {}", published.pipelineId(), unsampled);
+        }
     }
 }

@@ -119,8 +119,10 @@ class StoreBackedDagSourceTargetModelTest {
                 List.of(new io.tapstate.spi.store.SourceIndex("code_unique", List.of("code"), true)))));
         List<TargetTable> bound = new ArrayList<>();
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+        // The unique bit survives the projection because the column did not change. What it is worth
+        // does not travel with it: the source named the index plainly, so nothing proved the claim.
         assertThat(bound.getFirst().indexes()).containsExactly(
-                new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), true));
+                new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), true, false));
     }
 
     @Test
@@ -155,7 +157,7 @@ class StoreBackedDagSourceTargetModelTest {
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
                 "mongodb", Map.of("uri", "u"), null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null),
                 null, null, null));
         List<Map<String, TargetTable>> bound = new ArrayList<>();
 
@@ -177,7 +179,7 @@ class StoreBackedDagSourceTargetModelTest {
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
                 "mongodb", Map.of("uri", "u"), null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null),
                 null, null, null));
         List<TargetTable> bound = new ArrayList<>();
 
@@ -308,7 +310,7 @@ class StoreBackedDagSourceTargetModelTest {
     void does_not_require_an_undiscovered_view_source_when_sync_reads_another_source() {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("address_src"));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src"), SourceRef.bare("address_src")), null,
-                new ViewBlock.Inline("orders_view", FromRef.literal("orders_src"), "id", null, null),
+                new ViewBlock.Inline("orders_view", FromRef.literal("orders_src"), "id", null),
                 new ServeBlock.Inline(null, FromRef.literal("address_src"), List.of(new SyncElement(
                         "sync_1", "orders_dest", null, null, null)), null, null),
                 null, null));
@@ -327,7 +329,7 @@ class StoreBackedDagSourceTargetModelTest {
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
                 "mongodb", Map.of("uri", "u"), null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src")), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null),
                 null, null, null));
 
         new StoreBackedDagSource(store).validateStart("p");
@@ -556,7 +558,7 @@ class StoreBackedDagSourceTargetModelTest {
         store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
                 "mongodb", Map.of("uri", "u"), null, null, null, null));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "order_id", null),
                 null, null, null));
         List<PipelineNode> bound = new ArrayList<>();
 

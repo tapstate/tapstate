@@ -173,6 +173,19 @@
       <artifactId>adapter-transform</artifactId>
       <version>${revision}</version>
     </dependency>
+    <!-- The metrics export: the port the convergence loop offers facts through, and the OpenTelemetry
+         adapter that carries them out when an endpoint is configured. Wired here so the runtime and the
+         control ring see the port only (rule R7); the SDK stays inside the adapter (rule R3). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>spi-metrics</artifactId>
+      <version>${revision}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>adapter-otel</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The driver-free storage port the assembly root exposes to the service rings (StorePort),
          implemented by the store adapter above; wiring it here keeps the port type off any adapter. -->
     <dependency>

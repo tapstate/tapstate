@@ -9,6 +9,11 @@ import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.PayloadBytes;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.SinkFrontier.ChainEntry;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -18,6 +23,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.function.LongSupplier;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 
@@ -50,7 +57,12 @@ import java.util.concurrent.CompletionException;
  * durable offset is the source's, not Jet's, so a restart replays from the source rather than
  * resuming a sink snapshot.
  */
-public final class SinkProcessor extends AbstractProcessor {
+public final class SinkProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.SINK;
+    }
 
     // One write in flight by default: a batch is applied to completion before the next is issued, so a
     // key's events can never be applied out of their arrival order. Raising this pipelines writes and
@@ -62,6 +74,31 @@ public final class SinkProcessor extends AbstractProcessor {
     private final SinkAck sinkAck;
     private final SinkFrontier frontier;
     private final FrontierGauge gauge;
+    private final DeliveryGauge supplied;
+    // Which of the two the readings actually go to, settled at init: the one supplied, or one that reads
+    // nothing when this processor turns out not to be running inside a job. See init.
+    private DeliveryGauge delivery;
+    // What has settled since this processor started, kept here because the readings are cumulative and a
+    // batch only knows its own rows. Keyed by table, then by the source operation within it.
+    private final Map<String, Map<String, Long>> deliveredByTableAndOp = new LinkedHashMap<>();
+    // The newest event time settled per table, epoch milliseconds. Kept beside the counts rather than
+    // derived from them: a count says how much arrived and this says how current it is, and a table that
+    // is being written steadily with hours-old events reads healthy on the first and not on the second.
+    private final Map<String, Long> newestSettledEventTime = new LinkedHashMap<>();
+    // Payload bytes settled per table, kept beside the counts for the reason the event times are: how
+    // many rows arrived and how much data they were are different questions, and a table whose rows
+    // doubled in width answers the first identically.
+    private final Map<String, Long> settledBytes = new LinkedHashMap<>();
+    // How long each settled row took, from the source's stamp to the confirmed write, bucketed per table
+    // over the registered bounds and accumulated since this processor started. A distribution and not an
+    // average: the slow rows are the ones anybody reading a delivery time came for, and an average is
+    // where they disappear.
+    private final Map<String, DurationTotals> settledDurations = new LinkedHashMap<>();
+    // The clock a row's delivery is measured against, at the moment its write is confirmed. A seam so a
+    // duration can be witnessed at a known instant rather than by waiting for real time to pass.
+    private final LongSupplier clock;
+    // Times each batch this sink forms and issues, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.SINK);
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();
@@ -84,6 +121,11 @@ public final class SinkProcessor extends AbstractProcessor {
     // before it leaves this processor — see reapSettled and JobFailureRegistry.
     private String pipelineId;
     private JobFailureRegistry failureRegistry;
+    // When this processor began counting, epoch milliseconds. Taken here rather than from the job because
+    // the counters are this processor's: an execution that restarts inside a job builds a new processor
+    // with its totals back at zero, and a start that did not move with them would describe a stream that
+    // no longer exists.
+    private long countingSince;
 
     /** No sink-ack watermark: the order-independent or append-only path (any in-flight bound is allowed). */
     public SinkProcessor(SinkWriter writer, int maxInFlight, int maxBatchSize) {
@@ -98,8 +140,21 @@ public final class SinkProcessor extends AbstractProcessor {
 
     SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
             int maxInFlight, int maxBatchSize, FrontierGauge gauge) {
+        this(writer, sinkAck, frontier, maxInFlight, maxBatchSize, gauge, DeliveryGauge.none());
+    }
+
+    SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
+            int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery) {
+        this(writer, sinkAck, frontier, maxInFlight, maxBatchSize, gauge, delivery, System::currentTimeMillis);
+    }
+
+    SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
+            int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock) {
         this.writer = Objects.requireNonNull(writer, "writer");
         this.gauge = Objects.requireNonNull(gauge, "gauge");
+        this.supplied = Objects.requireNonNull(delivery, "delivery");
+        this.delivery = this.supplied;
+        this.clock = Objects.requireNonNull(clock, "clock");
         if (maxInFlight < 1) {
             throw new IllegalArgumentException("maxInFlight must be at least 1: " + maxInFlight);
         }
@@ -135,8 +190,8 @@ public final class SinkProcessor extends AbstractProcessor {
             SupplierEx<? extends SinkWriter> writerFactory) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
-        SupplierEx<Processor> supplier =
-                () -> new SinkProcessor(writerFactory.get(), DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE);
+        SupplierEx<Processor> supplier = () -> new SinkProcessor(writerFactory.get(), null, null,
+                DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, FrontierGauge.none(), new JetDeliveryGauge());
         return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 
@@ -171,13 +226,37 @@ public final class SinkProcessor extends AbstractProcessor {
      */
     @Override
     protected void init(Processor.Context context) {
+        this.timer = StageTimer.of(stage(), context);
         this.pipelineId = context.jobConfig().getName();
+        this.countingSince = clock.getAsLong();
         HazelcastInstance instance = context.hazelcastInstance();
         this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
+        // A gauge that writes into a job's statistics can only do so from that job's own threads, and a
+        // sink is also driven by hand - which is how its behaviour is pinned at all. Outside a job there
+        // is nothing to write into and asking for a handle fails outright, taking the sink down with it,
+        // so the readings go nowhere instead. The same absence already decides the failure registry
+        // above, and for the same reason: neither exists until there is a job to hold it.
+        if (instance == null && supplied.readableOnlyOnAJobThread()) {
+            this.delivery = DeliveryGauge.none();
+        }
+    }
+
+    /** What this stage has timed so far, for a witness driving it by hand. */
+    StageTimer timing() {
+        return timer;
     }
 
     @Override
     public void process(int ordinal, Inbox inbox) {
+        long started = timer.begin();
+        try {
+            processTimed(inbox);
+        } finally {
+            timer.end(started);
+        }
+    }
+
+    private void processTimed(Inbox inbox) {
         reapSettled();
         while (!inbox.isEmpty() && inFlight.size() < maxInFlight) {
             List<Envelope> batch = new ArrayList<>();
@@ -199,7 +278,10 @@ public final class SinkProcessor extends AbstractProcessor {
             }
             List<ChainEntry> positions = new ArrayList<>(positionsOf(batch));
             positions.addAll(absorbed);
-            inFlight.add(new InFlightBatch(settlementOf(batch), positions));
+            // Tallied while the rows are still here and counted only once the write settles. Holding the
+            // envelopes themselves until then would keep a batch's worth of rows alive for the length of a
+            // write; this keeps one number per table and operation in it instead.
+            inFlight.add(new InFlightBatch(settlementOf(batch), positions, DeliveredRows.of(batch)));
         }
         // A saturated in-flight set leaves the rest of the inbox unread; Jet backpressures upstream
         // until reapSettled frees a slot on a later call.
@@ -308,6 +390,16 @@ public final class SinkProcessor extends AbstractProcessor {
             if (frontier != null) {
                 frontier.settled(batch.positions(), sinkAck);
             }
+            // Counted here and nowhere earlier: this is the first line after the write is known to have
+            // succeeded, which is the boundary the count is defined at. A row counted on hand-off would be
+            // counted again when a failed write was retried, and would already have been counted for a
+            // write that never succeeded at all.
+            batch.delivered().foldInto(deliveredByTableAndOp, settledBytes, newestSettledEventTime);
+            // Measured against the clock at this line and no earlier one: a row's delivery is how long it
+            // was from the source's stamp until its write was known to have succeeded, and the wait in
+            // this processor's queue and in flight at the target is part of that, not noise around it.
+            batch.delivered().foldDurationsInto(settledDurations, clock.getAsLong());
+            reportDelivered(batch.delivered().tables());
             return true;
         });
         if (frontier != null) {
@@ -326,6 +418,34 @@ public final class SinkProcessor extends AbstractProcessor {
     private void reportTrailing() {
         gauge.trailing(frontier.gaps());
         gauge.pinned(frontier.stalls());
+    }
+
+    /**
+     * Hands out what has settled so far, every reading from the one set of totals this processor keeps.
+     *
+     * <p>{@code touched} names the tables the batch that just settled held rows of, and the distributions
+     * handed over are theirs alone. Every other table's is the one already published and has not moved;
+     * assembling all of them would build a boxed list per table on every settle — fifty of them for a
+     * batch that touched one, a few hundred times a second.
+     */
+    private void reportDelivered(Set<String> touched) {
+        if (deliveredByTableAndOp.isEmpty()) {
+            return;
+        }
+        delivery.delivered(deliveredByTableAndOp);
+        delivery.carried(settledBytes);
+        delivery.reached(newestSettledEventTime);
+        Map<String, HistogramValue> durations = new LinkedHashMap<>();
+        for (String table : touched) {
+            DurationTotals totals = settledDurations.get(table);
+            if (totals != null) {
+                durations.put(table, totals.value());
+            }
+        }
+        delivery.took(durations);
+        // Published with them and never alone: a total is readable only against what it accumulates from,
+        // and the two arriving by different routes is how they come to disagree.
+        delivery.countingSince(countingSince);
     }
 
     /** What this batch contributes to the frontier, empty when no frontier is tracked. */
@@ -365,8 +485,108 @@ public final class SinkProcessor extends AbstractProcessor {
         }
     }
 
-    /** One outstanding write and what its batch contributes to the frontier once it settles. */
-    private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions) {
+    /** One outstanding write, what its batch contributes to the frontier, and what it delivers. */
+    private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
+            DeliveredRows delivered) {
+    }
+
+    /**
+     * What one batch would add to the delivery totals once it settles: how many rows of each table and
+     * operation it holds, and the newest event time among them per table. Taken when the batch is formed
+     * and applied when the write succeeds, so nothing here depends on the envelopes still being reachable.
+     */
+    private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> bytes,
+            Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes) {
+
+        /** The tables this batch settled rows of, which are the ones whose readings have moved. */
+        Set<String> tables() {
+            return rows.keySet();
+        }
+
+        static DeliveredRows of(List<Envelope> batch) {
+            Map<String, Map<String, Long>> rows = new LinkedHashMap<>();
+            Map<String, Long> bytes = new LinkedHashMap<>();
+            Map<String, Long> newest = new LinkedHashMap<>();
+            Map<String, List<Long>> stamps = new LinkedHashMap<>();
+            for (Envelope event : batch) {
+                rows.computeIfAbsent(event.src(), table -> new LinkedHashMap<>())
+                        .merge(event.op().symbol(), 1L, Long::sum);
+                // Weighed while the batch still holds the envelopes, alongside the count, so that what
+                // settles later adds a figure taken from the rows themselves rather than from whatever
+                // is still reachable by then.
+                bytes.merge(event.src(), PayloadBytes.of(event), Long::sum);
+                newest.merge(event.src(), event.ts(), Math::max);
+                // Every row's stamp, not only the newest: a delivery time is measured per row when the
+                // write settles, and a batch that kept only its newest stamp would report the whole batch
+                // as fast as its freshest row.
+                stamps.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(event.ts());
+            }
+            return new DeliveredRows(rows, bytes, newest, stamps);
+        }
+
+        void foldInto(Map<String, Map<String, Long>> totals, Map<String, Long> bytesByTable,
+                Map<String, Long> newestByTable) {
+            rows.forEach((table, byOp) -> byOp.forEach((op, count) ->
+                    totals.computeIfAbsent(table, ignored -> new LinkedHashMap<>())
+                            .merge(op, count, Long::sum)));
+            bytes.forEach((table, size) -> bytesByTable.merge(table, size, Long::sum));
+            newestEventTime.forEach((table, ts) -> newestByTable.merge(table, ts, Math::max));
+        }
+
+        /** Buckets every row's age at {@code settledAtMillis} into its table's running distribution. */
+        void foldDurationsInto(Map<String, DurationTotals> totals, long settledAtMillis) {
+            eventTimes.forEach((table, stamps) -> {
+                DurationTotals running = totals.computeIfAbsent(table, ignored -> new DurationTotals());
+                for (long stamp : stamps) {
+                    running.add(settledAtMillis - stamp);
+                }
+            });
+        }
+    }
+
+    /**
+     * One table's running distribution of delivery times: how many rows, their total in milliseconds, and
+     * one count per registered bucket. Milliseconds are kept as a whole number so the sum never drifts by
+     * rounding; the value handed out converts once.
+     */
+    private static final class DurationTotals {
+
+        private static final HistogramBounds BOUNDS = HistogramBounds.RECORD_DELIVERY_DURATION;
+
+        private long count;
+        private long sumMillis;
+        private final long[] buckets = new long[BOUNDS.buckets()];
+
+        /**
+         * Counts one row that took {@code millis}. A source clock ahead of ours reads as nought rather than
+         * as a negative time: an age below zero is not a state a delivery can be in, and it would land in
+         * no bucket at all.
+         */
+        void add(long millis) {
+            long age = Math.max(0L, millis);
+            count++;
+            sumMillis += age;
+            buckets[bucketOf(age / 1000.0)]++;
+        }
+
+        /** The first bucket whose upper bound the value does not exceed; the last bucket for everything above. */
+        private static int bucketOf(double seconds) {
+            List<Double> bounds = BOUNDS.bounds();
+            for (int index = 0; index < bounds.size(); index++) {
+                if (seconds <= bounds.get(index)) {
+                    return index;
+                }
+            }
+            return bounds.size();
+        }
+
+        HistogramValue value() {
+            List<Long> counts = new ArrayList<>(buckets.length);
+            for (long bucket : buckets) {
+                counts.add(bucket);
+            }
+            return BOUNDS.value(count, sumMillis / 1000.0, counts);
+        }
     }
 
     /**
@@ -401,7 +621,8 @@ public final class SinkProcessor extends AbstractProcessor {
                 // A gauge per processor, not one shared: the handles it keeps belong to the sink that took
                 // the reading, and a shared one would have each sink's readings land under the other's.
                 processors.add(new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
-                        DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, new JetFrontierGauge()));
+                        DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, new JetFrontierGauge(),
+                        new JetDeliveryGauge()));
             }
             return processors;
         }

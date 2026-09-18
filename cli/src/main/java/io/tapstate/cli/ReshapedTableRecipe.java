@@ -96,7 +96,7 @@ final class ReshapedTableRecipe {
                     new TransformBody.Filter(answers.where()), null));
             upstream = "keep";
         }
-        ViewBlock view = new ViewBlock.Inline(answers.table().view(), FromRef.literal(upstream), "id", null, null);
+        ViewBlock view = new ViewBlock.Inline(answers.table().view(), FromRef.literal(upstream), "id", null);
         PipelineResource pipeline = new PipelineResource(MirroredTableRecipe.pipelineId(answers.table()), null,
                 List.of(SourceRef.bare(source.resource().id())), steps.isEmpty() ? null : steps, view, null, null,
                 null);

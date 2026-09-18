@@ -63,6 +63,19 @@ final class ControlPlane {
      */
     private static final String DEAD_LETTERED_PREFIX = "nestDeadLettered.";
 
+    /**
+     * The flat face's name for rows confirmed by a target. Exact, not a prefix: the inbound total sits
+     * beside it under the same stem, and the two are meant to be read apart.
+     */
+    private static final String RECORDS_OUT_METRIC = "records.out";
+
+    /**
+     * How the failure counter lands on the flat face: one key per code, the code after the dot. Summed
+     * rather than read by an exact name, because how many codes a pipeline has failed under is up to the
+     * pipeline and the connectors it drives.
+     */
+    private static final String ERRORS_PREFIX = "errors.";
+
     private final URI baseUrl;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
 
@@ -881,10 +894,53 @@ final class ControlPlane {
     record ConnectionTest(String outcome, Map<String, String> statusByCheck) {
     }
 
+    /**
+     * The facts the metrics face carries beside its flat map, each as the wire lays it out: a map with the
+     * metric's {@code name}, {@code type} and {@code unit}, and its {@code points}, each point a map with its
+     * {@code attributes} and either a {@code value} or the parts of a distribution. Read as maps rather than
+     * into a type on purpose: what a specification asserts here is the wire, and a type would answer for the
+     * wire it was written against.
+     *
+     * <p>Empty when the pipeline has published no observation yet, on the same terms as {@link #metricsNamed}:
+     * not yet is a reading, and a specification asserting a fact waits for it.
+     */
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> metricFacts(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        int status = response.statusCode();
+        String body = response.body();
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return List.of();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the metrics of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("facts") instanceof List<?> facts)) {
+            throw new AssertionError("metrics answer carried no facts: " + body);
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Object fact : facts) {
+            if (!(fact instanceof Map<?, ?> shaped)) {
+                throw new AssertionError("a fact that is not an object: " + fact);
+            }
+            out.add((Map<String, Object>) shaped);
+        }
+        return out;
+    }
+
     /** The published metrics body verbatim, for the same diagnostic use and on the same terms as {@link #logs}. */
     String metrics(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
         return response.statusCode() + " " + response.body();
+    }
+
+    /** The overview of every pipeline, verbatim - the list a console draws first. */
+    String pipelines() {
+        HttpResponse<String> response = send(authedGet("/api/pipelines"));
+        expect(response, 200, "list the pipelines");
+        return response.body();
     }
 
     /**
@@ -985,9 +1041,22 @@ final class ControlPlane {
     /**
      * What a metrics answer is allowed to mean, read exactly the way a status answer is: only the product's
      * own {@code monitor.no-observation} code reads as "nothing published yet", and every other refusal stays
-     * loud. A published observation always carries the errorCount metric - the runtime derives it from the
-     * actual state - so a 200 that omits it is a regression of that contract, surfaced rather than waited out
-     * as though the pipeline were merely slow to converge.
+     * loud.
+     *
+     * <p>How many errors a pipeline has counted, over every code it has counted one under. The product
+     * publishes a failure counter broken out by code, collapsed onto this face as one key per code, so
+     * "how many altogether" is their sum rather than a cell of its own.
+     *
+     * <p><strong>A pipeline that has failed nothing has no such key, and this reports nought for it.</strong>
+     * That is the honest total -- the sum of nothing. What it costs is one distinction: an assertion of
+     * nought here, <em>on its own</em>, is satisfied by a publisher that stopped publishing just as well as
+     * by a pipeline that is fine. It is not satisfied by a stopped publisher once it is paired with
+     * anything that had to read a live observation to pass -- a state assertion, say, since reading a state
+     * at all proves an observation is being republished. So a nought here wants a companion, not a ban.
+     *
+     * <p>This used to read a single {@code errorCount} cell that the runtime derived from the pipeline's
+     * state and always published, and a missing cell was therefore a regression worth throwing over. There
+     * is no such cell any more, because a state written as a number was never a count of anything.
      */
     static Optional<Long> interpretErrorCount(int status, String body, String pipelineId) {
         if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
@@ -1001,10 +1070,14 @@ final class ControlPlane {
         if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("metrics") instanceof Map<?, ?> metrics)) {
             throw new AssertionError("metrics answer carried no metrics: " + body);
         }
-        if (!(metrics.get("errorCount") instanceof Number errorCount)) {
-            throw new AssertionError("metrics carried no errorCount: " + body);
+        long counted = 0L;
+        for (Map.Entry<?, ?> entry : metrics.entrySet()) {
+            if (entry.getKey() instanceof String name && name.startsWith(ERRORS_PREFIX)
+                    && entry.getValue() instanceof Number count) {
+                counted += count.longValue();
+            }
         }
-        return Optional.of(errorCount.longValue());
+        return Optional.of(counted);
     }
 
     /**
@@ -1028,6 +1101,49 @@ final class ControlPlane {
     /** What a metrics answer says about discarded changes, read exactly the way the error count is. */
     static Optional<Long> interpretDeadLettered(int status, String body, String pipelineId) {
         return interpretMetricTotal(status, body, pipelineId, DEAD_LETTERED_PREFIX);
+    }
+
+    /**
+     * How many rows this pipeline has had confirmed by its targets, or empty when it has published no
+     * observation yet.
+     *
+     * <p>Read by exact name rather than by prefix, unlike the readings around it. What is being asked for
+     * is one published total, and the face carries a sibling under the same stem for the other direction:
+     * a prefix would add the two together and answer a question nobody asked.
+     */
+    Optional<Long> recordsOut(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        return interpretRecordsOut(response.statusCode(), response.body(), pipelineId);
+    }
+
+    /** What a metrics answer says about rows that reached a target, read by exact name. */
+    static Optional<Long> interpretRecordsOut(int status, String body, String pipelineId) {
+        return interpretMetricByName(status, body, pipelineId, RECORDS_OUT_METRIC);
+    }
+
+    /**
+     * One published metric of {@code pipelineId} by its exact name; empty when the pipeline has published
+     * no observation at all, and nought when it has published one that does not carry this name.
+     *
+     * <p>That nought is the deliberate half. A name absent from a published observation means the thing it
+     * counts has not happened, which is a reading; it is only an unmeasured one when nothing was published
+     * at all, and those two arrive as different HTTP answers rather than as the same missing key.
+     */
+    static Optional<Long> interpretMetricByName(
+            int status, String body, String pipelineId, String name) {
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return Optional.empty();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the metrics of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
+                || !(map.get("metrics") instanceof Map<?, ?> metrics)) {
+            throw new AssertionError("metrics answer carried no metrics: " + body);
+        }
+        return Optional.of(metrics.get(name) instanceof Number value ? value.longValue() : 0L);
     }
 
     /**

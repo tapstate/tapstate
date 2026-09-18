@@ -24,7 +24,7 @@ import org.springframework.context.annotation.Configuration;
  * substrate check, say — turns it off and starts without one.
  */
 @Configuration
-@EnableConfigurationProperties(MongoProperties.class)
+@EnableConfigurationProperties({MongoProperties.class, MetricsHistoryProperties.class})
 class StoreConfiguration {
 
     @Bean(destroyMethod = "close")
@@ -46,8 +46,10 @@ class StoreConfiguration {
      */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    StorePort storePort(MongoConnection storeConnection) {
-        return new MongoStorePort(storeConnection);
+    StorePort storePort(MongoConnection storeConnection, MetricsHistoryProperties history) {
+        // The one configured bound among the stores: how long a movement sample is kept. Written onto
+        // the history's expiring index as the port comes up, so a changed retention is a changed index.
+        return new MongoStorePort(storeConnection, history.getRetention());
     }
 
     /**

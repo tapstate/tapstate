@@ -170,7 +170,7 @@ class NodeColumnsAgainstRuntimeTest {
         Map<String, Object> handedToTheView = mapped(rules, row());
 
         NodeColumns derived = NodeColumns.of(
-                new ViewBlock.Inline("v", FromRef.literal("orders"), "order_id", null, null),
+                new ViewBlock.Inline("v", FromRef.literal("orders"), "order_id", null),
                 reachingTheView);
 
         agree(derived, handedToTheView);

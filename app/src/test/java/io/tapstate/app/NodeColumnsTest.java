@@ -176,7 +176,7 @@ class NodeColumnsTest {
     @Test
     @DisplayName("a view stores the rows it is given, so the columns it is given")
     void aViewStoresWhatItIsGiven() {
-        ViewBlock.Inline view = new ViewBlock.Inline("v", FromRef.literal("orders"), "id", null, null);
+        ViewBlock.Inline view = new ViewBlock.Inline("v", FromRef.literal("orders"), "id", null);
 
         NodeColumns answer = NodeColumns.of(view, upstream());
 
@@ -305,7 +305,7 @@ class NodeColumnsTest {
     @DisplayName("an unknown is handed on as it was written, naming the step that actually went dark")
     void anUnknownIsHandedOnUnreworded() {
         NodeColumns dark = NodeColumns.of(new TransformBody.Js("emit(record)"), one(upstream()), null);
-        ViewBlock.Inline view = new ViewBlock.Inline("v", FromRef.literal("orders"), "id", null, null);
+        ViewBlock.Inline view = new ViewBlock.Inline("v", FromRef.literal("orders"), "id", null);
         Map<String, FieldRule> rules = rules("tag", FieldRule.literal("eu"));
 
         // Every step below a dark one could say only that it cannot see past it, and a chain of those

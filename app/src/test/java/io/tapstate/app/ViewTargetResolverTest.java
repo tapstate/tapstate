@@ -22,7 +22,7 @@ class ViewTargetResolverTest {
         // Upsert matches on the key. Without one every change would append a second copy of the record
         // the write path believed it was updating - the silent corruption this refusal exists to stop.
         ViewBlock.Inline view = new ViewBlock.Inline(
-                "order_state", FromRef.literal("orders_src"), null, null, null);
+                "order_state", FromRef.literal("orders_src"), null, null);
 
         assertThatThrownBy(() -> ViewTargetResolver.resolve(view))
                 .isInstanceOf(TapstateException.class)
@@ -34,7 +34,7 @@ class ViewTargetResolverTest {
     void a_hot_tier_is_refused_by_name_rather_than_silently_ignored() {
         ViewBlock.Inline view = new ViewBlock.Inline(
                 "order_state", FromRef.literal("orders_src"), "order_id",
-                new Storage(new Storage.Hot("10m"), new Storage.Warm("order_state", null), null), null);
+                new Storage(new Storage.Hot("10m"), new Storage.Warm("order_state", null), null));
 
         assertThatThrownBy(() -> ViewTargetResolver.resolve(view))
                 .isInstanceOf(TapstateException.class)
@@ -46,7 +46,7 @@ class ViewTargetResolverTest {
     void a_cold_tier_is_refused_by_the_same_code_as_hot() {
         ViewBlock.Inline view = new ViewBlock.Inline(
                 "order_state", FromRef.literal("orders_src"), "order_id",
-                new Storage(null, new Storage.Warm("order_state", null), new Storage.Cold(List.of("day"))), null);
+                new Storage(null, new Storage.Warm("order_state", null), new Storage.Cold(List.of("day"))));
 
         assertThatThrownBy(() -> ViewTargetResolver.resolve(view))
                 .isInstanceOf(TapstateException.class)
@@ -58,7 +58,7 @@ class ViewTargetResolverTest {
     void a_view_without_storage_materializes_under_its_own_id() {
         // Declaring a view is the whole instruction: the author names no collection and gets one.
         ViewBlock.Inline view = new ViewBlock.Inline(
-                "order_state", FromRef.literal("orders_src"), "order_id", null, null);
+                "order_state", FromRef.literal("orders_src"), "order_id", null);
 
         assertThat(ViewTargetResolver.resolve(view).collection()).isEqualTo("order_state");
     }
@@ -67,7 +67,7 @@ class ViewTargetResolverTest {
     void an_explicit_warm_collection_overrides_the_default_physical_name() {
         ViewBlock.Inline view = new ViewBlock.Inline(
                 "order_state", FromRef.literal("orders_src"), "order_id",
-                new Storage(null, new Storage.Warm("orders_flat", null), null), null);
+                new Storage(null, new Storage.Warm("orders_flat", null), null));
 
         assertThat(ViewTargetResolver.resolve(view).collection()).isEqualTo("orders_flat");
     }
@@ -77,10 +77,10 @@ class ViewTargetResolverTest {
         // The store's source id is deliberately not per-view: it is the single place the deployment's
         // name for the managed store is written down, so renaming it is one edit rather than a sweep.
         ViewBlock.Inline first = new ViewBlock.Inline(
-                "order_state", FromRef.literal("orders_src"), "order_id", null, null);
+                "order_state", FromRef.literal("orders_src"), "order_id", null);
         ViewBlock.Inline second = new ViewBlock.Inline(
                 "shipment_state", FromRef.literal("ships_src"), "shipment_id",
-                new Storage(null, new Storage.Warm("ships_flat", null), null), null);
+                new Storage(null, new Storage.Warm("ships_flat", null), null));
 
         assertThat(ViewTargetResolver.resolve(first).sourceId())
                 .isEqualTo(ViewTargetResolver.resolve(second).sourceId())
@@ -106,7 +106,7 @@ class ViewTargetResolverTest {
         // Nothing else makes the key a viable sort key: a non-unique index leaves a range start
         // ambiguous, and no index at all fails only once the data outgrows an in-memory sort.
         ViewBlock.Inline view = new ViewBlock.Inline(
-                "order_state", FromRef.literal("orders_src"), "order_id", null, null);
+                "order_state", FromRef.literal("orders_src"), "order_id", null);
 
         assertThat(ViewTargetResolver.resolve(view).indexes())
                 .containsExactly(new TargetIndex(List.of("order_id"), true));
@@ -116,7 +116,7 @@ class ViewTargetResolverTest {
     void declared_warm_indexes_are_created_alongside_the_key_index_and_are_not_unique() {
         ViewBlock.Inline view = new ViewBlock.Inline(
                 "order_state", FromRef.literal("orders_src"), "order_id",
-                new Storage(null, new Storage.Warm("order_state", List.of("customer_id")), null), null);
+                new Storage(null, new Storage.Warm("order_state", List.of("customer_id")), null));
 
         assertThat(ViewTargetResolver.resolve(view).indexes()).containsExactly(
                 new TargetIndex(List.of("order_id"), true),
@@ -129,7 +129,7 @@ class ViewTargetResolverTest {
         // definitions over the one field - one unique, one not - is a shape a store may refuse outright.
         ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(new ViewBlock.Inline(
                 "order_state", FromRef.literal("orders"), "id",
-                new Storage(null, new Storage.Warm("order_state", List.of("id", "name")), null), null));
+                new Storage(null, new Storage.Warm("order_state", List.of("id", "name")), null)));
 
         assertThat(target.indexes())
                 .as("one definition per field, the key's unique one winning")

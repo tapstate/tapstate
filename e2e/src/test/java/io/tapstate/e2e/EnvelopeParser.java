@@ -441,6 +441,7 @@ public final class EnvelopeParser {
             case DOC -> doc(only.getValue());
             case ERROR_COUNT -> new Matcher.ErrorCount(rowCount(only.getValue(), "error_count"));
             case FAILURE_CODE -> new Matcher.FailureCode(failureCode(only.getValue()));
+            case RECORDS_OUT -> new Matcher.RecordsOut(rowCount(only.getValue(), "records_out"));
             case STATE -> new Matcher.State(pipelineState(only.getValue()));
         };
     }

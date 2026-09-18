@@ -49,6 +49,11 @@ class ConfigTypeCoercionTest {
                       }
                     }
                   }
+                },
+                "node": {
+                  "properties": {
+                    "decodeThreads": {"type": "integer", "x-component": "InputNumber"}
+                  }
                 }
               }
             }
@@ -79,6 +84,22 @@ class ConfigTypeCoercionTest {
 
         assertThat(timeout).isInstanceOf(Number.class);
         assertThat(((Number) timeout).intValue()).isEqualTo(30);
+    }
+
+    @Test
+    void aNumberDeclaredOnTheNodeFormIsCoercedToo(@TempDir Path dir) {
+        // A connector's spec declares two forms, and it loads both configs into the one bean that
+        // casts, so a node-form number spelled as text reaches that cast exactly as a connection one
+        // does. Reading only the connection form leaves the node half of the spec uncoerced.
+        ConnectorRef ref = new ConnectorRef(
+                List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, SPEC);
+
+        try (PdkConnector connector = PdkConnector.open("demo", ref, Map.of("decodeThreads", "16"))) {
+            Object threads = connector.context().getNodeConfig().get("decodeThreads");
+
+            assertThat(threads).isInstanceOf(Number.class);
+            assertThat(((Number) threads).intValue()).isEqualTo(16);
+        }
     }
 
     @Test

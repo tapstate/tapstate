@@ -53,6 +53,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
@@ -124,6 +125,23 @@ final class Repl {
     /** How often a wait wakes to notice the user interrupted it. */
     private static final Duration CANCEL_POLL = Duration.ofMillis(200);
 
+    /**
+     * How long a one-shot {@code status} waits for the observation to move on before giving up on a
+     * rate. A rate is two readings apart in the pipeline's own time; the second reading is taken when
+     * the server has published a newer observation, which it does about once a second while it is
+     * converging. Three seconds is three of those -- past any pause a healthy server takes, and short
+     * enough that a stalled publisher costs the reader a moment rather than a wait. It bounds the wait
+     * and nothing else: the rate's denominator is never this span.
+     */
+    static final Duration RATE_WAIT = Duration.ofSeconds(3);
+
+    /** How often the wait above looks again. */
+    private static final Duration RATE_POLL = Duration.ofMillis(250);
+
+    /** How often {@code status --watch} reads the movement, between the state frames the stream pushes. */
+    static final Duration WATCH_MOVEMENT_INTERVAL = Duration.ofSeconds(5);
+
+    /** How often a composed restart asks whether the pause it sent has been carried out. */
     private static final Duration PAUSE_SETTLE_POLL = Duration.ofMillis(500);
     private static final Duration PAUSE_SETTLE_BOUND = Duration.ofSeconds(30);
     private static final String PAUSE_SETTLE_BOUND_ENV = "TAPSTATE_RESTART_PAUSE_TIMEOUT_MS";
@@ -233,6 +251,9 @@ final class Repl {
      */
     private volatile boolean streamCancelled;
 
+    /** The bound a one-shot status waits for a second reading; shortened by tests that script a publisher that never moves on. */
+    private Duration rateWait = RATE_WAIT;
+
     Repl(CommandLine commandLine) {
         this(commandLine, WorkspaceOption.resolve());
     }
@@ -298,6 +319,11 @@ final class Repl {
     }
 
     /** Answers how wide the screen is; overridden so the narrow layout can be exercised. */
+    /** How long a one-shot status waits for the observation to advance; overridden so a stalled publisher can be exercised. */
+    void rateWait(Duration bound) {
+        this.rateWait = bound;
+    }
+
     void screenWidth(IntSupplier width) {
         this.screenWidth = width;
     }
@@ -1501,6 +1527,13 @@ final class Repl {
         }
         if (words.get(0).equals("logs") && words.contains("--follow")) {
             return logsFollow(words);
+        }
+        // `status` carries `--rate`: wait for the second reading a rate is made of, which it does by
+        // default only at a terminal. It parses its own words for the reason `derived-schema` does -- the
+        // guard below would refuse the flag and leave the verb answering without it while reporting
+        // success.
+        if (words.get(0).equals("status")) {
+            return statusOnline(words);
         }
         // The other connected verbs take positional operands only; a dash-option (e.g. `-o json`) is not yet
         // supported and must not be silently misread as an id / kind / path.
@@ -3749,13 +3782,12 @@ final class Repl {
      * working.
      */
     private int statusOnline(List<String> words) {
-        String id = readTargetId(words);
+        String id = streamTargetId(words, "--rate");
         if (id == null) {
             return Cli.EXIT_USAGE;
         }
-        StatusOutcome outcome = withFailover(() ->
-                controlPlane.status(session.landingNode(), session.credential(), id),
-                o -> o instanceof StatusOutcome.Unreachable);
+        boolean waitForRate = words.contains("--rate");
+        StatusOutcome outcome = readStatus(id);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case StatusOutcome.Found found -> {
@@ -3766,7 +3798,7 @@ final class Repl {
                     // coded refusal on stderr.
                     renderStatusFailure(found.failureCode(), found.failureMessage());
                 }
-                renderDiagnosis(out, id, found);
+                renderDiagnosis(out, id, found, waitForRate);
                 out.flush();
                 yield Cli.EXIT_OK;
             }
@@ -4020,23 +4052,81 @@ final class Repl {
         }
         PrintWriter out = commandLine.getOut();
         streamCancelled = false;
-        String refusal = controlPlane.watchStatus(session.landingNode(), session.credential(), id,
-                (pipelineId, state, failureCode, failureMessage) -> {
-                    out.println(pipelineId + "  " + state.toLowerCase(Locale.ROOT));
-                    if (failureCode != null) {
-                        // Mirrors the one-shot `status` read: a failed state that cannot say what failed
-                        // sends the watcher hunting through logs instead of the frame that just reported it.
-                        // This frame arrived over an open stream, not a refusal, so it renders to stdout.
-                        renderStatusFailure(failureCode, failureMessage);
-                    }
-                    out.flush();
-                },
-                this::isStreamCancelled);
+        // The movement rides beside the stream rather than in it: the stream carries state and pushes
+        // only a change of it, so a watcher of a healthy run would otherwise see one line and then
+        // nothing. The first reading is taken here, before the stream opens, and says what one reading
+        // can say -- which is not a rate. The rest are taken on a cadence of their own, each against the
+        // one before, until the stream ends.
+        MovementReading first = movementOf(readMetrics(id));
+        out.println(id + "  moving  " + (first == null
+                ? "not known -- no records counter is published"
+                : "not known yet -- one reading; a rate follows in " + MovementReading.human(WATCH_MOVEMENT_INTERVAL.toSeconds())));
+        out.flush();
+        AtomicBoolean streamOver = new AtomicBoolean();
+        Thread movement = new Thread(() -> followMovement(out, id, first, streamOver), "status-movement");
+        movement.setDaemon(true);
+        movement.start();
+        String refusal;
+        try {
+            refusal = controlPlane.watchStatus(session.landingNode(), session.credential(), id,
+                    (pipelineId, state, failureCode, failureMessage) -> {
+                        out.println(pipelineId + "  " + state.toLowerCase(Locale.ROOT));
+                        if (failureCode != null) {
+                            // Mirrors the one-shot `status` read: a failed state that cannot say what failed
+                            // sends the watcher hunting through logs instead of the frame that just reported it.
+                            // This frame arrived over an open stream, not a refusal, so it renders to stdout.
+                            renderStatusFailure(failureCode, failureMessage);
+                        }
+                        out.flush();
+                    },
+                    this::isStreamCancelled);
+        } finally {
+            streamOver.set(true);
+            movement.interrupt();
+            try {
+                movement.join(CANCEL_POLL.toMillis() * 5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         if (refusal != null) {
             return renderStreamRefusal(refusal, id);
         }
         // a stream ends because the user stopped it, which is the way it is meant to end
         return Cli.EXIT_OK;
+    }
+
+    /**
+     * Reads the movement every interval for as long as the stream is open, and prints each reading's rate
+     * against the one before it. A reading the face could not give resets the pair: the next one is a
+     * first reading again, and says so, rather than a rate across a gap nobody measured.
+     */
+    private void followMovement(PrintWriter out, String id, MovementReading first, AtomicBoolean streamOver) {
+        MovementReading previous = first;
+        while (!streamOver.get() && !isStreamCancelled()) {
+            try {
+                Thread.sleep(WATCH_MOVEMENT_INTERVAL.toMillis());
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (streamOver.get() || isStreamCancelled()) {
+                return;
+            }
+            MovementReading now = movementOf(readMetrics(id));
+            String line;
+            if (now == null) {
+                line = "not known -- no records counter is published";
+            } else if (previous == null) {
+                line = "not known yet -- one reading; a rate follows in "
+                        + MovementReading.human(WATCH_MOVEMENT_INTERVAL.toSeconds());
+            } else {
+                line = MovementReading.describe(now.since(previous)) + " \u00b7 lag " + now.describeLag();
+            }
+            out.println(id + "  moving  " + line);
+            out.flush();
+            previous = now;
+        }
     }
 
     /**
@@ -5002,18 +5092,118 @@ final class Repl {
      * publisher has gone silent is the clearest case of that: every other face would be re-reading the same
      * old observation, so asking them costs two round trips to learn nothing.
      */
-    private void renderDiagnosis(PrintWriter out, String id, StatusOutcome.Found found) {
-        StatusDiagnosis.Answer answer = StatusDiagnosis
-                .fromStatusAlone(id, found.state(), found.failureCode(), found.observedAgeMillis())
-                .orElseGet(() -> StatusDiagnosis.of(id, found.state(), found.failureCode(),
-                        found.failureMessage(), found.observedAgeMillis(),
-                        metricsFacts(id), snapshotRowsLoaded(id)));
+    private void renderDiagnosis(PrintWriter out, String id, StatusOutcome.Found found, boolean waitForRate) {
+        Optional<StatusDiagnosis.Answer> early = StatusDiagnosis
+                .fromStatusAlone(id, found.state(), found.failureCode(), found.observedAgeMillis());
+        MetricsOutcome first = null;
+        StatusDiagnosis.Answer answer;
+        if (early.isPresent()) {
+            answer = early.get();
+        } else {
+            // Read once and kept: the same reading is the first of the two a rate is made of below.
+            first = readMetrics(id);
+            answer = StatusDiagnosis.of(id, found.state(), found.failureCode(),
+                    found.failureMessage(), found.observedAgeMillis(),
+                    metricsFactsOf(first), snapshotRowsLoaded(id));
+        }
         out.println(Ansi.AUTO.string("@|bold why:|@") + " " + answer.conclusion());
         answer.readings().forEach(reading -> out.println("  read       " + reading));
         if (answer.next() != null) {
             out.println("  next       " + answer.next());
         }
         answer.cannotSay().forEach(unanswerable -> out.println("  cannot say " + unanswerable));
+        renderMovement(out, id, found, early.isPresent(), first, waitForRate);
+    }
+
+    /**
+     * How fast the pipeline is moving and how far behind it stands, under the answer.
+     *
+     * <p>A rate is two readings apart in the pipeline's own time, so a one-shot status takes the second
+     * reading itself: it waits, bounded, for the server to publish a newer observation than the one the
+     * answer was read from, and measures across the two observations' own times -- never across this
+     * machine's clock, which keeps running while a stalled publisher's reading stands still. When no
+     * newer observation comes within the bound there is one reading, and one reading is "not known"
+     * rather than nought: a pipeline that has not been observed twice and a pipeline that moved nothing
+     * call for different next steps, and only a number that is honestly absent keeps them apart.
+     *
+     * <p>When the status face answered on its own -- the reading is stale, or the run failed -- no other
+     * face is read, for the reason the answer gives, and the movement says so rather than measuring
+     * across an observation the answer has already called old.
+     *
+     * <p><strong>The second reading is waited for at a terminal, or when {@code --rate} asks for it.</strong>
+     * A person who ran this and is looking at it will spend a second on a rate; a script will not, and this
+     * verb is the one people run in a loop over every pipeline they have. Waiting there costs about a second
+     * per pipeline against a healthy publisher and the whole bound against a stalled one, for a number
+     * nothing in the script asked for. So the default follows the terminal, and a script that does want the
+     * number says so -- which is also what the line prints when it has to answer without one, since a flag
+     * nobody is told about is a flag nobody passes.
+     */
+    private void renderMovement(PrintWriter out, String id, StatusOutcome.Found found, boolean statusAnswered,
+            MetricsOutcome first, boolean waitForRate) {
+        String moving = "moving     ";
+        String lag = "lag        ";
+        if (statusAnswered) {
+            out.println(moving + "not known -- " + (found.failureCode() != null
+                    ? "the run failed"
+                    : "this reading is old, and a rate across an old reading would be a rate of nothing current"));
+            return;
+        }
+        MovementReading earlier = movementOf(first);
+        if (earlier == null) {
+            out.println(moving + "not known -- no records counter is published (no live job)");
+            out.println(lag + "not published");
+            return;
+        }
+        boolean waited = waitForRate || terminal.getAsBoolean();
+        MovementReading later = waited ? awaitNewerReading(id, earlier) : null;
+        if (later == null) {
+            out.println(moving + "not known -- " + (waited
+                    ? "the reading did not advance in " + MovementReading.seconds(rateWait)
+                            + "; one reading gives no rate (the publisher may have stalled)"
+                    : "one reading, and not a terminal to wait for a second; --rate waits for it,"
+                            + " --watch streams them"));
+            out.println(lag + earlier.describeLag());
+            return;
+        }
+        out.println(moving + MovementReading.describe(later.since(earlier)));
+        out.println(lag + later.describeLag());
+    }
+
+    /**
+     * The next reading whose observation time is later than {@code earlier}'s, or null when none came
+     * within the bound. The bound is wall time, because a wait has to end; the readings compared are
+     * the observations' own times, because that is what the rate is over.
+     */
+    private MovementReading awaitNewerReading(String id, MovementReading earlier) {
+        if (earlier.observedAt() == null) {
+            return null;
+        }
+        long deadline = System.nanoTime() + rateWait.toNanos();
+        while (true) {
+            try {
+                Thread.sleep(Math.min(RATE_POLL.toMillis(), Math.max(1, rateWait.toMillis())));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+            MovementReading later = movementOf(readMetrics(id));
+            if (later != null && later.observedAt() != null && later.observedAt().isAfter(earlier.observedAt())) {
+                return later;
+            }
+            if (System.nanoTime() - deadline >= 0) {
+                return null;
+            }
+        }
+    }
+
+    /** One read of the metrics face, on the node the status read just picked; no failover, as below. */
+    private MetricsOutcome readMetrics(String id) {
+        return controlPlane.metrics(session.landingNode(), session.credential(), id);
+    }
+
+    /** The movement a metrics read carried, or null when the face did not answer or carried none. */
+    private static MovementReading movementOf(MetricsOutcome outcome) {
+        return outcome instanceof MetricsOutcome.Found found ? MetricsFacts.movementOf(found.facts()) : null;
     }
 
     /**
@@ -5024,11 +5214,8 @@ final class Repl {
      * hunting. Null is carried all the way into the answer, because a face nobody could read and a face
      * with nothing wrong in it are the two readings this command exists to keep apart.
      */
-    private MetricsFacts metricsFacts(String id) {
-        return controlPlane.metrics(session.landingNode(), session.credential(), id)
-                        instanceof MetricsOutcome.Found found
-                ? MetricsFacts.of(found.metrics())
-                : null;
+    private static MetricsFacts metricsFactsOf(MetricsOutcome outcome) {
+        return outcome instanceof MetricsOutcome.Found found ? MetricsFacts.of(found.metrics(), found.facts()) : null;
     }
 
     /**

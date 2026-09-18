@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Processor;
@@ -10,6 +11,8 @@ import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import java.util.ArrayDeque;
 import java.util.Objects;
 
@@ -38,7 +41,12 @@ import java.util.Objects;
  * replayed from the durable source offset. The ring and the read-cursor sink are resolved on the member the
  * processor runs on, so nothing but serializable coordinates crosses the wire.
  */
-public final class SrsSourceProcessor extends AbstractProcessor {
+public final class SrsSourceProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.SOURCE;
+    }
 
     /** The most changes one fill drains before yielding - a bounded batch that lets Jet pace the source. */
     private static final int FILL_BATCH = 256;
@@ -74,8 +82,12 @@ public final class SrsSourceProcessor extends AbstractProcessor {
         this.stamp = stamp;
     }
 
+    // Times each read of the ring that produced something, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.SOURCE);
+
     @Override
     protected void init(Context context) {
+        this.timer = StageTimer.of(stage(), context);
         // Take what the capture side has already buffered for this ring before opening the ring reader, so
         // the source emits every snapshot row (op r, no source position) ahead of the first cdc change -- the
         // ordering that keeps a stale snapshot from landing at the sink after a newer change of the same key.
@@ -121,6 +133,10 @@ public final class SrsSourceProcessor extends AbstractProcessor {
                 return false;
             }
         }
+        // Reading and projecting what arrived is this stage's unit of work; a pass that finds nothing is
+        // not a unit and is not timed, or the distribution would be swamped by the idle polls between rows.
+        long started = timer.begin();
+        int pendingBefore = pending.size();
         // Whatever the capture has handed over since the last pass, ahead of the ring as always.
         drainBuffered();
         // The ring's sequence pairs with the generation this reader runs under to give each change its
@@ -131,6 +147,9 @@ public final class SrsSourceProcessor extends AbstractProcessor {
             pending.add(SrsProjection.toEnvelope(item, src, order));
             read = order;
         }, FILL_BATCH);
+        if (pending.size() > pendingBefore) {
+            timer.end(started);
+        }
         if (emitPending()) {
             stampWhatHasLeft();
             announce();

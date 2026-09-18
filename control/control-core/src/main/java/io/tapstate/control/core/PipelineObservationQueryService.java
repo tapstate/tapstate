@@ -53,14 +53,15 @@ public final class PipelineObservationQueryService {
     }
 
     /**
-     * The pipeline's open map of run statistics plus, per table, the one source position it records: how
-     * far the target has confirmed writes. The stored projection carries that position under a name that
-     * does not say which of the four positions it is; this face gives it back its name, because the face
-     * is where somebody decides whether a run is stuck.
+     * The pipeline's open map of run statistics, the facts those statistics were measured as, and, per
+     * table, the one source position it records: how far the target has confirmed writes. The stored
+     * projection carries that position under a name that does not say which of the four positions it is;
+     * this face gives it back its name, because the face is where somebody decides whether a run is stuck.
      */
     public PipelineMetrics metrics(String pipelineId) {
         Observation observation = require(pipelineId);
-        return new PipelineMetrics(observation.pipelineId(), observation.metrics(), observation.positions());
+        return new PipelineMetrics(observation.pipelineId(), observation.metrics(), observation.positions(),
+                observation.facts());
     }
 
     /** The pipeline's per-table initial-load progress. */

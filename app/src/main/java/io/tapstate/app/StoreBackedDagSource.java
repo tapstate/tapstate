@@ -28,6 +28,7 @@ import io.tapstate.runtime.engine.FrontierBinding;
 import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.engine.PipelineDagBuilder;
 import io.tapstate.runtime.engine.SinkAckFactory;
+import io.tapstate.runtime.engine.ViewSinkWriters;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinBinding;
 import io.tapstate.runtime.engine.join.JoinStoresBinding;
@@ -221,6 +222,7 @@ final class StoreBackedDagSource implements DagSource {
                 assembledTargets(pipeline, bySourceTable, sourceVertices, compiledJoins);
         Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
         targets.putAll(assembled);
+        Map<String, TargetTable> viewTargets = new LinkedHashMap<>(targets);
         Set<String> serveStreams = pipeline.serve() instanceof ServeBlock.Inline serve
                 && serve.sync() != null && !serve.sync().isEmpty()
                 ? streamsReaching(pipeline, serve.from(), sourceKeyByTable, sourceKeysById,
@@ -231,18 +233,24 @@ final class StoreBackedDagSource implements DagSource {
                         sourceVertices, stepIds)
                 : Set.of();
         // Each stream a sink receives, narrowed to what the pipeline actually publishes on it rather
-        // than to what its source table holds. Only the serve terminal is narrowed here: a view
-        // composes its own descriptor around the key it names, and a stream reaching both terminals
-        // would otherwise be answered twice with nothing saying which answer the map holds.
+        // than to what its source table holds. The two terminals keep independent maps because the
+        // same stream can reach them through different transform paths.
         if (pipeline.serve() instanceof ServeBlock.Inline serving && !serveStreams.isEmpty()) {
             targets.putAll(publishedTargets(pipelineId, pipeline, serving.from(), serveStreams,
+                    bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
+        }
+        // A view validates and binds against the rows at its own input, not against the source model
+        // those rows started from.
+        if (pipeline.view() instanceof ViewBlock.Inline viewing && !viewStreams.isEmpty()) {
+            viewTargets.putAll(publishedTargets(pipelineId, pipeline,
+                    FromClause.list(viewing.from()), viewStreams,
                     bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
         }
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
         FrontierBinding frontier = frontierBinding(sourceVertices);
         return PipelineDagBuilder.build(
                 pipeline,
-                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets,
+                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins),
                 sinkAckFactory(pipeline, pipelineId), frontier);
     }
@@ -1147,6 +1155,7 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, String> sourceKeyByTable,
             Map<String, List<String>> sourceKeysById,
             Map<String, TargetTable> targets,
+            Map<String, TargetTable> viewTargets,
             Set<String> serveStreams,
             Set<String> viewStreams,
             Set<String> stepIds,
@@ -1161,7 +1170,7 @@ final class StoreBackedDagSource implements DagSource {
                 element -> sinkWriter(pipeline, element, targets, serveStreams),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
-                view -> viewSink(pipeline, view, targets, viewStreams, sourceKeysById),
+                view -> viewSink(pipeline, view, viewTargets, viewStreams, sourceKeysById),
                 nestBinding(pipeline, sourceIdByTable(sourceVertices)),
                 joinBinding(compiledJoins));
     }
@@ -1388,7 +1397,8 @@ final class StoreBackedDagSource implements DagSource {
         // key has nothing for the identity gate to compare. Review found the reverse order turning the
         // coded missing-key refusal into a bare NullPointerException inside the gate.
         ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(inline);
-        requireKeyIsTheFeedIdentity(pipeline, inline, targets, tablesBySourceId);
+        boolean alternateKey = requireKeyIsTheFeedIdentity(
+                pipeline, inline, targets, tablesBySourceId);
         // Coded rather than bare, unlike a source the author named: this store is the deployment's, so
         // its absence is a condition an operator acts on rather than a defect on this side.
         SourceResource store = artifacts().get(target.sourceId())
@@ -1419,13 +1429,22 @@ final class StoreBackedDagSource implements DagSource {
             bySourceTable.put(sourceTable,
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
-        return sinkWriterBinder.bind(
+        SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bind(
                 store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable,
                 new PipelineNode(pipeline.id(), inline.id()));
+        String viewId = inline.id();
+        String viewKey = inline.primaryKey();
+        // A unique current value says nothing about what the capture stream puts in an earlier image.
+        // Guard only an accepted alternate identity: the discovered primary identity is the capture
+        // contract already used throughout the pipeline, while an alternate has no such guarantee.
+        return alternateKey
+                ? () -> ViewSinkWriters.requireAlternateKeyInBeforeImage(
+                        writer.get(), viewId, viewKey)
+                : writer;
     }
 
     /**
-     * Refuses a view whose single key is not the identity of what feeds it, before anything binds.
+     * Refuses a view whose single key cannot safely identify what feeds it, before anything binds.
      *
      * <p>The view sink upserts every stream on the view's declared key and indexes it uniquely, so the
      * key has to be what the feed converges on. Two shapes break that and neither says anything at
@@ -1435,10 +1454,20 @@ final class StoreBackedDagSource implements DagSource {
      * any single snapshot, which is why they are refused here by name instead.
      *
      * <p>What feeds the view is resolved by walking its from-reference down to leaves: a nest step is
-     * one assembled stream carrying its root's key, a source id is each of its tables, anything else
-     * is one table. A regex names many upstreams by construction and is refused as such.
+     * one assembled stream carrying its explicitly declared root key, a source id is each of its
+     * tables, anything else is one table. A regex names many upstreams by construction and is refused
+     * as such.
+     *
+     * <p>A discovered primary key is only a default, and an explicitly selected view key takes
+     * precedence over it - but precedence is not a waiver of proof that the chosen key can do the job.
+     * So an alternate is accepted only from an index discovery established constrains every row. A
+     * bare unique bit is not that: stores report it for indexes that skip the rows they do not qualify
+     * and for columns whose nulls they never compare, and most discovery carries the bit with nothing
+     * beside it to tell those apart. Where nothing proved the alternate, the primary key is what the
+     * view has to key on. The return value says the accepted identity is such an alternate, so its
+     * writer can require the key in update and delete before images before applying either change.
      */
-    private static void requireKeyIsTheFeedIdentity(PipelineResource pipeline, ViewBlock.Inline view,
+    private static boolean requireKeyIsTheFeedIdentity(PipelineResource pipeline, ViewBlock.Inline view,
             Map<String, TargetTable> targets, Map<String, List<String>> tablesBySourceId) {
         List<String> streams = new ArrayList<>();
         List<TransformBody.Nest> assemblies = new ArrayList<>();
@@ -1449,31 +1478,54 @@ final class StoreBackedDagSource implements DagSource {
         }
         if (assemblies.size() == 1) {
             requireKeyIs(view, assemblies.getFirst().root().key());
-            return;
+            return false;
         }
-        // A single table: its identity is whatever discovery recorded. An undiscovered table has no
-        // identity on record, and the view's own key is then the only identity there is - which is the
-        // path that lets materialization run before any discovery has.
+        // An undiscovered table has no identity claim to compare, so the view remains usable before
+        // discovery. Once discovery has supplied a model, the selected key is either the identity that
+        // model records for every row, or an index discovery proved constrains every one of them.
         if (streams.size() == 1 && targets != null) {
             TargetTable model = targets.get(streams.getFirst());
             if (model != null) {
-                List<String> identity = model.fields().stream()
+                List<String> selected = List.of(view.primaryKey());
+                List<String> discoveredKey = model.fields().stream()
                         .filter(TargetField::primaryKey).map(TargetField::name).toList();
-                if (!identity.isEmpty()) {
-                    requireKeyIs(view, identity);
+                if (selected.equals(discoveredKey)) {
+                    return false;
                 }
+                if (model.indexes().stream().filter(TargetIndex::constrainsEveryRow)
+                        .anyMatch(index -> index.fields().equals(selected))) {
+                    return true;
+                }
+                refuseKey(view, discoveredKey.isEmpty() ? claimedIdentity(model) : discoveredKey);
             }
         }
+        return false;
+    }
+
+    /**
+     * What a refusal names where discovery recorded no primary key: the first uniqueness the source
+     * claimed, which is the nearest thing to an identity there is to point an author at, or nothing
+     * where it claimed none. Naming it is not accepting it - the gate above has already refused it for
+     * want of proof, and an author reading that refusal still has to be told what discovery did record.
+     */
+    private static List<String> claimedIdentity(TargetTable model) {
+        return model.indexes().stream().filter(TargetIndex::unique)
+                .map(TargetIndex::fields).findFirst().orElse(List.of());
     }
 
     /** One refusal for every feed shape: the view's single key must be exactly this identity. */
     private static void requireKeyIs(ViewBlock.Inline view, List<String> identity) {
         if (identity == null || !identity.equals(List.of(view.primaryKey()))) {
-            throw new TapstateException(ActuationError.VIEW_KEY_NOT_FEED_IDENTITY,
-                    Map.of("view", view.id(), "key", String.valueOf(view.primaryKey()),
-                            "identity", identity == null ? "(none)" : String.join(", ", identity)),
-                    null);
+            refuseKey(view, identity);
         }
+    }
+
+    /** The refusal itself, naming the identity the view should have keyed on. */
+    private static void refuseKey(ViewBlock.Inline view, List<String> identity) {
+        throw new TapstateException(ActuationError.VIEW_KEY_NOT_FEED_IDENTITY,
+                Map.of("view", view.id(), "key", String.valueOf(view.primaryKey()),
+                        "identity", identity == null ? "(none)" : String.join(", ", identity)),
+                null);
     }
 
     /** Resolves one from-reference to the leaf streams it names; see the gate above for the reading. */

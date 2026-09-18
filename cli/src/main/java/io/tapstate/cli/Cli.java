@@ -79,7 +79,7 @@ public final class Cli implements Runnable {
      * declaration, and the version is wanted on a path that must not depend on either. The build pins it
      * to the project version, so the string here cannot quietly drift from what was released.
      */
-    static final String VERSION = "tapstate 0.4.5";
+    static final String VERSION = "tapstate 0.5.0";
 
     /**
      * Just the number out of {@link #VERSION}, for the places that print it beside another version and
@@ -252,8 +252,8 @@ public final class Cli implements Runnable {
                     "Pause a running pipeline, holding its position.")),
             Map.entry("resume", new VerbHelp("<pipeline-id>",
                     "Resume a paused pipeline from where it stopped.")),
-            Map.entry("status", new VerbHelp("<pipeline-id> [--watch]",
-                    "Show a pipeline's current state; --watch streams it until Ctrl-C.")),
+            Map.entry("status", new VerbHelp("<pipeline-id> [--watch] [--rate]",
+                    "Show a pipeline's state, rate and lag; --watch streams them until Ctrl-C.")),
             Map.entry("metrics", new VerbHelp("<pipeline-id>",
                     "Show a pipeline's counters and per-table positions.")),
             Map.entry("snapshot", new VerbHelp("<pipeline-id>",

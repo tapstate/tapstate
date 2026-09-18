@@ -291,8 +291,8 @@ class ControlPlaneConfiguration {
         // off the store port: those facets have no service in front of them.
         return new ArtifactMutationService(
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
-                storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), auditGate,
-                follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+                storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), storePort.rateHistory(),
+                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE));
     }
 
     @Bean

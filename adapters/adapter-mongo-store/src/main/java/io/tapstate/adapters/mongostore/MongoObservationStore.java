@@ -3,6 +3,10 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -12,11 +16,14 @@ import io.tapstate.spi.store.ObservationStore;
 import org.bson.Document;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeMap;
 
 /**
  * The MongoDB per-pipeline observation store: one observation document per pipeline, keyed by the
@@ -29,7 +36,15 @@ import java.util.Optional;
  * (rule R3). A stored document whose state is missing or unrecognized, or whose metric / snapshot / position
  * cells carry the wrong BSON type, is store corruption — surfaced as a coded io diagnostic, not a bare crash
  * while reconstructing. A document written before positions existed simply has no positions field and reads
- * back with empty positions.
+ * back with empty positions; one written before the measured facts travelled reads back with none.
+ *
+ * <p><strong>The facts are stored as the fact type lays them out</strong> — one array element per metric,
+ * each with its points, each point with its attributes, its instants as BSON dates and either a value or
+ * the four parts of a distribution — and reconstructed through the fact type's own constructor. So a stored
+ * fact this version would refuse to build (a distribution over bounds no longer registered, a closed
+ * attribute carrying a value the set no longer holds) reads as corruption of the {@code facts} field, on
+ * the same terms as an unrecognized state: the document is rewritten on the next publish, and until then a
+ * reader is told the document is unreadable rather than handed a fact that means something else now.
  */
 public final class MongoObservationStore implements ObservationStore {
 
@@ -65,11 +80,13 @@ public final class MongoObservationStore implements ObservationStore {
 
     /**
      * Maps an observation to its stored document: pipeline id as {@code _id}, state / metrics / snapshot /
-     * positions as fields.
+     * positions / facts as fields.
      */
     static Document toDocument(Observation observation) {
         Document metrics = new Document();
         observation.metrics().forEach(metrics::append);
+        List<Document> facts = new ArrayList<>();
+        observation.facts().forEach(fact -> facts.add(toDocument(fact)));
         Document snapshot = new Document();
         observation.snapshot().forEach((table, progress) -> {
             Document cell = new Document("rowsDone", progress.rowsDone());
@@ -87,7 +104,8 @@ public final class MongoObservationStore implements ObservationStore {
                 .append("state", observation.state().name())
                 .append("metrics", metrics)
                 .append("snapshot", snapshot)
-                .append("positions", positions);
+                .append("positions", positions)
+                .append("facts", facts);
         if (observation.observedAt() != null) {
             // Stored as a BSON date, not a string: the server can then order and expire on it, and a
             // lexicographic sort over an instant is not a chronological one. Absent when the publisher did
@@ -114,7 +132,159 @@ public final class MongoObservationStore implements ObservationStore {
             throw corrupt(id);
         }
         return new Observation(id, parseState(state, id), readMetrics(document, id), readSnapshot(document, id),
-                readPositions(document, id), readFailure(document, id), readObservedAt(document, id));
+                readPositions(document, id), readFailure(document, id), readObservedAt(document, id),
+                readFacts(document, id));
+    }
+
+    /**
+     * One metric as stored: its name, kind and unit, and its points. The kind is stored by its constant's
+     * name, the way the state is, so the stored word and the type it names cannot drift apart.
+     */
+    private static Document toDocument(MetricFact fact) {
+        List<Document> points = new ArrayList<>();
+        for (MetricPoint point : fact.points()) {
+            // Attributes sorted by key: a document that lists the same point's attributes in two orders on
+            // two ticks is two documents that mean one thing, and the difference is noise to anything
+            // reading the store directly.
+            Document attributes = new Document();
+            new TreeMap<>(point.attributes()).forEach(attributes::append);
+            Document cell = new Document("attributes", attributes);
+            if (point.startTime() != null) {
+                cell.append("startTime", Date.from(point.startTime()));
+            }
+            // A BSON date, like the observation's own time and for the same reason; and like it, held to
+            // milliseconds, which is what a date carries -- a start taken with finer precision is stored
+            // truncated, the same way on every tick, so it still identifies one accumulation.
+            cell.append("observedAt", Date.from(point.observedAt()));
+            if (point.value() != null) {
+                cell.append("value", point.value());
+            } else {
+                HistogramValue histogram = point.histogram();
+                cell.append("count", histogram.count())
+                        .append("sum", histogram.sum())
+                        .append("bounds", histogram.bounds())
+                        .append("bucketCounts", histogram.bucketCounts());
+            }
+            points.add(cell);
+        }
+        return new Document("name", fact.name())
+                .append("type", fact.type().name())
+                .append("unit", fact.unit())
+                .append("points", points);
+    }
+
+    /**
+     * Reads the facts array back through the fact type's own constructor; a missing field reads empty (the
+     * document was written before facts travelled), and a cell of the wrong shape, or a fact this version
+     * refuses to build, is corruption of this field.
+     */
+    private static List<MetricFact> readFacts(Document document, String id) {
+        Object raw = document.get("facts");
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> stored)) {
+            throw corrupt(id, "facts");
+        }
+        List<MetricFact> facts = new ArrayList<>();
+        for (Object element : stored) {
+            if (!(element instanceof Document fact)) {
+                throw corrupt(id, "facts");
+            }
+            facts.add(readFact(fact, id));
+        }
+        return facts;
+    }
+
+    private static MetricFact readFact(Document fact, String id) {
+        String name = requireString(fact.get("name"), id);
+        String type = requireString(fact.get("type"), id);
+        String unit = requireString(fact.get("unit"), id);
+        if (!(fact.get("points") instanceof List<?> stored)) {
+            throw corrupt(id, "facts");
+        }
+        List<MetricPoint> points = new ArrayList<>();
+        for (Object element : stored) {
+            if (!(element instanceof Document point)) {
+                throw corrupt(id, "facts");
+            }
+            points.add(readPoint(point, id));
+        }
+        try {
+            return new MetricFact(name, MetricType.valueOf(type), unit, points);
+        } catch (IllegalArgumentException e) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "facts"), e);
+        }
+    }
+
+    private static MetricPoint readPoint(Document point, String id) {
+        Map<String, String> attributes = new LinkedHashMap<>();
+        Object rawAttributes = point.get("attributes");
+        if (rawAttributes != null) {
+            if (!(rawAttributes instanceof Document stored)) {
+                throw corrupt(id, "facts");
+            }
+            for (Map.Entry<String, Object> attribute : stored.entrySet()) {
+                attributes.put(attribute.getKey(), requireString(attribute.getValue(), id));
+            }
+        }
+        Instant startTime = optionalDate(point.get("startTime"), id);
+        Object rawObservedAt = point.get("observedAt");
+        if (!(rawObservedAt instanceof Date observedAt)) {
+            throw corrupt(id, "facts");
+        }
+        Long value = optionalLong(point.get("value"), id);
+        HistogramValue histogram = null;
+        if (point.get("count") != null || point.get("bounds") != null) {
+            histogram = readHistogram(point, id);
+        }
+        try {
+            return new MetricPoint(attributes, startTime, observedAt.toInstant(), value, histogram);
+        } catch (IllegalArgumentException e) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "facts"), e);
+        }
+    }
+
+    private static HistogramValue readHistogram(Document point, String id) {
+        long count = requireLong(point.get("count"), id);
+        if (!(point.get("sum") instanceof Number sum)) {
+            throw corrupt(id, "facts");
+        }
+        List<Double> bounds = new ArrayList<>();
+        if (!(point.get("bounds") instanceof List<?> storedBounds)) {
+            throw corrupt(id, "facts");
+        }
+        for (Object bound : storedBounds) {
+            if (!(bound instanceof Number number)) {
+                throw corrupt(id, "facts");
+            }
+            bounds.add(number.doubleValue());
+        }
+        List<Long> bucketCounts = new ArrayList<>();
+        if (!(point.get("bucketCounts") instanceof List<?> storedCounts)) {
+            throw corrupt(id, "facts");
+        }
+        for (Object bucket : storedCounts) {
+            bucketCounts.add(requireLong(bucket, id));
+        }
+        try {
+            return new HistogramValue(count, sum.doubleValue(), bounds, bucketCounts);
+        } catch (IllegalArgumentException e) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "facts"), e);
+        }
+    }
+
+    private static Instant optionalDate(Object value, String id) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Date date)) {
+            throw corrupt(id, "facts");
+        }
+        return date.toInstant();
     }
 
     /**
@@ -268,7 +438,11 @@ public final class MongoObservationStore implements ObservationStore {
     }
 
     private static TapstateException corrupt(String id) {
+        return corrupt(id, "observation");
+    }
+
+    private static TapstateException corrupt(String id, String field) {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                Map.of("id", String.valueOf(id), "field", "observation"), null);
+                Map.of("id", String.valueOf(id), "field", field), null);
     }
 }
