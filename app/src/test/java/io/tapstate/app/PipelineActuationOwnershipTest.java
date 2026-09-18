@@ -83,7 +83,7 @@ class PipelineActuationOwnershipTest {
         assertThat(memberB.carrying()).as("the member that does not drive it never starts a run").isEmpty();
         assertThat(memberA.carrying()).as("and the run that was started is the one that was stopped").isEmpty();
 
-        WorkloadClaim held = claims.read(ORDERS).orElseThrow();
+        WorkloadClaim held = claims.read(ORDERS).orElseThrow().claim();
         assertThat(held.owner()).isEqualTo(NODE_A);
         assertThat(held.key().resourceId())
                 .as("an actuation claim is keyed by the pipeline it drives").isEqualTo("orders");
@@ -120,7 +120,7 @@ class PipelineActuationOwnershipTest {
 
         nodeA.retain(List.of());
 
-        WorkloadClaim released = claims.read(ORDERS).orElseThrow();
+        WorkloadClaim released = claims.read(ORDERS).orElseThrow().claim();
         assertThat(released.claimGeneration()).as("a release never lowers a generation").isEqualTo(1);
         PipelineActuationOwnership.Permit taken = ownership(NODE_B).permit("orders");
         assertThat(taken.granted()).as("the lease was expired, so the next member may take it").isTrue();

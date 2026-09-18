@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadOwner;
 
@@ -92,8 +93,9 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     @Override
-    public synchronized Optional<WorkloadClaim> read(WorkloadClaimKey key) {
-        return Optional.ofNullable(claims.get(key));
+    public synchronized Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
+        return Optional.ofNullable(claims.get(key))
+                .map(claim -> new WorkloadClaimReading(claim, Duration.between(now, claim.leaseUntil())));
     }
 
     private WorkloadClaim store(WorkloadClaim claim) {

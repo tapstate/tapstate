@@ -12,7 +12,9 @@ import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
 
@@ -129,6 +131,46 @@ class ExecutionAuthorizationTest {
     }
 
     @Test
+    void aRunWhoseOwnerStoppedRenewingStopsAtTheLeaseEvenThoughNobodyHasTakenItOver() {
+        ExecutionFence fence = submittedRun();
+        CountingWriter target = new CountingWriter();
+        AtomicInteger acked = new AtomicInteger();
+        ExecutionAuthorization guard = guard(claims);
+        SinkWriter writer = FencedSinkWriterFactory.guarded(target, fence, guard);
+        SinkAck ack = FencedSinkAckFactory.guarded((chain, position) -> acked.incrementAndGet(), fence, guard);
+        writer.write(List.of());
+
+        // The member holding the pipeline goes away. It renews nothing, and no other member has yet come
+        // for the claim -- so the record it left behind still carries the very generations this run was
+        // submitted with, and goes on carrying them for as long as nobody takes it over.
+        elapse(TTL.plusSeconds(1));
+        assertThat(claims.read(new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders"))
+                .orElseThrow())
+                .as("the generations this member is checking against have not moved at all")
+                .satisfies(reading -> {
+                    assertThat(reading.claim().claimGeneration()).isEqualTo(fence.claimGeneration());
+                    assertThat(reading.claim().executionGeneration()).isEqualTo(fence.executionGeneration());
+                    assertThat(reading.leased()).isFalse();
+                });
+        int writtenBefore = target.batches.get();
+
+        assertThatThrownBy(() -> writer.write(List.of()))
+                .as("an expired lease is nobody's run, whoever ends up holding it next")
+                .isInstanceOf(TapstateException.class)
+                .extracting(thrown -> ((TapstateException) thrown).code())
+                .isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED);
+        assertThatThrownBy(() -> ack.advance("orders", new ChainPosition(new SourceOrder(1, 2), "w2")))
+                .isInstanceOf(TapstateException.class);
+
+        // Far past any refresh window: without the lease bounding it, each refresh would keep finding the
+        // same matching generations and hand out another window, indefinitely.
+        elapse(WINDOW.multipliedBy(20));
+        assertThatThrownBy(() -> writer.write(List.of())).isInstanceOf(TapstateException.class);
+        assertThat(target.batches.get() - writtenBefore).isZero();
+        assertThat(acked).hasValue(0);
+    }
+
+    @Test
     void aMemberThatCannotRefreshStopsAtItsDeadlineRatherThanCarryingOn() {
         ExecutionFence fence = submittedRun();
         CountingWriter target = new CountingWriter();
@@ -148,6 +190,12 @@ class ExecutionAuthorizationTest {
         assertThat(store.reads.get())
                 .as("and the refused batches do not each turn into a store round trip")
                 .isLessThanOrEqualTo(2);
+    }
+
+    /** Moves both clocks together, the way waiting moves the store's lease and this member's deadline. */
+    private void elapse(Duration elapsed) {
+        claims.elapse(elapsed);
+        nanos.addAndGet(elapsed.toNanos());
     }
 
     /** A run of `orders` submitted by node A, fenced by the generations the store handed it. */
@@ -204,7 +252,7 @@ class ExecutionAuthorizationTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> read(WorkloadClaimKey key) {
+        public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
             if (reads.incrementAndGet() > 1) {
                 throw new IllegalStateException("coordination store unreachable");
             }

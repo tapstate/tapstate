@@ -12,9 +12,11 @@ import java.util.Objects;
  * run resumes from. So the member's own guard is asked before each advance, on the member where the sink
  * actually runs, exactly as it is asked before the batch that earned the position.
  *
- * <p>The store fences the same thing on its own side, by the generations the record carries. This is the
- * near end of that: it stops the call rather than having it rejected, which is what keeps a superseded
- * member from spending its time being turned away.
+ * <p>On this path that guard is the whole of the fence, and the limit is worth stating where it is felt:
+ * the durable record an advance lands in carries no generation of its own, so nothing on the far side
+ * turns a late advance away. The capture side does carry one and is refused at the store. Until the same
+ * holds here, an advance that leaves a member after its guard last said yes -- one already in flight, or
+ * one riding the slack between the two clocks -- is not caught a second time.
  */
 final class FencedSinkAckFactory implements SinkAckFactory {
 

@@ -19,5 +19,11 @@ public interface WorkloadClaimStore {
     /** Allocates the next execution generation under the exact live claim and topology revision. */
     Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision);
 
-    Optional<WorkloadClaim> read(WorkloadClaimKey key);
+    /**
+     * Reads a claim and, in the same answer, how much of its lease the store's own clock says is left.
+     *
+     * <p>Both, always: a caller that could read the record without the lease would have no way to tell an
+     * owner that is still there from one whose record simply outlived it.
+     */
+    Optional<WorkloadClaimReading> read(WorkloadClaimKey key);
 }

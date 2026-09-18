@@ -18,6 +18,7 @@ import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -213,8 +214,9 @@ class CaptureOwnershipTest {
         }
 
         @Override
-        public synchronized Optional<WorkloadClaim> read(WorkloadClaimKey key) {
-            return Optional.ofNullable(current);
+        public synchronized Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
+            return Optional.ofNullable(current)
+                    .map(claim -> new WorkloadClaimReading(claim, Duration.between(Instant.now(), claim.leaseUntil())));
         }
     }
 }

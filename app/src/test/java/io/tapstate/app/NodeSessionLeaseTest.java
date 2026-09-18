@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -49,6 +50,9 @@ class NodeSessionLeaseTest {
     }
 
     private static final class RecordingStore implements WorkloadClaimStore {
+
+        /** Nothing here reads the lease; it answers with a live one so a read is not a lapsed claim. */
+        private static final Duration LIVE_LEASE = Duration.ofSeconds(30);
         private final boolean renews;
         private final CountDownLatch renewed = new CountDownLatch(1);
         private final AtomicBoolean released = new AtomicBoolean();
@@ -81,8 +85,8 @@ class NodeSessionLeaseTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> read(WorkloadClaimKey key) {
-            return Optional.of(CLAIM);
+        public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
+            return Optional.of(new WorkloadClaimReading(CLAIM, LIVE_LEASE));
         }
     }
 }

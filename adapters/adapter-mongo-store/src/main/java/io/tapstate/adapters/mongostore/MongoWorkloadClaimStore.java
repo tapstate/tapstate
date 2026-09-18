@@ -11,6 +11,7 @@ import com.mongodb.client.model.ReturnDocument;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -26,6 +27,7 @@ import java.util.Optional;
 public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
 
     private static final int DUPLICATE_KEY = 11000;
+    private static final String LEASE_REMAINING = "leaseRemainingMillis";
     private final MongoCollection<Document> collection;
 
     public MongoWorkloadClaimStore(MongoCollection<Document> collection) {
@@ -65,7 +67,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         if (updated != null) {
             return WorkloadClaimAttempt.acquired(read(updated));
         }
-        WorkloadClaim current = read(key).orElseThrow(
+        WorkloadClaim current = read(key).map(WorkloadClaimReading::claim).orElseThrow(
                 () -> new IllegalStateException("contended workload claim vanished: " + key));
         return WorkloadClaimAttempt.refused(current);
     }
@@ -102,10 +104,17 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     @Override
-    public Optional<WorkloadClaim> read(WorkloadClaimKey key) {
+    public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
         Objects.requireNonNull(key, "key");
-        Document found = StoreIo.call(() -> collection.find(new Document("_id", id(key))).first());
-        return Optional.ofNullable(found).map(MongoWorkloadClaimStore::read);
+        // An aggregation rather than a find, for one field: how long this lease still has to run has to be
+        // worked out where $$NOW is -- on the server that holds the lease -- so that no clock of ours is
+        // ever subtracted from a deadline of theirs.
+        List<Document> pipeline = List.of(
+                new Document("$match", new Document("_id", id(key))),
+                new Document("$set", new Document(LEASE_REMAINING,
+                        new Document("$subtract", List.of("$leaseUntil", "$$NOW")))));
+        Document found = StoreIo.call(() -> collection.aggregate(pipeline).first());
+        return Optional.ofNullable(found).map(MongoWorkloadClaimStore::reading);
     }
 
     private Document findOneAndUpdate(Document filter, List<Document> update, boolean upsert) {
@@ -178,6 +187,11 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 number(document, "executionGeneration"),
                 number(document, "topologyRevision"),
                 date(document, "leaseUntil").toInstant());
+    }
+
+    private static WorkloadClaimReading reading(Document document) {
+        return new WorkloadClaimReading(
+                read(document), Duration.ofMillis(number(document, LEASE_REMAINING)));
     }
 
     private static long number(Document document, String field) {

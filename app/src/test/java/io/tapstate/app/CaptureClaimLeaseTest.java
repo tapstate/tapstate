@@ -6,6 +6,7 @@ import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
@@ -52,6 +53,9 @@ class CaptureClaimLeaseTest {
     }
 
     private static final class RefusingRenewals implements WorkloadClaimStore {
+
+        /** Nothing here reads the lease; it answers with a live one so a read is not a lapsed claim. */
+        private static final Duration LIVE_LEASE = Duration.ofSeconds(30);
         private WorkloadClaim claim;
         private int releases;
 
@@ -79,8 +83,8 @@ class CaptureClaimLeaseTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> read(WorkloadClaimKey key) {
-            return Optional.ofNullable(claim);
+        public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
+            return Optional.ofNullable(claim).map(held -> new WorkloadClaimReading(held, LIVE_LEASE));
         }
     }
 }

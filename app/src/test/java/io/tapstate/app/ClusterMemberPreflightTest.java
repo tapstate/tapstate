@@ -6,6 +6,7 @@ import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
@@ -38,7 +39,8 @@ class ClusterMemberPreflightTest {
         assertThat(first.nodeSession().claimGeneration()).isEqualTo(1);
         assertThat(second).isInstanceOfSatisfying(TapstateException.class,
                 coded -> assertThat(coded.code()).isEqualTo(BootError.NODE_ID_IN_USE));
-        assertThat(claims.read(first.nodeSession().key())).contains(first.nodeSession());
+        assertThat(claims.read(first.nodeSession().key()).map(WorkloadClaimReading::claim))
+                .contains(first.nodeSession());
     }
 
     @Test
@@ -159,6 +161,9 @@ class ClusterMemberPreflightTest {
     }
 
     private static final class MemoryClaims implements WorkloadClaimStore {
+
+        /** Nothing here reads the lease; it answers with a live one so a read is not a lapsed claim. */
+        private static final Duration LIVE_LEASE = Duration.ofSeconds(30);
         private WorkloadClaim current;
 
         @Override
@@ -189,8 +194,8 @@ class ClusterMemberPreflightTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> read(WorkloadClaimKey key) {
-            return Optional.ofNullable(current);
+        public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
+            return Optional.ofNullable(current).map(claim -> new WorkloadClaimReading(claim, LIVE_LEASE));
         }
     }
 }

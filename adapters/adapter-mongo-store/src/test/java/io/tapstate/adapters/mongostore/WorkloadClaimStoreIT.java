@@ -5,6 +5,7 @@ import com.mongodb.client.MongoClients;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
@@ -84,6 +85,33 @@ class WorkloadClaimStoreIT {
             assertThat(advanced.claimGeneration()).isEqualTo(claim.claimGeneration());
             assertThat(advanced.executionGeneration()).isEqualTo(1);
             assertThat(store.advanceExecution(claim, 7)).isEmpty();
+        });
+    }
+
+    @Test
+    void aReadAnswersHowMuchOfTheLeaseTheServerItselfSaysIsLeft() {
+        withStore((store, collection) -> {
+            WorkloadClaim claim = store.acquire(KEY, new WorkloadOwner("node-a", "boot-1"), 0, TTL).claim();
+
+            WorkloadClaimReading fresh = store.read(KEY).orElseThrow();
+
+            assertThat(fresh.claim()).isEqualTo(claim);
+            assertThat(fresh.leased()).isTrue();
+            assertThat(fresh.leaseRemaining())
+                    .as("a lease just handed out has nearly all of itself left, and never more than all")
+                    .isLessThanOrEqualTo(TTL)
+                    .isGreaterThan(TTL.minusSeconds(10));
+
+            assertThat(store.release(claim)).isTrue();
+
+            WorkloadClaimReading lapsed = store.read(KEY).orElseThrow();
+
+            assertThat(lapsed.claim().claimGeneration()).isEqualTo(claim.claimGeneration());
+            assertThat(lapsed.claim().executionGeneration()).isEqualTo(claim.executionGeneration());
+            assertThat(lapsed.leased())
+                    .as("the record and both generations outlive the lease; only this says nobody owns it")
+                    .isFalse();
+            assertThat(lapsed.leaseRemaining()).isLessThanOrEqualTo(Duration.ZERO);
         });
     }
 

@@ -4,6 +4,7 @@ import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -111,8 +112,8 @@ class ClusterWorkloadClaimsTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> read(WorkloadClaimKey key) {
-            return Optional.of(claim(key));
+        public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
+            return Optional.of(new WorkloadClaimReading(claim(key), TTL));
         }
     }
 }

@@ -4,8 +4,8 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.EngineError;
-import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 
@@ -27,21 +27,28 @@ import org.slf4j.LoggerFactory;
  * runs a piece of a job holds one, and every batch of external calls asks it before making them.
  *
  * <p>It is asked locally and answered locally on purpose: the coordination store is read on a bounded
- * schedule in the background, never once per record, and the answer is trusted for a bounded window
- * measured on the monotonic clock from a point taken <em>before</em> the read went out — so the window
- * cannot outlive the answer it was cut from, and moving the node's wall clock cannot widen it.
+ * schedule in the background, never once per record, and the answer is trusted until a deadline measured
+ * on the monotonic clock from a point taken <em>before</em> the read went out — so the deadline cannot
+ * outlive the answer it was cut from, and moving the node's wall clock cannot widen it.
  *
  * <p>What it compares is the pair of generations the run was submitted with against the pair the store
- * holds now. A refresh that cannot reach the store, a record that has gone, or either generation having
- * moved all read the same way: refused. Refusing is the safe direction — it stops calls going out, and
- * the run that is genuinely current re-reads its own generations on the next refresh and carries on.
+ * holds now. A refresh that cannot reach the store, a record that has gone, either generation having
+ * moved, or the lease behind them having lapsed all read the same way: refused. Refusing is the safe
+ * direction — it stops calls going out, and the run that is genuinely current re-reads its own
+ * generations on the next refresh and carries on.
  *
- * <p>What this bounds, and what it does not: after ownership actually changes, this member stops within
- * one window of its last successful refresh, while the next owner cannot even acquire the claim until
- * the previous lease has run out — a longer wait by design, which is why the two do not overlap in the
- * budget the cluster is configured with. A call already in flight when the window closes may still land;
- * that is the delivery contract's business, and the durable position it would advance is fenced
- * separately by the store itself.
+ * <p>What this bounds, and what it does not: the deadline is the shorter of this member's refresh window
+ * and what the store says is left of the owner's lease, so this member stops no later than the moment the
+ * claim becomes available to anyone else — the two never overlap, rather than merely being sized so that
+ * they usually do not. That also covers the case where nobody takes over at all: an owner that died
+ * leaves a record whose generations go on matching, and only the lease says it is nobody's. A call
+ * already in flight when the deadline passes may still land; that is the delivery contract's business.
+ * A durable position such a call would advance is not caught a second time either — the record it lands
+ * in carries no generation of its own, unlike a capture append, which the store refuses on its own side.
+ *
+ * <p>What it still assumes is that the two clocks run at comparable rates — a lease handed out in the
+ * store's seconds is counted down in this member's. Offsets between them are not assumed, which is the
+ * point of asking the store how much is left rather than reading the deadline it holds.
  */
 final class ExecutionAuthorization implements AutoCloseable {
 
@@ -55,6 +62,7 @@ final class ExecutionAuthorization implements AutoCloseable {
 
     private final String clusterId;
     private final WorkloadClaimStore claims;
+    private final Duration window;
     private final long windowNanos;
     private final long refreshIntervalNanos;
     private final LongSupplier nanoTime;
@@ -66,6 +74,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     private ExecutionAuthorization() {
         this.clusterId = "single";
         this.claims = null;
+        this.window = Duration.ZERO;
         this.windowNanos = 0;
         this.refreshIntervalNanos = 0;
         this.nanoTime = System::nanoTime;
@@ -91,6 +100,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         if (window.isZero() || window.isNegative()) {
             throw new IllegalArgumentException("the local authorization window must be positive");
         }
+        this.window = window;
         this.windowNanos = window.toNanos();
         // Twice per window: often enough that the batch path normally finds a live answer and never waits
         // on the store itself, and it doubles as the floor on how often an unreachable store is retried.
@@ -186,11 +196,11 @@ final class ExecutionAuthorization implements AutoCloseable {
         if (nextRead != null && now - nextRead < 0) {
             return evenIfStillLive ? entry : null;
         }
-        // Taken before the request goes out: whatever comes back is no older than this point, so a window
+        // Taken before the request goes out: whatever comes back is no older than this point, so a deadline
         // measured from here is never longer than the answer was actually good for.
         long startedAt = nanoTime.getAsLong();
         nextReadNanos.put(pipelineId, startedAt + refreshIntervalNanos);
-        Optional<WorkloadClaim> current;
+        Optional<WorkloadClaimReading> current;
         try {
             current = claims.read(
                     new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId));
@@ -202,9 +212,21 @@ final class ExecutionAuthorization implements AutoCloseable {
             entries.remove(pipelineId);
             return null;
         }
+        // The shorter of the two bounds, because each covers what the other cannot. The window bounds how
+        // stale this reading may be; the lease bounds how long the owner it names is still the owner. Two
+        // generations that still match say nothing about the second: the record of a member that died
+        // keeps matching until somebody else takes it over, and nobody may be in a hurry to.
+        Duration leaseRemaining = current.get().leaseRemaining();
+        long held = leaseRemaining.compareTo(window) < 0 ? leaseRemaining.toNanos() : windowNanos;
+        if (held <= 0) {
+            // Nobody owns this run any more, whoever may own it next. Dropping the entry is what refuses
+            // the batch: a reading that was already out of date when it arrived is not a reading.
+            entries.remove(pipelineId);
+            return null;
+        }
         Entry refreshed = new Entry(
-                current.get().claimGeneration(), current.get().executionGeneration(),
-                startedAt + windowNanos);
+                current.get().claim().claimGeneration(), current.get().claim().executionGeneration(),
+                startedAt + held);
         entries.put(pipelineId, refreshed);
         return refreshed;
     }
