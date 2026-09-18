@@ -33,6 +33,16 @@ public enum EngineError implements TapstateErrorCode {
             Set.of("chain", "epoch", "seq")),
 
     /**
+     * Running: a view selected a discovered alternate identity, but an update or delete reached its
+     * sink without that key in the earlier row. {@code view} and {@code key} name the materialization
+     * and selected identity, while {@code operation} names the change that cannot be applied safely.
+     * Without the old key, a delete cannot remove the materialized row and a key-changing update
+     * cannot remove the row under its previous identity, leaving stale data behind.
+     */
+    VIEW_KEY_MISSING_FROM_BEFORE_IMAGE("engine.view-key-missing-from-before-image",
+            Set.of("view", "key", "operation")),
+
+    /**
      * A pipeline's data-plane job died on its own, for a reason the product had not already coded at its
      * throw site: {@code pipeline} is the pipeline whose run died and {@code cause} is what it died of.
      * A fault that does carry its own code keeps that code instead — this is the last resort, so that a

@@ -1,7 +1,20 @@
-# Mongo supplies the source change stream; the view preserves its _id feed identity.
-# Its destination is the managed store, keeping this source witness independent of a JDBC sink.
-# Snapshot, insert, update and delete are separate delivery witnesses.
+# Mongo discovery records its internal _id as the primary identity and the seeded collection constrains
+# its id field uniquely, while the view explicitly chooses id. The declared view key must win between
+# those valid identities: reverting that precedence refuses the pipeline before it starts. Its destination
+# is the managed store, keeping this source witness
+# independent of a JDBC sink. Snapshot, insert, update and delete are separate delivery witnesses.
 # The changed sequence is read back: counts alone cannot detect a discarded update.
+#
+# The source asks the connector for pre-images and the seed enables them on the collection. Both are
+# required for the delete to carry id rather than only MongoDB's internal _id; removing either leaves
+# fifteen documents after the delete and fails the final count instead of exercising key precedence.
+#
+# Mutation evidence: restore the discovered-table identity comparison in
+# StoreBackedDagSource.requireKeyIsTheFeedIdentity. This case fails on both tiers at its first await,
+# "views.order_state expected 12, found 0", and the runtime reports
+# actuation.view-key-not-feed-identity with identity=_id and key=id. The neighboring
+# a-declared-view-materializes-with-no-serve-block case passes on both tiers in the same run.
+# Restoring the production fix passes all four runs without changing either case.
 name: a-mongo-collection-lands-in-the-managed-store
 setup:
   databases:
