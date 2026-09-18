@@ -169,6 +169,7 @@ engine.frontier-pinned
 engine.job-failed
 engine.join-dimension-row-displaced
 engine.no-such-job
+engine.view-key-missing-from-before-image
 io.document-too-large
 io.document-unreadable
 io.schema-read-contention

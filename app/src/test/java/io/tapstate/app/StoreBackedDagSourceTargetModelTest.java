@@ -119,8 +119,10 @@ class StoreBackedDagSourceTargetModelTest {
                 List.of(new io.tapstate.spi.store.SourceIndex("code_unique", List.of("code"), true)))));
         List<TargetTable> bound = new ArrayList<>();
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+        // The unique bit survives the projection because the column did not change. What it is worth
+        // does not travel with it: the source named the index plainly, so nothing proved the claim.
         assertThat(bound.getFirst().indexes()).containsExactly(
-                new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), true));
+                new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), true, false));
     }
 
     @Test

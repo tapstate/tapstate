@@ -73,6 +73,29 @@ class MongoEndpointsIT {
     }
 
     @Test
+    void aSeededCollectionSuppliesBeforeImagesByDefault() {
+        endpoints.seed(at(), TABLE, SeedRows.generated(1));
+
+        assertThat(beforeImagesEnabled()).isTrue();
+    }
+
+    @Test
+    void aSeededCollectionConstrainsTheIdentityEverySpecificationUses() {
+        endpoints.seed(at(), TABLE, SeedRows.generated(1));
+
+        assertThat(identityIsUnique()).isTrue();
+    }
+
+    @Test
+    void aSpecificationCanTurnBeforeImagesOffAfterSeeding() {
+        endpoints.seed(at(), TABLE, SeedRows.generated(1));
+
+        endpoints.withoutBeforeImages(at(), TABLE);
+
+        assertThat(beforeImagesEnabled()).isFalse();
+    }
+
+    @Test
     void insertingAppendsRowsAfterTheHighestIdTheCollectionHolds() {
         endpoints.seed(at(), TABLE, SeedRows.generated(3));
 
@@ -268,6 +291,25 @@ class MongoEndpointsIT {
     private void writeDirectly(Document document) {
         try (MongoClient client = MongoClients.create(uri)) {
             client.getDatabase("e2e_mongo_endpoints").getCollection(TABLE).insertOne(document);
+        }
+    }
+
+    private boolean beforeImagesEnabled() {
+        try (MongoClient client = MongoClients.create(uri)) {
+            Document collection = client.getDatabase("e2e_mongo_endpoints")
+                    .listCollections().filter(new Document("name", TABLE)).first();
+            Document options = collection.get("options", Document.class);
+            Document beforeImages = options.get("changeStreamPreAndPostImages", Document.class);
+            return beforeImages != null && Boolean.TRUE.equals(beforeImages.getBoolean("enabled"));
+        }
+    }
+
+    private boolean identityIsUnique() {
+        try (MongoClient client = MongoClients.create(uri)) {
+            List<Document> indexes = client.getDatabase("e2e_mongo_endpoints")
+                    .getCollection(TABLE).listIndexes().into(new ArrayList<>());
+            return indexes.stream().anyMatch(index -> Boolean.TRUE.equals(index.getBoolean("unique"))
+                    && new Document("id", 1).equals(index.get("key", Document.class)));
         }
     }
 
