@@ -28,6 +28,11 @@ class RuntimeConvergenceStartupTest {
             .withBean(PipelineCaptureCoordinator.class, NoOpCaptureCoordinator::new)
             .withBean(Engine.class, () -> new Engine(mock(HazelcastInstance.class)))
             .withBean(Clock.class, Clock::systemUTC)
+            // The two the driver asks the cluster for: whether this member may act on business work at
+            // all, and which pipelines are this member's to drive. Production wires both from the member
+            // configuration, which this context does not bring up -- it is the convergence loop alone.
+            .withBean(ClusterMembershipGate.class, () -> new ClusterMembershipGate(new ClusterProperties()))
+            .withBean(PipelineActuationOwnership.class, PipelineActuationOwnership::single)
             .withUserConfiguration(RuntimeConvergenceConfiguration.class);
 
     @Test

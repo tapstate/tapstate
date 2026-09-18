@@ -120,17 +120,6 @@ class HazelcastConfiguration {
             member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
             member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
             member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
-            // Bind this member's own execution guard, so a sink vertex that lands here -- carrying the
-            // generations of the run that submitted it -- can ask, without a store round trip per batch,
-            // whether that run is still the current one. A member of a cluster always binds one; a
-            // single-node run has one member and one run of anything and binds none, which resolves to a
-            // guard that allows everything and leaves the single-node path exactly as it was.
-            if (claimStore != null) {
-                member.getUserContext().put(
-                        ExecutionAuthorization.USER_CONTEXT_KEY,
-                        new ExecutionAuthorization(identity.clusterId(), claimStore,
-                                clusterProperties.getWorkloadClaimRenewInterval()));
-            }
             member.getUserContext().put(
                     io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
                     ClusterMembershipGate.PROTECTION_NAME);

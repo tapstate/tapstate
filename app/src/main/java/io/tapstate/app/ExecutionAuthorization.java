@@ -115,10 +115,22 @@ final class ExecutionAuthorization implements AutoCloseable {
         return bound instanceof ExecutionAuthorization authorization ? authorization : unfenced();
     }
 
-    /** The guard bound to this member, resolved where only the local process is in hand. */
+    /**
+     * The guard bound to this member, resolved where only the local process is in hand — the sink writer
+     * a job carries is opened without a member handle, exactly as the connector it opens is.
+     *
+     * <p>Anything other than one member in this process is a refusal rather than an unfenced guard:
+     * "which member is this" has no answer then, and answering "allow everything" would be a fence that
+     * quietly is not one. The sink connector resolves itself the same way and refuses the same way.
+     */
     static ExecutionAuthorization local() {
         Set<HazelcastInstance> instances = Hazelcast.getAllHazelcastInstances();
-        return instances.size() == 1 ? of(instances.iterator().next()) : unfenced();
+        if (instances.size() != 1) {
+            throw new IllegalStateException(
+                    "expected exactly one local Hazelcast member on the sink member, found "
+                            + instances.size());
+        }
+        return of(instances.iterator().next());
     }
 
     /** Refuses, with a diagnosis, when this member may no longer act for {@code fence}'s run. */

@@ -15,6 +15,7 @@ import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimStore;
 import java.time.Duration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -94,6 +95,30 @@ class DataPlaneActuationConfiguration {
         return new CaptureOwnership(
                 clusterProperties.getId(), nodeSession.owner(), membershipGate,
                 workloadClaims, clusterProperties.getWorkloadClaimTtl());
+    }
+
+    /**
+     * This member's own answer to whether a run may still touch anything outside the cluster, bound onto
+     * the member so a sink vertex that lands here -- carrying the generations of the run that submitted
+     * it -- can ask without a store round trip per batch. A bean rather than something the member factory
+     * makes, because it keeps a refresh thread and the container is what knows when to stop it.
+     *
+     * <p>A single-node run has one member and one run of anything, so it binds nothing and every resolve
+     * answers with a guard that allows everything -- which leaves that path exactly as it was.
+     */
+    @Bean(destroyMethod = "close")
+    ExecutionAuthorization executionAuthorization(
+            HazelcastInstance hazelcastMember,
+            ClusterProperties clusterProperties,
+            WorkloadClaimStore workloadClaimStore) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return ExecutionAuthorization.unfenced();
+        }
+        ExecutionAuthorization authorization = new ExecutionAuthorization(
+                clusterProperties.getId(), workloadClaimStore,
+                clusterProperties.getWorkloadClaimRenewInterval());
+        hazelcastMember.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
+        return authorization;
     }
 
     /**
