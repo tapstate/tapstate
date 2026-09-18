@@ -96,6 +96,30 @@ class DataPlaneActuationConfiguration {
                 workloadClaims, clusterProperties.getWorkloadClaimTtl());
     }
 
+    /**
+     * Who drives a pipeline's lifecycle. Wired beside the capture owner because the two are the same
+     * mechanism over two different resources, and both need the same three things: this member's durable
+     * identity, the membership gate that decides whether it may hold business claims at all, and the claim
+     * facade that enforces it. A single-node run has one member, so nothing is fenced there.
+     */
+    @Bean
+    PipelineActuationOwnership pipelineActuationOwnership(
+            HazelcastInstance hazelcastMember,
+            ClusterProperties clusterProperties,
+            ClusterMembershipGate membershipGate,
+            ClusterWorkloadClaims workloadClaims) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return PipelineActuationOwnership.single();
+        }
+        Object stored = hazelcastMember.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
+        if (!(stored instanceof WorkloadClaim nodeSession)) {
+            throw new IllegalStateException("cluster member started without its node-session identity");
+        }
+        return new PipelineActuationOwnership(
+                clusterProperties.getId(), nodeSession.owner(), membershipGate, workloadClaims,
+                clusterProperties.getWorkloadClaimTtl(), clusterProperties.getWorkloadClaimRenewInterval());
+    }
+
     @Bean
     PipelineCaptureCoordinator pipelineCaptureCoordinator(
             StorePort storePort, CaptureRunUnit captureRunUnit, SrsCoordinator srsCoordinator,

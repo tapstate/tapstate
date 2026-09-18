@@ -31,6 +31,7 @@ final class ConvergenceDriver {
     private final DesiredStore desired;
     private final ObservationPublisher publisher;
     private final BooleanSupplier businessEligible;
+    private final PipelineActuationOwnership actuation;
 
     // Consecutive failed-reconcile passes per pipeline, so a pipeline that keeps throwing surfaces as a
     // climbing errorCount rather than an empty read face. Reconcile runs on a single scheduler thread with a
@@ -43,10 +44,16 @@ final class ConvergenceDriver {
 
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
             BooleanSupplier businessEligible) {
+        this(converger, desired, publisher, businessEligible, PipelineActuationOwnership.single());
+    }
+
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            BooleanSupplier businessEligible, PipelineActuationOwnership actuation) {
         this.converger = converger;
         this.desired = desired;
         this.publisher = publisher;
         this.businessEligible = businessEligible;
+        this.actuation = actuation;
     }
 
     @Scheduled(fixedDelayString = "${tapstate.converge.interval-ms:1000}")
@@ -60,6 +67,14 @@ final class ConvergenceDriver {
             // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
             MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
             try {
+                if (!actuation.permit(pipelineId).granted()) {
+                    // Another member drives this pipeline. Observe desired and actual; drive neither. Both
+                    // halves matter: converging here would call the same lifecycle verb a second time --
+                    // this member is carrying no job, which is exactly the condition the converge side
+                    // starts one in -- and publishing here would overwrite the driver's observation with
+                    // this member's own run statistics, which are absent because the run is not here.
+                    continue;
+                }
                 ConvergeResult result = converger.converge(pipelineId);
                 ObservationFailure failure = null;
                 if (result.status() == ConvergeStatus.FAILED) {
@@ -97,5 +112,8 @@ final class ConvergenceDriver {
         // Forget streaks for pipelines that are no longer desired, so a deleted-while-failing pipeline does
         // not leak a counter that nothing will ever clear.
         reconcileFailures.keySet().retainAll(pipelineIds);
+        // Same for the claims: a pipeline that is gone still has this member named as its driver until the
+        // lease runs out, which delays nothing but reads as an owner over something that no longer exists.
+        actuation.retain(pipelineIds);
     }
 }
