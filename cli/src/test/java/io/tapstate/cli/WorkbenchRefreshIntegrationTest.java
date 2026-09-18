@@ -220,16 +220,21 @@ class WorkbenchRefreshIntegrationTest {
                     });
 
             assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ESCAPE), null)).isTrue();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay -> {
+                assertThat(overlay).isInstanceOf(WorkbenchOverlayState.Confirm.class);
+                assertThat(((WorkbenchOverlayState.Confirm) overlay).title()).isEqualTo("Discard Changes?");
+            });
             assertThat(runtime.state().workspaceView().document())
                     .hasValueSatisfying(document -> {
                         assertThat(document.editing()).isTrue();
-                        assertThat(document.pendingDiscard()).isTrue();
+                        assertThat(document.dirty()).isTrue();
                     });
             assertThat(session.handleEvent(KeyEvent.ofKey(KeyCode.ESCAPE), null)).isTrue();
+            assertThat(runtime.state().overlay()).isEmpty();
             assertThat(runtime.state().workspaceView().document())
                     .hasValueSatisfying(document -> {
                         assertThat(document.editing()).isTrue();
-                        assertThat(document.pendingDiscard()).isFalse();
+                        assertThat(document.dirty()).isTrue();
                     });
             assertThat(session.handleEvent(KeyEvent.ofChar('s', KeyModifiers.CTRL), null)).isTrue();
 
@@ -263,7 +268,7 @@ class WorkbenchRefreshIntegrationTest {
     }
 
     @Test
-    void contextSelectionAndAuthenticationAreIndependentEntries() throws Exception {
+    void contextSelectionPromptsForLoginWhenTheSelectedContextIsSignedOut() throws Exception {
         RecordingScheduler scheduler = new RecordingScheduler();
         WorkbenchRuntime runtime = new WorkbenchRuntime(
                 WorkbenchState.initial(), scheduler, () -> true, event -> {
@@ -313,12 +318,10 @@ class WorkbenchRefreshIntegrationTest {
             await(contextSelected);
             scheduler.awaitNext().run();
             assertThat(loginCalls).hasValue(0);
-            assertThat(runtime.state().overlay()).isEmpty();
-
-            scheduler.awaitNext().run();
-            assertThat(session.handleEvent(KeyEvent.ofChar('a'), null)).isTrue();
-            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay ->
-                    assertThat(overlay).isInstanceOf(WorkbenchOverlayState.Login.class));
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay -> {
+                assertThat(overlay).isInstanceOf(WorkbenchOverlayState.Login.class);
+                assertThat(((WorkbenchOverlayState.Login) overlay).contextName()).isEqualTo("dev");
+            });
         }
     }
 
@@ -396,7 +399,7 @@ class WorkbenchRefreshIntegrationTest {
     }
 
     @Test
-    void contextPickerCreatesAndActivatesAContextWithoutStartingLogin() throws Exception {
+    void contextPickerCreatesAContextAndPromptsForLoginWhenSignedOut() throws Exception {
         RecordingScheduler scheduler = new RecordingScheduler();
         WorkbenchRuntime runtime = new WorkbenchRuntime(
                 WorkbenchState.initial(), scheduler, () -> true, event -> {
@@ -459,7 +462,10 @@ class WorkbenchRefreshIntegrationTest {
             assertThat(createdServer).hasValue(URI.create("http://127.0.0.1:7900"));
             assertThat(createdVerifyTls).hasValue(true);
             assertThat(loginCalls).hasValue(0);
-            assertThat(runtime.state().overlay()).isEmpty();
+            assertThat(runtime.state().overlay()).hasValueSatisfying(overlay -> {
+                assertThat(overlay).isInstanceOf(WorkbenchOverlayState.Login.class);
+                assertThat(((WorkbenchOverlayState.Login) overlay).contextName()).isEqualTo("dev");
+            });
 
             scheduler.awaitNext().run();
             assertThat(runtime.state().snapshot())

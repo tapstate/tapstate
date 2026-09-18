@@ -30,7 +30,7 @@ class WorkbenchPtyLifecycleTest {
 
             assertThat(pty.jvmPid()).isEqualTo(originalJvm);
             assertThat(count(pty.transcript(), ENTER_ALTERNATE_SCREEN)).isEqualTo(1);
-            pty.send("q");
+            quit(pty);
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
             assertThat(pty.childExitStatus()).isZero();
             assertTerminalRecovered(pty);
@@ -41,7 +41,7 @@ class WorkbenchPtyLifecycleTest {
     void explicitWorkbenchBackendWinsWhenAnotherProviderIsDiscoverable(@TempDir Path home) throws Exception {
         try (JvmPtyFixture pty = JvmPtyFixture.start(home, JvmPtyFixture.Mode.BACKEND_SELECTION)) {
             pty.awaitText("__TAPSTATE_BACKEND__io.tapstate.cli.WorkbenchTerminalBackend", SCREEN_TIMEOUT);
-            pty.send("q");
+            quit(pty);
 
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
             assertThat(pty.childExitStatus()).isZero();
@@ -52,7 +52,7 @@ class WorkbenchPtyLifecycleTest {
     @Test
     void normalQuitReturnsZeroAndRestoresTheTerminal(@TempDir Path home) throws Exception {
         try (JvmPtyFixture pty = startBare(home)) {
-            pty.send("q");
+            quit(pty);
 
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
             assertThat(pty.childExitStatus()).isZero();
@@ -72,7 +72,7 @@ class WorkbenchPtyLifecycleTest {
             pty.awaitTextAfter("75", transcriptLengthBeforeResize, SCREEN_TIMEOUT);
 
             pty.send(F6);
-            pty.send("q");
+            quit(pty);
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
             assertThat(pty.childExitStatus()).isZero();
             assertTerminalRecovered(pty);
@@ -98,7 +98,7 @@ class WorkbenchPtyLifecycleTest {
             pty.awaitText("Terminal size too small:", SCREEN_TIMEOUT);
             pty.send("x");
             pty.awaitText("Injected", SCREEN_TIMEOUT);
-            pty.send("q");
+            quit(pty);
 
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
             assertThat(pty.childExitStatus()).isZero();
@@ -141,7 +141,7 @@ class WorkbenchPtyLifecycleTest {
     @Test
     void normalQuitEmitsEachTerminalRestorationOnce(@TempDir Path home) throws Exception {
         try (JvmPtyFixture pty = startBare(home)) {
-            pty.send("q");
+            quit(pty);
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
 
             assertThat(count(pty.transcript(), LEAVE_ALTERNATE_SCREEN))
@@ -171,6 +171,12 @@ class WorkbenchPtyLifecycleTest {
         JvmPtyFixture pty = JvmPtyFixture.start(home, JvmPtyFixture.Mode.BARE);
         pty.awaitText("Terminal size too small:", SCREEN_TIMEOUT);
         return pty;
+    }
+
+    private static void quit(JvmPtyFixture pty) throws Exception {
+        pty.send("q");
+        pty.awaitText("Confirm Quit", SCREEN_TIMEOUT);
+        pty.send("\r");
     }
 
     private static void assertTerminalRecovered(JvmPtyFixture pty) {
