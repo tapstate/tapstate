@@ -149,6 +149,7 @@ final class Repl {
     private static final String KEEP_STATE = "--keep-state";
     private static final Set<String> STOP_OPTIONS = Set.of(KEEP_STATE, "-y", "--non-interactive");
     private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--non-interactive");
+    private static final String INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
 
     /** The server's own code for a connector that is not registered. */
     private static final String CONNECTOR_NOT_REGISTERED = "connector.not-registered";
@@ -2235,7 +2236,7 @@ final class Repl {
         if (unattended) {
             return OptionalInt.empty();
         }
-        Prompter asking = terminal.getAsBoolean() ? prompter() : null;
+        Prompter asking = terminal.getAsBoolean() ? prompter : null;
         if (asking == null) {
             PrintWriter err = commandLine.getErr();
             Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", verb));
