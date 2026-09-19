@@ -18,6 +18,7 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
@@ -91,6 +92,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             return;
         }
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
+        ReadMode readMode = readModeOf(pipeline.settings());
+        // A snapshot-only run has no change chain to supply a generation. Advance its own durable order
+        // once for the whole pipeline run and above every retained chain generation, so every source in
+        // one assembly is comparable and the first run after a mode switch also outranks preserved state.
+        long snapshotEpoch = readMode == ReadMode.SNAPSHOT_ONLY
+                ? SnapshotRunOrder.next(storePort.keyedState(), pipelineId, retainedChainGeneration(pipelineId))
+                : 1L;
         List<CaptureRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
@@ -109,7 +117,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 SourceModel discovered = SourceDiscovery.model(storePort, source);
                 SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discovered);
                 CaptureRunSpec spec = deriveSpec(
-                        pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref));
+                        pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref),
+                        snapshotEpoch);
                 Map<String, Long> observedSnapshotCounts = new LinkedHashMap<>();
                 CaptureRun run = captureStarter.start(
                         spec, snapshotPassthrough(pipelineId, resolution, observedSnapshotCounts));
@@ -130,6 +139,22 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         runsByPipeline.put(pipelineId, runs);
         snapshotsByPipeline.put(pipelineId, reading(attributed, loadBegan));
         snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
+    }
+
+    /**
+     * The highest chain generation whose durable consumer record says this pipeline reached it.
+     *
+     * <p>A stop that preserves state leaves that record beside the operator state it ordered. Looking
+     * across every such chain also covers a pipeline whose source binding changed while stopped; using
+     * only the source it names now would lose the generation of the state the earlier binding left behind.
+     */
+    private long retainedChainGeneration(String pipelineId) {
+        return storePort.meta().miningChainIdsWithConsumer(pipelineId).stream()
+                .map(storePort.meta()::read)
+                .flatMap(Optional::stream)
+                .mapToLong(SrsMeta::epoch)
+                .max()
+                .orElse(0L);
     }
 
     /** One source run's snapshot: its completion chain, if any, and the tables it covers. */
@@ -500,8 +525,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     static CaptureRunSpec deriveSpec(
             String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution,
             boolean srsEnabled) {
-        ReadMode readMode = settings != null && settings.readMode() != null
-                ? settings.readMode() : ReadMode.SNAPSHOT_AND_CDC;
+        return deriveSpec(pipelineId, settings, source, resolution, srsEnabled, 1L);
+    }
+
+    private static CaptureRunSpec deriveSpec(
+            String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution,
+            boolean srsEnabled, long snapshotEpoch) {
+        ReadMode readMode = readModeOf(settings);
         String startFromRaw = settings != null && settings.startFrom() != null
                 ? settings.startFrom() : "latest";
         String retention = source.srs() != null ? source.srs().retention() : null;
@@ -517,7 +547,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 pipelineId,
                 StartFrom.parse(startFromRaw),
                 retention,
-                MOCK_SCHEMA_VER);
+                MOCK_SCHEMA_VER,
+                snapshotEpoch);
+    }
+
+    private static ReadMode readModeOf(Settings settings) {
+        return settings != null && settings.readMode() != null
+                ? settings.readMode() : ReadMode.SNAPSHOT_AND_CDC;
     }
 
     /**

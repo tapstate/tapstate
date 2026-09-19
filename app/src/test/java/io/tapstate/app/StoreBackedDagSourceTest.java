@@ -710,10 +710,8 @@ class StoreBackedDagSourceTest {
                 null, null));
         discovered(store, "orders_src", "orders");
 
-        // No chain record: only a read with an incremental tail through the shared ring opens one, so a
-        // snapshot-only or srs-disabled read reaches here with none. Its rows come from the snapshot buffer
-        // and no capture fills its ring, so demanding a generation of it would refuse to build a job that
-        // is perfectly well formed.
+        // No chain record: a graph may be inspected before its capture opens anything. A source with no
+        // buffered rows and no ring writer still builds; its absent generation orders nothing.
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
 
         assertThat(vertexNames(dag)).contains("orders_src");

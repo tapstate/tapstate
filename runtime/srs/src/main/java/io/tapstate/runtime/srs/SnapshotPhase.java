@@ -248,19 +248,28 @@ public final class SnapshotPhase {
 
     /**
      * Drains the bounded snapshot read straight to {@code sink}, returning the number of events passed
-     * through. Pure pass-through: it records no cdc-start position and touches no meta record — the path a
-     * {@code snapshot_only} or srs-disabled read takes, where there is no shared chain a cdc tail resumes
-     * against. Events go one by one, never buffered in the change ring, and the batch is always closed.
+     * through. It records no cdc-start position and touches no meta record — the path a
+     * {@code snapshot_only} read takes, where there is no change chain a tail resumes against. Every row is
+     * stamped with the generation assigned to this bounded run before it leaves: a stateful node needs an
+     * order even where there will never be a later change, and a later run needs a higher generation to beat
+     * state the earlier one left behind. Events go one by one, never buffered in the change ring, and the
+     * batch is always closed.
      */
-    public static long drain(CapturePort port, CaptureConfig config, Consumer<Envelope> sink) {
+    public static long drain(
+            CapturePort port, CaptureConfig config, long snapshotEpoch, Consumer<Envelope> sink) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(sink, "sink");
+        if (snapshotEpoch < 1) {
+            throw new IllegalArgumentException(
+                    "a chainless snapshot generation must be positive, got " + snapshotEpoch);
+        }
 
+        SourceOrder order = SourceOrder.snapshotRow(snapshotEpoch);
         long count = 0;
         try (CaptureBatch batch = port.snapshot(config)) {
             while (batch.hasNext()) {
-                sink.accept(batch.next());
+                sink.accept(batch.next().withOrder(order));
                 count++;
             }
         }

@@ -17,12 +17,11 @@ import java.util.ArrayDeque;
 import java.util.Objects;
 
 /**
- * The core-API self-built source over one per-table change ring: a Jet processor with no inbound edge that
- * emits this ring's buffered snapshot rows first, then tails the ring in sequence order emitting each change
- * already projected to the {@link Envelope} currency, the source vertex the engine's DAG builder wires. It is
- * the core-API sibling of {@link SrsRingSource} (the pipeline-API stream source over raw items): the DAG
- * builder speaks in processor suppliers, and the source position must enter the envelope at the source, so
- * the projection lives here rather than in a later stage.
+ * The core-API self-built source for one table: a Jet processor with no inbound edge that drains this
+ * pipeline's member-local hand-off and, when configured with a ring tail, follows the shared ring in sequence
+ * order. Ring changes are projected to the {@link Envelope} currency here because the engine's DAG builder
+ * speaks in processor suppliers and the source position must enter the envelope at the source. The ring-backed
+ * path is the core-API sibling of {@link SrsRingSource}, the pipeline-API stream source over raw items.
  *
  * <p>Snapshot rows and cdc changes flow through this one ordered source: the rows a member-side
  * {@link SnapshotBuffer} holds for this pipeline and ring are emitted ahead of any cdc change off the ring,
@@ -36,10 +35,10 @@ import java.util.Objects;
  * again -- with the job still running, nothing thrown, and the tail reporting healthy.
  *
  * <p>Non-cooperative, exactly as Jet's own SourceBuilder-built source is: it runs on its own thread and backs
- * off between empty fills, so an idle ring never spins a shared cooperative thread. It is not fault-tolerant -
- * it keeps no snapshot and its read position never enters Jet state; on an L1 restart the ring is re-mined and
- * replayed from the durable source offset. The ring and the read-cursor sink are resolved on the member the
- * processor runs on, so nothing but serializable coordinates crosses the wire.
+ * off between empty fills, so an idle input never spins a shared cooperative thread. It is not fault-tolerant -
+ * it keeps no snapshot and a ring read position never enters Jet state; on an L1 restart the ring is re-mined
+ * and replayed from the durable source offset. A configured ring and read-cursor sink are resolved on the
+ * member the processor runs on, so nothing but serializable coordinates crosses the wire.
  */
 public final class SrsSourceProcessor extends AbstractProcessor implements Staged {
 
@@ -54,10 +53,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final String pipelineId;
     private final String ringName;
     private final String src;
-    private final StartFrom start;
     private final long epoch;
-    private final SrsReadCursorPublisherFactory publisherFactory;
     private final SourceBoundStamp stamp;
+    private final RingTail ringTail;
     private final ArrayDeque<Envelope> pending = new ArrayDeque<>();
     private SnapshotBuffer buffered;
     private SrsRingReader reader;
@@ -71,15 +69,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     // Whether this source still owes the bound covering the snapshot rows it was seeded with.
     private boolean snapshotBoundDue;
 
-    private SrsSourceProcessor(String pipelineId, String ringName, String src, StartFrom start, long epoch,
-            SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp) {
+    private SrsSourceProcessor(String pipelineId, String ringName, String src, long epoch,
+            SourceBoundStamp stamp, RingTail ringTail) {
         this.pipelineId = pipelineId;
         this.ringName = ringName;
         this.src = src;
-        this.start = start;
         this.epoch = epoch;
-        this.publisherFactory = publisherFactory;
         this.stamp = stamp;
+        this.ringTail = ringTail;
     }
 
     // Times each read of the ring that produced something, which is this stage's unit of work.
@@ -93,18 +90,20 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // ordering that keeps a stale snapshot from landing at the sink after a newer change of the same key.
         // A member with no buffer bound, or a ring with none buffered, takes nothing here and is a pure ring
         // tail. Rows are preserved as-is: a null source position is what the sink-ack watermark skips.
-        // This is a streaming source: it assumes a cdc tail follows the snapshot. A snapshot-only read (no
-        // tail, a bounded source that emits the buffer then completes rather than tailing an empty ring) is a
-        // later increment; it is not driven through this vertex yet.
+        // A buffer-only source deliberately stops here: the ring name is its private hand-off coordinate,
+        // not permission to open the shared ring or publish a consumer cursor into its mining chain.
         //
         // The reference is kept, not just read: the buffer is looked at again on every pass, because a tail
         // with the shared ring switched off never stops appending to it.
         Object bound = context.hazelcastInstance().getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY);
         buffered = bound instanceof SnapshotBuffer resolved ? resolved : null;
         drainBuffered();
-        Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
-        SrsRingbuffer ring = new SrsRingbuffer(rb);
-        reader = SrsRingReader.from(ring, start, publisherFactory.resolve(context.hazelcastInstance()));
+        if (ringTail != null) {
+            Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
+            SrsRingbuffer ring = new SrsRingbuffer(rb);
+            reader = SrsRingReader.from(
+                    ring, ringTail.start(), ringTail.publisherFactory().resolve(context.hazelcastInstance()));
+        }
     }
 
     @Override
@@ -142,11 +141,13 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // The ring's sequence pairs with the generation this reader runs under to give each change its
         // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
         // again, so a change of the new ring would otherwise read as older than one of the ring before it.
-        reader.fill((item, seq) -> {
-            SourceOrder order = orderOf(seq);
-            pending.add(SrsProjection.toEnvelope(item, src, order));
-            read = order;
-        }, FILL_BATCH);
+        if (ringTail != null) {
+            reader.fill((item, seq) -> {
+                SourceOrder order = orderOf(seq);
+                pending.add(SrsProjection.toEnvelope(item, src, order));
+                read = order;
+            }, FILL_BATCH);
+        }
         if (pending.size() > pendingBefore) {
             timer.end(started);
         }
@@ -154,8 +155,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             stampWhatHasLeft();
             announce();
         }
-        // A streaming source never completes: on an empty ring it returns having emitted nothing and, being
-        // non-cooperative, its worker backs off before the next call rather than spinning.
+        // This source never completes: on an empty ring or buffer it returns having emitted nothing and,
+        // being non-cooperative, its worker backs off before the next call rather than spinning. Keeping a
+        // buffer-only source live also keeps Jet from advancing the downstream frontier past its last bound.
         return false;
     }
 
@@ -272,9 +274,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      *
      * <p>The generation is resolved when the job is assembled, not read per change: the ring is opened
      * before the job is submitted and does not change generation while it runs, so carrying it here keeps
-     * the durable store off the per-change path entirely. Zero means the source reads no chain of its own —
-     * a snapshot-only or srs-disabled read, whose rows come from the snapshot buffer and whose ring nobody
-     * fills; a change found on such a ring is rejected rather than ordered.
+     * the durable store off the per-change path entirely. Zero is reserved for a graph inspected before its
+     * capture was started, and a change found under it is rejected rather than ordered.
      */
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
             StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory) {
@@ -296,8 +297,31 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         if (epoch < 0) {
             throw new IllegalArgumentException("a ring generation is never negative, got " + epoch);
         }
-        SupplierEx<Processor> supplier =
-                () -> new SrsSourceProcessor(pipelineId, ringName, src, start, epoch, publisherFactory, stamp);
+        SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(
+                pipelineId, ringName, src, epoch, stamp, new RingTail(start, publisherFactory));
         return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+    }
+
+    /**
+     * A source for a bounded snapshot with no incremental tail. It drains only this pipeline's member-local
+     * hand-off, stamps its rows with {@code epoch}, and stays live so the downstream frontier remains sound.
+     * It deliberately accepts neither a start point nor a cursor publisher: {@code ringName} is only the
+     * buffer key, and another pipeline may be filling the shared ring behind that name.
+     */
+    public static ProcessorMetaSupplier snapshotOnlyMetaSupplier(
+            String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(ringName, "ringName");
+        Objects.requireNonNull(src, "src");
+        if (epoch < 0) {
+            throw new IllegalArgumentException("a snapshot generation is never negative, got " + epoch);
+        }
+        SupplierEx<Processor> supplier =
+                () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null);
+        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+    }
+
+    /** Present only on the source shape that follows a shared ring and publishes its read cursor. */
+    private record RingTail(StartFrom start, SrsReadCursorPublisherFactory publisherFactory) {
     }
 }
