@@ -184,9 +184,11 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      */
     private final Map<Object, Window> windows = new LinkedHashMap<>();
 
-    // The highest position per chain that a lookup has said owes nothing, waiting until this level holds
-    // nothing lower on that chain. In memory, like the windows beside it: a restart that has lost it has
-    // lost only a chance to advance a frontier, which is the direction to lose in.
+    // The highest position per chain that needs no further document here, waiting until this level holds
+    // nothing lower on that chain. These come from rows no document names and from a first filing already
+    // present in the document that crossed ahead of its wake. In memory, like the windows beside it: a
+    // restart that has lost one has lost only a chance to advance a frontier, which is the direction to
+    // lose in.
     private final Map<String, ChainPosition> settledAhead = new LinkedHashMap<>();
 
     /**
@@ -676,6 +678,15 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             // is sent on every row of a pointing stream whose row is already filed, and drawing those
             // documents again would double what a stream costs to say nothing new.
             if (word.onlyIfWaiting() && !waiting.contains(word.key())) {
+                return;
+            }
+            // A lookup writes a row before queueing its first wake. If the root crossed the other edge in
+            // between, it has already read that row and sent the complete document, so the wake changes no
+            // content. Its position still has to reach the sink: the row is durable in the lookup and any
+            // root that has not arrived yet will read it there, so the position can travel without another
+            // copy of the document. An edit to an existing filed row is never folded here.
+            if (word.firstFiling() && !waiting.contains(word.key())) {
+                SettledPositions.fold(settledAhead, word.positions());
                 return;
             }
             // Nothing here changes - what the document should now show is read out of that row's own
@@ -1330,12 +1341,12 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     }
 
     /**
-     * Queues on, for each chain, the position a lookup said owes nothing, once this level holds nothing
-     * lower on that chain.
+     * Queues on, for each chain, a position that needs no further document here, once this level holds
+     * nothing lower on that chain.
      *
      * <p><b>Held rather than passed straight on, and the hold is the whole of what makes it safe.</b> What
-     * it says is true where it was said: those rows are durable and no record about them is coming. What it
-     * cannot see is a document sitting here in its window holding a <em>lower</em> position on the same
+     * it says is true where it was said: those rows are durable and no further record about them is needed.
+     * What it cannot see is a document sitting here in its window holding a <em>lower</em> position on the same
      * chain - a document that is not durable anywhere, because a word about a row it points at changes
      * nothing in the state, only what has to be drawn again. Let past that document, this would have a sink
      * ack above a change that is then neither delivered nor replayable: the document stays at its previous
