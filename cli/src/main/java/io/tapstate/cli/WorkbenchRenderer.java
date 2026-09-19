@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -1087,7 +1088,7 @@ final class WorkbenchRenderer {
                 write(frame, inner.x(), y++, "State", theme.title(), inner);
                 Optional<WorkbenchPipelineStatus> status = selectedPipelineStatus(state);
                 write(frame, inner.x() + 2, y++, status.map(WorkbenchRenderer::pipelineStatusDetail)
-                        .orElse("Reading current state..."), status.map(value -> pipelineStatusStyle(value, theme))
+                        .orElse("Reading current state..."), status.map(statusValue -> pipelineStatusStyle(statusValue, theme))
                         .orElse(theme.muted()), inner);
                 MovementReading current = available.current();
                 String moving = current == null
