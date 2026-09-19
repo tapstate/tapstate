@@ -1,1 +1,0 @@
-mvn -pl runtime/engine -am -Dtest=AQueuedWakeDoesNotRedrawAnAlreadyCompleteDocumentTest -Dsurefire.failIfNoSpecifiedTests=false test
