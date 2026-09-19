@@ -226,8 +226,25 @@ final class PipelineActuationOwnership {
      * reason to replace the run would restart a connector defect that happened to die shortly after
      * somebody started a new node.
      *
-     * <p>False while this member has submitted no run, while nothing is committed, and on a single node
-     * -- one member cannot lose a member, it can only be the one that went.
+     * <p>False while nothing is committed and on a single node -- one member cannot lose a member, it
+     * can only be the one that went.
+     *
+     * <p><b>A run this member inherited is the one case it cannot answer this way</b>, and it is the
+     * case that matters most: the member that submitted the run is the member that went away, so
+     * nothing here remembers what that run was planned over. Holding a pipeline whose claim already
+     * carries an execution, with no run of this member's own behind it, is itself the answer - a claim
+     * only changes hands when its holder stops renewing, and what it left behind is a run nothing is
+     * driving. Such a run is admitted for rebuilding, once; the attempt budget and backoff above the
+     * caller bound it, and the first rebuild makes this member the submitter, after which the ordinary
+     * reading applies again.
+     *
+     * <p>This is narrower than the design's own words, which have the new holder verify the topology
+     * the failed execution ran under. That verification is not available to it: a claim's topology
+     * revision is overwritten by whoever acquires it next, so the revision the dead run was submitted
+     * under is gone by the time anybody could compare it. Recording it durably is the fuller answer and
+     * is written down as owed; what is here delivers the behaviour that matters - a pipeline whose
+     * driver was killed is picked up rather than left failed - without pretending to a check it cannot
+     * make.
      */
     boolean aMemberLeftUnderTheRun(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -238,8 +255,23 @@ final class PipelineActuationOwnership {
         if (state == null) {
             return false;
         }
+        if (state.runMembers == null) {
+            return inheritedARunNobodyIsDriving(state);
+        }
         observeMembership(state);
         return state.lostAMember;
+    }
+
+    /**
+     * Whether this member holds a pipeline whose claim carries a run it did not submit.
+     *
+     * <p>The execution generation is what says a run was ever submitted under this claim at all: it
+     * survives the claim changing hands, and it is zero on a pipeline nobody has started. Paired with
+     * this member having no run of its own, it is exactly "somebody else's run, and they are no longer
+     * holding it".
+     */
+    private static boolean inheritedARunNobodyIsDriving(Held state) {
+        return state.claim != null && state.claim.executionGeneration() > 0;
     }
 
     /**

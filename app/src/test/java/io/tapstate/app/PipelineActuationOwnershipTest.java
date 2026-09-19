@@ -152,6 +152,46 @@ class PipelineActuationOwnershipTest {
                 converger, desired, publisher, () -> true, ownership(owner));
     }
 
+    /**
+     * The run a killed member left behind is picked up by the one that inherits the pipeline.
+     *
+     * <p>Whether a member went away is read, everywhere else, off what this member remembers about the
+     * run it submitted. After a failover there is nobody left holding that memory: the member that
+     * submitted the run is the member that died, and the one that inherits the pipeline has never
+     * driven it. Answered only that way, the question is false forever and the pipeline stays failed
+     * with nothing in any log saying why - which is what a two-process failover found and no
+     * same-member case can.
+     *
+     * <p>Both directions, because only one of them is the defect: a pipeline nobody has ever run is not
+     * something to rebuild, and the member that did submit the run still answers from what moved under
+     * it rather than from having inherited anything.
+     */
+    @Test
+    void theRunAKilledMemberLeftBehindIsAdmittedForRebuildingByTheOneThatInheritsIt() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        assertThat(nodeA.aMemberLeftUnderTheRun("orders"))
+                .as("a pipeline nobody has run yet is not a run anybody left behind")
+                .isFalse();
+        assertThat(nodeA.beginExecution("orders").allowed()).isTrue();
+        assertThat(nodeA.aMemberLeftUnderTheRun("orders"))
+                .as("and nothing has moved under the member that submitted it")
+                .isFalse();
+
+        // That member is killed: it stops renewing, and the lease it never released runs out.
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+
+        PipelineActuationOwnership nodeB = ownership(NODE_B);
+        assertThat(nodeB.permit("orders").granted())
+                .as("the pipeline changes hands once the dead holder's lease expires")
+                .isTrue();
+        assertThat(nodeB.aMemberLeftUnderTheRun("orders"))
+                .as("the member that inherits a claim already carrying an execution is holding a run "
+                        + "nobody is driving, and that is the whole of what it needs to know to replace it")
+                .isTrue();
+    }
+
     private PipelineActuationOwnership ownership(WorkloadOwner owner) {
         return new PipelineActuationOwnership(
                 "cluster-a", owner, membership, new ClusterWorkloadClaims(claims, membership), TTL, RENEW,
