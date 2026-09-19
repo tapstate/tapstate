@@ -541,6 +541,17 @@ class ReplTest {
             return healthy.contains(baseUrl) ? logsOutcome : new LogsOutcome.Unreachable();
         }
 
+        /** What every member answers, which is the same answer: the cluster, not the node reached. */
+        ClusterMembersOutcome clusterOutcome = new ClusterMembersOutcome.Listed(null, null, List.of());
+
+        final List<String> clusterCalls = new ArrayList<>();
+
+        @Override
+        public ClusterMembersOutcome clusterMembers(URI baseUrl, String credential) {
+            clusterCalls.add(credential + "@" + baseUrl);
+            return healthy.contains(baseUrl) ? clusterOutcome : new ClusterMembersOutcome.Unreachable();
+        }
+
         @Override
         public String watchStatus(URI baseUrl, String credential, String pipelineId,
                 StatusStream sink, java.util.function.BooleanSupplier stop) {
@@ -4831,6 +4842,66 @@ class ReplTest {
         int mark = h.sink().toString().length();
         h.repl().dispatch("logs pl1");
         assertThat(h.sink().toString().substring(mark)).contains("no logs");
+    }
+
+    // --- cluster: the topology read -------------------------------------------------------------
+
+    @Test
+    void clusterListsEachMemberWithWhatItIsAndWhereToReachIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE"),
+                new RemoteClusterMember("node-b", "uuid-b", "boot-b", "[127.0.0.1]:5702",
+                        "https://b.example:8443", "JOINING")));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("cluster")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out)
+                .as("who it is, what it is to the cluster, and an address a reader can actually use")
+                .contains("node-a").contains("ACTIVE").contains("https://a.example:8443")
+                .contains("node-b").contains("JOINING").contains("https://b.example:8443");
+    }
+
+    @Test
+    void aClusterWithNothingCommittedSaysNothingRatherThanRevisionZero() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", null, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE")));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("cluster -o json")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark))
+                .as("nothing committed is not a cluster at revision zero, and a machine reader given a "
+                        + "zero has been told something untrue rather than nothing")
+                .doesNotContain("topologyRevision");
+    }
+
+    @Test
+    void clusterMovesToAnotherMemberWhenTheLandingNodeCannotAnswer() {
+        URI node1 = URI.create("http://node1:7900");
+        URI node2 = URI.create("http://node2:7900");
+        FakeControlPlane client = new FakeControlPlane(node1, node2);
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE")));
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
+        h.repl().session().connect(List.of(node1, node2), node1);
+        h.repl().session().authenticate("jwt-tok", "alice", null, List.of(node1, node2));
+        client.setHealthy(node2);
+
+        assertThat(h.repl().dispatch("cluster")).isTrue();
+
+        assertThat(client.clusterCalls)
+                .as("the topology is the cluster's answer, so a node that cannot give it is a node to "
+                        + "move off, not an answer")
+                .containsExactly("jwt-tok@http://node1:7900", "jwt-tok@http://node2:7900");
     }
 
     // --- status --watch / logs --follow stream over the websocket channel ------------------------

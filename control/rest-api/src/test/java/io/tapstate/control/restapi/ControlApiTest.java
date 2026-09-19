@@ -1,5 +1,7 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.ClusterTopologyView;
+import io.tapstate.control.core.ClusterMemberView;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.ApplyResult;
 import io.tapstate.core.common.TapstateException;
@@ -699,13 +701,23 @@ class ControlApiTest {
     }
 
     @Test
-    void clusterMembersIsRoutedButNotYetImplemented() {
-        // Topology must never leak anonymously: until the authentication interceptor and the member
-        // listing land, the endpoint is reserved and answers 501 — it exposes nothing.
-        HttpStatusCode status = client().get().uri("/api/cluster/members")
-                .exchange((request, response) -> response.getStatusCode());
+    void clusterMembersAnswersEachMembersStableAndRuntimeIdentityAndItsControlUrl() {
+        // The two identities are both there on purpose: the stable one is what a claim names as an owner,
+        // and the runtime pair is how a node that restarted is told from the one it replaced. The control
+        // URL is what a client does with the answer -- it is the address a reader can actually reach.
+        ClusterTopologyView topology = client().get().uri("/api/cluster/members")
+                .retrieve().body(ClusterTopologyView.class);
 
-        assertThat(status).isEqualTo(HttpStatus.NOT_IMPLEMENTED);
+        assertThat(topology.members())
+                .extracting(ClusterMemberView::nodeId, ClusterMemberView::memberUuid,
+                        ClusterMemberView::bootId, ClusterMemberView::hzAddress,
+                        ClusterMemberView::controlUrl)
+                .as("both members, and each of them said who it is and where to reach it")
+                .containsExactly(
+                        tuple("node-a", "8b0a1e6e-0000-4000-8000-00000000000a", "boot-a1",
+                                "[127.0.0.1]:5701", "https://node-a.example:8443"),
+                        tuple("node-b", "8b0a1e6e-0000-4000-8000-00000000000b", "boot-b1",
+                                "[127.0.0.1]:5702", "https://node-b.example:8443"));
     }
 
     // ---- the endpoint table is a derivation of the registry ----
@@ -772,7 +784,8 @@ class ControlApiTest {
      */
     @SpringBootConfiguration
     @EnableAutoConfiguration
-    @Import({RestApiConfiguration.class, SourceDraftTestConfiguration.class, ArtifactController.class,
+    @Import({RestApiConfiguration.class, SourceDraftTestConfiguration.class,
+            ClusterTopologyTestConfiguration.class, ArtifactController.class,
             SourceDraftController.class, ConnectionController.class,
             ClusterController.class, HealthController.class, VersionController.class,
             ApiExceptionHandler.class, FaultController.class})

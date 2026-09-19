@@ -767,6 +767,50 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
     }
 
+    @Override
+    public ClusterMembersOutcome clusterMembers(URI baseUrl, String credential) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/cluster/members", credential).GET().build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                return topology(response.body());
+            }
+            Rejection r = rejection(response.body(), "The server refused the read.");
+            return new ClusterMembersOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new ClusterMembersOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new ClusterMembersOutcome.Unreachable();
+        }
+    }
+
+    /** The topology decoded from a 200 body; a field the server did not send stays null, never a default. */
+    private static ClusterMembersOutcome.Listed topology(String body) {
+        List<RemoteClusterMember> members = new ArrayList<>();
+        String clusterId = null;
+        Long revision = null;
+        if (JsonReader.parse(body) instanceof Map<?, ?> map) {
+            clusterId = stringOrNull(map.get("clusterId"));
+            revision = map.get("topologyRevision") instanceof Number n ? n.longValue() : null;
+            if (map.get("members") instanceof List<?> list) {
+                for (Object o : list) {
+                    if (o instanceof Map<?, ?> m) {
+                        members.add(new RemoteClusterMember(
+                                stringOrNull(m.get("nodeId")),
+                                stringOrNull(m.get("memberUuid")),
+                                stringOrNull(m.get("bootId")),
+                                stringOrNull(m.get("hzAddress")),
+                                stringOrNull(m.get("controlUrl")),
+                                stringOrNull(m.get("state"))));
+                    }
+                }
+            }
+        }
+        return new ClusterMembersOutcome.Listed(clusterId, revision, members);
+    }
+
     /** The connectors decoded from a 200 body's {@code connectors} array; empty if the shape is unexpected. */
     private static List<CatalogConnector> catalogConnectors(String body) {
         List<CatalogConnector> connectors = new ArrayList<>();

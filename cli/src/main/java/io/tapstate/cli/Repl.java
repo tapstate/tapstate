@@ -148,7 +148,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "token", "derived-schema");
+            "connectors", "cluster", "token", "derived-schema");
 
     private final CommandLine commandLine;
 
@@ -757,6 +757,11 @@ final class Repl {
         // accepts an `-o` output flag and takes no operand — routed before the positional-only guard.
         if (words.get(0).equals("connectors")) {
             return connectorsOnline(words);
+        }
+        // `cluster` reads the topology and returns a structured list worth machine-reading, so it accepts
+        // an `-o` output flag and takes no operand -- routed here for the same reason `connectors` is.
+        if (words.get(0).equals("cluster")) {
+            return clusterOnline(words);
         }
         if (words.get(0).equals("token")) {
             return tokenOnline(words);
@@ -2766,6 +2771,80 @@ final class Repl {
             unit++;
         } while (size >= 1024 && unit < units.length - 1);
         return String.format(Locale.ROOT, "%.1f %s", size, units[unit]);
+    }
+
+    /**
+     * {@code cluster [-o text|json|yaml]} — lists the cluster's members: each one's stable node id, the
+     * runtime identity of this boot of it, where members reach it, where a client reaches its control
+     * face, and what it is to the cluster. Takes no operand; an unknown option is a benign usage line; a
+     * coded refusal renders its code and message.
+     *
+     * <p>Every member answers this identically, so which one the session happens to be landed on does not
+     * change what is printed — the point of asking a cluster rather than a node.
+     */
+    private int clusterOnline(List<String> words) {
+        OutputFormat format = parseFormatOnly("cluster", words);
+        if (format == null) {
+            return Cli.EXIT_USAGE;
+        }
+        ClusterMembersOutcome outcome = withFailover(
+                () -> controlPlane.clusterMembers(session.landingNode(), session.credential()),
+                o -> o instanceof ClusterMembersOutcome.Unreachable);
+        return switch (outcome) {
+            case ClusterMembersOutcome.Listed listed -> {
+                renderCluster(listed, format);
+                yield Cli.EXIT_OK;
+            }
+            case ClusterMembersOutcome.Rejected rejected ->
+                    renderRejection(rejected.code(), rejected.message());
+            case ClusterMembersOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    private void renderCluster(ClusterMembersOutcome.Listed listed, OutputFormat format) {
+        PrintWriter out = commandLine.getOut();
+        switch (format) {
+            case TEXT -> {
+                if (listed.members().isEmpty()) {
+                    out.println("no members");
+                } else {
+                    for (RemoteClusterMember member : listed.members()) {
+                        out.println(memberHeadline(member));
+                    }
+                }
+            }
+            case JSON -> out.println(JsonOut.write(clusterMap(listed)));
+            case YAML -> out.println(YamlOut.write(clusterMap(listed)));
+        }
+        out.flush();
+    }
+
+    /** The human line: who it is, what it is to the cluster, and the address a reader can use. */
+    private static String memberHeadline(RemoteClusterMember member) {
+        return cell(member.nodeId()) + "  " + cell(member.state()) + "  " + cell(member.controlUrl());
+    }
+
+    /** The topology as an ordered tree for the machine surfaces, omitting what the server did not say. */
+    private static Map<String, Object> clusterMap(ClusterMembersOutcome.Listed listed) {
+        List<Object> rows = new ArrayList<>();
+        for (RemoteClusterMember member : listed.members()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            putIfPresent(row, "nodeId", member.nodeId());
+            putIfPresent(row, "memberUuid", member.memberUuid());
+            putIfPresent(row, "bootId", member.bootId());
+            putIfPresent(row, "hzAddress", member.hzAddress());
+            putIfPresent(row, "controlUrl", member.controlUrl());
+            putIfPresent(row, "state", member.state());
+            rows.add(row);
+        }
+        Map<String, Object> map = new LinkedHashMap<>();
+        putIfPresent(map, "clusterId", listed.clusterId());
+        // Absent rather than zero: nothing committed is not a cluster at revision zero.
+        if (listed.topologyRevision() != null) {
+            map.put("topologyRevision", listed.topologyRevision());
+        }
+        map.put("members", rows);
+        return map;
     }
 
     /**

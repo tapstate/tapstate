@@ -748,5 +748,6 @@ class UpCmdTest {
         @Override public String watchStatus(URI u, String c, String id, StatusStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }
         @Override public String followLogs(URI u, String c, String id, LogStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }
         @Override public String tail(URI u, String c, String id, String collection, Object f, TailStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }
+        @Override public ClusterMembersOutcome clusterMembers(URI u, String c) { throw new AssertionError(); }
     }
 }

@@ -647,8 +647,9 @@ class AuthTest {
 
     @Test
     void topologyIsBehindAuthenticationNotAnonymous() {
-        // cluster.members is a read verb reserved as a 501 stub; the point here is that it is reached only
-        // after authentication — an anonymous caller is turned away at the interceptor with 401, never 501.
+        // Now that the verb answers with the cluster rather than a stub, this case is the one that says
+        // the answer is still only for somebody who authenticated — an anonymous caller is turned away at
+        // the interceptor, and never reaches the handler at all.
         HttpStatusCode anonymous = client().get().uri("/api/cluster/members")
                 .exchange((request, response) -> response.getStatusCode());
         assertThat(anonymous).isEqualTo(HttpStatus.UNAUTHORIZED);
@@ -656,7 +657,7 @@ class AuthTest {
         HttpStatusCode authenticated = client().get().uri("/api/cluster/members")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .exchange((request, response) -> response.getStatusCode());
-        assertThat(authenticated).isEqualTo(HttpStatus.NOT_IMPLEMENTED);
+        assertThat(authenticated).isEqualTo(HttpStatus.OK);
     }
 
     // ---- the unauthenticated surface is a closed allow-list (root-exit convergence) ----
@@ -734,6 +735,7 @@ class AuthTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
+            ClusterTopologyTestConfiguration.class,
             PipelinePositionTestConfiguration.class,
             DerivedSchemaTestConfiguration.class})
     static class TestApp {

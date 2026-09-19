@@ -24,7 +24,11 @@ import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
+import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.control.core.ClusterIdentityService;
+import io.tapstate.control.core.ClusterTopologyService;
+import io.tapstate.control.core.LiveClusterMembers;
+import io.tapstate.spi.store.ClusterMembershipStore;
 import io.tapstate.control.core.ConnectorConfigValidator;
 import io.tapstate.control.core.ConnectorRegisterService;
 import io.tapstate.control.core.ControlOperations;
@@ -121,7 +125,9 @@ import java.time.Clock;
 @Configuration
 @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
 @EnableConfigurationProperties({ControlAuthProperties.class, ConnectorPluginProperties.class})
-@Import(ControlHttpFace.class)
+// The topology read face reads the cluster id, and a control plane assembled without the engine must
+// still be able to stand up; the gate and the properties come from one place for everybody.
+@Import({ClusterMembershipConfiguration.class, ControlHttpFace.class})
 class ControlPlaneConfiguration {
 
     private static final Logger LOG = LoggerFactory.getLogger(ControlPlaneConfiguration.class);
@@ -168,6 +174,27 @@ class ControlPlaneConfiguration {
     @Bean
     ClusterIdentityService clusterIdentityService(ClusterIdentityStore store) {
         return new ClusterIdentityService(store);
+    }
+
+    /**
+     * The topology read face.
+     *
+     * <p>Both collaborators are optional, and for different reasons. A single-node build keeps no
+     * committed membership: one member is the whole cluster, and there is nothing for it to be outside
+     * of. An assembly with no engine member -- the control plane brought up on its own -- has no member
+     * list to read, and answers that it sees nobody, which is true of it: inventing itself as a
+     * one-member cluster would be the control plane reporting a data plane that is not running.
+     */
+    @Bean
+    ClusterTopologyService clusterTopologyService(
+            ObjectProvider<HazelcastInstance> member,
+            ObjectProvider<ClusterMembershipStore> membership,
+            ClusterProperties clusterProperties) {
+        HazelcastInstance engine = member.getIfAvailable();
+        return new ClusterTopologyService(
+                engine == null ? LiveClusterMembers.none() : new HazelcastLiveClusterMembers(engine),
+                membership.getIfAvailable(),
+                clusterProperties.getId());
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----

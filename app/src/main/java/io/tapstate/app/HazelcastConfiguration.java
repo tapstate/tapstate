@@ -37,6 +37,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
 import org.springframework.lang.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,7 +60,8 @@ import java.util.function.Supplier;
  * widening the bind is a deliberate multi-node change.
  */
 @Configuration
-@EnableConfigurationProperties({HazelcastProperties.class, ClusterProperties.class, ControlEndpointProperties.class})
+@EnableConfigurationProperties({HazelcastProperties.class, ControlEndpointProperties.class})
+@Import(ClusterMembershipConfiguration.class)
 class HazelcastConfiguration {
 
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
@@ -71,11 +73,6 @@ class HazelcastConfiguration {
      * than a tuned figure.
      */
     private static final int SRS_RING_CAPACITY = 1024;
-
-    @Bean
-    ClusterMembershipGate clusterMembershipGate(ClusterProperties properties) {
-        return new ClusterMembershipGate(properties);
-    }
 
     @Bean(destroyMethod = "shutdown")
     HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
@@ -96,13 +93,7 @@ class HazelcastConfiguration {
         }
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         if (identity != null) {
-            config.setClusterName(identity.clusterId());
-            config.getMemberAttributeConfig()
-                    .setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, identity.nodeId())
-                    .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE,
-                            identity.nodeSession().owner().bootId())
-                    .setAttribute(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE,
-                            identity.controlUrl().toString());
+            identify(config, identity);
             configureClusterProtection(config, membershipGate);
         }
         HazelcastInstance member;
@@ -323,6 +314,26 @@ class HazelcastConfiguration {
      * error while assembling the config) propagates unchanged: it must crash bare, not be laundered
      * into a code that hides the defect. The factory is a seam so the translation is unit-testable.
      */
+    /**
+     * Writes this node's Tapstate identity onto the member before it joins, as member attributes.
+     *
+     * <p>Attributes rather than a lookup: they travel with membership itself, so every member holds every
+     * other's identity the moment it sees it, with no round trip and no second place for them to go
+     * stale. That is what lets the topology read face answer the same on any node, and it is why they are
+     * set here -- before the member joins -- rather than published afterwards, which would leave a window
+     * in which a member is in the cluster and anonymous.
+     */
+    static Config identify(Config config, ClusterMemberPreflight.Identity identity) {
+        config.setClusterName(identity.clusterId());
+        config.getMemberAttributeConfig()
+                .setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, identity.nodeId())
+                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE,
+                        identity.nodeSession().owner().bootId())
+                .setAttribute(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE,
+                        identity.controlUrl().toString());
+        return config;
+    }
+
     static HazelcastInstance startMember(Supplier<HazelcastInstance> factory) {
         try {
             return factory.get();

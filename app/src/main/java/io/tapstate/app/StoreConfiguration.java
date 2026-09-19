@@ -15,6 +15,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
 
 /**
  * Wires the store into the assembly root. Under {@code --role=all} the server connects to the store
@@ -27,6 +28,7 @@ import org.springframework.context.annotation.Configuration;
  */
 @Configuration
 @EnableConfigurationProperties(MongoProperties.class)
+@Import(ClusterMembershipConfiguration.class)
 class StoreConfiguration {
 
     @Bean(destroyMethod = "close")

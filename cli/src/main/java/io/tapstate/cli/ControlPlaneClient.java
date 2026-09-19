@@ -162,6 +162,13 @@ interface ControlPlaneClient extends AutoCloseable {
     ConnectorListOutcome connectorList(URI baseUrl, String credential);
 
     /**
+     * Reads the cluster's members over {@code GET {baseUrl}/api/cluster/members}. Authenticated like every
+     * other read: membership is not anonymous, and a client that could read it without a credential would
+     * be reading a map of the deployment.
+     */
+    ClusterMembersOutcome clusterMembers(URI baseUrl, String credential);
+
+    /**
      * Lists the collections a declared source's own database holds, via
      * {@code GET {baseUrl}/api/sources/{sourceId}/collections}, authenticated by the bearer
      * {@code credential}: what the connector reported, a coded rejection when the server refuses (an id
