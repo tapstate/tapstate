@@ -1841,8 +1841,19 @@ class HttpControlPlaneClientTest {
         try (ServerSocket socket = new ServerSocket(0)) {
             closedPort = socket.getLocalPort();
         }
-        assertThat(new HttpControlPlaneClient().metrics(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1"))
-                .isInstanceOf(MetricsOutcome.Unreachable.class);
+        HttpServer competingServer = HttpServer.create(new InetSocketAddress("127.0.0.1", closedPort), 0);
+        competingServer.createContext("/api/pipelines/pl1/metrics", exchange -> {
+            exchange.sendResponseHeaders(503, -1);
+            exchange.close();
+        });
+        competingServer.start();
+        try {
+            assertThat(new HttpControlPlaneClient()
+                    .metrics(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1"))
+                    .isInstanceOf(MetricsOutcome.Unreachable.class);
+        } finally {
+            competingServer.stop(0);
+        }
     }
 
     @Test
