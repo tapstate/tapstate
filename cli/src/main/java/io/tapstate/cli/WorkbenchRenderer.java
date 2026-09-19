@@ -969,7 +969,7 @@ final class WorkbenchRenderer {
             return new ContentLayout(List.of(), Math.max(1, area.height() - 2));
         }
         if (state.selectedTab() == WorkbenchState.WorkbenchTab.INSPECT) {
-            renderInspect(frame, area, state.inspect(), theme);
+            renderInspect(frame, area, state, theme);
             return new ContentLayout(List.of(), Math.max(1, area.height() - 2));
         }
         Block block = Block.builder()
@@ -1060,8 +1060,8 @@ final class WorkbenchRenderer {
         if (view.newLines()) write(frame, inner.right() - 3, inner.y(), "(*)", theme.accent(), inner);
     }
 
-    private static void renderInspect(
-            Frame frame, Rect area, Optional<WorkbenchInspectState> inspect, WorkbenchTheme theme) {
+    private static void renderInspect(Frame frame, Rect area, WorkbenchState state, WorkbenchTheme theme) {
+        Optional<WorkbenchInspectState> inspect = state.inspect();
         String title = inspect.map(value -> "[" + value.pipelineId() + "] Inspect").orElse("Inspect");
         Block block = panel(title, false, theme);
         frame.renderWidget(block, area);
@@ -1084,6 +1084,11 @@ final class WorkbenchRenderer {
             case WorkbenchInspectState.Unavailable ignored ->
                     write(frame, inner.x(), y, "Sign in to read current Pipeline metrics.", theme.warning(), inner);
             case WorkbenchInspectState.Available available -> {
+                write(frame, inner.x(), y++, "State", theme.title(), inner);
+                Optional<WorkbenchPipelineStatus> status = selectedPipelineStatus(state);
+                write(frame, inner.x() + 2, y++, status.map(WorkbenchRenderer::pipelineStatusDetail)
+                        .orElse("Reading current state..."), status.map(value -> pipelineStatusStyle(value, theme))
+                        .orElse(theme.muted()), inner);
                 MovementReading current = available.current();
                 String moving = current == null
                         ? "not published"
@@ -1106,13 +1111,26 @@ final class WorkbenchRenderer {
                 }
                 write(frame, inner.x(), y++, "Counters", theme.title(), inner);
                 if (available.metrics().isEmpty()) {
-                    write(frame, inner.x() + 2, y, "No numeric counters published.", theme.muted(), inner);
-                    return;
+                    write(frame, inner.x() + 2, y++, "No numeric counters published.", theme.muted(), inner);
+                } else {
+                    for (Map.Entry<String, Long> entry : available.metrics().entrySet().stream()
+                            .sorted(Map.Entry.comparingByKey()).toList()) {
+                        if (y >= inner.bottom()) return;
+                        write(frame, inner.x() + 2, y++, entry.getKey() + ": " + entry.getValue(), theme.base(), inner);
+                    }
                 }
-                for (Map.Entry<String, Long> entry : available.metrics().entrySet().stream()
-                        .sorted(Map.Entry.comparingByKey()).toList()) {
-                    if (y >= inner.bottom()) return;
-                    write(frame, inner.x() + 2, y++, entry.getKey() + ": " + entry.getValue(), theme.base(), inner);
+                if (!available.facts().isEmpty() && y < inner.bottom()) {
+                    write(frame, inner.x(), y++, "Facts", theme.title(), inner);
+                    for (MetricsOutcome.FactPoint fact : available.facts().stream()
+                            .sorted(Comparator.comparing(MetricsOutcome.FactPoint::name)
+                                    .thenComparing(fact -> fact.attributes().toString()))
+                            .toList()) {
+                        if (y >= inner.bottom()) return;
+                        String attributes = fact.attributes().isEmpty() ? "" : " " + fact.attributes();
+                        String observedAt = fact.observedAt() == null ? "" : " @ " + LOG_TIMESTAMP.format(fact.observedAt());
+                        write(frame, inner.x() + 2, y++, fact.name() + attributes + ": " + fact.value() + observedAt,
+                                theme.base(), inner);
+                    }
                 }
             }
         }

@@ -21,6 +21,7 @@ sealed interface WorkbenchInspectState {
             Map<String, Long> metrics,
             Map<String, String> targetAckedPosition,
             List<String> positionsNotCollected,
+            List<MetricsOutcome.FactPoint> facts,
             MovementReading previous,
             MovementReading current,
             Instant receivedAt) implements WorkbenchInspectState {
@@ -29,6 +30,7 @@ sealed interface WorkbenchInspectState {
             metrics = metrics == null ? Map.of() : Map.copyOf(metrics);
             targetAckedPosition = targetAckedPosition == null ? Map.of() : Map.copyOf(targetAckedPosition);
             positionsNotCollected = positionsNotCollected == null ? List.of() : List.copyOf(positionsNotCollected);
+            facts = facts == null ? List.of() : List.copyOf(facts);
             Objects.requireNonNull(receivedAt, "receivedAt");
         }
     }

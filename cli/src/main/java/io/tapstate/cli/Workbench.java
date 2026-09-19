@@ -2509,20 +2509,11 @@ final class Workbench {
 
         private Optional<String> selectedPipelineStatusId() {
             WorkbenchState state = runtime.state();
-            if (state.selectedTab() != WorkbenchState.WorkbenchTab.PIPELINES || state.snapshot().isEmpty()) {
+            if (state.selectedTab() != WorkbenchState.WorkbenchTab.PIPELINES
+                    && state.selectedTab() != WorkbenchState.WorkbenchTab.INSPECT) {
                 return Optional.empty();
             }
-            WorkbenchSnapshot snapshot = state.snapshot().orElseThrow();
-            if (!(snapshot.pipelines().remoteState() instanceof WorkbenchRemoteState.Available)) {
-                return Optional.empty();
-            }
-            List<WorkbenchArtifactRow> rows = WorkbenchRenderer.sorted(snapshot.pipelines().rows(), state.pipelinesTable());
-            if (rows.isEmpty()) {
-                return Optional.empty();
-            }
-            WorkbenchArtifactRow selected = rows.get(Math.clamp(
-                    state.pipelinesTable().selectedIndex(), 0, rows.size() - 1));
-            return selected.remote().isEmpty() ? Optional.empty() : Optional.of(selected.key().id());
+            return selectedRemotePipelineId();
         }
 
         private void completeSelectedPipelineStatus(
@@ -2647,8 +2638,8 @@ final class Workbench {
                             .map(WorkbenchInspectState.Available::current)
                             .orElse(null);
                     yield new WorkbenchInspectState.Available(pipelineId, available.metrics(),
-                            available.targetAckedPosition(), available.positionsNotCollected(), previous, current,
-                            java.time.Instant.now());
+                            available.targetAckedPosition(), available.positionsNotCollected(), available.facts(),
+                            previous, current, java.time.Instant.now());
                 }
                 case WorkbenchActionGateway.PipelineMetricsResult.Rejected rejected ->
                         new WorkbenchInspectState.Rejected(pipelineId, rejected.code(), rejected.message());

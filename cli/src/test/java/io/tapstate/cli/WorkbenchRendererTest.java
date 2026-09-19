@@ -172,14 +172,19 @@ class WorkbenchRendererTest {
                 row("pipeline", "billing-pipeline", WorkbenchAlignment.IN_SYNC, "pipeline/billing.tap.yml", true)));
         WorkbenchState state = accepted(snapshot)
                 .select(WorkbenchState.WorkbenchTab.INSPECT)
+                .withSelectedPipelineStatus(Optional.of(new WorkbenchPipelineStatus.Available(
+                        "billing-pipeline", "RUNNING", Optional.empty(), Optional.empty())))
                 .withInspect(Optional.of(new WorkbenchInspectState.Available(
                         "billing-pipeline", Map.of("recordCount", 42L), Map.of("orders", "42"), List.of(),
+                        List.of(new MetricsOutcome.FactPoint("tapstate.pipeline.errors", Map.of("code", "timeout"),
+                                java.time.Instant.EPOCH, 1L)),
                         null, new MovementReading(null, Map.of("write", 42L), Map.of("orders", 3L)),
                         java.time.Instant.EPOCH)));
 
         assertThat(render(120, 32, state).text())
                 .contains("[billing-pipeline] Inspect", "Moving", "one reading gives no rate", "Lag", "orders 3s",
-                        "Target-acked positions", "recordCount: 42");
+                        "Target-acked positions", "recordCount: 42", "State", "RUNNING", "Facts",
+                        "tapstate.pipeline.errors {code=timeout}: 1");
     }
 
     @Test
