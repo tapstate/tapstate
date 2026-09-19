@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.function.IntFunction;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -23,6 +24,17 @@ final class RealProcessServer implements ServerHandle {
 
     /** Set by the failsafe binding, which knows where the reactor put the deliverable. */
     private static final String BOOT_JAR_PROPERTY = "tapstate.e2e.boot-jar";
+
+    /**
+     * Where a launch listens and where every case dials it.
+     *
+     * <p>A case whose subject is a member of a cluster widens the listen to every address with a later
+     * argument of its own - such a member is refused unless it advertises somewhere another member can
+     * reach it. It is still dialled here, and it has to be: the first admin is created over a channel
+     * the server accepts only from this address. {@link #freePort()} reserves on this address too, so
+     * widening the listen cannot hand a case somebody else's server on it.
+     */
+    private static final String LOOPBACK = "127.0.0.1";
 
     private static final Duration STARTUP_BUDGET = Duration.ofSeconds(120);
     private static final Duration POLL_INTERVAL = Duration.ofMillis(250);
@@ -41,6 +53,47 @@ final class RealProcessServer implements ServerHandle {
     /** Launches the deliverable and returns once its health probe answers. */
     static RealProcessServer start(String storeUri) {
         return start(storeUri, bootJar());
+    }
+
+    /**
+     * The same, with further settings on the launch.
+     *
+     * <p>For a witness whose subject is something the deliverable only does when it is configured to -
+     * joining another member of its own, say. They are the command line arguments an operator would
+     * pass, appended after the ones every launch carries, so a case about a setting exercises the way
+     * that setting really arrives rather than a fixture's idea of it.
+     *
+     * <p>Built from the port rather than handed over ready-made, because a member has to advertise the
+     * address it is reachable at and that port is chosen here. A caller that had to know it in advance
+     * would have to choose it too, and then this would be launching something at an address it does not
+     * own.
+     */
+    static RealProcessServer start(String storeUri, IntFunction<List<String>> extraArguments) {
+        return start(storeUri, LOOPBACK, extraArguments);
+    }
+
+    /**
+     * The same, listening on {@code listenAddress} rather than only where it is dialled.
+     *
+     * <p>For a witness whose subject is a member of a cluster. Such a member is refused at startup
+     * unless it advertises an address another member can reach, and advertising one while listening
+     * only on the loopback would advertise an address nothing answers at. It is still dialled on the
+     * loopback, and has to be: the first admin may only be created from there.
+     *
+     * <p>A parameter rather than something a caller appends, because a repeated command line option
+     * does not replace the earlier one here - the values are joined with a comma and the product is
+     * handed the pair, which fails to parse as one address.
+     */
+    static RealProcessServer start(String storeUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        RealProcessServer server = launching(storeUri, bootJar(), listenAddress, extraArguments);
+        try {
+            awaitHealthy(server.process, server.baseUrl, server.output);
+        } catch (RuntimeException | AssertionError e) {
+            server.process.destroyForcibly();
+            throw e;
+        }
+        return server;
     }
 
     /**
@@ -75,13 +128,25 @@ final class RealProcessServer implements ServerHandle {
 
     /** The same, launching the jar named rather than the one this reactor built. See {@link #start(String, Path)}. */
     static RealProcessServer launching(String storeUri, Path jar) {
+        return launching(storeUri, jar, port -> List.of());
+    }
+
+    /** The same, with further settings on the launch. See {@link #start(String, IntFunction)}. */
+    static RealProcessServer launching(String storeUri, Path jar, IntFunction<List<String>> extraArguments) {
+        return launching(storeUri, jar, LOOPBACK, extraArguments);
+    }
+
+    /** The same, listening on {@code listenAddress}. See {@link #start(String, String, IntFunction)}. */
+    static RealProcessServer launching(String storeUri, Path jar, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
-        URI baseUrl = URI.create("http://127.0.0.1:" + port);
+        URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
-        Process process = launch(jar, port, storeUri, workingDirectory, output);
+        Process process = launch(jar, port, listenAddress, storeUri, workingDirectory, output,
+                extraArguments.apply(port));
         return new RealProcessServer(process, baseUrl, output);
     }
 
@@ -152,8 +217,9 @@ final class RealProcessServer implements ServerHandle {
         }
     }
 
-    private static Process launch(Path jar, int port, String storeUri, Path workingDirectory, Path output) {
-        List<String> command = List.of(
+    private static Process launch(Path jar, int port, String listenAddress, String storeUri,
+            Path workingDirectory, Path output, List<String> extraArguments) {
+        List<String> command = new java.util.ArrayList<>(List.of(
                 javaBinary(),
                 "-jar",
                 jar.toString(),
@@ -163,7 +229,7 @@ final class RealProcessServer implements ServerHandle {
                 // every case dial it. Left to itself the product binds the wildcard, and a wildcard bind
                 // does not own 127.0.0.1:<port> -- a process already holding that port on the loopback
                 // keeps receiving the requests, and this server answers none of them.
-                "--server.address=127.0.0.1",
+                "--server.address=" + listenAddress,
                 "--server.port=" + port,
                 "--tapstate.store.mongo.enabled=true",
                 "--tapstate.store.mongo.uri=" + storeUri,
@@ -171,7 +237,11 @@ final class RealProcessServer implements ServerHandle {
                 // A staging directory of this launch's own, for the same reason the other tier gets one:
                 // the cache is content-addressed and reused, so a shared one serves a stale connector.
                 "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + ServerHandle.privateStagingDirectory(),
-                "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID);
+                "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
+        // After the standing ones, and additional to them rather than replacing any: a repeated option
+        // is joined with the earlier one by comma rather than winning over it, so anything a case needs
+        // to set differently is a parameter above instead of an argument here.
+        command.addAll(extraArguments);
         try {
             return new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())
@@ -228,6 +298,18 @@ final class RealProcessServer implements ServerHandle {
 
     private static String javaBinary() {
         return Path.of(System.getProperty("java.home"), "bin", "java").toString();
+    }
+
+    /**
+     * A port nothing is listening on, for a caller that has to know one before anything is launched -
+     * two members pointed at each other cannot both be told the other's address afterwards.
+     *
+     * <p>Reserved by binding and releasing, so it is free at the moment it is answered and not promised
+     * beyond that. Two calls never answer the same port while both are outstanding, which is what a
+     * caller lining up a pair needs.
+     */
+    static int reservePort() {
+        return freePort();
     }
 
     private static int freePort() {

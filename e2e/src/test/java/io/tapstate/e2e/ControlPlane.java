@@ -248,6 +248,43 @@ final class ControlPlane {
     }
 
     /**
+     * The node ids this member says are in its cluster, in order.
+     *
+     * <p>Asked of one member rather than of the cluster, because that is the property worth having: each
+     * of them answers out of the committed membership rather than out of what it happens to have seen,
+     * so two members that have found each other answer the same list and two that have not answer two
+     * lists of one. Sorted, so that comparing two members' answers compares what they hold rather than
+     * the order they happened to write it in.
+     */
+    List<String> clusterMemberNodeIds() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read who is in the cluster");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> topology)
+                || !(topology.get("members") instanceof List<?> members)) {
+            throw new AssertionError("the topology carried no members at all: " + response.body());
+        }
+        List<String> nodeIds = new ArrayList<>();
+        for (Object member : members) {
+            if (member instanceof Map<?, ?> one && one.get("nodeId") instanceof String nodeId) {
+                nodeIds.add(nodeId);
+            }
+        }
+        nodeIds.sort(String::compareTo);
+        return nodeIds;
+    }
+
+    /** The cluster id this member answers with, which is what a client checks a second member against. */
+    String clusterId() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read which cluster this is");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> topology)
+                || !(topology.get("clusterId") instanceof String clusterId)) {
+            throw new AssertionError("the topology named no cluster: " + response.body());
+        }
+        return clusterId;
+    }
+
+    /**
      * Mints a standing credential at the given scope and answers with it.
      *
      * <p>What a machine is given, as opposed to the session token a person's login returns. A
