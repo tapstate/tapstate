@@ -774,11 +774,7 @@ public final class JoinDriver {
      * made of rows that should not have matched at all.
      */
     private static String keyOf(Map<String, Object> row, List<String> columns) {
-        List<Object> values = new ArrayList<>(columns.size());
-        for (String column : columns) {
-            values.add(row.get(column));
-        }
-        JoinKey key = JoinKey.of(values);
+        JoinKey key = JoinKey.of(JoinKeys.valuesOf(row, columns));
         return key.matchable() ? key.name() : null;
     }
 
