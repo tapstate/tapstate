@@ -232,6 +232,9 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LOGS = mcp(
             "pipeline.logs", Scope.READ, false,
             "Read the bounded, secret-redacted log tail for a Pipeline.");
+    public static final Operation PIPELINE_LOG_LEVEL = new Operation(
+            "pipeline.log-level", Scope.WRITE, true, null,
+            "Set the minimum severity retained for one Pipeline's future node-local log lines.", CLI_ONLY);
 
     // Where a pipeline resumes from, read and written back. The read mutates nothing; the write moves
     // durable state that outlives every run on the chain -- shared with any other pipeline reading it --
@@ -308,6 +311,7 @@ public final class ControlOperations {
             PIPELINE_METRICS,
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
+            PIPELINE_LOG_LEVEL,
             PIPELINE_POSITION,
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,

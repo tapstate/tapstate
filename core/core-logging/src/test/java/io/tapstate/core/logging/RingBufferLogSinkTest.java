@@ -69,6 +69,52 @@ class RingBufferLogSinkTest {
     }
 
     @Test
+    void pageResumesStrictlyAfterTheReturnedCursor() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+        sink.append("pl1", line("a"));
+        sink.append("pl1", line("b"));
+        sink.append("pl1", line("c"));
+
+        LogPage first = sink.page("pl1", null, 2);
+        LogPage second = sink.page("pl1", first.nextCursor(), 2);
+
+        assertThat(first.lines()).extracting(LogLine::message).containsExactly("b", "c");
+        assertThat(first.nextCursor()).isNotNull();
+        assertThat(second.lines()).isEmpty();
+        assertThat(second.nextCursor()).isEqualTo(first.nextCursor());
+        assertThat(second.truncated()).isFalse();
+    }
+
+    @Test
+    void pageMarksAnEvictedCursorAsTruncatedAndContinuesAtTheOldestRetainedLine() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 2);
+        sink.append("pl1", line("a"));
+        LogCursor beforeEviction = sink.page("pl1", null, 8).nextCursor();
+        sink.append("pl1", line("b"));
+        sink.append("pl1", line("c"));
+
+        LogPage page = sink.page("pl1", beforeEviction, 8);
+
+        assertThat(page.lines()).extracting(LogLine::message).containsExactly("b", "c");
+        assertThat(page.truncated()).isTrue();
+    }
+
+    @Test
+    void pageMarksACursorFromARecreatedPipelineBufferAsTruncated() {
+        RingBufferLogSink sink = new RingBufferLogSink(1, 8);
+        sink.append("pl1", line("first"));
+        LogCursor cursor = sink.page("pl1", null, 8).nextCursor();
+
+        sink.append("pl2", line("other"));
+        sink.append("pl1", line("replacement"));
+
+        LogPage page = sink.page("pl1", cursor, 8);
+
+        assertThat(page.lines()).extracting(LogLine::message).containsExactly("replacement");
+        assertThat(page.truncated()).isTrue();
+    }
+
+    @Test
     void pipelineCardinalityIsBoundedEvictingTheLeastRecentlyAppended() {
         RingBufferLogSink sink = new RingBufferLogSink(2, 8);
 

@@ -4,6 +4,7 @@ import io.tapstate.control.core.PipelineLogs;
 import io.tapstate.control.core.PipelineStatus;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.logging.LogCursor;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.messages.MessageCatalog;
 import org.junit.jupiter.api.Test;
@@ -55,11 +56,13 @@ class StreamFramesTest {
     @Test
     void logsFrameCarriesTheIdAndLinesLikeTheReadFace() {
         PipelineLogs logs = new PipelineLogs("orders", List.of(
-                new LogLine(1_700_000_000_000L, "INFO", "submitted job")));
+                new LogLine(1_700_000_000_000L, "INFO", "submitted job")),
+                new LogCursor("generation", 7), false);
         String frame = StreamFrames.logs(logs);
         assertThat(frame).isEqualTo(
                 "{\"pipelineId\":\"orders\",\"lines\":[{\"timestampMillis\":1700000000000,"
-                        + "\"level\":\"INFO\",\"message\":\"submitted job\"}]}");
+                        + "\"level\":\"INFO\",\"message\":\"submitted job\"}],\"nextCursor\":{"
+                        + "\"generation\":\"generation\",\"sequence\":7},\"truncated\":false}");
     }
 
     @Test
@@ -73,6 +76,6 @@ class StreamFramesTest {
     @Test
     void logsFrameOfNoLinesCarriesAnEmptyArray() {
         String frame = StreamFrames.logs(new PipelineLogs("p", List.of()));
-        assertThat(frame).isEqualTo("{\"pipelineId\":\"p\",\"lines\":[]}");
+        assertThat(frame).isEqualTo("{\"pipelineId\":\"p\",\"lines\":[],\"truncated\":false}");
     }
 }

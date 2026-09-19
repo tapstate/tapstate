@@ -261,6 +261,16 @@ interface ControlPlaneClient extends AutoCloseable {
      */
     LogsOutcome logs(URI baseUrl, String credential, String pipelineId);
 
+    /** Reads a cursor-resumable page; null cursor retains the latest-tail behavior. */
+    default LogsOutcome logs(URI baseUrl, String credential, String pipelineId, RemoteLogCursor after) {
+        return logs(baseUrl, credential, pipelineId);
+    }
+
+    /** Sets the minimum severity retained for a Pipeline's future node-local log lines. */
+    default PipelineLogLevelOutcome logLevel(URI baseUrl, String credential, String pipelineId, String level) {
+        return new PipelineLogLevelOutcome.Unreachable();
+    }
+
     /**
      * Reads what a pipeline's join steps derive their output columns to be via
      * {@code GET {baseUrl}/api/pipelines/{pipelineId}/derived-schema}, authenticated by the bearer
@@ -300,6 +310,12 @@ interface ControlPlaneClient extends AutoCloseable {
      * the server closed with, or {@code null}. Blocks the caller until it returns. Never throws.
      */
     String followLogs(URI baseUrl, String credential, String pipelineId, LogStream sink, BooleanSupplier stop);
+
+    /** Follows strictly after a cursor when the server supports the resumable protocol. */
+    default String followLogs(URI baseUrl, String credential, String pipelineId, RemoteLogCursor after,
+            LogStream sink, BooleanSupplier stop) {
+        return followLogs(baseUrl, credential, pipelineId, sink, stop);
+    }
 
     /**
      * Follows one collection's changes over the websocket, delivering each to {@code sink} until

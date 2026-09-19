@@ -1,15 +1,19 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
-import io.tapstate.core.common.TapstateErrorCode;
-import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
+import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
-import io.tapstate.core.lifecycle.PipelineStateInventory;
-import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.schema.SchemaNavigator;
 import io.tapstate.messages.MessageCatalog;
 import org.jline.reader.EndOfFileException;
@@ -17,8 +21,17 @@ import org.jline.reader.Completer;
 import org.jline.reader.LineReader;
 import org.jline.reader.LineReaderBuilder;
 import org.jline.reader.UserInterruptException;
+import org.jline.builtins.InteractiveCommandGroup;
+import org.jline.builtins.PosixCommandGroup;
+import org.jline.shell.Command;
+import org.jline.shell.Shell;
+import org.jline.shell.ShellBuilder;
+import org.jline.shell.impl.DefaultCommandDispatcher;
+import org.jline.shell.impl.SimpleCommandGroup;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
+import org.jline.utils.AttributedStringBuilder;
+import org.jline.utils.AttributedStyle;
 import picocli.CommandLine;
 import picocli.CommandLine.Help.Ansi;
 
@@ -26,18 +39,21 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.OptionalInt;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.Set;
 import java.util.TreeMap;
@@ -128,49 +144,49 @@ final class Repl {
 
     /** How often a composed restart asks whether the pause it sent has been carried out. */
     private static final Duration PAUSE_SETTLE_POLL = Duration.ofMillis(500);
-
-    /** How long it waits for that before it stops and says the pipeline is on its way to paused. */
     private static final Duration PAUSE_SETTLE_BOUND = Duration.ofSeconds(30);
-
-    /**
-     * Overrides that bound, in milliseconds. A cluster whose converge interval has been widened needs a
-     * longer one, and a case exercising the giving-up path needs it not to take half a minute.
-     */
     private static final String PAUSE_SETTLE_BOUND_ENV = "TAPSTATE_RESTART_PAUSE_TIMEOUT_MS";
+    private static final String KEEP_STATE = "--keep-state";
+    private static final Set<String> STOP_OPTIONS = Set.of(KEEP_STATE, "-y", "--non-interactive");
+    private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--non-interactive");
+    private static final String STOP_USAGE = "stop <pipeline-id> [--keep-state] [-y]";
+    private static final String RESTART_USAGE = "restart <pipeline-id> [--rerun] [-y]";
+    private static final String INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
+
+    /** The server's own code for a connector that is not registered. */
+    private static final String CONNECTOR_NOT_REGISTERED = "connector.not-registered";
+
+    /** The server's code for a connector that could not complete its connection test. */
+    private static final String CONNECTOR_TEST_FAILED = "connector.test-failed";
+
+    /** The pipeline state under which there is nothing left to start. */
+    private static final String RUNNING = "RUNNING";
+
+    /** The apply change under which a resource was already what the workspace says. */
+    private static final String UNCHANGED = "UNCHANGED";
+
+    private static final String WORKBENCH_REMOTE_REJECTED_CODE = "workbench.remote-rejected";
+    private static final String WORKBENCH_REMOTE_REJECTED_MESSAGE = "Request rejected";
 
     /**
      * The refusals a repeating background read rides out rather than dying on. Both mean the connector
      * was busy serving somebody else this second, which is the arrangement working: the interactive
      * reads that took its turn are the ones a person is waiting on.
      */
-    /**
-     * The refusal a resume gets when the pipeline's definition was edited while it ran. Matched by code
-     * rather than by message: the message is prose for a person, and this is a branch.
-     */
-    private static final String INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
-
     private static final Set<String> BUSY_CODES =
             Set.of("connector.instances-busy", "connector.instance-limit-reached");
 
-    /** The word that keeps everything, and the words that only say "do not ask me". */
-    private static final String KEEP_STATE = "--keep-state";
-    private static final Set<String> STOP_OPTIONS = Set.of(KEEP_STATE, "-y", "--non-interactive");
-    private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--non-interactive");
-    private static final String STOP_USAGE = "stop <pipeline-id> [--keep-state] [-y]";
-    private static final String RESTART_USAGE = "restart <pipeline-id> [--rerun] [-y]";
-    private static final String POSITION_USAGE = "position <pipeline-id> [-f <file>]";
-
     private static final List<String> ONLINE_VERBS = List.of(
-            "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
-            "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "token", "derived-schema");
+            "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status",
+            "metrics", "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema",
+            "register", "connectors", "token", "derived-schema");
 
     private final CommandLine commandLine;
 
     /** The transport seam to a server; a network-free fake is injected in tests. */
     private final ControlPlaneClient controlPlane;
 
-    /** The release download seam used when {@code register} is given a published connector id. */
+    /** Fetches a released connector artifact when {@code register} receives its published id. */
     private PublishedConnectorArtifacts.Fetcher connectorFetcher;
 
     /** The one shared lazy target resolver; absent only in legacy unit seams that exercise no contexts. */
@@ -191,11 +207,7 @@ final class Repl {
     /** Reads the login password masked; a scripted fake is injected in tests, a JLine one bound in {@link #run}. */
     private Prompter prompter;
 
-    /**
-     * Where a prompter comes from when one is needed and none was injected. A supplier rather than a
-     * prompter because opening one opens a terminal: a verb that never asks anything must not pay for
-     * the ability to ask. The one-shot face sets this; the read loop binds the field directly.
-     */
+    /** Opens a terminal prompter only for a one-shot command that actually needs one. */
     private Supplier<Prompter> prompterSource;
 
     /**
@@ -224,9 +236,6 @@ final class Repl {
     /** The status of the last dispatched line; see {@link #lastExitCode()}. */
     private int lastExitCode;
 
-    /** The status the whole session will leave behind; see {@link #sessionExitCode()}. */
-    private int sessionExitCode = Cli.EXIT_OK;
-
     /** Whether to drop the connect / sign-in confirmations; see {@link #confirm}. */
     private boolean quiet;
 
@@ -236,10 +245,10 @@ final class Repl {
      */
     private final UnaryOperator<String> env;
 
-    /** Where the context store, the saved sessions and the local development stack live. */
+    /** Where the context store, saved sessions and the local development stack live. */
     Path homeDir = Path.of(System.getProperty("user.home"));
 
-    /** Test seam: the local development stack {@code up} may start; built under {@link #homeDir} when null. */
+    /** Test seam: the local development stack that {@code up} may start. */
     LocalStack localStack;
 
     /**
@@ -326,17 +335,16 @@ final class Repl {
         this.screenWidth = width;
     }
 
-    /** Replaces release downloads without changing registration transport; used by network-free tests. */
-    void connectorFetcher(PublishedConnectorArtifacts.Fetcher fetcher) {
-        this.connectorFetcher = fetcher;
+    /** Answers whether this process has a terminal; overridden so both branches can be exercised. */
+    void terminalCheck(BooleanSupplier check) {
+        this.terminal = check;
     }
 
-    /** Where to get a prompter from if one is asked for and none was injected. */
+    /** Supplies a lazy terminal prompter for one-shot interactive commands. */
     void prompterSource(Supplier<Prompter> source) {
-        this.prompterSource = source;
+        this.prompterSource = Objects.requireNonNull(source, "source");
     }
 
-    /** The prompter to ask with, opened on first use; null when there is no way to ask at all. */
     private Prompter prompter() {
         if (prompter == null && prompterSource != null) {
             prompter = prompterSource.get();
@@ -344,14 +352,787 @@ final class Repl {
         return prompter;
     }
 
-    /** Answers whether this process has a terminal; overridden so both branches can be exercised. */
-    void terminalCheck(BooleanSupplier check) {
-        this.terminal = check;
+    /** Replaces published-artifact downloads without changing registration transport; used by tests. */
+    void connectorFetcher(PublishedConnectorArtifacts.Fetcher fetcher) {
+        this.connectorFetcher = fetcher;
     }
 
     /** The current session workspace. */
     Path workdir() {
         return workdir;
+    }
+
+    /** The structured, silent read boundary used by the full-screen workbench. */
+    WorkbenchDataSource workbenchDataSource() {
+        return this::loadWorkbenchSnapshot;
+    }
+
+    /** The typed context and authentication boundary used by the full-screen workbench. */
+    WorkbenchActionGateway workbenchActionGateway() {
+        return new WorkbenchActionGateway() {
+            @Override
+            public List<ContextOption> contexts() {
+                return workbenchContextOptions();
+            }
+
+            @Override
+            public ContextResult selectContext(String name) {
+                return selectWorkbenchContext(name);
+            }
+
+            @Override
+            public ContextResult createContext(String name, URI server, boolean verifyTls) {
+                return createWorkbenchContext(name, server, verifyTls);
+            }
+
+            @Override
+            public ContextDeleteResult deleteContext(String name) {
+                return deleteWorkbenchContext(name);
+            }
+
+            @Override
+            public LoginResult login(LoginRequest request, SecretBuffer password) {
+                return loginFromWorkbench(request, password);
+            }
+
+            @Override
+            public FileReadResult readWorkspaceFile(Path relativePath) {
+                try {
+                    Path file = resolveWorkbenchFile(relativePath);
+                    return new FileReadResult.Loaded(relativePath.normalize(), Files.readString(file));
+                } catch (IOException | RuntimeException unavailable) {
+                    return new FileReadResult.Unavailable();
+                }
+            }
+
+            @Override
+            public FileWriteResult writeWorkspaceFile(Path relativePath, String content) {
+                try {
+                    Path file = resolveWorkbenchFile(relativePath);
+                    Files.writeString(file, content);
+                    return new FileWriteResult.Saved();
+                } catch (IOException | RuntimeException unavailable) {
+                    return new FileWriteResult.Unavailable();
+                }
+            }
+
+            @Override
+            public SourceCatalogResult sourceCatalog() {
+                try {
+                    TapstateCatalog catalog = TapstateCatalog.load();
+                    List<SourceConnector> connectors = catalog.ids().stream()
+                            .map(id -> new SourceConnector(id, SourceScaffold.modes(catalog.byId(id)),
+                                    catalog.byId(id).config().stream().map(Repl::sourceConfigField).toList()))
+                            .toList();
+                    return new SourceCatalogResult.Ready(new SourceCatalog(connectors));
+                } catch (RuntimeException unavailable) {
+                    return new SourceCatalogResult.Unavailable();
+                }
+            }
+
+            @Override
+            public SourcePreviewResult previewSource(SourceDraft draft) {
+                try {
+                    return new SourcePreviewResult.Ready(canonicalSource(draft));
+                } catch (RuntimeException rejected) {
+                    return new SourcePreviewResult.Rejected("Source draft is not valid");
+                }
+            }
+
+            @Override
+            public SourceCreateResult createSource(SourceCreateRequest request) {
+                try {
+                    Path relativePath = Path.of("source", request.id() + ".tap.yml");
+                    Path target = resolveWorkbenchNewFile(relativePath);
+                    try {
+                        Files.writeString(target, request.canonicalYaml(), java.nio.file.StandardOpenOption.CREATE_NEW);
+                    } catch (java.nio.file.FileAlreadyExistsException exists) {
+                        return new SourceCreateResult.Exists(relativePath);
+                    }
+                    return new SourceCreateResult.Created(relativePath, request.canonicalYaml());
+                } catch (IllegalArgumentException rejected) {
+                    return new SourceCreateResult.Rejected("Source draft is not valid");
+                } catch (IOException unavailable) {
+                    return new SourceCreateResult.Unavailable();
+                }
+            }
+
+            @Override
+            public PipelinePreviewResult previewPipeline(PipelineDraft draft) {
+                try {
+                    return new PipelinePreviewResult.Ready(canonicalPipeline(draft));
+                } catch (RuntimeException rejected) {
+                    return new PipelinePreviewResult.Rejected("Pipeline draft is not valid");
+                }
+            }
+
+            @Override
+            public PipelineCreateResult createPipeline(PipelineCreateRequest request) {
+                try {
+                    Path relativePath = Path.of("pipeline", request.id() + ".tap.yml");
+                    Path target = resolveWorkbenchNewFile(relativePath);
+                    try {
+                        Files.writeString(target, request.canonicalYaml(), java.nio.file.StandardOpenOption.CREATE_NEW);
+                    } catch (java.nio.file.FileAlreadyExistsException exists) {
+                        return new PipelineCreateResult.Exists(relativePath);
+                    }
+                    return new PipelineCreateResult.Created(relativePath, request.canonicalYaml());
+                } catch (IllegalArgumentException rejected) {
+                    return new PipelineCreateResult.Rejected("Pipeline draft is not valid");
+                } catch (IOException unavailable) {
+                    return new PipelineCreateResult.Unavailable();
+                }
+            }
+
+            @Override
+            public PipelineApplyResult applyPipelines(PipelineApplyRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineApplyResult.Unavailable();
+                }
+                try {
+                    Map<String, LocalDraft> draftsById = new LinkedHashMap<>();
+                    for (Path relativePath : request.relativePaths()) {
+                        if (relativePath.getNameCount() < 2 || !"pipeline".equals(relativePath.getName(0).toString())) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-path", "Only Pipeline workspace files can be applied here");
+                        }
+                        LocalDraft draft = draft(relativePath.normalize().toString(), resolveWorkbenchFile(relativePath));
+                        Resource resource = new DslParser().parse(draft.content());
+                        if (!(resource instanceof PipelineResource)) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-kind", "The selected file is not a valid Pipeline artifact");
+                        }
+                        if (draftsById.putIfAbsent(resource.id(), draft) != null) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-duplicate", "More than one local Pipeline has the same id");
+                        }
+                    }
+                    ListOutcome listed = withFailover(() -> controlPlane.list(
+                            session.landingNode(), session.credential(), "pipeline"),
+                            outcome -> outcome instanceof ListOutcome.Unreachable);
+                    if (listed instanceof ListOutcome.Rejected rejected) {
+                        return new PipelineApplyResult.Rejected(rejected.code(), rejected.message());
+                    }
+                    if (listed instanceof ListOutcome.Unreachable) {
+                        return new PipelineApplyResult.Unreachable();
+                    }
+                    Map<String, RemoteArtifact> remoteById = ((ListOutcome.Listed) listed).artifacts().stream()
+                            .collect(java.util.stream.Collectors.toMap(RemoteArtifact::id, artifact -> artifact,
+                                    (left, right) -> left, LinkedHashMap::new));
+                    List<LocalDraft> guarded = new ArrayList<>(draftsById.size());
+                    for (Map.Entry<String, LocalDraft> entry : draftsById.entrySet()) {
+                        RemoteArtifact remote = remoteById.get(entry.getKey());
+                        if (remote == null) {
+                            guarded.add(entry.getValue());
+                        } else if (!remote.readable() || remote.canonicalForm() == null) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-unreadable", "A remote Pipeline cannot be read for safe update");
+                        } else {
+                            guarded.add(new LocalDraft(entry.getValue().source(), entry.getValue().content(),
+                                    remote.contentHash()));
+                        }
+                    }
+                    ApplyOutcome outcome = withFailover(() -> controlPlane.apply(
+                            session.landingNode(), session.credential(), guarded),
+                            value -> value instanceof ApplyOutcome.Unreachable);
+                    return switch (outcome) {
+                        case ApplyOutcome.Applied applied -> new PipelineApplyResult.Applied(applied.items().stream()
+                                .filter(item -> "pipeline".equals(item.kind()))
+                                .map(item -> new SourceApplyItem(item.id(), item.change())).toList());
+                        case ApplyOutcome.Rejected rejected -> new PipelineApplyResult.Rejected(
+                                rejected.code(), rejected.message());
+                        case ApplyOutcome.Unreachable ignored -> new PipelineApplyResult.Unreachable();
+                    };
+                } catch (DslException rejected) {
+                    return new PipelineApplyResult.Rejected(rejected.code().code(), "A local Pipeline is not valid");
+                } catch (IOException | RuntimeException unavailable) {
+                    return new PipelineApplyResult.Unavailable();
+                }
+            }
+
+            @Override
+            public PipelineLifecycleResult changePipelineLifecycle(PipelineLifecycleRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineLifecycleResult.Unavailable();
+                }
+                LifecycleOutcome outcome = withFailover(() -> controlPlane.lifecycle(
+                        session.landingNode(), session.credential(), request.pipelineId(), request.verb(), null),
+                        value -> value instanceof LifecycleOutcome.Unreachable);
+                return switch (outcome) {
+                    case LifecycleOutcome.Accepted accepted -> new PipelineLifecycleResult.Changed(accepted.targetState());
+                    case LifecycleOutcome.Rejected rejected -> new PipelineLifecycleResult.Rejected(
+                            rejected.code(), rejected.message());
+                    case LifecycleOutcome.Unreachable ignored -> new PipelineLifecycleResult.Unreachable();
+                };
+            }
+
+            @Override
+            public PipelineStatusResult readPipelineStatus(PipelineStatusRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineStatusResult.Unavailable();
+                }
+                StatusOutcome outcome = withFailover(() -> controlPlane.status(
+                        session.landingNode(), session.credential(), request.pipelineId()),
+                        value -> value instanceof StatusOutcome.Unreachable);
+                return switch (outcome) {
+                    case StatusOutcome.Found found -> new PipelineStatusResult.Available(
+                            found.pipelineId(), found.state(),
+                            Optional.ofNullable(found.failureCode()), Optional.ofNullable(found.failureMessage()));
+                    case StatusOutcome.Rejected rejected -> new PipelineStatusResult.Rejected(
+                            request.pipelineId(), rejected.code(), rejected.message());
+                    case StatusOutcome.Unreachable ignored -> new PipelineStatusResult.Unreachable();
+                };
+            }
+
+            @Override
+            public PipelineMetricsResult readPipelineMetrics(PipelineMetricsRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineMetricsResult.Unavailable();
+                }
+                MetricsOutcome outcome = withFailover(() -> controlPlane.metrics(
+                        session.landingNode(), session.credential(), request.pipelineId()),
+                        value -> value instanceof MetricsOutcome.Unreachable);
+                return switch (outcome) {
+                    case MetricsOutcome.Found found -> new PipelineMetricsResult.Available(
+                            found.pipelineId(), found.metrics(), found.targetAckedPosition(),
+                            found.positionsNotCollected(), found.facts());
+                    case MetricsOutcome.Rejected rejected -> new PipelineMetricsResult.Rejected(
+                            request.pipelineId(), rejected.code(), rejected.message());
+                    case MetricsOutcome.Unreachable ignored -> new PipelineMetricsResult.Unreachable();
+                };
+            }
+
+            @Override
+            public LogsOutcome readPipelineLogs(String pipelineId, RemoteLogCursor after) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new LogsOutcome.Unreachable();
+                }
+                return withFailover(() -> controlPlane.logs(
+                        session.landingNode(), session.credential(), pipelineId, after),
+                        value -> value instanceof LogsOutcome.Unreachable);
+            }
+
+            @Override
+            public PipelineLogLevelOutcome setPipelineLogLevel(String pipelineId, String level) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineLogLevelOutcome.Unreachable();
+                }
+                return withFailover(() -> controlPlane.logLevel(
+                        session.landingNode(), session.credential(), pipelineId, level),
+                        value -> value instanceof PipelineLogLevelOutcome.Unreachable);
+            }
+
+            @Override
+            public String followPipelineLogs(String pipelineId, RemoteLogCursor after, LogStream sink,
+                    java.util.function.BooleanSupplier stop) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return "unavailable";
+                }
+                return controlPlane.followLogs(session.landingNode(), session.credential(), pipelineId, after, sink, stop);
+            }
+
+            @Override
+            public SourceApplyResult applySources(SourceApplyRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new SourceApplyResult.Unavailable();
+                }
+                try {
+                    List<LocalDraft> drafts = new ArrayList<>();
+                    Map<String, LocalDraft> draftsById = new LinkedHashMap<>();
+                    for (Path relativePath : request.relativePaths()) {
+                        Path file = resolveWorkbenchFile(relativePath);
+                        if (relativePath.getNameCount() < 2 || !"source".equals(relativePath.getName(0).toString())) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-path", "Only Source workspace files can be applied here");
+                        }
+                        LocalDraft draft = draft(relativePath.normalize().toString(), file);
+                        Resource resource = new DslParser().parse(draft.content());
+                        if (!(resource instanceof SourceResource)) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-kind", "The selected file is not a valid Source artifact");
+                        }
+                        if (draftsById.putIfAbsent(resource.id(), draft) != null) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-duplicate", "More than one local Source has the same id");
+                        }
+                        drafts.add(draft);
+                    }
+                    ListOutcome listed = withFailover(() -> controlPlane.list(
+                            session.landingNode(), session.credential(), "source"),
+                            outcome -> outcome instanceof ListOutcome.Unreachable);
+                    if (listed instanceof ListOutcome.Rejected rejected) {
+                        return new SourceApplyResult.Rejected(rejected.code(), rejected.message());
+                    }
+                    if (listed instanceof ListOutcome.Unreachable) {
+                        return new SourceApplyResult.Unreachable();
+                    }
+                    Map<String, RemoteArtifact> remoteById = ((ListOutcome.Listed) listed).artifacts().stream()
+                            .collect(java.util.stream.Collectors.toMap(RemoteArtifact::id, artifact -> artifact,
+                                    (left, right) -> left, LinkedHashMap::new));
+                    List<LocalDraft> guarded = new ArrayList<>(drafts.size());
+                    for (Map.Entry<String, LocalDraft> entry : draftsById.entrySet()) {
+                        RemoteArtifact remote = remoteById.get(entry.getKey());
+                        if (remote == null) {
+                            guarded.add(entry.getValue());
+                        } else if (!remote.readable() || remote.canonicalForm() == null) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-unreadable", "A remote Source cannot be read for safe update");
+                        } else {
+                            guarded.add(new LocalDraft(entry.getValue().source(), entry.getValue().content(),
+                                    remote.contentHash()));
+                        }
+                    }
+                    ApplyOutcome outcome = withFailover(() -> controlPlane.apply(
+                            session.landingNode(), session.credential(), guarded),
+                            value -> value instanceof ApplyOutcome.Unreachable);
+                    return switch (outcome) {
+                        case ApplyOutcome.Applied applied -> new SourceApplyResult.Applied(applied.items().stream()
+                                .filter(item -> "source".equals(item.kind()))
+                                .map(item -> new SourceApplyItem(item.id(), item.change())).toList());
+                        case ApplyOutcome.Rejected rejected -> new SourceApplyResult.Rejected(
+                                rejected.code(), rejected.message());
+                        case ApplyOutcome.Unreachable ignored -> new SourceApplyResult.Unreachable();
+                    };
+                } catch (DslException rejected) {
+                    return new SourceApplyResult.Rejected(rejected.code().code(), "A local Source is not valid");
+                } catch (IOException | RuntimeException unavailable) {
+                    return new SourceApplyResult.Unavailable();
+                }
+            }
+        };
+    }
+
+    private String canonicalSource(WorkbenchActionGateway.SourceDraft draft) {
+        TapstateCatalog catalog = TapstateCatalog.load();
+        var mode = SourceScaffold.resolveMode(catalog, draft.connector(), draft.mode());
+        SourceResource source = SourceScaffold.build(catalog, draft.connector(), draft.mode(),
+                SourceScaffold.tableRefs(draft.tables(), mode), draft.id(), draft.config());
+        return new CanonicalWriter().write(source);
+    }
+
+    private String canonicalPipeline(WorkbenchActionGateway.PipelineDraft draft) {
+        PipelineResource pipeline = new PipelineResource(draft.id(), null, List.of(SourceRef.bare(draft.sourceId())), null,
+                new ViewBlock.Inline("view", FromRef.regex(".*"), null, null), null, null, null);
+        return new CanonicalWriter().write(pipeline);
+    }
+
+    private static WorkbenchActionGateway.SourceConfigField sourceConfigField(ConfigField field) {
+        String label = field.label().getOrDefault("en_US", field.name());
+        Optional<WorkbenchActionGateway.SourceConfigVisibility> visibleWhen = field.visibleWhen() == null
+                ? Optional.empty()
+                : Optional.of(new WorkbenchActionGateway.SourceConfigVisibility(
+                        field.visibleWhen().controllingField(), field.visibleWhen().equalsAnyOf()));
+        return new WorkbenchActionGateway.SourceConfigField(
+                field.name(), field.type(), label, field.defaultValue(), field.secret(),
+                field.options().stream().map(option -> new WorkbenchActionGateway.SourceConfigOption(
+                        option.value(), option.label().getOrDefault("en_US", option.value()))).toList(), visibleWhen);
+    }
+
+    private Path resolveWorkbenchFile(Path relativePath) throws IOException {
+        Objects.requireNonNull(relativePath, "relativePath");
+        Path normalized = relativePath.normalize();
+        if (normalized.isAbsolute() || normalized.startsWith("..")) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        Path root = workdir.toRealPath();
+        Path file = root.resolve(normalized).toRealPath();
+        if (!file.startsWith(root) || !Files.isRegularFile(file)) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        return file;
+    }
+
+    private Path resolveWorkbenchNewFile(Path relativePath) throws IOException {
+        Objects.requireNonNull(relativePath, "relativePath");
+        Path normalized = relativePath.normalize();
+        if (normalized.isAbsolute() || normalized.startsWith("..") || normalized.getNameCount() != 2) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        Path root = workdir.toRealPath();
+        Path parent = root.resolve(normalized.getParent());
+        Files.createDirectories(parent);
+        Path realParent = parent.toRealPath();
+        if (!realParent.startsWith(root)) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        return realParent.resolve(normalized.getFileName());
+    }
+
+    private synchronized List<WorkbenchActionGateway.ContextOption> workbenchContextOptions() {
+        if (contextManager == null) {
+            return List.of();
+        }
+        try {
+            return contextManager.suggestions().stream()
+                    .map(choice -> new WorkbenchActionGateway.ContextOption(
+                            choice.name(), choice.suggested()))
+                    .toList();
+        } catch (RuntimeException unavailable) {
+            return List.of();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.ContextResult selectWorkbenchContext(String name) {
+        if (contextManager == null) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+        try {
+            ContextManager.ContextChoice choice = contextManager.suggestions().stream()
+                    .filter(candidate -> candidate.name().equals(name))
+                    .findFirst()
+                    .orElse(null);
+            if (choice == null) {
+                return new WorkbenchActionGateway.ContextResult.Unavailable();
+            }
+            ResolvedContext.Named selected = new ResolvedContext.Named(
+                    choice.name(), choice.definition(), ResolvedContext.Source.EXPLICIT);
+            contextManager.choose(name);
+            session.disconnect();
+            namedContext = selected;
+            WorkbenchRemoteState failure = prepareWorkbenchContext(
+                    selected, new RefreshRequest.CancellationToken());
+            if (failure instanceof WorkbenchRemoteState.Offline) {
+                return new WorkbenchActionGateway.ContextResult.Offline(name);
+            }
+            if (failure != null) {
+                return new WorkbenchActionGateway.ContextResult.Unavailable();
+            }
+            return new WorkbenchActionGateway.ContextResult.Ready(name, session.isAuthenticated());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.ContextResult createWorkbenchContext(
+            String name, URI server, boolean verifyTls) {
+        if (contextManager == null) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+        try {
+            ContextDefinition definition = contextManager.create(name, List.of(server), verifyTls);
+            contextManager.bind(workdir, name);
+            contextManager.choose(name);
+            session.disconnect();
+            namedContext = new ResolvedContext.Named(
+                    name, definition, ResolvedContext.Source.EXPLICIT);
+            return new WorkbenchActionGateway.ContextResult.Ready(name, false);
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.ContextDeleteResult deleteWorkbenchContext(String name) {
+        if (contextManager == null) {
+            return new WorkbenchActionGateway.ContextDeleteResult.Unavailable();
+        }
+        try {
+            contextManager.delete(name);
+            if (namedContext != null && namedContext.name().equals(name)) {
+                session.disconnect();
+                namedContext = null;
+            }
+            return new WorkbenchActionGateway.ContextDeleteResult.Deleted(name);
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.ContextDeleteResult.Unavailable();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.LoginResult loginFromWorkbench(
+            WorkbenchActionGateway.LoginRequest request, SecretBuffer password) {
+        Objects.requireNonNull(request, "request");
+        Objects.requireNonNull(password, "password");
+        if (machineToken != null) {
+            password.close();
+            return new WorkbenchActionGateway.LoginResult.Unavailable();
+        }
+        try {
+            if (request.server().isPresent()) {
+                URI server = request.server().orElseThrow();
+                if (!controlPlane.isHealthy(server)) {
+                    return new WorkbenchActionGateway.LoginResult.Unreachable();
+                }
+                namedContext = null;
+                session.disconnect();
+                session.connect(List.of(server), server, controlPlane.serverVersion(server));
+            }
+            if (!session.isConnected() && (namedContext == null || authService == null)) {
+                return new WorkbenchActionGateway.LoginResult.Unavailable();
+            }
+            if (namedContext == null || authService == null) {
+                IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(session.seeds(), null);
+                return password.consume(secret -> switch (verified.withCredential(
+                        secret, (node, credential) -> controlPlane.login(
+                                node, request.username(), credential))) {
+                    case LoginOutcome.Success success -> {
+                        session.reland(verified.seed());
+                        session.authenticate(
+                                success.token(), request.username(), null, session.seeds());
+                        yield new WorkbenchActionGateway.LoginResult.SignedIn(request.username());
+                    }
+                    case LoginOutcome.Rejected rejected ->
+                            new WorkbenchActionGateway.LoginResult.Rejected(rejected.code());
+                    case LoginOutcome.Unreachable ignored ->
+                            new WorkbenchActionGateway.LoginResult.Unreachable();
+                });
+            }
+            return password.consume(secret -> switch (authService.login(
+                    namedContext, request.username(), secret, true)) {
+                case AuthService.LoginResult.Success success -> {
+                    AuthService.ActiveSession active = success.session();
+                    session.connect(namedContext.definition().seeds(), active.seed(), null);
+                    session.authenticate(
+                            active.accessToken(),
+                            active.record().principal(),
+                            null,
+                            namedContext.definition().seeds());
+                    yield new WorkbenchActionGateway.LoginResult.SignedIn(
+                            active.record().principal());
+                }
+                case AuthService.LoginResult.Rejected rejected ->
+                        new WorkbenchActionGateway.LoginResult.Rejected(rejected.code());
+                case AuthService.LoginResult.Unreachable ignored ->
+                        new WorkbenchActionGateway.LoginResult.Unreachable();
+            });
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.LoginResult.Unavailable();
+        } finally {
+            password.close();
+        }
+    }
+
+    private WorkbenchSnapshot loadWorkbenchSnapshot(
+            long contextGeneration,
+            long requestSequence,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        cancellationToken.throwIfCancelled();
+        Path workspaceRoot = workdir;
+        List<WorkspaceScan.Artifact> localArtifacts = WorkspaceScan.of(workspaceRoot);
+        cancellationToken.throwIfCancelled();
+
+        WorkbenchContextSelection selection = resolveWorkbenchContext(workspaceRoot);
+        WorkbenchRemoteListing remote = loadWorkbenchRemote(selection, cancellationToken);
+        cancellationToken.throwIfCancelled();
+
+        return WorkbenchProjection.project(
+                contextGeneration,
+                requestSequence,
+                workbenchSession(workspaceRoot, selection.context()),
+                localArtifacts,
+                remote.state(),
+                remote.artifacts());
+    }
+
+    private WorkbenchContextSelection resolveWorkbenchContext(Path workspaceRoot) {
+        if (namedContext != null) {
+            return new WorkbenchContextSelection(Optional.of(namedContext), null);
+        }
+        if (session.isConnected() || contextResolver == null) {
+            return new WorkbenchContextSelection(Optional.empty(), null);
+        }
+        try {
+            Optional<ResolvedContext> resolved = contextResolver.resolve(null, explicitContext, workspaceRoot);
+            Optional<ResolvedContext.Named> named = resolved
+                    .filter(ResolvedContext.Named.class::isInstance)
+                    .map(ResolvedContext.Named.class::cast);
+            return new WorkbenchContextSelection(named, null);
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            return new WorkbenchContextSelection(
+                    Optional.empty(),
+                    new WorkbenchRemoteState.Diagnostic(failure.code(), Map.of()));
+        }
+    }
+
+    private WorkbenchRemoteListing loadWorkbenchRemote(
+            WorkbenchContextSelection selection,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        if (selection.diagnostic() != null) {
+            return new WorkbenchRemoteListing(selection.diagnostic(), List.of());
+        }
+        if (!session.isConnected() && selection.context().isPresent()) {
+            WorkbenchRemoteState preparationFailure = prepareWorkbenchContext(
+                    selection.context().orElseThrow(), cancellationToken);
+            if (preparationFailure != null) {
+                return new WorkbenchRemoteListing(preparationFailure, List.of());
+            }
+        }
+        if (!session.isConnected()) {
+            WorkbenchRemoteState state = selection.context().isPresent()
+                    ? new WorkbenchRemoteState.Offline()
+                    : new WorkbenchRemoteState.NotConfigured();
+            return new WorkbenchRemoteListing(state, List.of());
+        }
+        if (!session.isAuthenticated()) {
+            return new WorkbenchRemoteListing(new WorkbenchRemoteState.SignedOut(), List.of());
+        }
+
+        cancellationToken.throwIfCancelled();
+        URI failedLanding = session.landingNode();
+        ListOutcome outcome = controlPlane.list(failedLanding, session.credential(), null);
+        if (outcome instanceof ListOutcome.Unreachable) {
+            cancellationToken.throwIfCancelled();
+            if (silentWorkbenchFailover(failedLanding, cancellationToken)) {
+                cancellationToken.throwIfCancelled();
+                outcome = controlPlane.list(session.landingNode(), session.credential(), null);
+            }
+        }
+        cancellationToken.throwIfCancelled();
+        return switch (outcome) {
+            case ListOutcome.Listed listed -> new WorkbenchRemoteListing(
+                    new WorkbenchRemoteState.Available(listed.artifacts().size()), listed.artifacts());
+            case ListOutcome.Rejected ignored -> new WorkbenchRemoteListing(
+                    new WorkbenchRemoteState.Rejected(
+                            WORKBENCH_REMOTE_REJECTED_CODE,
+                            WORKBENCH_REMOTE_REJECTED_MESSAGE),
+                    List.of());
+            case ListOutcome.Unreachable ignored -> new WorkbenchRemoteListing(
+                    new WorkbenchRemoteState.Offline(), List.of());
+        };
+    }
+
+    private WorkbenchRemoteState prepareWorkbenchContext(
+            ResolvedContext.Named context,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        cancellationToken.throwIfCancelled();
+        try {
+            if (machineToken != null) {
+                IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(context.definition(), null);
+                mutateWorkbenchSession(cancellationToken, () -> {
+                    session.connect(context.definition().seeds(), verified.seed(), null);
+                    session.authenticateMachine(machineToken, context.definition().seeds());
+                    namedContext = context;
+                });
+                return null;
+            }
+
+            if (authService != null) {
+                Optional<AuthService.ActiveSession> resumed = authService.resume(context);
+                cancellationToken.throwIfCancelled();
+                if (resumed.isPresent()) {
+                    AuthService.ActiveSession active = resumed.orElseThrow();
+                    mutateWorkbenchSession(cancellationToken, () -> {
+                        session.connect(context.definition().seeds(), active.seed(), null);
+                        session.authenticate(
+                                active.accessToken(),
+                                active.record().principal(),
+                                null,
+                                context.definition().seeds());
+                        namedContext = context;
+                    });
+                    return null;
+                }
+            }
+
+            IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(context.definition(), null);
+            mutateWorkbenchSession(cancellationToken, () -> {
+                session.connect(context.definition().seeds(), verified.seed(), null);
+                namedContext = context;
+            });
+            return null;
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            cancellationToken.throwIfCancelled();
+            if (isWorkbenchOffline(failure)) {
+                return new WorkbenchRemoteState.Offline();
+            }
+            return new WorkbenchRemoteState.Diagnostic(failure.code(), Map.of());
+        }
+    }
+
+    private static boolean isWorkbenchOffline(io.tapstate.core.common.TapstateException failure) {
+        return failure.code() == CliError.ISSUER_DISCOVERY_FAILED
+                || failure.code() == CliError.AUTH_SESSION_UNREACHABLE;
+    }
+
+    private boolean silentWorkbenchFailover(
+            URI failedLanding,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        if (!session.isConnected()) {
+            return false;
+        }
+        for (URI member : session.members()) {
+            cancellationToken.throwIfCancelled();
+            if (failedLanding.equals(member)) {
+                continue;
+            }
+            if (controlPlane.isHealthy(member)) {
+                mutateWorkbenchSession(cancellationToken, () -> session.reland(member));
+                return true;
+            }
+        }
+        mutateWorkbenchSession(cancellationToken, session::disconnect);
+        return false;
+    }
+
+    private static void mutateWorkbenchSession(
+            RefreshRequest.CancellationToken cancellationToken,
+            Runnable mutation) throws InterruptedException {
+        if (!cancellationToken.mutateIfActive(mutation)) {
+            cancellationToken.throwIfCancelled();
+        }
+    }
+
+    private WorkbenchSessionSnapshot workbenchSession(
+            Path workspaceRoot,
+            Optional<ResolvedContext.Named> selected) {
+        WorkbenchConnection connection = session.isConnected()
+                ? WorkbenchConnection.CONNECTED
+                : selected.isPresent() ? WorkbenchConnection.OFFLINE : WorkbenchConnection.NO_CONTEXT;
+        WorkbenchAuthentication authentication;
+        if (!session.isConnected()) {
+            authentication = WorkbenchAuthentication.NOT_APPLICABLE;
+        } else if (session.hasMachineCredential()) {
+            authentication = WorkbenchAuthentication.MACHINE;
+        } else if (session.isAuthenticated()) {
+            authentication = WorkbenchAuthentication.SIGNED_IN;
+        } else {
+            authentication = WorkbenchAuthentication.SIGNED_OUT;
+        }
+        return new WorkbenchSessionSnapshot(
+                workspaceRoot,
+                selected.map(ResolvedContext.Named::name),
+                selected.map(ResolvedContext.Named::source),
+                connection,
+                authentication,
+                Optional.ofNullable(session.principal()),
+                safeLandingNode(session.landingNode()),
+                session.versions());
+    }
+
+    private static Optional<URI> safeLandingNode(URI endpoint) {
+        if (endpoint == null || endpoint.getHost() == null) {
+            return Optional.empty();
+        }
+        String scheme = endpoint.getScheme();
+        if (!("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(new URI(
+                    scheme.toLowerCase(Locale.ROOT),
+                    null,
+                    endpoint.getHost().toLowerCase(Locale.ROOT),
+                    endpoint.getPort(),
+                    null,
+                    null,
+                    null));
+        } catch (URISyntaxException invalid) {
+            return Optional.empty();
+        }
+    }
+
+    private record WorkbenchContextSelection(
+            Optional<ResolvedContext.Named> context,
+            WorkbenchRemoteState.Diagnostic diagnostic) {
+    }
+
+    private record WorkbenchRemoteListing(
+            WorkbenchRemoteState state,
+            List<RemoteArtifact> artifacts) {
+        private WorkbenchRemoteListing {
+            artifacts = List.copyOf(artifacts);
+        }
     }
 
     /** The current connection state. */
@@ -368,23 +1149,12 @@ final class Repl {
     }
 
     /**
-     * The status the last dispatched line produced, in the same scheme one-shot mode exits with. A line
-     * that failed does not end a session, so the read loop reads on past it; what the session leaves
-     * behind is {@link #sessionExitCode()}, which this one is folded into as each line is dispatched.
+     * The status the last dispatched line produced, in the same scheme one-shot mode exits with. The
+     * read loop ignores it — a line that failed does not end a session — but a scripted invocation that
+     * runs one line and leaves has nothing else to report with.
      */
     int lastExitCode() {
         return lastExitCode;
-    }
-
-    /**
-     * The status the session as a whole earned: the first line that was refused, or success if none was.
-     * A session outlives the line that failed in it, so the last line's status cannot speak for it -- a
-     * script ends with {@code exit}, which succeeds, and reading the status off the end would call every
-     * such run successful. The first refusal is kept rather than the last because the lines after it
-     * mostly fail because of it, and the first one is the one that explains the run.
-     */
-    int sessionExitCode() {
-        return sessionExitCode;
     }
 
     /** Requests any in-flight {@code --watch} / {@code --follow} stream to stop; wired to Ctrl-C in {@link #run}. */
@@ -466,11 +1236,10 @@ final class Repl {
     /**
      * Handles one input line. Returns {@code false} when the loop should stop (exit / quit); the status
      * the line produced is left in {@link #lastExitCode()}, which is what a one-shot invocation exits
-     * with, and folded into {@link #sessionExitCode()}, which is what a whole session exits with. A
-     * failed line does not end a session either way.
+     * with. Inside the read loop nothing consumes it — a failed line does not end a session.
      */
     boolean dispatch(String line) {
-        return keepSessionStatus(dispatchLine(line == null ? "" : line.trim()));
+        return dispatchLine(line == null ? "" : line.trim());
     }
 
     /**
@@ -479,7 +1248,7 @@ final class Repl {
      * and the shell has already done that job.
      */
     boolean dispatch(List<String> words) {
-        return keepSessionStatus(dispatchWords(words));
+        return dispatchWords(words);
     }
 
     /** Dispatches a scripted command without letting lazy target setup contaminate its stdout. */
@@ -487,22 +1256,10 @@ final class Repl {
         boolean previous = this.quiet;
         this.quiet = quiet;
         try {
-            return keepSessionStatus(dispatchWords(words));
+            return dispatchWords(words);
         } finally {
             this.quiet = previous;
         }
-    }
-
-    /**
-     * Folds the status the dispatched line just produced into the session's own, and passes the line's
-     * own answer about whether to keep reading through untouched. Every dispatched line returns through
-     * here, so no caller has to remember to collect a failure it did not stop for.
-     */
-    private boolean keepSessionStatus(boolean keepReading) {
-        if (sessionExitCode == Cli.EXIT_OK) {
-            sessionExitCode = lastExitCode;
-        }
-        return keepReading;
     }
 
     private boolean dispatchLine(String trimmed) {
@@ -639,8 +1396,8 @@ final class Repl {
                     DataBrowserCall.parseLive(verb, String.join(" ", words.subList(1, words.size()))), verb);
             return true;
         }
-        // The composite verb establishes its own target: it takes --server as an override for the run,
-        // which the shared resolution below cannot see, and the help is the one thing it answers offline.
+        // `up` owns target resolution because --server is a per-run override and an unbound workspace
+        // must be bound before the ordinary online-verb resolution can proceed.
         if (words.get(0).equals("up")) {
             boolean help = words.stream().anyMatch(word -> word.equals("-h") || word.equals("--help")
                     || word.equals("-V") || word.equals("--version"));
@@ -694,11 +1451,7 @@ final class Repl {
         return resolveTarget(words.get(0), null, workspaceFor(words));
     }
 
-    /**
-     * The same, with the pieces named: the verb the diagnostic names, an explicit seed list to reach
-     * instead of any saved target (a temporary target, resolved the way {@code --connect} is and never
-     * written anywhere), and the workspace whose binding is consulted when there is none.
-     */
+    /** Resolves a named verb against either an explicit temporary target or the workspace binding. */
     private int resolveTarget(String verb, String connect, Path workspace) {
         try {
             Optional<ResolvedContext> resolution = contextResolver.resolve(connect, explicitContext, workspace);
@@ -792,6 +1545,18 @@ final class Repl {
         if (words.get(0).equals("apply")) {
             return applyOnline(words);
         }
+        if (words.get(0).equals("restart")) {
+            return restartOnline(words);
+        }
+        if (words.get(0).equals("stop")) {
+            return stopOnline(words);
+        }
+        if (words.get(0).equals("position")) {
+            return positionOnline(words);
+        }
+        if (words.get(0).equals("derived-schema")) {
+            return derivedSchemaOnline(words);
+        }
         // The two streaming sugars ride the read verbs over the websocket channel: `status --watch` and
         // `logs --follow`. They are the only dash-options a connected verb accepts, and only on their verb.
         if (words.get(0).equals("status") && words.contains("--watch")) {
@@ -799,29 +1564,6 @@ final class Repl {
         }
         if (words.get(0).equals("logs") && words.contains("--follow")) {
             return logsFollow(words);
-        }
-        // Composed here out of the verbs the product has, so it parses its own words: the four it
-        // composes are all positional, and the guard below would refuse the one option this takes.
-        if (words.get(0).equals("restart")) {
-            return restartOnline(words);
-        }
-        // A stop is the verb that clears, so it is the verb that asks first -- and it carries the two
-        // words that say otherwise. It parses its own line for the same reason the two above do.
-        if (words.get(0).equals("stop")) {
-            return stopOnline(words);
-        }
-        // The write-back names the file it sends, so it parses its own line too. Its option carries a
-        // value rather than standing alone, which is the one shape the positional guard below cannot
-        // read: it would refuse the option, and left to the guard's fall-through the filename after it
-        // would be taken for the pipeline id.
-        if (words.get(0).equals("position")) {
-            return positionOnline(words);
-        }
-        // `derived-schema` carries `--accept`, the one act that moves what a start is held to, so it parses
-        // its own words rather than falling into the positional-only guard below, which would refuse the
-        // flag and leave the verb doing a plain read while reporting success.
-        if (words.get(0).equals("derived-schema")) {
-            return derivedSchemaOnline(words);
         }
         // `status` carries `--rate`: wait for the second reading a rate is made of, which it does by
         // default only at a terminal. It parses its own words for the reason `derived-schema` does -- the
@@ -843,12 +1585,11 @@ final class Repl {
             case "apply" -> applyOnline(words);
             case "get" -> getOnline(words);
             case "ls" -> lsOnline(words);
-            case "start", "pause", "resume" -> lifecycleOnline(words);
+            case "start", "stop", "pause", "resume" -> lifecycleOnline(words);
             case "status" -> statusOnline(words);
             case "metrics" -> metricsOnline(words);
             case "snapshot" -> snapshotOnline(words);
             case "logs" -> logsOnline(words);
-            case "position" -> positionOnline(words);
             default -> throw new IllegalStateException("not an online verb: " + words.get(0));
         };
     }
@@ -1424,46 +2165,22 @@ final class Repl {
             err.flush();
             return Cli.EXIT_USAGE;
         }
-        String id = words.get(1);
-        // A stop says what it means to do about the pipeline's state; the other three have nothing to
-        // say and send nothing. Stop clears -- that is what the verb is -- and the terminal asking
-        // first is a separate concern from the wire carrying the answer.
-        Boolean purgeState = verb.equals("stop") ? Boolean.TRUE : null;
-        return lifecycleOnline(verb, id, purgeState);
+        if (words.size() > 2) {
+            err.println(verb + ": options are not supported on a connected verb yet");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        return lifecycleOnline(verb, words.get(1), null);
     }
 
-    /**
-     * Waits for a pause to become the pipeline's actual state, and answers whether it did.
-     *
-     * <p>This is what makes the resume that follows a second instruction rather than one that erases the
-     * first. A pipeline has one slot for its intent and the converge side samples that slot rather than
-     * consuming a queue of them, so two verbs written inside one of its intervals leave only the second
-     * -- and the second here asks for the state the pipeline is already in, so the pass that finally
-     * looks actuates nothing and every face reports success. Nothing about that is visible from outside:
-     * the pipeline really is running, because it never stopped. Waiting until the pause is what the
-     * pipeline actually <em>is</em> separates the two verbs by more than the slot can lose.
-     *
-     * <p>The state read here is the actual one -- a read face serves what the converge side recorded,
-     * never the intent -- which is the whole reason this can be waited on at all.
-     *
-     * <p>A refusal ends the wait rather than being retried: it is an answer, and asking again produces
-     * the same one. An unreachable node is not, so it is polled through.
-     *
-     * @return the last state actually read, which the caller compares against paused; null when no read
-     *     ever produced one. Answering the state rather than a yes/no is what lets the caller say which
-     *     state the pipeline is in instead of only which one it is not.
-     */
     private String awaitPaused(String id) {
-        // This wait owns its own interruption window, the way every streaming command owns one. The flag
-        // is sticky: a Ctrl-C that stopped a watch three commands ago is still set, and without this a
-        // restart would read somebody else's interruption as its own and give up before it had waited.
         streamCancelled = false;
         long deadline = System.nanoTime() + pauseSettleBound().toNanos();
         String seen = null;
         while (true) {
-            StatusOutcome outcome = withFailover(() ->
-                    controlPlane.status(session.landingNode(), session.credential(), id),
-                    o -> o instanceof StatusOutcome.Unreachable);
+            StatusOutcome outcome = withFailover(() -> controlPlane.status(
+                    session.landingNode(), session.credential(), id),
+                    candidate -> candidate instanceof StatusOutcome.Unreachable);
             if (outcome instanceof StatusOutcome.Found found) {
                 seen = found.state();
                 if ("PAUSED".equalsIgnoreCase(seen)) {
@@ -1478,7 +2195,6 @@ final class Repl {
         }
     }
 
-    /** How long {@link #awaitPaused} waits, the environment's answer if it gave a usable one. */
     private Duration pauseSettleBound() {
         String configured = env == null ? null : env.apply(PAUSE_SETTLE_BOUND_ENV);
         if (configured == null || configured.isBlank()) {
@@ -1491,18 +2207,29 @@ final class Repl {
         }
     }
 
-    /**
-     * {@code stop <pipeline-id> [--keep-state] [-y]} -- the verb that clears, and the two words that
-     * change how it is asked for.
-     *
-     * <p>Plain, it clears what the pipeline accumulated, and asks first. {@code --keep-state} leaves
-     * every one of those items where it is, so the run that follows carries on rather than reading its
-     * whole source again. Which of the two a caller wants is not something the terminal can work out
-     * for them: the difference does not show until that next run is well under way.
-     *
-     * <p>Both spellings print the same list. The keeping one names what it is holding on to rather than
-     * what it is dropping, which is how somebody reads what a clear would take without running one.
-     */
+    private int lifecycleOnline(String verb, String id, Boolean purgeState) {
+        return renderLifecycle(driveLifecycle(verb, id, purgeState));
+    }
+
+    private LifecycleOutcome driveLifecycle(String verb, String id, Boolean purgeState) {
+        return withFailover(() -> controlPlane.lifecycle(
+                session.landingNode(), session.credential(), id, verb, purgeState),
+                candidate -> candidate instanceof LifecycleOutcome.Unreachable);
+    }
+
+    private int renderLifecycle(LifecycleOutcome outcome) {
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case LifecycleOutcome.Accepted accepted -> {
+                out.println(accepted.pipelineId() + "  " + accepted.targetState().toLowerCase(Locale.ROOT));
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case LifecycleOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case LifecycleOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
     private int stopOnline(List<String> words) {
         PrintWriter err = commandLine.getErr();
         boolean keepState = words.contains(KEEP_STATE);
@@ -1521,8 +2248,6 @@ final class Repl {
         }
         String id = operands.get(1);
         if (keepState) {
-            // Nothing is going, so there is nothing to confirm: this is the spelling that belongs in a
-            // script. The list is still printed -- it is the whole of what the reader gets to check.
             sayWhatBecomesOfTheState(false);
             return lifecycleOnline("stop", id, Boolean.FALSE);
         }
@@ -1530,7 +2255,6 @@ final class Repl {
         return refused.isPresent() ? refused.getAsInt() : lifecycleOnline("stop", id, Boolean.TRUE);
     }
 
-    /** Prints what a stop is about to do about the state, item by item, from the declarations. */
     private void sayWhatBecomesOfTheState(boolean purgeState) {
         PrintWriter out = commandLine.getOut();
         PipelineStateInventory.lines(purgeState, PipelineStateInventory.vocabulary())
@@ -1538,28 +2262,16 @@ final class Repl {
         out.flush();
     }
 
-    /** Whether the caller said not to ask; it says only that, and never that anything may be cleared. */
     private boolean unattended(List<String> words) {
         return words.contains("-y") || words.contains("--non-interactive");
     }
 
-    /**
-     * The gate in front of both spellings that clear: say what goes, then get an answer, or refuse.
-     *
-     * <p>Three outcomes and no fourth. Told not to ask, it goes ahead -- the flag says "do not ask me",
-     * and what may be cleared is carried by the verb, never by this. Asked where there is no terminal,
-     * it refuses: waiting would hang on an input that never arrives, and a hung run reads as a slow one,
-     * while going ahead would make an irreversible clearing the default of exactly the situation where
-     * nobody is watching. Otherwise it asks, and anything but yes leaves the pipeline alone.
-     *
-     * @return the exit code to stop at, or empty when the caller may go ahead
-     */
     private OptionalInt clearanceToClear(String verb, String id, boolean unattended) {
         sayWhatBecomesOfTheState(true);
         if (unattended) {
             return OptionalInt.empty();
         }
-        Prompter asking = terminal.getAsBoolean() ? prompter() : null;
+        Prompter asking = terminal.getAsBoolean() ? prompter : null;
         if (asking == null) {
             PrintWriter err = commandLine.getErr();
             Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", verb));
@@ -1572,29 +2284,11 @@ final class Repl {
             PrintWriter out = commandLine.getOut();
             out.println(verb + ": cancelled; " + id + " was left as it is");
             out.flush();
-            // Not zero. A caller that reads the status of a verb which did not do what it was asked, and
-            // is told it went fine, concludes the pipeline is stopped.
             return OptionalInt.of(Cli.EXIT_DIAGNOSTIC);
         }
         return OptionalInt.empty();
     }
 
-    /**
-     * {@code restart <pipeline-id> [--rerun] [-y]} -- the terminal's own composition of the four verbs
-     * the product has. There is no fifth verb behind this and no operation of its own: what a restart means
-     * is a sequence, and a sequence is what a front end is for.
-     *
-     * <p>Plain, it cycles the pipeline and lets it carry on from where it stopped -- a pause, waited for,
-     * and then a resume over a running one; a resume over a paused one. The wait is not politeness: two
-     * lifecycle verbs written inside one converge interval leave only the second, and the second here
-     * asks for the state the pipeline is already in, so neither half happens and the terminal says it
-     * went fine. With {@code --rerun} it asks for the whole source
-     * to be read again, which is a stop that clears followed by a start.
-     *
-     * <p>A pipeline with nothing to carry on from is started, and <em>told so</em>. The two outcomes are
-     * indistinguishable from the outside until the run is well under way -- one continues, the other
-     * re-reads everything -- so a restart that quietly did the second would be reporting the first.
-     */
     private int restartOnline(List<String> words) {
         PrintWriter err = commandLine.getErr();
         boolean rerun = words.contains("--rerun");
@@ -1614,14 +2308,12 @@ final class Repl {
         }
         String id = operands.get(1);
         if (rerun) {
-            // The plain restart clears nothing and asks nothing; this one is a stop that clears wearing
-            // another name, so it meets the same gate the plain stop does.
             OptionalInt refused = clearanceToClear("restart", id, unattended(words));
             return refused.isPresent() ? refused.getAsInt() : rerunFromTheStart(id);
         }
-        StatusOutcome outcome = withFailover(() ->
-                controlPlane.status(session.landingNode(), session.credential(), id),
-                o -> o instanceof StatusOutcome.Unreachable);
+        StatusOutcome outcome = withFailover(() -> controlPlane.status(
+                session.landingNode(), session.credential(), id),
+                candidate -> candidate instanceof StatusOutcome.Unreachable);
         return switch (outcome) {
             case StatusOutcome.Found found -> carryOnFrom(id, found.state());
             case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
@@ -1629,105 +2321,6 @@ final class Repl {
         };
     }
 
-    /** The plain restart, once the pipeline's state says which sequence carrying on actually is. */
-    private int carryOnFrom(String id, String state) {
-        PrintWriter out = commandLine.getOut();
-        PrintWriter err = commandLine.getErr();
-        switch (state.toUpperCase(Locale.ROOT)) {
-            case "RUNNING": {
-                int paused = lifecycleOnline("pause", id, null);
-                if (paused != Cli.EXIT_OK) {
-                    return paused;
-                }
-                String settled = awaitPaused(id);
-                if (!"PAUSED".equalsIgnoreCase(settled)) {
-                    // Nothing was resumed, and that is the point: the pipeline is on its way to paused
-                    // and will stay there, which is a state somebody can act on. Resuming from here
-                    // would write the second half of a pair whose first half nothing has read yet.
-                    //
-                    // The state it is actually in is named rather than the one it is not. A pipeline
-                    // that failed while pausing never reports paused either, and "it has not paused
-                    // yet" would send its owner to wait for something that is not coming.
-                    err.println("restart: " + id + " was asked to pause, but it is still "
-                            + (settled == null ? "not reporting a state" : settled.toLowerCase(Locale.ROOT))
-                            + ", so it has not been resumed; running restart again picks it up once it "
-                            + "has paused");
-                    err.flush();
-                    return Cli.EXIT_VERB_UNAVAILABLE;
-                }
-                LifecycleOutcome resumed = drive("resume", id, null);
-                if (resumed instanceof LifecycleOutcome.Rejected rejected
-                        && INCOMPATIBLE_REVISION.equals(rejected.code())) {
-                    // The one refusal worth more than its own text. Carrying on runs the pipeline as it
-                    // was when it paused, and the definition has been edited since -- so the refusal is
-                    // right, and "try again" is the one thing that will never work. What the caller
-                    // actually wants is named instead.
-                    renderRejection(rejected.code(), rejected.message());
-                    err.println("restart: " + id + " is now paused, and its definition changed while it "
-                            + "ran, so it cannot carry on as it was; 'restart " + id + " --rerun' runs "
-                            + "the new definition and reads the whole source again");
-                    err.flush();
-                    return Cli.EXIT_VERB_UNAVAILABLE;
-                }
-                if (resumed instanceof LifecycleOutcome.Rejected rejected) {
-                    // Any other refusal leaves it paused with everything it had, and trying again is
-                    // an answer -- which the one above is not.
-                    renderRejection(rejected.code(), rejected.message());
-                    err.println("restart: " + id + " is now paused and nothing was lost; running restart "
-                            + "again picks it up");
-                    err.flush();
-                    return Cli.EXIT_VERB_UNAVAILABLE;
-                }
-                return render(resumed);
-            }
-            case "PAUSED":
-                return lifecycleOnline("resume", id, null);
-            case "NEW":
-            case "STOPPED":
-            case "COMPLETED": {
-                // The half that is not the state change. Both outcomes end with the pipeline running, and
-                // which one happened shows only in how much of the source the run reads.
-                out.println("restart: " + id + " has no position to carry on from; this run reads "
-                        + "everything from the start");
-                out.flush();
-                return lifecycleOnline("start", id, null);
-            }
-            case "FAILED": {
-                // A failed run is carried on the same way anything else is, once the sequence is written
-                // out: a stop that keeps what the pipeline has, then a start. The state machine is built
-                // for it -- stopping is legal from failed and starting is not, precisely so recovery is a
-                // deliberate two steps -- and keeping is what makes it a recovery rather than a re-read:
-                // the position the run stopped at is still on record, and a start reads it back.
-                out.println("restart: " + id + " failed; carrying on from the position it reached");
-                out.flush();
-                int stopped = lifecycleOnline("stop", id, Boolean.FALSE);
-                if (stopped != Cli.EXIT_OK) {
-                    return stopped;
-                }
-                return lifecycleOnline("start", id, null);
-            }
-            default:
-                err.println("restart: " + id + " is " + state.toLowerCase(Locale.ROOT)
-                        + ", which restart does not know how to carry on from");
-                err.flush();
-                return Cli.EXIT_VERB_UNAVAILABLE;
-        }
-    }
-
-    /**
-     * {@code restart --rerun} -- clear what the pipeline has, then start it, so the whole source is read
-     * again.
-     *
-     * <p>The ordering that matters is already the product's: a stop that names a pipeline the server does
-     * not have, or one the state machine forbids stopping, is refused before the intent is written -- and
-     * nothing is cleared until the intent is written. So there is no window in which this asks for the
-     * clearing and then discovers the start was never going to be allowed.
-     *
-     * <p>What is left is the window nobody can close: the start being refused after the stop was accepted,
-     * because the pipeline was removed in between. That is reported as what it is rather than as a failed
-     * command, because the pipeline is now stopped with nothing to resume from and the next step is not
-     * "try again".
-     */
     private int rerunFromTheStart(String id) {
         int stopped = lifecycleOnline("stop", id, Boolean.TRUE);
         if (stopped != Cli.EXIT_OK) {
@@ -1744,29 +2337,70 @@ final class Repl {
         return started;
     }
 
-    private int lifecycleOnline(String verb, String id, Boolean purgeState) {
-        return render(drive(verb, id, purgeState));
-    }
-
-    /** The verb over the wire, unrendered, for a caller that has to read the refusal before showing it. */
-    private LifecycleOutcome drive(String verb, String id, Boolean purgeState) {
-        return withFailover(() ->
-                controlPlane.lifecycle(session.landingNode(), session.credential(), id, verb, purgeState),
-                o -> o instanceof LifecycleOutcome.Unreachable);
-    }
-
-    private int render(LifecycleOutcome outcome) {
+    private int carryOnFrom(String id, String state) {
         PrintWriter out = commandLine.getOut();
-        return switch (outcome) {
-            case LifecycleOutcome.Accepted accepted -> {
-                out.println(accepted.pipelineId() + "  " + accepted.targetState().toLowerCase(Locale.ROOT));
-                out.flush();
-                yield Cli.EXIT_OK;
+        PrintWriter err = commandLine.getErr();
+        switch (state.toUpperCase(Locale.ROOT)) {
+            case "RUNNING": {
+                int paused = lifecycleOnline("pause", id, null);
+                if (paused != Cli.EXIT_OK) {
+                    return paused;
+                }
+                String settled = awaitPaused(id);
+                if (!"PAUSED".equalsIgnoreCase(settled)) {
+                    err.println("restart: " + id + " was asked to pause, but it is still "
+                            + (settled == null ? "not reporting a state" : settled.toLowerCase(Locale.ROOT))
+                            + ", so it has not been resumed; running restart again picks it up once it "
+                            + "has paused");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                LifecycleOutcome resumed = driveLifecycle("resume", id, null);
+                if (resumed instanceof LifecycleOutcome.Rejected rejected
+                        && INCOMPATIBLE_REVISION.equals(rejected.code())) {
+                    renderRejection(rejected.code(), rejected.message());
+                    err.println("restart: " + id + " is now paused, and its definition changed while it "
+                            + "ran, so it cannot carry on as it was; 'restart " + id + " --rerun' runs "
+                            + "the new definition and reads the whole source again");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                if (resumed instanceof LifecycleOutcome.Rejected rejected) {
+                    renderRejection(rejected.code(), rejected.message());
+                    err.println("restart: " + id + " is now paused and nothing was lost; running restart "
+                            + "again picks it up");
+                    err.flush();
+                    return Cli.EXIT_VERB_UNAVAILABLE;
+                }
+                return renderLifecycle(resumed);
             }
-            case LifecycleOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
-            case LifecycleOutcome.Unreachable ignored -> reportRequestFailed();
-        };
+            case "PAUSED":
+                return lifecycleOnline("resume", id, null);
+            case "NEW":
+            case "STOPPED":
+            case "COMPLETED": {
+                out.println("restart: " + id + " has no position to carry on from; this run reads "
+                        + "everything from the start");
+                out.flush();
+                return lifecycleOnline("start", id, null);
+            }
+            case "FAILED": {
+                out.println("restart: " + id + " failed; carrying on from the position it reached");
+                out.flush();
+                int stopped = lifecycleOnline("stop", id, Boolean.FALSE);
+                if (stopped != Cli.EXIT_OK) {
+                    return stopped;
+                }
+                return lifecycleOnline("start", id, null);
+            }
+            default:
+                err.println("restart: " + id + " is " + state.toLowerCase(Locale.ROOT)
+                        + ", which restart does not know how to carry on from");
+                err.flush();
+                return Cli.EXIT_VERB_UNAVAILABLE;
+        }
     }
+
 
     /**
      * {@code apply [path]} — reads every {@code *.tap.yml} under the path (default: the session workspace)
@@ -1797,7 +2431,7 @@ final class Repl {
         Path target = operand != null ? workdir.resolve(operand).normalize() : workdir;
         List<LocalDraft> drafts;
         try {
-            drafts = collectDrafts(target, env);
+            drafts = collectDrafts(target);
         } catch (IOException e) {
             err.println("apply: cannot read " + target + ": " + e.getMessage());
             err.flush();
@@ -1831,7 +2465,10 @@ final class Repl {
             LocalDraft only = drafts.get(0);
             drafts = List.of(new LocalDraft(only.source(), only.content(), ifMatch));
         }
-        ApplyOutcome outcome = applyDrafts(drafts);
+        List<LocalDraft> submitted = drafts;
+        ApplyOutcome outcome = withFailover(() ->
+                controlPlane.apply(session.landingNode(), session.credential(), submitted),
+                o -> o instanceof ApplyOutcome.Unreachable);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case ApplyOutcome.Applied applied -> {
@@ -1943,8 +2580,6 @@ final class Repl {
                     o -> o instanceof GetOutcome.Unreachable);
             switch (read) {
                 case GetOutcome.Found found -> {
-                    // Taken from the response, not recomputed from the canonical form beside it: the
-                    // hash is over the resource's structure, so these bytes cannot produce it.
                     ifMatch = found.artifact().contentHash();
                     kind = found.artifact().kind();
                 }
@@ -2178,8 +2813,11 @@ final class Repl {
             return Cli.EXIT_DIAGNOSTIC;
         }
 
+        final String connectionId = parsed.id();
         OutputFormat chosen = parsed.format();
-        ConnectionTestOutcome outcome = testConnectionFor(parsed.id(), source.connector(), source.config());
+        ConnectionTestOutcome outcome = withFailover(() -> controlPlane.test(
+                session.landingNode(), session.credential(), connectionId, source.connector(), source.config()),
+                o -> o instanceof ConnectionTestOutcome.Unreachable);
         return switch (outcome) {
             case ConnectionTestOutcome.Tested tested -> {
                 renderReport(tested.report(), chosen);
@@ -2257,7 +2895,10 @@ final class Repl {
             return Cli.EXIT_DIAGNOSTIC;
         }
 
-        ConnectionDiscoverSchemaOutcome outcome = discoverSchemaFor(parsed.id(), source.connector(), source.config());
+        final String connectionId = parsed.id();
+        ConnectionDiscoverSchemaOutcome outcome = withFailover(() -> controlPlane.discoverSchema(
+                session.landingNode(), session.credential(), connectionId, source.connector(), source.config()),
+                o -> o instanceof ConnectionDiscoverSchemaOutcome.Unreachable);
         return switch (outcome) {
             case ConnectionDiscoverSchemaOutcome.Discovered discovered -> {
                 renderSchema(discovered.schema(), parsed.format());
@@ -2283,7 +2924,9 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         final String connectionId = parsed.id();
-        ConnectionSchemaOutcome outcome = readSchema(connectionId);
+        ConnectionSchemaOutcome outcome = withFailover(() ->
+                controlPlane.schema(session.landingNode(), session.credential(), connectionId),
+                o -> o instanceof ConnectionSchemaOutcome.Unreachable);
         return switch (outcome) {
             case ConnectionSchemaOutcome.Found found -> {
                 ConnectionSchema schema = found.schema();
@@ -2361,14 +3004,12 @@ final class Repl {
     }
 
     /**
-     * {@code register <path|connector-id> [-o text|json|yaml]} — registers a connector artifact with the
-     * server. An existing file uploads that one jar; an existing directory uploads every {@code *.jar}
-     * directly under it as a batch. An exact published connector id downloads its release asset and uploads
-     * those bytes. Local paths win over ids so a file named {@code oracle} keeps its ordinary meaning. The
-     * server introspects each artifact and stores it content-hash idempotently, then reports what was
-     * registered (newly, or an already-registered no-op). A missing operand or unknown option is a benign
-     * usage line; an unreadable path is a benign "cannot read" line; a download failure or coded server
-     * refusal renders its code and message, and on the machine surfaces an {@code {"error":{...}}} document.
+     * {@code register <path|connector-id> [-o text|json|yaml]} — registers a connector artifact with the server. A
+     * file path uploads that one jar; a directory path uploads every {@code *.jar} directly under it as a
+     * batch. The server introspects each artifact and stores it content-hash idempotently, then reports what
+     * was registered (newly, or an already-registered no-op). A missing operand or unknown option is a benign
+     * usage line; an unreadable path is a benign "cannot read" line; a coded refusal (a bad artifact, an id
+     * conflict) renders its code and message, and on the machine surfaces an {@code {"error":{...}}} document.
      */
     private int registerOnline(List<String> words) {
         PathAndFormat parsed = parsePathAndFormat(words);
@@ -2384,14 +3025,17 @@ final class Repl {
         byte[] artifact;
         String artifactName;
         if (publishedId) {
-            URI source;
             try {
-                source = PublishedConnectorArtifacts.artifact(parsed.path(), env);
+                URI source = PublishedConnectorArtifacts.artifact(parsed.path(), env);
                 artifactName = PublishedConnectorArtifacts.jarName(parsed.path());
-                echoDownloading(artifactName, source, parsed.format());
                 artifact = PublishedConnectorArtifacts.download(parsed.path(), source, connectorFetcher);
             } catch (IOException | IllegalArgumentException failed) {
-                return renderDownloadFailure(parsed.path(), failed, parsed.format());
+                String reason = failed.getMessage() == null || failed.getMessage().isBlank()
+                        ? failed.getClass().getSimpleName() : failed.getMessage();
+                MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(
+                        CliError.CONNECTOR_DOWNLOAD_FAILED, Map.of("connector", parsed.path(), "reason", reason));
+                renderRegisterRejection(CliError.CONNECTOR_DOWNLOAD_FAILED.code(), rendered.message(), parsed.format());
+                return Cli.EXIT_DIAGNOSTIC;
             }
         } else {
             try {
@@ -2422,9 +3066,8 @@ final class Repl {
     }
 
     /**
-     * Parses {@code <path|connector-id> [-o text|json|yaml]} for the register verb, printing its usage line
-     * to err and returning {@code null} on any error. The single positional operand is a local artifact path
-     * or an exact id with an asset on the connector release.
+     * Parses {@code <path> [-o text|json|yaml]} for the register verb, printing its usage line to err and
+     * returning {@code null} on any error. The single positional operand is the local artifact path to upload.
      */
     private PathAndFormat parsePathAndFormat(List<String> words) {
         PrintWriter err = commandLine.getErr();
@@ -2759,29 +3402,6 @@ final class Repl {
         err.flush();
     }
 
-    /** Announces the network read on the human surface; machine output remains one parseable document. */
-    private void echoDownloading(String artifact, URI source, OutputFormat format) {
-        if (format != OutputFormat.TEXT) {
-            return;
-        }
-        PrintWriter err = commandLine.getErr();
-        err.println("downloading " + artifact + " from " + source.getHost());
-        err.flush();
-    }
-
-    /** Renders a local release-fetch failure with the same structured contract as a server refusal. */
-    private int renderDownloadFailure(String connector, Exception failure, OutputFormat format) {
-        String reason = failure.getMessage() == null || failure.getMessage().isBlank()
-                ? failure.getClass().getSimpleName() : failure.getMessage();
-        Map<String, Object> params = Map.of("connector", connector, "reason", reason);
-        MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(CliError.CONNECTOR_DOWNLOAD_FAILED, params);
-        if (format == OutputFormat.TEXT) {
-            return renderRejection(CliError.CONNECTOR_DOWNLOAD_FAILED.code(), rendered.message(), params);
-        }
-        renderRegisterRejection(CliError.CONNECTOR_DOWNLOAD_FAILED.code(), rendered.message(), format);
-        return Cli.EXIT_DIAGNOSTIC;
-    }
-
     /** A short human byte size: {@code B} under a kibibyte, else one decimal in {@code KB}/{@code MB}/{@code GB}/{@code TB}. */
     private static String humanSize(long bytes) {
         if (bytes < 1024) {
@@ -2807,7 +3427,9 @@ final class Repl {
         if (format == null) {
             return Cli.EXIT_USAGE;
         }
-        ConnectorListOutcome outcome = listConnectors();
+        ConnectorListOutcome outcome = withFailover(() ->
+                controlPlane.connectorList(session.landingNode(), session.credential()),
+                o -> o instanceof ConnectorListOutcome.Unreachable);
         return switch (outcome) {
             case ConnectorListOutcome.Listed listed -> {
                 renderConnectors(listed.connectors(), format);
@@ -3331,85 +3953,6 @@ final class Repl {
     }
 
     /**
-     * {@code position <pipeline-id> [-f <file>]} — prints where the pipeline resumes from, one entry per
-     * mining chain, as the document the server holds; with {@code -f} it sends that document back, edited,
-     * and reports where each chain then stands.
-     *
-     * <p>The read prints json and nothing else, because what it prints is meant to be saved, edited and
-     * handed back — {@code position p > p.json}, change {@code resumeFrom.token}, {@code position p -f
-     * p.json}. A table would be a second rendering of the same thing that nothing could send back, and
-     * the values that must survive the trip unchanged are the ones a table would leave out.
-     *
-     * <p>The file is sent as its own bytes, unparsed. What the server compares against is what the server
-     * printed, so anything a reader and writer here changed on the way through would be a difference the
-     * author never made — and the server refuses each of those by name.
-     */
-    private int positionOnline(List<String> words) {
-        PrintWriter err = commandLine.getErr();
-        String file = null;
-        List<String> operands = new ArrayList<>();
-        for (int i = 0; i < words.size(); i++) {
-            String word = words.get(i);
-            if (i > 0 && word.equals("-f")) {
-                if (i + 1 >= words.size()) {
-                    err.println("position: -f needs a file (usage: " + POSITION_USAGE + ")");
-                    err.flush();
-                    return Cli.EXIT_USAGE;
-                }
-                file = words.get(++i);
-            } else if (i > 0 && word.startsWith("-")) {
-                err.println("position: unknown option " + word + " (usage: " + POSITION_USAGE + ")");
-                err.flush();
-                return Cli.EXIT_USAGE;
-            } else {
-                operands.add(word);
-            }
-        }
-        if (operands.size() < 2 || operands.get(1).isBlank()) {
-            err.println("position: missing operand (usage: " + POSITION_USAGE + ")");
-            err.flush();
-            return Cli.EXIT_USAGE;
-        }
-        String id = operands.get(1);
-        String document = null;
-        if (file != null) {
-            try {
-                document = Files.readString(Path.of(file));
-            } catch (IOException | RuntimeException unreadable) {
-                err.println("position: cannot read " + file + " (" + unreadable.getMessage() + ")");
-                err.flush();
-                return Cli.EXIT_USAGE;
-            }
-        }
-        String body = document;
-        PositionOutcome outcome = withFailover(() -> body == null
-                        ? controlPlane.position(session.landingNode(), session.credential(), id)
-                        : controlPlane.setPosition(session.landingNode(), session.credential(), id, body),
-                o -> o instanceof PositionOutcome.Unreachable);
-        PrintWriter out = commandLine.getOut();
-        return switch (outcome) {
-            case PositionOutcome.Found found -> {
-                if (body == null) {
-                    out.println(found.document());
-                } else {
-                    out.println("position written back for " + id);
-                    // Where every chain now stands, and -- the part worth printing after the fact --
-                    // whose else those chains are. A write-back moves a chain for every pipeline on it,
-                    // and this is the last moment anybody is told which ones those were.
-                    found.chains().forEach(chain -> out.println("  " + chain.chainId() + "  ->  "
-                            + (chain.token() == null ? "(nothing recorded)" : chain.token())
-                            + (chain.sharedWith().isEmpty()
-                                    ? "" : "   also read by: " + String.join(", ", chain.sharedWith()))));
-                }
-                out.flush();
-                yield Cli.EXIT_OK;
-            }
-            case PositionOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
-            case PositionOutcome.Unreachable ignored -> reportRequestFailed();
-        };
-    }
-
-    /**
      * {@code snapshot <pipeline-id>} — reads the pipeline's per-table initial-load progress and prints one
      * {@code <table>  <rowsDone>/<rowsTotal> (<pct>%)} line per table in name order (a table with no total
      * shows {@code <rowsDone>/?} — honest partial data), or a benign {@code no snapshot} line when there is
@@ -3438,6 +3981,126 @@ final class Repl {
             case SnapshotOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case SnapshotOutcome.Unreachable ignored -> reportRequestFailed();
         };
+    }
+
+    /** Reads a pipeline resume-position document, or writes back an edited document from {@code -f}. */
+    private int positionOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        String file = null;
+        List<String> operands = new ArrayList<>();
+        for (int i = 0; i < words.size(); i++) {
+            String word = words.get(i);
+            if (i > 0 && word.equals("-f")) {
+                if (i + 1 >= words.size()) {
+                    err.println("position: -f needs a file (usage: position <pipeline-id> [-f <file>])");
+                    err.flush();
+                    return Cli.EXIT_USAGE;
+                }
+                file = words.get(++i);
+            } else if (i > 0 && word.startsWith("-")) {
+                err.println("position: unknown option " + word + " (usage: position <pipeline-id> [-f <file>])");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            } else {
+                operands.add(word);
+            }
+        }
+        if (operands.size() < 2 || operands.get(1).isBlank()) {
+            err.println("position: missing operand (usage: position <pipeline-id> [-f <file>])");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String body = null;
+        if (file != null) {
+            try {
+                body = Files.readString(Path.of(file));
+            } catch (IOException | RuntimeException unreadable) {
+                err.println("position: cannot read " + file + " (" + unreadable.getMessage() + ")");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        String document = body;
+        String id = operands.get(1);
+        PositionOutcome outcome = withFailover(() -> document == null
+                        ? controlPlane.position(session.landingNode(), session.credential(), id)
+                        : controlPlane.setPosition(session.landingNode(), session.credential(), id, document),
+                candidate -> candidate instanceof PositionOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case PositionOutcome.Found found -> {
+                if (document == null) {
+                    out.println(found.document());
+                } else {
+                    out.println("position written back for " + id);
+                    found.chains().forEach(chain -> out.println("  " + chain.chainId() + "  ->  "
+                            + (chain.token() == null ? "(nothing recorded)" : chain.token())
+                            + (chain.sharedWith().isEmpty() ? "" : "   also read by: "
+                                    + String.join(", ", chain.sharedWith()))));
+                }
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case PositionOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case PositionOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /** Shows a pipeline's recorded, current, and target derived columns; {@code --accept} refreshes them. */
+    private int derivedSchemaOnline(List<String> words) {
+        String id = readTargetId(words);
+        if (id == null) {
+            return Cli.EXIT_USAGE;
+        }
+        boolean accept = words.size() > 2 && "--accept".equals(words.get(2));
+        if (words.size() > 3 || (words.size() == 3 && !accept)) {
+            PrintWriter err = commandLine.getErr();
+            err.println("derived-schema: usage: derived-schema <pipeline-id> [--accept]");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        DerivedSchemaOutcome outcome = accept
+                ? withFailover(() -> controlPlane.acceptDerivedSchema(
+                        session.landingNode(), session.credential(), id),
+                        candidate -> candidate instanceof DerivedSchemaOutcome.Unreachable)
+                : withFailover(() -> controlPlane.derivedSchema(
+                        session.landingNode(), session.credential(), id),
+                        candidate -> candidate instanceof DerivedSchemaOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case DerivedSchemaOutcome.Found found -> {
+                if (found.steps().isEmpty()) {
+                    out.println("no derived columns");
+                } else {
+                    found.steps().forEach(step -> renderDerivedStep(out, step));
+                }
+                if (accept) {
+                    out.println("accepted: the sources were re-read, and the columns above are what the next start is held to");
+                }
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case DerivedSchemaOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case DerivedSchemaOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    private static void renderDerivedStep(PrintWriter out, RemoteDerivedStep step) {
+        out.println(step.step() + "  ->  " + step.targetTable()
+                + (step.targetKnown() ? "" : "  (target columns unknown: nothing has discovered it)"));
+        out.println("  column                          recorded              derived               target");
+        step.columns().forEach(column -> out.println("  "
+                + padDerivedCell(column.column(), 32) + padDerivedCell(column.recorded(), 22)
+                + padDerivedCell(column.derived(), 22) + derivedCell(column.target())));
+    }
+
+    private static String padDerivedCell(String value, int width) {
+        String cell = derivedCell(value);
+        return cell.length() >= width ? cell + " " : cell + " ".repeat(width - cell.length());
+    }
+
+    private static String derivedCell(String value) {
+        return value == null ? "-" : value;
     }
 
     private int logsOnline(List<String> words) {
@@ -3643,83 +4306,6 @@ final class Repl {
     }
 
     /**
-     * What a pipeline's join steps derive their output columns to be, three sides at a time, and — with
-     * {@code --accept} — the one act that re-reads the sources and takes today's answer as the shape to
-     * hold them to from here.
-     *
-     * <p><b>{@code --accept} is the whole of "the database is the truth".</b> A pipeline holds its own
-     * copy of what its sources were discovered to be, so that the shape of a run's input cannot move
-     * under a run already using it; this is the act that re-takes that copy and works every step below
-     * it out again. Refused while a job is carrying the pipeline: the run is safe either way, but a
-     * record that no longer describes the job going on is not.
-     *
-     * <p>The accept is a flag on this verb rather than one on {@code start} deliberately. What makes the
-     * check worth having is the one moment a person looks at the difference and decides; a flag on the
-     * start is typed once and then lives in a script, which is the same as not checking.
-     */
-    private int derivedSchemaOnline(List<String> words) {
-        String id = readTargetId(words);
-        if (id == null) {
-            return Cli.EXIT_USAGE;
-        }
-        boolean accept = words.size() > 2 && "--accept".equals(words.get(2));
-        if (words.size() > 3 || (words.size() == 3 && !accept)) {
-            PrintWriter err = commandLine.getErr();
-            err.println("derived-schema: usage: derived-schema <pipeline-id> [--accept]");
-            err.flush();
-            return Cli.EXIT_USAGE;
-        }
-        DerivedSchemaOutcome outcome = accept
-                ? withFailover(() -> controlPlane.acceptDerivedSchema(
-                        session.landingNode(), session.credential(), id),
-                        o -> o instanceof DerivedSchemaOutcome.Unreachable)
-                : withFailover(() -> controlPlane.derivedSchema(
-                        session.landingNode(), session.credential(), id),
-                        o -> o instanceof DerivedSchemaOutcome.Unreachable);
-        PrintWriter out = commandLine.getOut();
-        return switch (outcome) {
-            case DerivedSchemaOutcome.Found found -> {
-                if (found.steps().isEmpty()) {
-                    out.println("no derived columns");
-                } else {
-                    found.steps().forEach(step -> renderDerivedStep(out, step));
-                }
-                if (accept) {
-                    out.println("accepted: the sources were re-read, and the columns above are what the next start is held to");
-                }
-                out.flush();
-                yield Cli.EXIT_OK;
-            }
-            case DerivedSchemaOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
-            case DerivedSchemaOutcome.Unreachable ignored -> reportRequestFailed();
-        };
-    }
-
-    /**
-     * One step's columns, three sides across: what was recorded, what is derived now, and what the
-     * target declares. An absent side prints as {@code -} rather than blank, so a column that is missing
-     * on one side cannot be misread as one whose value failed to render.
-     */
-    private static void renderDerivedStep(PrintWriter out, RemoteDerivedStep step) {
-        out.println(step.step() + "  ->  " + step.targetTable()
-                + (step.targetKnown() ? "" : "  (target columns unknown: nothing has discovered it)"));
-        out.println("  column                          recorded              derived               target");
-        step.columns().forEach(column -> out.println("  "
-                + pad(column.column(), 32) + pad(column.recorded(), 22)
-                + pad(column.derived(), 22) + cell(column.target())));
-    }
-
-    private static String pad(String value, int width) {
-        String cell = cell(value);
-        return cell.length() >= width ? cell + " " : cell + " ".repeat(width - cell.length());
-    }
-
-    /** An absent side, printed so that it reads as absent rather than as an empty value. */
-    private static String cell(String value) {
-        return value == null ? "-" : value;
-    }
-
-    /**
      * One table's snapshot progress: {@code rowsDone/rowsTotal (donePct%)} when the total is known, or
      * {@code rowsDone/?} when it is unavailable — honest partial data, never faked as a percentage.
      */
@@ -3744,70 +4330,6 @@ final class Repl {
         return outcome;
     }
 
-    /**
-     * Reads every {@code *.tap.yml} under a path (recursively for a directory) as drafts, in name order,
-     * with each file's {@code ${...}} references substituted from this session's environment.
-     *
-     * <p>Substituting here, rather than letting the server do it, is what keeps the variables read the
-     * author's own: this side loads the files, so this side resolves them, and only values cross the
-     * wire. The drafts stay raw text otherwise — the server remains the only parser.
-     */
-    private List<LocalDraft> collectDrafts(Path target, UnaryOperator<String> lookup) throws IOException {
-        List<LocalDraft> drafts = new ArrayList<>();
-        if (Files.isDirectory(target)) {
-            try (var files = Files.walk(target)) {
-                List<Path> yamls = files.filter(Files::isRegularFile)
-                        .filter(f -> f.getFileName().toString().endsWith(".tap.yml"))
-                        .sorted()
-                        .toList();
-                for (Path f : yamls) {
-                    drafts.add(draft(target.relativize(f).toString(), f, lookup));
-                }
-            } catch (UncheckedIOException e) {
-                // Files.walk surfaces a mid-traversal access error (an unreadable or concurrently-removed
-                // subdirectory) as an unchecked wrapper thrown from the terminal operation; normalize it to
-                // the checked IOException the caller renders as a benign "cannot read" line rather than
-                // letting it escape and crash the read loop.
-                throw e.getCause() != null ? e.getCause() : new IOException(e.getMessage(), e);
-            }
-        } else if (Files.isRegularFile(target)) {
-            drafts.add(draft(target.getFileName().toString(), target, lookup));
-        }
-        return drafts;
-    }
-
-    /** Reads one artifact and resolves its references, naming the file on whatever it refuses. */
-    private LocalDraft draft(String source, Path file, UnaryOperator<String> lookup) throws IOException {
-        String text = Files.readString(file);
-        try {
-            return new LocalDraft(source, Interpolator.interpolate(text, lookup));
-        } catch (DslException e) {
-            throw e.withSource(source);
-        }
-    }
-
-    // ---- up: the composite that brings a workspace to running -----------------------------------------
-
-    /**
-     * The server's own code for a connector that is not registered. Checked on this side before anything
-     * is applied, because the server would refuse the same way later — after the sources were written.
-     * Carried as the canonical code string, the way every server code reaches this ring.
-     */
-    private static final String CONNECTOR_NOT_REGISTERED = "connector.not-registered";
-    /**
-     * The server's code for a connector that could not complete its connection test, carried as a
-     * string for the same reason: it is the server's word, and a preflight that reports a check the
-     * connector failed without a code of its own reports it under the code the server would have used.
-     */
-    private static final String CONNECTOR_TEST_FAILED = "connector.test-failed";
-
-    /** The pipeline state under which there is nothing left to start, as the server spells it. */
-    private static final String RUNNING = "RUNNING";
-
-    /** The apply change under which a resource was already what the workspace says. */
-    private static final String UNCHANGED = "UNCHANGED";
-
-    /** What {@code up}'s words asked for. */
     private record UpOptions(String server, Path workdir, OutputFormat format, boolean startLocal, String user,
                              boolean yes) {
     }
@@ -3864,14 +4386,6 @@ final class Repl {
         return new UpRun(workspace, options.format(), connectedHere).run();
     }
 
-    /**
-     * Binds {@code workspace} to the server {@code --server} names, or to the one asked for at a
-     * terminal. Reached only while the directory is unbound, so the question is asked once per
-     * workspace rather than once per run. A script that named neither a server nor {@code --start-local}
-     * is refused rather than bound to whatever happens to be listening on this machine.
-     *
-     * @return {@link Cli#EXIT_OK} when the workspace is bound, or the code the failure is reported with
-     */
     /** Whether the workspace already names a server, which is what makes the question a first-run one. */
     private boolean boundAlready(Path workspace) {
         return java.nio.file.Files.isDirectory(workspace)
@@ -4491,6 +5005,57 @@ final class Repl {
     }
 
     /**
+     * Reads every {@code *.tap.yml} under a path (recursively for a directory) as drafts, in name order,
+     * with each file's {@code ${...}} references substituted from this session's environment.
+     *
+     * <p>Substituting here, rather than letting the server do it, is what keeps the variables read the
+     * author's own: this side loads the files, so this side resolves them, and only values cross the
+     * wire. The drafts stay raw text otherwise — the server remains the only parser.
+     */
+    private List<LocalDraft> collectDrafts(Path target) throws IOException {
+        return collectDrafts(target, env);
+    }
+
+    /** Reads drafts using the supplied lookup so a workspace's .env can take precedence for {@code up}. */
+    private List<LocalDraft> collectDrafts(Path target, UnaryOperator<String> lookup) throws IOException {
+        List<LocalDraft> drafts = new ArrayList<>();
+        if (Files.isDirectory(target)) {
+            try (var files = Files.walk(target)) {
+                List<Path> yamls = files.filter(Files::isRegularFile)
+                        .filter(f -> f.getFileName().toString().endsWith(".tap.yml"))
+                        .sorted()
+                        .toList();
+                for (Path f : yamls) {
+                    drafts.add(draft(target.relativize(f).toString(), f, lookup));
+                }
+            } catch (UncheckedIOException e) {
+                // Files.walk surfaces a mid-traversal access error (an unreadable or concurrently-removed
+                // subdirectory) as an unchecked wrapper thrown from the terminal operation; normalize it to
+                // the checked IOException the caller renders as a benign "cannot read" line rather than
+                // letting it escape and crash the read loop.
+                throw e.getCause() != null ? e.getCause() : new IOException(e.getMessage(), e);
+            }
+        } else if (Files.isRegularFile(target)) {
+            drafts.add(draft(target.getFileName().toString(), target, lookup));
+        }
+        return drafts;
+    }
+
+    /** Reads one artifact and resolves its references, naming the file on whatever it refuses. */
+    private LocalDraft draft(String source, Path file) throws IOException {
+        return draft(source, file, env);
+    }
+
+    private LocalDraft draft(String source, Path file, UnaryOperator<String> lookup) throws IOException {
+        String text = Files.readString(file);
+        try {
+            return new LocalDraft(source, Interpolator.interpolate(text, lookup));
+        } catch (DslException e) {
+            throw e.withSource(source);
+        }
+    }
+
+    /**
      * Renders a coded refusal raised on this side of the wire, located at the file and line it was found
      * on. Distinct from {@link #renderRejection} only in where the message comes from: a server refusal
      * arrives rendered, while this one is rendered here from the code and its arguments.
@@ -4865,8 +5430,7 @@ final class Repl {
         if (!session.isConnected()) {
             serverLine = "not connected";
         } else {
-            ControlPlaneClient.ServerVersion reported =
-                    controlPlane.serverVersionDetail(session.landingNode());
+            ControlPlaneClient.ServerVersion reported = controlPlane.serverVersionDetail(session.landingNode());
             serverLine = (reported == null ? "not reported" : reported.version())
                     + " (" + hostPort(session.landingNode()) + ")";
             dslLine = grammarLine(reported);
@@ -4878,12 +5442,6 @@ final class Repl {
         return Cli.EXIT_OK;
     }
 
-    /**
-     * Three answers, kept apart because two of them would otherwise read as the third: a server that did
-     * not send the field, one that sent an empty list -- it accepts no authoring grammar at all, which is
-     * a fact and not a silence -- and one that named some. A blank after the label is the shape that
-     * reads as agreement, so nothing here ever prints one.
-     */
     private static String grammarLine(ControlPlaneClient.ServerVersion reported) {
         if (reported == null || reported.dslVersions() == null) {
             return "not reported";
@@ -5231,7 +5789,7 @@ final class Repl {
                     Map.of("reason", "context manager is unavailable in this session"));
             return Cli.EXIT_USAGE;
         }
-        return new ContextConsole(contextManager, prompter, workdir,
+        return new ContextConsole(contextManager, prompter(), workdir,
                 commandLine.getOut(), commandLine.getErr()).run();
     }
 
@@ -5383,6 +5941,100 @@ final class Repl {
             builder.completer(completer);
         }
         return builder.build();
+    }
+
+    /** Runs the command session in a caller-owned virtual terminal. */
+    void runEmbeddedShell(Terminal terminal) {
+        PrintWriter previousOut = commandLine.getOut();
+        PrintWriter previousErr = commandLine.getErr();
+        Prompter previousPrompter = prompter;
+        BooleanSupplier previousTerminal = this.terminal;
+        IntSupplier previousScreenWidth = this.screenWidth;
+        commandLine.setOut(terminal.writer());
+        commandLine.setErr(terminal.writer());
+        this.terminal = () -> true;
+        this.screenWidth = () -> terminal.getWidth() > 0 ? terminal.getWidth() : DEFAULT_SCREEN_WIDTH;
+        this.prompter = new JLinePrompter(terminal, false);
+        try (Shell shell = buildEmbeddedShell(terminal)) {
+            shell.run();
+        } catch (Exception failure) {
+            terminal.writer().println("Shell crashed: " + failure.getClass().getSimpleName() + ": " + failure.getMessage());
+            terminal.writer().flush();
+        } finally {
+            commandLine.setOut(previousOut);
+            commandLine.setErr(previousErr);
+            this.prompter = previousPrompter;
+            this.terminal = previousTerminal;
+            this.screenWidth = previousScreenWidth;
+        }
+    }
+
+    private Shell buildEmbeddedShell(Terminal terminal) throws IOException {
+        return Shell.builder()
+                .terminal(terminal)
+                .prompt(Repl::embeddedPrompt)
+                .groups(tapstateCommandGroup(), new PosixCommandGroup(), new InteractiveCommandGroup())
+                .helpCommands(true)
+                .commandHighlighter(false)
+                .variable(LineReader.LIST_MAX, 50)
+                .onReaderReady((reader, dispatcher) -> {
+                    if (dispatcher instanceof DefaultCommandDispatcher commandDispatcher) {
+                        commandDispatcher.session().setWorkingDirectory(workdir);
+                    }
+                    terminal.handle(Terminal.Signal.INT, signal -> cancelStream());
+                })
+                .build();
+    }
+
+    private SimpleCommandGroup tapstateCommandGroup() {
+        LinkedHashSet<String> names = new LinkedHashSet<>(commandLine.getSubcommands().keySet());
+        names.addAll(List.of("connect", "disconnect", "login", "logout", ":ctx", "version"));
+        names.removeAll(Set.of(
+                "help", "exit", "quit", "cd", "pwd", "echo", "cat", "ls", "grep", "head", "tail", "wc",
+                "sort", "date", "sleep", "clear", "nano", "less", "more", "history"));
+        List<Command> commands = names.stream().map(this::tapstateCommand).toList();
+        return new SimpleCommandGroup("Tapstate", commands);
+    }
+
+    private Command tapstateCommand(String name) {
+        return new Command() {
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            public String description() {
+                CommandLine child = commandLine.getSubcommands().get(name);
+                if (child == null) {
+                    return "Tapstate interactive command";
+                }
+                String[] description = child.getCommandSpec().usageMessage().description();
+                return description.length == 0 ? "Tapstate command" : description[0];
+            }
+
+            @Override
+            public Object execute(org.jline.shell.CommandSession session, String[] arguments) {
+                List<String> words = new ArrayList<>(arguments.length + 1);
+                words.add(name);
+                words.addAll(List.of(arguments));
+                dispatch(words);
+                session.setLastExitCode(lastExitCode);
+                return null;
+            }
+        };
+    }
+
+    private static String embeddedPrompt() {
+        return new AttributedStringBuilder()
+                .append("tapstate", AttributedStyle.DEFAULT.bold().foregroundRgb(0x4FACBC))
+                .append("> ", AttributedStyle.DEFAULT)
+                .toAnsi();
+    }
+
+    /** The command table's diagnostic stream, shared with the workbench startup boundary. */
+    PrintWriter errorOutput() {
+        return commandLine.getErr();
     }
 
     /** Runs the interactive read loop until {@code exit} / {@code quit} or end-of-input. */

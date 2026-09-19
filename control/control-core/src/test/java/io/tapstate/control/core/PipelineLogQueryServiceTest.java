@@ -47,6 +47,23 @@ class PipelineLogQueryServiceTest {
     }
 
     @Test
+    void pagesStrictlyAfterTheReportedCursor() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+        sink.append("orders_sync", line("first"));
+        sink.append("orders_sync", line("second"));
+        sink.append("orders_sync", line("third"));
+        var service = new PipelineLogQueryService(sink);
+
+        PipelineLogs first = service.logs("orders_sync", null, 2);
+        PipelineLogs second = service.logs("orders_sync", first.nextCursor(), 2);
+
+        assertThat(first.lines()).extracting(LogLine::message).containsExactly("second", "third");
+        assertThat(first.nextCursor()).isNotNull();
+        assertThat(second.lines()).isEmpty();
+        assertThat(second.nextCursor()).isEqualTo(first.nextCursor());
+    }
+
+    @Test
     void aPipelineWithNoLinesProjectsAnEmptyTailNotAnError() {
         var service = new PipelineLogQueryService(new RingBufferLogSink(8, 8));
 

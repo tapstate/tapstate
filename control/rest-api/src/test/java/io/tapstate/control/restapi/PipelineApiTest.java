@@ -613,7 +613,7 @@ class PipelineApiTest {
                         "pipeline.list", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
                         "pipeline.update",
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
-                        "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
+                        "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs", "pipeline.log-level",
                         "pipeline.position", "pipeline.set-position",
                         "pipeline.derived-schema", "pipeline.accept-derived-schema");
 

@@ -1,0 +1,2810 @@
+package io.tapstate.cli;
+
+import dev.tamboui.terminal.Frame;
+import dev.tamboui.layout.Rect;
+import dev.tamboui.tui.TuiConfig;
+import dev.tamboui.tui.TuiRunner;
+import dev.tamboui.tui.event.Event;
+import dev.tamboui.tui.event.KeyEvent;
+import dev.tamboui.tui.event.MouseEvent;
+import dev.tamboui.tui.event.MouseEventKind;
+import dev.tamboui.tui.event.PasteEvent;
+import org.jline.terminal.Terminal;
+import org.jline.terminal.TerminalBuilder;
+
+import java.net.URI;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+/**
+ * The full-screen terminal owner for a bare CLI launch.
+ *
+ * <p>This is deliberately the only place that creates a TamboUI runner. Business verbs stay outside
+ * this lifecycle and continue through Picocli's one-shot command path.
+ */
+final class Workbench {
+
+    private Workbench() {
+    }
+
+    /** Opens the initial workbench shell and returns after its runner has restored the terminal. */
+    static int run(Repl session) {
+        Terminal terminal = null;
+        try {
+            terminal = TerminalBuilder.builder().system(true).dumb(true).build();
+            if ("dumb".equalsIgnoreCase(terminal.getType())) {
+                terminal.close();
+                Diagnostics.printText(session.errorOutput(), CliError.WORKBENCH_NEEDS_A_TERMINAL, Map.of());
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+            WorkbenchTerminalBackend backend = new WorkbenchTerminalBackend(terminal);
+            terminal = null;
+            TuiRunner runner = createRunner(backend);
+            try {
+                Session workbench = new Session(
+                        runner, session, session.workbenchDataSource(), session.workbenchActionGateway());
+                try {
+                    runner.runLater(workbench::refresh);
+                    runner.run(workbench::handleEvent, workbench::render);
+                } finally {
+                    workbench.close();
+                }
+            } catch (Exception | Error failure) {
+                closeAfterFailure(runner, backend, failure);
+                throw failure;
+            }
+            closeRunner(runner, backend);
+            return Cli.EXIT_OK;
+        } catch (Exception ignored) {
+            closeQuietly(terminal);
+            Diagnostics.printText(session.errorOutput(), CliError.WORKBENCH_UNAVAILABLE, Map.of());
+            return Cli.EXIT_DIAGNOSTIC;
+        }
+    }
+
+    /**
+     * Creates a runner with an explicit JLine backend so service discovery cannot select another
+     * terminal implementation when future optional integrations appear on the classpath.
+     */
+    private static TuiRunner createRunner(Terminal terminal) throws Exception {
+        return createRunner(new WorkbenchTerminalBackend(terminal));
+    }
+
+    static TuiRunner createRunner(WorkbenchTerminalBackend backend) throws Exception {
+        TuiRunner runner = null;
+        try {
+            runner = TuiRunner.create(runnerConfig(backend));
+            backend.quitOnEof(runner::quit);
+            backend.quitOnInterrupt(runner::quit);
+            backend.quitOnTerminate(runner::quit);
+            return runner;
+        } catch (Exception | Error failure) {
+            closeAfterFailure(runner, backend, failure);
+            throw failure;
+        }
+    }
+
+    static TuiConfig runnerConfig(WorkbenchTerminalBackend backend) {
+        return TuiConfig.builder()
+                .backend(backend)
+                .mouseCapture(true)
+                .bracketedPaste(true)
+                .noTick()
+                .build();
+    }
+
+    static void closeRunner(TuiRunner runner, WorkbenchTerminalBackend backend) throws Exception {
+        try {
+            runner.close();
+        } catch (Exception | Error failure) {
+            closeAfterFailure(null, backend, failure);
+            throw failure;
+        }
+        backend.throwIfCleanupFailed();
+    }
+
+    private static void closeAfterFailure(
+            TuiRunner runner, WorkbenchTerminalBackend backend, Throwable failure) {
+        try {
+            if (runner == null) {
+                backend.close();
+                backend.throwIfCleanupFailed();
+            } else {
+                closeRunner(runner, backend);
+            }
+        } catch (Exception | Error cleanupFailure) {
+            addSuppressedOnce(failure, cleanupFailure);
+        }
+    }
+
+    private static void addSuppressedOnce(Throwable failure, Throwable cleanupFailure) {
+        if (cleanupFailure == failure) {
+            return;
+        }
+        for (Throwable suppressed : failure.getSuppressed()) {
+            if (suppressed == cleanupFailure) {
+                return;
+            }
+        }
+        failure.addSuppressed(cleanupFailure);
+    }
+
+    /** Renders from the runner-owned frame so resize changes take effect without a second terminal owner. */
+    static void render(Frame frame) {
+        WorkbenchRenderer.render(frame, WorkbenchState.initial());
+    }
+
+    private static void closeQuietly(Terminal terminal) {
+        if (terminal == null) {
+            return;
+        }
+        try {
+            terminal.close();
+        } catch (Exception ignored) {
+            // The original terminal initialization failure is the diagnosable outcome.
+        }
+    }
+
+    /** The render-thread session for one runner lifecycle. */
+    static final class Session implements AutoCloseable {
+        private final WorkbenchRuntime runtime;
+        private final TuiRunner ownerRunner;
+        private final WorkbenchDataSource dataSource;
+        private final WorkbenchActionGateway actionGateway;
+        private final RefreshCoordinator refreshCoordinator;
+        private final WorkbenchActionCoordinator actionCoordinator;
+        private final SelectedPipelineStatusCoordinator pipelineStatusCoordinator;
+        private final WorkbenchLogCoordinator logCoordinator;
+        private final SelectedPipelineInspectCoordinator inspectCoordinator;
+        private final WorkbenchShellPanel shellPanel;
+        private volatile WorkbenchSnapshot lastSuccessfulSnapshot;
+        private WorkbenchRenderer.RenderLayout layout = WorkbenchRenderer.RenderLayout.forTooSmallFrame();
+
+        private Session(
+                TuiRunner runner,
+                Repl repl,
+                WorkbenchDataSource dataSource,
+                WorkbenchActionGateway actionGateway) {
+            this(new WorkbenchRuntime(
+                            WorkbenchState.initial(),
+                            runner::runLater,
+                            runner::isRenderThread,
+                            runner::dispatch),
+                    dataSource,
+                    actionGateway,
+                    repl,
+                    runner);
+        }
+
+        Session(WorkbenchRuntime runtime) {
+            this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.ownerRunner = null;
+            this.dataSource = null;
+            this.actionGateway = null;
+            this.refreshCoordinator = null;
+            this.actionCoordinator = null;
+            this.pipelineStatusCoordinator = null;
+            this.logCoordinator = null;
+            this.inspectCoordinator = null;
+            this.shellPanel = null;
+        }
+
+        Session(WorkbenchRuntime runtime, WorkbenchDataSource dataSource) {
+            this(runtime, dataSource, null);
+        }
+
+        Session(
+                WorkbenchRuntime runtime,
+                WorkbenchDataSource dataSource,
+                WorkbenchActionGateway actionGateway) {
+            this(runtime, dataSource, actionGateway, null);
+        }
+
+        private Session(
+                WorkbenchRuntime runtime,
+                WorkbenchDataSource dataSource,
+                WorkbenchActionGateway actionGateway,
+                Repl repl) {
+            this(runtime, dataSource, actionGateway, repl, null);
+        }
+
+        private Session(
+                WorkbenchRuntime runtime,
+                WorkbenchDataSource dataSource,
+                WorkbenchActionGateway actionGateway,
+                Repl repl,
+                TuiRunner ownerRunner) {
+            this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.ownerRunner = ownerRunner;
+            this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
+            this.actionGateway = actionGateway;
+            this.refreshCoordinator = new RefreshCoordinator(this::publishRefreshResult);
+            this.actionCoordinator = actionGateway == null ? null : new WorkbenchActionCoordinator(runtime);
+            this.pipelineStatusCoordinator = actionGateway == null ? null : new SelectedPipelineStatusCoordinator(runtime);
+            this.logCoordinator = actionGateway == null ? null : new WorkbenchLogCoordinator();
+            this.inspectCoordinator = actionGateway == null ? null : new SelectedPipelineInspectCoordinator(runtime);
+            this.shellPanel = repl == null ? null : new WorkbenchShellPanel(
+                    repl, runtime::requestRender, runtime::runLater);
+        }
+
+        boolean handleEvent(Event event, TuiRunner runner) {
+            if (event == WorkbenchRedrawEvent.INSTANCE) {
+                return true;
+            }
+            if (runtime.state().overlay().isPresent()) {
+                if (event instanceof KeyEvent key && key.isCtrlC()) {
+                    clearOverlaySecret();
+                    runner.quit();
+                    return true;
+                }
+                return handleOverlayEvent(event, runner);
+            }
+            if (shellPanel != null && shellPanel.isOpen()) {
+                if (event instanceof KeyEvent key) {
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.F6) && key.hasShift()) {
+                        shellPanel.cycleHeight();
+                        return true;
+                    }
+                    return shellPanel.handle(key);
+                }
+                if (event instanceof MouseEvent mouse) {
+                    return shellPanel.handle(mouse);
+                }
+                if (event instanceof PasteEvent paste) {
+                    return shellPanel.paste(paste.text());
+                }
+                return true;
+            }
+            if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                    && runtime.state().workspaceView().editing()) {
+                return handleWorkspaceEditorEvent(event, runner);
+            }
+            if (event instanceof PasteEvent) {
+                return false;
+            }
+            if (event instanceof KeyEvent key) {
+                if (key.isKey(dev.tamboui.tui.event.KeyCode.F2)) {
+                    return openActions();
+                }
+                if (key.isKey(dev.tamboui.tui.event.KeyCode.F6) && shellPanel != null) {
+                    shellPanel.open();
+                    return true;
+                }
+                if (key.isCtrlC()) {
+                    runner.quit();
+                    return true;
+                }
+                if (key.isCharIgnoreCase('q')) {
+                    return requestQuit();
+                }
+                if (key.isCharIgnoreCase('r') && refreshCoordinator != null) {
+                    refresh();
+                    return true;
+                }
+                if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.LOGS) {
+                    if (key.isCharIgnoreCase('l')) {
+                        return runtime.state().logs().map(WorkbenchLogsState::pipelineId)
+                                .map(this::openLogLevel).orElse(true);
+                    }
+                    if (key.isCharIgnoreCase('f')) {
+                        if (runtime.state().logs().map(WorkbenchLogsState::following).orElse(false)) {
+                            logCoordinator.cancel();
+                            return runtime.updateState(state -> state.withLogs(state.logs().map(WorkbenchLogsState::toggleFollow)));
+                        }
+                        return runtime.updateState(state -> state.withLogs(Optional.empty()));
+                    }
+                    if (key.isCharIgnoreCase('w')) return runtime.updateState(state -> state.withLogs(state.logs().map(WorkbenchLogsState::toggleWrap)));
+                    if (key.isUp() || key.isCharIgnoreCase('k')) return runtime.updateState(state -> state.withLogs(state.logs().map(value -> value.scroll(1))));
+                    if (key.isDown() || key.isCharIgnoreCase('j')) return runtime.updateState(state -> state.withLogs(state.logs().map(value -> value.scroll(-1))));
+                    if (key.isPageUp()) return runtime.updateState(state -> state.withLogs(state.logs().map(value -> value.scroll(10))));
+                    if (key.isPageDown()) return runtime.updateState(state -> state.withLogs(state.logs().map(value -> value.scroll(-10))));
+                    if (key.isHome()) return runtime.updateState(state -> state.withLogs(state.logs().map(WorkbenchLogsState::toOldest)));
+                    if (key.isEnd()) return runtime.updateState(state -> state.withLogs(state.logs().map(WorkbenchLogsState::toNewest)));
+                }
+                if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.PIPELINES) {
+                    if (key.isChar('6') && selectedRemotePipelineId().isPresent()) {
+                        return runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.INSPECT));
+                    }
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.F10) && selectedPipelineApplyRequest().isPresent()) {
+                        return confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                    }
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.F5) && selectedPipelineId().isPresent()) {
+                        return confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "start");
+                    }
+                    if (key.isChar('p') && selectedPipelineId().isPresent()) {
+                        return confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "pause");
+                    }
+                    if (key.isChar('u') && selectedPipelineId().isPresent()) {
+                        return confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "resume");
+                    }
+                    if (key.isChar('x') && selectedPipelineId().isPresent()) {
+                        return confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "stop");
+                    }
+                }
+                if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                        && key.isKey(dev.tamboui.tui.event.KeyCode.F10)) {
+                    if (selectedSourceRequest().isPresent()) {
+                        return confirmSourceApply(selectedSourceRequest().orElseThrow());
+                    }
+                    if (selectedPipelineApplyRequest().isPresent()) {
+                        return confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                    }
+                }
+                if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE) {
+                    if (runtime.state().workspaceView().focus()
+                            == WorkbenchWorkspaceState.Focus.VIEWER
+                            && (key.isUp() || key.isDown() || key.isLeft() || key.isRight()
+                                    || key.isHome() || key.isEnd())) {
+                        return runtime.updateState(state -> state.withWorkspaceView(
+                                state.workspaceView().navigate(key)));
+                    }
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.TAB)) {
+                        return runtime.updateState(state -> state.withWorkspaceView(
+                                state.workspaceView().toggleFocus()));
+                    }
+                    if (key.isConfirm() && runtime.state().workspaceView().focus()
+                            == WorkbenchWorkspaceState.Focus.FILES) {
+                        return openSelectedWorkspaceFile(false);
+                    }
+                    if (key.isKey(dev.tamboui.tui.event.KeyCode.F4)) {
+                        if (runtime.state().workspaceView().focus()
+                                == WorkbenchWorkspaceState.Focus.VIEWER
+                                && runtime.state().workspaceView().document().isPresent()) {
+                            return runtime.updateState(state -> state.withWorkspaceView(
+                                    state.workspaceView().edit()));
+                        }
+                        return openSelectedWorkspaceFile(true);
+                    }
+                    if (key.isCancel() && !runtime.state().workspaceView()
+                            .equals(WorkbenchWorkspaceState.empty())) {
+                        return runtime.updateState(state -> state.withWorkspaceView(
+                                state.workspaceView().back()));
+                    }
+                    if (runtime.state().workspaceView().focus()
+                            == WorkbenchWorkspaceState.Focus.FILES
+                            && runtime.state().workspaceView().document().isPresent()
+                            && isWorkspaceFileNavigation(key)) {
+                        runtime.updateState(state -> state.reduce(key, visibleRows()));
+                        return previewSelectedWorkspaceFile();
+                    }
+                }
+                if (key.isCharIgnoreCase('c')) {
+                    return openContextEntry();
+                }
+                if (key.isCharIgnoreCase('a')) {
+                    return openAuthEntry();
+                }
+                if (key.isChar('0')) {
+                    return runtime.updateState(state -> state.withOverlay(
+                            new WorkbenchOverlayState.More(0)));
+                }
+                return runtime.updateState(state -> state.reduce(key, visibleRows()));
+            }
+            if (event instanceof MouseEvent mouse) {
+                if (mouse.kind() == MouseEventKind.SCROLL_UP || mouse.kind() == MouseEventKind.SCROLL_DOWN) {
+                    int direction = mouse.kind() == MouseEventKind.SCROLL_UP ? -1 : 1;
+                    if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.LOGS) {
+                        return runtime.updateState(state -> state.withLogs(state.logs()
+                                .map(value -> value.scroll(direction < 0 ? 3 : -3))));
+                    }
+                    return runtime.updateState(state -> state.reduce(
+                            KeyEvent.ofKey(direction < 0
+                                    ? dev.tamboui.tui.event.KeyCode.UP : dev.tamboui.tui.event.KeyCode.DOWN),
+                            visibleRows()));
+                }
+                if (!mouse.isClick()) {
+                    return false;
+                }
+                var action = layout.actionAt(mouse.x(), mouse.y());
+                if (action.isPresent()) {
+                    return switch (action.orElseThrow()) {
+                        case CONTEXT -> openContextEntry();
+                        case AUTH -> openAuthEntry();
+                        case MORE -> runtime.updateState(state -> state.withOverlay(
+                                new WorkbenchOverlayState.More(0)));
+                    };
+                }
+                var footerAction = layout.footerActionAt(mouse.x(), mouse.y());
+                if (footerAction.isPresent()) {
+                    return handleFooterAction(footerAction.orElseThrow(), runner);
+                }
+                var clickedTab = layout.tabAt(mouse.x(), mouse.y());
+                if (clickedTab.isPresent()) {
+                    return runtime.updateState(state -> state.select(clickedTab.orElseThrow()));
+                }
+                var clickedRow = layout.rowAt(mouse.x(), mouse.y());
+                if (clickedRow.isPresent()) {
+                    WorkbenchRenderer.RowHit row = clickedRow.orElseThrow();
+                    return runtime.updateState(state -> {
+                        WorkbenchState selected = state.selectRow(
+                                row.tab(), row.rowIndex(), visibleRows());
+                        return row.tab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                                ? selected.withWorkspaceView(selected.workspaceView().focusFiles())
+                                : selected;
+                    });
+                }
+            }
+            return false;
+        }
+
+        WorkbenchRenderer.RenderLayout layout() {
+            return layout;
+        }
+
+        private boolean handleFooterAction(WorkbenchRenderer.FooterAction action, TuiRunner runner) {
+            return switch (action) {
+                case ACTIONS -> openActions();
+                case CONTEXT -> openContextEntry();
+                case AUTH -> openAuthEntry();
+                case MORE -> runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.More(0)));
+                case REFRESH -> {
+                    if (refreshCoordinator == null) {
+                        yield false;
+                    }
+                    refresh();
+                    yield true;
+                }
+                case QUIT -> {
+                    yield requestQuit();
+                }
+                case SHELL -> {
+                    if (shellPanel == null) {
+                        yield false;
+                    }
+                    shellPanel.open();
+                    yield true;
+                }
+                case BACK -> runtime.updateState(state -> state.selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                        && !state.workspaceView().equals(WorkbenchWorkspaceState.empty())
+                        ? state.withWorkspaceView(state.workspaceView().back())
+                        : state.reduce(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ESCAPE), visibleRows()));
+                case SORT -> runtime.updateState(state -> state.reduce(KeyEvent.ofChar('s'), visibleRows()));
+                case OPEN -> openSelectedWorkspaceFile(false);
+                case EDIT -> {
+                    if (runtime.state().overlay().orElse(null) instanceof WorkbenchOverlayState.SourceCreate source
+                            && source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW) {
+                        yield openSourceYamlEditor(source);
+                    }
+                    if (runtime.state().overlay().orElse(null) instanceof WorkbenchOverlayState.PipelineCreate pipeline
+                            && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW) {
+                        yield openPipelineYamlEditor(pipeline);
+                    }
+                    yield runtime.state().workspaceView().focus() == WorkbenchWorkspaceState.Focus.VIEWER
+                            && runtime.state().workspaceView().document().isPresent()
+                            ? runtime.updateState(state -> state.withWorkspaceView(state.workspaceView().edit()))
+                            : openSelectedWorkspaceFile(true);
+                }
+                case TOGGLE_FOCUS -> runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().toggleFocus()));
+                case SAVE -> saveWorkspaceFile(false);
+                case SAVE_AND_CLOSE -> runtime.state().overlay().orElse(null)
+                        instanceof WorkbenchOverlayState.SourceYamlEditor editor
+                        ? acceptSourceYamlEditor(editor) : saveWorkspaceFile(true);
+                case CANCEL_EDIT -> requestWorkspaceEditCancel();
+                case DISCARD -> runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER))));
+                case CANCEL_DISCARD -> runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ESCAPE))));
+                case APPLY_PIPELINE -> confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                case LOGS -> runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.LOGS));
+                case INSPECT -> runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.INSPECT));
+                case START_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "start");
+                case PAUSE_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "pause");
+                case RESUME_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "resume");
+                case STOP_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "stop");
+                case APPLY_SELECTED_ARTIFACT -> {
+                    if (selectedSourceRequest().isPresent()) {
+                        yield confirmSourceApply(selectedSourceRequest().orElseThrow());
+                    }
+                    yield confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                }
+                case CONFIRM -> confirmOverlay();
+                case CANCEL_CONFIRM -> cancelConfirmOverlay();
+            };
+        }
+
+        private boolean handleWorkspaceEditorEvent(Event event, TuiRunner runner) {
+            if (event instanceof PasteEvent paste) {
+                return runtime.updateState(state -> state.withWorkspaceView(
+                        state.workspaceView().paste(paste.text())));
+            }
+            if (!(event instanceof KeyEvent key)) {
+                return true;
+            }
+            if (key.isCtrlC()) {
+                runner.quit();
+                return true;
+            }
+            if (key.isCancel()) {
+                return requestWorkspaceEditCancel();
+            }
+            if (key.hasCtrl() && key.isCharIgnoreCase('s')) {
+                return saveWorkspaceFile(false);
+            }
+            if (key.isKey(dev.tamboui.tui.event.KeyCode.F5)) {
+                return saveWorkspaceFile(true);
+            }
+            return runtime.updateState(state -> state.withWorkspaceView(
+                    state.workspaceView().edit(key)));
+        }
+
+        private boolean openSelectedWorkspaceFile(boolean edit) {
+            if (actionGateway == null) {
+                return false;
+            }
+            Optional<WorkbenchArtifactRow> selected = selectedWorkspaceRow();
+            if (selected.isEmpty() || selected.orElseThrow().local().isEmpty()) {
+                return true;
+            }
+            Path relativePath = selected.orElseThrow().local().getFirst().relativePath();
+            return switch (actionGateway.readWorkspaceFile(relativePath)) {
+                case WorkbenchActionGateway.FileReadResult.Loaded loaded -> runtime.updateState(state -> {
+                    WorkbenchWorkspaceState opened = state.workspaceView()
+                            .open(loaded.relativePath(), loaded.content());
+                    return state.withWorkspaceView(edit ? opened.edit() : opened);
+                });
+                case WorkbenchActionGateway.FileReadResult.Unavailable ignored -> true;
+            };
+        }
+
+        private boolean previewSelectedWorkspaceFile() {
+            if (actionGateway == null) {
+                return false;
+            }
+            Optional<WorkbenchArtifactRow> selected = selectedWorkspaceRow();
+            if (selected.isEmpty() || selected.orElseThrow().local().isEmpty()) {
+                return true;
+            }
+            Path relativePath = selected.orElseThrow().local().getFirst().relativePath();
+            return switch (actionGateway.readWorkspaceFile(relativePath)) {
+                case WorkbenchActionGateway.FileReadResult.Loaded loaded -> runtime.updateState(state ->
+                        state.withWorkspaceView(state.workspaceView().preview(
+                                loaded.relativePath(), loaded.content())));
+                case WorkbenchActionGateway.FileReadResult.Unavailable ignored -> true;
+            };
+        }
+
+        private static boolean isWorkspaceFileNavigation(KeyEvent key) {
+            return key.isUp() || key.isDown() || key.isPageUp() || key.isPageDown()
+                    || key.isCharIgnoreCase('j') || key.isCharIgnoreCase('k');
+        }
+
+        private Optional<WorkbenchArtifactRow> selectedWorkspaceRow() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            List<WorkbenchArtifactRow> rows = WorkbenchRenderer.sorted(
+                    state.snapshot().orElseThrow().workspace().rows(), state.workspaceTable());
+            if (rows.isEmpty()) {
+                return Optional.empty();
+            }
+            int selected = Math.clamp(state.workspaceTable().selectedIndex(), 0, rows.size() - 1);
+            return Optional.of(rows.get(selected));
+        }
+
+        private boolean saveWorkspaceFile(boolean closeEditor) {
+            if (actionGateway == null) {
+                return false;
+            }
+            WorkbenchWorkspaceState.Document document = runtime.state().workspaceView()
+                    .document().orElseThrow();
+            return switch (actionGateway.writeWorkspaceFile(
+                    document.relativePath(), document.content())) {
+                case WorkbenchActionGateway.FileWriteResult.Saved ignored -> {
+                    runtime.updateState(state -> state.withWorkspaceView(
+                            state.workspaceView().saved(closeEditor)));
+                    if (refreshCoordinator != null) {
+                        refresh();
+                    }
+                    yield true;
+                }
+                case WorkbenchActionGateway.FileWriteResult.Unavailable ignored -> true;
+            };
+        }
+
+        private boolean handleOverlayEvent(Event event, TuiRunner runner) {
+            WorkbenchOverlayState overlay = runtime.state().overlay().orElseThrow();
+            if (event instanceof PasteEvent paste) {
+                return handleOverlayPaste(overlay, paste.text());
+            }
+            if (event instanceof MouseEvent mouse) {
+                if (mouse.kind() == MouseEventKind.SCROLL_UP || mouse.kind() == MouseEventKind.SCROLL_DOWN) {
+                    int direction = mouse.kind() == MouseEventKind.SCROLL_UP ? -1 : 1;
+                    return switch (overlay) {
+                        case WorkbenchOverlayState.Actions actions -> runtime.updateState(state ->
+                                state.withOverlay(actions.select(actions.selectedIndex() + direction)));
+                        case WorkbenchOverlayState.SourceCreate source
+                                when source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                                || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE -> {
+                            List<String> choices = sourceChoices(source);
+                            if (choices.isEmpty()) {
+                                yield true;
+                            }
+                            int selected = Math.floorMod(source.selectedIndex() + direction, choices.size());
+                            yield updateSourceCreate(source, source.stage(), selected, source.connector(), source.mode(),
+                                    source.tables(), source.id(), source.canonicalYaml(), false, source.message());
+                        }
+                        case WorkbenchOverlayState.SourceYamlEditor editor -> runtime.updateState(state ->
+                                state.withOverlay(new WorkbenchOverlayState.SourceYamlEditor(
+                                        editor.source(), editor.document().edit(KeyEvent.ofKey(direction < 0
+                                                ? dev.tamboui.tui.event.KeyCode.UP
+                                                : dev.tamboui.tui.event.KeyCode.DOWN)))));
+                        default -> true;
+                    };
+                }
+                if (!mouse.isClick()) {
+                    return true;
+                }
+                Optional<WorkbenchRenderer.FooterAction> footerAction = layout.footerActionAt(mouse.x(), mouse.y());
+                if (footerAction.isPresent()) {
+                    return handleFooterAction(footerAction.orElseThrow(), runner);
+                }
+                OptionalInt clicked = layout.overlayIndexAt(mouse.x(), mouse.y());
+                if (clicked.isEmpty()) {
+                    return true;
+                }
+                int index = clicked.orElseThrow();
+                return switch (overlay) {
+                        case WorkbenchOverlayState.More ignored -> runtime.updateState(state ->
+                            state.withOverlay(new WorkbenchOverlayState.More(Math.clamp(index, 0, 2))));
+                        case WorkbenchOverlayState.ContextPicker picker -> runtime.updateState(state ->
+                            state.withOverlay(picker.select(index)));
+                        case WorkbenchOverlayState.ContextCreate ignored -> true;
+                        case WorkbenchOverlayState.SourceCreate ignored -> true;
+                        case WorkbenchOverlayState.SourceYamlEditor ignored -> true;
+                        case WorkbenchOverlayState.PipelineCreate ignored -> true;
+                        case WorkbenchOverlayState.PipelineYamlEditor ignored -> true;
+                        case WorkbenchOverlayState.Confirm ignored -> true;
+                        case WorkbenchOverlayState.Login ignored -> true;
+                        case WorkbenchOverlayState.Actions actions -> handleActionsKey(
+                                actions.select(index), KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER));
+                    case WorkbenchOverlayState.LogLevel level -> handleLogLevelKey(
+                            level.select(index), KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ENTER));
+                    case WorkbenchOverlayState.Help ignored -> true;
+                };
+            }
+            if (!(event instanceof KeyEvent key)) {
+                return true;
+            }
+            if (key.isCancel()) {
+                if (overlay instanceof WorkbenchOverlayState.SourceYamlEditor editor) {
+                    return requestSourceYamlEditorCancel(editor);
+                }
+                if (overlay instanceof WorkbenchOverlayState.PipelineYamlEditor editor) {
+                    return requestPipelineYamlEditorCancel(editor);
+                }
+                return overlay instanceof WorkbenchOverlayState.Confirm confirm
+                        ? cancelConfirm(confirm)
+                        : closeOverlay(overlay);
+            }
+            return switch (overlay) {
+                case WorkbenchOverlayState.More more -> handleMoreKey(more, key);
+                case WorkbenchOverlayState.ContextPicker picker -> handleContextKey(picker, key);
+                case WorkbenchOverlayState.ContextCreate create -> handleContextCreateKey(create, key);
+                case WorkbenchOverlayState.SourceCreate source -> handleSourceCreateKey(source, key);
+                case WorkbenchOverlayState.SourceYamlEditor editor -> handleSourceYamlEditorKey(editor, key);
+                case WorkbenchOverlayState.PipelineCreate pipeline -> handlePipelineCreateKey(pipeline, key);
+                case WorkbenchOverlayState.PipelineYamlEditor editor -> handlePipelineYamlEditorKey(editor, key);
+                case WorkbenchOverlayState.Confirm confirm -> handleConfirmKey(confirm, key);
+                case WorkbenchOverlayState.Login login -> handleLoginKey(login, key);
+                case WorkbenchOverlayState.Actions actions -> handleActionsKey(actions, key);
+                case WorkbenchOverlayState.LogLevel level -> handleLogLevelKey(level, key);
+                case WorkbenchOverlayState.Help ignored -> true;
+            };
+        }
+
+        private boolean openLogLevel(String pipelineId) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.LogLevel(pipelineId, 2)));
+        }
+
+        private boolean handleLogLevelKey(WorkbenchOverlayState.LogLevel level, KeyEvent key) {
+            if (key.isUp() || key.isDown()) {
+                return runtime.updateState(state -> state.withOverlay(level.select(
+                        level.selectedIndex() + (key.isUp() ? -1 : 1))));
+            }
+            if (!(key.isSelect() || key.isConfirm())) {
+                return true;
+            }
+            if (actionGateway == null) {
+                return true;
+            }
+            return switch (actionGateway.setPipelineLogLevel(level.pipelineId(), level.selectedLevel())) {
+                case PipelineLogLevelOutcome.Changed ignored -> runtime.updateState(WorkbenchState::closeOverlay);
+                case PipelineLogLevelOutcome.Rejected ignored -> runtime.updateState(WorkbenchState::closeOverlay);
+                case PipelineLogLevelOutcome.Unreachable ignored -> runtime.updateState(WorkbenchState::closeOverlay);
+            };
+        }
+
+        private boolean openActions() {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Actions(
+                    availableActions(state), 0)));
+        }
+
+        private boolean handleActionsKey(WorkbenchOverlayState.Actions actions, KeyEvent key) {
+            if (key.isUp() || key.isDown()) {
+                return runtime.updateState(state -> state.withOverlay(actions.select(
+                        actions.selectedIndex() + (key.isUp() ? -1 : 1))));
+            }
+            if (!(key.isSelect() || key.isConfirm())) {
+                return true;
+            }
+            WorkbenchOverlayState.Actions.Action action = actions.actions().get(actions.selectedIndex());
+            return switch (action) {
+                case CONTEXT -> openContextEntry();
+                case AUTHENTICATION -> openAuthEntry();
+                case NEW_SOURCE -> openSourceCreate();
+                case NEW_PIPELINE -> openPipelineCreate();
+                case APPLY_SELECTED_SOURCE -> confirmSourceApply(selectedSourceRequest().orElseThrow());
+                case APPLY_WORKSPACE_SOURCES -> confirmSourceApply(workspaceSourceRequest().orElseThrow());
+                case APPLY_SELECTED_PIPELINE -> confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
+                case START_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "start");
+                case PAUSE_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "pause");
+                case RESUME_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "resume");
+                case STOP_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "stop");
+                case REFRESH -> {
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    if (refreshCoordinator != null) {
+                        refresh();
+                    }
+                    yield true;
+                }
+                case SHELL -> {
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    if (shellPanel != null) {
+                        shellPanel.open();
+                    }
+                    yield true;
+                }
+            };
+        }
+
+        private boolean handleMoreKey(WorkbenchOverlayState.More more, KeyEvent key) {
+            if (key.isUp() || key.isDown()) {
+                int selected = key.isUp() ? Math.max(0, more.selectedIndex() - 1)
+                        : Math.min(2, more.selectedIndex() + 1);
+                runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.More(selected)));
+                return true;
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                if (more.selectedIndex() == 0) {
+                    return openContextEntry();
+                }
+                if (more.selectedIndex() == 1) {
+                    return openAuthEntry();
+                }
+                runtime.updateState(state -> state.withOverlay(WorkbenchOverlayState.Help.INSTANCE));
+                return true;
+            }
+            return true;
+        }
+
+        private boolean handleContextKey(WorkbenchOverlayState.ContextPicker picker, KeyEvent key) {
+            if (picker.pending()) {
+                return true;
+            }
+            if (key.isUp() || key.isDown()) {
+                int selected = picker.selectedIndex() + (key.isUp() ? -1 : 1);
+                runtime.updateState(state -> state.withOverlay(picker.select(selected)));
+                return true;
+            }
+            if (key.isChar('d') && picker.selectedIndex() < picker.contexts().size()) {
+                String contextName = picker.contexts().get(picker.selectedIndex()).name();
+                runtime.updateState(state -> state.withOverlay(contextDeleteConfirm(contextName, picker)));
+                return true;
+            }
+            if ((key.isSelect() || key.isConfirm()) && picker.selectedIndex() >= 0) {
+                if (picker.selectedIndex() == picker.contexts().size()) {
+                    runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextCreate(
+                            WorkbenchOverlayState.ContextCreate.Stage.NAME,
+                            "", "", true, false, Optional.empty(), Optional.of(picker))));
+                } else {
+                    selectContext(picker);
+                }
+            }
+            return true;
+        }
+
+        private boolean handleConfirmKey(WorkbenchOverlayState.Confirm confirm, KeyEvent key) {
+            if (confirm.pending()) {
+                return true;
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                confirmOverlay();
+            }
+            return true;
+        }
+
+        private boolean confirmOverlay() {
+            Optional<WorkbenchOverlayState> overlay = runtime.state().overlay();
+            if (overlay.isEmpty() || !(overlay.orElseThrow() instanceof WorkbenchOverlayState.Confirm confirm)
+                    || confirm.pending()) {
+                return false;
+            }
+            return switch (confirm.intent()) {
+                case WorkbenchOverlayState.Confirm.Intent.DeleteContext ignored -> {
+                    submitContextDelete(confirm);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.CreateSource create -> {
+                    submitSourceCreate(confirm, create);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.CreatePipeline create -> {
+                    submitPipelineCreate(confirm, create);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.ApplySources apply -> {
+                    submitSourceApply(confirm, apply);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.ApplyPipelines apply -> {
+                    submitPipelineApply(confirm, apply);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.ChangePipelineLifecycle lifecycle -> {
+                    submitPipelineLifecycle(confirm, lifecycle);
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.Quit ignored -> {
+                    if (ownerRunner == null) {
+                        yield false;
+                    }
+                    ownerRunner.quit();
+                    yield true;
+                }
+                case WorkbenchOverlayState.Confirm.Intent.DiscardChanges ignored -> runtime.updateState(state ->
+                        state.withWorkspaceView(state.workspaceView().cancelEdit()).closeOverlay());
+                case WorkbenchOverlayState.Confirm.Intent.DiscardSourceYaml discard -> runtime.updateState(state ->
+                        state.withOverlay(discard.editor().source()));
+                case WorkbenchOverlayState.Confirm.Intent.DiscardPipelineYaml discard -> runtime.updateState(state ->
+                        state.withOverlay(discard.editor().pipeline()));
+            };
+        }
+
+        private boolean cancelConfirmOverlay() {
+            return runtime.state().overlay()
+                    .filter(WorkbenchOverlayState.Confirm.class::isInstance)
+                    .map(WorkbenchOverlayState.Confirm.class::cast)
+                    .map(this::cancelConfirm)
+                    .orElse(false);
+        }
+
+        private boolean cancelConfirm(WorkbenchOverlayState.Confirm confirm) {
+            return confirm.pending() ? true : closeOverlay(confirm);
+        }
+
+        private boolean requestQuit() {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    WorkbenchOverlayState.Confirm.Intent.Quit.INSTANCE,
+                    "Confirm Quit", "Quit the TUI?", false, state.overlay())));
+        }
+
+        private boolean closeOverlay(WorkbenchOverlayState overlay) {
+            clearOverlaySecret();
+            return runtime.updateState(state -> previousOverlay(overlay)
+                    .map(state::withOverlay)
+                    .orElseGet(state::closeOverlay));
+        }
+
+        private boolean requestWorkspaceEditCancel() {
+            return runtime.updateState(state -> state.workspaceView().document()
+                    .filter(document -> document.editing() && document.dirty())
+                    .map(ignored -> state.withOverlay(discardChangesConfirm()))
+                    .orElseGet(() -> state.withWorkspaceView(state.workspaceView().cancelEdit())));
+        }
+
+        private static WorkbenchOverlayState.Confirm contextDeleteConfirm(
+                String contextName, WorkbenchOverlayState.ContextPicker previous) {
+            return new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.DeleteContext(contextName),
+                    "Delete Context",
+                    "Delete context " + contextName + "? Workspace bindings will be removed; auth cache is kept.",
+                    false,
+                    Optional.of(previous));
+        }
+
+        private static WorkbenchOverlayState.Confirm discardChangesConfirm() {
+            return new WorkbenchOverlayState.Confirm(
+                    WorkbenchOverlayState.Confirm.Intent.DiscardChanges.INSTANCE,
+                    "Discard Changes?",
+                    "Unsaved changes will be lost.",
+                    false,
+                    Optional.empty());
+        }
+
+        private static WorkbenchOverlayState.Confirm discardSourceYamlConfirm(
+                WorkbenchOverlayState.SourceYamlEditor editor) {
+            return new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.DiscardSourceYaml(editor),
+                    "Discard Changes?",
+                    "Unsaved YAML changes will be lost.",
+                    false,
+                    Optional.of(editor));
+        }
+
+        private boolean handleContextCreateKey(
+                WorkbenchOverlayState.ContextCreate create, KeyEvent key) {
+            if (create.pending()) {
+                return true;
+            }
+            if (key.isUp() || key.isDown()) {
+                WorkbenchOverlayState.ContextCreate.Stage[] stages =
+                        WorkbenchOverlayState.ContextCreate.Stage.values();
+                int current = create.stage().ordinal();
+                int next = Math.floorMod(current + (key.isUp() ? -1 : 1), stages.length);
+                return updateContextCreate(create, stages[next], create.name(), create.server(),
+                        create.verifyTls(), Optional.empty());
+            }
+            if (key.isDeleteBackward()) {
+                String name = create.name();
+                String server = create.server();
+                if (create.stage() == WorkbenchOverlayState.ContextCreate.Stage.NAME) {
+                    name = deleteLastCodePoint(name);
+                } else if (create.stage() == WorkbenchOverlayState.ContextCreate.Stage.SERVER) {
+                    server = deleteLastCodePoint(server);
+                }
+                return updateContextCreate(create, create.stage(), name, server,
+                        create.verifyTls(), Optional.empty());
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                return advanceContextCreate(create);
+            }
+            if (create.stage() == WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS
+                    && key.code() == dev.tamboui.tui.event.KeyCode.CHAR
+                    && (key.isCharIgnoreCase('y') || key.isCharIgnoreCase('n') || key.isChar(' '))) {
+                boolean verifyTls = key.isCharIgnoreCase('y')
+                        || key.isChar(' ') && !create.verifyTls();
+                return updateContextCreate(create, create.stage(), create.name(), create.server(),
+                        verifyTls, Optional.empty());
+            }
+            if (key.code() == dev.tamboui.tui.event.KeyCode.CHAR
+                    && create.stage() != WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS) {
+                return appendContextCreateText(create, key.string());
+            }
+            return true;
+        }
+
+        private boolean openSourceCreate() {
+            if (actionCoordinator == null) {
+                return false;
+            }
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                    new WorkbenchActionGateway.SourceCatalog(List.of()),
+                    WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR,
+                    0,
+                    "",
+                    "",
+                    "",
+                    "",
+                    Optional.empty(),
+                    true,
+                    Optional.empty())));
+            actionCoordinator.submit(
+                    actionGateway::sourceCatalog,
+                    failure -> new WorkbenchActionGateway.SourceCatalogResult.Unavailable(),
+                    this::completeSourceCatalog);
+            return true;
+        }
+
+        private void completeSourceCatalog(WorkbenchActionGateway.SourceCatalogResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.SourceCatalogResult.Ready ready -> {
+                    if (ready.catalog().connectors().isEmpty()) {
+                        runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Actions(
+                                availableActions(state), 0,
+                                Optional.of("No source connectors are available"))));
+                        return;
+                    }
+                    String connector = ready.catalog().connectors().getFirst().id();
+                    String mode = ready.catalog().connectors().getFirst().modes().getFirst();
+                    WorkbenchOverlayState.SourceCreate initial = new WorkbenchOverlayState.SourceCreate(
+                            ready.catalog(), WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR, 0,
+                            "", connector, mode, "", SourceScaffold.suggestedId(connector),
+                            sourceOptionDefaults(ready.catalog(), connector), Optional.empty(), false,
+                            Optional.empty());
+                    runtime.updateState(state -> state.withOverlay(initial));
+                    requestLiveSourcePreview(initial);
+                }
+                case WorkbenchActionGateway.SourceCatalogResult.Unavailable ignored -> runtime.updateState(state ->
+                        state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                                new WorkbenchActionGateway.SourceCatalog(List.of()),
+                                WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR,
+                                0,
+                                "",
+                                "",
+                                "",
+                                "",
+                                Optional.empty(),
+                                false,
+                                Optional.of("Source catalog is unavailable"))));
+            }
+        }
+
+        private boolean handleSourceCreateKey(WorkbenchOverlayState.SourceCreate source, KeyEvent key) {
+            if (source.pending()) {
+                return true;
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
+                    && key.isKey(dev.tamboui.tui.event.KeyCode.F4)) {
+                return openSourceYamlEditor(source);
+            }
+            if (key.isCancel()) {
+                if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW) {
+                    return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.ID, 0,
+                            source.connector(), source.mode(), source.tables(), source.id(), Optional.empty(), false,
+                            Optional.empty());
+                }
+                return runtime.updateState(WorkbenchState::closeOverlay);
+            }
+            if ((source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR
+                    || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE
+                    || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) && (key.isUp() || key.isDown())) {
+                List<String> choices = sourceChoices(source);
+                if (choices.isEmpty()) {
+                    return true;
+                }
+                int next = Math.floorMod(source.selectedIndex() + (key.isUp() ? -1 : 1), choices.size());
+                return updateSourceCreate(source, source.stage(), next, source.connector(), source.mode(),
+                        source.tables(), source.id(), Optional.empty(), false, Optional.empty());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG
+                    && (key.isLeft() || key.isRight())) {
+                if (sourceConfigField(source, source.selectedIndex()).options().isEmpty()) {
+                    return true;
+                }
+                return cycleSourceConfigOption(source, key.isLeft() ? -1 : 1);
+            }
+            if (key.isDeleteBackward()) {
+                return switch (source.stage()) {
+                    case CONNECTOR -> updateSourceFilter(source, deleteLastCodePoint(source.filter()));
+                    case TABLES -> updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(),
+                            source.mode(), deleteLastCodePoint(source.tables()), source.id(), Optional.empty(), false,
+                            Optional.empty());
+                    case ID -> updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(),
+                            source.mode(), source.tables(), deleteLastCodePoint(source.id()), Optional.empty(), false,
+                            Optional.empty());
+                    case CONFIG -> updateSourceConfig(source, source.selectedIndex(),
+                            deleteLastCodePoint(sourceConfigText(source, source.selectedIndex())), Optional.empty());
+                    default -> true;
+                };
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                return advanceSourceCreate(source);
+            }
+            if (key.code() == dev.tamboui.tui.event.KeyCode.CHAR) {
+                return appendSourceCreateText(source, key.string());
+            }
+            return true;
+        }
+
+        private boolean openSourceYamlEditor(WorkbenchOverlayState.SourceCreate source) {
+            String yaml = source.canonicalYaml().orElse("");
+            if (yaml.isBlank()) {
+                return true;
+            }
+            WorkbenchWorkspaceState.Document document = WorkbenchWorkspaceState.Document
+                    .open(java.nio.file.Path.of("source-draft.tap.yml"), yaml)
+                    .edit();
+            return runtime.updateState(state -> state.withOverlay(
+                    new WorkbenchOverlayState.SourceYamlEditor(source, document)));
+        }
+
+        private boolean handleSourceYamlEditorKey(
+                WorkbenchOverlayState.SourceYamlEditor editor, KeyEvent key) {
+            if (key.hasCtrl() && key.isCharIgnoreCase('s')) {
+                return acceptSourceYamlEditor(editor);
+            }
+            if (key.isKey(dev.tamboui.tui.event.KeyCode.F5)) {
+                return acceptSourceYamlEditor(editor);
+            }
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceYamlEditor(
+                    editor.source(), editor.document().edit(key))));
+        }
+
+        private boolean requestSourceYamlEditorCancel(
+                WorkbenchOverlayState.SourceYamlEditor editor) {
+            if (!editor.document().dirty()) {
+                return runtime.updateState(state -> state.withOverlay(editor.source()));
+            }
+            return runtime.updateState(state -> state.withOverlay(discardSourceYamlConfirm(editor)));
+        }
+
+        private boolean acceptSourceYamlEditor(
+                WorkbenchOverlayState.SourceYamlEditor editor) {
+            String yaml = editor.document().content();
+            if (yaml.isBlank()) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceYamlEditor(
+                        editor.source(), editor.document())));
+            }
+            WorkbenchOverlayState.SourceCreate source = editor.source();
+            WorkbenchOverlayState.SourceCreate accepted = new WorkbenchOverlayState.SourceCreate(
+                    source.catalog(), WorkbenchOverlayState.SourceCreate.Stage.PREVIEW, 0,
+                    source.filter(), source.connector(), source.mode(), source.tables(), source.id(),
+                    source.config(), Optional.of(yaml), false, Optional.empty());
+            return runtime.updateState(state -> state.withOverlay(accepted));
+        }
+
+        private boolean appendSourceCreateText(WorkbenchOverlayState.SourceCreate source, String text) {
+            if (source.pending()) {
+                return true;
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR) {
+                StringBuilder filter = new StringBuilder(source.filter());
+                text.codePoints().filter(codePoint -> !Character.isISOControl(codePoint)).forEach(filter::appendCodePoint);
+                return updateSourceFilter(source, filter.toString());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) {
+                WorkbenchActionGateway.SourceConfigField field = sourceConfigField(source, source.selectedIndex());
+                if (!field.options().isEmpty()) {
+                    return true;
+                }
+                return updateSourceConfig(source, source.selectedIndex(),
+                        sourceConfigText(source, source.selectedIndex()) + printableText(text), Optional.empty());
+            }
+            if (source.stage() != WorkbenchOverlayState.SourceCreate.Stage.TABLES
+                    && source.stage() != WorkbenchOverlayState.SourceCreate.Stage.ID) {
+                return true;
+            }
+            StringBuilder value = new StringBuilder(source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES
+                    ? source.tables() : source.id());
+            text.codePoints().filter(codePoint -> !Character.isISOControl(codePoint)).forEach(value::appendCodePoint);
+            return source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES
+                    ? updateSourceDraft(source, source.stage(), source.selectedIndex(), source.connector(), source.mode(),
+                            value.toString(), source.id(), Optional.empty(), Optional.empty())
+                    : updateSourceDraft(source, source.stage(), source.selectedIndex(), source.connector(), source.mode(),
+                            source.tables(), value.toString(), Optional.empty(), Optional.empty());
+        }
+
+        private boolean advanceSourceCreate(WorkbenchOverlayState.SourceCreate source) {
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR) {
+                List<String> choices = sourceChoices(source);
+                if (choices.isEmpty()) {
+                    return updateSourceFilter(source, source.filter());
+                }
+                String connector = choices.get(source.selectedIndex());
+                String mode = source.catalog().connectors().stream().filter(item -> item.id().equals(connector))
+                        .findFirst().orElseThrow().modes().getFirst();
+                WorkbenchOverlayState.SourceCreate next = new WorkbenchOverlayState.SourceCreate(
+                        source.catalog(), WorkbenchOverlayState.SourceCreate.Stage.MODE, 0, source.filter(), connector,
+                        mode, source.tables(), SourceScaffold.suggestedId(connector),
+                        sourceOptionDefaults(source.catalog(), connector), Optional.empty(), false, Optional.empty());
+                boolean changed = runtime.updateState(state -> state.withOverlay(next));
+                requestLiveSourcePreview(next);
+                return changed;
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.MODE) {
+                return updateSourceDraft(source, WorkbenchOverlayState.SourceCreate.Stage.TABLES, 0, source.connector(),
+                        sourceChoices(source).get(source.selectedIndex()), source.tables(), source.id(), Optional.empty(),
+                        Optional.empty());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.TABLES) {
+                WorkbenchOverlayState.SourceCreate.Stage next = sourceConfigFields(source).isEmpty()
+                        ? WorkbenchOverlayState.SourceCreate.Stage.ID : WorkbenchOverlayState.SourceCreate.Stage.CONFIG;
+                return updateSourceDraft(source, next, 0, source.connector(), source.mode(), source.tables(), source.id(),
+                        Optional.empty(), Optional.empty());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) {
+                List<WorkbenchActionGateway.SourceConfigField> fields = sourceConfigFields(source);
+                if (fields.isEmpty()) {
+                    return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.ID, 0,
+                            source.connector(), source.mode(), source.tables(), source.id(), Optional.empty(),
+                            false, Optional.empty());
+                }
+                int selected = Math.clamp(source.selectedIndex(), 0, fields.size() - 1);
+                if (selected < fields.size() - 1) {
+                    return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.CONFIG, selected + 1,
+                            source.connector(), source.mode(), source.tables(), source.id(), Optional.empty(),
+                            false, Optional.empty());
+                }
+                return updateSourceCreate(source, WorkbenchOverlayState.SourceCreate.Stage.ID, 0, source.connector(),
+                        source.mode(), source.tables(), source.id(), Optional.empty(), false, Optional.empty());
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.ID) {
+                if (source.id().isBlank()) {
+                    return updateSourceCreate(source, source.stage(), 0, source.connector(), source.mode(), source.tables(),
+                            source.id(), Optional.empty(), false, Optional.of("Resource id is required"));
+                }
+                previewSource(source);
+                return true;
+            }
+            return sourceCreateConfirm(source);
+        }
+
+        private boolean sourceCreateConfirm(WorkbenchOverlayState.SourceCreate source) {
+            String yaml = source.canonicalYaml().orElseThrow();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.CreateSource(
+                            new WorkbenchActionGateway.SourceCreateRequest(source.id(), yaml)),
+                    "Create Source",
+                    "Create source/" + source.id() + ".tap.yml?",
+                    false,
+                    Optional.of(source))));
+        }
+
+        private List<String> sourceChoices(WorkbenchOverlayState.SourceCreate source) {
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONNECTOR) {
+                String filter = source.filter().toLowerCase(java.util.Locale.ROOT);
+                return source.catalog().connectors().stream().map(WorkbenchActionGateway.SourceConnector::id)
+                        .filter(id -> id.toLowerCase(java.util.Locale.ROOT).contains(filter)).toList();
+            }
+            if (source.stage() == WorkbenchOverlayState.SourceCreate.Stage.CONFIG) {
+                return sourceConfigFields(source).stream().map(WorkbenchActionGateway.SourceConfigField::name).toList();
+            }
+            return source.catalog().connectors().stream().filter(item -> item.id().equals(source.connector()))
+                    .findFirst().orElseThrow().modes();
+        }
+
+        private boolean updateSourceCreate(
+                WorkbenchOverlayState.SourceCreate source,
+                WorkbenchOverlayState.SourceCreate.Stage stage,
+                int selectedIndex,
+                String connector,
+                String mode,
+                String tables,
+                String id,
+                Optional<String> yaml,
+                boolean pending,
+                Optional<String> message) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                    source.catalog(), stage, selectedIndex, source.filter(), connector, mode, tables, id,
+                    source.config(), yaml, pending, message)));
+        }
+
+        private boolean updateSourceFilter(WorkbenchOverlayState.SourceCreate source, String filter) {
+            List<String> choices = source.catalog().connectors().stream()
+                    .map(WorkbenchActionGateway.SourceConnector::id)
+                    .filter(id -> id.toLowerCase(java.util.Locale.ROOT)
+                            .contains(filter.toLowerCase(java.util.Locale.ROOT)))
+                    .toList();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                    source.catalog(), source.stage(), choices.isEmpty() ? 0 : Math.min(source.selectedIndex(), choices.size() - 1),
+                    filter, source.connector(), source.mode(), source.tables(), source.id(), source.config(), source.canonicalYaml(),
+                    false, choices.isEmpty() ? Optional.of("No connectors match this filter") : Optional.empty())));
+        }
+
+        private void previewSource(WorkbenchOverlayState.SourceCreate source) {
+            WorkbenchActionGateway.SourceDraft draft = new WorkbenchActionGateway.SourceDraft(
+                    source.connector(), source.mode(), source.tables(), source.id(), sourceConfig(source));
+            updateSourceCreate(source, source.stage(), source.selectedIndex(), source.connector(), source.mode(),
+                    source.tables(), source.id(), Optional.empty(), true, Optional.empty());
+            actionCoordinator.submit(() -> actionGateway.previewSource(draft),
+                    failure -> new WorkbenchActionGateway.SourcePreviewResult.Unavailable(),
+                    result -> completeSourcePreview(source, result));
+        }
+
+        private void completeSourcePreview(WorkbenchOverlayState.SourceCreate source,
+                WorkbenchActionGateway.SourcePreviewResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.SourcePreviewResult.Ready ready -> updateSourceCreate(source,
+                        WorkbenchOverlayState.SourceCreate.Stage.PREVIEW, 0, source.connector(), source.mode(),
+                        source.tables(), source.id(), Optional.of(ready.canonicalYaml()), false, Optional.empty());
+                case WorkbenchActionGateway.SourcePreviewResult.Rejected rejected -> updateSourceCreate(source,
+                        WorkbenchOverlayState.SourceCreate.Stage.ID, 0, source.connector(), source.mode(), source.tables(),
+                        source.id(), Optional.empty(), false, Optional.of(rejected.message()));
+                case WorkbenchActionGateway.SourcePreviewResult.Unavailable ignored -> updateSourceCreate(source,
+                        WorkbenchOverlayState.SourceCreate.Stage.ID, 0, source.connector(), source.mode(), source.tables(),
+                        source.id(), Optional.empty(), false, Optional.of("Source preview is unavailable"));
+            }
+        }
+
+        private void submitSourceCreate(
+                WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.CreateSource create) {
+            WorkbenchOverlayState.SourceCreate source = confirm.previous()
+                    .filter(WorkbenchOverlayState.SourceCreate.class::isInstance)
+                    .map(WorkbenchOverlayState.SourceCreate.class::cast)
+                    .orElseThrow();
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.createSource(create.request()),
+                    failure -> new WorkbenchActionGateway.SourceCreateResult.Unavailable(),
+                    result -> completeSourceCreate(source, result));
+        }
+
+        private void completeSourceCreate(
+                WorkbenchOverlayState.SourceCreate source,
+                WorkbenchActionGateway.SourceCreateResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.SourceCreateResult.Created created -> {
+                    runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.WORKSPACE)
+                            .withWorkspaceView(state.workspaceView().open(created.relativePath(), created.canonicalYaml()))
+                            .closeOverlay());
+                    refresh();
+                }
+                case WorkbenchActionGateway.SourceCreateResult.Exists exists -> restoreSourceCreate(source,
+                        Optional.of("File already exists: " + exists.relativePath()));
+                case WorkbenchActionGateway.SourceCreateResult.Rejected rejected -> restoreSourceCreate(source,
+                        Optional.of(rejected.message()));
+                case WorkbenchActionGateway.SourceCreateResult.Unavailable ignored -> restoreSourceCreate(source,
+                        Optional.of("Source creation is unavailable"));
+            }
+        }
+
+        private boolean openPipelineCreate() {
+            List<String> sources = localSourceIds();
+            if (sources.isEmpty()) {
+                restoreActions("Create a local Source before creating a Pipeline");
+                return true;
+            }
+            String source = sources.getFirst();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineCreate(
+                    sources, WorkbenchOverlayState.PipelineCreate.Stage.SOURCE, 0, source,
+                    suggestedPipelineId(source), Optional.empty(), false, Optional.empty())));
+        }
+
+        private List<String> localSourceIds() {
+            return runtime.state().snapshot().stream()
+                    .flatMap(snapshot -> snapshot.workspace().rows().stream())
+                    .filter(Session::isApplicableSource)
+                    .map(row -> row.key().id())
+                    .sorted()
+                    .toList();
+        }
+
+        private static String suggestedPipelineId(String sourceId) {
+            return sourceId.startsWith("src_") ? sourceId.substring(4) + "_pipeline" : sourceId + "_pipeline";
+        }
+
+        private boolean handlePipelineCreateKey(WorkbenchOverlayState.PipelineCreate pipeline, KeyEvent key) {
+            if (pipeline.pending()) {
+                return true;
+            }
+            if (key.isKey(dev.tamboui.tui.event.KeyCode.F4)
+                    && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW) {
+                return openPipelineYamlEditor(pipeline);
+            }
+            if (key.isCancel()) {
+                return pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW
+                        ? updatePipelineCreate(pipeline, WorkbenchOverlayState.PipelineCreate.Stage.ID, 0,
+                                pipeline.sourceId(), pipeline.id(), Optional.empty(), false, Optional.empty())
+                        : runtime.updateState(WorkbenchState::closeOverlay);
+            }
+            if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE && (key.isUp() || key.isDown())) {
+                int index = Math.floorMod(pipeline.selectedIndex() + (key.isUp() ? -1 : 1), pipeline.sourceIds().size());
+                String source = pipeline.sourceIds().get(index);
+                return updatePipelineCreate(pipeline, pipeline.stage(), index, source, suggestedPipelineId(source),
+                        Optional.empty(), false, Optional.empty());
+            }
+            if (key.isDeleteBackward() && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.ID) {
+                return updatePipelineCreate(pipeline, pipeline.stage(), 0, pipeline.sourceId(),
+                        deleteLastCodePoint(pipeline.id()), Optional.empty(), false, Optional.empty());
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                return advancePipelineCreate(pipeline);
+            }
+            if (key.code() == dev.tamboui.tui.event.KeyCode.CHAR
+                    && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.ID) {
+                return updatePipelineCreate(pipeline, pipeline.stage(), 0, pipeline.sourceId(),
+                        pipeline.id() + printableText(key.string()), Optional.empty(), false, Optional.empty());
+            }
+            return true;
+        }
+
+        private boolean advancePipelineCreate(WorkbenchOverlayState.PipelineCreate pipeline) {
+            if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.SOURCE) {
+                return updatePipelineCreate(pipeline, WorkbenchOverlayState.PipelineCreate.Stage.ID, 0,
+                        pipeline.sourceId(), pipeline.id(), Optional.empty(), false, Optional.empty());
+            }
+            if (pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.ID) {
+                if (pipeline.id().isBlank()) {
+                    return updatePipelineCreate(pipeline, pipeline.stage(), 0, pipeline.sourceId(), pipeline.id(),
+                            Optional.empty(), false, Optional.of("Pipeline id is required"));
+                }
+                previewPipeline(pipeline);
+                return true;
+            }
+            String yaml = pipeline.canonicalYaml().orElseThrow();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.CreatePipeline(
+                            new WorkbenchActionGateway.PipelineCreateRequest(pipeline.id(), yaml)),
+                    "Create Pipeline", "Create pipeline/" + pipeline.id() + ".tap.yml?", false, Optional.of(pipeline))));
+        }
+
+        private void previewPipeline(WorkbenchOverlayState.PipelineCreate pipeline) {
+            updatePipelineCreate(pipeline, pipeline.stage(), pipeline.selectedIndex(), pipeline.sourceId(), pipeline.id(),
+                    Optional.empty(), true, Optional.empty());
+            actionCoordinator.submit(() -> actionGateway.previewPipeline(
+                            new WorkbenchActionGateway.PipelineDraft(pipeline.sourceId(), pipeline.id())),
+                    failure -> new WorkbenchActionGateway.PipelinePreviewResult.Unavailable(),
+                    result -> completePipelinePreview(pipeline, result));
+        }
+
+        private void completePipelinePreview(WorkbenchOverlayState.PipelineCreate pipeline,
+                WorkbenchActionGateway.PipelinePreviewResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.PipelinePreviewResult.Ready ready -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0, pipeline.sourceId(), pipeline.id(),
+                        Optional.of(ready.canonicalYaml()), false, Optional.empty());
+                case WorkbenchActionGateway.PipelinePreviewResult.Rejected rejected -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.ID, 0, pipeline.sourceId(), pipeline.id(),
+                        Optional.empty(), false, Optional.of(rejected.message()));
+                case WorkbenchActionGateway.PipelinePreviewResult.Unavailable ignored -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.ID, 0, pipeline.sourceId(), pipeline.id(),
+                        Optional.empty(), false, Optional.of("Pipeline preview is unavailable"));
+            }
+        }
+
+        private boolean updatePipelineCreate(WorkbenchOverlayState.PipelineCreate pipeline,
+                WorkbenchOverlayState.PipelineCreate.Stage stage, int selectedIndex, String sourceId, String id,
+                Optional<String> yaml, boolean pending, Optional<String> message) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineCreate(
+                    pipeline.sourceIds(), stage, selectedIndex, sourceId, id, yaml, pending, message)));
+        }
+
+        private boolean openPipelineYamlEditor(WorkbenchOverlayState.PipelineCreate pipeline) {
+            String yaml = pipeline.canonicalYaml().orElse("");
+            if (yaml.isBlank()) {
+                return true;
+            }
+            WorkbenchWorkspaceState.Document document = WorkbenchWorkspaceState.Document
+                    .open(java.nio.file.Path.of("pipeline-draft.tap.yml"), yaml).edit();
+            return runtime.updateState(state -> state.withOverlay(
+                    new WorkbenchOverlayState.PipelineYamlEditor(pipeline, document)));
+        }
+
+        private boolean handlePipelineYamlEditorKey(WorkbenchOverlayState.PipelineYamlEditor editor, KeyEvent key) {
+            if ((key.hasCtrl() && key.isCharIgnoreCase('s')) || key.isKey(dev.tamboui.tui.event.KeyCode.F5)) {
+                return acceptPipelineYamlEditor(editor);
+            }
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineYamlEditor(
+                    editor.pipeline(), editor.document().edit(key))));
+        }
+
+        private boolean requestPipelineYamlEditorCancel(WorkbenchOverlayState.PipelineYamlEditor editor) {
+            if (!editor.document().dirty()) {
+                return runtime.updateState(state -> state.withOverlay(editor.pipeline()));
+            }
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.DiscardPipelineYaml(editor), "Discard changes?",
+                    "Discard Pipeline YAML changes?", false, Optional.of(editor.pipeline()))));
+        }
+
+        private boolean acceptPipelineYamlEditor(WorkbenchOverlayState.PipelineYamlEditor editor) {
+            String yaml = editor.document().content();
+            if (yaml.isBlank()) {
+                return true;
+            }
+            WorkbenchOverlayState.PipelineCreate pipeline = editor.pipeline();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineCreate(
+                    pipeline.sourceIds(), WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0,
+                    pipeline.sourceId(), pipeline.id(), Optional.of(yaml), false, Optional.empty())));
+        }
+
+        private void submitPipelineCreate(WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.CreatePipeline create) {
+            WorkbenchOverlayState.PipelineCreate pipeline = confirm.previous()
+                    .filter(WorkbenchOverlayState.PipelineCreate.class::isInstance)
+                    .map(WorkbenchOverlayState.PipelineCreate.class::cast).orElseThrow();
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.createPipeline(create.request()),
+                    failure -> new WorkbenchActionGateway.PipelineCreateResult.Unavailable(),
+                    result -> completePipelineCreate(pipeline, result));
+        }
+
+        private void completePipelineCreate(WorkbenchOverlayState.PipelineCreate pipeline,
+                WorkbenchActionGateway.PipelineCreateResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.PipelineCreateResult.Created created -> {
+                    runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.WORKSPACE)
+                            .withWorkspaceView(state.workspaceView().open(created.relativePath(), created.canonicalYaml()))
+                            .closeOverlay());
+                    refresh();
+                }
+                case WorkbenchActionGateway.PipelineCreateResult.Exists exists -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0, pipeline.sourceId(), pipeline.id(),
+                        pipeline.canonicalYaml(), false, Optional.of("File already exists: " + exists.relativePath()));
+                case WorkbenchActionGateway.PipelineCreateResult.Rejected rejected -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0, pipeline.sourceId(), pipeline.id(),
+                        pipeline.canonicalYaml(), false, Optional.of(rejected.message()));
+                case WorkbenchActionGateway.PipelineCreateResult.Unavailable ignored -> updatePipelineCreate(pipeline,
+                        WorkbenchOverlayState.PipelineCreate.Stage.PREVIEW, 0, pipeline.sourceId(), pipeline.id(),
+                        pipeline.canonicalYaml(), false, Optional.of("Pipeline creation is unavailable"));
+            }
+        }
+
+        private List<WorkbenchOverlayState.Actions.Action> availableActions(WorkbenchState state) {
+            List<WorkbenchOverlayState.Actions.Action> actions = new ArrayList<>(List.of(
+                    WorkbenchOverlayState.Actions.Action.CONTEXT,
+                    WorkbenchOverlayState.Actions.Action.AUTHENTICATION,
+                    WorkbenchOverlayState.Actions.Action.NEW_SOURCE,
+                    WorkbenchOverlayState.Actions.Action.NEW_PIPELINE));
+            if (selectedSourceRequest().isPresent()) {
+                actions.add(WorkbenchOverlayState.Actions.Action.APPLY_SELECTED_SOURCE);
+            }
+            if (workspaceSourceRequest().isPresent()) {
+                actions.add(WorkbenchOverlayState.Actions.Action.APPLY_WORKSPACE_SOURCES);
+            }
+            if (selectedPipelineApplyRequest().isPresent()) {
+                actions.add(WorkbenchOverlayState.Actions.Action.APPLY_SELECTED_PIPELINE);
+            }
+            if (selectedPipelineId().isPresent()) {
+                actions.addAll(List.of(
+                        WorkbenchOverlayState.Actions.Action.START_PIPELINE,
+                        WorkbenchOverlayState.Actions.Action.PAUSE_PIPELINE,
+                        WorkbenchOverlayState.Actions.Action.RESUME_PIPELINE,
+                        WorkbenchOverlayState.Actions.Action.STOP_PIPELINE));
+            }
+            actions.add(WorkbenchOverlayState.Actions.Action.REFRESH);
+            actions.add(WorkbenchOverlayState.Actions.Action.SHELL);
+            return List.copyOf(actions);
+        }
+
+        private Optional<WorkbenchActionGateway.SourceApplyRequest> selectedSourceRequest() {
+            WorkbenchState state = runtime.state();
+            if (state.selectedTab() != WorkbenchState.WorkbenchTab.WORKSPACE || state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            WorkbenchSnapshot snapshot = state.snapshot().orElseThrow();
+            if (!(snapshot.workspace().remoteState() instanceof WorkbenchRemoteState.Available)) {
+                return Optional.empty();
+            }
+            return selectedWorkspaceRow()
+                    .filter(Session::isApplicableSource)
+                    .map(row -> new WorkbenchActionGateway.SourceApplyRequest(
+                            List.of(row.local().getFirst().relativePath())));
+        }
+
+        private Optional<WorkbenchActionGateway.SourceApplyRequest> workspaceSourceRequest() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            WorkbenchSnapshot snapshot = state.snapshot().orElseThrow();
+            if (!(snapshot.workspace().remoteState() instanceof WorkbenchRemoteState.Available)) {
+                return Optional.empty();
+            }
+            List<WorkbenchArtifactRow> sources = snapshot.workspace().rows().stream()
+                    .filter(row -> "source".equals(row.key().kind()))
+                    .toList();
+            if (sources.isEmpty() || sources.stream().anyMatch(row -> !isApplicableSource(row))) {
+                return Optional.empty();
+            }
+            return Optional.of(new WorkbenchActionGateway.SourceApplyRequest(sources.stream()
+                    .map(row -> row.local().getFirst().relativePath()).toList()));
+        }
+
+        private static boolean isApplicableSource(WorkbenchArtifactRow row) {
+            return "source".equals(row.key().kind())
+                    && row.local().size() == 1
+                    && row.local().getFirst().valid();
+        }
+
+        private boolean confirmSourceApply(WorkbenchActionGateway.SourceApplyRequest request) {
+            int count = request.relativePaths().size();
+            String noun = count == 1 ? "Source" : "Sources";
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.ApplySources(request),
+                    "Apply " + noun + "?",
+                    "Apply " + count + " local " + noun.toLowerCase(java.util.Locale.ROOT)
+                            + " to the current server?",
+                    false,
+                    state.overlay())));
+        }
+
+        private void submitSourceApply(
+                WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.ApplySources apply) {
+            if (actionCoordinator == null || actionGateway == null) {
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.applySources(apply.request()),
+                    failure -> new WorkbenchActionGateway.SourceApplyResult.Unavailable(),
+                    this::completeSourceApply);
+        }
+
+        private void completeSourceApply(WorkbenchActionGateway.SourceApplyResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.SourceApplyResult.Applied ignored -> {
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    refresh();
+                }
+                case WorkbenchActionGateway.SourceApplyResult.Rejected rejected -> restoreActions(
+                        rejected.code() + ": " + rejected.message());
+                case WorkbenchActionGateway.SourceApplyResult.Unreachable ignored ->
+                        restoreActions("Server could not be reached");
+                case WorkbenchActionGateway.SourceApplyResult.Unavailable ignored ->
+                        restoreActions("Source apply is unavailable");
+            }
+        }
+
+        private Optional<WorkbenchActionGateway.PipelineApplyRequest> selectedPipelineApplyRequest() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()
+                    || !(state.snapshot().orElseThrow().workspace().remoteState() instanceof WorkbenchRemoteState.Available)) {
+                return Optional.empty();
+            }
+            return selectedPipelineRow().filter(Session::isApplicablePipeline)
+                    .map(row -> new WorkbenchActionGateway.PipelineApplyRequest(
+                            List.of(row.local().getFirst().relativePath())));
+        }
+
+        private Optional<String> selectedPipelineId() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()
+                    || !(state.snapshot().orElseThrow().workspace().remoteState() instanceof WorkbenchRemoteState.Available)) {
+                return Optional.empty();
+            }
+            return selectedPipelineRow().map(row -> row.key().id());
+        }
+
+        private Optional<WorkbenchArtifactRow> selectedPipelineRow() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            List<WorkbenchArtifactRow> rows = switch (state.selectedTab()) {
+                case WORKSPACE -> WorkbenchRenderer.sorted(state.snapshot().orElseThrow().workspace().rows(), state.workspaceTable());
+                case PIPELINES -> WorkbenchRenderer.sorted(state.snapshot().orElseThrow().pipelines().rows(), state.pipelinesTable());
+                default -> List.of();
+            };
+            if (rows.isEmpty()) {
+                return Optional.empty();
+            }
+            int selected = state.selectedTab() == WorkbenchState.WorkbenchTab.WORKSPACE
+                    ? state.workspaceTable().selectedIndex() : state.pipelinesTable().selectedIndex();
+            WorkbenchArtifactRow row = rows.get(Math.clamp(selected, 0, rows.size() - 1));
+            return "pipeline".equals(row.key().kind()) ? Optional.of(row) : Optional.empty();
+        }
+
+        private static boolean isApplicablePipeline(WorkbenchArtifactRow row) {
+            return "pipeline".equals(row.key().kind()) && row.local().size() == 1 && row.local().getFirst().valid();
+        }
+
+        private boolean confirmPipelineApply(WorkbenchActionGateway.PipelineApplyRequest request) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.ApplyPipelines(request), "Apply Pipeline?",
+                    "Apply the selected local Pipeline to the current server?", false, state.overlay())));
+        }
+
+        private void submitPipelineApply(WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.ApplyPipelines apply) {
+            if (actionCoordinator == null || actionGateway == null) {
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.applyPipelines(apply.request()),
+                    failure -> new WorkbenchActionGateway.PipelineApplyResult.Unavailable(),
+                    result -> completePipelineApply(confirm, result));
+        }
+
+        private void completePipelineApply(
+                WorkbenchOverlayState.Confirm confirm,
+                WorkbenchActionGateway.PipelineApplyResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.PipelineApplyResult.Applied ignored -> {
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    refresh();
+                }
+                case WorkbenchActionGateway.PipelineApplyResult.Rejected rejected -> restorePipelineFailure(
+                        confirm, rejected.code() + ": " + rejected.message());
+                case WorkbenchActionGateway.PipelineApplyResult.Unreachable ignored ->
+                        restorePipelineFailure(confirm, "Server could not be reached");
+                case WorkbenchActionGateway.PipelineApplyResult.Unavailable ignored ->
+                        restorePipelineFailure(confirm, "Pipeline apply is unavailable");
+            }
+        }
+
+        private boolean confirmPipelineLifecycle(String pipelineId, String verb) {
+            String title = Character.toUpperCase(verb.charAt(0)) + verb.substring(1) + " Pipeline?";
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    new WorkbenchOverlayState.Confirm.Intent.ChangePipelineLifecycle(
+                            new WorkbenchActionGateway.PipelineLifecycleRequest(pipelineId, verb)),
+                    title, title.replace("?", " " + pipelineId + "?"), false, state.overlay())));
+        }
+
+        private void submitPipelineLifecycle(WorkbenchOverlayState.Confirm confirm,
+                WorkbenchOverlayState.Confirm.Intent.ChangePipelineLifecycle lifecycle) {
+            if (actionCoordinator == null || actionGateway == null) {
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(() -> actionGateway.changePipelineLifecycle(lifecycle.request()),
+                    failure -> new WorkbenchActionGateway.PipelineLifecycleResult.Unavailable(),
+                    result -> completePipelineLifecycle(confirm, result));
+        }
+
+        private void completePipelineLifecycle(
+                WorkbenchOverlayState.Confirm confirm,
+                WorkbenchActionGateway.PipelineLifecycleResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.PipelineLifecycleResult.Changed ignored -> {
+                    clearSelectedPipelineStatus();
+                    runtime.updateState(WorkbenchState::closeOverlay);
+                    refresh();
+                }
+                case WorkbenchActionGateway.PipelineLifecycleResult.Rejected rejected -> restorePipelineFailure(
+                        confirm, rejected.code() + ": " + rejected.message());
+                case WorkbenchActionGateway.PipelineLifecycleResult.Unreachable ignored ->
+                        restorePipelineFailure(confirm, "Server could not be reached");
+                case WorkbenchActionGateway.PipelineLifecycleResult.Unavailable ignored ->
+                        restorePipelineFailure(confirm, "Pipeline lifecycle control is unavailable");
+            }
+        }
+
+        private void restorePipelineFailure(WorkbenchOverlayState.Confirm confirm, String message) {
+            if (confirm.previous().filter(WorkbenchOverlayState.Actions.class::isInstance).isPresent()) {
+                restoreActions(message);
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Confirm(
+                    confirm.intent(), confirm.title(), message, false, confirm.previous())));
+        }
+
+        private void restoreActions(String message) {
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Actions(
+                    availableActions(state), 0, Optional.of(message))));
+        }
+
+        private void restoreSourceCreate(
+                WorkbenchOverlayState.SourceCreate source, Optional<String> message) {
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(source.catalog(),
+                    source.stage(), source.selectedIndex(), source.filter(), source.connector(), source.mode(),
+                    source.tables(), source.id(), source.config(), source.canonicalYaml(), false, message)));
+        }
+
+        private List<WorkbenchActionGateway.SourceConfigField> sourceConfigFields(
+                WorkbenchOverlayState.SourceCreate source) {
+            return source.catalog().connectors().stream()
+                    .filter(connector -> connector.id().equals(source.connector()))
+                    .findFirst().map(WorkbenchActionGateway.SourceConnector::configFields).orElse(List.of()).stream()
+                    .filter(field -> field.visibleWhen().map(visibility -> {
+                        String controller = source.config().get(visibility.controllingField());
+                        return controller != null && visibility.equalsAnyOf().contains(controller);
+                    }).orElse(true))
+                    .toList();
+        }
+
+        private WorkbenchActionGateway.SourceConfigField sourceConfigField(
+                WorkbenchOverlayState.SourceCreate source, int index) {
+            List<WorkbenchActionGateway.SourceConfigField> fields = sourceConfigFields(source);
+            return fields.get(Math.clamp(index, 0, fields.size() - 1));
+        }
+
+        private String sourceConfigText(WorkbenchOverlayState.SourceCreate source, int index) {
+            WorkbenchActionGateway.SourceConfigField field = sourceConfigField(source, index);
+            return source.config().getOrDefault(field.name(), "");
+        }
+
+        private boolean updateSourceConfig(WorkbenchOverlayState.SourceCreate source, int index, String value,
+                Optional<String> message) {
+            WorkbenchActionGateway.SourceConfigField field = sourceConfigField(source, index);
+            Map<String, String> config = new java.util.LinkedHashMap<>(source.config());
+            if (value.isBlank()) {
+                config.remove(field.name());
+            } else {
+                config.put(field.name(), value);
+            }
+            List<WorkbenchActionGateway.SourceConfigField> fields = sourceConfigFields(source);
+            int selected = fields.isEmpty() ? 0 : Math.min(index, fields.size() - 1);
+            WorkbenchOverlayState.SourceCreate next = new WorkbenchOverlayState.SourceCreate(
+                    source.catalog(), source.stage(), selected, source.filter(), source.connector(), source.mode(),
+                    source.tables(), source.id(), config, Optional.empty(), false, message);
+            boolean changed = runtime.updateState(state -> state.withOverlay(next));
+            requestLiveSourcePreview(next);
+            return changed;
+        }
+
+        private boolean updateSourceDraft(
+                WorkbenchOverlayState.SourceCreate source,
+                WorkbenchOverlayState.SourceCreate.Stage stage,
+                int selectedIndex,
+                String connector,
+                String mode,
+                String tables,
+                String id,
+                Optional<String> yaml,
+                Optional<String> message) {
+            WorkbenchOverlayState.SourceCreate next = new WorkbenchOverlayState.SourceCreate(
+                    source.catalog(), stage, selectedIndex, source.filter(), connector, mode, tables, id,
+                    source.config(), yaml, false, message);
+            boolean changed = runtime.updateState(state -> state.withOverlay(next));
+            requestLiveSourcePreview(next);
+            return changed;
+        }
+
+        private boolean cycleSourceConfigOption(WorkbenchOverlayState.SourceCreate source, int direction) {
+            WorkbenchActionGateway.SourceConfigField field = sourceConfigField(source, source.selectedIndex());
+            List<WorkbenchActionGateway.SourceConfigOption> options = field.options();
+            int current = options.stream().map(WorkbenchActionGateway.SourceConfigOption::value)
+                    .toList().indexOf(source.config().getOrDefault(field.name(), ""));
+            if (current < 0) {
+                current = 0;
+            }
+            int next = Math.floorMod(current + direction, options.size());
+            return updateSourceConfig(source, source.selectedIndex(), options.get(next).value(), Optional.empty());
+        }
+
+        private Map<String, String> sourceOptionDefaults(
+                WorkbenchActionGateway.SourceCatalog catalog, String connector) {
+            return catalog.connectors().stream()
+                    .filter(item -> item.id().equals(connector))
+                    .findFirst()
+                    .orElseThrow()
+                    .configFields().stream()
+                    .filter(field -> !field.options().isEmpty())
+                    .collect(java.util.stream.Collectors.toMap(
+                            WorkbenchActionGateway.SourceConfigField::name,
+                            field -> field.options().stream()
+                                    .filter(option -> option.value().equals(field.defaultValue()))
+                                    .findFirst()
+                                    .orElse(field.options().getFirst())
+                                    .value(),
+                            (left, right) -> right,
+                            java.util.LinkedHashMap::new));
+        }
+
+        private Map<String, Object> sourceConfig(WorkbenchOverlayState.SourceCreate source) {
+            Map<String, Object> config = new java.util.LinkedHashMap<>();
+            for (WorkbenchActionGateway.SourceConfigField field : sourceConfigFields(source)) {
+                String raw = source.config().get(field.name());
+                if (raw != null && !raw.isBlank()) {
+                    config.put(field.name(), SourceScaffold.coerce(field.type(), raw.trim()));
+                }
+            }
+            return Map.copyOf(config);
+        }
+
+        private void requestLiveSourcePreview(WorkbenchOverlayState.SourceCreate source) {
+            if (actionCoordinator == null || source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW) {
+                return;
+            }
+            WorkbenchActionGateway.SourceDraft draft = new WorkbenchActionGateway.SourceDraft(
+                    source.connector(), source.mode(), source.tables(), source.id(), sourceConfig(source));
+            actionCoordinator.submit(() -> actionGateway.previewSource(draft),
+                    failure -> new WorkbenchActionGateway.SourcePreviewResult.Unavailable(),
+                    result -> completeLiveSourcePreview(source, result));
+        }
+
+        private void completeLiveSourcePreview(
+                WorkbenchOverlayState.SourceCreate requested,
+                WorkbenchActionGateway.SourcePreviewResult result) {
+            if (!(runtime.state().overlay().orElse(null) instanceof WorkbenchOverlayState.SourceCreate current)
+                    || !sameSourceDraft(requested, current)) {
+                return;
+            }
+            if (result instanceof WorkbenchActionGateway.SourcePreviewResult.Ready ready) {
+                runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceCreate(
+                        current.catalog(), current.stage(), current.selectedIndex(), current.filter(), current.connector(),
+                        current.mode(), current.tables(), current.id(), current.config(),
+                        Optional.of(ready.canonicalYaml()), current.pending(), current.message())));
+            }
+        }
+
+        private boolean sameSourceDraft(
+                WorkbenchOverlayState.SourceCreate left,
+                WorkbenchOverlayState.SourceCreate right) {
+            return left.connector().equals(right.connector())
+                    && left.mode().equals(right.mode())
+                    && left.tables().equals(right.tables())
+                    && left.id().equals(right.id())
+                    && left.config().equals(right.config());
+        }
+
+        private static String printableText(String text) {
+            StringBuilder value = new StringBuilder(text.length());
+            text.codePoints().filter(codePoint -> !Character.isISOControl(codePoint)).forEach(value::appendCodePoint);
+            return value.toString();
+        }
+
+        private boolean handleLoginKey(WorkbenchOverlayState.Login login, KeyEvent key) {
+            if (login.pending()) {
+                return true;
+            }
+            if (key.isUp() || key.isDown()) {
+                WorkbenchOverlayState.Login.Stage[] stages = transientLogin(login)
+                        ? WorkbenchOverlayState.Login.Stage.values()
+                        : new WorkbenchOverlayState.Login.Stage[]{
+                            WorkbenchOverlayState.Login.Stage.USERNAME,
+                            WorkbenchOverlayState.Login.Stage.PASSWORD};
+                int current = 0;
+                for (int index = 0; index < stages.length; index++) {
+                    if (stages[index] == login.stage()) {
+                        current = index;
+                        break;
+                    }
+                }
+                int next = Math.floorMod(current + (key.isUp() ? -1 : 1), stages.length);
+                return updateLogin(login, stages[next], login.server(), login.username(), Optional.empty());
+            }
+            if (key.isDeleteBackward()) {
+                if (login.stage() == WorkbenchOverlayState.Login.Stage.SERVER) {
+                    String server = deleteLastCodePoint(login.server());
+                    runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                            login.contextName(), login.stage(), server, login.username(),
+                            login.password(), false, Optional.empty(), login.previous())));
+                } else if (login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME) {
+                    String username = deleteLastCodePoint(login.username());
+                    runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                            login.contextName(), login.stage(), login.server(), username,
+                            login.password(), false, Optional.empty(), login.previous())));
+                } else {
+                    login.password().deleteLast();
+                    runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                            login.contextName(), login.stage(), login.server(), login.username(),
+                            login.password(), false, Optional.empty(), login.previous())));
+                }
+                return true;
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                if (login.stage() == WorkbenchOverlayState.Login.Stage.SERVER) {
+                    if (validServer(login.server())) {
+                        runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                                login.server(), WorkbenchOverlayState.Login.Stage.USERNAME,
+                                login.server(), login.username(), login.password(), false,
+                                Optional.empty(), login.previous())));
+                    } else {
+                        runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                                login.contextName(), login.stage(), login.server(), login.username(),
+                                login.password(), false, Optional.of("Enter an absolute server URL"),
+                                login.previous())));
+                    }
+                } else if (login.stage() == WorkbenchOverlayState.Login.Stage.USERNAME) {
+                    if (!login.username().isBlank()) {
+                        runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                                login.contextName(), WorkbenchOverlayState.Login.Stage.PASSWORD,
+                                login.server(), login.username(), login.password(), false,
+                                Optional.empty(), login.previous())));
+                    }
+                } else if (login.password().length() > 0) {
+                    submitLogin(login);
+                }
+                return true;
+            }
+            if (key.code() == dev.tamboui.tui.event.KeyCode.CHAR) {
+                return appendLoginText(login, key.string());
+            }
+            return true;
+        }
+
+        private boolean handleOverlayPaste(WorkbenchOverlayState overlay, String text) {
+            if (overlay instanceof WorkbenchOverlayState.Login login && !login.pending()) {
+                return appendLoginText(login, text);
+            }
+            if (overlay instanceof WorkbenchOverlayState.ContextCreate create && !create.pending()
+                    && create.stage() != WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS) {
+                return appendContextCreateText(create, text);
+            }
+            if (overlay instanceof WorkbenchOverlayState.SourceCreate source && !source.pending()) {
+                return appendSourceCreateText(source, text);
+            }
+            if (overlay instanceof WorkbenchOverlayState.PipelineCreate pipeline && !pipeline.pending()
+                    && pipeline.stage() == WorkbenchOverlayState.PipelineCreate.Stage.ID) {
+                return updatePipelineCreate(pipeline, pipeline.stage(), 0, pipeline.sourceId(),
+                        pipeline.id() + printableText(text), Optional.empty(), false, Optional.empty());
+            }
+            if (overlay instanceof WorkbenchOverlayState.SourceYamlEditor editor) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.SourceYamlEditor(
+                        editor.source(), editor.document().insert(text))));
+            }
+            if (overlay instanceof WorkbenchOverlayState.PipelineYamlEditor editor) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.PipelineYamlEditor(
+                        editor.pipeline(), editor.document().insert(text))));
+            }
+            return true;
+        }
+
+        private boolean appendContextCreateText(
+                WorkbenchOverlayState.ContextCreate create, String text) {
+            StringBuilder value = new StringBuilder(
+                    create.stage() == WorkbenchOverlayState.ContextCreate.Stage.NAME
+                            ? create.name() : create.server());
+            text.codePoints()
+                    .filter(codePoint -> !Character.isISOControl(codePoint))
+                    .forEach(value::appendCodePoint);
+            return create.stage() == WorkbenchOverlayState.ContextCreate.Stage.NAME
+                    ? updateContextCreate(create, create.stage(), value.toString(), create.server(),
+                            create.verifyTls(), Optional.empty())
+                    : updateContextCreate(create, create.stage(), create.name(), value.toString(),
+                            create.verifyTls(), Optional.empty());
+        }
+
+        private boolean advanceContextCreate(WorkbenchOverlayState.ContextCreate create) {
+            if (create.stage() == WorkbenchOverlayState.ContextCreate.Stage.NAME) {
+                if (create.name().isBlank()) {
+                    return updateContextCreate(create, create.stage(), create.name(), create.server(),
+                            create.verifyTls(), Optional.of("Context name is required"));
+                }
+                return updateContextCreate(create, WorkbenchOverlayState.ContextCreate.Stage.SERVER,
+                        create.name(), create.server(), create.verifyTls(), Optional.empty());
+            }
+            if (create.stage() == WorkbenchOverlayState.ContextCreate.Stage.SERVER) {
+                try {
+                    URI server = URI.create(create.server());
+                    if (server.getScheme() == null || server.getHost() == null) {
+                        throw new IllegalArgumentException("absolute server URL required");
+                    }
+                } catch (IllegalArgumentException invalid) {
+                    return updateContextCreate(create, create.stage(), create.name(), create.server(),
+                            create.verifyTls(), Optional.of("Enter an absolute server URL"));
+                }
+                return updateContextCreate(create, WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS,
+                        create.name(), create.server(), create.verifyTls(), Optional.empty());
+            }
+            submitContextCreate(create);
+            return true;
+        }
+
+        private boolean updateContextCreate(
+                WorkbenchOverlayState.ContextCreate current,
+                WorkbenchOverlayState.ContextCreate.Stage stage,
+                String name,
+                String server,
+                boolean verifyTls,
+                Optional<String> message) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextCreate(
+                    stage, name, server, verifyTls, current.pending(), message, current.previous())));
+        }
+
+        private void submitContextCreate(WorkbenchOverlayState.ContextCreate create) {
+            if (actionCoordinator == null) {
+                return;
+            }
+            WorkbenchOverlayState.ContextCreate pending = new WorkbenchOverlayState.ContextCreate(
+                    create.stage(), create.name(), create.server(), create.verifyTls(), true,
+                    Optional.empty(), create.previous());
+            runtime.updateState(state -> state.withOverlay(pending));
+            actionCoordinator.submit(
+                    () -> actionGateway.createContext(
+                            create.name(), URI.create(create.server()), create.verifyTls()),
+                    failure -> new WorkbenchActionGateway.ContextResult.Unavailable(),
+                    this::completeContextSelection);
+        }
+
+        private boolean appendLoginText(WorkbenchOverlayState.Login login, String text) {
+            if (login.stage() != WorkbenchOverlayState.Login.Stage.PASSWORD) {
+                StringBuilder value = new StringBuilder(
+                        login.stage() == WorkbenchOverlayState.Login.Stage.SERVER
+                                ? login.server() : login.username());
+                text.codePoints()
+                        .filter(codePoint -> !Character.isISOControl(codePoint))
+                        .forEach(value::appendCodePoint);
+                if (login.stage() == WorkbenchOverlayState.Login.Stage.SERVER) {
+                    runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                            login.contextName(), login.stage(), value.toString(), login.username(),
+                            login.password(), false, Optional.empty(), login.previous())));
+                } else {
+                    runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                            login.contextName(), login.stage(), login.server(), value.toString(),
+                            login.password(), false, Optional.empty(), login.previous())));
+                }
+            } else {
+                login.password().append(text);
+                runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                        login.contextName(), login.stage(), login.server(), login.username(), login.password(),
+                        false, Optional.empty(), login.previous())));
+            }
+            return true;
+        }
+
+        private boolean openContextEntry() {
+            if (actionGateway == null) {
+                return false;
+            }
+            List<WorkbenchActionGateway.ContextOption> contexts = actionGateway.contexts();
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.ContextPicker(
+                    contexts,
+                    0,
+                    false,
+                    Optional.empty(),
+                    state.overlay().filter(WorkbenchOverlayState.More.class::isInstance))));
+        }
+
+        private boolean openAuthEntry() {
+            if (actionGateway == null) {
+                return false;
+            }
+            Optional<WorkbenchSessionSnapshot> current = runtime.state().snapshot()
+                    .map(WorkbenchSnapshot::session);
+            WorkbenchSessionSnapshot session = current.orElseGet(WorkbenchSessionSnapshot::empty);
+            if (session.connection() != WorkbenchConnection.CONNECTED) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                        "temporary server",
+                        WorkbenchOverlayState.Login.Stage.SERVER,
+                        "",
+                        "",
+                        new SecretBuffer(),
+                        false,
+                        Optional.empty(),
+                        state.overlay().filter(WorkbenchOverlayState.More.class::isInstance))));
+            }
+            if (session.authentication() != WorkbenchAuthentication.SIGNED_OUT) {
+                return false;
+            }
+            String target = session.contextName()
+                    .or(() -> session.landingNode().map(Object::toString))
+                    .orElse("current server");
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                    target,
+                    WorkbenchOverlayState.Login.Stage.USERNAME,
+                    "",
+                    "",
+                    new SecretBuffer(),
+                    false,
+                    Optional.empty(),
+                    state.overlay().filter(WorkbenchOverlayState.More.class::isInstance))));
+        }
+
+        private void selectContext(WorkbenchOverlayState.ContextPicker picker) {
+            if (actionCoordinator == null) {
+                return;
+            }
+            String contextName = picker.contexts().get(picker.selectedIndex()).name();
+            runtime.updateState(state -> state.withOverlay(picker.asPending()));
+            actionCoordinator.submit(
+                    () -> actionGateway.selectContext(contextName),
+                    failure -> new WorkbenchActionGateway.ContextResult.Unavailable(),
+                    this::completeContextSelection);
+        }
+
+        private void completeContextSelection(WorkbenchActionGateway.ContextResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.ContextResult.Ready ready -> {
+                    if (ready.signedIn()) {
+                        refreshAfterActivation();
+                    } else {
+                        Optional<WorkbenchOverlayState> previous = runtime.state().overlay()
+                                .flatMap(Session::previousOverlay);
+                        openContextLogin(ready.contextName(), previous);
+                    }
+                }
+                case WorkbenchActionGateway.ContextResult.Offline offline -> runtime.updateState(state ->
+                        state.withOverlay(contextMessage("Context is offline: " + offline.contextName())));
+                case WorkbenchActionGateway.ContextResult.Unavailable ignored -> runtime.updateState(state ->
+                        state.withOverlay(contextMessage("Context could not be selected")));
+            }
+        }
+
+        private void openContextLogin(String contextName, Optional<WorkbenchOverlayState> previous) {
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                    contextName,
+                    WorkbenchOverlayState.Login.Stage.USERNAME,
+                    "",
+                    "",
+                    new SecretBuffer(),
+                    false,
+                    Optional.empty(),
+                    previous)));
+        }
+
+        private WorkbenchOverlayState.ContextPicker contextMessage(String message) {
+            List<WorkbenchActionGateway.ContextOption> contexts = actionGateway.contexts();
+            return new WorkbenchOverlayState.ContextPicker(
+                    contexts, 0, false, Optional.of(message));
+        }
+
+        private void submitLogin(WorkbenchOverlayState.Login login) {
+            if (actionCoordinator == null) {
+                return;
+            }
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                    login.contextName(), login.stage(), login.server(), login.username(),
+                    login.password(), true, Optional.empty(), login.previous())));
+            Optional<URI> server = login.server().isBlank()
+                    ? Optional.empty() : Optional.of(URI.create(login.server()));
+            actionCoordinator.submit(
+                    () -> actionGateway.login(
+                            new WorkbenchActionGateway.LoginRequest(server, login.username()), login.password()),
+                    failure -> new WorkbenchActionGateway.LoginResult.Unavailable(),
+                    result -> completeLogin(
+                            login.contextName(), login.server(), login.username(), login.previous(), result));
+        }
+
+        private void submitContextDelete(WorkbenchOverlayState.Confirm confirm) {
+            if (actionCoordinator == null) {
+                return;
+            }
+            WorkbenchOverlayState.Confirm.Intent.DeleteContext delete =
+                    (WorkbenchOverlayState.Confirm.Intent.DeleteContext) confirm.intent();
+            runtime.updateState(state -> state.withOverlay(confirm.asPending()));
+            actionCoordinator.submit(
+                    () -> actionGateway.deleteContext(delete.contextName()),
+                    failure -> new WorkbenchActionGateway.ContextDeleteResult.Unavailable(),
+                    this::completeContextDelete);
+        }
+
+        private void completeContextDelete(WorkbenchActionGateway.ContextDeleteResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.ContextDeleteResult.Deleted ignored -> {
+                    refreshCoordinator.advanceContext();
+                    refresh();
+                    runtime.updateState(state -> state.withOverlay(contextMessage("Context deleted")));
+                }
+                case WorkbenchActionGateway.ContextDeleteResult.Unavailable ignored -> runtime.updateState(state ->
+                        state.withOverlay(contextMessage("Context could not be deleted")));
+            }
+        }
+
+        private void completeLogin(
+                String contextName,
+                String server,
+                String username,
+                Optional<WorkbenchOverlayState> previous,
+                WorkbenchActionGateway.LoginResult result) {
+            switch (result) {
+                case WorkbenchActionGateway.LoginResult.SignedIn ignored -> refreshAfterActivation();
+                case WorkbenchActionGateway.LoginResult.Rejected rejected -> showLoginFailure(
+                        contextName, server, username, previous, "Sign in rejected: " + rejected.code());
+                case WorkbenchActionGateway.LoginResult.Unreachable ignored -> showLoginFailure(
+                        contextName, server, username, previous, "Server is unreachable");
+                case WorkbenchActionGateway.LoginResult.Unavailable ignored -> showLoginFailure(
+                        contextName, server, username, previous, "Sign in is unavailable");
+            }
+        }
+
+        private void showLoginFailure(
+                String contextName,
+                String server,
+                String username,
+                Optional<WorkbenchOverlayState> previous,
+                String message) {
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                    contextName,
+                    WorkbenchOverlayState.Login.Stage.PASSWORD,
+                    server,
+                    username,
+                    new SecretBuffer(),
+                    false,
+                    Optional.of(message),
+                    previous)));
+        }
+
+        private boolean updateLogin(
+                WorkbenchOverlayState.Login login,
+                WorkbenchOverlayState.Login.Stage stage,
+                String server,
+                String username,
+                Optional<String> message) {
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.Login(
+                    login.contextName(), stage, server, username, login.password(), false,
+                    message, login.previous())));
+        }
+
+        private static boolean transientLogin(WorkbenchOverlayState.Login login) {
+            return login.stage() == WorkbenchOverlayState.Login.Stage.SERVER || !login.server().isBlank();
+        }
+
+        private static Optional<WorkbenchOverlayState> previousOverlay(WorkbenchOverlayState overlay) {
+            return switch (overlay) {
+                case WorkbenchOverlayState.ContextPicker picker -> picker.previous();
+                case WorkbenchOverlayState.ContextCreate create -> create.previous();
+                case WorkbenchOverlayState.SourceCreate ignored -> Optional.empty();
+                case WorkbenchOverlayState.SourceYamlEditor ignored -> Optional.empty();
+                case WorkbenchOverlayState.PipelineCreate ignored -> Optional.empty();
+                case WorkbenchOverlayState.PipelineYamlEditor ignored -> Optional.empty();
+                case WorkbenchOverlayState.Confirm confirm -> confirm.previous();
+                case WorkbenchOverlayState.Login login -> login.previous();
+                case WorkbenchOverlayState.Actions ignored -> Optional.empty();
+                case WorkbenchOverlayState.LogLevel ignored -> Optional.empty();
+                case WorkbenchOverlayState.Help ignored -> Optional.of(new WorkbenchOverlayState.More(2));
+                case WorkbenchOverlayState.More ignored -> Optional.empty();
+            };
+        }
+
+        private static boolean validServer(String value) {
+            try {
+                URI server = URI.create(value);
+                return server.getScheme() != null && server.getHost() != null;
+            } catch (IllegalArgumentException invalid) {
+                return false;
+            }
+        }
+
+        private void refreshAfterActivation() {
+            runtime.updateState(WorkbenchState::closeOverlay);
+            refreshCoordinator.advanceContext();
+            refresh();
+        }
+
+        private void clearOverlaySecret() {
+            runtime.state().overlay()
+                    .filter(WorkbenchOverlayState.Login.class::isInstance)
+                    .map(WorkbenchOverlayState.Login.class::cast)
+                    .ifPresent(login -> login.password().close());
+        }
+
+        private static String deleteLastCodePoint(String value) {
+            if (value.isEmpty()) {
+                return value;
+            }
+            return value.substring(0, value.offsetByCodePoints(value.length(), -1));
+        }
+
+        void refresh() {
+            if (refreshCoordinator == null || dataSource == null) {
+                throw new IllegalStateException("This workbench session has no refresh data source");
+            }
+            RefreshRequest request = refreshCoordinator.refresh((generation, sequence, token) ->
+                    RefreshResult.success(dataSource.load(generation, sequence, token)));
+            clearSelectedPipelineStatus();
+            runtime.expectSnapshot(new WorkbenchSnapshot(
+                    request.contextGeneration(), request.requestSequence()));
+        }
+
+        void expectSnapshot(WorkbenchSnapshot snapshot) {
+            runtime.expectSnapshot(snapshot);
+        }
+
+        void publishSnapshot(WorkbenchSnapshot snapshot) {
+            runtime.publishSnapshot(snapshot);
+        }
+
+        void render(Frame frame) {
+            ensureSelectedPipelineStatus();
+            ensureLogs();
+            ensureInspect();
+            if (shellPanel == null || !shellPanel.isOpen() || runtime.state().overlay().isPresent()
+                    || frame.area().height() < 24) {
+                layout = WorkbenchRenderer.render(frame, runtime.state());
+                return;
+            }
+            int panelHeight = shellPanel.heightFor(frame.area());
+            int mainHeight = frame.area().height() - panelHeight - 1;
+            Rect mainArea = new Rect(frame.area().x(), frame.area().y(), frame.area().width(), mainHeight);
+            layout = WorkbenchRenderer.render(frame, runtime.state(), WorkbenchTheme.dark(), mainArea, false, false);
+            Rect shellArea = new Rect(frame.area().x(), mainArea.bottom(), frame.area().width(), panelHeight);
+            shellPanel.render(frame, shellArea, WorkbenchTheme.dark());
+            shellPanel.renderFooter(frame, new Rect(frame.area().x(), frame.area().bottom() - 1,
+                    frame.area().width(), 1), WorkbenchTheme.dark());
+        }
+
+        @Override
+        public void close() {
+            clearOverlaySecret();
+            if (shellPanel != null) {
+                shellPanel.destroy();
+            }
+            if (actionCoordinator != null) {
+                actionCoordinator.close();
+            }
+            if (pipelineStatusCoordinator != null) {
+                pipelineStatusCoordinator.close();
+            }
+            if (logCoordinator != null) {
+                logCoordinator.close();
+            }
+            if (inspectCoordinator != null) {
+                inspectCoordinator.close();
+            }
+            if (refreshCoordinator != null) {
+                refreshCoordinator.close();
+            }
+        }
+
+        void publishRefreshResult(RefreshResult result) {
+            WorkbenchSnapshot baseline = currentBaseline(result.contextGeneration());
+            WorkbenchSnapshot snapshot = switch (result.outcome()) {
+                case RefreshResult.Success success -> remember(success.snapshot());
+                case RefreshResult.Empty ignored -> unavailableSnapshot(
+                        result, emptyRemoteState(baseline), baseline);
+                case RefreshResult.Offline ignored -> unavailableSnapshot(
+                        result, new WorkbenchRemoteState.Offline(), baseline);
+                case RefreshResult.Diagnostic diagnostic -> unavailableSnapshot(
+                        result, new WorkbenchRemoteState.Diagnostic(
+                                diagnostic.code(), diagnostic.arguments()), baseline);
+            };
+            runtime.publishSnapshot(snapshot);
+        }
+
+        private WorkbenchSnapshot remember(WorkbenchSnapshot snapshot) {
+            lastSuccessfulSnapshot = snapshot;
+            return snapshot;
+        }
+
+        private WorkbenchSnapshot currentBaseline(long contextGeneration) {
+            WorkbenchSnapshot snapshot = lastSuccessfulSnapshot;
+            return snapshot != null && snapshot.contextGeneration() == contextGeneration
+                    ? snapshot
+                    : null;
+        }
+
+        private static WorkbenchRemoteState emptyRemoteState(WorkbenchSnapshot baseline) {
+            return baseline != null && baseline.session().connection() != WorkbenchConnection.NO_CONTEXT
+                    ? new WorkbenchRemoteState.Available(0)
+                    : new WorkbenchRemoteState.NotConfigured();
+        }
+
+        private static WorkbenchSnapshot unavailableSnapshot(
+                RefreshResult result,
+                WorkbenchRemoteState remoteState,
+                WorkbenchSnapshot baseline) {
+            WorkbenchSessionSnapshot session = baseline == null
+                    ? WorkbenchSessionSnapshot.empty()
+                    : baseline.session();
+            List<WorkbenchArtifactRow> rows = baseline == null
+                    ? List.of()
+                    : localRows(baseline.workspace().rows(), remoteState);
+            return new WorkbenchSnapshot(
+                    result.contextGeneration(),
+                    result.requestSequence(),
+                    session,
+                    overview(rows, remoteState),
+                    new WorkbenchWorkspaceSnapshot(remoteState, rows),
+                    new WorkbenchResourceListSnapshot("source", remoteState, List.of()),
+                    new WorkbenchResourceListSnapshot("pipeline", remoteState, List.of()));
+        }
+
+        private static List<WorkbenchArtifactRow> localRows(
+                List<WorkbenchArtifactRow> baselineRows,
+                WorkbenchRemoteState remoteState) {
+            boolean remoteAvailable = remoteState instanceof WorkbenchRemoteState.Available;
+            return baselineRows.stream()
+                    .filter(row -> !row.local().isEmpty())
+                    .map(row -> new WorkbenchArtifactRow(
+                            row.key(),
+                            row.local(),
+                            List.of(),
+                            invalidLocal(row)
+                                    ? WorkbenchAlignment.INVALID_LOCAL
+                                    : remoteAvailable
+                                            ? WorkbenchAlignment.LOCAL_ONLY
+                                            : WorkbenchAlignment.UNKNOWN))
+                    .toList();
+        }
+
+        private static boolean invalidLocal(WorkbenchArtifactRow row) {
+            return row.local().size() > 1 || row.local().stream().anyMatch(local -> !local.valid());
+        }
+
+        private static WorkbenchOverviewSnapshot overview(
+                List<WorkbenchArtifactRow> rows,
+                WorkbenchRemoteState remoteState) {
+            boolean remoteAvailable = remoteState instanceof WorkbenchRemoteState.Available;
+            List<WorkbenchKindCount> counts = WorkbenchProjection.VISIBLE_KINDS.stream()
+                    .map(kind -> new WorkbenchKindCount(
+                            kind,
+                            (int) rows.stream()
+                                    .filter(row -> row.key().kind().equals(kind))
+                                    .count(),
+                            remoteAvailable ? OptionalInt.of(0) : OptionalInt.empty()))
+                    .toList();
+            return new WorkbenchOverviewSnapshot(counts, new WorkbenchAlignmentCounts(
+                    count(rows, WorkbenchAlignment.LOCAL_ONLY),
+                    0,
+                    0,
+                    0,
+                    count(rows, WorkbenchAlignment.INVALID_LOCAL),
+                    count(rows, WorkbenchAlignment.UNKNOWN)));
+        }
+
+        private static int count(
+                List<WorkbenchArtifactRow> rows,
+                WorkbenchAlignment alignment) {
+            return (int) rows.stream().filter(row -> row.alignment() == alignment).count();
+        }
+
+        private void ensureSelectedPipelineStatus() {
+            if (pipelineStatusCoordinator == null || actionGateway == null || runtime.state().overlay().isPresent()) {
+                return;
+            }
+            Optional<String> pipelineId = selectedPipelineStatusId();
+            if (pipelineId.isEmpty()) {
+                clearSelectedPipelineStatus();
+                return;
+            }
+            String id = pipelineId.orElseThrow();
+            if (runtime.state().selectedPipelineStatus().map(WorkbenchPipelineStatus::pipelineId)
+                    .filter(id::equals).isPresent()) {
+                return;
+            }
+            runtime.updateState(state -> state.withSelectedPipelineStatus(
+                    Optional.of(new WorkbenchPipelineStatus.Loading(id))));
+            pipelineStatusCoordinator.submit(id,
+                    () -> actionGateway.readPipelineStatus(new WorkbenchActionGateway.PipelineStatusRequest(id)),
+                    result -> completeSelectedPipelineStatus(id, result));
+        }
+
+        private Optional<String> selectedPipelineStatusId() {
+            WorkbenchState state = runtime.state();
+            if (state.selectedTab() != WorkbenchState.WorkbenchTab.PIPELINES
+                    && state.selectedTab() != WorkbenchState.WorkbenchTab.INSPECT) {
+                return Optional.empty();
+            }
+            return selectedRemotePipelineId();
+        }
+
+        private void completeSelectedPipelineStatus(
+                String pipelineId,
+                WorkbenchActionGateway.PipelineStatusResult result) {
+            if (selectedPipelineStatusId().filter(pipelineId::equals).isEmpty()) {
+                return;
+            }
+            WorkbenchPipelineStatus status = switch (result) {
+                case WorkbenchActionGateway.PipelineStatusResult.Available available ->
+                        new WorkbenchPipelineStatus.Available(
+                                pipelineId, available.state(), available.failureCode(), available.failureMessage());
+                case WorkbenchActionGateway.PipelineStatusResult.Rejected rejected ->
+                        new WorkbenchPipelineStatus.Rejected(pipelineId, rejected.code(), rejected.message());
+                case WorkbenchActionGateway.PipelineStatusResult.Unreachable ignored ->
+                        new WorkbenchPipelineStatus.Unreachable(pipelineId);
+                case WorkbenchActionGateway.PipelineStatusResult.Unavailable ignored ->
+                        new WorkbenchPipelineStatus.Unavailable(pipelineId);
+            };
+            runtime.updateState(state -> state.withSelectedPipelineStatus(Optional.of(status)));
+        }
+
+        private void clearSelectedPipelineStatus() {
+            if (runtime.state().selectedPipelineStatus().isEmpty()) {
+                return;
+            }
+            if (pipelineStatusCoordinator != null) {
+                pipelineStatusCoordinator.cancel();
+            }
+            runtime.updateState(state -> state.withSelectedPipelineStatus(Optional.empty()));
+        }
+
+        private void ensureLogs() {
+            if (runtime.state().selectedTab() != WorkbenchState.WorkbenchTab.LOGS) {
+                if (logCoordinator != null) logCoordinator.cancel();
+                return;
+            }
+            if (actionGateway == null || logCoordinator == null) {
+                return;
+            }
+            Optional<String> target = logsTargetId();
+            if (target.isEmpty()) {
+                runtime.updateState(state -> state.withLogs(Optional.empty()));
+                return;
+            }
+            String id = target.orElseThrow();
+            if (runtime.state().logs().map(WorkbenchLogsState::pipelineId).filter(id::equals).isPresent()) return;
+            runtime.updateState(state -> state.withLogs(Optional.of(WorkbenchLogsState.loading(id))));
+            logCoordinator.start(actionGateway, id, outcome -> runtime.runLater(() -> {
+                if (runtime.state().selectedTab() != WorkbenchState.WorkbenchTab.LOGS
+                        || runtime.state().logs().map(WorkbenchLogsState::pipelineId).filter(id::equals).isEmpty()) return;
+                runtime.updateState(state -> state.withLogs(state.logs().map(current -> switch (outcome) {
+                    case LogsOutcome.Found found -> current.append(found);
+                    case LogsOutcome.Rejected rejected -> current.fail(rejected.message());
+                    case LogsOutcome.Unreachable ignored -> current.fail("Logs are unreachable.");
+                })));
+                runtime.requestRender();
+            }), ignored -> { });
+        }
+
+        private Optional<String> logsTargetId() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) return Optional.empty();
+            List<WorkbenchArtifactRow> rows = WorkbenchRenderer.sorted(
+                    state.snapshot().orElseThrow().pipelines().rows(), state.pipelinesTable());
+            if (rows.isEmpty()) return Optional.empty();
+            WorkbenchArtifactRow row = rows.get(Math.clamp(state.pipelinesTable().selectedIndex(), 0, rows.size() - 1));
+            return row.remote().isEmpty() ? Optional.empty() : Optional.of(row.key().id());
+        }
+
+        private Optional<String> selectedRemotePipelineId() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            List<WorkbenchArtifactRow> rows = WorkbenchRenderer.sorted(
+                    state.snapshot().orElseThrow().pipelines().rows(), state.pipelinesTable());
+            if (rows.isEmpty()) {
+                return Optional.empty();
+            }
+            WorkbenchArtifactRow row = rows.get(Math.clamp(state.pipelinesTable().selectedIndex(), 0, rows.size() - 1));
+            return row.remote().isEmpty() ? Optional.empty() : Optional.of(row.key().id());
+        }
+
+        private void ensureInspect() {
+            if (runtime.state().selectedTab() != WorkbenchState.WorkbenchTab.INSPECT) {
+                if (inspectCoordinator != null) {
+                    inspectCoordinator.cancel();
+                }
+                return;
+            }
+            if (actionGateway == null || inspectCoordinator == null || runtime.state().overlay().isPresent()) {
+                return;
+            }
+            Optional<String> selected = selectedRemotePipelineId();
+            if (selected.isEmpty()) {
+                inspectCoordinator.cancel();
+                runtime.updateState(state -> state.withInspect(Optional.empty()));
+                return;
+            }
+            String id = selected.orElseThrow();
+            if (runtime.state().inspect().map(WorkbenchInspectState::pipelineId).filter(id::equals).isEmpty()) {
+                runtime.updateState(state -> state.withInspect(Optional.of(new WorkbenchInspectState.Loading(id))));
+            }
+            inspectCoordinator.start(id,
+                    () -> actionGateway.readPipelineMetrics(new WorkbenchActionGateway.PipelineMetricsRequest(id)),
+                    result -> completeInspect(id, result));
+        }
+
+        private void completeInspect(String pipelineId, WorkbenchActionGateway.PipelineMetricsResult result) {
+            if (runtime.state().selectedTab() != WorkbenchState.WorkbenchTab.INSPECT
+                    || selectedRemotePipelineId().filter(pipelineId::equals).isEmpty()) {
+                return;
+            }
+            WorkbenchInspectState next = switch (result) {
+                case WorkbenchActionGateway.PipelineMetricsResult.Available available -> {
+                    MovementReading current = MetricsFacts.movementOf(available.facts());
+                    MovementReading previous = runtime.state().inspect()
+                            .filter(WorkbenchInspectState.Available.class::isInstance)
+                            .map(WorkbenchInspectState.Available.class::cast)
+                            .filter(value -> pipelineId.equals(value.pipelineId()))
+                            .map(WorkbenchInspectState.Available::current)
+                            .orElse(null);
+                    yield new WorkbenchInspectState.Available(pipelineId, available.metrics(),
+                            available.targetAckedPosition(), available.positionsNotCollected(), available.facts(),
+                            previous, current, java.time.Instant.now());
+                }
+                case WorkbenchActionGateway.PipelineMetricsResult.Rejected rejected ->
+                        new WorkbenchInspectState.Rejected(pipelineId, rejected.code(), rejected.message());
+                case WorkbenchActionGateway.PipelineMetricsResult.Unreachable ignored ->
+                        new WorkbenchInspectState.Unreachable(pipelineId);
+                case WorkbenchActionGateway.PipelineMetricsResult.Unavailable ignored ->
+                        new WorkbenchInspectState.Unavailable(pipelineId);
+            };
+            runtime.updateState(state -> state.withInspect(Optional.of(next)));
+        }
+
+        private int visibleRows() {
+            return Math.max(1, layout.visibleRowCapacity());
+        }
+    }
+
+    /** Samples one selected Pipeline while Inspect is open; stale selections never publish. */
+    private static final class SelectedPipelineInspectCoordinator implements AutoCloseable {
+
+        private final WorkbenchRuntime runtime;
+        private final ScheduledThreadPoolExecutor worker;
+        private ScheduledFuture<?> active;
+        private String activePipelineId;
+        private long sequence;
+        private boolean closed;
+
+        private SelectedPipelineInspectCoordinator(WorkbenchRuntime runtime) {
+            this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.worker = new ScheduledThreadPoolExecutor(1, task -> {
+                Thread thread = new Thread(task, "tapstate-pipeline-inspect");
+                thread.setDaemon(true);
+                return thread;
+            });
+            this.worker.setRemoveOnCancelPolicy(true);
+        }
+
+        synchronized void start(
+                String pipelineId,
+                Supplier<WorkbenchActionGateway.PipelineMetricsResult> read,
+                Consumer<WorkbenchActionGateway.PipelineMetricsResult> completion) {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(read, "read");
+            Objects.requireNonNull(completion, "completion");
+            if (closed || pipelineId.equals(activePipelineId)) {
+                return;
+            }
+            cancel();
+            activePipelineId = pipelineId;
+            long currentSequence = Math.incrementExact(sequence);
+            active = worker.scheduleWithFixedDelay(() -> {
+                WorkbenchActionGateway.PipelineMetricsResult result;
+                try {
+                    result = read.get();
+                } catch (RuntimeException failure) {
+                    result = new WorkbenchActionGateway.PipelineMetricsResult.Unavailable();
+                }
+                WorkbenchActionGateway.PipelineMetricsResult completed = result;
+                runtime.runLater(() -> complete(currentSequence, completed, completion));
+            }, 0, 5, TimeUnit.SECONDS);
+        }
+
+        synchronized void cancel() {
+            sequence = Math.incrementExact(sequence);
+            activePipelineId = null;
+            if (active != null) {
+                active.cancel(true);
+                active = null;
+            }
+        }
+
+        private synchronized void complete(
+                long completedSequence,
+                WorkbenchActionGateway.PipelineMetricsResult result,
+                Consumer<WorkbenchActionGateway.PipelineMetricsResult> completion) {
+            if (closed || completedSequence != sequence) {
+                return;
+            }
+            completion.accept(result);
+            runtime.requestRender();
+        }
+
+        @Override
+        public synchronized void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            cancel();
+            worker.shutdownNow();
+        }
+    }
+
+    /** Runs only the latest selected-Pipeline status lookup without interrupting mutation work. */
+    private static final class SelectedPipelineStatusCoordinator implements AutoCloseable {
+
+        private final WorkbenchRuntime runtime;
+        private final ThreadPoolExecutor worker;
+        private Future<?> active;
+        private long sequence;
+        private boolean closed;
+
+        private SelectedPipelineStatusCoordinator(WorkbenchRuntime runtime) {
+            this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.worker = new ThreadPoolExecutor(
+                    1, 1, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1),
+                    task -> {
+                        Thread thread = new Thread(task, "tapstate-pipeline-status");
+                        thread.setDaemon(true);
+                        return thread;
+                    }, new ThreadPoolExecutor.AbortPolicy());
+        }
+
+        synchronized void submit(
+                String pipelineId,
+                Supplier<WorkbenchActionGateway.PipelineStatusResult> read,
+                Consumer<WorkbenchActionGateway.PipelineStatusResult> completion) {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(read, "read");
+            Objects.requireNonNull(completion, "completion");
+            if (closed) {
+                return;
+            }
+            cancelActive();
+            long currentSequence = Math.incrementExact(sequence);
+            active = worker.submit(() -> {
+                WorkbenchActionGateway.PipelineStatusResult result;
+                try {
+                    result = read.get();
+                } catch (RuntimeException failure) {
+                    result = new WorkbenchActionGateway.PipelineStatusResult.Unavailable();
+                }
+                WorkbenchActionGateway.PipelineStatusResult completed = result;
+                runtime.runLater(() -> complete(currentSequence, completed, completion));
+            });
+        }
+
+        synchronized void cancel() {
+            sequence = Math.incrementExact(sequence);
+            cancelActive();
+        }
+
+        private synchronized void complete(
+                long completedSequence,
+                WorkbenchActionGateway.PipelineStatusResult result,
+                Consumer<WorkbenchActionGateway.PipelineStatusResult> completion) {
+            if (closed || completedSequence != sequence) {
+                return;
+            }
+            active = null;
+            completion.accept(result);
+            runtime.requestRender();
+        }
+
+        private void cancelActive() {
+            if (active != null) {
+                active.cancel(true);
+                active = null;
+            }
+        }
+
+        @Override
+        public synchronized void close() {
+            closed = true;
+            cancelActive();
+            worker.shutdownNow();
+        }
+    }
+}
