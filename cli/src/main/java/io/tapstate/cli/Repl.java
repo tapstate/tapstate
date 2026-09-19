@@ -5398,17 +5398,22 @@ final class Repl {
             serverLine = "not connected";
         } else {
             ControlPlaneClient.ServerVersion reported = controlPlane.serverVersionDetail(session.landingNode());
-            serverLine = (reported == null || reported.version() == null ? "not reported" : reported.version())
+            serverLine = (reported == null ? "not reported" : reported.version())
                     + " (" + hostPort(session.landingNode()) + ")";
-            if (reported != null && reported.dslVersions() != null) {
-                dslLine = String.join(", ", reported.dslVersions());
-            }
-            if (reported != null && reported.dataVersion() != null) {
-                dataLine = String.valueOf(reported.dataVersion());
-            }
+            dslLine = grammarLine(reported);
+            dataLine = reported == null || reported.dataVersion() == null
+                    ? "not reported"
+                    : String.valueOf(reported.dataVersion());
         }
         VersionCmd.render(commandLine.getOut(), serverLine, dslLine, dataLine);
         return Cli.EXIT_OK;
+    }
+
+    private static String grammarLine(ControlPlaneClient.ServerVersion reported) {
+        if (reported == null || reported.dslVersions() == null) {
+            return "not reported";
+        }
+        return reported.dslVersions().isEmpty() ? "none" : String.join(", ", reported.dslVersions());
     }
 
     /** Clears the connection back to offline; a benign line either way, never an error. */

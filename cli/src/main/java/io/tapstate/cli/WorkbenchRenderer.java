@@ -1669,6 +1669,7 @@ final class WorkbenchRenderer {
             rootHints.addAll(hints);
             hints = List.copyOf(rootHints);
         }
+        hints = compactFooterHints(hints, area.width());
         int x = area.x();
         List<FooterHit> hits = new ArrayList<>();
         for (FooterHint hint : hints) {
@@ -1686,6 +1687,19 @@ final class WorkbenchRenderer {
             }
         }
         return new FooterLayout(hits);
+    }
+
+    private static List<FooterHint> compactFooterHints(List<FooterHint> hints, int width) {
+        if (footerWidth(hints) <= width) {
+            return hints;
+        }
+        List<FooterHint> compacted = new ArrayList<>(hints);
+        compacted.removeIf(hint -> "F6".equals(hint.key()) && "shell".equals(hint.label()));
+        return List.copyOf(compacted);
+    }
+
+    private static int footerWidth(List<FooterHint> hints) {
+        return hints.stream().mapToInt(hint -> hint.key().length() + hint.label().length() + 7).sum();
     }
 
     private static List<FooterHint> pipelineFooter(WorkbenchState state, boolean hasSelectableRows) {

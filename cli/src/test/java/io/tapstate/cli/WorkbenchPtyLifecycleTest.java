@@ -42,7 +42,7 @@ class WorkbenchPtyLifecycleTest {
         try (JvmPtyFixture pty = JvmPtyFixture.start(home, JvmPtyFixture.Mode.BACKEND_SELECTION)) {
             pty.resize(100, 24);
             pty.awaitText("__TAPSTATE_BACKEND__io.tapstate.cli.WorkbenchTerminalBackend", SCREEN_TIMEOUT);
-            quit(pty);
+            pty.send("q");
 
             assertThat(pty.awaitExit(EXIT_TIMEOUT)).as(pty::visibleTranscript).isTrue();
             assertThat(pty.childExitStatus()).isZero();

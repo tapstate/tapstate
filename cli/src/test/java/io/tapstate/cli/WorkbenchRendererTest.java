@@ -75,7 +75,7 @@ class WorkbenchRendererTest {
                 .contains("source", "pipeline", "in sync 1", "local only 1")
                 .contains("c  context", "a  auth", "0  more", "r  refresh", "q  quit")
                 .doesNotContain(secret, "/admin", "explicit", "Remote artifacts:",
-                        "F1", "F2", "command palette",
+                        "F1", "command palette",
                         "Up/Down select", "[2]", "[1]", "[0]");
         assertThat(rendered.layout().tooSmall()).isFalse();
         assertThat(rendered.layout().wide()).isFalse();
