@@ -152,10 +152,7 @@ public final class JoinDag {
             if (row == null) {
                 return "";
             }
-            List<Object> values = new ArrayList<>(columns.size());
-            for (String column : columns) {
-                values.add(row.get(column));
-            }
+            List<Object> values = JoinKeys.valuesOf(row, columns);
             JoinKey key = JoinKey.of(values);
             // A key with a null in it matches nothing, so where it lands is free - but it still has to
             // land somewhere, and every such row landing together would be a hot partition made of rows

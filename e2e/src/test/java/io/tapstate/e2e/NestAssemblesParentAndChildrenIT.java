@@ -39,9 +39,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * root is what separates "children were attached" from "children were attached to whoever came first",
  * which an implementation ignoring the join key satisfies while the first root's assertion still passes.
  *
- * <p>Read mode is {@code snapshot_and_cdc} rather than {@code snapshot_only} deliberately: a stateful
- * node needs every row to carry its order, and a source reading no chain of its own supplies none. The
- * seeded rows still arrive as snapshot reads; the change stream is what puts them on a chain.
+ * <p>Read mode is {@code snapshot_and_cdc} because this case exercises the complete snapshot-to-tail path.
+ * The seeded rows still arrive as snapshot reads and the change stream keeps the source live.
  *
  * <p>Gated on Docker and on a directory of real connector jars, like its flat siblings
  * {@link RealMysqlToMongoSnapshotIT} and {@link RealMysqlToMongoCdcIT}. Run it with:
