@@ -54,6 +54,39 @@ class ClusterMembershipGateTest {
         assertThat(ClusterMembershipGate.strictMajority(4, 3)).isTrue();
     }
 
+    /**
+     * Two readings of one predicate, and the one that admits work waits for the one that serves it.
+     *
+     * <p>This is not symmetry for its own sake. The cluster library caches its reading and recomputes
+     * it when the membership changes and on a timer of its own, so right after a cluster forms this
+     * side says yes for up to a heartbeat interval while every ring and map still refuses. A run
+     * admitted then reaches RUNNING and dies on its first write - and it dies permanently, for a
+     * condition that clears itself seconds later. Measured on a two-member cluster: committed at
+     * 23:14:18, admitted immediately, first ring write refused at 23:14:19, pipeline FAILED at 23:14:20.
+     *
+     * <p>Asserted in both directions, because only one of them is the defect: refusing while the data
+     * plane refuses is the fix, and refusing after it agrees would be a gate that never opens.
+     */
+    @Test
+    void workIsNotAdmittedWhileThisMembersOwnDataPlaneWouldRefuseIt() {
+        ClusterMembershipGate gate = productionGate();
+        gate.install(new ClusterMembership("cluster-a", 1, Set.of("a", "b", "c")));
+        assertThat(gate.canCommit(Set.of("a", "b")))
+                .describedAs("this side's own answer, which is yes")
+                .isTrue();
+
+        gate.observeDataPlane(() -> false);
+        assertThat(gate.businessEligible())
+                .describedAs("the data plane has not caught up, so nothing may be taken on yet")
+                .isFalse();
+
+        gate.observeDataPlane(() -> true);
+        assertThat(gate.businessEligible())
+                .describedAs("and once it agrees, this member takes work on again without anything "
+                        + "else having to change")
+                .isTrue();
+    }
+
     private static ClusterMembershipGate productionGate() {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);

@@ -6,8 +6,10 @@ import io.tapstate.spi.store.ClusterMembership;
 
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 /** Non-blocking local view of the durable membership predicate used by data structures and controllers. */
 final class ClusterMembershipGate implements SplitBrainProtectionFunction {
@@ -22,6 +24,12 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     private final AtomicReference<ClusterMembership> committed = new AtomicReference<>();
     private final AtomicReference<Set<String>> visible = new AtomicReference<>(Set.of());
 
+    /**
+     * The data plane's own answer to this same predicate. Until a member binds one, nothing is asked -
+     * a build with no member has no data plane to disagree with.
+     */
+    private final AtomicReference<BooleanSupplier> dataPlane = new AtomicReference<>(() -> true);
+
     ClusterMembershipGate(ClusterProperties properties) {
         this.profile = properties.getProfile();
         this.bootstrapMinMembers = properties.getBootstrapMinMembers();
@@ -32,8 +40,34 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
         return eligible(rememberVisible(nodeIds(members)));
     }
 
+    /**
+     * Whether this member may take work on, which requires the data plane to agree that it may.
+     *
+     * <p>Both sides read this one predicate, and they do not read it at the same moment. This side is
+     * computed on the spot; the cluster library caches its side and recomputes it when the membership
+     * changes and on a timer of its own - so for up to one heartbeat interval after a cluster forms,
+     * this side says yes while every ring and map the work would touch still refuses. Work admitted in
+     * that window is admitted onto a data plane that will not accept a single write, and what the
+     * operator sees is a pipeline that reaches RUNNING and dies, permanently, for a condition that
+     * cleared itself seconds later.
+     *
+     * <p>So admission waits for the slower of the two. It can only ever delay work by the length of
+     * that window - the answer this side would have given is still required - and the rest of this
+     * class is what makes that answer fail closed. The direction matters: disagreeing by refusing is a
+     * pause, and disagreeing by admitting is a dead run.
+     */
     boolean businessEligible() {
-        return eligible(visible.get());
+        return eligible(visible.get()) && dataPlane.get().getAsBoolean();
+    }
+
+    /**
+     * Binds the data plane's answer, once the member whose answer it is exists.
+     *
+     * <p>Bound afterwards rather than taken in the constructor because this gate is handed to the
+     * member's own configuration: it has to exist before the member it then asks.
+     */
+    void observeDataPlane(BooleanSupplier admits) {
+        dataPlane.set(Objects.requireNonNull(admits, "admits"));
     }
 
     boolean canCommit(Set<String> visibleNodeIds) {

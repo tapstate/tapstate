@@ -12,6 +12,7 @@ import com.hazelcast.splitbrainprotection.SplitBrainProtectionOn;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
@@ -106,6 +107,11 @@ class HazelcastConfiguration {
             throw startupFailure;
         }
         if (identity != null) {
+            // What the rings and maps of this member will answer when work reaches them. Asked rather
+            // than assumed, because the library caches its answer and recomputes it on its own schedule:
+            // admitting work this member's data plane is still refusing produces a run that reaches
+            // RUNNING and then dies on its first write.
+            membershipGate.observeDataPlane(() -> dataPlaneAdmitsWork(member));
             member.getUserContext().put("tapstate.cluster.id", identity.clusterId());
             member.getUserContext().put("tapstate.cluster.node-id", identity.nodeId());
             member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
@@ -487,6 +493,27 @@ class HazelcastConfiguration {
         // there is nothing behind the pattern being shadowed yet - which is exactly the state the nest
         // maps were in until the day one was added.
         return config;
+    }
+
+    /**
+     * Whether this member's own rings and maps would accept a write right now.
+     *
+     * <p>Not a second opinion on the same question: it is the same call. What a ring does before it
+     * accepts a write ends in {@code hasMinimumSize()}, which is what this reads - so the two cannot
+     * drift apart without the library's own enforcement drifting with them.
+     *
+     * <p>A member on its way out answers no rather than throwing: shutdown order between the member and
+     * whatever is still asking is not ours to fix here, and a member that is stopping is a member that
+     * must not be taking work on anyway.
+     */
+    private static boolean dataPlaneAdmitsWork(HazelcastInstance member) {
+        try {
+            return member.getSplitBrainProtectionService()
+                    .getSplitBrainProtection(ClusterMembershipGate.PROTECTION_NAME)
+                    .hasMinimumSize();
+        } catch (HazelcastInstanceNotActiveException stopping) {
+            return false;
+        }
     }
 
     static void configureClusterProtection(Config config, ClusterMembershipGate gate) {
