@@ -89,6 +89,7 @@ U+1F4C4 PAGE FACING UP                            Terminal UI tab icon.
 U+1F4DC SCROLL                                   Terminal UI log tab icon.
 U+1F500 TWISTED RIGHTWARDS ARROWS                 Terminal UI pipeline icon.
 U+1F50C ELECTRIC PLUG                             Terminal UI source icon.
+U+1F50E RIGHT-POINTING MAGNIFYING GLASS            Terminal UI inspect tab icon.
 U+1F510 LOCK                                     Terminal UI authentication icon.
 U+1F680 ROCKET                                    Terminal UI action icon.
 U+1F9ED COMPASS                                  Terminal UI context icon.
