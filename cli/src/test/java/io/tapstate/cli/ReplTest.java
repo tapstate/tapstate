@@ -542,7 +542,8 @@ class ReplTest {
         }
 
         /** What every member answers, which is the same answer: the cluster, not the node reached. */
-        ClusterMembersOutcome clusterOutcome = new ClusterMembersOutcome.Listed(null, null, List.of());
+        ClusterMembersOutcome clusterOutcome =
+                new ClusterMembersOutcome.Listed(null, null, List.of(), List.of());
 
         final List<String> clusterCalls = new ArrayList<>();
 
@@ -1297,6 +1298,112 @@ class ReplTest {
         assertThat(prompter.secretQuestions).isNotEmpty();   // the password was read masked, never echoed
         assertThat(client.loginCalls).containsExactly("alice:s3cret@http://localhost:7900");
         assertThat(h.sink().toString()).contains("logged in as alice");
+    }
+
+    @Test
+    void loggingInLearnsWhereElseTheSessionCanGoFromTheClusterItself() {
+        // A seed list is what somebody typed once. A cluster that has grown since has members it has
+        // never heard of, and until this runs the session can only ever move back to a node in it.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-abc");
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("test-cluster", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "http://localhost:7900", "ACTIVE"),
+                new RemoteClusterMember("node-b", "uuid-b", "boot-b", "[127.0.0.1]:5702",
+                        "http://node-b.example:7900", "ACTIVE")), List.of());
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("s3cret"));
+        h.repl().dispatch("connect localhost:7900");
+
+        assertThat(h.repl().dispatch("login alice")).isTrue();
+
+        assertThat(h.repl().session().members())
+                .as("the member the cluster advertises and the session was never seeded with is now "
+                        + "somewhere this session can fail over to")
+                .contains(URI.create("http://node-b.example:7900"));
+        assertThat(h.repl().session().members())
+                .as("and the node it is actually on is still among them: an advertised address can be "
+                        + "one this client cannot dial, and trading a candidate that demonstrably works "
+                        + "for one that might not has nothing on its side")
+                .contains(URI.create("http://localhost:7900"));
+    }
+
+    @Test
+    void theNodeTheSessionIsOnStaysACandidateEvenWhenTheClusterDoesNotAdvertiseIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-abc");
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("test-cluster", 7L, List.of(
+                new RemoteClusterMember("node-b", "uuid-b", "boot-b", "[127.0.0.1]:5702",
+                        "http://node-b.internal:7900", "ACTIVE")), List.of());
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("s3cret"));
+        h.repl().dispatch("connect localhost:7900");
+
+        assertThat(h.repl().dispatch("login alice")).isTrue();
+
+        assertThat(h.repl().session().members())
+                .as("a member can advertise an address only reachable from inside the cluster, so "
+                        + "discovery adds places to go and never takes one away -- and the node this "
+                        + "session is demonstrably talking to is the one it must not lose")
+                .contains(URI.create("http://localhost:7900"))
+                .contains(URI.create("http://node-b.internal:7900"));
+    }
+
+    @Test
+    void theClusterIsAskedWhoItsMembersAreOncePerConnectionAndNotPerCommand() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-abc");
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("test-cluster", 7L, List.of(
+                new RemoteClusterMember("node-b", "uuid-b", "boot-b", "[127.0.0.1]:5702",
+                        "http://node-b.example:7900", "ACTIVE")), List.of());
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("s3cret", "s3cret"));
+        h.repl().dispatch("connect localhost:7900");
+
+        h.repl().dispatch("login alice");
+        h.repl().dispatch("login alice");
+
+        assertThat(client.clusterCalls)
+                .as("a cached session is re-activated before every API call, so asking each time would "
+                        + "put a second round trip in front of every command this CLI runs")
+                .hasSize(1);
+        assertThat(h.repl().session().members())
+                .as("and what it learned survives the re-authentication rather than falling back to "
+                        + "the seeds, which would lose the member it went to the trouble of finding")
+                .contains(URI.create("http://node-b.example:7900"));
+    }
+
+    @Test
+    void membersAdvertisedByADifferentClusterAreNotAdopted() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-abc");
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("another-cluster", 7L, List.of(
+                new RemoteClusterMember("node-x", "uuid-x", "boot-x", "[127.0.0.1]:5701",
+                        "http://node-x.example:7900", "ACTIVE")), List.of());
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("s3cret"));
+        h.repl().dispatch("connect localhost:7900");
+
+        assertThat(h.repl().dispatch("login alice")).isTrue();
+
+        assertThat(h.repl().session().members())
+                .as("two clusters' members in one candidate set is a session that fails over into the "
+                        + "wrong cluster while holding a credential the right one issued -- exactly "
+                        + "what the issuer gate refuses at the seed, undone one level further in")
+                .containsExactly(URI.create("http://localhost:7900"));
+    }
+
+    @Test
+    void aClusterThatCannotAnswerLeavesTheSessionWhereItWas() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-abc");
+        client.clusterOutcome = new ClusterMembersOutcome.Unreachable();
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("s3cret"));
+        h.repl().dispatch("connect localhost:7900");
+
+        assertThat(h.repl().dispatch("login alice")).isTrue();
+
+        assertThat(h.repl().session().isAuthenticated())
+                .as("this makes a session better informed; it is not a step logging in depends on")
+                .isTrue();
+        assertThat(h.repl().session().members())
+                .containsExactly(URI.create("http://localhost:7900"));
     }
 
     @Test
@@ -4853,7 +4960,7 @@ class ReplTest {
                 new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
                         "https://a.example:8443", "ACTIVE"),
                 new RemoteClusterMember("node-b", "uuid-b", "boot-b", "[127.0.0.1]:5702",
-                        "https://b.example:8443", "JOINING")));
+                        "https://b.example:8443", "JOINING")), List.of());
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -4871,7 +4978,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", null, List.of(
                 new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
-                        "https://a.example:8443", "ACTIVE")));
+                        "https://a.example:8443", "ACTIVE")), List.of());
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -4890,7 +4997,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(node1, node2);
         client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
                 new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
-                        "https://a.example:8443", "ACTIVE")));
+                        "https://a.example:8443", "ACTIVE")), List.of());
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
         h.repl().session().connect(List.of(node1, node2), node1);
         h.repl().session().authenticate("jwt-tok", "alice", null, List.of(node1, node2));
@@ -4902,6 +5009,141 @@ class ReplTest {
                 .as("the topology is the cluster's answer, so a node that cannot give it is a node to "
                         + "move off, not an answer")
                 .containsExactly("jwt-tok@http://node1:7900", "jwt-tok@http://node2:7900");
+    }
+
+    @Test
+    void clusterSaysWhoOwnsEachPipelineAndWhereItsVerticesAreRunning() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE"),
+                new RemoteClusterMember("node-b", "uuid-b", "boot-b", "[127.0.0.1]:5702",
+                        "https://b.example:8443", "ACTIVE")),
+                List.of(running("orders", "node-b", 3L, 7L)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("cluster")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out)
+                .as("who owns it and under which generations -- the pair is what tells one run of a "
+                        + "pipeline from the next, and an operator comparing two readings needs both")
+                .contains("orders").contains("claim 3").contains("execution 7");
+        assertThat(out)
+                .as("and where each vertex's work is, by the node names a reader can act on: a vertex "
+                        + "pinned to one member on one, an ordinary one on both")
+                .contains("source").contains("serve-orders").contains("node-a, node-b");
+    }
+
+    @Test
+    void aPipelineTheClusterIsNotRunningIsListedAndSaysSo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE")),
+                List.of(new RemotePipeline("orders",
+                        new RemoteClaim("orders", "node-b", "boot-b", 3L, 7L, false),
+                        List.of(), null, List.of(), List.of(), List.of())));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("cluster")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark))
+                .as("the pipeline that is supposed to be running and is not is the first one anybody "
+                        + "looks for, and its last owner plus a lapsed lease is the whole of why")
+                .contains("orders").contains("not running").contains("lease expired");
+    }
+
+    @Test
+    void aPlacementStillArrivingFromSomeMembersSaysSoRatherThanReadingAsNarrow() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE"),
+                new RemoteClusterMember("node-b", "uuid-b", "boot-b", "[127.0.0.1]:5702",
+                        "https://b.example:8443", "ACTIVE")),
+                List.of(new RemotePipeline("orders",
+                        new RemoteClaim("orders", "node-b", "boot-b", 3L, 7L, true),
+                        List.of(), "2026-09-19T08:30:00Z", List.of("uuid-b"), List.of(),
+                        List.of(new RemoteVertex("serve-orders", null, 1, null, "exec-1",
+                                List.of(new RemoteProcessor(0, "uuid-b", "node-b")))))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("cluster")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark))
+                .as("for the first seconds of a run the readings have arrived from some members and not "
+                        + "others; without this the half-assembled picture reads as a pipeline that is "
+                        + "genuinely running in one place")
+                .contains("measured from 1 of 2 members");
+    }
+
+    @Test
+    void theMachineSurfacesOmitAVertexParallelismNobodyAskedFor() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE")),
+                List.of(running("orders", "node-b", 3L, 7L)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("cluster -o json")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out)
+                .as("nothing in the plan pins a vertex's parallelism yet; a reader given a number here "
+                        + "would read it as what was asked for")
+                .doesNotContain("requested").doesNotContain("computedLocal");
+        assertThat(out)
+                .as("what is measured is published, so the two can be compared once there is something "
+                        + "to compare")
+                .contains("effective").contains("executionId");
+    }
+
+    @Test
+    void clusterNamesTheMembersARunningPipelineIsGivingNoWorkTo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE"),
+                new RemoteClusterMember("node-c", "uuid-c", "boot-c", "[127.0.0.1]:5703",
+                        "https://c.example:8443", "ACTIVE")),
+                List.of(new RemotePipeline("orders",
+                        new RemoteClaim("orders", "node-a", "boot-a", 3L, 7L, true),
+                        List.of(), "2026-09-19T08:30:00Z", List.of("uuid-a"), List.of("node-c"),
+                        List.of(new RemoteVertex("serve-orders", null, 1, null, "exec-1",
+                                List.of(new RemoteProcessor(0, "uuid-a", "node-a")))))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("cluster")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark))
+                .as("'I added a machine and nothing happened' is answered here rather than by the "
+                        + "operator diffing a member list against a placement")
+                .contains("awaiting rebalance: node-c");
+    }
+
+    /** One pipeline with a pinned vertex on one member and an ordinary one on both. */
+    private static RemotePipeline running(
+            String pipelineId, String owner, long claimGeneration, long executionGeneration) {
+        return new RemotePipeline(
+                pipelineId,
+                new RemoteClaim(pipelineId, owner, "boot-b", claimGeneration, executionGeneration, true),
+                List.of(new RemoteClaim("capture-f00d", "node-a", "boot-a", 1L, 1L, true)),
+                "2026-09-19T08:30:00Z",
+                List.of("uuid-a", "uuid-b"),
+                List.of(),
+                List.of(
+                        new RemoteVertex("source", null, 1, null, "exec-1",
+                                List.of(new RemoteProcessor(0, "uuid-b", "node-b"))),
+                        new RemoteVertex("serve-orders", null, 2, null, "exec-1", List.of(
+                                new RemoteProcessor(0, "uuid-a", "node-a"),
+                                new RemoteProcessor(1, "uuid-b", "node-b")))));
     }
 
     // --- status --watch / logs --follow stream over the websocket channel ------------------------

@@ -125,6 +125,38 @@ class CaptureOwnershipTest {
         assertThat(closed).as("the last local attachment releases the shared tail").hasValue(1);
     }
 
+    @Test
+    void theReadFaceNamesTheSameCaptureTheRunningCoordinatorClaimed() {
+        // The topology says who owns a pipeline's captures, and it works the identities out from the
+        // stored contract rather than asking whoever is running them -- so that every member answers the
+        // same. That only reports ownership if the id it derives is the id the claim is actually filed
+        // under: derive it even slightly differently and the read face looks up a claim nobody ever
+        // took, which is indistinguishable from a capture nobody owns.
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p"));
+        MemoryClaims raw = new MemoryClaims();
+        StoreBackedPipelineCaptureCoordinator owner = managed(
+                store, (spec, passthrough, startTail) -> run(() -> { }), eligibleGate(), raw,
+                new WorkloadOwner("node-a", "boot-a"));
+        owner.startCapture("p");
+
+        try {
+            assertThat(new StoreBackedPipelineCaptures(store).captureIds("p"))
+                    .as("the id the claim was filed under, worked out from the artifacts alone")
+                    .containsExactly(raw.current.key().resourceId());
+        } finally {
+            owner.stopCapture("p", false);
+        }
+    }
+
+    @Test
+    void aPipelineWhoseArtifactsAreGoneNamesNoCaptureRatherThanInventingOne() {
+        assertThat(new StoreBackedPipelineCaptures(new InMemoryStorePort(new InMemoryArtifactStore()))
+                        .captureIds("p"))
+                .as("there is no contract to derive an id from, and an invented one would file a "
+                        + "reader's attention under a claim nobody holds")
+                .isEmpty();
+    }
+
     private static StoreBackedPipelineCaptureCoordinator managed(
             InMemoryStorePort store,
             CaptureAttacher attacher,

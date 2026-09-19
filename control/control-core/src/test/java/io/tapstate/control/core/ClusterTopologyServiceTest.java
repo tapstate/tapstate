@@ -27,7 +27,8 @@ class ClusterTopologyServiceTest {
     @Test
     void aMemberTheClusterHasCommittedIsActive() {
         ClusterTopologyService topology = new ClusterTopologyService(
-                () -> List.of(NODE_A, NODE_B), committed(4, "node-a", "node-b"), "cluster-a");
+                () -> List.of(NODE_A, NODE_B), committed(4, "node-a", "node-b"), noPipelines(),
+                "cluster-a");
 
         ClusterTopologyView view = topology.topology();
 
@@ -45,7 +46,7 @@ class ClusterTopologyServiceTest {
     @Test
     void aMemberTheEngineSeesButNobodyHasCommittedIsStillJoining() {
         ClusterTopologyService topology = new ClusterTopologyService(
-                () -> List.of(NODE_A, NODE_B), committed(4, "node-a"), "cluster-a");
+                () -> List.of(NODE_A, NODE_B), committed(4, "node-a"), noPipelines(), "cluster-a");
 
         assertThat(topology.topology().members())
                 .extracting(ClusterMemberView::nodeId, ClusterMemberView::state)
@@ -59,7 +60,7 @@ class ClusterTopologyServiceTest {
     @Test
     void aMemberTheClusterCommittedButTheEngineCannotSeeIsNotListed() {
         ClusterTopologyService topology = new ClusterTopologyService(
-                () -> List.of(NODE_A), committed(4, "node-a", "node-b"), "cluster-a");
+                () -> List.of(NODE_A), committed(4, "node-a", "node-b"), noPipelines(), "cluster-a");
 
         assertThat(topology.topology().members())
                 .extracting(ClusterMemberView::nodeId)
@@ -71,7 +72,7 @@ class ClusterTopologyServiceTest {
     @Test
     void withNothingCommittedNobodyIsReportedAsJoiningSomething() {
         ClusterTopologyService topology =
-                new ClusterTopologyService(() -> List.of(NODE_A), null, "cluster-a");
+                new ClusterTopologyService(() -> List.of(NODE_A), null, noPipelines(), "cluster-a");
 
         ClusterTopologyView view = topology.topology();
 
@@ -87,13 +88,20 @@ class ClusterTopologyServiceTest {
     @Test
     void membersComeBackInAStableOrder() {
         ClusterTopologyService topology = new ClusterTopologyService(
-                () -> List.of(NODE_B, NODE_A), committed(4, "node-a", "node-b"), "cluster-a");
+                () -> List.of(NODE_B, NODE_A), committed(4, "node-a", "node-b"), noPipelines(),
+                "cluster-a");
 
         assertThat(topology.topology().members())
                 .extracting(ClusterMemberView::nodeId)
                 .as("the engine's own order is not one; a list that reshuffles between reads cannot be "
                         + "diffed by anybody")
                 .containsExactly("node-a", "node-b");
+    }
+
+    /** This case is about the member half; the pipeline half has nothing to enumerate from. */
+    private static ClusterPipelineTopologyService noPipelines() {
+        return new ClusterPipelineTopologyService(
+                LivePipelineRuns.none(), PipelineCaptures.none(), null, null, "cluster-a");
     }
 
     private static ClusterMembershipStore committed(long revision, String... nodeIds) {

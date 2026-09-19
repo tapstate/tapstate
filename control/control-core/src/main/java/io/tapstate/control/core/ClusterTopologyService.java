@@ -22,11 +22,17 @@ import java.util.Set;
  * <p>A member the committed set names but the engine cannot see is deliberately not listed: this
  * answers what is here, and a node that is gone is absent from it. That it was committed is readable
  * from the claims it still holds, which outlive it by exactly one lease.
+ *
+ * <p>The pipeline half is joined on here rather than asked for separately, because the two halves answer
+ * one question between them: a pipeline's work is reported against members, and a reader given the
+ * pipelines without the members they run on would have to take a second reading to make sense of the
+ * first -- by which time the cluster may have changed underneath both.
  */
 public final class ClusterTopologyService {
 
     private final LiveClusterMembers live;
     private final ClusterMembershipStore committed;
+    private final ClusterPipelineTopologyService pipelines;
     private final String clusterId;
 
     /**
@@ -34,9 +40,13 @@ public final class ClusterTopologyService {
      *                  a single node is the whole cluster, and there is nothing for it to be outside of
      */
     public ClusterTopologyService(
-            LiveClusterMembers live, ClusterMembershipStore committed, String clusterId) {
+            LiveClusterMembers live,
+            ClusterMembershipStore committed,
+            ClusterPipelineTopologyService pipelines,
+            String clusterId) {
         this.live = Objects.requireNonNull(live, "live");
         this.committed = committed;
+        this.pipelines = Objects.requireNonNull(pipelines, "pipelines");
         this.clusterId = clusterId;
     }
 
@@ -57,7 +67,13 @@ public final class ClusterTopologyService {
         members.sort(Comparator.comparing(
                 ClusterMemberView::nodeId, Comparator.nullsLast(Comparator.naturalOrder())));
         return new ClusterTopologyView(
-                clusterId, membership.map(ClusterMembership::revision).orElse(null), members);
+                clusterId,
+                membership.map(ClusterMembership::revision).orElse(null),
+                members,
+                // The member half goes into the pipeline half: a processor is reported under the
+                // engine's identity for this run of a member while a claim names the stable one, and
+                // which members a run is carrying no part of is a question about both.
+                pipelines.pipelines(members));
     }
 
     private static ClusterMemberState stateOf(LiveClusterMember member, Set<String> active) {

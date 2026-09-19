@@ -789,6 +789,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     /** The topology decoded from a 200 body; a field the server did not send stays null, never a default. */
     private static ClusterMembersOutcome.Listed topology(String body) {
         List<RemoteClusterMember> members = new ArrayList<>();
+        List<RemotePipeline> pipelines = new ArrayList<>();
         String clusterId = null;
         Long revision = null;
         if (JsonReader.parse(body) instanceof Map<?, ?> map) {
@@ -807,8 +808,90 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     }
                 }
             }
+            pipelines.addAll(pipelines(map));
         }
-        return new ClusterMembersOutcome.Listed(clusterId, revision, members);
+        return new ClusterMembersOutcome.Listed(clusterId, revision, members, pipelines);
+    }
+
+    /** The pipeline half of a topology body; a field the server did not send stays null. */
+    private static List<RemotePipeline> pipelines(Map<?, ?> map) {
+        List<RemotePipeline> pipelines = new ArrayList<>();
+        if (!(map.get("pipelines") instanceof List<?> list)) {
+            return pipelines;
+        }
+        for (Object entry : list) {
+            if (!(entry instanceof Map<?, ?> m)) {
+                continue;
+            }
+            List<RemoteClaim> captures = new ArrayList<>();
+            if (m.get("captureClaims") instanceof List<?> claims) {
+                for (Object claim : claims) {
+                    if (claim instanceof Map<?, ?> c) {
+                        captures.add(claim(c));
+                    }
+                }
+            }
+            List<String> measuredFrom = new ArrayList<>();
+            if (m.get("measuredFrom") instanceof List<?> from) {
+                for (Object member : from) {
+                    measuredFrom.add(stringOrNull(member));
+                }
+            }
+            List<String> awaiting = new ArrayList<>();
+            if (m.get("awaitingRebalance") instanceof List<?> waiting) {
+                for (Object member : waiting) {
+                    awaiting.add(stringOrNull(member));
+                }
+            }
+            List<RemoteVertex> vertices = new ArrayList<>();
+            if (m.get("vertices") instanceof List<?> list2) {
+                for (Object vertex : list2) {
+                    if (vertex instanceof Map<?, ?> v) {
+                        vertices.add(vertex(v));
+                    }
+                }
+            }
+            pipelines.add(new RemotePipeline(
+                    stringOrNull(m.get("pipelineId")),
+                    m.get("controllerClaim") instanceof Map<?, ?> c ? claim(c) : null,
+                    captures,
+                    stringOrNull(m.get("measuredAt")),
+                    measuredFrom,
+                    awaiting,
+                    vertices));
+        }
+        return pipelines;
+    }
+
+    private static RemoteClaim claim(Map<?, ?> claim) {
+        return new RemoteClaim(
+                stringOrNull(claim.get("resourceId")),
+                stringOrNull(claim.get("ownerNodeId")),
+                stringOrNull(claim.get("ownerBootId")),
+                claim.get("claimGeneration") instanceof Number n ? n.longValue() : null,
+                claim.get("executionGeneration") instanceof Number n ? n.longValue() : null,
+                claim.get("leased") instanceof Boolean b ? b : null);
+    }
+
+    private static RemoteVertex vertex(Map<?, ?> vertex) {
+        List<RemoteProcessor> processors = new ArrayList<>();
+        if (vertex.get("processors") instanceof List<?> list) {
+            for (Object processor : list) {
+                if (processor instanceof Map<?, ?> p) {
+                    processors.add(new RemoteProcessor(
+                            p.get("index") instanceof Number n ? n.intValue() : null,
+                            stringOrNull(p.get("memberUuid")),
+                            stringOrNull(p.get("nodeId"))));
+                }
+            }
+        }
+        return new RemoteVertex(
+                stringOrNull(vertex.get("name")),
+                vertex.get("requested") instanceof Number n ? n.intValue() : null,
+                vertex.get("effective") instanceof Number n ? n.intValue() : null,
+                vertex.get("computedLocal") instanceof Number n ? n.intValue() : null,
+                stringOrNull(vertex.get("executionId")),
+                processors);
     }
 
     /** The connectors decoded from a 200 body's {@code connectors} array; empty if the shape is unexpected. */

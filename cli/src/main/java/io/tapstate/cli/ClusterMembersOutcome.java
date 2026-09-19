@@ -15,11 +15,19 @@ sealed interface ClusterMembersOutcome {
      * @param clusterId        the stable cluster identity, or null when the server did not say
      * @param topologyRevision the committed membership revision, or null when nothing is committed --
      *                         which is not the same as revision zero and must not be printed as one
+     * @param pipelines        every pipeline the cluster has been asked to run, whether or not it is
+     *                         running -- the one that is supposed to be and is not is the first one
+     *                         anybody looks for
      */
-    record Listed(String clusterId, Long topologyRevision, List<RemoteClusterMember> members)
+    record Listed(
+            String clusterId,
+            Long topologyRevision,
+            List<RemoteClusterMember> members,
+            List<RemotePipeline> pipelines)
             implements ClusterMembersOutcome {
         public Listed {
             members = List.copyOf(members);
+            pipelines = List.copyOf(pipelines);
         }
     }
 
