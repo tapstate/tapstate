@@ -127,9 +127,13 @@ class AJoinKeyIsTheValueRatherThanTheCarrierItArrivedInIT {
 
             awaitName(mongo, target, 10, "ada",
                     "a dimension row keyed by the driver's own type to be joined in");
-            assertThat(nameOf(mongo, target, 11))
-                    .as("a second fact row, on a different key, so one collision cannot pass for matching")
-                    .isEqualTo("bo");
+            // Awaited rather than read once. The two customers are separate dimension rows, and a
+            // snapshot that reads the fact table first publishes all three orders unmatched - so the
+            // count above is reached with every name still empty, and each customer then fills its own
+            // rows in its own turn. Reading this one the moment the one above appeared fails a run that
+            // is merely a moment behind, which is a red nothing about the product explains.
+            awaitName(mongo, target, 11, "bo",
+                    "a second fact row, on a different key, so one collision cannot pass for matching");
             assertThat(nameOf(mongo, target, 12))
                     .as("a fact row naming a key no customer holds keeps its joined column empty")
                     .isNull();
