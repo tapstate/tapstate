@@ -43,7 +43,9 @@ import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
 import java.util.function.IntSupplier;
 import java.util.function.Predicate;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+import java.util.function.ToIntFunction;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -1172,23 +1174,24 @@ final class Repl {
         out.println("following " + namespace + " · whole collection · streaming changes");
         out.println("note: shows changes as written to the store — not every intermediate version");
         out.flush();
-        streamCancelled = false;
-        String refusal = controlPlane.tail(session.landingNode(), session.credential(),
+        AtomicInteger shown = new AtomicInteger();
+        // Across members like the other two. What a change stream shows after a move is whatever the
+        // connector supplies from there, which the header above has already said this view cannot
+        // promise to be gapless -- but a view that stops updating with no line saying so promises less.
+        return streamAcrossMembers(shown, () -> controlPlane.tail(
+                session.landingNode(), session.credential(),
                 live.sourceId(), live.collection(), live.filter(),
                 change -> {
+                    shown.incrementAndGet();
                     TailRenderer.lines(change, screenWidth.getAsInt()).forEach(out::println);
                     out.flush();
                 },
-                this::isStreamCancelled);
-        if (refusal != null) {
-            // A follow that ended by itself arrives as a code and nothing else - the close frame has
-            // room for one. Rendering it from the bundled catalog is what turns "the screen stopped
-            // updating" into a sentence; handed on as a bare code with no message, the reader is told
-            // that something has a name and not what happened.
-            return renderRejection(refusal, MessageCatalog.bundled().render(refusal, Map.of()).message());
-        }
-        // A stream ends because the user stopped it, which is the way it is meant to end.
-        return Cli.EXIT_OK;
+                this::isStreamCancelled),
+                // A follow that ended by itself arrives as a code and nothing else - the close frame has
+                // room for one. Rendering it from the bundled catalog is what turns "the screen stopped
+                // updating" into a sentence; handed on as a bare code with no message, the reader is told
+                // that something has a name and not what happened.
+                code -> renderRejection(code, MessageCatalog.bundled().render(code, Map.of()).message()));
     }
 
     /**
@@ -3448,9 +3451,14 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         PrintWriter out = commandLine.getOut();
-        streamCancelled = false;
-        String refusal = controlPlane.watchStatus(session.landingNode(), session.credential(), id,
+        AtomicInteger shown = new AtomicInteger();
+        // Re-attaching re-reads the state rather than resuming a position, which is what the state is:
+        // a value in the store that any member answers, not a log this member happens to hold. Saying it
+        // again after a move is a re-poll, and a watcher who just saw the connection move is owed it.
+        return streamAcrossMembers(shown, () -> controlPlane.watchStatus(
+                session.landingNode(), session.credential(), id,
                 (pipelineId, state, failureCode, failureMessage) -> {
+                    shown.incrementAndGet();
                     out.println(pipelineId + "  " + state.toLowerCase(Locale.ROOT));
                     if (failureCode != null) {
                         // Mirrors the one-shot `status` read: a failed state that cannot say what failed
@@ -3460,12 +3468,48 @@ final class Repl {
                     }
                     out.flush();
                 },
-                this::isStreamCancelled);
-        if (refusal != null) {
-            return renderStreamRefusal(refusal, id);
+                this::isStreamCancelled), code -> renderStreamRefusal(code, id));
+    }
+
+    /** How many attaches in a row may show nothing before a stream stops looking for a member. */
+    private static final int MAX_BARREN_ATTACHES = 3;
+
+    /**
+     * Keeps a streamed read attached for as long as the user wants it, moving to another member when the
+     * one it was attached to stops serving. A stream ends in exactly three ways: the user stops it, the
+     * server refuses it with a code -- which no other member would answer differently, so moving would
+     * only ask the same question again -- or there is no member left to attach to.
+     *
+     * <p>An attach that shows nothing counts against a small budget, so that a member answering its
+     * health probe while refusing the stream cannot hold a watch in a loop nobody can see. Anything shown
+     * gives the budget back: a quiet watch is not the same as a watch that cannot attach.
+     */
+    private int streamAcrossMembers(
+            AtomicInteger shown, Supplier<String> attach, ToIntFunction<String> renderRefusal) {
+        streamCancelled = false;
+        int barren = 0;
+        while (true) {
+            int before = shown.get();
+            String refusal = attach.get();
+            if (refusal != null) {
+                return renderRefusal.applyAsInt(refusal);
+            }
+            if (isStreamCancelled()) {
+                // a stream ends because the user stopped it, which is the way it is meant to end
+                return Cli.EXIT_OK;
+            }
+            barren = shown.get() > before ? 0 : barren + 1;
+            if (barren >= MAX_BARREN_ATTACHES) {
+                PrintWriter err = commandLine.getErr();
+                err.println("stopped: no cluster member is serving this stream");
+                err.flush();
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+            if (!failover()) {
+                // failover already said the connection is lost, and took the session offline saying it
+                return Cli.EXIT_DIAGNOSTIC;
+            }
         }
-        // a stream ends because the user stopped it, which is the way it is meant to end
-        return Cli.EXIT_OK;
     }
 
     /**
@@ -3479,18 +3523,22 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         PrintWriter out = commandLine.getOut();
-        streamCancelled = false;
-        String refusal = controlPlane.followLogs(session.landingNode(), session.credential(), id,
-                (pipelineId, lines) -> {
-                    lines.forEach(line -> out.println(renderLogLine(line)));
-                    out.flush();
-                },
-                this::isStreamCancelled);
-        if (refusal != null) {
-            return renderStreamRefusal(refusal, id);
-        }
-        // a stream ends because the user stopped it, which is the way it is meant to end
-        return Cli.EXIT_OK;
+        AtomicInteger shown = new AtomicInteger();
+        PrintedLogTail printed = new PrintedLogTail();
+        return streamAcrossMembers(shown, () -> {
+            printed.attaching();
+            return controlPlane.followLogs(session.landingNode(), session.credential(), id,
+                    (pipelineId, lines) -> {
+                        List<RemoteLogLine> fresh = printed.notYetPrinted(lines);
+                        if (fresh.isEmpty()) {
+                            return;
+                        }
+                        shown.addAndGet(fresh.size());
+                        fresh.forEach(line -> out.println(renderLogLine(line)));
+                        out.flush();
+                    },
+                    this::isStreamCancelled);
+        }, code -> renderStreamRefusal(code, id));
     }
 
     /**

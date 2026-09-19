@@ -96,6 +96,14 @@ class ReplTest {
     private record Harness(Repl repl, StringWriter sink) {
     }
 
+    /** Gives a fake control plane the stop seam a person uses, so it can model a stopped stream. */
+    private static Harness wired(Repl repl, StringWriter sink, ControlPlaneClient controlPlane) {
+        if (controlPlane instanceof FakeControlPlane fake) {
+            fake.stopStreams = repl::cancelStream;
+        }
+        return new Harness(repl, sink);
+    }
+
     private static Harness harness() {
         return harness(Path.of("tap-work"));
     }
@@ -115,7 +123,7 @@ class ReplTest {
         PrintWriter pw = new PrintWriter(sink);
         cl.setOut(pw);
         cl.setErr(pw);
-        return new Harness(new Repl(cl, workdir, controlPlane), sink);
+        return wired(new Repl(cl, workdir, controlPlane), sink, controlPlane);
     }
 
     private static Harness harness(Path workdir, ControlPlaneClient controlPlane, Prompter prompter) {
@@ -124,7 +132,7 @@ class ReplTest {
         PrintWriter pw = new PrintWriter(sink);
         cl.setOut(pw);
         cl.setErr(pw);
-        return new Harness(new Repl(cl, workdir, controlPlane, prompter), sink);
+        return wired(new Repl(cl, workdir, controlPlane, prompter), sink, controlPlane);
     }
 
     /** A harness whose interpolation environment is the given map rather than the real process's. */
@@ -135,7 +143,7 @@ class ReplTest {
         PrintWriter pw = new PrintWriter(sink);
         cl.setOut(pw);
         cl.setErr(pw);
-        return new Harness(new Repl(cl, workdir, controlPlane, prompter, env::get), sink);
+        return wired(new Repl(cl, workdir, controlPlane, prompter, env::get), sink, controlPlane);
     }
 
     /**
@@ -250,6 +258,7 @@ class ReplTest {
                            Object filter, TailStream sink, java.util.function.BooleanSupplier stop) {
             dataBrowserCalls.add("tail " + sourceId + "." + collection + " filter=" + filter);
             tailFrames.forEach(sink::change);
+            endOfAttach();
             return tailRefusal;
         }
         Object lastFindFilter;
@@ -258,6 +267,34 @@ class ReplTest {
 
         FakeControlPlane(URI... healthy) {
             this.healthy = new LinkedHashSet<>(List.of(healthy));
+        }
+
+        /**
+         * How a stream ends. The two are not the same ending and the CLI has to tell them apart: a
+         * user stopping a watch is how it is meant to end, while a connection going away is a member
+         * this session has to move off. The double used to answer both by returning, which is what
+         * let "the node stopped serving this stream" read as "the user is done watching".
+         */
+        enum StreamEnding {
+            STOPPED,
+            DROPPED
+        }
+
+        /** How each attach ends, in order; the last entry repeats. Default: the user stopped it. */
+        final List<StreamEnding> streamEndings = new ArrayList<>(List.of(StreamEnding.STOPPED));
+
+        /** Wired to the repl's Ctrl-C seam, so a stop is modelled the way a person performs one. */
+        Runnable stopStreams = () -> { };
+
+        private int attaches;
+
+        /** Ends one attach the way this case asked for; each stream then answers with its own refusal. */
+        private void endOfAttach() {
+            StreamEnding ending = streamEndings.get(Math.min(attaches, streamEndings.size() - 1));
+            attaches++;
+            if (ending == StreamEnding.STOPPED) {
+                stopStreams.run();
+            }
         }
 
         @Override
@@ -514,6 +551,7 @@ class ReplTest {
                 }
                 sink.state(pipelineId, state, watchFailureCode, watchFailureMessage);
             }
+            endOfAttach();
             return streamRefusalCode;
         }
 
@@ -527,6 +565,7 @@ class ReplTest {
                 }
                 sink.lines(pipelineId, batch);
             }
+            endOfAttach();
             return streamRefusalCode;
         }
     }
@@ -1371,7 +1410,11 @@ class ReplTest {
         StringWriter err = new StringWriter();
         cl.setOut(new PrintWriter(out));
         cl.setErr(new PrintWriter(err));
-        return new SplitHarness(new Repl(cl, workdir, controlPlane, new ScriptedPrompter("pw")), out, err);
+        Repl repl = new Repl(cl, workdir, controlPlane, new ScriptedPrompter("pw"));
+        if (controlPlane instanceof FakeControlPlane fake) {
+            fake.stopStreams = repl::cancelStream;
+        }
+        return new SplitHarness(repl, out, err);
     }
 
     /** An authenticated session with stdout and stderr kept apart. */
@@ -4803,6 +4846,77 @@ class ReplTest {
         assertThat(out).contains("running").contains("paused");
         assertThat(out.indexOf("running")).isLessThan(out.indexOf("paused"));
         assertThat(client.watchCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
+    }
+
+    @Test
+    void aWatchWhoseMemberGoesAwayCarriesOnFromAnotherMember() {
+        URI node1 = URI.create("http://node1:7900");
+        URI node2 = URI.create("http://node2:7900");
+        FakeControlPlane client = new FakeControlPlane(node1, node2);
+        client.watchStates = List.of("RUNNING");
+        client.streamEndings.clear();
+        client.streamEndings.addAll(List.of(
+                FakeControlPlane.StreamEnding.DROPPED, FakeControlPlane.StreamEnding.STOPPED));
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
+        h.repl().session().connect(List.of(node1, node2), node1);
+        h.repl().session().authenticate("jwt-tok", "alice", null, List.of(node1, node2));
+        client.setHealthy(node2);
+
+        assertThat(h.repl().dispatch("status pl1 --watch")).isTrue();
+
+        assertThat(client.watchCalls)
+                .as("the member being watched from went away; the watch re-attaches to one that is "
+                        + "still there rather than retrying the node that is gone until somebody notices")
+                .containsExactly("jwt-tok@http://node1:7900/pl1", "jwt-tok@http://node2:7900/pl1");
+        assertThat(h.repl().session().landingNode())
+                .as("and the session moved with it, so the next verb does not start by failing over again")
+                .isEqualTo(node2);
+    }
+
+    @Test
+    void aFollowThatAttachesAgainCarriesOnInsteadOfReprintingTheWindow() {
+        // A fresh attach opens with the whole window the node holds, because the server's "already sent"
+        // bookkeeping lives in the connection that just went. Reprinting it is what makes a reconnect
+        // look like the pipeline logged everything twice.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.followBatches = List.of(List.of(
+                new RemoteLogLine(1_700_000_000_000L, "INFO", "submitted job"),
+                new RemoteLogLine(1_700_000_000_100L, "WARN", "slow tick")));
+        client.streamEndings.clear();
+        client.streamEndings.addAll(List.of(
+                FakeControlPlane.StreamEnding.DROPPED, FakeControlPlane.StreamEnding.STOPPED));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("logs pl1 --follow")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(client.followCalls).as("it did attach a second time").hasSize(2);
+        assertThat(occurrences(out, "submitted job")).isEqualTo(1);
+        assertThat(occurrences(out, "slow tick")).isEqualTo(1);
+    }
+
+    @Test
+    void aStreamNoMemberWillServeStopsRatherThanAttachingForever() {
+        // The member answers its health probe, so failover keeps re-landing on it, but it serves the
+        // stream to nobody. Without a budget this is a loop with no output and no end.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.watchStates = List.of();
+        client.streamEndings.clear();
+        client.streamEndings.add(FakeControlPlane.StreamEnding.DROPPED);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("status pl1 --watch")).isTrue();
+
+        assertThat(client.watchCalls).hasSize(3);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("no cluster member is serving this stream");
+    }
+
+    /** How many times {@code needle} appears in {@code text}; a reprint is the thing under test. */
+    private static int occurrences(String text, String needle) {
+        return text.split(java.util.regex.Pattern.quote(needle), -1).length - 1;
     }
 
     @Test

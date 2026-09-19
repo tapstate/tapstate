@@ -1300,7 +1300,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     // --- streaming reads over a websocket (status --watch / logs --follow) -----------------------
 
-    /** How long to wait after a live connection drops before re-attaching (same landing node in L1). */
+    /** How long to wait after a live connection drops before the caller may attach anywhere again. */
     private static final Duration RECONNECT_BACKOFF = Duration.ofSeconds(1);
 
     /** How often the blocking stream loop wakes to check the stop signal while waiting. */
@@ -1375,40 +1375,43 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     /**
      * Opens a websocket to {@code wsUri}, delivering each decoded text frame to {@code onFrame}, and blocks
-     * until {@code stop} signals. A refused or unreachable handshake ends the stream; a live connection that
-     * later drops is re-attached after a short backoff until stopped. One close is terminal rather than a
-     * drop: the server closing with {@code 1008} whose reason names a coded refusal — the stream can never
-     * be served (e.g. a pipeline id that will never resolve), so re-attaching would be refused identically
-     * forever, churning the connection while the caller waits on something that cannot come. That refusal's
-     * code is returned; every other ending returns {@code null}. Never throws.
+     * until {@code stop} signals or the connection ends. One close is terminal rather than a drop: the
+     * server closing with {@code 1008} whose reason names a coded refusal — the stream can never be served
+     * (e.g. a pipeline id that will never resolve), so attaching again would be refused identically
+     * forever, churning the connection while the caller waits on something that cannot come. That
+     * refusal's code is returned; every other ending returns {@code null}. Never throws.
+     *
+     * <p>A dropped connection ends this call rather than being re-attached here. The node behind
+     * {@code wsUri} may be the one that went away, and this layer knows of no other: which member to
+     * attach to next is the session's question, and answering it here by retrying the same address is how
+     * a stream stays pointed at a member that is gone. The short pace before returning stays here,
+     * though, so that every caller gets it without having to remember to.
      */
     private String stream(URI wsUri, String credential, BooleanSupplier stop, Consumer<String> onFrame) {
-        while (!stop.getAsBoolean()) {
-            CountDownLatch closed = new CountDownLatch(1);
-            AtomicReference<String> refusal = new AtomicReference<>();
-            WebSocket ws;
-            try {
-                ws = client().newWebSocketBuilder()
-                        .header("Authorization", "Bearer " + credential)
-                        .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal))
-                        .join();
-            } catch (RuntimeException handshakeFailed) {
-                // join() wraps a refused (401/403) or unreachable handshake in a CompletionException (a
-                // RuntimeException); either way it cannot be streamed, so end the stream.
-                return null;
-            }
-            awaitClosedOrStop(closed, stop);
-            ws.abort();
-            if (refusal.get() != null) {
-                return refusal.get();
-            }
-            if (stop.getAsBoolean()) {
-                return null;
-            }
-            // A live connection dropped (not a stop): re-attach after a short backoff.
-            if (!sleepUnlessStopped(RECONNECT_BACKOFF, stop)) {
-                return null;
-            }
+        if (stop.getAsBoolean()) {
+            return null;
+        }
+        CountDownLatch closed = new CountDownLatch(1);
+        AtomicReference<String> refusal = new AtomicReference<>();
+        WebSocket ws;
+        try {
+            ws = client().newWebSocketBuilder()
+                    .header("Authorization", "Bearer " + credential)
+                    .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal))
+                    .join();
+        } catch (RuntimeException handshakeFailed) {
+            // join() wraps a refused (401/403) or unreachable handshake in a CompletionException (a
+            // RuntimeException); either way this node is not serving the stream right now.
+            sleepUnlessStopped(RECONNECT_BACKOFF, stop);
+            return null;
+        }
+        awaitClosedOrStop(closed, stop);
+        ws.abort();
+        if (refusal.get() != null) {
+            return refusal.get();
+        }
+        if (!stop.getAsBoolean()) {
+            sleepUnlessStopped(RECONNECT_BACKOFF, stop);
         }
         return null;
     }
