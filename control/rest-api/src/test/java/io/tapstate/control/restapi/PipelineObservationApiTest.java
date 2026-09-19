@@ -759,7 +759,7 @@ class PipelineObservationApiTest {
             return new SrsMeta("shop@mysql-1",
                     new ChainPosition(new SourceOrder(3L, 91201L), "mysql-bin.000004:154"),
                     List.of(new ConsumerOffset("pl2", Map.of(), null)),
-                    null, List.of(), null, 3L, 0L, NOW);
+                    List.of(), null, 3L, NOW);
         }
 
         void reset() {
@@ -774,8 +774,7 @@ class PipelineObservationApiTest {
         @Override
         public void rewindSourceReadOffset(String miningChainId, String token) {
             held = new SrsMeta(miningChainId, new ChainPosition(null, token), held.consumerOffsets(),
-                    held.cdcStartPosition(), held.schemaHistory(), held.retention(), held.epoch(),
-                    held.snapshotEpoch(), NOW);
+                    held.schemaHistory(), held.retention(), held.epoch(), NOW);
         }
 
         @Override
@@ -791,8 +790,7 @@ class PipelineObservationApiTest {
         @Override
         public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
             held = new SrsMeta(miningChainId, held.sourceRead(), List.of(offset),
-                    held.cdcStartPosition(), held.schemaHistory(), held.retention(), held.epoch(),
-                    held.snapshotEpoch(), held.sourceReadAt());
+                    held.schemaHistory(), held.retention(), held.epoch(), held.sourceReadAt());
         }
 
         @Override
@@ -807,7 +805,8 @@ class PipelineObservationApiTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             throw new AssertionError("setCdcStart");
         }
 

@@ -39,9 +39,10 @@ class MongoSrsMetaStoreTest {
                 "orders@mysql-1",
                 new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"),
                 List.of(
-                        new ConsumerOffset("p1", Map.of("orders", 42L), new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100"), List.of("orders")),
+                        new ConsumerOffset("p1", Map.of("orders", 42L),
+                                new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100"),
+                                List.of("orders"), "binlog.000042:1024", 1L),
                         new ConsumerOffset("p2", new LinkedHashMap<>(Map.of("orders", 7L, "items", 3L)), null)),
-                "binlog.000042:1024",
                 List.of(
                         new SchemaVersion(0, Map.of("id", "int"), 0),
                         new SchemaVersion(1, new LinkedHashMap<>(Map.of("id", "int", "name", "string")), 12)),
@@ -51,7 +52,6 @@ class MongoSrsMetaStoreTest {
 
         assertThat(document.getString("_id")).isEqualTo("orders@mysql-1");
         assertThat(document.getString("sourceReadOffset")).isEqualTo("gtid:aaa-1:900");
-        assertThat(document.getString("cdcStartPosition")).isEqualTo("binlog.000042:1024");
         assertThat(document.getString("retention")).isEqualTo("7d");
         // consumer records keyed by pipeline id, so a per-consumer set targets one path
         assertThat(document.get("consumerOffsets", Document.class)).containsOnlyKeys("p1", "p2");
@@ -60,9 +60,16 @@ class MongoSrsMetaStoreTest {
         assertThat(document.get("consumerOffsets", Document.class)
                 .get("p1", Document.class)
                 .getList("snapshotCompletedTables", String.class)).containsExactly("orders");
+        assertThat(document.get("consumerOffsets", Document.class)
+                .get("p1", Document.class)
+                .getString("cdcStartPosition")).isEqualTo("binlog.000042:1024");
+        assertThat(document.get("consumerOffsets", Document.class)
+                .get("p1", Document.class)
+                .getLong("snapshotEpoch")).isEqualTo(1L);
         assertThat(document.get("consumerOffsets", Document.class).get("p2", Document.class))
                 .doesNotContainKey("snapshotCompletedTables");
         assertThat(document).doesNotContainKey("snapshotCompletedTables");
+        assertThat(document).doesNotContainKeys("cdcStartPosition", "snapshotEpoch");
         assertThat(MongoSrsMetaStore.toMeta(document)).isEqualTo(meta);
     }
 
@@ -107,7 +114,7 @@ class MongoSrsMetaStoreTest {
     void aConsumerWithOnlyCompletionMarksRoundTrips() {
         SrsMeta meta = new SrsMeta("chain", null,
                 List.of(new ConsumerOffset("p1", Map.of(), null, List.of("orders", "items"))),
-                null, List.of(), null);
+                List.of(), null);
 
         SrsMeta back = MongoSrsMetaStore.toMeta(MongoSrsMetaStore.toDocument(meta));
 
@@ -117,7 +124,7 @@ class MongoSrsMetaStoreTest {
 
     @Test
     void seedMetaRoundTripsWithNoOffsetsConsumersOrSchema() {
-        SrsMeta seed = new SrsMeta("chain", null, List.of(), null, List.of(), null);
+        SrsMeta seed = new SrsMeta("chain", null, List.of(), List.of(), null);
 
         Document document = MongoSrsMetaStore.toDocument(seed);
 

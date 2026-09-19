@@ -192,7 +192,7 @@ class SrsSchemaHistoryCeilingIT {
     /** The same, for a history that is already built. */
     private static Document recordDocument(List<SchemaVersion> history) {
         return MongoSrsMetaStore.toDocument(
-                new SrsMeta(CHAIN, null, List.of(), null, history, null, 0L, 0L, null));
+                new SrsMeta(CHAIN, null, List.of(), history, null, 0L, null));
     }
 
     /**

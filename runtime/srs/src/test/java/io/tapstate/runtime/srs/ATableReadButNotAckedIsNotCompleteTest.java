@@ -192,7 +192,7 @@ class ATableReadButNotAckedIsNotCompleteTest {
 
         private SrsMeta of(String miningChainId) {
             return records.computeIfAbsent(miningChainId,
-                    id -> new SrsMeta(id, null, List.of(), null, List.of(), null));
+                    id -> new SrsMeta(id, null, List.of(), List.of(), null));
         }
 
         @Override
@@ -201,10 +201,27 @@ class ATableReadButNotAckedIsNotCompleteTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             SrsMeta m = of(miningChainId);
-            records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
-                    cdcStartPosition, m.schemaHistory(), m.retention(), m.epoch(), snapshotEpoch));
+            List<ConsumerOffset> consumers = new ArrayList<>();
+            ConsumerOffset mine = null;
+            for (ConsumerOffset consumer : m.consumerOffsets()) {
+                if (consumer.pipelineId().equals(pipelineId)) {
+                    mine = consumer;
+                } else {
+                    consumers.add(consumer);
+                }
+            }
+            consumers.add(new ConsumerOffset(
+                    pipelineId,
+                    mine == null ? Map.of() : mine.perTableSeq(),
+                    mine == null ? null : mine.sinkAcked(),
+                    mine == null ? List.of() : mine.snapshotCompletedTables(),
+                    cdcStartPosition,
+                    snapshotEpoch));
+            records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         @Override
@@ -227,10 +244,11 @@ class ATableReadButNotAckedIsNotCompleteTest {
                 completed.add(table);
             }
             consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
-                    mine == null ? null : mine.sinkAcked(), completed));
+                    mine == null ? null : mine.sinkAcked(), completed,
+                    mine == null ? null : mine.cdcStartPosition(),
+                    mine == null ? 0L : mine.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
-                    m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(),
-                    m.snapshotEpoch()));
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         @Override
@@ -281,7 +299,7 @@ class ATableReadButNotAckedIsNotCompleteTest {
             }
             consumers.add(offset);
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
-                    m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         @Override
