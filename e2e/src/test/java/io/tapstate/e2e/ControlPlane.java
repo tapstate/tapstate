@@ -273,6 +273,58 @@ final class ControlPlane {
         return nodeIds;
     }
 
+    /**
+     * The captures this pipeline reads through, each named with the node holding its claim.
+     *
+     * <p>Keyed by capture id rather than listed, because what is worth reading here is the identity two
+     * pipelines do or do not share: a capture's id is derived from the stored source contract, so two
+     * pipelines reading one source name one capture and two pipelines reading two sources name two. A
+     * capture nobody has claimed is absent rather than present with no owner, which is the read face's
+     * own distinction between "not taken" and "not there".
+     */
+    Map<String, String> captureOwnersOf(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read who owns the captures of " + pipelineId);
+        Map<String, String> owners = new LinkedHashMap<>();
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (!(pipeline instanceof Map<?, ?> one) || !pipelineId.equals(one.get("pipelineId"))) {
+                continue;
+            }
+            if (!(one.get("captureClaims") instanceof List<?> claims)) {
+                continue;
+            }
+            for (Object claim : claims) {
+                if (claim instanceof Map<?, ?> filed
+                        && filed.get("resourceId") instanceof String captureId) {
+                    owners.put(captureId, String.valueOf(filed.get("ownerNodeId")));
+                }
+            }
+        }
+        return owners;
+    }
+
+    /** Who actuates this pipeline right now, or empty when nothing fences it and nobody has taken it. */
+    Optional<String> pipelineControllerOf(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read who drives " + pipelineId);
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("controllerClaim") instanceof Map<?, ?> claim
+                    && claim.get("ownerNodeId") instanceof String nodeId) {
+                return Optional.of(nodeId);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static List<?> pipelinesOf(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> topology)
+                || !(topology.get("pipelines") instanceof List<?> pipelines)) {
+            throw new AssertionError("the topology carried no pipelines at all: " + body);
+        }
+        return pipelines;
+    }
+
     /** The cluster id this member answers with, which is what a client checks a second member against. */
     String clusterId() {
         HttpResponse<String> response = send(authedGet("/api/cluster/members"));
