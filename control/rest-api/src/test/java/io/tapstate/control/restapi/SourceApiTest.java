@@ -32,6 +32,7 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConnectionTestResult;
@@ -198,6 +199,18 @@ class SourceApiTest {
                 .retrieve().toEntity(String.class);
         assertThat(got.getHeaders().getETag()).isEqualTo(created.getHeaders().getETag());
         assertThat(JSON.readTree(got.getBody())).isEqualTo(JSON.readTree(created.getBody()));
+    }
+
+    @Test
+    void listRetainsReadableSourcesWhenAnotherStoredSourceIsUnreadable() throws Exception {
+        create("healthy", "available");
+        context.getBean(InMemoryArtifactStore.class).putUnreadable("src_mysql_0914", "source");
+
+        JsonNode listed = JSON.readTree(request("reader").get().uri("/api/sources")
+                .retrieve().body(String.class));
+
+        assertThat(listed.path("items")).extracting(source -> source.path("id").asText())
+                .containsExactly("healthy");
     }
 
     @Test
@@ -638,7 +651,16 @@ class SourceApiTest {
 
     private static final class InMemoryArtifactStore implements ArtifactStore {
         private final Map<String, Resource> byId = new LinkedHashMap<>();
-        synchronized void clear() { byId.clear(); }
+        private final Map<String, StoredArtifactRecord> unreadableById = new LinkedHashMap<>();
+
+        synchronized void clear() {
+            byId.clear();
+            unreadableById.clear();
+        }
+
+        synchronized void putUnreadable(String id, String kind) {
+            unreadableById.put(id, new StoredArtifactRecord(id, kind, null, null, false));
+        }
         public synchronized ArtifactMutation create(Resource artifact) {
             if (byId.containsKey(artifact.id())) return ArtifactMutation.ALREADY_EXISTS;
             byId.put(artifact.id(), artifact); return ArtifactMutation.CREATED;
@@ -658,6 +680,15 @@ class SourceApiTest {
         public synchronized void saveAll(List<Resource> resources) { resources.forEach(r -> byId.put(r.id(), r)); }
         public synchronized Optional<Resource> get(String id) { return Optional.ofNullable(byId.get(id)); }
         public synchronized List<Resource> list() { return new ArrayList<>(byId.values()); }
+
+        @Override
+        public synchronized List<StoredArtifactRecord> listStored() {
+            List<StoredArtifactRecord> rows = byId.values().stream().map(StoredArtifactRecord::of)
+                    .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+            rows.addAll(unreadableById.values());
+            return rows;
+        }
+
         private static String hash(Resource resource) {
             return CanonicalHash.of(resource);
         }

@@ -58,6 +58,7 @@ import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResultStore;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import io.tapstate.spi.store.ClusterIdentity;
 import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.DesiredStore;
@@ -402,6 +403,40 @@ class PipelineApiTest {
             assertThat(r.principal()).isEqualTo("alice");
             assertThat(r.resourceId()).isEqualTo("pl1");
         });
+    }
+
+    @Test
+    void listRetainsReadablePipelinesWhenAnotherStoredPipelineIsUnreadable() {
+        context.getBean(FakeArtifactStore.class).putUnreadable("broken_pipeline", "pipeline");
+
+        ResponseEntity<Map> listed = client().get().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+
+        assertThat(listed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat((List<?>) listed.getBody().get("items")).hasSize(1);
+    }
+
+    @Test
+    void createReturnsCodedValidationWhenItsReferencedSourceIsUnreadable() {
+        context.getBean(FakeArtifactStore.class).putUnreadable("unreadable_source", "source");
+        String mutation = """
+                {"id":"pipeline_with_unreadable_source","sources":["unreadable_source"],
+                 "transforms":[],"view":null,"serve":{"from":"/.*/"},
+                 "settings":null,"experimental":null}
+                """;
+
+        ApiError error = client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(mutation)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(error.code()).isEqualTo("dsl.missing-reference");
+        assertThat(error.params()).containsEntry("ref", "unreadable_source");
     }
 
     @Test
@@ -1080,9 +1115,15 @@ class PipelineApiTest {
     /** An in-memory artifact store holding resources by id, seedable from pipeline DSL. */
     static final class FakeArtifactStore implements ArtifactStore {
         private final Map<String, Resource> byId = new LinkedHashMap<>();
+        private final Map<String, StoredArtifactRecord> unreadableById = new LinkedHashMap<>();
 
         void clear() {
             byId.clear();
+            unreadableById.clear();
+        }
+
+        void putUnreadable(String id, String kind) {
+            unreadableById.put(id, new StoredArtifactRecord(id, kind, null, null, false));
         }
 
         void seed(String dsl) {
@@ -1138,7 +1179,18 @@ class PipelineApiTest {
 
         @Override
         public List<Resource> list() {
+            if (!unreadableById.isEmpty()) {
+                throw new IllegalStateException("strict resource listing must not be used for dirty rows");
+            }
             return List.copyOf(byId.values());
+        }
+
+        @Override
+        public List<StoredArtifactRecord> listStored() {
+            List<StoredArtifactRecord> rows = byId.values().stream().map(StoredArtifactRecord::of)
+                    .collect(Collectors.toCollection(ArrayList::new));
+            rows.addAll(unreadableById.values());
+            return rows;
         }
     }
 

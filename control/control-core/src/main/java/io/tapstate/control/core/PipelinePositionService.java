@@ -219,7 +219,7 @@ public final class PipelinePositionService {
 
     /** The stored pipelines declaring {@code sourceId}, whether or not any of them has ever run. */
     private List<String> declaring(String sourceId) {
-        List<Resource> stored = artifacts.list();
+        List<Resource> stored = ReadableArtifactInventory.list(artifacts);
         Set<String> pipelines = new LinkedHashSet<>();
         for (Resource resource : stored) {
             if (resource instanceof PipelineResource) {
