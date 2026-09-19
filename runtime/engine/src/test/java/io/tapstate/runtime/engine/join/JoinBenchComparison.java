@@ -103,20 +103,17 @@ record JoinBenchComparison(JoinBenchComparison.Timing carrier,
         Timing first = run.get();
         long total = first.nanos();
         int runs = 1;
-        List<Long> durations = new ArrayList<>();
-        durations.add(first.nanos());
-        long began = first.midpoint() - first.nanos() / 2;
-        long ended = first.midpoint() + first.nanos() - first.nanos() / 2;
+        List<Timing> timings = new ArrayList<>();
+        timings.add(first);
         while (runs < minimumRuns || total < minimumWindowNanos) {
             Timing each = run.get();
             total += each.nanos();
             runs++;
-            durations.add(each.nanos());
-            ended = each.midpoint() + each.nanos() - each.nanos() / 2;
+            timings.add(each);
         }
-        durations.sort(Long::compareTo);
-        long normalized = durations.get((durations.size() - 1) / minimumRuns);
-        return new Timing(normalized, began + (ended - began) / 2, total);
+        timings.sort(Comparator.comparingLong(Timing::nanos));
+        Timing normalized = timings.get((timings.size() - 1) / minimumRuns);
+        return new Timing(normalized.nanos(), normalized.midpoint(), total);
     }
 
     double controlNanos() {

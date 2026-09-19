@@ -88,6 +88,20 @@ class JoinBenchComparisonTest {
     }
 
     @Test
+    void aMonotonicControlDriftUsesTheSelectedSamplesActualTimes() {
+        AtomicInteger controls = new AtomicInteger();
+        var sample = JoinBenchComparison.measureWithControlWindow(() -> {
+            int slot = controls.getAndIncrement();
+            return new JoinBenchComparison.Timing(10L * (slot + 1), 1_000L * (slot + 1));
+        }, () -> new JoinBenchComparison.Timing(850, 8_500), 8, 1);
+
+        assertThat(sample.before()).isEqualTo(new JoinBenchComparison.Timing(10, 1_000, 360));
+        assertThat(sample.after()).isEqualTo(new JoinBenchComparison.Timing(90, 9_000, 1_000));
+        assertThat(sample.controlNanos()).isEqualTo(85.0);
+        assertThat(sample.ratio()).isEqualTo(10.0);
+    }
+
+    @Test
     void anUnbracketedOrEmptyMeasurementCannotProduceAPlausibleRatio() {
         assertThatIllegalArgumentException().isThrownBy(() -> comparison(100, 5, 10, 10, 10, 20));
         assertThatIllegalArgumentException().isThrownBy(() -> comparison(100, 30, 10, 10, 10, 20));
