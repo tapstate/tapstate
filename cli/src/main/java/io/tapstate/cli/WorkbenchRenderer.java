@@ -968,6 +968,10 @@ final class WorkbenchRenderer {
             renderLogs(frame, area, state.logs(), theme);
             return new ContentLayout(List.of(), Math.max(1, area.height() - 2));
         }
+        if (state.selectedTab() == WorkbenchState.WorkbenchTab.INSPECT) {
+            renderInspect(frame, area, state.inspect(), theme);
+            return new ContentLayout(List.of(), Math.max(1, area.height() - 2));
+        }
         Block block = Block.builder()
                 .borderType(BorderType.ROUNDED)
                 .borders(Borders.ALL)
@@ -1054,6 +1058,64 @@ final class WorkbenchRenderer {
                     .build(), new Rect(contentArea.x(), y, contentArea.width(), visibleHeight));
         }
         if (view.newLines()) write(frame, inner.right() - 3, inner.y(), "(*)", theme.accent(), inner);
+    }
+
+    private static void renderInspect(
+            Frame frame, Rect area, Optional<WorkbenchInspectState> inspect, WorkbenchTheme theme) {
+        String title = inspect.map(value -> "[" + value.pipelineId() + "] Inspect").orElse("Inspect");
+        Block block = panel(title, false, theme);
+        frame.renderWidget(block, area);
+        Rect inner = block.inner(area);
+        if (inspect.isEmpty()) {
+            write(frame, inner.x(), inner.y(), "Select a remote Pipeline in 4 Pipelines, then press 6.", theme.muted(), inner);
+            return;
+        }
+        WorkbenchInspectState value = inspect.orElseThrow();
+        int y = inner.y();
+        switch (value) {
+            case WorkbenchInspectState.Loading loading ->
+                    write(frame, inner.x(), y, "Reading current metrics for " + loading.pipelineId() + "...", theme.muted(), inner);
+            case WorkbenchInspectState.Rejected rejected -> {
+                write(frame, inner.x(), y, "Metrics unavailable: " + rejected.code(), theme.error(), inner);
+                write(frame, inner.x(), y + 1, rejected.message(), theme.muted(), inner);
+            }
+            case WorkbenchInspectState.Unreachable ignored ->
+                    write(frame, inner.x(), y, "Metrics server is unreachable.", theme.error(), inner);
+            case WorkbenchInspectState.Unavailable ignored ->
+                    write(frame, inner.x(), y, "Sign in to read current Pipeline metrics.", theme.warning(), inner);
+            case WorkbenchInspectState.Available available -> {
+                MovementReading current = available.current();
+                String moving = current == null
+                        ? "not published"
+                        : MovementReading.describe(current.since(available.previous()));
+                write(frame, inner.x(), y++, "Moving", theme.title(), inner);
+                write(frame, inner.x() + 2, y++, moving, theme.base(), inner);
+                write(frame, inner.x(), y++, "Lag", theme.title(), inner);
+                write(frame, inner.x() + 2, y++, current == null ? "not published" : current.describeLag(), theme.base(), inner);
+                if (!available.positionsNotCollected().isEmpty()) {
+                    write(frame, inner.x(), y++, "Positions not collected: "
+                            + String.join(", ", available.positionsNotCollected()), theme.warning(), inner);
+                }
+                if (!available.targetAckedPosition().isEmpty() && y < inner.bottom()) {
+                    write(frame, inner.x(), y++, "Target-acked positions", theme.title(), inner);
+                    for (Map.Entry<String, String> entry : available.targetAckedPosition().entrySet().stream()
+                            .sorted(Map.Entry.comparingByKey()).toList()) {
+                        if (y >= inner.bottom()) return;
+                        write(frame, inner.x() + 2, y++, entry.getKey() + ": " + entry.getValue(), theme.base(), inner);
+                    }
+                }
+                write(frame, inner.x(), y++, "Counters", theme.title(), inner);
+                if (available.metrics().isEmpty()) {
+                    write(frame, inner.x() + 2, y, "No numeric counters published.", theme.muted(), inner);
+                    return;
+                }
+                for (Map.Entry<String, Long> entry : available.metrics().entrySet().stream()
+                        .sorted(Map.Entry.comparingByKey()).toList()) {
+                    if (y >= inner.bottom()) return;
+                    write(frame, inner.x() + 2, y++, entry.getKey() + ": " + entry.getValue(), theme.base(), inner);
+                }
+            }
+        }
     }
 
     private static List<Line> logLines(List<RemoteLogLine> entries, WorkbenchTheme theme) {
@@ -1661,6 +1723,10 @@ final class WorkbenchRenderer {
                     new FooterHint("f", "follow " + state.logs().map(value -> value.following() ? "[on]" : "[off]").orElse("[on]"), Optional.empty()),
                     new FooterHint("w", "wrap " + state.logs().map(value -> value.wrapped() ? "[on]" : "[off]").orElse("[on]"), Optional.empty()),
                     new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)), new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
+            case INSPECT -> List.of(
+                    new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
+                    new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
+                    new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
             };
         }
         if (state.overlay().isEmpty()) {
@@ -1721,6 +1787,7 @@ final class WorkbenchRenderer {
             }
             if (!row.remote().isEmpty() && remoteAvailable) {
                 hints.add(new FooterHint("5", "logs", Optional.of(FooterAction.LOGS)));
+                hints.add(new FooterHint("6", "inspect", Optional.of(FooterAction.INSPECT)));
                 hints.add(new FooterHint("F5", "start", Optional.of(FooterAction.START_PIPELINE)));
                 hints.add(new FooterHint("p", "pause", Optional.of(FooterAction.PAUSE_PIPELINE)));
                 hints.add(new FooterHint("u", "resume", Optional.of(FooterAction.RESUME_PIPELINE)));
@@ -1927,6 +1994,7 @@ final class WorkbenchRenderer {
             case SOURCES -> "🔌";
             case PIPELINES -> "🔀";
             case LOGS -> "📜";
+            case INSPECT -> "🔎";
         };
     }
 
@@ -1937,6 +2005,7 @@ final class WorkbenchRenderer {
             case SOURCES -> "3";
             case PIPELINES -> "4";
             case LOGS -> "5";
+            case INSPECT -> "6";
         };
     }
 
@@ -1947,11 +2016,13 @@ final class WorkbenchRenderer {
             case SOURCES -> "Sources";
             case PIPELINES -> "Pipelines";
             case LOGS -> "Logs";
+            case INSPECT -> "Inspect";
         };
     }
 
     private static String tabBadge(WorkbenchState state, WorkbenchState.WorkbenchTab tab) {
-        if (tab == WorkbenchState.WorkbenchTab.OVERVIEW || tab == WorkbenchState.WorkbenchTab.LOGS) {
+        if (tab == WorkbenchState.WorkbenchTab.OVERVIEW || tab == WorkbenchState.WorkbenchTab.LOGS
+                || tab == WorkbenchState.WorkbenchTab.INSPECT) {
             return "";
         }
         String count = state.snapshot().map(snapshot -> switch (tab) {
@@ -1964,6 +2035,7 @@ final class WorkbenchRenderer {
                     ? Integer.toString(snapshot.pipelines().rows().size())
                     : "?";
             case LOGS -> "";
+            case INSPECT -> "";
         }).orElse("?");
         return "(" + count + ")";
     }
@@ -1990,6 +2062,7 @@ final class WorkbenchRenderer {
             case SOURCES -> snapshot.sources().remoteState();
             case PIPELINES -> snapshot.pipelines().remoteState();
             case LOGS -> snapshot.pipelines().remoteState();
+            case INSPECT -> snapshot.pipelines().remoteState();
         };
     }
 
@@ -2001,6 +2074,7 @@ final class WorkbenchRenderer {
             case SOURCES -> snapshot.sources().rows();
             case PIPELINES -> snapshot.pipelines().rows();
             case LOGS -> List.of();
+            case INSPECT -> List.of();
         };
     }
 
@@ -2012,6 +2086,7 @@ final class WorkbenchRenderer {
             case SOURCES -> state.sourcesTable();
             case PIPELINES -> state.pipelinesTable();
             case LOGS -> WorkbenchTableState.empty();
+            case INSPECT -> WorkbenchTableState.empty();
         };
     }
 
@@ -2032,6 +2107,7 @@ final class WorkbenchRenderer {
             case SOURCES -> "No sources.";
             case PIPELINES -> "No pipelines.";
             case LOGS -> "No logs.";
+            case INSPECT -> "No current Pipeline metrics.";
         };
     }
 
@@ -2244,6 +2320,7 @@ final class WorkbenchRenderer {
         CANCEL_DISCARD,
         APPLY_PIPELINE,
         LOGS,
+        INSPECT,
         START_PIPELINE,
         PAUSE_PIPELINE,
         RESUME_PIPELINE,

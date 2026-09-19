@@ -167,6 +167,22 @@ class WorkbenchRendererTest {
     }
 
     @Test
+    void inspectRendersSelectedPipelineCurrentFactsWithoutPretendingOneReadingIsARate() {
+        WorkbenchSnapshot snapshot = snapshot(new WorkbenchRemoteState.Available(1), List.of(
+                row("pipeline", "billing-pipeline", WorkbenchAlignment.IN_SYNC, "pipeline/billing.tap.yml", true)));
+        WorkbenchState state = accepted(snapshot)
+                .select(WorkbenchState.WorkbenchTab.INSPECT)
+                .withInspect(Optional.of(new WorkbenchInspectState.Available(
+                        "billing-pipeline", Map.of("recordCount", 42L), Map.of("orders", "42"), List.of(),
+                        null, new MovementReading(null, Map.of("write", 42L), Map.of("orders", 3L)),
+                        java.time.Instant.EPOCH)));
+
+        assertThat(render(120, 32, state).text())
+                .contains("[billing-pipeline] Inspect", "Moving", "one reading gives no rate", "Lag", "orders 3s",
+                        "Target-acked positions", "recordCount: 42");
+    }
+
+    @Test
     void overviewMakesTheDemoAndExistingServerPathsLegibleForFirstRun() {
         WorkbenchSessionSnapshot session = new WorkbenchSessionSnapshot(
                 Path.of("/work/empty"),

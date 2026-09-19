@@ -67,6 +67,11 @@ interface WorkbenchActionGateway {
         return new PipelineStatusResult.Unavailable();
     }
 
+    /** Reads the selected Pipeline's current metrics without dispatching a command string. */
+    default PipelineMetricsResult readPipelineMetrics(PipelineMetricsRequest request) {
+        return new PipelineMetricsResult.Unavailable();
+    }
+
     default LogsOutcome readPipelineLogs(String pipelineId, RemoteLogCursor after) {
         return new LogsOutcome.Unreachable();
     }
@@ -267,6 +272,12 @@ interface WorkbenchActionGateway {
         }
     }
 
+    record PipelineMetricsRequest(String pipelineId) {
+        public PipelineMetricsRequest {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+        }
+    }
+
     record SourceApplyRequest(List<Path> relativePaths) {
         public SourceApplyRequest {
             relativePaths = List.copyOf(relativePaths);
@@ -437,6 +448,36 @@ interface WorkbenchActionGateway {
         }
 
         record Unavailable() implements PipelineStatusResult {
+        }
+    }
+
+    /** The typed workbench result for one selected-Pipeline metrics read. */
+    sealed interface PipelineMetricsResult {
+        record Available(String pipelineId, Map<String, Long> metrics,
+                         Map<String, String> targetAckedPosition,
+                         List<String> positionsNotCollected,
+                         List<MetricsOutcome.FactPoint> facts) implements PipelineMetricsResult {
+            public Available {
+                Objects.requireNonNull(pipelineId, "pipelineId");
+                metrics = metrics == null ? Map.of() : Map.copyOf(metrics);
+                targetAckedPosition = targetAckedPosition == null ? Map.of() : Map.copyOf(targetAckedPosition);
+                positionsNotCollected = positionsNotCollected == null ? List.of() : List.copyOf(positionsNotCollected);
+                facts = facts == null ? List.of() : List.copyOf(facts);
+            }
+        }
+
+        record Rejected(String pipelineId, String code, String message) implements PipelineMetricsResult {
+            public Rejected {
+                Objects.requireNonNull(pipelineId, "pipelineId");
+                Objects.requireNonNull(code, "code");
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unreachable() implements PipelineMetricsResult {
+        }
+
+        record Unavailable() implements PipelineMetricsResult {
         }
     }
 

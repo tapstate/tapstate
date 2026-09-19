@@ -13,14 +13,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 class WorkbenchStateTest {
 
     @Test
-    void exposesFiveTabsInShortcutOrderWithoutStealingViewArrowKeys() {
+    void exposesInspectInShortcutOrderWithoutStealingViewArrowKeys() {
         assertThat(WorkbenchState.WorkbenchTab.values())
                 .containsExactly(
                         WorkbenchState.WorkbenchTab.OVERVIEW,
                         WorkbenchState.WorkbenchTab.WORKSPACE,
                         WorkbenchState.WorkbenchTab.SOURCES,
                         WorkbenchState.WorkbenchTab.PIPELINES,
-                        WorkbenchState.WorkbenchTab.LOGS);
+                        WorkbenchState.WorkbenchTab.LOGS,
+                        WorkbenchState.WorkbenchTab.INSPECT);
 
         WorkbenchState state = WorkbenchState.initial();
         assertThat(state.reduce(KeyEvent.ofChar('2')).selectedTab())
@@ -31,6 +32,8 @@ class WorkbenchStateTest {
                 .isEqualTo(WorkbenchState.WorkbenchTab.PIPELINES);
         assertThat(state.reduce(KeyEvent.ofChar('5')).selectedTab())
                 .isEqualTo(WorkbenchState.WorkbenchTab.LOGS);
+        assertThat(state.reduce(KeyEvent.ofChar('6')).selectedTab())
+                .isEqualTo(WorkbenchState.WorkbenchTab.INSPECT);
         assertThat(state.reduce(KeyEvent.ofKey(KeyCode.LEFT)).selectedTab())
                 .isEqualTo(WorkbenchState.WorkbenchTab.OVERVIEW);
         assertThat(state.select(WorkbenchState.WorkbenchTab.PIPELINES)

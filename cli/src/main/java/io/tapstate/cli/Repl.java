@@ -570,6 +570,24 @@ final class Repl {
             }
 
             @Override
+            public PipelineMetricsResult readPipelineMetrics(PipelineMetricsRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineMetricsResult.Unavailable();
+                }
+                MetricsOutcome outcome = withFailover(() -> controlPlane.metrics(
+                        session.landingNode(), session.credential(), request.pipelineId()),
+                        value -> value instanceof MetricsOutcome.Unreachable);
+                return switch (outcome) {
+                    case MetricsOutcome.Found found -> new PipelineMetricsResult.Available(
+                            found.pipelineId(), found.metrics(), found.targetAckedPosition(),
+                            found.positionsNotCollected(), found.facts());
+                    case MetricsOutcome.Rejected rejected -> new PipelineMetricsResult.Rejected(
+                            request.pipelineId(), rejected.code(), rejected.message());
+                    case MetricsOutcome.Unreachable ignored -> new PipelineMetricsResult.Unreachable();
+                };
+            }
+
+            @Override
             public LogsOutcome readPipelineLogs(String pipelineId, RemoteLogCursor after) {
                 if (!session.isConnected() || !session.isAuthenticated()) {
                     return new LogsOutcome.Unreachable();

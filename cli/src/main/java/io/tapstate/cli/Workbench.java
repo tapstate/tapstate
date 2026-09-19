@@ -22,6 +22,8 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -166,6 +168,7 @@ final class Workbench {
         private final WorkbenchActionCoordinator actionCoordinator;
         private final SelectedPipelineStatusCoordinator pipelineStatusCoordinator;
         private final WorkbenchLogCoordinator logCoordinator;
+        private final SelectedPipelineInspectCoordinator inspectCoordinator;
         private final WorkbenchShellPanel shellPanel;
         private volatile WorkbenchSnapshot lastSuccessfulSnapshot;
         private WorkbenchRenderer.RenderLayout layout = WorkbenchRenderer.RenderLayout.forTooSmallFrame();
@@ -195,6 +198,7 @@ final class Workbench {
             this.actionCoordinator = null;
             this.pipelineStatusCoordinator = null;
             this.logCoordinator = null;
+            this.inspectCoordinator = null;
             this.shellPanel = null;
         }
 
@@ -231,6 +235,7 @@ final class Workbench {
             this.actionCoordinator = actionGateway == null ? null : new WorkbenchActionCoordinator(runtime);
             this.pipelineStatusCoordinator = actionGateway == null ? null : new SelectedPipelineStatusCoordinator(runtime);
             this.logCoordinator = actionGateway == null ? null : new WorkbenchLogCoordinator();
+            this.inspectCoordinator = actionGateway == null ? null : new SelectedPipelineInspectCoordinator(runtime);
             this.shellPanel = repl == null ? null : new WorkbenchShellPanel(
                     repl, runtime::requestRender, runtime::runLater);
         }
@@ -310,6 +315,9 @@ final class Workbench {
                     if (key.isEnd()) return runtime.updateState(state -> state.withLogs(state.logs().map(WorkbenchLogsState::toNewest)));
                 }
                 if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.PIPELINES) {
+                    if (key.isChar('6') && selectedRemotePipelineId().isPresent()) {
+                        return runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.INSPECT));
+                    }
                     if (key.isKey(dev.tamboui.tui.event.KeyCode.F10) && selectedPipelineApplyRequest().isPresent()) {
                         return confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
                     }
@@ -492,6 +500,7 @@ final class Workbench {
                         state.workspaceView().edit(KeyEvent.ofKey(dev.tamboui.tui.event.KeyCode.ESCAPE))));
                 case APPLY_PIPELINE -> confirmPipelineApply(selectedPipelineApplyRequest().orElseThrow());
                 case LOGS -> runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.LOGS));
+                case INSPECT -> runtime.updateState(state -> state.select(WorkbenchState.WorkbenchTab.INSPECT));
                 case START_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "start");
                 case PAUSE_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "pause");
                 case RESUME_PIPELINE -> confirmPipelineLifecycle(selectedPipelineId().orElseThrow(), "resume");
@@ -2336,6 +2345,7 @@ final class Workbench {
         void render(Frame frame) {
             ensureSelectedPipelineStatus();
             ensureLogs();
+            ensureInspect();
             if (shellPanel == null || !shellPanel.isOpen() || runtime.state().overlay().isPresent()
                     || frame.area().height() < 24) {
                 layout = WorkbenchRenderer.render(frame, runtime.state());
@@ -2365,6 +2375,9 @@ final class Workbench {
             }
             if (logCoordinator != null) {
                 logCoordinator.close();
+            }
+            if (inspectCoordinator != null) {
+                inspectCoordinator.close();
             }
             if (refreshCoordinator != null) {
                 refreshCoordinator.close();
@@ -2580,8 +2593,151 @@ final class Workbench {
             return row.remote().isEmpty() ? Optional.empty() : Optional.of(row.key().id());
         }
 
+        private Optional<String> selectedRemotePipelineId() {
+            WorkbenchState state = runtime.state();
+            if (state.snapshot().isEmpty()) {
+                return Optional.empty();
+            }
+            List<WorkbenchArtifactRow> rows = WorkbenchRenderer.sorted(
+                    state.snapshot().orElseThrow().pipelines().rows(), state.pipelinesTable());
+            if (rows.isEmpty()) {
+                return Optional.empty();
+            }
+            WorkbenchArtifactRow row = rows.get(Math.clamp(state.pipelinesTable().selectedIndex(), 0, rows.size() - 1));
+            return row.remote().isEmpty() ? Optional.empty() : Optional.of(row.key().id());
+        }
+
+        private void ensureInspect() {
+            if (runtime.state().selectedTab() != WorkbenchState.WorkbenchTab.INSPECT) {
+                if (inspectCoordinator != null) {
+                    inspectCoordinator.cancel();
+                }
+                return;
+            }
+            if (actionGateway == null || inspectCoordinator == null || runtime.state().overlay().isPresent()) {
+                return;
+            }
+            Optional<String> selected = selectedRemotePipelineId();
+            if (selected.isEmpty()) {
+                inspectCoordinator.cancel();
+                runtime.updateState(state -> state.withInspect(Optional.empty()));
+                return;
+            }
+            String id = selected.orElseThrow();
+            if (runtime.state().inspect().map(WorkbenchInspectState::pipelineId).filter(id::equals).isEmpty()) {
+                runtime.updateState(state -> state.withInspect(Optional.of(new WorkbenchInspectState.Loading(id))));
+            }
+            inspectCoordinator.start(id,
+                    () -> actionGateway.readPipelineMetrics(new WorkbenchActionGateway.PipelineMetricsRequest(id)),
+                    result -> completeInspect(id, result));
+        }
+
+        private void completeInspect(String pipelineId, WorkbenchActionGateway.PipelineMetricsResult result) {
+            if (runtime.state().selectedTab() != WorkbenchState.WorkbenchTab.INSPECT
+                    || selectedRemotePipelineId().filter(pipelineId::equals).isEmpty()) {
+                return;
+            }
+            WorkbenchInspectState next = switch (result) {
+                case WorkbenchActionGateway.PipelineMetricsResult.Available available -> {
+                    MovementReading current = MetricsFacts.movementOf(available.facts());
+                    MovementReading previous = runtime.state().inspect()
+                            .filter(WorkbenchInspectState.Available.class::isInstance)
+                            .map(WorkbenchInspectState.Available.class::cast)
+                            .filter(value -> pipelineId.equals(value.pipelineId()))
+                            .map(WorkbenchInspectState.Available::current)
+                            .orElse(null);
+                    yield new WorkbenchInspectState.Available(pipelineId, available.metrics(),
+                            available.targetAckedPosition(), available.positionsNotCollected(), previous, current,
+                            java.time.Instant.now());
+                }
+                case WorkbenchActionGateway.PipelineMetricsResult.Rejected rejected ->
+                        new WorkbenchInspectState.Rejected(pipelineId, rejected.code(), rejected.message());
+                case WorkbenchActionGateway.PipelineMetricsResult.Unreachable ignored ->
+                        new WorkbenchInspectState.Unreachable(pipelineId);
+                case WorkbenchActionGateway.PipelineMetricsResult.Unavailable ignored ->
+                        new WorkbenchInspectState.Unavailable(pipelineId);
+            };
+            runtime.updateState(state -> state.withInspect(Optional.of(next)));
+        }
+
         private int visibleRows() {
             return Math.max(1, layout.visibleRowCapacity());
+        }
+    }
+
+    /** Samples one selected Pipeline while Inspect is open; stale selections never publish. */
+    private static final class SelectedPipelineInspectCoordinator implements AutoCloseable {
+
+        private final WorkbenchRuntime runtime;
+        private final ScheduledThreadPoolExecutor worker;
+        private ScheduledFuture<?> active;
+        private String activePipelineId;
+        private long sequence;
+        private boolean closed;
+
+        private SelectedPipelineInspectCoordinator(WorkbenchRuntime runtime) {
+            this.runtime = Objects.requireNonNull(runtime, "runtime");
+            this.worker = new ScheduledThreadPoolExecutor(1, task -> {
+                Thread thread = new Thread(task, "tapstate-pipeline-inspect");
+                thread.setDaemon(true);
+                return thread;
+            });
+            this.worker.setRemoveOnCancelPolicy(true);
+        }
+
+        synchronized void start(
+                String pipelineId,
+                Supplier<WorkbenchActionGateway.PipelineMetricsResult> read,
+                Consumer<WorkbenchActionGateway.PipelineMetricsResult> completion) {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(read, "read");
+            Objects.requireNonNull(completion, "completion");
+            if (closed || pipelineId.equals(activePipelineId)) {
+                return;
+            }
+            cancel();
+            activePipelineId = pipelineId;
+            long currentSequence = Math.incrementExact(sequence);
+            active = worker.scheduleWithFixedDelay(() -> {
+                WorkbenchActionGateway.PipelineMetricsResult result;
+                try {
+                    result = read.get();
+                } catch (RuntimeException failure) {
+                    result = new WorkbenchActionGateway.PipelineMetricsResult.Unavailable();
+                }
+                WorkbenchActionGateway.PipelineMetricsResult completed = result;
+                runtime.runLater(() -> complete(currentSequence, completed, completion));
+            }, 0, 5, TimeUnit.SECONDS);
+        }
+
+        synchronized void cancel() {
+            sequence = Math.incrementExact(sequence);
+            activePipelineId = null;
+            if (active != null) {
+                active.cancel(true);
+                active = null;
+            }
+        }
+
+        private synchronized void complete(
+                long completedSequence,
+                WorkbenchActionGateway.PipelineMetricsResult result,
+                Consumer<WorkbenchActionGateway.PipelineMetricsResult> completion) {
+            if (closed || completedSequence != sequence) {
+                return;
+            }
+            completion.accept(result);
+            runtime.requestRender();
+        }
+
+        @Override
+        public synchronized void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            cancel();
+            worker.shutdownNow();
         }
     }
 
