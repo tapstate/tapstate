@@ -135,8 +135,11 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         if (!flush()) {
             return;
         }
-        Map<Object, Map<String, Object>> filed =
-                ordinal == REGISTRATIONS ? rowsNamedIn(inbox) : Map.of();
+        Set<Object> filed = switch (ordinal) {
+            case ROWS -> filedKeysIn(inbox, lookup.partitionKey());
+            case REGISTRATIONS -> filedKeysIn(inbox, lookup.referenceFields());
+            default -> new LinkedHashSet<>();
+        };
         for (Object item; (item = inbox.peek()) != null; ) {
             handle(ordinal, (Envelope) item, filed);
             inbox.remove();
@@ -175,28 +178,26 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
     }
 
     /**
-     * Which of the rows this drain's registrations name are filed already, asked for in one request.
+     * Which row keys this drain will address are filed already, asked for in one request.
      *
      * <p><b>Once per drain rather than once per row, which is the difference between one round trip and
      * as many as the drain is long.</b> Behind this namespace is a store, and a read of it per arrival of
-     * the pointing stream is exactly the degeneration nothing else here is allowed either - and one that
+     * the stream is exactly the degeneration nothing else here is allowed either - and one that
      * reads identically to a batch from every angle but a count of the trips.
      *
-     * <p>Taken before the drain and used throughout it, which is sound because the two edges are drained
-     * separately: nothing files a row while this ordinal is being worked, so the reading cannot go stale
-     * inside the loop. A row filed after this drain arrives to a bucket that now names the registration,
-     * and is answered by the wake on its own arrival - the two paths meet exactly, with no gap and no
-     * overlap.
+     * <p>For registrations, the keys are the rows they name; the reading stays fixed because the two edges
+     * are drained separately. For rows, the keys are their own identities and each is added after its first
+     * event in this drain, so two events for one new key mark only the first as its first filing.
      */
-    private Map<Object, Map<String, Object>> rowsNamedIn(Inbox inbox) {
+    private Set<Object> filedKeysIn(Inbox inbox, List<String> fields) {
         Collection<Object> named = new LinkedHashSet<>();
         for (Object item : inbox) {
-            named.add(NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), lookup.referenceFields()));
+            named.add(NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), fields));
         }
-        return store.loadAll(named);
+        return new LinkedHashSet<>(store.loadAll(named).keySet());
     }
 
-    private void handle(int ordinal, Envelope event, Map<Object, Map<String, Object>> filed) {
+    private void handle(int ordinal, Envelope event, Set<Object> filed) {
         Map<String, Object> row = NestKeys.rowOf(event);
         if (ordinal == REGISTRATIONS) {
             register(event, row, filed);
@@ -214,8 +215,9 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         // far and never about the ones to come, so a record dropped because nothing wanted it at that
         // moment is the answer missing for the next document that does - and that document waits for an
         // arrival already in the past, for the life of the job, with nothing thrown and no count moved.
-        store.save(key, NestKeys.isDeletion(event) ? NestLookup.gone() : row);
-        wake(key, event);
+        boolean firstFiling = filed.add(key);
+        store.save(key, NestKeys.isDeletion(event) ? NestLookup.gone() : row, firstFiling);
+        wake(key, event, firstFiling);
     }
 
     /**
@@ -227,9 +229,10 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      * trip and as many as there are buckets, and the second turns a generous bucket count into a cost paid
      * on every single edit.
      *
-     * <p><b>What one edit costs downstream is not softened anywhere, deliberately.</b> Each row woken here
-     * is a document re-drawn and written out whole, so one edit to a row a hundred thousand documents name
-     * is a hundred thousand documents rewritten. <b>The throttle does not help and must not be assumed to:
+     * <p><b>What one later edit costs downstream is not softened anywhere, deliberately.</b> Each row woken
+     * after its first filing is a document re-drawn and written out whole, so one edit to a row a hundred
+     * thousand documents name is a hundred thousand documents rewritten. <b>The throttle does not help and
+     * must not be assumed to:
      * its window is opened per document</b>, and the documents woken by one edit are a different document
      * each - every one of them with no window open and nothing to fold with, so a hundred thousand windows
      * open and a hundred thousand documents go. The three ways to soften it were each considered and each
@@ -237,7 +240,8 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      * sending only the changed field means every sink downstream has to apply field-level edits; not
      * propagating at all is the behaviour this whole direction exists to fix. So the only thing bounding
      * this is the ceiling on how many rows may point at one, which fails the job outright rather than
-     * letting it quietly grind: what is being refused there is the rewrite, not the storage.
+     * letting it quietly grind: what is being refused there is the rewrite, not the storage. A first filing
+     * is marked separately only because a document crossing behind its store write can already contain it.
      *
      * <p><b>That ceiling is weighed here, and it costs nothing to weigh.</b> Every bucket is in hand
      * already and every identity in them is about to be walked, so counting them first is a second walk
@@ -245,7 +249,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      * limit sit on the edit that pays for it rather than on the arrival of each row that registers, where
      * it would have cost a read of every bucket per row of the pointing stream.
      */
-    private void wake(List<Object> key, Envelope event) {
+    private void wake(List<Object> key, Envelope event, boolean firstFiling) {
         Collection<Set<Object>> buckets = references.loadAll(bucketsOf(key)).values();
         long referrers = 0;
         for (Set<Object> bucket : buckets) {
@@ -264,7 +268,8 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         }
         for (Set<Object> bucket : buckets) {
             for (Object referrer : bucket) {
-                outgoing.add(new NestTouch(referrer, event.ts(), event.positions(), false));
+                outgoing.add(new NestTouch(
+                        referrer, event.ts(), event.positions(), false, firstFiling));
             }
         }
     }
@@ -294,8 +299,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      * adding and removing the same identity in the same bucket, from two deliveries the engine is free to
      * hand over in either order, so which one won would be a coin toss nothing reports.
      */
-    private void register(Envelope event, Map<String, Object> row,
-            Map<Object, Map<String, Object>> filed) {
+    private void register(Envelope event, Map<String, Object> row, Set<Object> filed) {
         List<Object> referenced = NestKeys.valuesOf(row, lookup.referenceFields());
         List<Object> referrer = NestKeys.valuesOf(row, lookup.referrerIdentity());
         Object bucket = NestLookup.bucketKey(referenced, NestLookup.bucketOf(referrer));
@@ -304,7 +308,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             return;
         }
         references.add(bucket, referrer);
-        if (filed.containsKey(referenced)) {
+        if (filed.contains(referenced)) {
             tellItWhatItMissed(referrer, event);
         }
     }
@@ -346,7 +350,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      * an edge back to this one.
      */
     private void tellItWhatItMissed(List<Object> referrer, Envelope event) {
-        outgoing.add(new NestTouch(referrer, event.ts(), event.positions(), true));
+        outgoing.add(new NestTouch(referrer, event.ts(), event.positions(), true, false));
     }
 
     /**
