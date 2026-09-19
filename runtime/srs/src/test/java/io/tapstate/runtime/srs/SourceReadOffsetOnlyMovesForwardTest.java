@@ -204,7 +204,8 @@ class SourceReadOffsetOnlyMovesForwardTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             throw new UnsupportedOperationException();
         }
 

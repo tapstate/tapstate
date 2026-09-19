@@ -266,7 +266,7 @@ class SrsCoordinatorTest {
                 throw new IllegalStateException("chain already seeded: " + miningChainId);
             }
             created.put(miningChainId, retention);
-            records.put(miningChainId, new SrsMeta(miningChainId, null, List.of(), null, List.of(), retention));
+            records.put(miningChainId, new SrsMeta(miningChainId, null, List.of(), List.of(), retention));
             mutations.add("create:" + miningChainId);
         }
 
@@ -297,7 +297,8 @@ class SrsCoordinatorTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             mutations.add("cdcStart:" + miningChainId);
         }
 

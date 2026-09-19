@@ -128,7 +128,8 @@ public final class PipelinePositionService {
                 // pipeline finished are answers about work that did happen, and moving the tail says
                 // nothing about either.
                 meta.upsertConsumerOffset(chainId, new ConsumerOffset(offset.pipelineId(),
-                        offset.perTableSeq(), null, offset.snapshotCompletedTables()));
+                        offset.perTableSeq(), null, offset.snapshotCompletedTables(),
+                        offset.cdcStartPosition(), offset.snapshotEpoch()));
             }
         }
     }

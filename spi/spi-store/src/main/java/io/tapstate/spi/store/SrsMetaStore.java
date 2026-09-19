@@ -16,7 +16,7 @@ import java.util.Optional;
  * is a caller ordering error; a caller that needs to know can {@link #read} first.
  *
  * <p>The mutators each update one facet of an already-seeded record — the source read offset, one
- * consumer's cursor, the cdc start position, or the schema history. A mutate on a chain that has not been
+ * consumer's cursor or snapshot start, or the schema history. A mutate on a chain that has not been
  * seeded is a caller ordering error, surfaced bare (an {@code IllegalStateException}), not laundered into
  * a coded diagnostic that would hide the defect. The durable-frontier bound on a source-read-offset
  * advance (an advance must not pass the slowest consumer's acked position) is the caller's concern; this
@@ -124,9 +124,10 @@ public interface SrsMetaStore {
     void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position);
 
     /**
-     * Records the chain's snapshot-to-cdc seam: the opaque position the cdc tail starts from, together
-     * with the ring generation the snapshot that reached this seam began in. A mutate on an unseeded chain
-     * is a caller ordering error.
+     * Records one pipeline's snapshot-to-cdc seam: the opaque position its cdc tail starts from, together
+     * with the ring generation that pipeline's snapshot began in. A mutate on an unseeded chain is a
+     * caller ordering error. The consumer entry is created when the pipeline has none yet, and only these
+     * two fields are touched.
      *
      * <p>The two are one call because they are only ever read together. The seam position is the sole
      * record that a snapshot began at all, so a snapshot resuming after a restart looks here to learn
@@ -134,7 +135,7 @@ public interface SrsMetaStore {
      * position without its generation would leave a resumed snapshot with nothing to pin to, and a rerun
      * that then took the current generation would overwrite changes the earlier one had already applied.
      */
-    void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch);
+    void setCdcStart(String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch);
 
     /**
      * Opens the chain's next ring generation and returns it — the monotonic counter every order on this
@@ -144,9 +145,9 @@ public interface SrsMetaStore {
      * <p>Called once per ring establishment: a restart or a re-mine rebuilds the ring and takes a new
      * generation, while a second source force-merging onto an already-open chain joins the generation
      * already running rather than opening one. Generations are per chain, because an order is only ever
-     * compared against another order of the same chain. It leaves the recorded snapshot generation alone —
-     * that is the whole point of keeping the two apart. A mutate on an unseeded chain is a caller ordering
-     * error.
+     * compared against another order of the same chain. It leaves every pipeline's recorded snapshot
+     * generation alone — that is the whole point of keeping them apart. A mutate on an unseeded chain is
+     * a caller ordering error.
      */
     long openEpoch(String miningChainId);
 
@@ -169,7 +170,7 @@ public interface SrsMetaStore {
      * Marks one table's bounded snapshot read as drained to completion <em>for one consumer pipeline</em>.
      * The caller marks a table only once that pipeline's sink has confirmed that table's rows, so a reader
      * may take the mark as "every row of this table is in this pipeline's target" — a distinct question
-     * from the one {@link #setCdcStart} answers, which is where the tail resumes and is written before the
+     * from the one {@link #setCdcStart} answers, which is where that pipeline's tail resumes and is written before the
      * snapshot begins.
      *
      * <p>Per table because one chain carries many, each snapshotted by its own capture run; per pipeline
@@ -219,7 +220,7 @@ public interface SrsMetaStore {
     void detachConsumer(String miningChainId, String pipelineId);
 
     /**
-     * Removes a mining chain's whole record — the read offset, the seam the tail resumes from, the schema
+     * Removes a mining chain's whole record — the read offset, every pipeline's seam, the schema
      * history, and every consumer's cursor with it. Only the last pipeline to leave a chain may call this:
      * what it removes is shared, and taking it away while another pipeline reads the chain would have that
      * pipeline read its whole source again with nothing anywhere saying why. A pipeline leaving a chain

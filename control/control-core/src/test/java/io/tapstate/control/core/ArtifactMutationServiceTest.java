@@ -1039,7 +1039,7 @@ class ArtifactMutationServiceTest {
         void seed(String miningChainId, ConsumerOffset... consumers) {
             chains.put(miningChainId,
                     new SrsMeta(miningChainId, new ChainPosition(new SourceOrder(1L, 1L), "srcpos-1"),
-                            List.of(consumers), null, List.of(), null));
+                            List.of(consumers), List.of(), null));
         }
 
         /** Arms one chain to refuse a detach, standing in for a chain whose store is momentarily down. */
@@ -1088,11 +1088,9 @@ class ArtifactMutationServiceTest {
             List<ConsumerOffset> kept = chain.consumerOffsets().stream()
                     .filter(offset -> !offset.pipelineId().equals(pipelineId))
                     .toList();
-            // Everything but the consumers is carried across; the six-argument constructor would
-            // default the snapshot-complete tables and both generations away, which a detach does not do.
+            // Everything but the departing consumer is carried across.
             chains.put(miningChainId, new SrsMeta(chain.miningChainId(), chain.sourceRead(), kept,
-                    chain.cdcStartPosition(), chain.schemaHistory(), chain.retention(),
-                    chain.epoch(), chain.snapshotEpoch()));
+                    chain.schemaHistory(), chain.retention(), chain.epoch()));
         }
 
         @Override
@@ -1127,7 +1125,8 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             throw new UnsupportedOperationException("the delete path never advances a chain");
         }
 

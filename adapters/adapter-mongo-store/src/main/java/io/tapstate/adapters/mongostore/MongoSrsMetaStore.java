@@ -37,8 +37,9 @@ import java.util.function.Supplier;
  * <p>Each consumer's own state is stored as a sub-document keyed by pipeline id — a resource id, which
  * the grammar forbids from containing a dot, so the id is a safe update path and one consumer is updated
  * at {@code consumerOffsets.<pipelineId>} independently. That sub-document holds everything belonging to
- * one pipeline rather than to the chain: its read cursor, its acked position, and the tables whose initial
- * load its sink has confirmed. The schema history is an append-only array, advanced by an update that
+ * one pipeline rather than to the chain: its read cursor, its acked position, the tables whose initial
+ * load its sink has confirmed, and the seam and generation at which its load began. The schema history is
+ * an append-only array, advanced by an update that
  * keeps the newest entries inside a fixed byte budget. The nullable positions are stored only when present,
  * never as explicit nulls.
  *
@@ -133,7 +134,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     public void create(String miningChainId, String retention) {
         // Insert-only: insertOne fails on a duplicate _id, so an existing chain's accumulated offset /
         // cursor / schema truth is never discarded by a re-seed.
-        Document document = toDocument(new SrsMeta(miningChainId, null, List.of(), null, List.of(), retention));
+        Document document = toDocument(new SrsMeta(miningChainId, null, List.of(), List.of(), retention));
         try {
             collection.insertOne(document);
         } catch (MongoException e) {
@@ -297,15 +298,19 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
-    public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+    public void setCdcStart(
+            String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(cdcStartPosition, "cdcStartPosition");
         if (snapshotEpoch < 0) {
             throw new IllegalArgumentException("snapshotEpoch must not be negative, got " + snapshotEpoch);
         }
         // One update, both fields: a resumed snapshot reads them together, so a state where the seam
-        // position is stored without the generation it belongs to must not be reachable.
-        update(miningChainId, new Document("$set", new Document("cdcStartPosition", cdcStartPosition)
-                .append("snapshotEpoch", snapshotEpoch)));
+        // position is stored without the generation it belongs to must not be reachable. The pipeline id
+        // scopes both so one pipeline never reads another pipeline's load start.
+        String path = "consumerOffsets." + pipelineId + ".";
+        update(miningChainId, new Document("$set", new Document(path + "cdcStartPosition", cdcStartPosition)
+                .append(path + "snapshotEpoch", snapshotEpoch)));
     }
 
     @Override
@@ -313,7 +318,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(miningChainId, "miningChainId");
         // An atomic increment read back after the write: two members opening the same chain must take two
         // different generations, so the counter is advanced by the store rather than read, added to and
-        // written back. It touches only epoch, leaving any pinned snapshot generation where it is.
+        // written back. It touches only epoch, leaving every pinned pipeline snapshot generation where it is.
         Document updated = StoreIo.call(() -> collection.findOneAndUpdate(
                 new Document("_id", miningChainId),
                 new Document("$inc", new Document("epoch", 1L)),
@@ -492,8 +497,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /**
      * The path-scoped update that removes one consumer from a chain: an {@code $unset} of
-     * {@code consumerOffsets.<pipelineId>} alone, so every other consumer's cursor and the chain's own
-     * offset, cdc start position and schema history survive it untouched. Removing the whole entry rather
+     * {@code consumerOffsets.<pipelineId>} alone, so every other consumer's cursor and snapshot start, and
+     * the chain's own offset and schema history survive it untouched. Removing the whole entry rather
      * than blanking its positions is what takes the departing consumer out of the two minimums that would
      * otherwise still fold it in.
      */
@@ -574,19 +579,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         if (meta.sourceRead() != null) {
             document.putAll(sourceReadFields(meta.sourceRead(), meta.sourceReadAt()));
         }
-        if (meta.cdcStartPosition() != null) {
-            document.append("cdcStartPosition", meta.cdcStartPosition());
-        }
         if (meta.retention() != null) {
             document.append("retention", meta.retention());
         }
-        // Zero means "no generation opened" and "no snapshot pinned", which is also what an absent field
-        // reads back as, so a seed stays a seed rather than carrying two fields that say nothing.
+        // Zero means "no generation opened", which is also what an absent field reads back as, so a seed
+        // stays a seed rather than carrying a field that says nothing.
         if (meta.epoch() != 0L) {
             document.append("epoch", meta.epoch());
-        }
-        if (meta.snapshotEpoch() != 0L) {
-            document.append("snapshotEpoch", meta.snapshotEpoch());
         }
         return document;
     }
@@ -634,8 +633,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             schemaHistory.add(schemaFromDocument(asDocument(entry, id), id));
         }
         return new SrsMeta(id, sourceReadFrom(document), consumers,
-                document.getString("cdcStartPosition"), schemaHistory, document.getString("retention"),
-                readEpoch(document, "epoch"), readEpoch(document, "snapshotEpoch"),
+                schemaHistory, document.getString("retention"), readEpoch(document, "epoch"),
                 sourceReadAtFrom(document));
     }
 
@@ -656,7 +654,12 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                     Map.of("id", pipelineId, "field", "perTable"), null);
         }
         return new ConsumerOffset(
-                pipelineId, perTableSeq, sinkAckedFrom(document), snapshotCompletedFrom(document));
+                pipelineId,
+                perTableSeq,
+                sinkAckedFrom(document),
+                snapshotCompletedFrom(document),
+                document.getString("cdcStartPosition"),
+                readEpoch(document, "snapshotEpoch"));
     }
 
     /**
@@ -743,7 +746,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     /**
      * Maps one consumer's record to its stored sub-document: the per-table read cursor, the tables it has
      * finished loading (omitted while it has finished none, so a cursor-only consumer stays a cursor-only
-     * consumer) and the acked position.
+     * consumer), the snapshot start pair and the acked position.
      */
     private static Document consumerToDocument(ConsumerOffset offset) {
         Document perTable = new Document();
@@ -753,6 +756,12 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Document document = new Document("perTableSeq", perTable);
         if (!offset.snapshotCompletedTables().isEmpty()) {
             document.append("snapshotCompletedTables", List.copyOf(offset.snapshotCompletedTables()));
+        }
+        if (offset.cdcStartPosition() != null) {
+            document.append("cdcStartPosition", offset.cdcStartPosition());
+        }
+        if (offset.snapshotEpoch() != 0L) {
+            document.append("snapshotEpoch", offset.snapshotEpoch());
         }
         if (offset.sinkAcked() != null) {
             document.append("sinkAckedEpoch", offset.sinkAcked().order().epoch())

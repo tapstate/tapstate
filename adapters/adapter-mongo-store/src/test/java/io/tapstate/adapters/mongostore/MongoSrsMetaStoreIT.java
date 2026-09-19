@@ -87,7 +87,6 @@ class MongoSrsMetaStoreIT {
             assertThat(seeded.miningChainId()).isEqualTo(CHAIN);
             assertThat(seeded.retention()).isEqualTo("7d");
             assertThat(seeded.sourceReadOffset()).isNull();
-            assertThat(seeded.cdcStartPosition()).isNull();
             assertThat(seeded.consumerOffsets()).isEmpty();
             assertThat(seeded.schemaHistory()).isEmpty();
         });
@@ -277,15 +276,20 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
-    void setCdcStartPersistsTheSeamPositionAndItsGeneration() {
+    void setCdcStartPersistsEachPipelinesSeamPositionAndGenerationIndependently() {
         withStore(store -> {
             store.create(CHAIN, null);
 
-            store.setCdcStart(CHAIN, "binlog.000042:1024", 3L);
+            store.setCdcStart(CHAIN, "p1", "binlog.000042:1024", 3L);
+            store.setCdcStart(CHAIN, "p2", "binlog.000099:2048", 7L);
 
             SrsMeta record = store.read(CHAIN).orElseThrow();
-            assertThat(record.cdcStartPosition()).isEqualTo("binlog.000042:1024");
-            assertThat(record.snapshotEpoch()).isEqualTo(3L);
+            ConsumerOffset p1 = record.consumerOffset("p1").orElseThrow();
+            assertThat(p1.cdcStartPosition()).isEqualTo("binlog.000042:1024");
+            assertThat(p1.snapshotEpoch()).isEqualTo(3L);
+            ConsumerOffset p2 = record.consumerOffset("p2").orElseThrow();
+            assertThat(p2.cdcStartPosition()).isEqualTo("binlog.000099:2048");
+            assertThat(p2.snapshotEpoch()).isEqualTo(7L);
         });
     }
 
@@ -308,7 +312,7 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, null);
             long running = store.openEpoch(CHAIN);
-            store.setCdcStart(CHAIN, "binlog.000042:1024", running);
+            store.setCdcStart(CHAIN, "p1", "binlog.000042:1024", running);
 
             store.openEpoch(CHAIN);
 
@@ -317,7 +321,7 @@ class MongoSrsMetaStoreIT {
             // and let them overwrite changes the older one had already applied.
             SrsMeta record = store.read(CHAIN).orElseThrow();
             assertThat(record.epoch()).isEqualTo(2L);
-            assertThat(record.snapshotEpoch()).isEqualTo(1L);
+            assertThat(record.consumerOffset("p1").orElseThrow().snapshotEpoch()).isEqualTo(1L);
         });
     }
 
@@ -326,11 +330,10 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, null);
 
-            // The meta field set is append-only: a document an older build wrote carries neither
-            // generation, and that has to read back as "no generation opened" rather than as corruption.
+            // A freshly seeded document carries no chain generation and no pipeline snapshot state.
             SrsMeta record = store.read(CHAIN).orElseThrow();
             assertThat(record.epoch()).isZero();
-            assertThat(record.snapshotEpoch()).isZero();
+            assertThat(record.consumerOffsets()).isEmpty();
         });
     }
 
@@ -433,7 +436,7 @@ class MongoSrsMetaStoreIT {
             // that reaches the ceiling is derived from the entry's own stored bytes and the case keeps
             // meaning what it says if that shape ever moves.
             long entryBytes = bsonSize(MongoSrsMetaStore.toDocument(new SrsMeta(CHAIN, null, List.of(),
-                    null, List.of(new SchemaVersion(1, wideSchema(), 1)), null, 0L, 0L, null)));
+                    List.of(new SchemaVersion(1, wideSchema(), 1)), null, 0L, null)));
             int appended = (int) (3 * DOCUMENT_CEILING / (2 * entryBytes));
             assertThat(entryBytes * appended)
                     .as("the premise: %d versions of this shape are %d bytes of history between them, past "
@@ -566,7 +569,7 @@ class MongoSrsMetaStoreIT {
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.advanceSinkAcked("nope", "p", new ChainPosition(new SourceOrder(1, 1), "gtid:aaa-1:1")))
                     .isInstanceOf(IllegalStateException.class);
-            assertThatThrownBy(() -> store.setCdcStart("nope", "x", 1L))
+            assertThatThrownBy(() -> store.setCdcStart("nope", "p", "x", 1L))
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.appendSchemaVersion("nope", new SchemaVersion(0, Map.of(), 0)))
                     .isInstanceOf(IllegalStateException.class);
@@ -582,12 +585,12 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, "7d");
             store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
-            store.setCdcStart(CHAIN, "gtid:aaa-1:1", 1L);
             store.appendSchemaVersion(CHAIN, new SchemaVersion(0, Map.of("id", "int"), 0));
             store.upsertConsumerOffset(CHAIN, new ConsumerOffset("departing", Map.of("orders", 100L),
                     new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100")));
             store.upsertConsumerOffset(CHAIN, new ConsumerOffset("staying", Map.of("orders", 900L),
                     new ChainPosition(new SourceOrder(1, 900), "gtid:aaa-1:900")));
+            store.setCdcStart(CHAIN, "staying", "gtid:aaa-1:1", 1L);
 
             store.detachConsumer(CHAIN, "departing");
 
@@ -595,10 +598,16 @@ class MongoSrsMetaStoreIT {
             // The chain record outlives its consumers: it is keyed by the chain, so removing it would be
             // cross-pipeline data loss, and everything on it that is not the departing cursor is untouched.
             assertThat(after.consumerOffsets())
-                    .containsExactly(new ConsumerOffset("staying", Map.of("orders", 900L),
-                            new ChainPosition(new SourceOrder(1, 900), "gtid:aaa-1:900")));
+                    .containsExactly(new ConsumerOffset(
+                            "staying",
+                            Map.of("orders", 900L),
+                            new ChainPosition(new SourceOrder(1, 900), "gtid:aaa-1:900"),
+                            List.of(),
+                            "gtid:aaa-1:1",
+                            1L));
             assertThat(after.sourceReadOffset()).isEqualTo("gtid:aaa-1:500");
-            assertThat(after.cdcStartPosition()).isEqualTo("gtid:aaa-1:1");
+            assertThat(after.consumerOffset("staying").orElseThrow().cdcStartPosition())
+                    .isEqualTo("gtid:aaa-1:1");
             assertThat(after.schemaHistory()).hasSize(1);
             assertThat(after.retention()).isEqualTo("7d");
         });
@@ -772,7 +781,7 @@ class MongoSrsMetaStoreIT {
             history.add(new SchemaVersion(version, StoredBytes.schemaOfWidth(HISTORY_COLUMNS), version));
         }
         return MongoSrsMetaStore.toDocument(
-                        new SrsMeta(chain, null, List.of(), null, history, null, 0L, 0L, null))
+                        new SrsMeta(chain, null, List.of(), history, null, 0L, null))
                 .getList("schemaHistory", Document.class);
     }
 
@@ -782,7 +791,7 @@ class MongoSrsMetaStoreIT {
      */
     private static String retentionFillingTheRecord() {
         long empty = bsonSize(MongoSrsMetaStore.toDocument(
-                new SrsMeta(CHAIN, null, List.of(), null, List.of(), "", 0L, 0L, null)));
+                new SrsMeta(CHAIN, null, List.of(), List.of(), "", 0L, null)));
         return "r".repeat((int) (DOCUMENT_CEILING - empty - UNDER_THE_CEILING));
     }
 
