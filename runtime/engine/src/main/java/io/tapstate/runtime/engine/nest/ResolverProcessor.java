@@ -831,16 +831,22 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
      * this one hangs from - the same climb this level's own rows make, which is what lets a level nested
      * anywhere point at a row without a path of its own.
      *
-     * <p><b>Word for a row whose parent is not known yet is dropped, and that loses nothing.</b> Nothing of
-     * this level is in a document until its parent turns up, and whatever puts it there draws the document
-     * then - reading the edited row as it now stands, because it was filed before this word was ever sent.
-     * Holding the word instead would mean queueing a wake-up for a document that does not exist, on a key
-     * that may never resolve.
+     * <p><b>Word for a later edit whose parent is not known yet is dropped, and that loses nothing.</b>
+     * Nothing of this level is in a document until its parent turns up, and whatever puts it there draws the
+     * document then - reading the edited row as it now stands, because it was filed before this word was ever
+     * sent. Holding the word instead would mean queueing a wake-up for a document that does not exist, on a
+     * key that may never resolve. A first filing still sends its position on: the filed row is durable, and
+     * nothing else will carry its chain to the sink when there is no parent to address the wake to.
      */
     private void passOn(NestTouch word, Map<Object, ResolverState> touched) {
         ResolverState state = stateFor(word.key(), touched);
         if (state.parentKey() != null) {
             emit(word.routedBy(state.parentKey()));
+        } else if (word.firstFiling()) {
+            // This row is durable in its lookup, and a referrer that has not reached its parent yet will
+            // read it when it eventually does. No document needs redrawing here, but the row's own chain
+            // still needs a position at the sink or its frontier stops at this first filing for good.
+            emit(new SettledPositions(word.positions()));
         }
     }
 

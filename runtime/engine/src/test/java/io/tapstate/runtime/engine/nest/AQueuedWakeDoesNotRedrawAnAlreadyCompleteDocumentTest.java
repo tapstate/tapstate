@@ -14,6 +14,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.ReplayFloor;
+import io.tapstate.runtime.engine.SettledPositions;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -78,6 +79,16 @@ class AQueuedWakeDoesNotRedrawAnAlreadyCompleteDocumentTest {
                 .describedAs("one order and one customer arrival produce one completed document, even "
                         + "when the lookup queued its wake before the root reached the assembler")
                 .containsExactly(completed);
+
+        assembler.tryProcess();
+        assertThat(drain(assemblerOut))
+                .describedAs("the customer filing is durable even though another copy of the document "
+                        + "was not needed, so its position still reaches the sink and the customer chain "
+                        + "does not stop behind the avoided redraw")
+                .singleElement()
+                .isInstanceOfSatisfying(SettledPositions.class,
+                        settled -> assertThat(settled.positions().get("customer").order())
+                                .isEqualTo(at(5)));
     }
 
     private static void feed(com.hazelcast.jet.core.Processor processor, int ordinal, Object... items) {
