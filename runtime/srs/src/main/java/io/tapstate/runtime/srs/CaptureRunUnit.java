@@ -205,7 +205,8 @@ public final class CaptureRunUnit {
                     LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
                     routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
                 }
-                CaptureStart minerStart = tailStart(meta, cid, ownSeam, CaptureStart.present());
+                CaptureStart minerStart = tailStart(
+                        meta, cid, spec.pipelineId(), ownSeam, CaptureStart.present());
                 refuseAnInstantThisBufferWillNeverReach(
                         spec.startFrom(), minerStart, spec.retention());
                 subscription = Optional.of(CdcPhase.run(
@@ -237,7 +238,8 @@ public final class CaptureRunUnit {
                 AtomicLong forwarded = new AtomicLong();
                 AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
                 subscription = Optional.of(port.cdc(
-                        spec.config(), tailStart(meta, directChain, ownSeam, sourceStart(spec.startFrom())),
+                        spec.config(), tailStart(
+                                meta, directChain, spec.pipelineId(), ownSeam, sourceStart(spec.startFrom())),
                         health.recording((events, position) -> forwardDirect(
                                 events, position, directChain, directEpoch, forwarded,
                                 directConsumers, directLastWritten, passthrough))));
@@ -348,7 +350,7 @@ public final class CaptureRunUnit {
     }
 
     /**
-     * Where this chain's tail begins, read back from the durable record rather than assumed.
+     * Where this pipeline run's tail begins, read back from the durable record rather than assumed.
      *
      * <p>Four states, in this order, and the order is the whole of it:
      *
@@ -357,9 +359,9 @@ public final class CaptureRunUnit {
      *       cover every change since, or a row this load read and the source then changed is left at the
      *       value the load saw;</li>
      *   <li>a recorded read offset — the tail ran before and got this far, so it picks up there;</li>
-     *   <li>no read offset but a recorded seam — the snapshot ran and the tail has not advanced past
-     *       where the snapshot began, so it starts at the seam and the idempotent sink absorbs the
-     *       overlap;</li>
+     *   <li>no read offset but this pipeline's recorded seam — its snapshot ran and the tail has not
+     *       advanced past where that snapshot began, so it starts at the seam and the idempotent sink
+     *       absorbs the overlap;</li>
      *   <li>none of those — nothing has read this chain, so {@code firstRun} decides: the start the
      *       caller resolved for a run that has no position to pick up from.</li>
      * </ol>
@@ -375,7 +377,11 @@ public final class CaptureRunUnit {
      * the tail comes up healthy, and every change between where it had reached and now is simply gone.
      */
     private static CaptureStart tailStart(
-            SrsMetaStore meta, String miningChainId, String ownSnapshotSeam, CaptureStart firstRun) {
+            SrsMetaStore meta,
+            String miningChainId,
+            String pipelineId,
+            String ownSnapshotSeam,
+            CaptureStart firstRun) {
         if (ownSnapshotSeam != null) {
             return CaptureStart.resume(new SourcePosition(ownSnapshotSeam));
         }
@@ -384,9 +390,11 @@ public final class CaptureRunUnit {
                     if (record.sourceReadOffset() != null) {
                         return CaptureStart.resume(new SourcePosition(record.sourceReadOffset()));
                     }
-                    return record.cdcStartPosition() == null
-                            ? firstRun
-                            : CaptureStart.resume(new SourcePosition(record.cdcStartPosition()));
+                    return record.consumerOffset(pipelineId)
+                            .map(consumer -> consumer.cdcStartPosition() == null
+                                    ? firstRun
+                                    : CaptureStart.resume(new SourcePosition(consumer.cdcStartPosition())))
+                            .orElse(firstRun);
                 })
                 .orElse(firstRun);
     }

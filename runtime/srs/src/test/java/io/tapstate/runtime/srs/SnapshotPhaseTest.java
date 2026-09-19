@@ -198,12 +198,12 @@ class SnapshotPhaseTest {
     void aSnapshotThatNeverDrainedKeepsItsGenerationWhenItRerunsUnderANewRing() {
         // The chain recorded a seam under generation 1 and this table never finished draining, so the ring
         // that is running now is a rebuild -- generation 2. The rerun's rows must stay on generation 1.
-        // This pipeline has a record of its own on the chain, which is what makes the recorded snapshot
-        // one it started: the seam and the generation on a chain belong to whichever pipeline recorded
-        // them, and every pipeline on a chain loads a target of its own.
+        // This pipeline has a seam and generation of its own on the chain, so the recorded snapshot is
+        // unambiguously the one it started.
         SrsMeta interrupted = new SrsMeta("chain", null,
-                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of())),
-                "binlog.000042:1024", List.of(), null, 2L, 1L);
+                List.of(new ConsumerOffset(
+                        PIPE, Map.of(), null, List.of(), "binlog.000042:1024", 1L)),
+                List.of(), null, 2L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
         List<Envelope> sink = new ArrayList<>();
 
@@ -223,8 +223,9 @@ class SnapshotPhaseTest {
         // The same interruption as above, but the source has moved on: the batch this rerun opens samples
         // a later seam than the one the interrupted run recorded.
         SrsMeta interrupted = new SrsMeta("chain", null,
-                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of())),
-                "binlog.000042:1024", List.of(), null, 2L, 1L);
+                List.of(new ConsumerOffset(
+                        PIPE, Map.of(), null, List.of(), "binlog.000042:1024", 1L)),
+                List.of(), null, 2L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
 
         SnapshotPhase.run(
@@ -241,13 +242,14 @@ class SnapshotPhaseTest {
     }
 
     @Test
-    void aPipelineNewToTheChainLoadsBehindItsOwnSeamAndLeavesTheRecordedOneAlone() {
+    void aPipelineNewToTheChainRecordsItsOwnSeamWithoutMovingAnotherPipelines() {
         // pipe-a recorded this seam under generation 1 and finished its load. The source has moved on
         // since: the batch pipe-b opens samples a much later seam. pipe-b has no record of its own on the
         // chain, so nothing written here is a snapshot it began.
         SrsMeta anothersLoad = new SrsMeta("chain", null,
-                List.of(new ConsumerOffset("pipe-a", Map.of(), null, List.of("orders"))),
-                "binlog.000042:1024", List.of(), null, 2L, 1L);
+                List.of(new ConsumerOffset(
+                        "pipe-a", Map.of(), null, List.of("orders"), "binlog.000042:1024", 1L)),
+                List.of(), null, 2L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), anothersLoad);
         List<Envelope> sink = new ArrayList<>();
 
@@ -263,17 +265,22 @@ class SnapshotPhaseTest {
         // pipe-b's rows belong to the generation running now, not to the one pipe-a's load was pinned to.
         assertThat(sink).extracting(event -> event.position().order())
                 .containsOnly(SourceOrder.snapshotRow(2L));
-        // And pipe-a's seam is left where pipe-a put it. Moving it forward would push where pipe-a's own
-        // tail resumes over the span between the two, which nothing else covers.
-        assertThat(meta.cdcStart).isNull();
+        // Pipe-b records its own seam, while pipe-a's remains where pipe-a put it. One chain-level slot
+        // could satisfy only one of these assertions.
+        assertThat(meta.pipelineId).isEqualTo("pipe-b");
+        assertThat(meta.cdcStart).isEqualTo("binlog.000099:1");
+        assertThat(anothersLoad.consumerOffset("pipe-a")).get()
+                .extracting(ConsumerOffset::cdcStartPosition)
+                .isEqualTo("binlog.000042:1024");
     }
 
     @Test
     void readsNothingWhenEverySelectedTableIsAlreadyRecordedAsWritten() {
         // Same recorded seam, and the one selected table is recorded as written.
         SrsMeta written = new SrsMeta("chain", null,
-                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"))),
-                "binlog.000042:1024", List.of(), null, 2L, 1L);
+                List.of(new ConsumerOffset(
+                        PIPE, Map.of(), null, List.of("orders"), "binlog.000042:1024", 1L)),
+                List.of(), null, 2L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), written);
         FakePort port = new FakePort(new FakeBatch(List.of(row(1)), "binlog.000099:1"));
         List<Envelope> sink = new ArrayList<>();
@@ -294,7 +301,7 @@ class SnapshotPhaseTest {
 
     @Test
     void aChainThatRecordedNoSeamHasNoSnapshotToResumeAndTakesTheGenerationRunningNow() {
-        SrsMeta neverSnapshotted = new SrsMeta("chain", null, List.of(), null, List.of(), null, 2L, 0L);
+        SrsMeta neverSnapshotted = new SrsMeta("chain", null, List.of(), List.of(), null, 2L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), neverSnapshotted);
         List<Envelope> sink = new ArrayList<>();
 
@@ -393,8 +400,9 @@ class SnapshotPhaseTest {
         // The seam was recorded under generation 1 and the ring running now is a rebuild -- generation 2.
         // One of the two selected tables drained before the interruption; the other did not.
         SrsMeta interrupted = new SrsMeta("chain", null,
-                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"))),
-                "binlog.000042:1024", List.of(), null, 2L, 1L);
+                List.of(new ConsumerOffset(
+                        PIPE, Map.of(), null, List.of("orders"), "binlog.000042:1024", 1L)),
+                List.of(), null, 2L);
         RecordingMeta meta = new RecordingMeta(new ArrayList<>(), interrupted);
         List<Envelope> sink = new ArrayList<>();
 
@@ -415,8 +423,9 @@ class SnapshotPhaseTest {
         // The seam was recorded under generation 1 and the ring running now is a rebuild -- generation 2.
         // One of the two selected tables is recorded as written; the other is not.
         SrsMeta interrupted = new SrsMeta("chain", null,
-                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"))),
-                "binlog.000042:1024", List.of(), null, 2L, 1L);
+                List.of(new ConsumerOffset(
+                        PIPE, Map.of(), null, List.of("orders"), "binlog.000042:1024", 1L)),
+                List.of(), null, 2L);
         FakePort port = new FakePort(Map.of(
                 "orders", new FakeBatch(List.of(row("orders", 1)), "binlog.000042:1024"),
                 "customers", new FakeBatch(List.of(row("customers", 1)), "binlog.000042:1024")));
@@ -595,11 +604,12 @@ class SnapshotPhaseTest {
         private final List<String> trace;
         private final SrsMeta stored;
         final List<String> completed = new ArrayList<>();
+        String pipelineId;
         String cdcStart;
         long pinnedEpoch;
 
         RecordingMeta(List<String> trace) {
-            this(trace, new SrsMeta("chain", null, List.of(), null, List.of(), null));
+            this(trace, new SrsMeta("chain", null, List.of(), List.of(), null));
         }
 
         RecordingMeta(List<String> trace, SrsMeta stored) {
@@ -608,7 +618,9 @@ class SnapshotPhaseTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
+            this.pipelineId = pipelineId;
             this.cdcStart = cdcStartPosition;
             this.pinnedEpoch = snapshotEpoch;
             trace.add("cdc-start");

@@ -4,6 +4,7 @@ import io.tapstate.core.event.ChainPosition;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * The durable coordination record for one mining chain — the offset and schema truth that outlives the
@@ -14,14 +15,11 @@ import java.util.List;
  * chain has read: the source's own position paired with the order the engine assigned it; absent until
  * the first cdc read; its durable advance is bounded by the slowest consumer's acked position, and it
  * only ever moves forward), {@code consumerOffsets} (one record per consumer pipeline — see
- * {@link ConsumerOffset} — carrying that pipeline's cursor, its acked position and which tables it has
- * finished loading), {@code cdcStartPosition} (the opaque position the cdc tail starts from,
- * recorded at the snapshot-to-cdc seam; absent until a snapshot seam or start point resolves it),
+ * {@link ConsumerOffset} — carrying that pipeline's cursor, acked position and snapshot state),
  * {@code schemaHistory} (the versioned schema, appended to on a schema change and holding as much of that
  * history as the store retains), {@code retention} (the retention configuration passed through from the source; a
  * config value only — the change ring is bounded by its capacity and backpressure, not trimmed by this),
- * {@code epoch} (the change ring's current generation, zero until one is opened), {@code snapshotEpoch}
- * (the generation the recorded snapshot began in, zero until a snapshot records its seam) and
+ * {@code epoch} (the change ring's current generation, zero until one is opened) and
  * {@code sourceReadAt} (when {@code sourceRead} was last written, absent on a record whose offset
  * predates the stamp).
  *
@@ -32,28 +30,24 @@ import java.util.List;
  *
  * <p><strong>What is here is the chain's, and only the chain's.</strong> The line is which of the two
  * things a quantity answers for: the chain is one read of one source's change log, shared by everyone on
- * it, so how far that read has got, where its tail joins, and what the source's schema has been are the
+ * it, so how far that read has got and what the source's schema has been are the
  * chain's. Anything that answers for one pipeline's target belongs to that pipeline and lives in its
- * {@link ConsumerOffset} — the acked position, the read cursor, and which tables it has finished loading.
- * The last of those used to be recorded here, as one list for the whole chain, and a second pipeline on
- * the chain then read the first one's answer and skipped a load it had never done, leaving its target
- * short of every row of those tables with the run healthy and nothing logged.
+ * {@link ConsumerOffset} — the acked position, the read cursor, which tables it has finished loading, and
+ * the seam and generation its load began at. Snapshot completion and the seam are the same kind of fact:
+ * recording either once for the chain lets a second pipeline read the first pipeline's answer.
  *
- * <p>The two generations are separate because a snapshot outlives the ring it started under. Every
+ * <p>The chain and snapshot generations are separate because a snapshot outlives the ring it started under. Every
  * restart or re-mine opens a new generation, and orders compare generation first — so a snapshot that
  * had not drained keeps the one it began in, and its rerun rows can never overwrite changes the earlier
- * generation already applied. Reading the current generation for a rerun's rows is precisely the
- * reversal these two fields exist to prevent, which is why one field cannot serve both. {@code
- * snapshotEpoch} is written in the same update as {@code cdcStartPosition}: the seam position is the
- * only record that a snapshot began, so a snapshot that resumes would otherwise have no way to know
- * what to pin its rows to.
+ * generation already applied. The current chain generation therefore lives here while each pipeline's
+ * pinned snapshot generation lives beside that pipeline's seam in {@link ConsumerOffset}.
  *
  * <p>The field set is append-only: a field may be added but never removed or repurposed, so an older
  * reader stays forward-compatible. That rule was broken once, deliberately and on the record, to move
- * snapshot completion out to {@link ConsumerOffset}: the guarantee protects readers of already-written
- * data, this product has not shipped, and so the set it protected was empty. Keeping the field as well
- * would have left two places recording one fact, which is the shape the defect above had. The rule holds
- * for every field named here, and the next removal needs its own argument.
+ * pipeline-owned snapshot state out to {@link ConsumerOffset}: the guarantee protects readers of
+ * already-written data, this product has not shipped, and so the set it protected was empty. Keeping the
+ * fields as well would leave two places recording one fact. The rule holds for every field named here,
+ * and the next removal needs its own argument.
  *
  * <p>The lists are unmodifiable defensive copies. A pure value over {@code java..} only (rule R2):
  * positions travel as opaque tokens, never as a connector type.
@@ -62,21 +56,17 @@ public record SrsMeta(
         String miningChainId,
         ChainPosition sourceRead,
         List<ConsumerOffset> consumerOffsets,
-        String cdcStartPosition,
         List<SchemaVersion> schemaHistory,
         String retention,
         long epoch,
-        long snapshotEpoch,
         Instant sourceReadAt) {
 
     public SrsMeta {
         if (miningChainId == null || miningChainId.isBlank()) {
             throw new IllegalArgumentException("srs meta miningChainId must be non-blank");
         }
-        if (epoch < 0 || snapshotEpoch < 0) {
-            throw new IllegalArgumentException(
-                    "srs meta generations must not be negative, got epoch " + epoch
-                            + " and snapshotEpoch " + snapshotEpoch);
+        if (epoch < 0) {
+            throw new IllegalArgumentException("srs meta epoch must not be negative, got " + epoch);
         }
         if (consumerOffsets == null) {
             throw new IllegalArgumentException("srs meta consumerOffsets must be set");
@@ -105,18 +95,22 @@ public record SrsMeta(
      * owes every table it selected.
      */
     public List<String> snapshotCompletedTables(String pipelineId) {
-        return consumerOffsets.stream()
-                .filter(consumer -> consumer.pipelineId().equals(pipelineId))
-                .findFirst()
+        return consumerOffset(pipelineId)
                 .map(ConsumerOffset::snapshotCompletedTables)
                 .orElse(List.of());
     }
 
+    /** The state recorded for {@code pipelineId}, or empty before that pipeline first writes this chain. */
+    public Optional<ConsumerOffset> consumerOffset(String pipelineId) {
+        return consumerOffsets.stream()
+                .filter(consumer -> consumer.pipelineId().equals(pipelineId))
+                .findFirst();
+    }
+
     /** A record with no generation opened and no snapshot pinned — the shape a freshly seeded chain has. */
     public SrsMeta(String miningChainId, ChainPosition sourceRead, List<ConsumerOffset> consumerOffsets,
-            String cdcStartPosition, List<SchemaVersion> schemaHistory, String retention) {
-        this(miningChainId, sourceRead, consumerOffsets, cdcStartPosition, schemaHistory, retention,
-                0L, 0L);
+            List<SchemaVersion> schemaHistory, String retention) {
+        this(miningChainId, sourceRead, consumerOffsets, schemaHistory, retention, 0L, null);
     }
 
     /**
@@ -125,9 +119,7 @@ public record SrsMeta(
      * {@code sourceReadAt} reads null, which is absence rather than a moment at the epoch.
      */
     public SrsMeta(String miningChainId, ChainPosition sourceRead, List<ConsumerOffset> consumerOffsets,
-            String cdcStartPosition, List<SchemaVersion> schemaHistory, String retention,
-            long epoch, long snapshotEpoch) {
-        this(miningChainId, sourceRead, consumerOffsets, cdcStartPosition, schemaHistory, retention,
-                epoch, snapshotEpoch, null);
+            List<SchemaVersion> schemaHistory, String retention, long epoch) {
+        this(miningChainId, sourceRead, consumerOffsets, schemaHistory, retention, epoch, null);
     }
 }

@@ -12,8 +12,10 @@ import java.util.Map;
  * — the run-local read cursor into each per-table ring (a table-to-sequence map; not stable across a
  * restart, because a re-mine allocates a fresh sequence space) — {@code sinkAcked} — the source position
  * durably acked to the pipeline's sink (stable across a restart; the quantity a source-read-offset advance
- * is bounded by) — and {@code snapshotCompletedTables} — the tables whose initial load this pipeline's
- * sink has confirmed. The acked position is absent until the pipeline's sink first acks a change.
+ * is bounded by) — and the snapshot state: {@code snapshotCompletedTables}, the tables whose initial load
+ * this pipeline's sink has confirmed, plus {@code cdcStartPosition} and {@code snapshotEpoch}, the seam and
+ * generation at which this pipeline's load began. The acked position is absent until the pipeline's sink
+ * first acks a change.
  *
  * <p>The acked position is a pair, and both halves are needed for different reasons. The token is what
  * a read resumes from and the only half a connector understands. The order is the engine's own record of
@@ -37,6 +39,13 @@ import java.util.Map;
  * changed after the seam. So the mark is the sink's to make and no reader's. Membership is a set: marking a
  * table already listed changes nothing.
  *
+ * <p><strong>The snapshot seam is one pipeline's answer too.</strong> Every pipeline on a chain runs its
+ * own load, and the seam says where that load began. Storing one seam on the shared chain lets a pipeline
+ * whose restart reads no tables adopt whichever other pipeline recorded the chain first. Once the source
+ * has aged past that position, the restart cannot be served. The seam and generation move together because
+ * a resumed load needs both the position its tail replays from and the generation its rows remain pinned
+ * to.
+ *
  * <p>The lists and maps are unmodifiable defensive copies. A pure value over {@code java..} only (rule R2):
  * positions travel as opaque tokens, never as a connector type.
  */
@@ -44,7 +53,9 @@ public record ConsumerOffset(
         String pipelineId,
         Map<String, Long> perTableSeq,
         ChainPosition sinkAcked,
-        List<String> snapshotCompletedTables) {
+        List<String> snapshotCompletedTables,
+        String cdcStartPosition,
+        long snapshotEpoch) {
 
     public ConsumerOffset {
         if (pipelineId == null || pipelineId.isBlank()) {
@@ -56,13 +67,26 @@ public record ConsumerOffset(
         if (snapshotCompletedTables == null) {
             throw new IllegalArgumentException("consumer offset snapshotCompletedTables must be set");
         }
+        if (snapshotEpoch < 0) {
+            throw new IllegalArgumentException(
+                    "consumer offset snapshotEpoch must not be negative, got " + snapshotEpoch);
+        }
         perTableSeq = Collections.unmodifiableMap(new LinkedHashMap<>(perTableSeq));
         snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
     }
 
+    /** A cursor with completion state but no snapshot seam recorded yet. */
+    public ConsumerOffset(
+            String pipelineId,
+            Map<String, Long> perTableSeq,
+            ChainPosition sinkAcked,
+            List<String> snapshotCompletedTables) {
+        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, null, 0L);
+    }
+
     /** A cursor with no table's initial load confirmed yet — the shape a pipeline has before its first ack. */
     public ConsumerOffset(String pipelineId, Map<String, Long> perTableSeq, ChainPosition sinkAcked) {
-        this(pipelineId, perTableSeq, sinkAcked, List.of());
+        this(pipelineId, perTableSeq, sinkAcked, List.of(), null, 0L);
     }
 
     /** The acked token, or null when the sink has acked nothing yet — what a read resumes from. */
