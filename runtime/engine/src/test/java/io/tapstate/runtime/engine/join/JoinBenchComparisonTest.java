@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.join;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -55,6 +56,38 @@ class JoinBenchComparisonTest {
     }
 
     @Test
+    void aControlWindowIsLongEnoughToAbsorbSchedulingNoiseButKeepsOneRunAsItsUnit() {
+        AtomicInteger controls = new AtomicInteger();
+        AtomicLong clock = new AtomicLong();
+        var sample = JoinBenchComparison.measureWithControlWindow(() -> {
+            controls.incrementAndGet();
+            return timing(clock, 10);
+        }, () -> timing(clock, 100), 1, 40);
+
+        assertThat(controls).hasValue(8);
+        assertThat(sample.before().nanos()).isEqualTo(10);
+        assertThat(sample.after().nanos()).isEqualTo(10);
+        assertThat(sample.controlWindowNanos()).isEqualTo(40);
+        assertThat(sample.ratio()).isEqualTo(10.0);
+    }
+
+    @Test
+    void aLongerWindowKeepsTheLowEighthThatTheRecordedMeasurementUses() {
+        AtomicInteger controls = new AtomicInteger();
+        AtomicLong clock = new AtomicLong();
+        long[] durations = {80, 70, 60, 50, 40, 30, 20, 10};
+        var sample = JoinBenchComparison.measureWithControlWindow(() -> {
+            long nanos = durations[controls.getAndIncrement() % durations.length];
+            return timing(clock, nanos);
+        }, () -> timing(clock, 100), 8, 1);
+
+        assertThat(controls).hasValue(16);
+        assertThat(sample.before().nanos()).isEqualTo(10);
+        assertThat(sample.after().nanos()).isEqualTo(10);
+        assertThat(sample.ratio()).isEqualTo(10.0);
+    }
+
+    @Test
     void anUnbracketedOrEmptyMeasurementCannotProduceAPlausibleRatio() {
         assertThatIllegalArgumentException().isThrownBy(() -> comparison(100, 5, 10, 10, 10, 20));
         assertThatIllegalArgumentException().isThrownBy(() -> comparison(100, 30, 10, 10, 10, 20));
@@ -70,5 +103,10 @@ class JoinBenchComparisonTest {
         return new JoinBenchComparison(new JoinBenchComparison.Timing(carrier, carrierAt),
                 new JoinBenchComparison.Timing(before, beforeAt),
                 new JoinBenchComparison.Timing(after, afterAt));
+    }
+
+    private static JoinBenchComparison.Timing timing(AtomicLong clock, long nanos) {
+        long began = clock.getAndAdd(nanos);
+        return new JoinBenchComparison.Timing(nanos, began + nanos / 2);
     }
 }

@@ -185,7 +185,7 @@ class JoinBenchRun {
         run(name, tier, sizes, Arm.CARRIER);
         List<Result> controls = new ArrayList<>();
         List<Result> carriers = new ArrayList<>();
-        var comparison = JoinBenchComparison.measure(() -> {
+        var comparison = JoinBenchComparison.measureWithControlWindow(() -> {
             Result result = run(name, tier, sizes, Arm.HEAP);
             controls.add(result);
             return result.timing();
@@ -201,10 +201,8 @@ class JoinBenchRun {
                         + control.workShape() + " / " + carrier.workShape());
             }
         }
-        Result before = controls.stream().filter(row -> row.timing().equals(comparison.before()))
-                .findFirst().orElseThrow();
-        Result after = controls.stream().filter(row -> row.timing().equals(comparison.after()))
-                .findFirst().orElseThrow();
+        Result before = controls.getFirst().withTiming(comparison.before());
+        Result after = controls.getFirst().withTiming(comparison.after());
         System.out.println(before.row());
         System.out.println(carrier.row());
         System.out.println(after.row());
@@ -1139,6 +1137,12 @@ class JoinBenchRun {
         Result withBatches(long[] each) {
             return new Result(scenario, tier, note, nanos, rows, trips, coldKeys, tripsWhere, resident,
                     written, batchReads, singleReads, keysRead, writes, midpoint, each);
+        }
+
+        Result withTiming(JoinBenchComparison.Timing timing) {
+            return new Result(scenario, tier, note, timing.nanos(), rows, trips, coldKeys, tripsWhere,
+                    resident, written, batchReads, singleReads, keysRead, writes, timing.midpoint(),
+                    null);
         }
 
         String workShape() {

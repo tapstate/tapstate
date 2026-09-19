@@ -131,9 +131,11 @@ class JoinPerformanceGateTest {
     private static final double MARGIN = 1.6;
 
     /**
-     * Three carrier trials, each bracketed by eight heap samples on either side.
-     * The fastest control on each side removes brief disturbances; interpolation at the carrier's
-     * timed midpoint follows smooth local drift. The selected ratio keeps its own controls.
+     * Three carrier trials, each bracketed by a heap control window on either side. Each window runs
+     * at least eight times and until its timed regions total a measurable interval. Its low eighth is
+     * the same statistic the earlier fastest-of-eight control represented, over a population large
+     * enough that a single short interval cannot decide the verdict. Interpolation at the carrier's
+     * timed midpoint follows smooth local drift, and the selected ratio keeps its own controls.
      *
      * <p>The sample counts were originally measured as follows.
      *
@@ -155,7 +157,7 @@ class JoinPerformanceGateTest {
      */
     private static final int CARRIER_SAMPLES = 3;
 
-    private static final int HEAP_SAMPLES = JoinBenchComparison.CONTROL_SAMPLES;
+    private static final int HEAP_QUANTILE_SLICES = JoinBenchComparison.CONTROL_SAMPLES;
 
     /**
      * Heap samples run and thrown away before the timed ones start.
@@ -208,8 +210,9 @@ class JoinPerformanceGateTest {
         Map<String, String> golden = readGolden();
         List<String> complaints = new ArrayList<>();
 
-        System.out.println("# joinperf carrierSamples=" + CARRIER_SAMPLES + " heapSamplesPerSide="
-                + HEAP_SAMPLES + " " + SIZES);
+        System.out.println("# joinperf carrierSamples=" + CARRIER_SAMPLES + " heapControlQuantile=1/"
+                + HEAP_QUANTILE_SLICES + " heapControlWindowMs="
+                + JoinBenchComparison.CONTROL_WINDOW_NANOS / 1_000_000 + " " + SIZES);
         System.out.println(String.join("\t", "joinperf", "scenario", "tier", "batchReads",
                 "singleReads", "keysRead", "writes", "ratio", "carrierMs", "heapMs", "coldTrips",
                 "coldKeys"));
@@ -272,7 +275,7 @@ class JoinPerformanceGateTest {
             JoinBenchRun.run(scenario, tier, SIZES, JoinBenchRun.Arm.HEAP);
         }
         for (int i = 0; i < (timed ? CARRIER_SAMPLES : 1); i++) {
-            comparisons.add(JoinBenchComparison.measure(() -> {
+            comparisons.add(JoinBenchComparison.measureWithControlWindow(() -> {
                 var heap = JoinBenchRun.run(scenario, tier, SIZES, JoinBenchRun.Arm.HEAP);
                 observed.add(heap);
                 return heap.timing();
@@ -281,7 +284,8 @@ class JoinPerformanceGateTest {
                 observed.add(carrier);
                 carriers.add(carrier);
                 return carrier.timing();
-            }, timed ? HEAP_SAMPLES : 1));
+            }, timed ? HEAP_QUANTILE_SLICES : 1,
+                    timed ? JoinBenchComparison.CONTROL_WINDOW_NANOS : 1));
         }
 
         // Every sample must do the same work, including controls that were not selected. Otherwise
@@ -296,7 +300,7 @@ class JoinPerformanceGateTest {
         }
         JoinBenchComparison best = JoinBenchComparison.best(comparisons);
         return new Measured(carriers.get(comparisons.indexOf(best)), best.carrier().nanos(),
-                best.controlNanos());
+                best.controlNanos(), best.controlWindowNanos());
     }
 
     // ---------------------------------------------------------------- judging
@@ -318,6 +322,9 @@ class JoinPerformanceGateTest {
                     + "it asking in smaller pages; a rise in writes is it doing more work per row");
         }
         if ("-".equals(want[6])) {
+            return;
+        }
+        if (measured.heapWindowNanos() < JoinBenchComparison.CONTROL_WINDOW_NANOS) {
             return;
         }
         double allowed = Double.parseDouble(want[6]) * MARGIN;
@@ -372,7 +379,12 @@ class JoinPerformanceGateTest {
 
     // ---------------------------------------------------------------- what one row measured
 
-    private record Measured(JoinBenchRun.Result carrier, long carrierNanos, double heapNanos) {
+    private record Measured(JoinBenchRun.Result carrier, long carrierNanos, double heapNanos,
+                            long heapWindowNanos) {
+
+        private Measured(JoinBenchRun.Result carrier, long carrierNanos, double heapNanos) {
+            this(carrier, carrierNanos, heapNanos, Math.round(heapNanos));
+        }
 
         private double ratio() {
             return carrierNanos / heapNanos;
