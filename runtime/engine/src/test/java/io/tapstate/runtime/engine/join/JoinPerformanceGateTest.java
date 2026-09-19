@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
 
 /**
@@ -234,6 +235,23 @@ class JoinPerformanceGateTest {
         if (!complaints.isEmpty()) {
             fail(String.join("\n", complaints));
         }
+    }
+
+    @Test
+    void ordinaryBuildLoadDoesNotTurnAnUnchangedCarrierIntoARegression() {
+        long carrierNanos = 1_849_100_000L;
+        double heapNanos = carrierNanos / 909.0;
+        var carrier = new JoinBenchRun.Result("F1", "mixed", "", carrierNanos, 2_000, 0, 0,
+                "", 0, 6_000, 2, 0, 2_000, 6_000, 0);
+        List<String> complaints = new ArrayList<>();
+
+        check("F1", "mixed", new Measured(carrier, carrierNanos, heapNanos),
+                "F1\tmixed\t2\t0\t2000\t6000\t550.6", complaints);
+
+        assertThat(complaints)
+                .describedAs("the reported loaded run kept the carrier in its passing range, so its "
+                        + "two-millisecond heap control must not decide the verdict")
+                .isEmpty();
     }
 
     // ---------------------------------------------------------------- measuring
