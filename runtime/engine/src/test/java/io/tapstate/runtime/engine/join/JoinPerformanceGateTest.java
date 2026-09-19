@@ -11,6 +11,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
@@ -241,20 +242,38 @@ class JoinPerformanceGateTest {
     }
 
     @Test
-    void ordinaryBuildLoadDoesNotTurnAnUnchangedCarrierIntoARegression() {
-        long carrierNanos = 1_849_100_000L;
-        double heapNanos = carrierNanos / 909.0;
-        var carrier = new JoinBenchRun.Result("F1", "mixed", "", carrierNanos, 2_000, 0, 0,
-                "", 0, 6_000, 2, 0, 2_000, 6_000, 0);
+    void anUndersizedControlWindowCannotPassTheGate() {
+        long carrierNanos = 100_000_000L;
+        var carrier = carrier(carrierNanos);
         List<String> complaints = new ArrayList<>();
 
-        check("F1", "mixed", new Measured(carrier, carrierNanos, heapNanos),
+        check("F1", "mixed", new Measured(carrier, carrierNanos, 1_000_000,
+                        JoinBenchComparison.CONTROL_WINDOW_NANOS / 2),
                 "F1\tmixed\t2\t0\t2000\t6000\t550.6", complaints);
 
-        assertThat(complaints)
-                .describedAs("the reported loaded run kept the carrier in its passing range, so its "
-                        + "two-millisecond heap control must not decide the verdict")
-                .isEmpty();
+        assertThat(complaints).singleElement().asString()
+                .contains("the heap control window covered 50.0 ms, below the required 100.0 ms");
+    }
+
+    @Test
+    void theReportedRatioIsJudgedAfterACompleteControlWindow() {
+        long carrierNanos = 1_849_100_000L;
+        long heapNanos = Math.round(carrierNanos / 909.0);
+        AtomicLong clock = new AtomicLong();
+        JoinBenchComparison comparison = JoinBenchComparison.measureWithControlWindow(
+                () -> timing(clock, heapNanos), () -> timing(clock, carrierNanos),
+                HEAP_QUANTILE_SLICES);
+        List<String> complaints = new ArrayList<>();
+
+        check("F1", "mixed", new Measured(carrier(carrierNanos), comparison.carrier().nanos(),
+                        comparison.controlNanos(), comparison.controlWindowNanos()),
+                "F1\tmixed\t2\t0\t2000\t6000\t550.6", complaints);
+
+        assertThat(comparison.controlWindowNanos())
+                .isGreaterThanOrEqualTo(JoinBenchComparison.CONTROL_WINDOW_NANOS);
+        assertThat(complaints).singleElement().asString()
+                .contains("the full phase costs 909.0 times plain heap")
+                .contains("over the 881.0 this allows");
     }
 
     // ---------------------------------------------------------------- measuring
@@ -325,6 +344,10 @@ class JoinPerformanceGateTest {
             return;
         }
         if (measured.heapWindowNanos() < JoinBenchComparison.CONTROL_WINDOW_NANOS) {
+            complaints.add(String.format("%s/%s: the heap control window covered %.1f ms, below "
+                            + "the required %.1f ms, so the performance ratio cannot be judged",
+                    scenario, tier, measured.heapWindowNanos() / 1e6,
+                    JoinBenchComparison.CONTROL_WINDOW_NANOS / 1e6));
             return;
         }
         double allowed = Double.parseDouble(want[6]) * MARGIN;
@@ -382,10 +405,6 @@ class JoinPerformanceGateTest {
     private record Measured(JoinBenchRun.Result carrier, long carrierNanos, double heapNanos,
                             long heapWindowNanos) {
 
-        private Measured(JoinBenchRun.Result carrier, long carrierNanos, double heapNanos) {
-            this(carrier, carrierNanos, heapNanos, Math.round(heapNanos));
-        }
-
         private double ratio() {
             return carrierNanos / heapNanos;
         }
@@ -412,5 +431,15 @@ class JoinPerformanceGateTest {
                     Integer.toString(carrier.writes()),
                     TIMED.contains(scenario) ? String.format("%.1f", ratio()) : "-");
         }
+    }
+
+    private static JoinBenchRun.Result carrier(long nanos) {
+        return new JoinBenchRun.Result("F1", "mixed", "", nanos, 2_000, 0, 0,
+                "", 0, 6_000, 2, 0, 2_000, 6_000, 0);
+    }
+
+    private static JoinBenchComparison.Timing timing(AtomicLong clock, long nanos) {
+        long began = clock.getAndAdd(nanos);
+        return new JoinBenchComparison.Timing(nanos, began + nanos / 2);
     }
 }
