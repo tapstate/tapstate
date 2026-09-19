@@ -6,7 +6,6 @@ import org.junit.jupiter.api.Test;
 
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -48,6 +47,12 @@ class HttpControlPlaneClientTest {
         return URI.create("http://127.0.0.1:" + server.getAddress().getPort());
     }
 
+    private static URI unreachableBase() {
+        // A listener cannot own TCP port zero, so no other process can answer between fixture setup
+        // and the request. Binding a socket to zero instead asks the kernel to allocate another port.
+        return URI.create("http://127.0.0.1:0");
+    }
+
     @Test
     void healthyWhenHealthzReturns200() throws Exception {
         HttpServer server = serverReplying(200, "ok");
@@ -70,12 +75,7 @@ class HttpControlPlaneClientTest {
 
     @Test
     void notHealthyForAnUnreachablePortWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }   // the port is closed on scope exit -> a connect there is refused
-        URI base = URI.create("http://127.0.0.1:" + closedPort);
-        assertThat(new HttpControlPlaneClient().isHealthy(base)).isFalse();
+        assertThat(new HttpControlPlaneClient().isHealthy(unreachableBase())).isFalse();
     }
 
     @Test
@@ -261,11 +261,7 @@ class HttpControlPlaneClientTest {
 
     @Test
     void noVersionForAnUnreachablePortWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }   // the port is closed on scope exit -> a connect there is refused
-        assertThat(new HttpControlPlaneClient().serverVersion(URI.create("http://127.0.0.1:" + closedPort)))
+        assertThat(new HttpControlPlaneClient().serverVersion(unreachableBase()))
                 .isNull();
     }
 
@@ -426,12 +422,8 @@ class HttpControlPlaneClientTest {
 
     @Test
     void loginReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
         LoginOutcome outcome =
-                new HttpControlPlaneClient().login(URI.create("http://127.0.0.1:" + closedPort), "a", "b");
+                new HttpControlPlaneClient().login(unreachableBase(), "a", "b");
         assertThat(outcome).isInstanceOf(LoginOutcome.Unreachable.class);
     }
 
@@ -964,12 +956,8 @@ class HttpControlPlaneClientTest {
 
     @Test
     void registerReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
         ConnectorRegisterOutcome outcome = new HttpControlPlaneClient()
-                .register(URI.create("http://127.0.0.1:" + closedPort), "tok", new byte[] {1});
+                .register(unreachableBase(), "tok", new byte[] {1});
         assertThat(outcome).isInstanceOf(ConnectorRegisterOutcome.Unreachable.class);
     }
 
@@ -1070,12 +1058,8 @@ class HttpControlPlaneClientTest {
 
     @Test
     void applyReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
         ApplyOutcome outcome = new HttpControlPlaneClient(Duration.ofMillis(400), Duration.ofMillis(400))
-                .apply(URI.create("http://127.0.0.1:" + closedPort),
+                .apply(unreachableBase(),
                         "tok", List.of(new LocalDraft("a.tap.yml", "version: tapstate/v1\nkind: source\n")));
         assertThat(outcome).isInstanceOf(ApplyOutcome.Unreachable.class);
     }
@@ -1150,12 +1134,8 @@ class HttpControlPlaneClientTest {
 
     @Test
     void lifecycleReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
         LifecycleOutcome outcome = new HttpControlPlaneClient()
-                .lifecycle(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1", "start", null);
+                .lifecycle(unreachableBase(), "tok", "pl1", "start", null);
         assertThat(outcome).isInstanceOf(LifecycleOutcome.Unreachable.class);
     }
 
@@ -1205,11 +1185,7 @@ class HttpControlPlaneClientTest {
 
     @Test
     void getReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
-        assertThat(new HttpControlPlaneClient().get(URI.create("http://127.0.0.1:" + closedPort), "tok", "x"))
+        assertThat(new HttpControlPlaneClient().get(unreachableBase(), "tok", "x"))
                 .isInstanceOf(GetOutcome.Unreachable.class);
     }
 
@@ -1324,11 +1300,7 @@ class HttpControlPlaneClientTest {
 
     @Test
     void listReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
-        assertThat(new HttpControlPlaneClient().list(URI.create("http://127.0.0.1:" + closedPort), "tok", null))
+        assertThat(new HttpControlPlaneClient().list(unreachableBase(), "tok", null))
                 .isInstanceOf(ListOutcome.Unreachable.class);
     }
 
@@ -1388,12 +1360,8 @@ class HttpControlPlaneClientTest {
 
     @Test
     void testReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
         assertThat(new HttpControlPlaneClient()
-                .test(URI.create("http://127.0.0.1:" + closedPort), "tok", "c", "oracle", Map.of()))
+                .test(unreachableBase(), "tok", "c", "oracle", Map.of()))
                 .isInstanceOf(ConnectionTestOutcome.Unreachable.class);
     }
 
@@ -1458,12 +1426,8 @@ class HttpControlPlaneClientTest {
 
     @Test
     void testResultReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
         assertThat(new HttpControlPlaneClient()
-                .testResult(URI.create("http://127.0.0.1:" + closedPort), "tok", "c"))
+                .testResult(unreachableBase(), "tok", "c"))
                 .isInstanceOf(ConnectionTestResultOutcome.Unreachable.class);
     }
 
@@ -1528,12 +1492,8 @@ class HttpControlPlaneClientTest {
 
     @Test
     void discoverSchemaReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
         assertThat(new HttpControlPlaneClient()
-                .discoverSchema(URI.create("http://127.0.0.1:" + closedPort), "tok", "c", "oracle", Map.of()))
+                .discoverSchema(unreachableBase(), "tok", "c", "oracle", Map.of()))
                 .isInstanceOf(ConnectionDiscoverSchemaOutcome.Unreachable.class);
     }
 
@@ -1607,12 +1567,8 @@ class HttpControlPlaneClientTest {
 
     @Test
     void schemaReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
         assertThat(new HttpControlPlaneClient()
-                .schema(URI.create("http://127.0.0.1:" + closedPort), "tok", "c"))
+                .schema(unreachableBase(), "tok", "c"))
                 .isInstanceOf(ConnectionSchemaOutcome.Unreachable.class);
     }
 
@@ -1701,11 +1657,7 @@ class HttpControlPlaneClientTest {
 
     @Test
     void statusReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
-        assertThat(new HttpControlPlaneClient().status(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1"))
+        assertThat(new HttpControlPlaneClient().status(unreachableBase(), "tok", "pl1"))
                 .isInstanceOf(StatusOutcome.Unreachable.class);
     }
 
@@ -1837,23 +1789,8 @@ class HttpControlPlaneClientTest {
 
     @Test
     void metricsReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
-        HttpServer competingServer = HttpServer.create(new InetSocketAddress("127.0.0.1", closedPort), 0);
-        competingServer.createContext("/api/pipelines/pl1/metrics", exchange -> {
-            exchange.sendResponseHeaders(503, -1);
-            exchange.close();
-        });
-        competingServer.start();
-        try {
-            assertThat(new HttpControlPlaneClient()
-                    .metrics(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1"))
-                    .isInstanceOf(MetricsOutcome.Unreachable.class);
-        } finally {
-            competingServer.stop(0);
-        }
+        assertThat(new HttpControlPlaneClient().metrics(unreachableBase(), "tok", "pl1"))
+                .isInstanceOf(MetricsOutcome.Unreachable.class);
     }
 
     @Test
@@ -1890,11 +1827,7 @@ class HttpControlPlaneClientTest {
 
     @Test
     void snapshotReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
-        assertThat(new HttpControlPlaneClient().snapshot(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1"))
+        assertThat(new HttpControlPlaneClient().snapshot(unreachableBase(), "tok", "pl1"))
                 .isInstanceOf(SnapshotOutcome.Unreachable.class);
     }
 
@@ -1973,11 +1906,7 @@ class HttpControlPlaneClientTest {
 
     @Test
     void logsReturnsUnreachableWhenTheServerIsDownWithoutThrowing() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
-        }
-        assertThat(new HttpControlPlaneClient().logs(URI.create("http://127.0.0.1:" + closedPort), "tok", "pl1"))
+        assertThat(new HttpControlPlaneClient().logs(unreachableBase(), "tok", "pl1"))
                 .isInstanceOf(LogsOutcome.Unreachable.class);
     }
 
