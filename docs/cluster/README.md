@@ -14,11 +14,24 @@ Every cluster member needs:
 - one shared `tapstate.cluster.id`;
 - one stable, unique `tapstate.cluster.node-id`;
 - an absolute, routable `tapstate.control.advertise-url`;
-- an explicit member discovery mode and a routable `tapstate.hz.bind-address`; and
+- an explicit member discovery mode and a routable `tapstate.hz.bind-address`;
+- at least 4 GiB of JVM heap; and
 - a MongoDB replica set available to the members as the majority coordination store.
 
 The member port serves an unauthenticated Hazelcast protocol. Expose it only on a private network or
 behind a NetworkPolicy. Cluster mode does not add transport authentication or TLS to that port.
+
+## Heap
+
+The requirement is the same one a single server has - at least 4 GiB of JVM heap, and why that is a
+requirement rather than advice is in
+[what the server needs](../running-on-your-own-databases.md#what-the-server-needs). What changes on a
+cluster is only this:
+
+**Adding members does not divide it.** Each member holds the state of the partitions it owns, so a
+larger cluster holds more in total and no less on any one member. Where a map keeps a copy for another
+member the copy is paid for as well: a join step's maps are replicated and a nest's are not, so size
+from twice a join step's resident budget for every join map a member runs.
 
 ## Profiles
 

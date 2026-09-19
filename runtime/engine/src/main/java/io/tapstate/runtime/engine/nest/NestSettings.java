@@ -40,6 +40,28 @@ public final class NestSettings implements Serializable {
     private static final long serialVersionUID = 1L;
 
     /**
+     * The heap every member is required to have, which is what the capacity defaults below are sized
+     * against.
+     *
+     * <p><b>A stated requirement rather than an assumption, and it has to be one of the two.</b> Each
+     * default below is this figure divided by something - what one entry may take on its own, what one
+     * namespace may hold resident - so a deployment that gives a member less does not get smaller limits,
+     * it gets limits that are never reached: the heap runs out first, and what is reported then is some
+     * other failure, from some other part of the process, taking the rest of the pipeline with it. That is
+     * the failure these limits exist to replace, so the figure they assume is published beside them rather
+     * than left where only this file could be read for it.
+     *
+     * <p>Per member, and every member. Adding machines does not divide it: a member holds the state of the
+     * partitions it owns, so a bigger cluster holds more in total and no less on each of them. Where a map
+     * keeps a copy for another member, that member pays for the copy as well.
+     *
+     * <p>The number itself is a measurement of what the defaults need, not a recommendation of what to
+     * run: more heap than this is always fine, and the defaults are the conservative end of what was
+     * measured rather than the edge of it.
+     */
+    public static final long REFERENCE_MEMBER_HEAP_BYTES = 4L * 1024L * 1024L * 1024L;
+
+    /**
      * How many elements one document may hold when nothing says otherwise.
      *
      * <p>Per document rather than per namespace, and one of the two counts that fail a run rather than being
