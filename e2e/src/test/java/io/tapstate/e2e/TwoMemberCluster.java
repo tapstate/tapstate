@@ -100,6 +100,30 @@ final class TwoMemberCluster implements AutoCloseable {
         return b;
     }
 
+    /** The control plane of whichever member is not the one named. */
+    ControlPlane memberOtherThan(String nodeId) {
+        return NODE_A.equals(requireKnown(nodeId)) ? b : a;
+    }
+
+    /**
+     * The process carrying one member, for a case whose subject is that process going away.
+     *
+     * <p>Handed out rather than hidden because a member failing is not something a cluster can be asked
+     * to do to itself: the case has to reach the process. Which member to reach for is read off the
+     * cluster first - the one holding the work - so the case never assumes where that landed.
+     */
+    RealProcessServer processCarrying(String nodeId) {
+        return NODE_A.equals(requireKnown(nodeId)) ? first : second;
+    }
+
+    private static String requireKnown(String nodeId) {
+        if (!NODE_A.equals(nodeId) && !NODE_B.equals(nodeId)) {
+            throw new AssertionError("this cluster carries " + NODE_A + " and " + NODE_B
+                    + ", and was asked about '" + nodeId + "'");
+        }
+        return nodeId;
+    }
+
     /**
      * Polls one member until it reports both, so a case fails on their not joining rather than on timing.
      *

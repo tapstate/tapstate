@@ -317,6 +317,26 @@ final class ControlPlane {
         return Optional.empty();
     }
 
+    /**
+     * The execution generation the pipeline's current controller holds, or empty when nothing fences it.
+     *
+     * <p>What tells one run of a pipeline from the run that replaced it. A rebuild that reused the
+     * number would leave the two indistinguishable to everything downstream, which is the whole reason
+     * the number exists.
+     */
+    Optional<Long> executionGenerationOf(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read the execution generation of " + pipelineId);
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("controllerClaim") instanceof Map<?, ?> claim
+                    && claim.get("executionGeneration") instanceof Number generation) {
+                return Optional.of(generation.longValue());
+            }
+        }
+        return Optional.empty();
+    }
+
     private static List<?> pipelinesOf(String body) {
         if (!(JsonReader.parse(body) instanceof Map<?, ?> topology)
                 || !(topology.get("pipelines") instanceof List<?> pipelines)) {
