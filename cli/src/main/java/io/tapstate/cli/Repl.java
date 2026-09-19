@@ -207,6 +207,9 @@ final class Repl {
     /** Reads the login password masked; a scripted fake is injected in tests, a JLine one bound in {@link #run}. */
     private Prompter prompter;
 
+    /** Opens a terminal prompter only for a one-shot command that actually needs one. */
+    private Supplier<Prompter> prompterSource;
+
     /**
      * Whether this process's output goes to a terminal, which is what the in-place view needs and the
      * only thing it refuses for. A seam rather than a direct call so both answers can be exercised: a
@@ -335,6 +338,18 @@ final class Repl {
     /** Answers whether this process has a terminal; overridden so both branches can be exercised. */
     void terminalCheck(BooleanSupplier check) {
         this.terminal = check;
+    }
+
+    /** Supplies a lazy terminal prompter for one-shot interactive commands. */
+    void prompterSource(Supplier<Prompter> source) {
+        this.prompterSource = Objects.requireNonNull(source, "source");
+    }
+
+    private Prompter prompter() {
+        if (prompter == null && prompterSource != null) {
+            prompter = prompterSource.get();
+        }
+        return prompter;
     }
 
     /** Replaces published-artifact downloads without changing registration transport; used by tests. */
@@ -5774,7 +5789,7 @@ final class Repl {
                     Map.of("reason", "context manager is unavailable in this session"));
             return Cli.EXIT_USAGE;
         }
-        return new ContextConsole(contextManager, prompter, workdir,
+        return new ContextConsole(contextManager, prompter(), workdir,
                 commandLine.getOut(), commandLine.getErr()).run();
     }
 

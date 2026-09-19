@@ -552,6 +552,7 @@ public final class Cli implements Runnable {
             Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
                     new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
+            repl.prompterSource(launchPrompt::get);
             String machineToken = launch.machineToken();
             if (machineToken != null) {
                 repl.installMachineToken(machineToken);
