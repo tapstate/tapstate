@@ -40,6 +40,15 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
         now = now.plus(elapsed);
     }
 
+    /**
+     * Puts this store's clock at {@code instant}, so a test can set an exact distance between it and the
+     * clock of the member talking to it. Machines drift and operators move clocks; a test that leaves the
+     * two agreeing cannot tell an implementation that asks the store from one that asks itself.
+     */
+    synchronized void clockAt(Instant instant) {
+        now = Objects.requireNonNull(instant, "instant");
+    }
+
     @Override
     public synchronized WorkloadClaimAttempt acquire(
             WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
