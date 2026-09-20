@@ -1,21 +1,18 @@
-package io.tapstate.adapters.mongostore.migration;
+package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.MongoDatabase;
-import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.ChangeSet.Fence;
-import io.tapstate.adapters.mongostore.IndexEnsure;
-import io.tapstate.adapters.mongostore.SystemCollections;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /** A versioned migration that installs one collection's declared indexes. */
-abstract class DeclaredCollectionIndexes implements ChangeSet {
+public abstract class DeclaredCollectionIndexes implements ChangeSet {
 
     private final int version;
     private final SystemCollections collection;
 
-    DeclaredCollectionIndexes(int version, SystemCollections collection) {
+    protected DeclaredCollectionIndexes(int version, SystemCollections collection) {
         this.version = version;
         this.collection = collection;
     }

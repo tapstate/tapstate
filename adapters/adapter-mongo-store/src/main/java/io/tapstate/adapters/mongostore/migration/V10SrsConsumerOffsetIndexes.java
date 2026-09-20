@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore.migration;
 
+import io.tapstate.adapters.mongostore.DeclaredCollectionIndexes;
 import io.tapstate.adapters.mongostore.SystemCollections;
 
 /**
