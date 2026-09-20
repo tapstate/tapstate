@@ -48,12 +48,21 @@ final class TwoMemberCluster implements AutoCloseable {
     private final RealProcessServer second;
     private final ControlPlane a;
     private final ControlPlane b;
+    private final String storeUri;
+    private final String clusterId;
+    private final String bindAddress;
+    private final String seeds;
 
-    private TwoMemberCluster(RealProcessServer first, RealProcessServer second) {
+    private TwoMemberCluster(RealProcessServer first, RealProcessServer second, String storeUri,
+            String clusterId, String bindAddress, String seeds) {
         this.first = first;
         this.second = second;
         this.a = new ControlPlane(first.baseUrl());
         this.b = new ControlPlane(second.baseUrl());
+        this.storeUri = storeUri;
+        this.clusterId = clusterId;
+        this.bindAddress = bindAddress;
+        this.seeds = seeds;
     }
 
     /**
@@ -78,7 +87,8 @@ final class TwoMemberCluster implements AutoCloseable {
             first.close();
             throw failure;
         }
-        TwoMemberCluster cluster = new TwoMemberCluster(first, second);
+        TwoMemberCluster cluster =
+                new TwoMemberCluster(first, second, storeUri, clusterId, bindAddress, seeds);
         try {
             cluster.a.bootstrapAndLogin(ADMIN, PASSWORD);
             // The administrator lives in the store both of them share, so the second does not create one.
@@ -125,16 +135,40 @@ final class TwoMemberCluster implements AutoCloseable {
     }
 
     /**
+     * Launches a further process into this cluster under {@code nodeId}, and hands it back before it
+     * serves.
+     *
+     * <p>Unstarted on purpose. A case whose subject is a boot being turned away cannot wait for health,
+     * because health is the thing that is not going to arrive; what to wait for instead - the member
+     * appearing in the membership, or the process exiting and saying why - is the case's own business.
+     *
+     * <p>It is given this cluster's id and seed list, so a member that is allowed to join joins this
+     * cluster rather than standing up one of its own. Its own member port is reserved here; the seed
+     * list is not extended with it, and does not need to be - a member dials the seeds, and the members
+     * already standing accept what dials them.
+     */
+    RealProcessServer launching(String nodeId) {
+        int memberPort = RealProcessServer.reservePort();
+        return RealProcessServer.launching(storeUri, "0.0.0.0",
+                httpPort -> arguments(clusterId, nodeId, memberPort, seeds, httpPort, bindAddress));
+    }
+
+    /**
      * Polls one member until it reports both, so a case fails on their not joining rather than on timing.
      *
      * @return the node ids that member answered with, in order
      */
     List<String> awaitBothMembers() {
+        return awaitMembers(2);
+    }
+
+    /** The same, for a cluster a case has added a further member to. */
+    List<String> awaitMembers(int atLeast) {
         AtomicReference<List<String>> seen = new AtomicReference<>(List.of());
-        Await.until("the two processes to become one cluster", JOIN_BUDGET,
+        Await.until("the cluster to report " + atLeast + " members", JOIN_BUDGET,
                 () -> {
                     seen.set(a.clusterMemberNodeIds());
-                    return seen.get().size() >= 2;
+                    return seen.get().size() >= atLeast;
                 },
                 () -> "the membership was still " + seen.get());
         return seen.get();

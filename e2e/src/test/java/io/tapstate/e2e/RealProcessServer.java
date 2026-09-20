@@ -136,6 +136,15 @@ final class RealProcessServer implements ServerHandle {
         return launching(storeUri, jar, LOOPBACK, extraArguments);
     }
 
+    /**
+     * The same, listening on {@code listenAddress} rather than the loopback, with the jar this reactor
+     * built -- what a member of a cluster needs, since one that binds the loopback is refused.
+     */
+    static RealProcessServer launching(String storeUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        return launching(storeUri, bootJar(), listenAddress, extraArguments);
+    }
+
     /** The same, listening on {@code listenAddress}. See {@link #start(String, String, IntFunction)}. */
     static RealProcessServer launching(String storeUri, Path jar, String listenAddress,
             IntFunction<List<String>> extraArguments) {
