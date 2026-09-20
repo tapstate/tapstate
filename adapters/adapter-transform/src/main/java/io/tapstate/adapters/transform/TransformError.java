@@ -31,6 +31,9 @@ public enum TransformError implements TapstateErrorCode {
     /** A js transform script could not be compiled. {@code detail} is the script-engine diagnostic. */
     SCRIPT_COMPILE_FAILED("transform.script-compile-failed", Set.of("detail")),
 
+    /** An exact decimal would become zero or infinity when exposed as a JavaScript number. */
+    SCRIPT_DECIMAL_OUT_OF_RANGE("transform.script-decimal-out-of-range", Set.of("value")),
+
     /** A js transform script defines no {@code process(record, ctx)} function — its required entry point. */
     SCRIPT_NO_PROCESS("transform.script-no-process", Set.of()),
 
