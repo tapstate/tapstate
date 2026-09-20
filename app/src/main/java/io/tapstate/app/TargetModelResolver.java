@@ -30,7 +30,7 @@ import java.util.Optional;
  * the source the sink reads and mapping the discovered {@link SourceTable} onto a {@link TargetTable}.
  *
  * <p>A source may select several tables. When a table's schema has never been discovered, it is absent from
- * the resolved map. View materialization tolerates that absence; a sync start refuses it before binding.
+ * the resolved map. A start that materializes either a view or a sync refuses that absence before binding.
  */
 final class TargetModelResolver {
 
@@ -41,9 +41,9 @@ final class TargetModelResolver {
     }
 
     /**
-     * Requires every source model that reaches a sync to have been discovered. Literal table selectors can
-     * still resolve without discovery for legacy view/nest paths, but a sync target needs the discovered
-     * fields and primary key before capture or a sink can safely start.
+     * Requires every source model that reaches a materialized output to have been discovered. Literal table
+     * selectors can still resolve without discovery while a pipeline is authored, but a write target needs
+     * the discovered fields and primary key before capture or a sink can safely start.
      */
     void requireAllDiscovered(Iterable<String> sourceIds) {
         for (String sourceId : sourceIds) {

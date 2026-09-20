@@ -102,11 +102,9 @@ moving     not known -- the run failed
 
 Run `discover-schema` for the source it names, then start again.
 
-One shape does not fail this way, and you should not read that as permission to skip the step: a
-pipeline whose only output is a view over tables named literally starts, reports itself healthy, and
-materializes rows carrying **the primary key alone** - every other column is silently dropped, because
-the columns a view is built from come from the discovered schema and there is none. Nothing on any read
-face says so. Discover the schema before you start, whatever the pipeline's output shape is.
+This refusal also applies when the pipeline's only output is a view over literally named tables. No
+view rows are materialized until the source schema has been discovered, because that schema supplies
+the columns and identity of the collection the view writes.
 
 ## When a pipeline says `running` but nothing arrives
 
