@@ -102,6 +102,7 @@ connector.discover-failed
 connector.instance-limit-reached
 connector.instances-busy
 connector.load-failed
+connector.logminer-identifier-too-long
 connector.no-connector-class
 connector.not-found
 connector.not-official
