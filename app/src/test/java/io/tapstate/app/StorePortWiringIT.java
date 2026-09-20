@@ -118,6 +118,12 @@ class StorePortWiringIT {
     void blankOrIllegalOperatorStateDatabaseFailsStartupWithACodedDiagnostic() {
         assertInvalidOperatorStateDatabase("");
         assertInvalidOperatorStateDatabase("invalid/name");
+        assertInvalidOperatorStateDatabase("invalid$name");
+        assertInvalidOperatorStateDatabase("\u00e9".repeat(32));
+        assertInvalidOperatorStateDatabase("local");
+        assertInvalidOperatorStateDatabase("Config");
+        assertInvalidOperatorStateDatabase("issue431_invalid", "issue431_invalid");
+        assertInvalidOperatorStateDatabase("issue431_invalid", "ISSUE431_INVALID");
     }
 
     private void withStore(String controlDatabase, String operatorStateDatabase, Consumer<StorePort> action) {
@@ -138,9 +144,13 @@ class StorePortWiringIT {
     }
 
     private void assertInvalidOperatorStateDatabase(String name) {
+        assertInvalidOperatorStateDatabase("issue431_invalid", name);
+    }
+
+    private void assertInvalidOperatorStateDatabase(String controlDatabase, String name) {
         runner.withPropertyValues(
                         "tapstate.store.mongo.enabled=true",
-                        "tapstate.store.mongo.uri=" + REPLICA_SET.getReplicaSetUrl("issue431_invalid"),
+                        "tapstate.store.mongo.uri=" + REPLICA_SET.getReplicaSetUrl(controlDatabase),
                         "tapstate.store.mongo.operator-state-database=" + name,
                         "tapstate.store.mongo.server-selection-timeout=5s")
                 .run(context -> {

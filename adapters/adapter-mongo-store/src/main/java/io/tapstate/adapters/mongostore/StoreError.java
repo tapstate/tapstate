@@ -24,7 +24,7 @@ public enum StoreError implements TapstateErrorCode {
     /** The store was reached but is not a replica-set: {@code target} is the connection target. */
     NOT_REPLICA_SET("store.not-replica-set", Set.of("target")),
 
-    /** The configured durable operator-state database name is not valid for MongoDB. */
+    /** The configured durable operator-state database name is unsafe or not valid for MongoDB. */
     INVALID_OPERATOR_STATE_DATABASE("store.invalid-operator-state-database", Set.of()),
 
     /**

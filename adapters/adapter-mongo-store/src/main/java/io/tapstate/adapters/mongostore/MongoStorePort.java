@@ -23,9 +23,11 @@ import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The MongoDB implementation of the persistence port: it aggregates fourteen sub-stores — the artifact
@@ -40,6 +42,9 @@ import java.util.Objects;
  * only the driver-free {@link StorePort}, so no driver type escapes this module (rule R3).
  */
 public final class MongoStorePort implements StorePort {
+
+    private static final int MAX_DATABASE_NAME_BYTES = 63;
+    private static final Set<String> RESERVED_OPERATOR_STATE_DATABASES = Set.of("config", "local");
 
     /** The collection holding the canonical artifact truth layer. */
     public static final String ARTIFACTS = "artifacts";
@@ -141,8 +146,8 @@ public final class MongoStorePort implements StorePort {
     public MongoStorePort(
             MongoConnection connection, String operatorStateDatabase, Duration rateHistoryRetention) {
         Objects.requireNonNull(connection, "connection");
-        String stateDatabaseName = requireOperatorStateDatabase(operatorStateDatabase);
         MongoDatabase database = connection.database();
+        String stateDatabaseName = requireOperatorStateDatabase(operatorStateDatabase, database.getName());
         this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
         this.state = new MongoStateStore(SystemCollections.PIPELINE_STATE.on(database));
         this.desired = new MongoDesiredStore(SystemCollections.PIPELINE_DESIRED.on(database));
@@ -169,16 +174,26 @@ public final class MongoStorePort implements StorePort {
         this.nestDeadLetters = new MongoNestDeadLetterStore(SystemCollections.NEST_DEAD_LETTERS.on(nestState));
     }
 
-    private static String requireOperatorStateDatabase(String name) {
+    private static String requireOperatorStateDatabase(String name, String controlDatabase) {
         if (name == null || name.isBlank()) {
-            throw new TapstateException(StoreError.INVALID_OPERATOR_STATE_DATABASE, Map.of(), null);
+            throw invalidOperatorStateDatabase(null);
         }
         try {
             MongoNamespace.checkDatabaseNameValidity(name);
-            return name;
         } catch (IllegalArgumentException e) {
-            throw new TapstateException(StoreError.INVALID_OPERATOR_STATE_DATABASE, Map.of(), e);
+            throw invalidOperatorStateDatabase(e);
         }
+        if (name.indexOf('$') >= 0
+                || name.getBytes(StandardCharsets.UTF_8).length > MAX_DATABASE_NAME_BYTES
+                || RESERVED_OPERATOR_STATE_DATABASES.stream().anyMatch(name::equalsIgnoreCase)
+                || name.equalsIgnoreCase(controlDatabase)) {
+            throw invalidOperatorStateDatabase(null);
+        }
+        return name;
+    }
+
+    private static TapstateException invalidOperatorStateDatabase(Throwable cause) {
+        return new TapstateException(StoreError.INVALID_OPERATOR_STATE_DATABASE, Map.of(), cause);
     }
 
     @Override
