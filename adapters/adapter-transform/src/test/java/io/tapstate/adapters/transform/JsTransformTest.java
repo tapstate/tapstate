@@ -74,6 +74,51 @@ class JsTransformTest {
     }
 
     @Test
+    @DisplayName("exact decimals outside the javascript number range are refused bare or carried")
+    void refusesOutOfRangeExactDecimalsBareOrCarried() {
+        BigDecimal underflow = new BigDecimal("1E-6143");
+        BigDecimal overflow = new BigDecimal("1E+6144");
+
+        assertDecimalRefused(
+                underflow,
+                underflow,
+                "function process(r, ctx) { return r; }"
+                        + " function filter(r) { return r.after.amount > 0; }",
+                "bare underflow");
+        assertDecimalRefused(
+                underflow,
+                new ConvertedValue(underflow, "DECIMAL128"),
+                "function process(r, ctx) { return r; }"
+                        + " function filter(r) { return r.after.amount > 0; }",
+                "carried underflow");
+        assertDecimalRefused(
+                overflow,
+                overflow,
+                "function process(r, ctx) { r.after.copy = r.after.amount; return r; }",
+                "bare overflow");
+        assertDecimalRefused(
+                overflow,
+                new ConvertedValue(overflow, "DECIMAL128"),
+                "function process(r, ctx) { r.after.copy = r.after.amount; return r; }",
+                "carried overflow");
+    }
+
+    private static void assertDecimalRefused(
+            BigDecimal decimal, Object value, String script, String description) {
+        TransformPort js = js(script);
+        Envelope row = Envelope.insert(1L, "orders", Map.of("amount", value), null);
+
+        assertThatThrownBy(() -> js.transform(row))
+                .as(description)
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> {
+                    TapstateException error = (TapstateException) thrown;
+                    assertThat(error.code()).isEqualTo(TransformError.SCRIPT_DECIMAL_OUT_OF_RANGE);
+                    assertThat(error.args()).containsEntry("value", decimal.toString());
+                });
+    }
+
+    @Test
     @DisplayName("a value a connector converted reaches the script as the value, not as a host object")
     void aCarriedValueReachesTheScriptAsTheValue() {
         TransformPort js = js(

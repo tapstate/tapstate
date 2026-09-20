@@ -238,6 +238,7 @@ store.tls-ca-unreadable
 store.unreachable
 transform.expression-failed
 transform.script-compile-failed
+transform.script-decimal-out-of-range
 transform.script-failed
 transform.script-no-process
 transform.script-output-invalid

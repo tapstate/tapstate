@@ -96,8 +96,10 @@ The limits that remain come from the portable value the connector returns:
 - **A `js` transform reads an exact decimal as a JavaScript number.** Arithmetic and comparisons work,
   but JavaScript numbers have double precision, so a calculation can round digits the exact decimal
   held. A field the script leaves untouched keeps its exact value and source type; a value the script
-  computes or copies into another field has JavaScript's precision. The `filter` and `map` ports are
-  unaffected: they refuse arithmetic on a decimal while the pipeline is being validated.
+  computes or copies into another field has JavaScript's precision. An exact decimal outside the
+  JavaScript number range is refused when read rather than changed to zero or infinity. The `filter`
+  and `map` ports are unaffected: they refuse arithmetic on a decimal while the pipeline is being
+  validated.
 - **A BSON timestamp's counter is not represented.** Its seconds field reads as the corresponding
   instant, but the per-second ordering counter has no counterpart in the portable date-time value and
   is not carried. A BSON timestamp is an internal replication type and is rare in application data;
