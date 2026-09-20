@@ -108,6 +108,15 @@ public enum ConnectorError implements TapstateErrorCode {
             Set.of("connector", "field", "expected", "value")),
 
     /**
+     * Oracle LogMiner cannot represent an identifier longer than its documented limit, so starting CDC
+     * with one would produce a healthy-looking stream that silently omits its changes. {@code connector}
+     * is the Oracle connector id; {@code kind} is schema, table or column; {@code identifier} is the
+     * refused name; {@code limit} is the supported character count.
+     */
+    LOGMINER_IDENTIFIER_TOO_LONG("connector.logminer-identifier-too-long",
+            Set.of("connector", "kind", "identifier", "limit")),
+
+    /**
      * The connector requires a newer PDK API level than the bridge provides, so it is refused rather
      * than silently downgraded. {@code connector} is the connector id; {@code required} is the level
      * it asked for; {@code provided} is the level the bridge provides.

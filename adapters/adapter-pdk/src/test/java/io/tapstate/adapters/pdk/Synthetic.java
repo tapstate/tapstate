@@ -27,6 +27,17 @@ final class Synthetic {
      */
     private static String source(
             String simpleName, String ctorBody, String registerBody, String members) {
+        return source(simpleName, ctorBody, registerBody, members,
+                "TapTable table = new TapTable(\"t1\");"
+                        + "table.add(new TapField(\"id\", \"int\"));"
+                        + "List<TapTable> tables = new ArrayList<>();"
+                        + "tables.add(table);"
+                        + "s.accept(tables);");
+    }
+
+    /** The shared source scaffold with a caller-supplied discovery body. */
+    private static String source(
+            String simpleName, String ctorBody, String registerBody, String members, String discoveryBody) {
         return ""
                 + "package synthetic;"
                 + "import io.tapdata.pdk.apis.TapConnector;"
@@ -55,11 +66,7 @@ final class Synthetic {
                 + "  public void init(TapConnectionContext c) {}"
                 + "  public void stop(TapConnectionContext c) {}"
                 + "  public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> s) {"
-                + "    TapTable table = new TapTable(\"t1\");"
-                + "    table.add(new TapField(\"id\", \"int\"));"
-                + "    List<TapTable> tables = new ArrayList<>();"
-                + "    tables.add(table);"
-                + "    s.accept(tables);"
+                + discoveryBody
                 + "  }"
                 + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> s) {"
                 + "    s.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY));"
@@ -68,6 +75,20 @@ final class Synthetic {
                 + "  public int tableCount(TapConnectionContext c) { return 1; }"
                 + members
                 + "}";
+    }
+
+    /** A stream source whose discovered table and column names are supplied by the caller. */
+    static Path namedStreamSource(Path dir, String table, String column) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  throw new IllegalStateException(\"stream read must not start\");"
+                + "});";
+        String discovery = "TapTable table = new TapTable(\"" + table + "\");"
+                + "table.add(new TapField(\"" + column + "\", \"int\"));"
+                + "List<TapTable> tables = new ArrayList<>();"
+                + "tables.add(table);"
+                + "s.accept(tables);";
+        return SyntheticJar.compileToJar(dir, "synthetic.NamedStreamSource",
+                source("NamedStreamSource", "", register, "", discovery));
     }
 
     /**
