@@ -34,8 +34,15 @@ import org.slf4j.LoggerFactory;
  * <p>What it compares is the pair of generations the run was submitted with against the pair the store
  * holds now. A refresh that cannot reach the store, a record that has gone, either generation having
  * moved, or the lease behind them having lapsed all read the same way: refused. Refusing is the safe
- * direction — it stops calls going out, and the run that is genuinely current re-reads its own
- * generations on the next refresh and carries on.
+ * direction for a run that should stop — it stops calls going out.
+ *
+ * <p><b>A refusal is not a pause, so being behind is not a safe place to be.</b> It leaves here as an
+ * exception, through the sink writer, into the processor, and it ends the job — there is no next refresh
+ * for the run it refused, and nothing rebuilds a run whose members are all still present. So a reading
+ * this member knows to be older than the run it is being asked about is refreshed on the spot rather
+ * than waited out, and the floor that keeps an unreachable store from being asked per batch is not
+ * allowed to become a stretch of time in which a live store is not asked at all. Measured 2026-09-20:
+ * that stretch ended 14 of 20 unprompted failovers with the pipeline left failed for a person.
  *
  * <p>What this bounds, and what it does not: the deadline is the shorter of this member's refresh window
  * and what the store says is left of the owner's lease, so this member stops no later than the moment the
@@ -159,12 +166,32 @@ final class ExecutionAuthorization implements AutoCloseable {
         Objects.requireNonNull(fence, "fence");
         long now = nanoTime.getAsLong();
         Entry entry = entries.get(fence.pipelineId());
-        if (entry == null || now - entry.deadlineNanos() >= 0) {
+        if (entry != null && precedes(entry, fence)) {
+            // This reading was taken before the run asking about itself was submitted, so it is not the
+            // one that decides it. Only the store hands generations out, and only upwards, so a run
+            // carrying more than this member has read is a run submitted since this member last looked —
+            // never a superseded one, which is what a reading is held against. So its own deadline is
+            // spent rather than waited out: the answer is known to be out of date, and a refusal from it
+            // does not pause the run — it reaches the job as an exception, which ends it.
+            entry = read(fence.pipelineId(), true);
+        } else if (entry == null || now - entry.deadlineNanos() >= 0) {
             entry = read(fence.pipelineId(), false);
         }
         return entry != null
                 && entry.claimGeneration() == fence.claimGeneration()
                 && entry.executionGeneration() == fence.executionGeneration();
+    }
+
+    /**
+     * Whether {@code entry} was read before the run {@code fence} names was submitted, ordered the way
+     * the store advances the pair: taking a claim over takes the next claim generation and carries the
+     * execution generation across, and submitting a run under a claim takes that claim's next execution
+     * generation.
+     */
+    private static boolean precedes(Entry entry, ExecutionFence fence) {
+        return entry.claimGeneration() < fence.claimGeneration()
+                || (entry.claimGeneration() == fence.claimGeneration()
+                        && entry.executionGeneration() < fence.executionGeneration());
     }
 
     private void refreshAll() {
@@ -181,9 +208,15 @@ final class ExecutionAuthorization implements AutoCloseable {
     }
 
     /**
-     * Reads one pipeline's current generations, at most once per window even while the store is
-     * unreachable — the batch path calls this whenever its answer has expired, and a store that is down
-     * must not turn that into a round trip per batch.
+     * Reads one pipeline's current generations, at most once per window while the store cannot be
+     * reached — the batch path calls this whenever its answer has expired, and a store that is down must
+     * not turn that into a round trip per batch.
+     *
+     * <p>That floor is held against an unreachable store and nothing else. Every other outcome below is
+     * the store answering, and the two answers that refuse — no record, and a lease with nothing left of
+     * it — are answers whose whole point is that somebody is about to take the claim over. Holding them
+     * for a refresh interval is how a member comes to refuse the very run its own takeover submitted,
+     * with no reading in hand to say so and no reading allowed until the floor runs out.
      */
     private synchronized Entry read(String pipelineId, boolean evenIfStillLive) {
         long now = nanoTime.getAsLong();
@@ -199,15 +232,16 @@ final class ExecutionAuthorization implements AutoCloseable {
         // Taken before the request goes out: whatever comes back is no older than this point, so a deadline
         // measured from here is never longer than the answer was actually good for.
         long startedAt = nanoTime.getAsLong();
-        nextReadNanos.put(pipelineId, startedAt + refreshIntervalNanos);
         Optional<WorkloadClaimReading> current;
         try {
             current = claims.read(
                     new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId));
         } catch (RuntimeException unreachable) {
+            nextReadNanos.put(pipelineId, startedAt + refreshIntervalNanos);
             entries.remove(pipelineId);
             return null;
         }
+        nextReadNanos.remove(pipelineId);
         if (current.isEmpty()) {
             entries.remove(pipelineId);
             return null;

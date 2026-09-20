@@ -170,6 +170,56 @@ class ExecutionAuthorizationTest {
         assertThat(acked).hasValue(0);
     }
 
+    /**
+     * The other five cases above build the guard <em>after</em> the run they ask about, so the guard has
+     * nothing to be behind with. A member carrying a real run has answered for the previous one, and
+     * what it answered with is what these two are about: a reading older than the run being asked about
+     * is not evidence against that run, and refusing on it does not pause anything — it reaches the job
+     * as an exception and ends it, which is the one thing nothing here recovers from.
+     */
+    @Test
+    void aSecondRunFromTheSameHolderIsNotRefusedByTheReadingTakenOfTheFirst() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence first = nodeA.beginExecution("orders").fence();
+        ExecutionAuthorization guard = guard(claims);
+        // Answering once for the first run is what leaves the reading behind, and a member that wrote a
+        // single batch of it has one. The reading is still live when the second run arrives, because a
+        // rebuild follows the death that caused it by about a second.
+        assertThat(guard.authorized(first)).isTrue();
+
+        ExecutionFence second = nodeA.beginExecution("orders").fence();
+
+        assertThat(second.executionGeneration()).isGreaterThan(first.executionGeneration());
+        assertThat(guard.authorized(second))
+                .as("the store is the only thing that hands out a generation, so a run carrying more than"
+                        + " this member has read is newer than the reading, never superseded by it")
+                .isTrue();
+    }
+
+    @Test
+    void takingOverALapsedClaimDoesNotLeaveThisMemberRefusingTheRunItJustSubmitted() {
+        ExecutionFence dead = submittedRun();
+        ExecutionAuthorization guard = guard(claims);
+        assertThat(guard.authorized(dead)).isTrue();
+
+        elapse(TTL.plusSeconds(1));
+        assertThat(guard.authorized(dead))
+                .as("a lapsed lease is nobody's run, and saying so is what drops this member's reading")
+                .isFalse();
+
+        // And the lapse is exactly what lets the next member have the claim, so the takeover follows it
+        // at once -- well inside the interval that a refusal would otherwise keep the store unasked for.
+        PipelineActuationOwnership nodeB = ownership(NODE_B);
+        assertThat(nodeB.permit("orders").granted()).isTrue();
+        ExecutionFence taken = nodeB.beginExecution("orders").fence();
+
+        assertThat(guard.authorized(taken))
+                .as("a member with no reading at all must go and get one rather than refuse: the run it"
+                        + " would refuse here is the takeover it just submitted")
+                .isTrue();
+    }
+
     @Test
     void aMemberThatCannotRefreshStopsAtItsDeadlineRatherThanCarryingOn() {
         ExecutionFence fence = submittedRun();
