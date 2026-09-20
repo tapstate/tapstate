@@ -139,15 +139,28 @@ final class StoreBackedDagSource implements DagSource {
     public void validateStart(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        boolean writesView = pipeline.view() instanceof ViewBlock.Inline;
+        boolean writesSync = pipeline.serve() instanceof ServeBlock.Inline serve
+                && serve.sync() != null && !serve.sync().isEmpty();
+        if (!writesView && !writesSync) {
+            return;
+        }
+        Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> stepIds = stepIds(pipeline);
+        Set<String> sourceIds = new LinkedHashSet<>();
         if (pipeline.serve() instanceof ServeBlock.Inline serve
                 && serve.sync() != null && !serve.sync().isEmpty()) {
-            Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
-            Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
-            Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
-            targetModelResolver.requireAllDiscovered(sourceIdsReaching(
-                    pipeline, serve.from(), sourceKeyByTable, sourceKeysById, sourceVertices,
-                    stepIds(pipeline)));
+            sourceIds.addAll(sourceIdsReaching(
+                    pipeline, serve.from(), sourceKeyByTable, sourceKeysById, sourceVertices, stepIds));
         }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            sourceIds.addAll(sourceIdsReaching(
+                    pipeline, FromClause.list(view.from()), sourceKeyByTable, sourceKeysById,
+                    sourceVertices, stepIds));
+        }
+        targetModelResolver.requireAllDiscovered(sourceIds);
     }
 
     StoreBackedDagSource(StorePort storePort, SinkWriterBinder sinkWriterBinder) {
