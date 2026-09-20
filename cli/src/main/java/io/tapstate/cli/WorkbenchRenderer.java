@@ -173,9 +173,9 @@ final class WorkbenchRenderer {
 
         String divider = wide ? " | " : "|";
         x = area.x();
-        WorkbenchState.WorkbenchTab[] tabs = WorkbenchState.WorkbenchTab.values();
-        for (int index = 0; index < tabs.length; index++) {
-            WorkbenchState.WorkbenchTab tab = tabs[index];
+        List<WorkbenchState.WorkbenchTab> tabs = headerTabs(area.width(), wide);
+        for (int index = 0; index < tabs.size(); index++) {
+            WorkbenchState.WorkbenchTab tab = tabs.get(index);
             String label = tabLabel(tab);
             String badge = tabBadge(state, tab);
             if (!badge.isEmpty()) {
@@ -204,6 +204,24 @@ final class WorkbenchRenderer {
                     new Rect(moreX, area.y() + TAB_LABELS_Y, moreWidth, 1)));
         }
         return new HeaderLayout(List.copyOf(hits), List.copyOf(actions));
+    }
+
+    /** Keeps the four primary workbench views and the More launcher visible at the minimum terminal width. */
+    private static List<WorkbenchState.WorkbenchTab> headerTabs(int width, boolean wide) {
+        List<WorkbenchState.WorkbenchTab> all = List.of(WorkbenchState.WorkbenchTab.values());
+        String divider = wide ? " | " : "|";
+        int required = displayWidth("📂  0 More ▾");
+        for (WorkbenchState.WorkbenchTab tab : all) {
+            required += displayWidth(tabIcon(tab) + "  " + tabNumber(tab) + " " + tabName(tab) + divider);
+        }
+        if (required <= width) {
+            return all;
+        }
+        return List.of(
+                WorkbenchState.WorkbenchTab.OVERVIEW,
+                WorkbenchState.WorkbenchTab.WORKSPACE,
+                WorkbenchState.WorkbenchTab.SOURCES,
+                WorkbenchState.WorkbenchTab.PIPELINES);
     }
 
     private static List<OverlayHit> renderOverlay(

@@ -71,6 +71,7 @@ class WorkbenchRendererTest {
         assertThat(rendered.text())
                 .contains("Tapstate", "ctx: dev", "connected", "auth: alice", "workspace: /work/catalog")
                 .contains("1 Overview", "2 Workspace", "3 Sources", "4 Pipelines", "0 More")
+                .doesNotContain("5 Logs", "6 Inspect")
                 .contains("Resources")
                 .contains("source", "pipeline", "in sync 1", "local only 1")
                 .contains("c  context", "a  auth", "0  more", "r  refresh", "q  quit")
