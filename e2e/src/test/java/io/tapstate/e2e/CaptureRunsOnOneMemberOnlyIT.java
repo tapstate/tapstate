@@ -12,15 +12,18 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * A source is read once, however many members are in the cluster and however many pipelines read it.
+ * One process reads a source and opens one tail on it, however many members are in the cluster and
+ * however many pipelines read it.
  *
  * <p>This is the refutable form of the promise that a cluster is not a multiplier on the databases it
  * reads. Two members each running the capture would double every read the source serves, and on a
@@ -29,16 +32,30 @@ import org.junit.jupiter.api.io.TempDir;
  * the same final state. A case that counted rows at the target would pass at full marks against
  * exactly the defect this is about, which is why the count is taken at the far end instead.
  *
+ * <p><b>What is not promised, and why saying so is part of the case.</b> The cluster is not a
+ * multiplier; the number of pipelines still is, for the initial load alone. A load is owed per
+ * pipeline and asked of that pipeline's own record, so a second pipeline over a source already being
+ * tailed loads what it has never loaded - deliberately, because a chain leaves the table subset out
+ * of its identity and a pipeline that trusted the chain's answer would skip a load it never did. So
+ * the tail is shared and the load is not, and a case that held the total to one number would be
+ * asserting which member the second pipeline happened to land on: where that member already holds the
+ * capture it attaches and loads, and where it does not it reads nothing at all and takes its rows
+ * from the ring. Measured over 28 runs of the earlier form, that placement decided the verdict every
+ * time - 5 red, all of them the placement, none of them the property.
+ *
  * <p><b>What counts as a read, and who counts it.</b> The harness's own connector notes every batch of
  * rows it hands over into a ledger of its own, one file per process. Nothing in the product is asked,
  * so a product that believed it was reading once would not be believed here; and a second reader
  * cannot hide, because it reads through a connector of its own that writes its own file. A batch
  * handed over is the unit rather than a poll, so the number does not grow with how long the case runs.
  *
- * <p><b>The number it is held to is measured, not written down.</b> One member running the same
+ * <p><b>The numbers it is held to are measured, not written down.</b> One member running the same
  * pipeline over the same rows is run first, and what it read is the figure the cluster is held to. A
  * literal would have to be re-derived by hand whenever the connector's batching changed, and the first
- * person to update it would have no way to tell a legitimate change from the defect.
+ * person to update it would have no way to tell a legitimate change from the defect. Two of the three
+ * are held to it exactly - the processes that read, and the tails they opened - and the third, the
+ * loads, to a bound of one per pipeline, which is the most that can be said about it without saying
+ * something untrue.
  *
  * <p><b>Two fences hold this up, and the case exercises them in turn.</b> A pipeline is driven by one
  * member because its actuation is claimed; a source is captured once because the capture itself is
@@ -87,11 +104,16 @@ class CaptureRunsOnOneMemberOnlyIT {
     void oneSourceIsReadOnceHoweverManyMembersAndPipelinesReadIt(@TempDir Path directory) throws Exception {
         byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
         try (FileEndpoints files = new FileEndpoints()) {
-            long byOneMemberAlone = whatOneMemberReads(directory.resolve("alone"), connector, files);
-            assertThat(byOneMemberAlone)
+            Reads byOneMemberAlone = whatOneMemberReads(directory.resolve("alone"), connector, files);
+            assertThat(byOneMemberAlone.tails())
                     .describedAs("what reading this source once looks like, measured rather than "
-                            + "assumed - a zero here would make both comparisons below vacuous, since "
-                            + "a source nothing ever read is also read no more than once")
+                            + "assumed - a zero here would make every comparison below vacuous, since "
+                            + "a source nothing ever read is also read no more than once: %s",
+                            byOneMemberAlone)
+                    .isPositive();
+            assertThat(byOneMemberAlone.snapshots())
+                    .describedAs("and it loaded, so that the bound on loads below bounds something: %s",
+                            byOneMemberAlone)
                     .isPositive();
 
             Path source = Files.createDirectories(directory.resolve("cluster/src"));
@@ -115,12 +137,20 @@ class CaptureRunsOnOneMemberOnlyIT {
                 awaitRunning(control, FIRST_PIPELINE);
                 awaitTheRowsAtTheTarget(files, firstTarget);
 
-                assertThat(settle(ledger))
-                        .describedAs("the cluster read the source no more than the single member did. "
-                                + "A member that captured alongside the one driving the pipeline would "
-                                + "double this, and nothing at either target would show it: %s",
-                                (Object) ledgerDump(ledger))
-                        .isEqualTo(byOneMemberAlone);
+                Reads onePipeline = settle(ledger);
+                assertThat(onePipeline.readers())
+                        .describedAs("one process read the source, exactly as on the single member. A "
+                                + "member that captured alongside the one driving the pipeline would "
+                                + "make this two, and nothing at either target would show it: %s",
+                                onePipeline)
+                        .isEqualTo(byOneMemberAlone.readers());
+                assertThat(onePipeline.tails())
+                        .describedAs("and one tail was opened on it, not one per member: %s", onePipeline)
+                        .isEqualTo(byOneMemberAlone.tails());
+                assertThat(onePipeline.snapshots())
+                        .describedAs("and it was loaded once. One pipeline owes one load however many "
+                                + "members could have run it: %s", onePipeline)
+                        .isEqualTo(byOneMemberAlone.snapshots());
 
                 // The whole workspace, not the two new documents alone: what is applied is read as the
                 // workspace entire, so a pipeline arriving without the source it names is refused for
@@ -136,12 +166,26 @@ class CaptureRunsOnOneMemberOnlyIT {
                                 + "two readers of one source rather than one that replaced the other")
                         .contains(PipelineState.RUNNING);
 
-                assertThat(settle(ledger))
-                        .describedAs("a second pipeline over the same source opened no second read of "
-                                + "it. Its identity is the source contract's, not the pipeline's, so "
-                                + "the member that picked this one up joins the capture already "
-                                + "running rather than starting one: %s", (Object) ledgerDump(ledger))
-                        .isEqualTo(byOneMemberAlone);
+                Reads twoPipelines = settle(ledger);
+                assertThat(twoPipelines.readers())
+                        .describedAs("a second pipeline over the same source brought no second reader "
+                                + "of it. Its capture's identity is the source contract's, not the "
+                                + "pipeline's, so whichever member picked this one up joins the capture "
+                                + "already running rather than standing up one of its own: %s",
+                                twoPipelines)
+                        .isEqualTo(byOneMemberAlone.readers());
+                assertThat(twoPipelines.tails())
+                        .describedAs("and opened no second tail on it, which is the half of this that "
+                                + "is shared between pipelines rather than owed by each: %s",
+                                twoPipelines)
+                        .isEqualTo(byOneMemberAlone.tails());
+                assertThat(twoPipelines.snapshots())
+                        .describedAs("and loaded at most once more - a load per pipeline is owed, and "
+                                + "anything past that is a source being re-read for nothing. Held to a "
+                                + "bound rather than a number because which of the two it is depends on "
+                                + "where the second pipeline landed, and that is the product's decision "
+                                + "rather than a promise to this case: %s", twoPipelines)
+                        .isBetween(byOneMemberAlone.snapshots(), 2 * byOneMemberAlone.snapshots());
 
                 Map<String, String> behindTheSecond = control.captureOwnersOf(SECOND_PIPELINE);
                 assertThat(behindTheSecond)
@@ -164,7 +208,7 @@ class CaptureRunsOnOneMemberOnlyIT {
      * under the pipeline, and the ring it fills under the source's settings, so sharing either with the
      * cluster half would have the two halves reading each other's leavings.
      */
-    private static long whatOneMemberReads(Path root, byte[] connector, FileEndpoints files)
+    private static Reads whatOneMemberReads(Path root, byte[] connector, FileEndpoints files)
             throws IOException {
         Path source = Files.createDirectories(root.resolve("src"));
         Path ledger = Files.createDirectories(root.resolve("reads"));
@@ -194,13 +238,52 @@ class CaptureRunsOnOneMemberOnlyIT {
     }
 
     /**
+     * What the source's own ledger says happened: who read it, and which phases they opened.
+     *
+     * <p>Three numbers rather than one total, because the three are not promised alike. How many
+     * processes read the source, and how many tails were opened on it, are what a capture claim exists
+     * to hold at one however large the cluster gets. How many initial loads ran is not - a load is owed
+     * per pipeline. A single total adds the three together and then cannot say which of them moved,
+     * which is how the earlier form of this case came to assert a number that depended on where the
+     * second pipeline landed: it failed 5 times in 28 runs, every one of them on a load that was owed.
+     */
+    private record Reads(int readers, long snapshots, long tails, List<String> lines) {
+
+        private static final String SNAPSHOT = "snapshot";
+        private static final String TAIL = "tail";
+
+        /** Parses the ledger the harness's own connector writes: pid, phase, table, rows, tab-separated. */
+        static Reads of(List<String> lines) {
+            Set<String> readers = new LinkedHashSet<>();
+            long snapshots = 0;
+            long tails = 0;
+            for (String line : lines) {
+                String[] fields = line.split("\t");
+                readers.add(fields[0]);
+                if (fields.length > 1 && SNAPSHOT.equals(fields[1])) {
+                    snapshots++;
+                } else if (fields.length > 1 && TAIL.equals(fields[1])) {
+                    tails++;
+                }
+            }
+            return new Reads(readers.size(), snapshots, tails, List.copyOf(lines));
+        }
+
+        @Override
+        public String toString() {
+            return readers + " process(es), " + snapshots + " load(s), " + tails + " tail(s) in "
+                    + lines.size() + " batch(es): " + lines;
+        }
+    }
+
+    /**
      * Waits until the ledger stops growing and answers what it then held.
      *
      * <p>Quiet rather than a moment chosen by the case: a read that is going to happen has been asked
      * for by the time the pipeline that wants it is running, but it is served on the capture's own
      * thread, and a count taken the instant the state flips would be a race the product usually wins.
      */
-    private static long settle(Path ledger) {
+    private static Reads settle(Path ledger) {
         long[] last = {reads(ledger)};
         long[] since = {System.nanoTime()};
         Await.until("the source's own ledger of reads to stop growing", SETTLE_BOUND,
@@ -214,7 +297,7 @@ class CaptureRunsOnOneMemberOnlyIT {
                     return System.nanoTime() - since[0] >= QUIET.toNanos();
                 },
                 () -> ledgerDump(ledger));
-        return last[0];
+        return Reads.of(ledgerLines(ledger));
     }
 
     /** Every line the source's readers wrote, so a failure says who read and what they took. */
