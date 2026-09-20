@@ -3,6 +3,7 @@ package io.tapstate.adapters.transform;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -28,12 +29,13 @@ import org.graalvm.polyglot.proxy.ProxyObject;
  * is JS null). The maps are exposed through host-backed proxies, so a field the script leaves untouched
  * keeps its exact Java type on the way out (a BIGINT stays a long, a DOUBLE stays a double), while a
  * value the script writes becomes an ordinary JS value — an integer-valued number narrows to int / long
- * before double, which is the unavoidable ambiguity of JS having one number type. A connector-converted
- * value is exposed in its portable form while its restoration metadata follows an untouched slot; writing
- * that slot drops the metadata because the new value did not come from the source conversion. The script
- * mutates the record, returns one, or fans out through {@code ctx.emit}; the output is every emitted record
- * in order, followed by the return value when it is non-null (return null to drop). Unlike filter / map, js
- * sees every event including ddl.
+ * before double, which is the unavoidable ambiguity of JS having one number type. An exact decimal is
+ * likewise exposed as a JS number, while its untouched backing slot retains the original {@link BigDecimal}.
+ * A connector-converted value is exposed in its portable form while its restoration metadata follows an
+ * untouched slot; writing that slot drops the metadata because the new value did not come from the source
+ * conversion. The script mutates the record, returns one, or fans out through {@code ctx.emit}; the output
+ * is every emitted record in order, followed by the return value when it is non-null (return null to drop).
+ * Unlike filter / map, js sees every event including ddl.
  *
  * <p>A script holds a private GraalVM {@link Context}, reused across events on the single cooperative
  * thread that owns the port; it is not thread-safe and holds no cross-event state of its own (state /
@@ -391,7 +393,7 @@ final class RowScript {
         while (value instanceof CarriedSlot carried) {
             value = carried.exposed;
         }
-        return value;
+        return value instanceof BigDecimal decimal ? decimal.doubleValue() : value;
     }
 
     /**

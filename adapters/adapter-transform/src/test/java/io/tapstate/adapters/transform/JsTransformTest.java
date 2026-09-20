@@ -8,6 +8,7 @@ import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.transform.TransformPort;
+import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +30,47 @@ class JsTransformTest {
 
     private static Map<String, Object> after(Envelope out) {
         return out.after();
+    }
+
+    @Test
+    @DisplayName("exact decimals reach javascript as numbers without changing untouched values")
+    void exactDecimalsReachJavascriptAsNumbersWithoutChangingUntouchedValues() {
+        BigDecimal decimal = new BigDecimal("1.5");
+        ConvertedValue carried = new ConvertedValue(decimal, "DECIMAL128");
+        TransformPort js = js(
+                "function process(r, ctx) {"
+                        + " r.after.observed = {"
+                        + "  bareType: typeof r.after.bare,"
+                        + "  bareTimesTwo: r.after.bare * 2,"
+                        + "  bareGreaterThanOne: r.after.bare > 1,"
+                        + "  bareString: String(r.after.bare),"
+                        + "  carriedType: typeof r.after.carried,"
+                        + "  carriedTimesTwo: r.after.carried * 2,"
+                        + "  doubleType: typeof r.after.dbl,"
+                        + "  doubleTimesTwo: r.after.dbl * 2"
+                        + " };"
+                        + " return r;"
+                        + " }");
+        Envelope row = Envelope.insert(1L, "orders", new LinkedHashMap<>(Map.of(
+                "bare", decimal,
+                "carried", carried,
+                "dbl", 1.5d)), null);
+
+        Map<String, Object> output = after(js.transform(row).get(0));
+
+        assertThat(output)
+                .containsEntry("bare", decimal)
+                .containsEntry("carried", carried)
+                .containsEntry("dbl", 1.5d);
+        assertThat(output.get("observed")).isEqualTo(Map.of(
+                "bareType", "number",
+                "bareTimesTwo", 3L,
+                "bareGreaterThanOne", true,
+                "bareString", "1.5",
+                "carriedType", "number",
+                "carriedTimesTwo", 3L,
+                "doubleType", "number",
+                "doubleTimesTwo", 3L));
     }
 
     @Test
