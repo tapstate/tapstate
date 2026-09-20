@@ -78,6 +78,18 @@ class MigrationRunnerIT {
     }
 
     @Test
+    void bringsConsumerCursorIndexesToAStoreAlreadyPastTheBaseline() {
+        MongoDatabase database = freshDatabase("runner_consumer_cursor_indexes");
+        seedSchemaDocument(database, 9, null);
+
+        MigrationRunner.migrate(database);
+
+        assertThat(installedVersion(database)).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
+        assertThat(indexNames(database, SystemCollections.SRS_CONSUMER_OFFSETS))
+                .contains("miningChainId_idx", "pipelineId_idx");
+    }
+
+    @Test
     void runningItAgainstTheSameStoreAgainChangesNothing() {
         MongoDatabase database = freshDatabase("runner_twice");
 
@@ -280,7 +292,8 @@ class MigrationRunnerIT {
         assertThat(before.pending())
                 .containsExactly("V1BaselineIndexes", "V2StructuredArtifacts", "V3RecordedSrsSwitches",
                         "V4DiscardInventedPositions", "V5SplitSourceSchemas", "V6SplitDerivedSchemas",
-                        "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes");
+                        "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
+                        "V10SrsConsumerOffsetIndexes");
 
         MigrationRunner.migrate(database);
 

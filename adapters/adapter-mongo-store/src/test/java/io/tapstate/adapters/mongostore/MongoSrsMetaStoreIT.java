@@ -214,6 +214,30 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void aConsumerWriteSplitsEveryLegacyCursorBeforeItAdvancesOne() {
+        withCollection((store, collection) -> {
+            ConsumerOffset advancing = new ConsumerOffset("p1", Map.of("orders", 10L),
+                    new ChainPosition(new SourceOrder(1L, 10L), "gtid:aaa-1:10"));
+            ConsumerOffset untouched = new ConsumerOffset("p2", Map.of("orders", 20L),
+                    new ChainPosition(new SourceOrder(1L, 20L), "gtid:aaa-1:20"));
+            collection.insertOne(MongoSrsMetaStore.toDocument(
+                    new SrsMeta(CHAIN, null, List.of(advancing, untouched), List.of(), null)));
+
+            store.advanceConsumerReadSeq(CHAIN, "p1", "orders", 11L);
+
+            Document root = collection.find(new Document("_id", CHAIN)).first();
+            assertThat(root).isNotNull();
+            assertThat(root.get("consumerOffsets", Document.class)).isEmpty();
+            assertThat(collection.find(new Document("miningChainId", CHAIN))
+                    .into(new ArrayList<>()))
+                    .hasSize(2);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).containsExactlyInAnyOrder(
+                    new ConsumerOffset("p1", Map.of("orders", 11L), advancing.sinkAcked()),
+                    untouched);
+        });
+    }
+
+    @Test
     void advanceConsumerReadSeqAdvancesTheReadCursorWithoutClobberingTheSinkAckedPosition() {
         withStore(store -> {
             store.create(CHAIN, null);
@@ -532,12 +556,11 @@ class MongoSrsMetaStoreIT {
      * A write the endpoint refuses because the record it would leave behind is too large is reported as
      * exactly that, not as a store that could not be reached.
      *
-     * <p>The trim bounds the one facet that grows for the life of a chain; it cannot bound the rest, and a
-     * record can still arrive at the ceiling by what else it carries — at which point every mutator fails
-     * on it. What that failure must not do is send whoever reads it to check a store that is healthy:
-     * nothing is wrong with the store and no retry can help, and what has to change is how much is being
-     * put in one document. The endpoint reports this as an ordinary command failure, so it is only told
-     * apart by being named.
+     * <p>The history budget keeps ordinary chain records below the ceiling, but a record can still be
+     * seeded with another field that leaves less room than one schema entry needs. What that refusal must
+     * not do is send whoever reads it to check a store that is healthy: nothing is wrong with the store and
+     * no retry can help. The endpoint reports this as an ordinary command failure, so it is only told apart
+     * by being named.
      */
     @Test
     void aWriteRefusedForTheSizeOfItsRecordIsReportedAsTheSizeItIs() {
@@ -548,8 +571,8 @@ class MongoSrsMetaStoreIT {
                             + "for what it would add rather than for what is already there")
                     .isLessThan(DOCUMENT_CEILING);
 
-            assertThatThrownBy(() -> store.upsertConsumerOffset(CHAIN,
-                    new ConsumerOffset("pipeline-1", cursorOverTables(300), null)))
+            assertThatThrownBy(() -> store.appendSchemaVersion(
+                    CHAIN, new SchemaVersion(1L, wideSchema(), 1L)))
                     .isInstanceOf(TapstateException.class)
                     .extracting(thrown -> ((TapstateException) thrown).code())
                     .isEqualTo(IoError.DOCUMENT_TOO_LARGE);
@@ -663,6 +686,20 @@ class MongoSrsMetaStoreIT {
 
             assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).isEmpty();
             assertThat(store.read("never_seeded")).isEmpty();
+        });
+    }
+
+    @Test
+    void droppingAChainRemovesItsSplitConsumersBeforeThatIdCanBeSeededAgain() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("p1", Map.of("orders", 7L), null));
+
+            store.dropChain(CHAIN);
+
+            assertThat(collection.countDocuments()).isZero();
+            store.create(CHAIN, null);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).isEmpty();
         });
     }
 
@@ -793,15 +830,6 @@ class MongoSrsMetaStoreIT {
         long empty = bsonSize(MongoSrsMetaStore.toDocument(
                 new SrsMeta(CHAIN, null, List.of(), List.of(), "", 0L, null)));
         return "r".repeat((int) (DOCUMENT_CEILING - empty - UNDER_THE_CEILING));
-    }
-
-    /** A consumer's per-table cursor over that many tables: more bytes than the record has room for. */
-    private static Map<String, Long> cursorOverTables(int tables) {
-        Map<String, Long> cursor = new LinkedHashMap<>();
-        for (int table = 0; table < tables; table++) {
-            cursor.put("table_" + table, (long) table);
-        }
-        return cursor;
     }
 
     /** A table's field schema at the width the history case drives. */

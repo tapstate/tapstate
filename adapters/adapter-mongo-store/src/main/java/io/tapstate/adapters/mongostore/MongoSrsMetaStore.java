@@ -6,7 +6,9 @@ import com.mongodb.MongoWriteException;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.Projections;
+import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.ReturnDocument;
+import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.result.UpdateResult;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
@@ -22,6 +24,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -29,19 +32,21 @@ import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
- * The MongoDB SRS meta store: one durable coordination document per mining chain — the offset, consumer
- * cursor and schema truth that outlives the in-memory change ring. The document is keyed by the mining
- * chain id (as {@code _id}); each facet is advanced by its own atomic update, so a consumer that sets
- * its own cursor never clobbers another consumer's concurrent set or the chain's offset advance.
+ * The MongoDB SRS meta store: one durable coordination document per mining chain — the offset and schema
+ * truth that outlive the in-memory change ring — plus one cursor document per consumer pipeline. The chain
+ * document is keyed by the mining chain id (as {@code _id}); a consumer document has a compound id naming
+ * its chain and pipeline, so each facet advances independently and no consumer cursor can fill the chain
+ * document until its own source position can no longer move.
  *
- * <p>Each consumer's own state is stored as a sub-document keyed by pipeline id — a resource id, which
- * the grammar forbids from containing a dot, so the id is a safe update path and one consumer is updated
- * at {@code consumerOffsets.<pipelineId>} independently. That sub-document holds everything belonging to
- * one pipeline rather than to the chain: its read cursor, its acked position, the tables whose initial
- * load its sink has confirmed, and the seam and generation at which its load began. The schema history is
- * an append-only array, advanced by an update that
- * keeps the newest entries inside a fixed byte budget. The nullable positions are stored only when present,
- * never as explicit nulls.
+ * <p>A consumer document holds everything belonging to one pipeline rather than to the chain: its read
+ * cursor, its acked position, the tables whose initial load its sink has confirmed, and the seam and
+ * generation at which its load began. Records written before that split carried those documents under the
+ * chain's {@code consumerOffsets} field. The first consumer write migrates them; a chain write that finds
+ * an old record already at the endpoint ceiling does the same and retries. The copy is insert-only and the
+ * embedded map is cleared only after every cursor has landed, so an interrupted migration loses nothing.
+ * The schema history remains an append-only array on the chain document, advanced by an update that keeps
+ * the newest entries inside a fixed byte budget. Nullable positions are stored only when present, never as
+ * explicit nulls.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A re-seed of an existing chain (which would discard its accumulated truth) and a mutate of
@@ -63,8 +68,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * <p>Bytes rather than a count of entries, because bytes are what the ceiling counts. An entry is a
      * table's field schema, and a wide table's is a hundred times a narrow one's, so a count that holds
      * the record under the ceiling at one entry size does not at another. A sixteenth of the ceiling
-     * leaves the rest of the record — the consumer cursors and the positions — the room it always had,
-     * and is a window hundreds of versions long at the entry size this product's records carry.
+     * leaves the rest of the chain record — its positions and structural fields — ample room, and is a
+     * window hundreds of versions long at the entry size this product's records carry.
      */
     private static final long SCHEMA_HISTORY_BUDGET_BYTES = 1024L * 1024L;
 
@@ -77,15 +82,27 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     private static final int HISTORY_ENTRY_OVERHEAD_BYTES = 12;
 
     private final MongoCollection<Document> collection;
+    private final MongoCollection<Document> consumers;
     private final Clock clock;
 
     public MongoSrsMetaStore(MongoCollection<Document> collection) {
-        this(collection, Clock.systemUTC());
+        this(collection, collection, Clock.systemUTC());
     }
 
     /** The same store reading a given clock, for a caller that needs the recorded time to be decidable. */
     public MongoSrsMetaStore(MongoCollection<Document> collection, Clock clock) {
+        this(collection, collection, clock);
+    }
+
+    /** A store whose chain roots and per-consumer cursors live in their declared collections. */
+    public MongoSrsMetaStore(MongoCollection<Document> collection, MongoCollection<Document> consumers) {
+        this(collection, consumers, Clock.systemUTC());
+    }
+
+    /** The same two-collection store reading a given clock. */
+    MongoSrsMetaStore(MongoCollection<Document> collection, MongoCollection<Document> consumers, Clock clock) {
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.consumers = Objects.requireNonNull(consumers, "consumers");
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
@@ -93,11 +110,23 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     public Optional<SrsMeta> read(String miningChainId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Document document = StoreIo.call(() -> collection.find(new Document("_id", miningChainId)).first());
-        return document == null ? Optional.empty() : Optional.of(toMeta(document));
+        if (document == null) {
+            return Optional.empty();
+        }
+        SrsMeta chain = toMeta(document);
+        return Optional.of(new SrsMeta(
+                chain.miningChainId(),
+                chain.sourceRead(),
+                mergedConsumers(document),
+                chain.schemaHistory(),
+                chain.retention(),
+                chain.epoch(),
+                chain.sourceReadAt()));
     }
 
     /**
-     * Fetches the consumer cursors alone, asking the endpoint for that field and no other.
+     * Fetches the consumer cursors alone, asking the chain document only for its legacy field and reading
+     * the split cursor documents without carrying the schema history over the wire.
      *
      * <p>This exists because of what it does not carry back. The record's schema history grows by one
      * entry per DDL, up to the bound the record keeps it under, and the cdc write path -- which reads
@@ -118,16 +147,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         if (document == null) {
             return List.of();
         }
-        String id = String.valueOf(document.get("_id"));
-        Object consumersRaw = document.get("consumerOffsets");
-        if (!(consumersRaw instanceof Document consumersDoc)) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id), null);
-        }
-        List<ConsumerOffset> consumers = new ArrayList<>();
-        for (Map.Entry<String, Object> entry : consumersDoc.entrySet()) {
-            consumers.add(consumerFromDocument(entry.getKey(), asDocument(entry.getValue(), id)));
-        }
-        return List.copyOf(consumers);
+        return mergedConsumers(document);
     }
 
     @Override
@@ -151,7 +171,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // filter, so the comparison and the write are one atomic act: a read-then-write would let a second
         // member land its advance in between and be overwritten by this one, which is the rewind this
         // exists to stop. It matches nothing when the recorded position already ranks at or after this one.
-        long matched = StoreIo.call(() -> collection.updateOne(
+        long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
                 sourceReadAdvanceFilter(miningChainId, position.order()),
                 new Document("$set", sourceReadFields(position, Instant.now(clock)))).getMatchedCount());
         if (matched > 0) {
@@ -171,7 +191,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // token says where the engine observed that token in the ring, and this token was not observed
         // here at all -- leaving the old one in place would have the record claim the new position sits
         // exactly where the old one did, in the comparison that decides what is safe to forget.
-        long matched = StoreIo.call(() -> collection.updateOne(
+        long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
                         new Document("_id", miningChainId),
                         new Document("$set", new Document("sourceReadOffset", token)
                                 .append("sourceReadAt", Instant.now(clock).toEpochMilli()))
@@ -230,43 +250,40 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
         Objects.requireNonNull(offset, "offset");
-        // Keyed by the dot-free pipeline id, so one consumer's cursor is set independently of the others'.
-        update(miningChainId, new Document("$set",
-                new Document("consumerOffsets." + offset.pipelineId(), consumerToDocument(offset))));
+        migrateLegacyConsumers(miningChainId, true);
+        StoreIo.call(miningChainId, () -> consumers.replaceOne(
+                consumerKey(miningChainId, offset.pipelineId()),
+                consumerDocument(miningChainId, offset),
+                new ReplaceOptions().upsert(true)));
     }
 
     @Override
     public void advanceConsumerReadSeq(String miningChainId, String pipelineId, String table, long lastReadSeq) {
-        update(miningChainId, consumerReadSeqUpdate(pipelineId, table, lastReadSeq));
+        updateConsumer(miningChainId, pipelineId, consumerReadSeqUpdate(pipelineId, table, lastReadSeq));
     }
 
     @Override
     public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
-        update(miningChainId, sinkAckedUpdate(pipelineId, position));
+        updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, position));
     }
 
     /**
-     * The path-scoped update advancing one consumer's read cursor for one table: it sets only
-     * {@code consumerOffsets.<pipelineId>.perTableSeq.<table>}, so the consumer's sink-acked position is
-     * left untouched by a read-cursor advance. Both keys are dot-free — the pipeline id is a resource id
-     * the grammar forbids a dot in, and an L1 stream name is a bare identifier — so the dotted path
-     * addresses exactly one field. A deep {@code $set} creates the intermediate objects, so a reader may
-     * advance before the consumer has any other cursor state.
+     * The path-scoped update advancing one consumer document's read cursor for one table. It sets only
+     * {@code perTableSeq.<table>}, so the sink-acked position in that document is left untouched. The L1
+     * stream name is a bare identifier, so the dotted path addresses exactly one field. A deep
+     * {@code $set} creates the cursor map when a reader advances before the sink has written anything.
      */
     static Document consumerReadSeqUpdate(String pipelineId, String table, long lastReadSeq) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(table, "table");
-        return new Document("$set",
-                new Document("consumerOffsets." + pipelineId + ".perTableSeq." + table, lastReadSeq));
+        return new Document("$set", new Document("perTableSeq." + table, lastReadSeq));
     }
 
     /**
-     * The path-scoped update that advances one consumer's durable sink-acked position: a {@code $set} on
-     * {@code consumerOffsets.<pipelineId>.sinkAckedSrcpos} and the two fields carrying the order it sat
-     * at, so the reader's per-table cursor is left untouched by a sink-ack advance. The pipeline id is a
-     * resource id the grammar forbids a dot in, so each dotted path addresses exactly one field. A deep
-     * {@code $set} creates the intermediate objects, so a sink may ack before the consumer has any other
-     * cursor state.
+     * The path-scoped update that advances one consumer document's durable sink-acked position: a
+     * {@code $set} on the token and the two fields carrying the order it sat at, so the reader's per-table
+     * cursor in that document is left untouched. An upsert lets a sink ack before the consumer has any
+     * other cursor state.
      *
      * <p>The three fields move together in one update. A token stored without its order can no longer be
      * ranked against anything, and an order stored without its token is nothing a read can resume from;
@@ -285,14 +302,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(position, "position");
         Objects.requireNonNull(position.order(), "position order");
-        String path = "consumerOffsets." + pipelineId + ".";
-        Document fields = new Document(path + "sinkAckedEpoch", position.order().epoch())
-                .append(path + "sinkAckedSeq", position.order().seq());
+        Document fields = new Document("sinkAckedEpoch", position.order().epoch())
+                .append("sinkAckedSeq", position.order().seq());
         Document update = new Document("$set", fields);
         if (position.token() != null) {
-            fields.append(path + "sinkAckedSrcpos", position.token());
+            fields.append("sinkAckedSrcpos", position.token());
         } else {
-            update.append("$unset", new Document(path + "sinkAckedSrcpos", ""));
+            update.append("$unset", new Document("sinkAckedSrcpos", ""));
         }
         return update;
     }
@@ -306,11 +322,10 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             throw new IllegalArgumentException("snapshotEpoch must not be negative, got " + snapshotEpoch);
         }
         // One update, both fields: a resumed snapshot reads them together, so a state where the seam
-        // position is stored without the generation it belongs to must not be reachable. The pipeline id
-        // scopes both so one pipeline never reads another pipeline's load start.
-        String path = "consumerOffsets." + pipelineId + ".";
-        update(miningChainId, new Document("$set", new Document(path + "cdcStartPosition", cdcStartPosition)
-                .append(path + "snapshotEpoch", snapshotEpoch)));
+        // position is stored without the generation it belongs to must not be reachable.
+        updateConsumer(miningChainId, pipelineId,
+                new Document("$set", new Document("cdcStartPosition", cdcStartPosition)
+                        .append("snapshotEpoch", snapshotEpoch)));
     }
 
     @Override
@@ -319,7 +334,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // An atomic increment read back after the write: two members opening the same chain must take two
         // different generations, so the counter is advanced by the store rather than read, added to and
         // written back. It touches only epoch, leaving every pinned pipeline snapshot generation where it is.
-        Document updated = StoreIo.call(() -> collection.findOneAndUpdate(
+        Document updated = writeChainWithConsumerMigration(miningChainId, () -> collection.findOneAndUpdate(
                 new Document("_id", miningChainId),
                 new Document("$inc", new Document("epoch", 1L)),
                 new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)));
@@ -434,55 +449,58 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     @Override
     public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
-        update(miningChainId, snapshotCompleteUpdate(pipelineId, table));
+        updateConsumer(miningChainId, pipelineId, snapshotCompleteUpdate(pipelineId, table));
     }
 
     /**
-     * The update that marks one table's snapshot drained for one consumer: an {@code $addToSet} on
-     * {@code consumerOffsets.<pipelineId>.snapshotCompletedTables}. A set add, not a push — the mark
-     * answers "has this table landed in this pipeline's target?", so re-marking a table (a replay, a
-     * re-run of the snapshot) must be a no-op rather than a duplicate entry.
+     * The update that marks one table's snapshot drained in one consumer document: an {@code $addToSet}
+     * on {@code snapshotCompletedTables}. A set add, not a push — the mark answers "has this table landed
+     * in this pipeline's target?", so re-marking a table must be a no-op rather than a duplicate entry.
      *
-     * <p>Scoped under the consumer for the same reason its cursor is: the pipeline id is a resource id the
-     * grammar forbids a dot in, so the dotted path addresses exactly one consumer's set and cannot reach a
-     * neighbour's. Recording it against the chain instead is what let a pipeline new to a shared chain read
-     * another pipeline's answer and skip a load it had never done. The path creates the consumer entry when
-     * the pipeline has none yet, and touches nothing else in it.
+     * <p>The containing document scopes the mark to the pipeline. Recording it against the chain instead
+     * is what let a pipeline new to a shared chain read another pipeline's answer and skip a load it had
+     * never done. An upsert creates the consumer entry when the pipeline has none and touches nothing else.
      */
     static Document snapshotCompleteUpdate(String pipelineId, String table) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(table, "table");
-        return new Document("$addToSet",
-                new Document("consumerOffsets." + pipelineId + ".snapshotCompletedTables", table));
+        return new Document("$addToSet", new Document("snapshotCompletedTables", table));
     }
 
     @Override
     public List<String> miningChainIdsWithConsumer(String pipelineId) {
-        // Asked of the chains, not of the consumer: a chain carries its consumers, so the presence of the
-        // dot-free pipeline id under consumerOffsets is itself the membership test. Only the id is read,
-        // never the record, so enumerating never reconstructs — and so never fails — on a corrupt document.
-        Document filter = consumerPresenceFilter(pipelineId);
-        return StoreIo.call(() -> collection.find(filter)
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        // Include both shapes during the lazy migration window. Only ids are read, so enumeration never
+        // reconstructs a cursor and a corrupt cursor cannot prevent a departing pipeline from detaching.
+        LinkedHashSet<String> chains = new LinkedHashSet<>();
+        StoreIo.call(() -> collection.find(consumerPresenceFilter(pipelineId))
                 .projection(Projections.include("_id"))
                 .map(document -> document.getString("_id"))
-                .into(new ArrayList<>()));
+                .into(chains));
+        StoreIo.call(() -> consumers.find(new Document("pipelineId", pipelineId))
+                .projection(Projections.include("miningChainId"))
+                .map(document -> document.getString("miningChainId"))
+                .into(chains));
+        return List.copyOf(chains);
     }
 
     @Override
     public void dropChain(String miningChainId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        // deleteOne on a missing _id removes nothing and reports so without failing, which is the no-op
-        // an absent chain is meant to be.
+        // Delete the root first: after that a partial cleanup can leave only unreachable cursor documents,
+        // never a live chain whose durable cursor vanished. A retry removes those cursor documents too.
         StoreIo.run(() -> collection.deleteOne(new Document("_id", miningChainId)));
+        StoreIo.run(() -> consumers.deleteMany(consumersOfChain(miningChainId)));
     }
 
     @Override
     public void detachConsumer(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        // Deliberately not routed through update(): a detach is idempotent, so an absent chain is the end
-        // condition already met rather than the ordering error the advancing mutators treat it as.
-        Document filter = new Document("_id", miningChainId);
-        StoreIo.run(() -> collection.updateOne(filter, detachConsumerUpdate(pipelineId)));
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        // A detach is idempotent, so an absent chain is already the requested end state. Migration still
+        // runs when the chain exists, preserving every other legacy cursor before this one is removed.
+        migrateLegacyConsumers(miningChainId, false);
+        StoreIo.run(() -> consumers.deleteOne(consumerKey(miningChainId, pipelineId)));
     }
 
     /**
@@ -496,27 +514,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     /**
-     * The path-scoped update that removes one consumer from a chain: an {@code $unset} of
-     * {@code consumerOffsets.<pipelineId>} alone, so every other consumer's cursor and snapshot start, and
-     * the chain's own offset and schema history survive it untouched. Removing the whole entry rather
-     * than blanking its positions is what takes the departing consumer out of the two minimums that would
-     * otherwise still fold it in.
-     */
-    static Document detachConsumerUpdate(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
-        return new Document("$unset", new Document("consumerOffsets." + pipelineId, ""));
-    }
-
-    /** Applies an atomic update to a seeded chain, written with update operators. */
-    private void update(String miningChainId, Document update) {
-        applyToSeeded(miningChainId,
-                () -> collection.updateOne(new Document("_id", miningChainId), update));
-    }
-
-    /**
-     * The same for an update written as a pipeline — the form an update takes when what it writes is a
-     * function of what the record already holds, which no single update operator expresses. Still one
-     * atomic act on one document.
+     * Applies an update written as a pipeline — the form an update takes when what it writes is a function
+     * of what the record already holds, which no single update operator expresses. Still one atomic act on
+     * one chain document.
      */
     private void updatePipeline(String miningChainId, List<Document> pipeline) {
         applyToSeeded(miningChainId,
@@ -524,17 +524,161 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     /**
-     * What both update forms share: the id check, the driver translation, and the matched count. A zero
-     * matched count means no document carried the id — the chain was never seeded, a caller ordering error
-     * surfaced bare (not laundered into an io code). The chain id is handed to the translation so that a
-     * write the endpoint refuses for its size names the record it was for.
+     * Checks the result of a chain update. A zero matched count means no document carried the id — the
+     * chain was never seeded, a caller ordering error surfaced bare (not laundered into an io code). The
+     * chain id is handed to the translation so that a size refusal names the record it was for.
      */
     private void applyToSeeded(String miningChainId, Supplier<UpdateResult> updateOne) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        UpdateResult result = StoreIo.call(miningChainId, updateOne);
+        UpdateResult result = writeChainWithConsumerMigration(miningChainId, updateOne);
         if (result.getMatchedCount() == 0) {
             throw unseededChain(miningChainId);
         }
+    }
+
+    /**
+     * Writes one split consumer document after moving any embedded predecessors out of the chain record.
+     * The identity fields are insert-only so a partial update can create the cursor without replacing a
+     * different facet written concurrently by the same pipeline.
+     */
+    private void updateConsumer(String miningChainId, String pipelineId, Document update) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        migrateLegacyConsumers(miningChainId, true);
+        update.append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
+        StoreIo.call(miningChainId, () -> consumers.updateOne(
+                consumerKey(miningChainId, pipelineId), update, new UpdateOptions().upsert(true)));
+    }
+
+    /**
+     * Retries a chain-document write after losslessly splitting legacy consumer cursors out of a record
+     * that they have already filled. A size failure with no embedded cursors is unchanged: migration has
+     * no truthful bytes to reclaim from that document.
+     */
+    private <T> T writeChainWithConsumerMigration(String miningChainId, Supplier<T> write) {
+        try {
+            return StoreIo.call(miningChainId, write);
+        } catch (TapstateException e) {
+            if (e.code() != IoError.DOCUMENT_TOO_LARGE) {
+                throw e;
+            }
+            // Retry even when this call finds the map already empty: another writer may have completed
+            // the migration after this write was refused, and rethrowing the stale refusal would turn that
+            // successful concurrent repair into a false failure.
+            migrateLegacyConsumers(miningChainId, true);
+            return StoreIo.call(miningChainId, write);
+        }
+    }
+
+    /**
+     * Copies every cursor from the legacy embedded map into its own document, then clears that map. The
+     * copy uses {@code $setOnInsert}: if a previous attempt landed a cursor and stopped before the clear,
+     * retrying cannot replace that cursor with the older embedded value. The empty map remains on the root
+     * because it is a structural field older readers and the stored-record decoder require.
+     */
+    private void migrateLegacyConsumers(String miningChainId, boolean requireSeeded) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("consumerOffsets"))
+                .first());
+        if (root == null) {
+            if (requireSeeded) {
+                throw unseededChain(miningChainId);
+            }
+            return;
+        }
+        Object raw = root.get("consumerOffsets");
+        if (!(raw instanceof Document embedded)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", miningChainId, "field", "consumerOffsets"), null);
+        }
+        if (embedded.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, Object> entry : embedded.entrySet()) {
+            String pipelineId = entry.getKey();
+            Document identityAndCursor = consumerIdentity(miningChainId, pipelineId);
+            identityAndCursor.putAll(asDocument(entry.getValue(), miningChainId));
+            insertLegacyConsumer(miningChainId, pipelineId, identityAndCursor);
+        }
+        UpdateResult cleared = StoreIo.call(miningChainId, () -> collection.updateOne(
+                new Document("_id", miningChainId),
+                new Document("$set", new Document("consumerOffsets", new Document()))));
+        if (cleared.getMatchedCount() == 0 && requireSeeded) {
+            throw unseededChain(miningChainId);
+        }
+    }
+
+    /**
+     * Lands one legacy cursor unless another migration landed it first. Concurrent upserts can race at
+     * the unique id and make one driver call report a duplicate; that means the cursor now exists, which
+     * is the requested postcondition, while every other Mongo failure still goes through the translator.
+     */
+    private void insertLegacyConsumer(String miningChainId, String pipelineId, Document identityAndCursor) {
+        try {
+            StoreIo.call(miningChainId, () -> consumers.updateOne(
+                    consumerKey(miningChainId, pipelineId),
+                    new Document("$setOnInsert", identityAndCursor),
+                    new UpdateOptions().upsert(true)));
+        } catch (TapstateException e) {
+            if (!(e.getCause() instanceof MongoWriteException write)
+                    || write.getError().getCategory() != ErrorCategory.DUPLICATE_KEY) {
+                throw e;
+            }
+        }
+    }
+
+    /** Reads legacy and split cursors, with the split document winning during an interrupted migration. */
+    private List<ConsumerOffset> mergedConsumers(Document root) {
+        String miningChainId = root.getString("_id");
+        Object raw = root.get("consumerOffsets");
+        if (miningChainId == null || !(raw instanceof Document embedded)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(miningChainId),
+                            "field", miningChainId == null ? "_id" : "consumerOffsets"), null);
+        }
+        Map<String, ConsumerOffset> merged = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : embedded.entrySet()) {
+            merged.put(entry.getKey(),
+                    consumerFromDocument(entry.getKey(), asDocument(entry.getValue(), miningChainId)));
+        }
+        List<Document> split = StoreIo.call(() -> consumers.find(consumersOfChain(miningChainId))
+                .into(new ArrayList<>()));
+        for (Document document : split) {
+            String pipelineId = document.getString("pipelineId");
+            if (pipelineId == null) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", String.valueOf(document.get("_id")), "field", "pipelineId"), null);
+            }
+            merged.put(pipelineId, consumerFromDocument(pipelineId, document));
+        }
+        return List.copyOf(merged.values());
+    }
+
+    /** The collision-free id of one cursor document; chain roots keep scalar string ids. */
+    private static Document consumerKey(String miningChainId, String pipelineId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return new Document("_id", new Document("chain", miningChainId).append("pipeline", pipelineId));
+    }
+
+    /** Fields every split cursor carries so both lookup directions can use declared indexes. */
+    private static Document consumerIdentity(String miningChainId, String pipelineId) {
+        return new Document("miningChainId", miningChainId)
+                .append("pipelineId", pipelineId);
+    }
+
+    /** One full split cursor document, used by replacement writes. */
+    private static Document consumerDocument(String miningChainId, ConsumerOffset offset) {
+        Document document = consumerKey(miningChainId, offset.pipelineId());
+        document.putAll(consumerIdentity(miningChainId, offset.pipelineId()));
+        document.putAll(consumerToDocument(offset));
+        return document;
+    }
+
+    /** All split cursor documents belonging to one chain. */
+    private static Document consumersOfChain(String miningChainId) {
+        return new Document("miningChainId", miningChainId);
     }
 
     /**
@@ -561,7 +705,10 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         return StoreIo.coded(e);
     }
 
-    /** Maps a meta record to its stored document: the mining chain id as {@code _id}, the rest as fields. */
+    /**
+     * Maps the legacy single-document shape used by compatibility reads and their witnesses. New roots are
+     * created through this mapping with no consumers; consumer writes persist split documents instead.
+     */
     static Document toDocument(SrsMeta meta) {
         Document consumers = new Document();
         for (ConsumerOffset offset : meta.consumerOffsets()) {

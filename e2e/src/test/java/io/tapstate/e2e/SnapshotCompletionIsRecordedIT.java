@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
@@ -22,7 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * A finished snapshot leaves a durable mark naming the table it drained.
  *
- * <p>The coordination record already carried a cdc-start position, but that is written before the
+ * <p>The pipeline's durable cursor already carried a cdc-start position, but that is written before the
  * snapshot drains -- it has to be, or a change made while the snapshot runs would be missed -- so its
  * presence says the snapshot started, not that it finished. Completion is a separate mark, and this is
  * the witness that it lands on the shipped path rather than only where a unit test calls the phase
@@ -47,8 +48,6 @@ class SnapshotCompletionIsRecordedIT {
     private static final String EXAMPLE = "the-snapshot-half-reaches-the-target";
     private static final String TABLE = "orders";
 
-    private static final String SRS_META = "srs_meta";
-    private static final String CONSUMERS = "consumerOffsets";
     private static final String COMPLETED = "snapshotCompletedTables";
 
     @TempDir
@@ -143,24 +142,13 @@ class SnapshotCompletionIsRecordedIT {
         try (MongoClient client = MongoClients.create(storeUri)) {
             String database = new com.mongodb.ConnectionString(storeUri).getDatabase();
             List<String> tables = new ArrayList<>();
-            for (Document chain : client.getDatabase(database).getCollection(SRS_META).find()) {
-                // Completion is recorded against the pipeline that confirmed it, under its own consumer
-                // entry -- a chain-level list would answer every pipeline on the chain with the first
-                // one's answer. This gathers every consumer's, which is what "was it recorded at all"
-                // asks; which pipeline marked it is asserted where two of them exist.
-                Object consumers = chain.get(CONSUMERS);
-                if (!(consumers instanceof Document byPipeline)) {
-                    continue;
-                }
-                for (String pipelineId : byPipeline.keySet()) {
-                    Object consumer = byPipeline.get(pipelineId);
-                    if (!(consumer instanceof Document record)) {
-                        continue;
-                    }
-                    Object marked = record.get(COMPLETED);
-                    if (marked instanceof List<?> entries) {
-                        entries.forEach(entry -> tables.add(String.valueOf(entry)));
-                    }
+            for (Document consumer : client.getDatabase(database)
+                    .getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).find()) {
+                // Completion is recorded in the cursor of the pipeline that confirmed it. This gathers
+                // every cursor's marks, which is what "was it recorded at all" asks; which pipeline
+                // marked it is asserted where two of them exist.
+                if (consumer.get(COMPLETED) instanceof List<?> entries) {
+                    entries.forEach(entry -> tables.add(String.valueOf(entry)));
                 }
             }
             return tables;
