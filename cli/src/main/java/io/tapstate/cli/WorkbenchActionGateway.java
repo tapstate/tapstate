@@ -85,6 +85,10 @@ interface WorkbenchActionGateway {
         return new PipelineLogLevelOutcome.Unreachable();
     }
 
+    default PipelineLogLevelOutcome readPipelineLogLevel(String pipelineId) {
+        return new PipelineLogLevelOutcome.Unreachable();
+    }
+
     record ContextOption(String name, boolean suggested) {
         public ContextOption {
             Objects.requireNonNull(name, "name");

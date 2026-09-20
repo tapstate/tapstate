@@ -59,4 +59,11 @@ class PipelineLogsController {
             throw MalformedRequest.rejecting("level must be one of ERROR, WARN, INFO, DEBUG, or TRACE", invalidLevel);
         }
     }
+
+    /** Reads the threshold used for future node-local log capture without changing it. */
+    @Verb("pipeline.logs")
+    @GetMapping("/pipelines/{id}:log-level")
+    PipelineLogLevel level(@PathVariable("id") String id) {
+        return logs.level(id);
+    }
 }

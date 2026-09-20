@@ -229,7 +229,7 @@ final class WorkbenchRenderer {
         int width = overlay instanceof WorkbenchOverlayState.Actions ? Math.min(40, area.width() - 8)
                 : Math.min(60, area.width() - 8);
         int contentRows = switch (overlay) {
-            case WorkbenchOverlayState.More ignored -> 3;
+            case WorkbenchOverlayState.More ignored -> WorkbenchOverlayState.More.ENTRIES.size();
             case WorkbenchOverlayState.ContextPicker picker ->
                     Math.max(5, Math.min(10, picker.contexts().size()) + 4);
             case WorkbenchOverlayState.ContextCreate ignored -> 8;
@@ -315,7 +315,7 @@ final class WorkbenchRenderer {
 
     private static List<OverlayHit> renderMore(
             Frame frame, Rect area, Rect box, WorkbenchOverlayState.More more, WorkbenchTheme theme) {
-        List<String> entries = List.of("Context", "Authentication", "Help");
+        List<String> entries = WorkbenchOverlayState.More.ENTRIES;
         List<OverlayHit> hits = new ArrayList<>();
         for (int index = 0; index < entries.size(); index++) {
             String line = (index == more.selectedIndex() ? "> " : "  ") + entries.get(index);
@@ -1048,6 +1048,8 @@ final class WorkbenchRenderer {
         frame.renderWidget(block, area);
         Rect inner = block.inner(area);
         int y = inner.y();
+        write(frame, inner.x(), y, "Log level: " + view.level(), theme.info(), inner);
+        y++;
         if (view.loading()) write(frame, inner.x(), y++, "Loading logs for " + view.pipelineId() + "...", theme.muted(), inner);
         if (view.truncated()) write(frame, inner.x(), y++, "Earlier logs are no longer retained on this node.", theme.warning(), inner);
         if (view.error().isPresent()) write(frame, inner.x(), y++, view.error().orElseThrow(), theme.error(), inner);
@@ -1085,74 +1087,102 @@ final class WorkbenchRenderer {
         Block block = panel(title, false, theme);
         frame.renderWidget(block, area);
         Rect inner = block.inner(area);
+        List<Line> lines = inspectLines(state, theme);
+        int visibleHeight = Math.max(1, inner.height());
+        int maximumScroll = Math.max(0, lines.size() - visibleHeight);
+        int start = Math.clamp(state.inspectScroll(), 0, maximumScroll);
+        int end = Math.min(lines.size(), start + visibleHeight);
+        Rect contentArea = inner;
+        if (lines.size() > visibleHeight) {
+            List<Rect> chunks = Layout.horizontal()
+                    .constraints(Constraint.fill(), Constraint.length(1))
+                    .split(inner);
+            ScrollbarState scrollState = new ScrollbarState();
+            scrollState.contentLength(lines.size())
+                    .viewportContentLength(visibleHeight)
+                    .position(start);
+            frame.renderStatefulWidget(Scrollbar.builder().build(), chunks.get(1), scrollState);
+            contentArea = chunks.getFirst();
+        }
+        if (start < end) {
+            frame.renderWidget(Paragraph.builder()
+                    .text(Text.from(lines.subList(start, end)))
+                    .overflow(Overflow.CLIP)
+                    .build(), new Rect(contentArea.x(), contentArea.y(), contentArea.width(), visibleHeight));
+        }
+    }
+
+    private static List<Line> inspectLines(WorkbenchState state, WorkbenchTheme theme) {
+        Optional<WorkbenchInspectState> inspect = state.inspect();
         if (inspect.isEmpty()) {
-            write(frame, inner.x(), inner.y(), "Select a remote Pipeline in 4 Pipelines, then press 6.", theme.muted(), inner);
-            return;
+            return List.of(inspectLine("Select a remote Pipeline in 4 Pipelines, then press 6.", theme.muted()));
         }
         WorkbenchInspectState value = inspect.orElseThrow();
-        int y = inner.y();
+        List<Line> lines = new ArrayList<>();
         switch (value) {
             case WorkbenchInspectState.Loading loading ->
-                    write(frame, inner.x(), y, "Reading current metrics for " + loading.pipelineId() + "...", theme.muted(), inner);
+                    lines.add(inspectLine("Reading current metrics for " + loading.pipelineId() + "...", theme.muted()));
             case WorkbenchInspectState.Rejected rejected -> {
-                write(frame, inner.x(), y, "Metrics unavailable: " + rejected.code(), theme.error(), inner);
-                write(frame, inner.x(), y + 1, rejected.message(), theme.muted(), inner);
+                lines.add(inspectLine("Metrics unavailable: " + rejected.code(), theme.error()));
+                lines.add(inspectLine(rejected.message(), theme.muted()));
             }
             case WorkbenchInspectState.Unreachable ignored ->
-                    write(frame, inner.x(), y, "Metrics server is unreachable.", theme.error(), inner);
+                    lines.add(inspectLine("Metrics server is unreachable.", theme.error()));
             case WorkbenchInspectState.Unavailable ignored ->
-                    write(frame, inner.x(), y, "Sign in to read current Pipeline metrics.", theme.warning(), inner);
+                    lines.add(inspectLine("Sign in to read current Pipeline metrics.", theme.warning()));
             case WorkbenchInspectState.Available available -> {
-                write(frame, inner.x(), y++, "State", theme.title(), inner);
+                lines.add(inspectLine("State", theme.title()));
                 Optional<WorkbenchPipelineStatus> status = selectedPipelineStatus(state);
-                write(frame, inner.x() + 2, y++, status.map(WorkbenchRenderer::pipelineStatusDetail)
+                lines.add(inspectLine("  " + status.map(WorkbenchRenderer::pipelineStatusDetail)
                         .orElse("Reading current state..."), status.map(statusValue -> pipelineStatusStyle(statusValue, theme))
-                        .orElse(theme.muted()), inner);
+                        .orElse(theme.muted())));
                 MovementReading current = available.current();
                 String moving = current == null
                         ? "not published"
                         : MovementReading.describe(current.since(available.previous()));
-                write(frame, inner.x(), y++, "Moving", theme.title(), inner);
-                write(frame, inner.x() + 2, y++, moving, theme.base(), inner);
-                write(frame, inner.x(), y++, "Lag", theme.title(), inner);
-                write(frame, inner.x() + 2, y++, current == null ? "not published" : current.describeLag(), theme.base(), inner);
+                lines.add(inspectLine("Moving", theme.title()));
+                lines.add(inspectLine("  " + moving, theme.base()));
+                lines.add(inspectLine("Lag", theme.title()));
+                lines.add(inspectLine("  " + (current == null ? "not published" : current.describeLag()), theme.base()));
                 if (!available.positionsNotCollected().isEmpty()) {
-                    write(frame, inner.x(), y++, "Positions not collected: "
-                            + String.join(", ", available.positionsNotCollected()), theme.warning(), inner);
+                    lines.add(inspectLine("Positions not collected: "
+                            + String.join(", ", available.positionsNotCollected()), theme.warning()));
                 }
-                if (!available.targetAckedPosition().isEmpty() && y < inner.bottom()) {
-                    write(frame, inner.x(), y++, "Target-acked positions", theme.title(), inner);
+                if (!available.targetAckedPosition().isEmpty()) {
+                    lines.add(inspectLine("Target-acked positions", theme.title()));
                     for (Map.Entry<String, String> entry : available.targetAckedPosition().entrySet().stream()
                             .sorted(Map.Entry.comparingByKey()).toList()) {
-                        if (y >= inner.bottom()) return;
-                        write(frame, inner.x() + 2, y++, entry.getKey() + ": " + entry.getValue(), theme.base(), inner);
+                        lines.add(inspectLine("  " + entry.getKey() + ": " + entry.getValue(), theme.base()));
                     }
                 }
-                write(frame, inner.x(), y++, "Counters", theme.title(), inner);
+                lines.add(inspectLine("Counters", theme.title()));
                 if (available.metrics().isEmpty()) {
-                    write(frame, inner.x() + 2, y++, "No numeric counters published.", theme.muted(), inner);
+                    lines.add(inspectLine("  No numeric counters published.", theme.muted()));
                 } else {
                     for (Map.Entry<String, Long> entry : available.metrics().entrySet().stream()
                             .sorted(Map.Entry.comparingByKey()).toList()) {
-                        if (y >= inner.bottom()) return;
-                        write(frame, inner.x() + 2, y++, entry.getKey() + ": " + entry.getValue(), theme.base(), inner);
+                        lines.add(inspectLine("  " + entry.getKey() + ": " + entry.getValue(), theme.base()));
                     }
                 }
-                if (!available.facts().isEmpty() && y < inner.bottom()) {
-                    write(frame, inner.x(), y++, "Facts", theme.title(), inner);
+                if (!available.facts().isEmpty()) {
+                    lines.add(inspectLine("Facts", theme.title()));
                     for (MetricsOutcome.FactPoint fact : available.facts().stream()
                             .sorted(Comparator.comparing(MetricsOutcome.FactPoint::name)
                                     .thenComparing(fact -> fact.attributes().toString()))
                             .toList()) {
-                        if (y >= inner.bottom()) return;
                         String attributes = fact.attributes().isEmpty() ? "" : " " + fact.attributes();
                         String observedAt = fact.observedAt() == null ? "" : " @ " + LOG_TIMESTAMP.format(fact.observedAt());
-                        write(frame, inner.x() + 2, y++, fact.name() + attributes + ": " + fact.value() + observedAt,
-                                theme.base(), inner);
+                        lines.add(inspectLine("  " + fact.name() + attributes + ": " + fact.value() + observedAt,
+                                theme.base()));
                     }
                 }
             }
         }
+        return List.copyOf(lines);
+    }
+
+    private static Line inspectLine(String text, Style style) {
+        return Line.from(Span.styled(text, style));
     }
 
     private static List<Line> logLines(List<RemoteLogLine> entries, WorkbenchTheme theme) {
@@ -1756,11 +1786,14 @@ final class WorkbenchRenderer {
                             new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
             case PIPELINES -> pipelineFooter(state, hasSelectableRows);
             case LOGS -> List.of(new FooterHint("↑↓", "scroll", Optional.empty()), new FooterHint("Home/End", "top/live", Optional.empty()), new FooterHint("PgUp/PgDn", "page", Optional.empty()),
-                    new FooterHint("l", "level", Optional.empty()),
+                    new FooterHint("l", "level " + state.logs().map(value -> "[" + value.level() + "]").orElse("[INFO]"), Optional.empty()),
                     new FooterHint("f", "follow " + state.logs().map(value -> value.following() ? "[on]" : "[off]").orElse("[on]"), Optional.empty()),
                     new FooterHint("w", "wrap " + state.logs().map(value -> value.wrapped() ? "[on]" : "[off]").orElse("[on]"), Optional.empty()),
                     new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)), new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));
             case INSPECT -> List.of(
+                    new FooterHint("↑↓", "scroll", Optional.empty()),
+                    new FooterHint("Home/End", "top/bottom", Optional.empty()),
+                    new FooterHint("PgUp/PgDn", "page", Optional.empty()),
                     new FooterHint("r", "refresh", Optional.of(FooterAction.REFRESH)),
                     new FooterHint("Esc", "back", Optional.of(FooterAction.BACK)),
                     new FooterHint("q", "quit", Optional.of(FooterAction.QUIT)));

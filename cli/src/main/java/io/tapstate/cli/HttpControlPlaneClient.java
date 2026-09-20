@@ -1377,6 +1377,26 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
     }
 
+    @Override
+    public PipelineLogLevelOutcome logLevel(URI baseUrl, String credential, String pipelineId) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + ":log-level", credential)
+                    .GET()
+                    .build();
+            HttpResponse<String> response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200 && JsonReader.parse(response.body()) instanceof String current) {
+                return new PipelineLogLevelOutcome.Current(current);
+            }
+            Rejection rejection = rejection(response.body(), "The server refused the log level read.");
+            return new PipelineLogLevelOutcome.Rejected(rejection.code(), rejection.message());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new PipelineLogLevelOutcome.Unreachable();
+        } catch (IOException | RuntimeException unavailable) {
+            return new PipelineLogLevelOutcome.Unreachable();
+        }
+    }
+
     // --- streaming reads over a websocket (status --watch / logs --follow) -----------------------
 
     /** How long to wait after a live connection drops before re-attaching (same landing node in L1). */

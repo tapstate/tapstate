@@ -63,8 +63,9 @@ class SessionResumePtyIT {
             wait_no_echo = os.environ.pop("TAPSTATE_PTY_WAIT_NO_ECHO", "0") == "1"
             pid, fd = pty.fork()
             if pid == 0:
-                if os.environ.get("TERM", "") in ("", "dumb"):
-                    os.environ["TERM"] = "linux"
+                # Exercise the basic terminal profile used by CI.  It does not answer JLine's
+                # optional capability probes, so a one-shot prompt must not depend on them.
+                os.environ["TERM"] = "linux"
                 os.execvp(sys.argv[1], sys.argv[1:])
 
             output = bytearray()
@@ -88,7 +89,11 @@ class SessionResumePtyIT {
                     if not chunk:
                         break
                     output.extend(chunk)
-                if not sent and (no_echo() if wait_no_echo else bool(output)):
+                # JLine may emit terminal-capability probes before it has installed the reader.
+                # For ordinary prompts, wait until line editing is enabled rather than treating those
+                # probes as a ready signal. Password input still waits for echo to be disabled.
+                ready = no_echo() if wait_no_echo else b"\x1b[?2004h>" in output
+                if not sent and ready:
                     os.write(fd, data)
                     sent = True
                 done, child_status = os.waitpid(pid, os.WNOHANG)

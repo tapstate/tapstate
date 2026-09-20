@@ -17,7 +17,8 @@ record WorkbenchState(
         WorkbenchTableState pipelinesTable,
         Optional<WorkbenchPipelineStatus> selectedPipelineStatus,
         Optional<WorkbenchLogsState> logs,
-        Optional<WorkbenchInspectState> inspect) {
+        Optional<WorkbenchInspectState> inspect,
+        int inspectScroll) {
 
     WorkbenchState {
         Objects.requireNonNull(selectedTab, "selectedTab");
@@ -31,6 +32,9 @@ record WorkbenchState(
         Objects.requireNonNull(selectedPipelineStatus, "selectedPipelineStatus");
         Objects.requireNonNull(logs, "logs");
         Objects.requireNonNull(inspect, "inspect");
+        if (inspectScroll < 0) {
+            throw new IllegalArgumentException("Inspect scroll cannot be negative");
+        }
     }
 
     static WorkbenchState initial() {
@@ -43,7 +47,7 @@ record WorkbenchState(
                 WorkbenchWorkspaceState.empty(),
                 WorkbenchTableState.empty(),
                 WorkbenchTableState.empty(),
-                Optional.empty(), Optional.empty(), Optional.empty());
+                Optional.empty(), Optional.empty(), Optional.empty(), 0);
     }
 
     WorkbenchState reduce(KeyEvent key) {
@@ -60,6 +64,17 @@ record WorkbenchState(
         if (selectedTab == WorkbenchTab.WORKSPACE
                 && workspaceView.focus() == WorkbenchWorkspaceState.Focus.VIEWER) {
             return this;
+        }
+        if (selectedTab == WorkbenchTab.INSPECT) {
+            if (key.isHome()) {
+                return withInspectScroll(0);
+            }
+            if (key.isEnd()) {
+                return withInspectScroll(Integer.MAX_VALUE);
+            }
+            int delta = navigationDelta(key, visibleRows);
+            long nextScroll = (long) inspectScroll + delta;
+            return delta == 0 ? this : withInspectScroll((int) Math.clamp(nextScroll, 0, Integer.MAX_VALUE));
         }
         if (selectedTab != WorkbenchTab.OVERVIEW
                 && selectedTab != WorkbenchTab.WORKSPACE
@@ -97,7 +112,7 @@ record WorkbenchState(
                 workspaceView,
                 sourcesTable,
                 pipelinesTable,
-                selectedPipelineStatus, logs, inspect);
+                selectedPipelineStatus, logs, inspect, inspectScroll);
     }
 
     WorkbenchState closeOverlay() {
@@ -110,7 +125,7 @@ record WorkbenchState(
                 workspaceView,
                 sourcesTable,
                 pipelinesTable,
-                selectedPipelineStatus, logs, inspect);
+                selectedPipelineStatus, logs, inspect, inspectScroll);
     }
 
     WorkbenchState selectRow(WorkbenchTab tab, int index, int visibleRows) {
@@ -146,7 +161,7 @@ record WorkbenchState(
                 contextChanged ? WorkbenchTableState.empty() : sourcesTable,
                 contextChanged ? WorkbenchTableState.empty() : pipelinesTable,
                 contextChanged ? Optional.empty() : selectedPipelineStatus, contextChanged ? Optional.empty() : logs,
-                contextChanged ? Optional.empty() : inspect);
+                contextChanged ? Optional.empty() : inspect, contextChanged ? 0 : inspectScroll);
     }
 
     WorkbenchState acceptSnapshot(WorkbenchSnapshot published) {
@@ -170,7 +185,7 @@ record WorkbenchState(
                 workspaceView,
                 sourcesTable.clamp(published.sources().rows().size()),
                 pipelinesTable.clamp(published.pipelines().rows().size()),
-                selectedPipelineStatus, logs, inspect);
+                selectedPipelineStatus, logs, inspect, inspectScroll);
     }
 
     private WorkbenchState withTable(WorkbenchTab tab, WorkbenchTableState table) {
@@ -191,32 +206,47 @@ record WorkbenchState(
             WorkbenchTableState pipelines) {
         return new WorkbenchState(
                 tab, expectedSnapshot, snapshot, overlay,
-                workspace, workspaceView, sources, pipelines, selectedPipelineStatus, logs, inspect);
+                workspace, workspaceView, sources, pipelines, selectedPipelineStatus, logs, inspect,
+                tab == WorkbenchTab.INSPECT && selectedTab != WorkbenchTab.INSPECT ? 0 : inspectScroll);
     }
 
     WorkbenchState withWorkspaceView(WorkbenchWorkspaceState view) {
         Objects.requireNonNull(view, "view");
         return new WorkbenchState(
                 selectedTab, expectedSnapshot, snapshot, overlay,
-                workspaceTable, view, sourcesTable, pipelinesTable, selectedPipelineStatus, logs, inspect);
+                workspaceTable, view, sourcesTable, pipelinesTable, selectedPipelineStatus, logs, inspect, inspectScroll);
     }
 
     WorkbenchState withSelectedPipelineStatus(Optional<WorkbenchPipelineStatus> status) {
         Objects.requireNonNull(status, "status");
         return status.equals(selectedPipelineStatus) ? this : new WorkbenchState(
                 selectedTab, expectedSnapshot, snapshot, overlay,
-                workspaceTable, workspaceView, sourcesTable, pipelinesTable, status, logs, inspect);
+                workspaceTable, workspaceView, sourcesTable, pipelinesTable, status, logs, inspect, inspectScroll);
     }
 
     WorkbenchState withLogs(Optional<WorkbenchLogsState> next) {
         return new WorkbenchState(selectedTab, expectedSnapshot, snapshot, overlay,
-                workspaceTable, workspaceView, sourcesTable, pipelinesTable, selectedPipelineStatus, next, inspect);
+                workspaceTable, workspaceView, sourcesTable, pipelinesTable, selectedPipelineStatus, next, inspect, inspectScroll);
     }
 
     WorkbenchState withInspect(Optional<WorkbenchInspectState> next) {
         Objects.requireNonNull(next, "next");
-        return next.equals(inspect) ? this : new WorkbenchState(selectedTab, expectedSnapshot, snapshot, overlay,
-                workspaceTable, workspaceView, sourcesTable, pipelinesTable, selectedPipelineStatus, logs, next);
+        if (next.equals(inspect)) {
+            return this;
+        }
+        boolean pipelineChanged = next.map(WorkbenchInspectState::pipelineId)
+                .filter(id -> inspect.map(WorkbenchInspectState::pipelineId).filter(id::equals).isEmpty())
+                .isPresent();
+        return new WorkbenchState(selectedTab, expectedSnapshot, snapshot, overlay,
+                workspaceTable, workspaceView, sourcesTable, pipelinesTable, selectedPipelineStatus, logs, next,
+                pipelineChanged ? 0 : inspectScroll);
+    }
+
+    private WorkbenchState withInspectScroll(int nextScroll) {
+        int normalized = Math.max(0, nextScroll);
+        return normalized == inspectScroll ? this : new WorkbenchState(selectedTab, expectedSnapshot, snapshot, overlay,
+                workspaceTable, workspaceView, sourcesTable, pipelinesTable, selectedPipelineStatus, logs, inspect,
+                normalized);
     }
 
     private WorkbenchTableState table(WorkbenchTab tab) {

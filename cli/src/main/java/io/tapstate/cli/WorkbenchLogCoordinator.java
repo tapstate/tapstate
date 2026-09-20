@@ -11,10 +11,12 @@ import java.util.function.Consumer;
 final class WorkbenchLogCoordinator implements AutoCloseable {
     private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> { Thread t = new Thread(r, "tapstate-logs"); t.setDaemon(true); return t; });
     private Future<?> active;
-    synchronized void start(WorkbenchActionGateway gateway, String id, Consumer<LogsOutcome> page, Consumer<String> ended) {
+    synchronized void start(WorkbenchActionGateway gateway, String id, Consumer<PipelineLogLevelOutcome> level,
+            Consumer<LogsOutcome> page, Consumer<String> ended) {
         cancel();
         AtomicBoolean stopped = new AtomicBoolean();
         active = worker.submit(() -> {
+            level.accept(gateway.readPipelineLogLevel(id));
             LogsOutcome initial = gateway.readPipelineLogs(id, null);
             page.accept(initial);
             if (!(initial instanceof LogsOutcome.Found found)) return;

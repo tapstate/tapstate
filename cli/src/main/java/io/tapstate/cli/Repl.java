@@ -623,6 +623,16 @@ final class Repl {
             }
 
             @Override
+            public PipelineLogLevelOutcome readPipelineLogLevel(String pipelineId) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineLogLevelOutcome.Unreachable();
+                }
+                return withFailover(() -> controlPlane.logLevel(
+                        session.landingNode(), session.credential(), pipelineId),
+                        value -> value instanceof PipelineLogLevelOutcome.Unreachable);
+            }
+
+            @Override
             public String followPipelineLogs(String pipelineId, RemoteLogCursor after, LogStream sink,
                     java.util.function.BooleanSupplier stop) {
                 if (!session.isConnected() || !session.isAuthenticated()) {

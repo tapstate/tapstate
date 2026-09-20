@@ -40,10 +40,17 @@ sealed interface WorkbenchOverlayState
     }
 
     record More(int selectedIndex) implements WorkbenchOverlayState {
+        static final List<String> ENTRIES = List.of(
+                "🧭  Context", "🔐  Authentication", "📜  Logs", "🔎  Inspect", "?  Help");
+
         public More {
-            if (selectedIndex < 0 || selectedIndex > 2) {
+            if (selectedIndex < 0 || selectedIndex >= ENTRIES.size()) {
                 throw new IllegalArgumentException("More selection is outside the menu");
             }
+        }
+
+        More select(int index) {
+            return new More(Math.clamp(index, 0, ENTRIES.size() - 1));
         }
     }
 

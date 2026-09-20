@@ -660,7 +660,7 @@ final class Workbench {
                 int index = clicked.orElseThrow();
                 return switch (overlay) {
                         case WorkbenchOverlayState.More ignored -> runtime.updateState(state ->
-                            state.withOverlay(new WorkbenchOverlayState.More(Math.clamp(index, 0, 2))));
+                            state.withOverlay(new WorkbenchOverlayState.More(0).select(index)));
                         case WorkbenchOverlayState.ContextPicker picker -> runtime.updateState(state ->
                             state.withOverlay(picker.select(index)));
                         case WorkbenchOverlayState.ContextCreate ignored -> true;
@@ -708,7 +708,13 @@ final class Workbench {
         }
 
         private boolean openLogLevel(String pipelineId) {
-            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.LogLevel(pipelineId, 2)));
+            int selected = runtime.state().logs()
+                    .filter(logs -> logs.pipelineId().equals(pipelineId))
+                    .map(WorkbenchLogsState::level)
+                    .map(WorkbenchOverlayState.LogLevel.LEVELS::indexOf)
+                    .filter(index -> index >= 0)
+                    .orElse(2);
+            return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.LogLevel(pipelineId, selected)));
         }
 
         private boolean handleLogLevelKey(WorkbenchOverlayState.LogLevel level, KeyEvent key) {
@@ -723,7 +729,10 @@ final class Workbench {
                 return true;
             }
             return switch (actionGateway.setPipelineLogLevel(level.pipelineId(), level.selectedLevel())) {
-                case PipelineLogLevelOutcome.Changed ignored -> runtime.updateState(WorkbenchState::closeOverlay);
+                case PipelineLogLevelOutcome.Changed changed -> runtime.updateState(state -> state.withLogs(state.logs()
+                        .filter(logs -> logs.pipelineId().equals(level.pipelineId()))
+                        .map(logs -> logs.withLevel(changed.level()))).closeOverlay());
+                case PipelineLogLevelOutcome.Current ignored -> runtime.updateState(WorkbenchState::closeOverlay);
                 case PipelineLogLevelOutcome.Rejected ignored -> runtime.updateState(WorkbenchState::closeOverlay);
                 case PipelineLogLevelOutcome.Unreachable ignored -> runtime.updateState(WorkbenchState::closeOverlay);
             };
@@ -775,18 +784,19 @@ final class Workbench {
         private boolean handleMoreKey(WorkbenchOverlayState.More more, KeyEvent key) {
             if (key.isUp() || key.isDown()) {
                 int selected = key.isUp() ? Math.max(0, more.selectedIndex() - 1)
-                        : Math.min(2, more.selectedIndex() + 1);
+                        : Math.min(WorkbenchOverlayState.More.ENTRIES.size() - 1, more.selectedIndex() + 1);
                 runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.More(selected)));
                 return true;
             }
             if (key.isSelect() || key.isConfirm()) {
-                if (more.selectedIndex() == 0) {
-                    return openContextEntry();
+                switch (more.selectedIndex()) {
+                    case 0 -> openContextEntry();
+                    case 1 -> openAuthEntry();
+                    case 2 -> runtime.updateState(state -> state.closeOverlay().select(WorkbenchState.WorkbenchTab.LOGS));
+                    case 3 -> runtime.updateState(state -> state.closeOverlay().select(WorkbenchState.WorkbenchTab.INSPECT));
+                    case 4 -> runtime.updateState(state -> state.withOverlay(WorkbenchOverlayState.Help.INSTANCE));
+                    default -> throw new IllegalStateException("Unknown More selection");
                 }
-                if (more.selectedIndex() == 1) {
-                    return openAuthEntry();
-                }
-                runtime.updateState(state -> state.withOverlay(WorkbenchOverlayState.Help.INSTANCE));
                 return true;
             }
             return true;
@@ -2289,7 +2299,7 @@ final class Workbench {
                 case WorkbenchOverlayState.Login login -> login.previous();
                 case WorkbenchOverlayState.Actions ignored -> Optional.empty();
                 case WorkbenchOverlayState.LogLevel ignored -> Optional.empty();
-                case WorkbenchOverlayState.Help ignored -> Optional.of(new WorkbenchOverlayState.More(2));
+                case WorkbenchOverlayState.Help ignored -> Optional.of(new WorkbenchOverlayState.More(4));
                 case WorkbenchOverlayState.More ignored -> Optional.empty();
             };
         }
@@ -2562,7 +2572,13 @@ final class Workbench {
             String id = target.orElseThrow();
             if (runtime.state().logs().map(WorkbenchLogsState::pipelineId).filter(id::equals).isPresent()) return;
             runtime.updateState(state -> state.withLogs(Optional.of(WorkbenchLogsState.loading(id))));
-            logCoordinator.start(actionGateway, id, outcome -> runtime.runLater(() -> {
+            logCoordinator.start(actionGateway, id, level -> runtime.runLater(() -> {
+                if (runtime.state().selectedTab() == WorkbenchState.WorkbenchTab.LOGS
+                        && runtime.state().logs().map(WorkbenchLogsState::pipelineId).filter(id::equals).isPresent()
+                        && level instanceof PipelineLogLevelOutcome.Current current) {
+                    runtime.updateState(state -> state.withLogs(state.logs().map(logs -> logs.withLevel(current.level()))));
+                }
+            }), outcome -> runtime.runLater(() -> {
                 if (runtime.state().selectedTab() != WorkbenchState.WorkbenchTab.LOGS
                         || runtime.state().logs().map(WorkbenchLogsState::pipelineId).filter(id::equals).isEmpty()) return;
                 runtime.updateState(state -> state.withLogs(state.logs().map(current -> switch (outcome) {

@@ -271,6 +271,11 @@ interface ControlPlaneClient extends AutoCloseable {
         return new PipelineLogLevelOutcome.Unreachable();
     }
 
+    /** Reads the minimum severity currently retained for a Pipeline's node-local log lines. */
+    default PipelineLogLevelOutcome logLevel(URI baseUrl, String credential, String pipelineId) {
+        return new PipelineLogLevelOutcome.Unreachable();
+    }
+
     /**
      * Reads what a pipeline's join steps derive their output columns to be via
      * {@code GET {baseUrl}/api/pipelines/{pipelineId}/derived-schema}, authenticated by the bearer
