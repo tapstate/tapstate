@@ -103,7 +103,7 @@ class WhatTheFrontierHasPassedSurvivesAKillIT {
         // First half: what the frontier was allowed past is on the disk of a process that is now gone.
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             KeyedStateStore cold = new MongoKeyedStateStore(
-                    client.getDatabase(MongoStorePort.NEST_STATE_DATABASE)
+                    client.getDatabase(MongoProperties.DEFAULT_OPERATOR_STATE_DATABASE)
                             .getCollection(MongoStorePort.OPERATOR_STATE));
             long stored = 0;
             for (String namespace : namespaces(report)) {

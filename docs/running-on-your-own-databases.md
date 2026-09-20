@@ -20,7 +20,7 @@ admin are the same either way and are covered by the quickstart - do those once,
 | | |
 |---|---|
 | **MongoDB, as a replica set** | The control plane stores its own state here, and it uses transactions - so a standalone `mongod` is not enough. A single-member set is fine. |
-| **A database of its own** | Point the server at a database that is not your data. The examples below use `tapstate`. |
+| **Databases of its own** | Point the server at a control database that is not your data. Durable operator state uses a second database on the same MongoDB deployment. The examples below use `tapstate` and `tapstate_nest`. |
 | **MySQL with binlog** | Only if you are capturing from it. The connector reads the binlog, so `binlog_format=ROW` and a user that may read it. |
 
 The databases do not have to be in containers, and the server does not have to be on the same host as
@@ -34,6 +34,7 @@ java -jar app-<version>-boot.jar \
   --role=all \
   --tapstate.store.mongo.enabled=true \
   --tapstate.store.mongo.uri="mongodb://127.0.0.1:27018/tapstate?replicaSet=rs0" \
+  --tapstate.store.mongo.operator-state-database=tapstate_nest \
   --tapstate.store.mongo.server-selection-timeout=5s \
   --tapstate.connectors.plugins-dir=/path/to/plugins
 ```
@@ -43,8 +44,12 @@ What each one is for:
 - `--role=all` runs every role in one process. It is the single-process form; splitting roles across
   processes is a deployment choice, not something this page needs.
 - `--tapstate.store.mongo.uri` is **where the control plane keeps its own state** - pipelines,
-  schemas, users, operator state. It is not where your data goes; that is a source you declare later.
-  Give it its own database name.
+  schemas and users. It is not where your data goes; that is a source you declare later. Give it its
+  own database name.
+- `--tapstate.store.mongo.operator-state-database` is the separate database for durable operator
+  state and nest dead letters on that same MongoDB deployment. It defaults to `tapstate_nest` for
+  upgrade compatibility. Give deployments that share one MongoDB deployment different names. A name
+  change selects a different database; Tapstate does not copy state from the previous name.
 - `--tapstate.store.mongo.server-selection-timeout` bounds how long a wrong address takes to fail.
   Without it an unreachable Mongo looks like a slow start rather than a mistake.
 - `--tapstate.connectors.plugins-dir` is where registered connector jars are unpacked. Point it at a

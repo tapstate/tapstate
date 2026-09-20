@@ -873,6 +873,7 @@ the server and databases are hosted changes.
    mkdir -p ./plugins       # a writable cache the server unpacks registered connectors into
    java -jar app/target/app-<version>-boot.jar --role=all \
      --tapstate.store.mongo.uri="mongodb://127.0.0.1:27017/tapstate?replicaSet=rs0" \
+     --tapstate.store.mongo.operator-state-database=tapstate_nest \
      --tapstate.connectors.plugins-dir=./plugins
    ```
 
@@ -900,8 +901,9 @@ the server and databases are hosted changes.
    `config: { host: 127.0.0.1, port: 5432, … }` in `fulfillment_db`. Both of them, not one:
    a source left pointing at a compose service name resolves to nothing from the host, and
    the pipeline names every source it reads. The pipeline itself needs no change — the
-   managed store it materializes into is addressed by the server, through the
-   `--tapstate.store.mongo.uri` you passed in step 3, not by a resource here.
+   managed store it materializes into is addressed by the server, through the store settings you
+   passed in step 3, not by a resource here. The operator-state database defaults to `tapstate_nest`;
+   changing its setting selects another database and does not copy the old state.
 
 6. **Online verbs, observe, CDC** are identical to steps 6–8, except you reach the
    databases with your own client (`docker exec tapstate-mysql …` /

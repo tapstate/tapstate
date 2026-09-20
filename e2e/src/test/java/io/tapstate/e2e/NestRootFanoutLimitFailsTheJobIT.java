@@ -65,8 +65,8 @@ class NestRootFanoutLimitFailsTheJobIT {
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,
-     * and a base of its own so no two witnesses share one either. A nest keeps its state in a database of
-     * a fixed name addressed by a namespace built from the pipeline and step ids.
+     * and a base of its own so no two witnesses share one either. A nest keeps its state in the
+     * deployment's configured database, addressed by a namespace built from the pipeline and step ids.
      */
     private String pipelineId;
 
