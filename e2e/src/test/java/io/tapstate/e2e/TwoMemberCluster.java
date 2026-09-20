@@ -5,6 +5,7 @@ import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.UUID;
@@ -52,9 +53,10 @@ final class TwoMemberCluster implements AutoCloseable {
     private final String clusterId;
     private final String bindAddress;
     private final String seeds;
+    private final Duration nodeSessionTtl;
 
     private TwoMemberCluster(RealProcessServer first, RealProcessServer second, String storeUri,
-            String clusterId, String bindAddress, String seeds) {
+            String clusterId, String bindAddress, String seeds, Duration nodeSessionTtl) {
         this.first = first;
         this.second = second;
         this.a = new ControlPlane(first.baseUrl());
@@ -63,6 +65,7 @@ final class TwoMemberCluster implements AutoCloseable {
         this.clusterId = clusterId;
         this.bindAddress = bindAddress;
         this.seeds = seeds;
+        this.nodeSessionTtl = nodeSessionTtl;
     }
 
     /**
@@ -71,6 +74,21 @@ final class TwoMemberCluster implements AutoCloseable {
      * @param name a word naming the case, carried into the cluster id so a stray process is traceable
      */
     static TwoMemberCluster start(String storeUri, String name) {
+        return start(storeUri, name, null);
+    }
+
+    /**
+     * The same, with the node-session lease sized by the case instead of left at the product's default.
+     *
+     * <p>Only a case whose subject is the lease itself should pass anything here. The stable id a member
+     * holds outlives the process by exactly one lease, so a case about what happens inside that window
+     * has to choose how wide it is: the default is a compromise struck for deployments, and a case that
+     * took it would be racing a number nobody picked for it. Everything else passes null and is held to
+     * what a real member is held to.
+     *
+     * @param nodeSessionTtl the lease each member's node session is taken under, or null for the default
+     */
+    static TwoMemberCluster start(String storeUri, String name, Duration nodeSessionTtl) {
         String clusterId = name + "-" + UUID.randomUUID();
         String bindAddress = routableAddress();
         int memberPortA = RealProcessServer.reservePort();
@@ -78,17 +96,19 @@ final class TwoMemberCluster implements AutoCloseable {
         String seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
 
         RealProcessServer first = RealProcessServer.start(storeUri, "0.0.0.0",
-                httpPort -> arguments(clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress));
+                httpPort -> arguments(
+                        clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl));
         RealProcessServer second;
         try {
             second = RealProcessServer.start(storeUri, "0.0.0.0",
-                    httpPort -> arguments(clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress));
+                    httpPort -> arguments(
+                            clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl));
         } catch (RuntimeException | Error failure) {
             first.close();
             throw failure;
         }
-        TwoMemberCluster cluster =
-                new TwoMemberCluster(first, second, storeUri, clusterId, bindAddress, seeds);
+        TwoMemberCluster cluster = new TwoMemberCluster(
+                first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl);
         try {
             cluster.a.bootstrapAndLogin(ADMIN, PASSWORD);
             // The administrator lives in the store both of them share, so the second does not create one.
@@ -150,7 +170,21 @@ final class TwoMemberCluster implements AutoCloseable {
     RealProcessServer launching(String nodeId) {
         int memberPort = RealProcessServer.reservePort();
         return RealProcessServer.launching(storeUri, "0.0.0.0",
-                httpPort -> arguments(clusterId, nodeId, memberPort, seeds, httpPort, bindAddress));
+                httpPort -> arguments(
+                        clusterId, nodeId, memberPort, seeds, httpPort, bindAddress, nodeSessionTtl));
+    }
+
+    /**
+     * A control plane on a process this case launched into the cluster, signed in like the other two.
+     *
+     * <p>The administrator lives in the store all of them share, so a member that joins later signs in
+     * rather than bootstrapping - and a case that wants to ask the new arrival what it can see, rather
+     * than only asking the members that were already standing, needs to be able to reach it.
+     */
+    ControlPlane signedInAt(RealProcessServer member) {
+        ControlPlane control = new ControlPlane(member.baseUrl());
+        control.login(ADMIN, PASSWORD);
+        return control;
     }
 
     /**
@@ -184,8 +218,8 @@ final class TwoMemberCluster implements AutoCloseable {
     }
 
     private static List<String> arguments(String clusterId, String nodeId, int memberPort, String seeds,
-            int httpPort, String bindAddress) {
-        return List.of(
+            int httpPort, String bindAddress, Duration nodeSessionTtl) {
+        List<String> arguments = new ArrayList<>(List.of(
                 // Also the name of the member protocol's cluster, which is why it carries this run's own.
                 "--tapstate.cluster.id=" + clusterId,
                 "--tapstate.cluster.node-id=" + nodeId,
@@ -199,7 +233,14 @@ final class TwoMemberCluster implements AutoCloseable {
                 "--tapstate.hz.bind-address=" + bindAddress,
                 "--tapstate.hz.member-port=" + memberPort,
                 "--tapstate.hz.discovery.mode=tcp-ip",
-                "--tapstate.hz.discovery.tcp-ip.seeds=" + seeds);
+                "--tapstate.hz.discovery.tcp-ip.seeds=" + seeds));
+        if (nodeSessionTtl != null) {
+            // Renewed three times over the life of a lease. A member that renewed once per lease would
+            // lose its session to a single slow round trip, which is a different case's subject.
+            arguments.add("--tapstate.cluster.node-session-ttl=" + nodeSessionTtl);
+            arguments.add("--tapstate.cluster.node-session-renew-interval=" + nodeSessionTtl.dividedBy(3));
+        }
+        return List.copyOf(arguments);
     }
 
     /**

@@ -274,6 +274,36 @@ final class ControlPlane {
     }
 
     /**
+     * Every member this node lists, in the order it listed them, with what identifies each boot.
+     *
+     * <p>A list rather than a map keyed on the stable id, because the first thing a case about a
+     * stable id wants to know is whether one id is in here twice - and a map would have answered no
+     * to that question without ever looking.
+     */
+    List<ClusterMemberFacts> clusterMembers() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read who is in the cluster");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> topology)
+                || !(topology.get("members") instanceof List<?> members)) {
+            throw new AssertionError("the topology carried no members at all: " + response.body());
+        }
+        List<ClusterMemberFacts> facts = new ArrayList<>();
+        for (Object member : members) {
+            if (member instanceof Map<?, ?> one) {
+                facts.add(new ClusterMemberFacts(
+                        asText(one.get("nodeId")), asText(one.get("memberUuid")),
+                        asText(one.get("bootId")), asText(one.get("controlUrl")),
+                        asText(one.get("state"))));
+            }
+        }
+        return facts;
+    }
+
+    private static String asText(Object value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
+    /**
      * The captures this pipeline reads through, each named with the node holding its claim.
      *
      * <p>Keyed by capture id rather than listed, because what is worth reading here is the identity two
