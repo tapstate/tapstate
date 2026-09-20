@@ -621,6 +621,9 @@ transform.expression-failed:
 transform.script-compile-failed:
   message: "The js transform script could not be compiled: {detail}."
   solution: "Fix the script so it parses as valid JavaScript."
+transform.script-decimal-out-of-range:
+  message: "The js transform cannot expose exact decimal {value} as a JavaScript number without changing it to zero or infinity."
+  solution: "Use a value whose conversion to a JavaScript number stays finite and does not underflow to zero, or keep this value outside the js transform."
 transform.script-failed:
   message: "The js transform script raised an error while processing a row: {detail}."
   solution: "Fix the script so it does not throw for this input, or guard the failing operation."
