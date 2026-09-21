@@ -83,15 +83,28 @@ connection pool. The credential in `tapstate.store.mongo.uri` therefore needs ac
 selected by a Nest. The same database-name checks as the deployment setting apply, including the ban on
 `local`, `config`, and the control database itself.
 
+For least privilege, grant the running server `readWrite` only on the deployment default and every database
+named by a Nest; it needs no administrative role for this feature. A separate migration account may use
+`read` on the old database and `readWrite` on the new one, then be removed after verification.
+
 Changing this field while the same server process still has that Nest's maps configured is refused with
 `nest.state-database-changed-while-running`. A process restart is part of every supported move; restarting
 only the pipeline cannot change where an existing map writes.
+
+On every start that contains a Nest, before capture begins, the server writes an INFO entry beginning
+`Nest state placement resolved before pipeline` followed by each exact Nest namespace and its resolved
+database. Check that entry before allowing traffic: an explicit `state.database` must appear as written;
+an absent block must resolve to `tapstate.store.mongo.operator-state-database`, or to `tapstate_nest` when
+that deployment setting is absent. Do not resume if any namespace points at the old or an unexpected
+database.
 
 ## Move an existing Nest state database
 
 A state-database change is a state transition, not a normal live configuration edit. There are two
 supported outcomes: preserve the state by copying it while every writer is stopped, or deliberately
 discard the continuation and replay the full source. There is no online dual-write or automatic copy.
+The old and new names may come from two Nest overrides, or from moving between an override and the
+deployment default; the procedure is the same.
 
 ### Preserve the state and resume
 
@@ -125,6 +138,9 @@ const deadLetterMatch = { "_id.ns": mapNamespaces };
 
 const stateBefore = from.operator_state.countDocuments(stateMatch);
 const deadBefore = from.nest_dead_letters.countDocuments(deadLetterMatch);
+if (stateBefore === 0) {
+  throw new Error("no operator-state records matched; check the pipeline and step ids");
+}
 
 from.operator_state.aggregate([
   { $match: stateMatch },

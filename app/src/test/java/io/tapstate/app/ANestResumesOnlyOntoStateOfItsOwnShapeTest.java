@@ -26,6 +26,7 @@ import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -105,6 +106,30 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
                 .filteredOn(location -> location.namespace().startsWith("nest."))
                 .isNotEmpty()
                 .allMatch(location -> location.database().equals(database));
+    }
+
+    @Test
+    void removingTheOverrideSelectsTheDeploymentDefaultWithoutMovingExistingState() {
+        InMemoryStorePort store = seedStore("items");
+        String database = "orders_operator_state";
+        store.artifacts().save(pipeline("items", database));
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+        String namespace = source.capacityOf(PIPELINE).mapDatabases().keySet().iterator().next();
+        var custom = store.operatorStateStores().inDatabase(database).state();
+        custom.save(namespace, "held", "custom".getBytes(StandardCharsets.UTF_8));
+
+        store.artifacts().save(pipeline("items"));
+        DagSource.NestCapacity inherited = source.capacityOf(PIPELINE);
+
+        assertThat(inherited.mapDatabases().values())
+                .isNotEmpty()
+                .containsOnly(store.operatorStateStores().defaultDatabase());
+        assertThat(custom.load(namespace, "held"))
+                .as("removing the override does not move or delete the old location")
+                .isPresent();
+        assertThat(store.keyedState().load(namespace, "held"))
+                .as("the inherited target starts without an implicit copy")
+                .isEmpty();
     }
 
     // ---- fixtures ---------------------------------------------------------------------

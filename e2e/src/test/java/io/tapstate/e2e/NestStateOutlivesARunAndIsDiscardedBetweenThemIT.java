@@ -3,9 +3,11 @@ package io.tapstate.e2e;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import io.tapstate.adapters.mongostore.MongoNestDeadLetterStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.NestDeadLetterRecord;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
@@ -212,9 +214,21 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                     () -> control.state(MIGRATION_PIPELINE).map(Enum::name).orElse("no observation"));
         }
 
+        seedMigrationDeadLetter(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
+        long sourceStateCount = mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
+        long sourceShapeCount = shapeRecordDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
+        long sourceDeadLetterCount = deadLetterDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
         copyNestState(MIGRATION_OLD, MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc");
         assertThat(mapStateDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"))
                 .as("the migration copied the in-flight child state")
+                .isEqualTo(sourceStateCount);
+        assertThat(shapeRecordDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"))
+                .as("the migration copied the shape record beside the map state")
+                .isEqualTo(sourceShapeCount)
+                .isPositive();
+        assertThat(deadLetterDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"))
+                .as("the migration copied the Nest's dead letters")
+                .isEqualTo(sourceDeadLetterCount)
                 .isPositive();
 
         try (ServerHandle server = Tiers.IN_PROCESS.launch(controlUri, MIGRATION_DEFAULT);
@@ -242,7 +256,10 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
 
         assertThat(mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
                 .as("copying and switching never deletes the rollback source")
-                .isPositive();
+                .isEqualTo(sourceStateCount);
+        assertThat(deadLetterDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
+                .as("the rollback source keeps its dead letters too")
+                .isEqualTo(sourceDeadLetterCount);
     }
 
     /**
@@ -408,6 +425,35 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
             return client.getDatabase(database)
                     .getCollection(MongoStorePort.OPERATOR_STATE)
                     .countDocuments(new Document("_id.ns", new Document("$regex", prefix)));
+        }
+    }
+
+    private static long shapeRecordDocuments(String database, String pipelineId, String stepId) {
+        Document shape = new Document("_id.ns", "nest.shape." + pipelineId).append("_id.k", stepId);
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
+            return client.getDatabase(database)
+                    .getCollection(MongoStorePort.OPERATOR_STATE)
+                    .countDocuments(shape);
+        }
+    }
+
+    private static long deadLetterDocuments(String database, String pipelineId, String stepId) {
+        String prefix = "^nest\\." + pipelineId + "\\." + stepId + "\\.";
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
+            return client.getDatabase(database)
+                    .getCollection(MongoStorePort.NEST_DEAD_LETTERS)
+                    .countDocuments(new Document("_id.ns", new Document("$regex", prefix)));
+        }
+    }
+
+    private static void seedMigrationDeadLetter(String database, String pipelineId, String stepId) {
+        String namespace = "nest." + pipelineId + "." + stepId + ".$root";
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
+            new MongoNestDeadLetterStore(client.getDatabase(database)
+                    .getCollection(MongoStorePort.NEST_DEAD_LETTERS))
+                    .record(new NestDeadLetterRecord(
+                            namespace, "waiting-child", "src_children", "1:1", 0L, 9_000L,
+                            Map.of("sku", "waiting-sku")));
         }
     }
 

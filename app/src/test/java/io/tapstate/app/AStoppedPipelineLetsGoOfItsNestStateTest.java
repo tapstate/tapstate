@@ -388,6 +388,19 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
+    void aLegacyNamespaceOnlyTeardownRecordStillMeansTheDeploymentDefaultDatabase() {
+        InMemoryStorePort store = seedStore();
+        seedState(store, ROOT_NAMESPACE);
+        store.keyedState().save(TEARDOWN_NAMESPACE, "namespaces",
+                ROOT_NAMESPACE.getBytes(StandardCharsets.UTF_8));
+
+        new NestStateTeardown(member, store.operatorStateStores()).finishPending(PIPELINE);
+
+        assertThat(store.keyedState().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "namespaces")).isEmpty();
+    }
+
+    @Test
     @DisplayName("a pipeline that nests nothing records connector state and drops its record after purge")
     void aPipelineWithoutNestsRecordsConnectorState() {
         InMemoryStorePort store = seedStore();
@@ -398,7 +411,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))
                 .hasValueSatisfying(bytes -> assertThat(new String(bytes, StandardCharsets.UTF_8))
-                        .contains(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE));
+                        .startsWith("v2:")
+                        .doesNotContain(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE));
         actuator.stop(PIPELINE, true);
 
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))

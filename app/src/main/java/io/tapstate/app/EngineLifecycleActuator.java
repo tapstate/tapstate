@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -31,6 +33,8 @@ import java.util.Optional;
  * </ul>
  */
 final class EngineLifecycleActuator implements LifecycleActuator {
+
+    private static final Logger LOG = LoggerFactory.getLogger(EngineLifecycleActuator.class);
 
     /**
      * How long a stop waits for the job to actually be over before it gives up on letting go of that job's
@@ -64,6 +68,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         stateTeardown.finishPending(pipelineId);
         DagSource.NestCapacity capacity = dagSource.capacityOf(pipelineId);
         engine.configureNestState(capacity.mapDatabases(), capacity.settings());
+        if (!capacity.mapDatabases().isEmpty()) {
+            LOG.info("Nest state placement resolved before pipeline '{}' starts: {}",
+                    pipelineId, capacity.mapDatabases());
+        }
         // Where this run keeps state, said before anything can write any: the pipeline is only certainly
         // the one this run is built from now, and an apply may move it out from under the run at any point
         // after. Said after the drop above, which is the one thing entitled to clear what earlier runs said.

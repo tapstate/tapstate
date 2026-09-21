@@ -1,7 +1,7 @@
 package io.tapstate.spi.store;
 
-import java.util.Objects;
 import java.util.List;
+import java.util.Objects;
 
 /** Resolves durable operator stores by database on the deployment's already configured store connection. */
 public interface OperatorStateStores {

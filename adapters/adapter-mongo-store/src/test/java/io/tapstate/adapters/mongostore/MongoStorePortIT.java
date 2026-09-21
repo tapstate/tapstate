@@ -218,10 +218,17 @@ class MongoStorePortIT {
             assertThat(second.deadLetters().read(namespace, 10)).isEmpty();
 
             second.state().save(namespace, "same-key", "second".getBytes(StandardCharsets.UTF_8));
+            second.deadLetters().record(new NestDeadLetterRecord(
+                    namespace, "same-element", "mysql-b", "1:1", 0L, 9_001L, Map.of("id", 1)));
             assertThat(new String(first.state().load(namespace, "same-key").orElseThrow(),
                     StandardCharsets.UTF_8)).isEqualTo("first");
             assertThat(new String(second.state().load(namespace, "same-key").orElseThrow(),
                     StandardCharsets.UTF_8)).isEqualTo("second");
+
+            first.state().dropNamespace(namespace);
+            first.deadLetters().dropNamespace(namespace);
+            assertThat(second.state().load(namespace, "same-key")).isPresent();
+            assertThat(second.deadLetters().read(namespace, 10)).hasSize(1);
         }
     }
 

@@ -6,10 +6,10 @@ import io.tapstate.spi.store.OperatorStateStores;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.Map;
 
 /**
  * Where a nest's state paths are written down: the same store the state itself is in, so the record and

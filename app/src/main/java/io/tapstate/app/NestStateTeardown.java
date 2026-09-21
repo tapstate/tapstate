@@ -210,9 +210,6 @@ final class NestStateTeardown {
     }
 
     private String encode(OperatorStateLocation location) {
-        if (location.database().equals(stores.defaultDatabase())) {
-            return location.namespace();
-        }
         Base64.Encoder encoder = Base64.getUrlEncoder().withoutPadding();
         return ROUTED_PREFIX
                 + encoder.encodeToString(location.database().getBytes(StandardCharsets.UTF_8))
