@@ -252,10 +252,23 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
             assertThat(migrated.getList("items", Document.class))
                     .extracting(item -> item.getString("sku"))
                     .containsExactly("waiting-sku");
+
+            control.stop(MIGRATION_PIPELINE, true);
+            Await.until("the migrated pipeline is purged from its new database",
+                    () -> control.state(MIGRATION_PIPELINE).orElse(null) == PipelineState.STOPPED
+                            && mapStateDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc") == 0
+                            && shapeRecordDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc") == 0
+                            && deadLetterDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc") == 0,
+                    () -> "state=" + mapStateDocuments(
+                            MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc")
+                            + ", shape=" + shapeRecordDocuments(
+                                    MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc")
+                            + ", deadLetters=" + deadLetterDocuments(
+                                    MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"));
         }
 
         assertThat(mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
-                .as("copying and switching never deletes the rollback source")
+                .as("copying, switching, and later purging never delete the rollback source")
                 .isEqualTo(sourceStateCount);
         assertThat(deadLetterDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
                 .as("the rollback source keeps its dead letters too")

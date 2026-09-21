@@ -374,13 +374,14 @@ class EngineLifecycleActuatorTest {
         }
 
         @Override
-        public StartPreparation prepareStart(String pipelineId) {
+        public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
             if (artifactSnapshot == null) {
-                return DagSource.super.prepareStart(pipelineId);
+                return DagSource.super.prepareStart(pipelineId, defaultDatabase);
             }
             validateStart(pipelineId);
             return new StartPreparation(
-                    capacityOf(pipelineId), stateLocations(pipelineId), Optional.of(artifactSnapshot),
+                    capacityOf(pipelineId), stateLocations(pipelineId, defaultDatabase),
+                    Optional.of(artifactSnapshot),
                     () -> dagFor(pipelineId));
         }
 

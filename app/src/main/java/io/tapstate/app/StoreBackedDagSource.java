@@ -138,13 +138,13 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     @Override
-    public StartPreparation prepareStart(String pipelineId) {
+    public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
         ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, snapshot);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
-        Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId);
+        Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot), () -> captured.dagFor(pipelineId));
     }
@@ -331,11 +331,11 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     @Override
-    public Set<OperatorStateLocation> stateLocations(String pipelineId) {
+    public Set<OperatorStateLocation> stateLocations(String pipelineId, String defaultDatabase) {
+        Objects.requireNonNull(defaultDatabase, "defaultDatabase");
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
         var stores = storePort.operatorStateStores();
-        String defaultDatabase = stores.defaultDatabase();
         Set<OperatorStateLocation> locations = new LinkedHashSet<>();
 
         Set<String> routedNestNamespaces = new LinkedHashSet<>();

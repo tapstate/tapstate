@@ -81,6 +81,45 @@ class ANestStateDatabaseReachesItsMapsTest {
     }
 
     @Test
+    void aDefaultPlacementStaysUnpinnedSoAPurgedMapCanTakeALaterBudget() {
+        NestStatePlacement.applyTo(member, Map.of(FIRST, stores.defaultDatabase()),
+                NestSettings.defaults());
+        member.getMap(FIRST).destroy();
+
+        assertThat(member.getConfig().getMapConfigs()).doesNotContainKey(FIRST);
+        assertThatCode(() -> NestStatePlacement.applyTo(
+                member, Map.of(FIRST, stores.defaultDatabase()),
+                NestSettings.defaults().withEntriesHeldInMemory(40_000L)))
+                .doesNotThrowAnyException();
+        assertThat(member.getConfig().findMapConfig(FIRST).getEvictionConfig().getSize())
+                .isEqualTo(40_000);
+    }
+
+    @Test
+    void aDifferentBudgetForAnAlreadyMadeMapIsRefusedRatherThanIgnored() {
+        member.getMap(FIRST);
+
+        Throwable thrown = catchThrowable(() -> NestStatePlacement.applyTo(
+                member, Map.of(FIRST, stores.defaultDatabase()),
+                NestSettings.defaults().withEntriesHeldInMemory(40_000L)));
+
+        assertThat(thrown).isInstanceOf(TapstateException.class);
+        assertThat(((TapstateException) thrown).code().code())
+                .isEqualTo("nest.memory-budget-changed-while-running");
+        assertThat(((TapstateException) thrown).args())
+                .containsEntry("configured", NestSettings.DEFAULT_ENTRIES_HELD_IN_MEMORY)
+                .containsEntry("requested", 40_000L);
+    }
+
+    @Test
+    void anUnspecifiedDatabaseIsNotEncodedAsTheLegalDatabaseNameDefault() {
+        assertThat(NestMaps.stateDatabase(NestSettings.defaults().backedStateMaps(FIRST))).isNull();
+        assertThat(NestMaps.stateDatabase(
+                NestSettings.defaults().backedStateMaps(FIRST, "default")))
+                .isEqualTo("default");
+    }
+
+    @Test
     void aLiveNamespaceCannotSilentlyMoveToAnotherDatabase() {
         NestStatePlacement.applyTo(member, Map.of(FIRST, "state_a"), NestSettings.defaults());
 

@@ -38,14 +38,13 @@ public final class NestStatePlacement {
                 return;
             }
             if (alreadyMade.contains(namespace)) {
-                MapConfig configured = member.getConfig().findMapConfig(namespace);
-                String configuredDatabase = NestMaps.stateDatabase(configured);
-                if (configuredDatabase == null && "default".equals(database)) {
-                    return;
-                }
-                if (!Objects.equals(configuredDatabase, database)) {
-                    refuseDatabase(namespace, configuredDatabase, database);
-                }
+                refuseIfDifferent(namespace, inherited, wanted);
+                return;
+            }
+            // Repeating the pattern under an exact name would buy no placement or capacity change, but
+            // the exact entry cannot be removed while this member lives. Leaving it unpinned is what lets
+            // a purged map take a different budget on a later run without requiring a process restart.
+            if (equivalent(inherited, wanted)) {
                 return;
             }
             member.getConfig().addMapConfig(wanted);
@@ -83,6 +82,11 @@ public final class NestStatePlacement {
                             "configured", (long) configuredEntries,
                             "requested", (long) requestedEntries), null);
         }
+    }
+
+    private static boolean equivalent(MapConfig configured, MapConfig wanted) {
+        return Objects.equals(NestMaps.stateDatabase(configured), NestMaps.stateDatabase(wanted))
+                && configured.getEvictionConfig().getSize() == wanted.getEvictionConfig().getSize();
     }
 
     private static void refuseDatabase(String namespace, String configured, String requested) {

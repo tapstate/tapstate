@@ -85,7 +85,7 @@ final class NestMaps {
      * only for the keys it is actually asked about.
      */
     static MapConfig backedStateMaps(long entriesHeldInMemory) {
-        return backedStateMaps(NAMESPACE_PREFIX + "*", entriesHeldInMemory, "default");
+        return backedStateMaps(NAMESPACE_PREFIX + "*", entriesHeldInMemory, null);
     }
 
     static MapConfig backedStateMaps(long entriesHeldInMemory, String database) {
@@ -103,12 +103,16 @@ final class NestMaps {
      * live store does not survive being written down.
      */
     static MapConfig backedStateMaps(String name, long entriesHeldInMemory) {
-        return backedStateMaps(name, entriesHeldInMemory, "default");
+        return backedStateMaps(name, entriesHeldInMemory, null);
     }
 
     static MapConfig backedStateMaps(String name, long entriesHeldInMemory, String database) {
         Properties properties = new Properties();
-        properties.setProperty(STATE_DATABASE_PROPERTY, database);
+        // Absence means the OperatorStateStores deployment default. A magic string cannot represent that:
+        // every legal string, including "default", is also a real MongoDB database name.
+        if (database != null) {
+            properties.setProperty(STATE_DATABASE_PROPERTY, database);
+        }
         MapConfig config = stateMaps().setName(name).setMapStoreConfig(new MapStoreConfig()
                 .setEnabled(true)
                 .setWriteDelaySeconds(0)

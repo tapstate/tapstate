@@ -61,7 +61,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     public void start(String pipelineId) {
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
-        DagSource.StartPreparation prepared = dagSource.prepareStart(pipelineId);
+        DagSource.StartPreparation prepared = dagSource.prepareStart(
+                pipelineId, stateTeardown.defaultDatabase());
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
         // what leaves a run that died without a stop with its state - and so with a shape to be held to.
@@ -131,7 +132,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             // finishes. What the runs said they keep is the half that survives an edit; what the pipeline
             // compiles to now is the half that covers state older than there being anywhere to say it. The
             // note takes both.
-            stateTeardown.noteLocations(pipelineId, dagSource.stateLocations(pipelineId));
+            stateTeardown.noteLocations(
+                    pipelineId, dagSource.stateLocations(pipelineId, stateTeardown.defaultDatabase()));
         }
         boolean jobOver = engine.awaitTerminal(pipelineId, JOB_TEARDOWN_BUDGET);
         captureCoordinator.stopCapture(pipelineId, purgeState);

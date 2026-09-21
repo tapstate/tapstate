@@ -30,10 +30,10 @@ interface DagSource {
      * The deferment lets an outstanding teardown finish before DAG construction reads or records shape
      * state, while the captured artifact revision remains fixed across every answer below.
      */
-    default StartPreparation prepareStart(String pipelineId) {
+    default StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
         validateStart(pipelineId);
         NestCapacity capacity = capacityOf(pipelineId);
-        Set<OperatorStateLocation> locations = stateLocations(pipelineId);
+        Set<OperatorStateLocation> locations = stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(capacity, locations, Optional.empty(), () -> dagFor(pipelineId));
     }
 
@@ -69,13 +69,15 @@ interface DagSource {
     List<PipelineStateHolding> stateHeldBy(String pipelineId);
 
     /**
-     * The physical locations behind {@link #stateHeldBy}. Lightweight sources inherit no locations;
-     * the store-backed source names every database and namespace a purge must reach.
+     * The physical locations behind {@link #stateHeldBy}. The generic answer resolves every declared
+     * namespace through the deployment default supplied by the store-owning actuator; the store-backed
+     * source overrides it to route Nest namespaces to their per-operator databases.
      */
-    default Set<OperatorStateLocation> stateLocations(String pipelineId) {
+    default Set<OperatorStateLocation> stateLocations(String pipelineId, String defaultDatabase) {
+        Objects.requireNonNull(defaultDatabase, "defaultDatabase");
         java.util.LinkedHashSet<OperatorStateLocation> locations = new java.util.LinkedHashSet<>();
         stateHeldBy(pipelineId).forEach(holding -> holding.namespaces().forEach(namespace ->
-                locations.add(new OperatorStateLocation("default", namespace))));
+                locations.add(new OperatorStateLocation(defaultDatabase, namespace))));
         return Set.copyOf(locations);
     }
 

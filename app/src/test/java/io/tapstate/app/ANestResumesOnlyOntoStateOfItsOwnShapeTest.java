@@ -102,7 +102,8 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
         assertThat(source.capacityOf(PIPELINE).mapDatabases().values())
                 .isNotEmpty()
                 .containsOnly(database);
-        assertThat(source.stateLocations(PIPELINE))
+        assertThat(source.stateLocations(
+                PIPELINE, store.operatorStateStores().defaultDatabase()))
                 .filteredOn(location -> location.namespace().startsWith("nest."))
                 .isNotEmpty()
                 .allMatch(location -> location.database().equals(database));
@@ -140,7 +141,8 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
         store.artifacts().save(pipeline("items", firstDatabase));
         StoreBackedDagSource source = new StoreBackedDagSource(store);
 
-        DagSource.StartPreparation prepared = source.prepareStart(PIPELINE);
+        DagSource.StartPreparation prepared = source.prepareStart(
+                PIPELINE, store.operatorStateStores().defaultDatabase());
         store.artifacts().save(pipeline("items", laterDatabase));
         DagSource.StartPlan plan = prepared.build();
 

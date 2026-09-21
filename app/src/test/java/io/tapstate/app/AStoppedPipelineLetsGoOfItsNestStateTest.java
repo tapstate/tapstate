@@ -388,6 +388,37 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
+    void aPurgeAfterRelocationLeavesTheOldDatabaseAsARollbackCopy() {
+        InMemoryStorePort store = seedStore();
+        String oldDatabase = "orders_state_old";
+        String newDatabase = "orders_state_new";
+        var oldStores = store.operatorStateStores().inDatabase(oldDatabase);
+        var newStores = store.operatorStateStores().inDatabase(newDatabase);
+        oldStores.state().save(ROOT_NAMESPACE, "k", "old".getBytes(StandardCharsets.UTF_8));
+        newStores.state().save(ROOT_NAMESPACE, "k", "new".getBytes(StandardCharsets.UTF_8));
+        oldStores.deadLetters().record(new NestDeadLetterRecord(
+                ROOT_NAMESPACE, "old-e", "orders", "1:1", 0L, 0L, Map.of("id", 1)));
+        newStores.deadLetters().record(new NestDeadLetterRecord(
+                ROOT_NAMESPACE, "new-e", "orders", "1:1", 0L, 0L, Map.of("id", 1)));
+
+        NestStateTeardown teardown = new NestStateTeardown(member, store.operatorStateStores());
+        teardown.willKeepStateAt(PIPELINE, Set.of(
+                new OperatorStateLocation(oldDatabase, ROOT_NAMESPACE)));
+        teardown.willKeepStateAt(PIPELINE, Set.of(
+                new OperatorStateLocation(newDatabase, ROOT_NAMESPACE)));
+        teardown.noteLocations(PIPELINE, Set.of(
+                new OperatorStateLocation(newDatabase, ROOT_NAMESPACE)));
+        teardown.finishPending(PIPELINE);
+
+        assertThat(newStores.state().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(newStores.deadLetters().read(ROOT_NAMESPACE, 10)).isEmpty();
+        assertThat(oldStores.state().load(ROOT_NAMESPACE, "k"))
+                .describedAs("the pre-migration copy remains available for rollback")
+                .isPresent();
+        assertThat(oldStores.deadLetters().read(ROOT_NAMESPACE, 10)).hasSize(1);
+    }
+
+    @Test
     void aLegacyNamespaceOnlyTeardownRecordStillMeansTheDeploymentDefaultDatabase() {
         InMemoryStorePort store = seedStore();
         seedState(store, ROOT_NAMESPACE);

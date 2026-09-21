@@ -73,16 +73,25 @@ final class NestStateTeardown {
         this.ledger = stores.inDatabase(stores.defaultDatabase()).state();
     }
 
+    String defaultDatabase() {
+        return stores.defaultDatabase();
+    }
+
     /**
      * Records that a run of this pipeline keeps state in {@code namespaces}, said as that run starts so
      * that the answer comes from the tree the run is built from rather than from whatever the pipeline
      * reads as by the time it is taken down.
      *
      * <p>What is recorded adds to what is already there rather than replacing it. A run keeping state
-     * somewhere new does not move what an earlier run left where it left it - an embed renamed, or taken
-     * out and put back, keeps its old entries under the old names - and a record holding only the most
-     * recent run's names would strand precisely the entries this exists to reach. They add up until a stop
-     * lets go of them, which is the point they stop being anybody's.
+     * under a new namespace does not move what an earlier run left under the old name - an embed renamed,
+     * or taken out and put back, keeps its old entries - and a record holding only the most recent run's
+     * names would strand precisely the entries this exists to reach. They add up until a stop lets go of
+     * them, which is the point they stop being anybody's.
+     *
+     * <p>A database relocation is different: the same namespace in its newly selected database supersedes
+     * that namespace's old physical location. The copied old location is a rollback source, not state the
+     * new run owns, so a later purge must not reach back and delete it. Only that same-namespace move is
+     * pruned; namespaces absent from the new run remain recorded for the edit/removal case above.
      *
      * <p>A run that keeps state nowhere records nothing, so a pipeline with no nest in it never grows one
      * of these and a later reader is never handed an empty record to tell apart from a full one.
@@ -98,7 +107,12 @@ final class NestStateTeardown {
             return;
         }
         Set<OperatorStateLocation> kept = read(pipelineId, KEPT_KEY);
-        if (!kept.addAll(locations)) {
+        Set<String> currentNamespaces = new LinkedHashSet<>();
+        locations.forEach(location -> currentNamespaces.add(location.namespace()));
+        boolean changed = kept.removeIf(location -> currentNamespaces.contains(location.namespace())
+                && !locations.contains(location));
+        changed |= kept.addAll(locations);
+        if (!changed) {
             // Every name is already down, which is the ordinary case: a pipeline restarted unchanged says
             // what it said last time. Rewriting the same bytes would be a write per start for no difference.
             return;
