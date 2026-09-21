@@ -308,6 +308,42 @@ final class StoreBackedDagSource implements DagSource {
         return List.copyOf(holdings);
     }
 
+    @Override
+    public Set<OperatorStateLocation> stateLocations(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        var stores = storePort.operatorStateStores();
+        String defaultDatabase = stores.defaultDatabase();
+        Set<OperatorStateLocation> locations = new LinkedHashSet<>();
+
+        Set<String> routedNestNamespaces = new LinkedHashSet<>();
+        if (PipelineDagBuilder.hasNest(pipeline)) {
+            Map<String, NestTable> byAlias = nestTablesByAlias(
+                    pipeline, sourceIdByTable(sourceVertices(pipeline)));
+            Map<String, String> mapDatabases = PipelineDagBuilder.nestStateDatabases(
+                    pipeline, byAlias::get, defaultDatabase);
+            mapDatabases.forEach((namespace, database) -> {
+                stores.inDatabase(database);
+                routedNestNamespaces.add(namespace);
+                locations.add(new OperatorStateLocation(database, namespace));
+            });
+            PipelineDagBuilder.nestStateDatabasesByStep(pipeline, defaultDatabase).values().stream()
+                    .distinct()
+                    .forEach(database -> locations.add(new OperatorStateLocation(
+                            database, StoreBackedNestStateLedger.namespaceOf(pipelineId))));
+        }
+
+        for (PipelineStateHolding holding : stateHeldBy(pipelineId)) {
+            for (String namespace : holding.namespaces()) {
+                if (!routedNestNamespaces.contains(namespace)
+                        && !namespace.equals(StoreBackedNestStateLedger.namespaceOf(pipelineId))) {
+                    locations.add(new OperatorStateLocation(defaultDatabase, namespace));
+                }
+            }
+        }
+        return Set.copyOf(locations);
+    }
+
     /**
      * The exact PDK state namespaces the assembled pipeline can open: its capture sources and every sink
      * the DAG builds. The PDK owns the namespace spelling, while this layer owns which pipeline nodes the
@@ -1825,7 +1861,12 @@ final class StoreBackedDagSource implements DagSource {
             return NestCapacity.none();
         }
         Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
-        return new NestCapacity(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get),
+        var stores = storePort.operatorStateStores();
+        String defaultDatabase = stores.defaultDatabase();
+        Map<String, String> databases = PipelineDagBuilder.nestStateDatabases(
+                pipeline, byAlias::get, defaultDatabase);
+        databases.values().stream().distinct().forEach(stores::inDatabase);
+        return new NestCapacity(databases,
                 PipelineDagBuilder.nestSettings(pipeline, byAlias::get, nestSettings));
     }
 
@@ -2002,10 +2043,13 @@ final class StoreBackedDagSource implements DagSource {
 
     private NestBinding nestBinding(PipelineResource pipeline, Map<String, String> sourceIdByTable) {
         Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable);
+        var operatorStateStores = storePort.operatorStateStores();
         return new NestBinding(byAlias::get, NestBinding.onMap(),
                 new LoggingNestDeadLetter(new DurableNestDeadLetter()),
                 new StoreBackedReplayFloorFactory(chainIdByTable(pipeline), pipeline.id()),
-                new StoreBackedNestStateLedger(storePort.keyedState()),
+                new StoreBackedNestStateLedger(operatorStateStores,
+                        PipelineDagBuilder.nestStateDatabasesByStep(
+                                pipeline, operatorStateStores.defaultDatabase())),
                 // What the deployment was started with, with what this pipeline's author wrote over it.
                 // Laid on here rather than held as one value for the process because the shape each
                 // number bounds is the pipeline's, not the process's: one tree is deep and narrow and

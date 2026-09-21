@@ -216,6 +216,14 @@ class SchemaGeneratorTest {
         Json.Obj nestRoot = (Json.Obj) ((Json.Obj) defs.get("NestRoot")).get("properties");
         assertThat(nestRoot.get("trackKeyChanges")).isNotNull();
         assertThat(nestRoot.get("track_key_changes")).isNull();
+
+        Json.Obj nest = (Json.Obj) ((Json.Obj) defs.get("TransformBody.Nest")).get("properties");
+        Json.Obj state = (Json.Obj) nest.get("state");
+        assertThat(state).isEqualTo(
+                new Json.Obj(List.of(new Json.Entry("$ref", new Json.Str("#/$defs/NestStateStorage")))));
+        Json.Obj stateProperties =
+                (Json.Obj) ((Json.Obj) defs.get("NestStateStorage")).get("properties");
+        assertThat(stateProperties.get("database")).isNotNull();
     }
 
     @Test

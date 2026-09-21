@@ -363,6 +363,31 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
+    void aPurgeDropsStateAndDeadLettersFromTheDatabaseTheNestSelected() {
+        InMemoryStorePort store = seedStore();
+        String database = "orders_operator_state";
+        var routed = store.operatorStateStores().inDatabase(database);
+        routed.state().save(ROOT_NAMESPACE, "k", "held".getBytes(StandardCharsets.UTF_8));
+        routed.deadLetters().record(new NestDeadLetterRecord(
+                ROOT_NAMESPACE, "e1", "orders", "1:1", 0L, 0L, Map.of("id", 1)));
+        store.keyedState().save(OTHER_PIPELINE_NAMESPACE, "k", "other".getBytes(StandardCharsets.UTF_8));
+        member.getMap(ROOT_NAMESPACE).put("k", "held");
+
+        NestStateTeardown teardown = new NestStateTeardown(member, store.operatorStateStores());
+        Set<OperatorStateLocation> locations = Set.of(
+                new OperatorStateLocation(database, ROOT_NAMESPACE));
+        teardown.willKeepStateAt(PIPELINE, locations);
+        teardown.noteLocations(PIPELINE, Set.of());
+        teardown.finishPending(PIPELINE);
+
+        assertThat(routed.state().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(routed.deadLetters().read(ROOT_NAMESPACE, 10)).isEmpty();
+        assertThat(member.getMap(ROOT_NAMESPACE).size()).isZero();
+        assertThat(store.keyedState().load(OTHER_PIPELINE_NAMESPACE, "k")).isPresent();
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept")).isEmpty();
+    }
+
+    @Test
     @DisplayName("a pipeline that nests nothing records connector state and drops its record after purge")
     void aPipelineWithoutNestsRecordsConnectorState() {
         InMemoryStorePort store = seedStore();

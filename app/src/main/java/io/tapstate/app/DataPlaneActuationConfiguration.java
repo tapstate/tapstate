@@ -12,6 +12,7 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
 import java.time.Duration;
@@ -35,8 +36,8 @@ import org.springframework.lang.Nullable;
 class DataPlaneActuationConfiguration {
 
     @Bean
-    Engine engine(HazelcastInstance hazelcastMember, @Nullable KeyedStateStore nestStateStore) {
-        return new Engine(hazelcastMember, nestStateStore);
+    Engine engine(HazelcastInstance hazelcastMember, @Nullable OperatorStateStores operatorStateStores) {
+        return new Engine(hazelcastMember, operatorStateStores);
     }
 
     /**
@@ -86,8 +87,9 @@ class DataPlaneActuationConfiguration {
     }
 
     @Bean
-    NestStateTeardown nestStateTeardown(HazelcastInstance hazelcastMember, StorePort storePort) {
-        return new NestStateTeardown(hazelcastMember, storePort.keyedState(), storePort.nestDeadLetters());
+    NestStateTeardown nestStateTeardown(
+            HazelcastInstance hazelcastMember, OperatorStateStores operatorStateStores) {
+        return new NestStateTeardown(hazelcastMember, operatorStateStores);
     }
 
     @Bean

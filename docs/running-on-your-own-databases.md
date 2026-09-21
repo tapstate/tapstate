@@ -55,6 +55,134 @@ What each one is for:
 - `--tapstate.connectors.plugins-dir` is where registered connector jars are unpacked. Point it at a
   directory that survives a restart and the connectors registered once stay registered.
 
+## Give one Nest its own state database
+
+The deployment setting above is the default. A Nest can select another database on the same MongoDB
+connection without changing any other Nest:
+
+```yaml
+transforms:
+  - id: order_doc
+    type: nest
+    state:
+      database: order_doc_state
+    from: { o: orders, i: order_items }
+    root:
+      from: o
+      key: [id]
+      embed:
+        - { from: i, on: { order_id: id }, as: array, path: items }
+```
+
+The override moves three things together: that Nest's records in `operator_state`, its shape record,
+and its records in `nest_dead_letters`. The collection names and logical namespaces stay fixed. Other
+Nests, joins, and connector state continue to use the deployment default.
+
+`state.database` is only a database name. It does not select another server, URI, credential, or
+connection pool. The credential in `tapstate.store.mongo.uri` therefore needs access to every database
+selected by a Nest. The same database-name checks as the deployment setting apply, including the ban on
+`local`, `config`, and the control database itself.
+
+Changing this field while the same server process still has that Nest's maps configured is refused with
+`nest.state-database-changed-while-running`. A process restart is part of every supported move; restarting
+only the pipeline cannot change where an existing map writes.
+
+## Move an existing Nest state database
+
+A state-database change is a state transition, not a normal live configuration edit. There are two
+supported outcomes: preserve the state by copying it while every writer is stopped, or deliberately
+discard the continuation and replay the full source. There is no online dual-write or automatic copy.
+
+### Preserve the state and resume
+
+1. Record the pipeline id, Nest step id, old database, new database, and a rollback point. Verify the
+   MongoDB credential can read the old database and create/update collections in the new one.
+2. Stop the pipeline without clearing it: `stop <pipeline-id> --keep-state`. Stop every Tapstate server
+   process that can run this deployment. A rolling change is unsafe because old and new processes would
+   write the same logical Nest to different databases.
+3. Back up the old database. Do not continue without a restorable copy.
+4. Copy the selected Nest's `operator_state` records, shape record, and `nest_dead_letters` records. The
+   script below is an example for MongoDB 7; replace all four values before running it.
+
+```javascript
+const fromName = "tapstate_nest";
+const toName = "order_doc_state";
+const pipelineId = "orders";
+const stepId = "order_doc";
+
+const from = db.getSiblingDB(fromName);
+const to = db.getSiblingDB(toName);
+const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const mapPrefix = `nest.${pipelineId}.${stepId}.`;
+const mapNamespaces = { $regex: `^${escapeRegex(mapPrefix)}` };
+const shapeNamespace = `nest.shape.${pipelineId}`;
+
+const stateMatch = { $or: [
+  { "_id.ns": mapNamespaces },
+  { "_id.ns": shapeNamespace, "_id.k": stepId }
+] };
+const deadLetterMatch = { "_id.ns": mapNamespaces };
+
+const stateBefore = from.operator_state.countDocuments(stateMatch);
+const deadBefore = from.nest_dead_letters.countDocuments(deadLetterMatch);
+
+from.operator_state.aggregate([
+  { $match: stateMatch },
+  { $merge: { into: { db: toName, coll: "operator_state" }, on: "_id",
+              whenMatched: "replace", whenNotMatched: "insert" } }
+]).toArray();
+from.nest_dead_letters.aggregate([
+  { $match: deadLetterMatch },
+  { $merge: { into: { db: toName, coll: "nest_dead_letters" }, on: "_id",
+              whenMatched: "replace", whenNotMatched: "insert" } }
+]).toArray();
+
+const stateAfter = to.operator_state.countDocuments(stateMatch);
+const deadAfter = to.nest_dead_letters.countDocuments(deadLetterMatch);
+printjson({ stateBefore, stateAfter, deadBefore, deadAfter });
+if (stateBefore !== stateAfter || deadBefore !== deadAfter) {
+  throw new Error("operator-state copy verification failed");
+}
+printjson({
+  sourceStateIndexes: from.operator_state.getIndexes(),
+  targetStateIndexes: to.operator_state.getIndexes(),
+  sourceDeadLetterIndexes: from.nest_dead_letters.getIndexes(),
+  targetDeadLetterIndexes: to.nest_dead_letters.getIndexes()
+});
+```
+
+The current collections require only their automatic `_id_` indexes. Still compare the index lists: a
+future release may add another required index, and `$merge` copies documents rather than index definitions.
+Copying by `"_id.ns"` is intentionally an offline scan; it is not an event-path query.
+
+5. Add or change `state.database` in that Nest, apply the artifact while the pipeline remains stopped,
+   restart every server process, and start the pipeline.
+6. Verify the pipeline is running, the target counts still match, the target shape record exists, and new
+   writes increase only the new database. Keep the old database and backup until this verification has
+   survived normal traffic.
+
+For rollback, stop every writer again. If no new source event was processed after cutover, restore the old
+artifact and restart against the old database. If the new target received writes, treat rollback as the same
+migration in reverse; simply pointing back would abandon those newer state changes.
+
+### Start clean without copying
+
+Pointing at an empty database leaves the old database untouched, but it does not make the old state
+reconstruct itself. Resuming from the old durable source position is unsafe: events already acknowledged
+before that position will not be replayed, while the pending documents that held them are absent.
+
+The supported clean-start procedure is destructive by design:
+
+1. Stop all writers and take a backup if the old state may be needed later.
+2. Clear the pipeline continuation with `stop <pipeline-id> -y`, or use
+   `restart <pipeline-id> --rerun -y` when keeping the same artifact. This removes the old operator state
+   and read position rather than pretending they still agree.
+3. Apply the artifact with the new `state.database`, restart the servers, and start the pipeline so a full
+   snapshot/replay rebuilds the Nest.
+
+Do not use `--keep-state` for this path: keeping the old read position while selecting an empty state
+database is precisely the inconsistent combination the full replay avoids.
+
 It is up in a few seconds. Check it, and check it the right way. The server binds 8080
 unless `SERVER_PORT` says otherwise; export its address once and the commands below follow
 it:

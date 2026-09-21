@@ -15,6 +15,8 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.OperatorStateStore;
+import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
@@ -128,6 +130,7 @@ public final class MongoStorePort implements StorePort {
     private final DerivedSchemaStore derivedSchemas;
     private final KeyedStateStore keyedState;
     private final NestDeadLetterStore nestDeadLetters;
+    private final OperatorStateStores operatorStateStores;
 
     /**
      * Binds the sub-stores to their own collections on the verified connection's database, bar operator
@@ -147,7 +150,6 @@ public final class MongoStorePort implements StorePort {
             MongoConnection connection, String operatorStateDatabase, Duration rateHistoryRetention) {
         Objects.requireNonNull(connection, "connection");
         MongoDatabase database = connection.database();
-        String stateDatabaseName = requireOperatorStateDatabase(operatorStateDatabase, database.getName());
         this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
         this.state = new MongoStateStore(SystemCollections.PIPELINE_STATE.on(database));
         this.desired = new MongoDesiredStore(SystemCollections.PIPELINE_DESIRED.on(database));
@@ -168,13 +170,14 @@ public final class MongoStorePort implements StorePort {
         // Operator state alone sits in its configured database on the same client. Same connection, same
         // credentials, same lifecycle - a different database. What that operator could not assemble goes
         // in the same database, being produced by the same run.
-        MongoDatabase nestState = connection.client().getDatabase(stateDatabaseName)
-                .withWriteConcern(NEST_STATE_WRITE_CONCERN);
-        this.keyedState = new MongoKeyedStateStore(SystemCollections.OPERATOR_STATE.on(nestState));
-        this.nestDeadLetters = new MongoNestDeadLetterStore(SystemCollections.NEST_DEAD_LETTERS.on(nestState));
+        this.operatorStateStores = new MongoOperatorStateStores(
+                connection.client(), database.getName(), operatorStateDatabase);
+        OperatorStateStore defaultState = operatorStateStores.inDatabase(operatorStateStores.defaultDatabase());
+        this.keyedState = defaultState.state();
+        this.nestDeadLetters = defaultState.deadLetters();
     }
 
-    private static String requireOperatorStateDatabase(String name, String controlDatabase) {
+    static String requireOperatorStateDatabase(String name, String controlDatabase) {
         if (name == null || name.isBlank()) {
             throw invalidOperatorStateDatabase(null);
         }
@@ -279,5 +282,10 @@ public final class MongoStorePort implements StorePort {
     @Override
     public NestDeadLetterStore nestDeadLetters() {
         return nestDeadLetters;
+    }
+
+    @Override
+    public OperatorStateStores operatorStateStores() {
+        return operatorStateStores;
     }
 }

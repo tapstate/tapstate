@@ -1,15 +1,11 @@
 package io.tapstate.app;
 
-import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 
 import java.time.Duration;
-import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 
 /**
  * Binds the converge loop's lifecycle actuator seam to the Jet execution engine and the source-side capture
@@ -66,17 +62,18 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
         // what leaves a run that died without a stop with its state - and so with a shape to be held to.
         stateTeardown.finishPending(pipelineId);
+        DagSource.NestCapacity capacity = dagSource.capacityOf(pipelineId);
+        engine.configureNestState(capacity.mapDatabases(), capacity.settings());
         // Where this run keeps state, said before anything can write any: the pipeline is only certainly
         // the one this run is built from now, and an apply may move it out from under the run at any point
         // after. Said after the drop above, which is the one thing entitled to clear what earlier runs said.
-        stateTeardown.willKeepStateIn(pipelineId, namespacesOf(dagSource.stateHeldBy(pipelineId)));
+        stateTeardown.willKeepStateAt(pipelineId, dagSource.stateLocations(pipelineId));
         captureCoordinator.startCapture(pipelineId);
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
-        DagSource.NestCapacity capacity = dagSource.capacityOf(pipelineId);
         engine.submit(pipelineId, dagSource.dagFor(pipelineId),
-                capacity.mapNamespaces(), capacity.settings());
+                capacity.mapDatabases(), capacity.settings());
     }
 
     @Override
@@ -119,7 +116,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             // finishes. What the runs said they keep is the half that survives an edit; what the pipeline
             // compiles to now is the half that covers state older than there being anywhere to say it. The
             // note takes both.
-            stateTeardown.note(pipelineId, namespacesOf(dagSource.stateHeldBy(pipelineId)));
+            stateTeardown.noteLocations(pipelineId, dagSource.stateLocations(pipelineId));
         }
         boolean jobOver = engine.awaitTerminal(pipelineId, JOB_TEARDOWN_BUDGET);
         captureCoordinator.stopCapture(pipelineId, purgeState);
@@ -128,17 +125,6 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             // closes, and a drop racing that leaves entries behind with the note already gone.
             stateTeardown.finishPending(pipelineId);
         }
-    }
-
-    /**
-     * Where the declared holdings are kept, flattened. Dropping is by namespace and knows nothing of who
-     * declared what, which is exactly why a component that declares one needs no other change: the drop
-     * already reaches every name it is given.
-     */
-    private static Set<String> namespacesOf(List<PipelineStateHolding> held) {
-        Set<String> namespaces = new LinkedHashSet<>();
-        held.forEach(holding -> namespaces.addAll(holding.namespaces()));
-        return namespaces;
     }
 
     @Override

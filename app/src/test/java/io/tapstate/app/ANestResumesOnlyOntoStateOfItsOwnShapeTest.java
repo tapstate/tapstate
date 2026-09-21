@@ -10,6 +10,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.NestStateStorage;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -85,6 +86,27 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
                 .isPresent();
     }
 
+    @Test
+    void theShapeLedgerAndMapPlacementFollowTheNestDatabase() {
+        InMemoryStorePort store = seedStore("items");
+        String database = "orders_operator_state";
+        store.artifacts().save(pipeline("items", database));
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+
+        source.dagFor(PIPELINE);
+
+        assertThat(store.operatorStateStores().inDatabase(database).state()
+                .load("nest.shape." + PIPELINE, STEP)).isPresent();
+        assertThat(store.keyedState().load("nest.shape." + PIPELINE, STEP)).isEmpty();
+        assertThat(source.capacityOf(PIPELINE).mapDatabases().values())
+                .isNotEmpty()
+                .containsOnly(database);
+        assertThat(source.stateLocations(PIPELINE))
+                .filteredOn(location -> location.namespace().startsWith("nest."))
+                .isNotEmpty()
+                .allMatch(location -> location.database().equals(database));
+    }
+
     // ---- fixtures ---------------------------------------------------------------------
 
     /** The two sources, the sink connection, a discovered model each, and the nest pipeline. */
@@ -110,9 +132,14 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
     }
 
     private static PipelineResource pipeline(String embedPath) {
+        return pipeline(embedPath, null);
+    }
+
+    private static PipelineResource pipeline(String embedPath, String stateDatabase) {
         Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, embedPath, List.of("id"),
                 null, null, null);
-        TransformBody.Nest body = new TransformBody.Nest(null, null,
+        TransformBody.Nest body = new TransformBody.Nest(null, null, null, null,
+                stateDatabase == null ? null : new NestStateStorage(stateDatabase),
                 new NestRoot("o", List.of("id"), null, null, List.of(item)));
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("o", FromRef.literal(PARENT_TABLE));

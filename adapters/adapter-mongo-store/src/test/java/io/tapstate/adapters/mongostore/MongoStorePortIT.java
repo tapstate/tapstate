@@ -5,6 +5,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.DesiredState;
@@ -33,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Witnesses the aggregated store port against a real Mongo replica-set: one write through each of the
@@ -49,6 +51,8 @@ class MongoStorePortIT {
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final DslParser PARSER = new DslParser();
     private static final String OPERATOR_STATE_DATABASE = "tapstate_nest";
+    private static final String OPERATOR_STATE_DATABASE_A = "operator_state_route_a";
+    private static final String OPERATOR_STATE_DATABASE_B = "operator_state_route_b";
 
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
@@ -186,6 +190,53 @@ class MongoStorePortIT {
                 assertThat(raw.getDatabase(configured)
                         .getCollection(MongoStorePort.NEST_DEAD_LETTERS).countDocuments()).isZero();
             }
+        }
+    }
+
+    @Test
+    void onePortRoutesAStateAndItsDeadLettersToTheSelectedDatabase() {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+        try (MongoConnection connection = new MongoConnection(settings)) {
+            connection.verify();
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            try (MongoClient raw = MongoClients.create(uri)) {
+                raw.getDatabase(OPERATOR_STATE_DATABASE_A).drop();
+                raw.getDatabase(OPERATOR_STATE_DATABASE_B).drop();
+            }
+
+            String namespace = "nest.orders.order_doc.$root";
+            var first = port.operatorStateStores().inDatabase(OPERATOR_STATE_DATABASE_A);
+            var second = port.operatorStateStores().inDatabase(OPERATOR_STATE_DATABASE_B);
+            first.state().save(namespace, "same-key", "first".getBytes(StandardCharsets.UTF_8));
+            first.deadLetters().record(new NestDeadLetterRecord(
+                    namespace, "same-element", "mysql-a", "1:1", 0L, 9_000L, Map.of("id", 1)));
+
+            assertThat(first.state().load(namespace, "same-key")).isPresent();
+            assertThat(first.deadLetters().read(namespace, 10)).hasSize(1);
+            assertThat(second.state().load(namespace, "same-key")).isEmpty();
+            assertThat(second.deadLetters().read(namespace, 10)).isEmpty();
+
+            second.state().save(namespace, "same-key", "second".getBytes(StandardCharsets.UTF_8));
+            assertThat(new String(first.state().load(namespace, "same-key").orElseThrow(),
+                    StandardCharsets.UTF_8)).isEqualTo("first");
+            assertThat(new String(second.state().load(namespace, "same-key").orElseThrow(),
+                    StandardCharsets.UTF_8)).isEqualTo("second");
+        }
+    }
+
+    @Test
+    void aPerNestDatabaseUsesTheSameStartupValidationAsTheDeploymentDefault() {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+        try (MongoConnection connection = new MongoConnection(settings)) {
+            connection.verify();
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+
+            assertThatThrownBy(() -> port.operatorStateStores().inDatabase("local"))
+                    .isInstanceOf(TapstateException.class)
+                    .extracting(thrown -> ((TapstateException) thrown).code().code())
+                    .isEqualTo("store.invalid-operator-state-database");
         }
     }
 
