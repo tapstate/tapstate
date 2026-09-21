@@ -402,6 +402,12 @@ connector.class-not-found:
 connector.config-type-mismatch:
   message: "Connection setting '{field}' of connector '{connector}' must be a {expected}, but its value is '{value}'."
   solution: "Give '{field}' a {expected} the connector can read, or remove it if the connection does not need it."
+connector.logminer-identifier-too-long:
+  message: "Oracle LogMiner connector '{connector}' cannot capture {kind} identifier '{identifier}' because it is longer than {limit} characters."
+  solution: "Use an Oracle schema, table and column name no longer than {limit} characters, or select another supported Oracle capture mode."
+connector.logminer-preflight-timeout:
+  message: "Oracle LogMiner connector '{connector}' did not finish initialization and schema discovery within {timeout} and was stopped."
+  solution: "Check that the Oracle source is reachable and responsive, or increase the LogMiner preflight timeout if discovery is expected to take longer."
 connector.no-connector-class:
   message: "No connector class found in artifact '{artifact}'."
   solution: "Check the jar is a PDK connector: it must contain a class annotated with @TapConnectorClass."
