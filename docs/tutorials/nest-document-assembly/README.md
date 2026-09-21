@@ -456,7 +456,8 @@ needs from the source.
 ## 8. Where the assembled state lives
 
 A nest holds partly assembled documents between events. That state is in memory up to the budget you
-set with `entries_in_memory`, and written through to MongoDB behind it, in a database of its own:
+set with `entries_in_memory`, and written through to MongoDB behind it, in a database of its own. The
+default name is `tapstate_nest`:
 
 ```js
 use tapstate_nest
@@ -479,7 +480,9 @@ tapstate -c http://127.0.0.1:8080 -u admin metrics order_doc
 | `nestStatePendingHighWater.<ns>` | the deepest one key's pending queue has ever got; a high-water mark, it does not fall back |
 
 Two things to know: the state is dropped when the pipeline stops, so read these while it runs; and
-`tapstate_nest` is not the control store (`tapstate`) and not your target.
+this is not the control store (`tapstate`) or your target. A deployment can choose another name with
+`tapstate.store.mongo.operator-state-database`. Changing the name selects a different state database;
+it does not copy the old one.
 
 ## 9. Clean up
 

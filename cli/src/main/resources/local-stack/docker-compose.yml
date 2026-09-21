@@ -39,6 +39,9 @@ services:
       # Addressed directly rather than through topology discovery: the set has exactly one
       # member, and its advertised address is not resolvable from outside the set's own network.
       TAPSTATE_STORE_MONGO_URI: mongodb://mongo:27017/tapstate?directConnection=true
+      # Durable operator state stays separate from control data. Another stack sharing this
+      # MongoDB service must choose another name to keep equal pipeline namespaces isolated.
+      TAPSTATE_STORE_MONGO_OPERATOR_STATE_DATABASE: tapstate_nest
       # The connector jars staged in ./connectors are registered once at boot, through the same
       # register-if-absent path `tapstate register` uploads to. An absolute path, so it stays
       # fixed to the mount below whatever the image's working directory is.

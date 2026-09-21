@@ -92,9 +92,9 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
     @EnumSource(Tiers.class)
     void theNotepadTheRunAfterTheReplacementOpensIsTheOneTheRunBeforeItWroteIn(
             Tiers tier, @TempDir Path directory) throws Exception {
-        // The tier rides on the pipeline id because the namespace is built from it and the state database
-        // has a fixed name: on one Mongo, two tiers sharing an id would be writing the same notepad, and
-        // the second tier would read back a value the first one minted and call it its own.
+        // The tier rides on the pipeline id because the namespace is built from it and both tiers use this
+        // test deployment's configured state database. Two tiers sharing an id would write the same
+        // notepad, and the second would read back a value the first minted and call it its own.
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         String pipelineId = PIPELINE_BASE + "_" + suffix;
         String namespace = NAMESPACE_PREFIX + pipelineId + "." + SOURCE_ID;

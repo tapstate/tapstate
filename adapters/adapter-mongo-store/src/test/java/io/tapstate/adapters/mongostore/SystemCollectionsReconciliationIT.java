@@ -55,6 +55,7 @@ class SystemCollectionsReconciliationIT {
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final DslParser PARSER = new DslParser();
     private static final String DATABASE = "reconciliation";
+    private static final String OPERATOR_STATE_DATABASE = "tapstate_nest";
     private static final Instant WHEN = Instant.parse("2026-09-02T00:00:00Z");
 
     @Container
@@ -76,7 +77,8 @@ class SystemCollectionsReconciliationIT {
         try (MongoConnection connection =
                 new MongoConnection(new MongoConnectionSettings(storeUri, null, Duration.ofSeconds(5)))) {
             connection.verify();
-            writeThroughEveryStore(new MongoStorePort(connection), new MongoAuthStores(connection));
+            writeThroughEveryStore(
+                    new MongoStorePort(connection, OPERATOR_STATE_DATABASE), new MongoAuthStores(connection));
 
             try (MongoClient raw = MongoClients.create(uri)) {
                 List<String> live = new ArrayList<>();
@@ -100,7 +102,7 @@ class SystemCollectionsReconciliationIT {
                         .isSubsetOf(declared);
 
                 List<String> liveNest = new ArrayList<>();
-                raw.getDatabase(MongoStorePort.NEST_STATE_DATABASE).listCollectionNames().into(liveNest);
+                raw.getDatabase(OPERATOR_STATE_DATABASE).listCollectionNames().into(liveNest);
                 assertThat(liveNest)
                         .as("positive control: operator state and its dead letters must have been written")
                         .hasSizeGreaterThanOrEqualTo(2);
