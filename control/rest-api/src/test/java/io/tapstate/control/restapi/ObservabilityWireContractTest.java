@@ -35,6 +35,25 @@ class ObservabilityWireContractTest {
     private static final Instant CUTOFF = Instant.parse("2026-09-05T11:00:00Z");
 
     @Test
+    void manifestPinsTheFirstBackendRevisionAndEveryFixture() throws Exception {
+        Map<?, ?> manifest = JSON.readValue(golden("manifest.json"), Map.class);
+
+        assertThat(manifest.get("contractVersion")).isEqualTo("v1");
+        assertThat(manifest.get("firstSupportedProductVersion")).isEqualTo("0.5.0");
+        assertThat(manifest.get("firstSupportedBackendRevision"))
+                .isEqualTo("27472a5e8ecbfe3a3b35585ae6e203a752672cd6");
+        assertThat(((List<?>) manifest.get("operations")).stream().map(String::valueOf).toList())
+                .containsExactly("pipeline.metrics.history", "pipeline.explain");
+        assertThat(((List<?>) manifest.get("fixtures")).stream().map(String::valueOf).toList()).containsExactly(
+                "history-raw-page-1.golden.json",
+                "history-raw-page-2.golden.json",
+                "history-aggregate-boundaries.golden.json",
+                "history-empty.golden.json",
+                "explain-stale.golden.json",
+                "explain-no-match.golden.json");
+    }
+
+    @Test
     void rawPagesMatchTheConsumerFixturesExactly() throws Exception {
         PipelineMetricsHistory first = history(EffectiveHistoryResolution.PT1M,
                 List.of(segment("2026-09-20T09:59:00Z", "2026-09-20T10:01:00Z",
