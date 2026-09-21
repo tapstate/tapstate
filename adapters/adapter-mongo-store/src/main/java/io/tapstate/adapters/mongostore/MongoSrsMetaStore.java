@@ -167,8 +167,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     public void create(String miningChainId, String retention) {
         // Insert-only: insertOne fails on a duplicate _id, so an existing chain's accumulated offset /
         // cursor / schema truth is never discarded by a re-seed.
-        Document document = toDocument(new SrsMeta(miningChainId, null, List.of(), List.of(), retention))
-                .append(CONSUMER_WRITE_REVISION, 0L);
+        Document document = toDocument(new SrsMeta(miningChainId, null, List.of(), List.of(), retention));
         try {
             collection.insertOne(document);
         } catch (MongoException e) {
@@ -795,7 +794,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // appended only when set, so a seed reads back as a seed rather than as corruption.
         Document document = new Document("_id", meta.miningChainId())
                 .append("consumerOffsets", consumers)
-                .append("schemaHistory", schemaHistory);
+                .append("schemaHistory", schemaHistory)
+                .append(CONSUMER_WRITE_REVISION, 0L);
         if (meta.sourceRead() != null) {
             document.putAll(sourceReadFields(meta.sourceRead(), meta.sourceReadAt()));
         }
