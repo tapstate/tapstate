@@ -60,6 +60,12 @@ import java.util.function.Supplier;
 public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /**
+     * A root-local fence advanced with every split-cursor write. It has no model meaning: its write is
+     * what makes the root-existence check conflict with a concurrent lifecycle delete.
+     */
+    private static final String CONSUMER_WRITE_REVISION = "consumerWriteRevision";
+
+    /**
      * How much of a chain's schema history the record retains, in bytes of stored entries.
      *
      * <p>The record is one document, and the endpoint refuses a write whose result passes its 16 MiB
@@ -161,7 +167,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     public void create(String miningChainId, String retention) {
         // Insert-only: insertOne fails on a duplicate _id, so an existing chain's accumulated offset /
         // cursor / schema truth is never discarded by a re-seed.
-        Document document = toDocument(new SrsMeta(miningChainId, null, List.of(), List.of(), retention));
+        Document document = toDocument(new SrsMeta(miningChainId, null, List.of(), List.of(), retention))
+                .append(CONSUMER_WRITE_REVISION, 0L);
         try {
             collection.insertOne(document);
         } catch (MongoException e) {
@@ -258,7 +265,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
         Objects.requireNonNull(offset, "offset");
         migrateLegacyConsumers(miningChainId, true);
-        StoreIo.call(miningChainId, () -> consumers.replaceOne(
+        writeConsumer(miningChainId, session -> consumers.replaceOne(session,
                 consumerKey(miningChainId, offset.pipelineId()),
                 consumerDocument(miningChainId, offset),
                 new ReplaceOptions().upsert(true)));
@@ -564,8 +571,36 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(pipelineId, "pipelineId");
         migrateLegacyConsumers(miningChainId, true);
         update.append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
-        StoreIo.call(miningChainId, () -> consumers.updateOne(
+        writeConsumer(miningChainId, session -> consumers.updateOne(session,
                 consumerKey(miningChainId, pipelineId), update, new UpdateOptions().upsert(true)));
+    }
+
+    /**
+     * Checks the root and writes one split cursor as a single lifecycle operation. The revision increment
+     * deliberately writes the root rather than merely reading it: a concurrent {@link #dropChain(String)}
+     * then conflicts on that document, so MongoDB serializes the two transactions. If the drop wins, a
+     * retry finds no root and refuses the mutation; if this write wins, the later drop removes its cursor.
+     */
+    private void writeConsumer(String miningChainId, ConsumerWrite write) {
+        StoreIo.run(miningChainId, () -> {
+            try (ClientSession session = client.startSession()) {
+                session.withTransaction(() -> {
+                    UpdateResult fenced = collection.updateOne(session,
+                            new Document("_id", miningChainId),
+                            new Document("$inc", new Document(CONSUMER_WRITE_REVISION, 1L)));
+                    if (fenced.getMatchedCount() == 0) {
+                        throw unseededChain(miningChainId);
+                    }
+                    write.apply(session);
+                    return null;
+                });
+            }
+        });
+    }
+
+    @FunctionalInterface
+    private interface ConsumerWrite {
+        void apply(ClientSession session);
     }
 
     /**

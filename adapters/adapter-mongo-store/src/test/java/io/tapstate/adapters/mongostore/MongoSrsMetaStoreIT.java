@@ -30,6 +30,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -784,6 +785,77 @@ class MongoSrsMetaStoreIT {
             assertThat(collection.find(new Document("pipelineId", "returning")).first())
                     .doesNotContainKey("detached");
         });
+    }
+
+    @Test
+    void aConsumerAdvanceAfterItsRootCheckCannotSurviveAConcurrentDrop() throws Exception {
+        CountDownLatch rootChecked = new CountDownLatch(1);
+        CountDownLatch resumeConsumerWrite = new CountDownLatch(1);
+        AtomicBoolean paused = new AtomicBoolean();
+        CommandListener pauseAfterRootCheck = new CommandListener() {
+            @Override
+            public void commandSucceeded(CommandSucceededEvent event) {
+                if (!"find".equals(event.getCommandName()) || !paused.compareAndSet(false, true)) {
+                    return;
+                }
+                rootChecked.countDown();
+                try {
+                    if (!resumeConsumerWrite.await(30, TimeUnit.SECONDS)) {
+                        throw new AssertionError("consumer write was not resumed");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while holding the consumer write", e);
+                }
+            }
+        };
+        MongoClientSettings writingSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(pauseAfterRootCheck)
+                .build();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try (MongoClient writingClient = MongoClients.create(writingSettings);
+                MongoClient currentClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoCollection<Document> roots = currentClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers =
+                    currentClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            MongoSrsMetaStore writingStore = new MongoSrsMetaStore(writingClient,
+                    writingClient.getDatabase("tapstate").getCollection("srs_meta"),
+                    writingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+            MongoSrsMetaStore currentStore = new MongoSrsMetaStore(currentClient, roots, consumers);
+            currentStore.create(CHAIN, null);
+
+            Future<?> staleAdvance = executor.submit(
+                    () -> writingStore.advanceConsumerReadSeq(CHAIN, "stale", "orders", 9L));
+            assertThat(rootChecked.await(10, TimeUnit.SECONDS))
+                    .as("the consumer writer is paused after confirming that the root exists")
+                    .isTrue();
+
+            currentStore.dropChain(CHAIN);
+            assertThat(roots.find(new Document("_id", CHAIN)).first()).isNull();
+            assertThat(consumers.countDocuments(new Document("miningChainId", CHAIN))).isZero();
+            resumeConsumerWrite.countDown();
+
+            assertThatThrownBy(() -> staleAdvance.get(30, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(IllegalStateException.class)
+                    .hasRootCauseMessage("srs meta mutate on an unseeded mining chain: " + CHAIN
+                            + " (create must seed it first)");
+            assertThat(consumers.countDocuments(new Document("miningChainId", CHAIN)))
+                    .as("the refused writer leaves no orphan cursor")
+                    .isZero();
+
+            currentStore.create(CHAIN, null);
+            assertThat(currentStore.read(CHAIN).orElseThrow().consumerOffsets())
+                    .as("a later chain incarnation cannot adopt state from the refused writer")
+                    .isEmpty();
+        } finally {
+            resumeConsumerWrite.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        }
     }
 
     @Test
