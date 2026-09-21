@@ -118,7 +118,8 @@ public final class HistoryCursorCodec {
             throw invalid("MALFORMED", malformed);
         }
         if (!clock.instant().isBefore(state.expiresAt())) {
-            throw new TapstateException(MonitorError.CURSOR_EXPIRED, Map.of(), null);
+            throw new TapstateException(MonitorError.CURSOR_EXPIRED,
+                    Map.of("operation", "pipeline.metrics.history"), null);
         }
         if (!state.binding().equals(expected)) {
             throw invalid("QUERY_MISMATCH", null);
@@ -244,6 +245,7 @@ public final class HistoryCursorCodec {
     }
 
     private static TapstateException invalid(String reason, Throwable cause) {
-        return new TapstateException(MonitorError.INVALID_CURSOR, Map.of("reason", reason), cause);
+        return new TapstateException(MonitorError.INVALID_CURSOR,
+                Map.of("operation", "pipeline.metrics.history", "reason", reason), cause);
     }
 }

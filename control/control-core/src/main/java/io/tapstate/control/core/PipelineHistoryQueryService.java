@@ -496,7 +496,7 @@ public final class PipelineHistoryQueryService {
 
     private static TapstateException budget(String name, int limit) {
         return new TapstateException(MonitorError.QUERY_BUDGET_EXCEEDED,
-                Map.of("budget", name, "limit", limit), null);
+                Map.of("operation", "pipeline.metrics.history", "budget", name, "limit", limit), null);
     }
 
     private static Instant min(Instant left, Instant right) {

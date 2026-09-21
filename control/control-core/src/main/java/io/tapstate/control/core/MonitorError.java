@@ -24,13 +24,13 @@ public enum MonitorError implements TapstateErrorCode {
     NO_OBSERVATION("monitor.no-observation", Set.of("pipeline")),
 
     /** A history cursor could not be parsed, verified, or matched to the repeated query. */
-    INVALID_CURSOR("monitor.invalid-cursor", Set.of("reason")),
+    INVALID_CURSOR("monitor.invalid-cursor", Set.of("operation", "reason")),
 
     /** A valid history cursor is older than the bounded continuation lifetime. */
-    CURSOR_EXPIRED("monitor.cursor-expired", Set.of()),
+    CURSOR_EXPIRED("monitor.cursor-expired", Set.of("operation")),
 
     /** A history query crossed one of its independently counted runtime budgets. */
-    QUERY_BUDGET_EXCEEDED("monitor.query-budget-exceeded", Set.of("budget", "limit"));
+    QUERY_BUDGET_EXCEEDED("monitor.query-budget-exceeded", Set.of("operation", "budget", "limit"));
 
     private final String code;
     private final Set<String> placeholders;

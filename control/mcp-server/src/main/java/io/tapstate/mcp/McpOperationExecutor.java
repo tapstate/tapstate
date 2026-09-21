@@ -73,6 +73,8 @@ final class McpOperationExecutor {
                 case "pipeline.metrics" -> pipelineRead(args, "metrics");
                 case "pipeline.snapshot" -> pipelineRead(args, "snapshot");
                 case "pipeline.logs" -> pipelineLogs(args);
+                case "pipeline.metrics.history" -> pipelineHistory(args);
+                case "pipeline.explain" -> pipelineRead(args, "explain");
                 case "data-browser.collections" -> get(collectionsOf(args));
                 case "data-browser.stats" -> get(collectionOf(args) + "/stats");
                 case "data-browser.find" -> post(
@@ -331,6 +333,46 @@ final class McpOperationExecutor {
             path += "?limit=" + Math.max(1, Math.min(200, number.intValue()));
         }
         return get(path);
+    }
+
+    private McpResult pipelineHistory(Map<String, Object> arguments) {
+        String id = required(arguments, "id");
+        StringBuilder path = new StringBuilder("/api/pipelines/")
+                .append(segment(id))
+                .append("/metrics/history?from=")
+                .append(segment(required(arguments, "from")))
+                .append("&to=")
+                .append(segment(required(arguments, "to")));
+        optionalText(path, arguments, "resolution");
+        if (arguments.containsKey("limit")) {
+            path.append("&limit=").append(integerArgument(arguments, "limit", 0));
+        }
+        Object selected = arguments.get("table");
+        if (selected != null) {
+            if (!(selected instanceof List<?> tables)) {
+                throw malformedListArgument("`table` must be an array of strings");
+            }
+            for (Object table : tables) {
+                if (!(table instanceof String value) || value.isBlank()) {
+                    throw malformedListArgument("`table` entries must be non-blank strings");
+                }
+                path.append("&table=").append(segment(value));
+            }
+        }
+        optionalText(path, arguments, "cursor");
+        return get(path.toString());
+    }
+
+    private static void optionalText(
+            StringBuilder path, Map<String, Object> arguments, String name) {
+        Object value = arguments.get(name);
+        if (value == null) {
+            return;
+        }
+        if (!(value instanceof String text) || text.isBlank()) {
+            throw malformedListArgument("`" + name + "` must be a non-blank string");
+        }
+        path.append('&').append(name).append('=').append(segment(text));
     }
 
     /** The listing path for the source a read names. */

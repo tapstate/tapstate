@@ -568,13 +568,13 @@ monitor.no-observation:
   message: "No observation is available for pipeline {pipeline}."
   solution: "Check the pipeline id for typos; a freshly started pipeline may take a moment to publish its first observation."
 monitor.invalid-cursor:
-  message: "The history cursor is invalid ({reason})."
+  message: "The cursor for {operation} is invalid ({reason})."
   solution: "Start a new history query, then repeat every query parameter unchanged when following its next cursor."
 monitor.cursor-expired:
-  message: "The history cursor has expired."
+  message: "The cursor for {operation} has expired."
   solution: "Start a new history query; cursors are intentionally short-lived and do not hold a server-side session."
 monitor.query-budget-exceeded:
-  message: "The history query exceeded the {budget} budget of {limit}."
+  message: "The {operation} query exceeded the {budget} budget of {limit}."
   solution: "Narrow the time range or select fewer table series, then start a new query."
 artifact.in-use:
   message: "Artifact `{id}` is still referenced by: {referrers}."

@@ -58,6 +58,14 @@ class McpOperationExecutorTest {
             Map<String, Object> stop = Map.of("id", "orders", "purgeState", true);
             Map<String, Object> logs = new LinkedHashMap<>(pipeline);
             logs.put("limit", 999);
+            Map<String, Object> history = Map.of(
+                    "id", "orders",
+                    "from", "2026-09-20T10:00:00Z",
+                    "to", "2026-09-20T11:00:00Z",
+                    "resolution", "raw",
+                    "limit", 10,
+                    "table", List.of("public.orders"),
+                    "cursor", "next page");
 
             List<Map.Entry<io.tapstate.control.core.Operation, Map<String, Object>>> calls = List.of(
                     Map.entry(ControlOperations.SYSTEM_VERSION, Map.of()),
@@ -84,6 +92,8 @@ class McpOperationExecutorTest {
                     Map.entry(ControlOperations.PIPELINE_METRICS, pipeline),
                     Map.entry(ControlOperations.PIPELINE_SNAPSHOT, pipeline),
                     Map.entry(ControlOperations.PIPELINE_LOGS, logs),
+                    Map.entry(ControlOperations.PIPELINE_METRICS_HISTORY, history),
+                    Map.entry(ControlOperations.PIPELINE_EXPLAIN, pipeline),
                     Map.entry(ControlOperations.DATA_BROWSER_COLLECTIONS, Map.of("sourceId", "views")),
                     Map.entry(ControlOperations.DATA_BROWSER_STATS,
                             Map.of("sourceId", "views", "collection", "order_state")),
@@ -117,6 +127,10 @@ class McpOperationExecutorTest {
                     "/api/pipelines/orders:pause", "/api/pipelines/orders:resume",
                     "/api/pipelines/orders/status", "/api/pipelines/orders/metrics",
                     "/api/pipelines/orders/snapshot", "/api/pipelines/orders/logs?limit=200",
+                    "/api/pipelines/orders/metrics/history?from=2026-09-20T10%3A00%3A00Z"
+                            + "&to=2026-09-20T11%3A00%3A00Z&resolution=raw&limit=10"
+                            + "&table=public.orders&cursor=next%20page",
+                    "/api/pipelines/orders/explain",
                     "/api/sources/views/collections",
                     "/api/sources/views/collections/order_state/stats",
                     "/api/sources/views/collections/order_state:find");

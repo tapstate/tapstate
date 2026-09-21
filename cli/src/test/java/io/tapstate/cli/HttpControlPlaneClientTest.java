@@ -1662,6 +1662,75 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void explainDecodesTypedEvidenceAndNullableNext() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1/explain", 200,
+                "{\"pipelineId\":\"pl1\",\"state\":\"RUNNING\",\"kind\":\"NO_MATCH\","
+                        + "\"message\":\"No diagnostic rule matched.\",\"freshness\":\"UNKNOWN\","
+                        + "\"evidence\":[{\"source\":\"status\",\"field\":\"observedAgeMillis\","
+                        + "\"value\":null}],\"cannotSay\":[\"The observation has no time.\"],"
+                        + "\"next\":null}", seen);
+        try {
+            ExplainOutcome outcome = new HttpControlPlaneClient().explain(baseOf(server), "tok-abc", "pl1");
+
+            assertThat(outcome).isInstanceOf(ExplainOutcome.Found.class);
+            ExplainOutcome.Found found = (ExplainOutcome.Found) outcome;
+            assertThat(found.kind()).isEqualTo("NO_MATCH");
+            assertThat(found.freshness()).isEqualTo("UNKNOWN");
+            assertThat(found.evidence()).containsExactly(
+                    new ExplainOutcome.Evidence("status", "observedAgeMillis", null));
+            assertThat(found.next()).isNull();
+            assertThat(seen.get().path()).isEqualTo("/api/pipelines/pl1/explain");
+            assertThat(seen.get().authorization()).isEqualTo("Bearer tok-abc");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void historySendsEverySelectorAndDecodesTheTypedPage() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1/metrics/history", 200,
+                "{\"pipelineId\":\"pl1\",\"from\":\"2026-09-20T10:00:00Z\","
+                        + "\"to\":\"2026-09-20T11:00:00Z\","
+                        + "\"effectiveFrom\":\"2026-09-20T10:00:00Z\","
+                        + "\"effectiveTo\":\"2026-09-20T11:00:00Z\","
+                        + "\"retentionCutoff\":\"2026-09-05T11:00:00Z\","
+                        + "\"effectiveResolution\":\"PT1M\",\"status\":\"OK\","
+                        + "\"consistency\":\"EVENTUAL\",\"segments\":[{"
+                        + "\"intervalStart\":\"2026-09-20T10:00:00Z\","
+                        + "\"intervalEnd\":\"2026-09-20T10:01:00Z\","
+                        + "\"startReason\":\"WINDOW_START\",\"points\":[{"
+                        + "\"intervalStart\":\"2026-09-20T10:00:00Z\","
+                        + "\"intervalEnd\":\"2026-09-20T10:01:00Z\","
+                        + "\"recordsOut\":{\"delta\":60,\"averageRate\":1,\"maxRate\":2},"
+                        + "\"lag\":[{\"table\":\"orders\","
+                        + "\"observedAt\":\"2026-09-20T10:01:00Z\",\"last\":2,\"max\":4}]}]}],"
+                        + "\"gaps\":[],\"unavailable\":[{\"metric\":\"bytes.out\"}],"
+                        + "\"nextCursor\":null}", seen);
+        try {
+            HistoryOutcome outcome = new HttpControlPlaneClient().history(
+                    baseOf(server), "tok-abc", "pl1",
+                    new HistoryRequest("2026-09-20T10:00:00Z", "2026-09-20T11:00:00Z",
+                            "raw", 1, List.of("orders", "items"), "next page"));
+
+            assertThat(outcome).isInstanceOf(HistoryOutcome.Found.class);
+            HistoryOutcome.Found found = (HistoryOutcome.Found) outcome;
+            assertThat(found.effectiveResolution()).isEqualTo("PT1M");
+            assertThat(found.segments().getFirst().points().getFirst().recordsOut())
+                    .isEqualTo(new HistoryOutcome.Rate(60L, 1L, 2L));
+            assertThat(found.unavailable()).containsExactly(new HistoryOutcome.Unavailable("bytes.out", null));
+            assertThat(found.nextCursor()).isNull();
+            assertThat(seen.get().query()).contains(
+                    "from=2026-09-20T10:00:00Z", "to=2026-09-20T11:00:00Z",
+                    "resolution=raw", "limit=1", "table=orders", "table=items", "cursor=next+page");
+            assertThat(seen.get().authorization()).isEqualTo("Bearer tok-abc");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void metricsGetsTheMetricsFaceAndReturnsTheOpenMap() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/metrics", 200,

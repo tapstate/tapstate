@@ -211,6 +211,16 @@ class ApiExceptionHandlerTest {
     }
 
     @Test
+    void historyCursorAndBudgetRefusalsHaveTheirPublishedStatuses() {
+        assertThat(ApiExceptionHandler.statusFor(MonitorError.INVALID_CURSOR))
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(ApiExceptionHandler.statusFor(MonitorError.CURSOR_EXPIRED))
+                .isEqualTo(HttpStatus.GONE);
+        assertThat(ApiExceptionHandler.statusFor(MonitorError.QUERY_BUDGET_EXCEEDED))
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
     void aBoundaryAttributedCodedErrorIsABadRequestPreservingTheCode() {
         // A verb boundary that knows a domain code is the client's fault in its context wraps it as a
         // BadRequestCodedException: a 400 that still renders the underlying coded body (here a connector
