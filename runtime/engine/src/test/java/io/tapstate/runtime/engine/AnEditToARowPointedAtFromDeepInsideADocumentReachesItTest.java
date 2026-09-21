@@ -42,6 +42,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -170,6 +171,11 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
                     AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest::sinkEvidence);
         } catch (AssertionError timedOut) {
             job.cancel();
+            try {
+                job.join();
+            } catch (CancellationException cancelled) {
+                // cancel() only submits the request; join before exposing the completed cleanup.
+            }
             throw timedOut;
         }
         job.join();
