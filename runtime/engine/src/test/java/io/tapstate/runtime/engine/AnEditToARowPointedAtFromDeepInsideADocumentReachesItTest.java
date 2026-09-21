@@ -122,6 +122,17 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
                 .isEqualTo(2);
     }
 
+    @Test
+    void aLateRenderingStillSeesThePreEditName() {
+        member.getJet().newJob(ordersWithLinesPointingAtProducts(Duration.ofSeconds(3))).join();
+
+        assertThat(namesSeenForTheSharedProduct())
+                .describedAs("even when reactor load postpones document rendering past the wall-clock "
+                        + "edit deadline, the shared product is rendered under its pre-edit name as well "
+                        + "as its new one")
+                .containsExactlyInAnyOrder("Widget", "Cog");
+    }
+
     /** Every distinct name the shared product was rendered under, anywhere in any document. */
     private static Set<Object> namesSeenForTheSharedProduct() {
         Set<Object> names = new LinkedHashSet<>();
@@ -170,6 +181,11 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
 
     /** Two orders, each with lines, some of which point at the same product. */
     private static DAG ordersWithLinesPointingAtProducts() {
+        return ordersWithLinesPointingAtProducts(Duration.ofMillis(400));
+    }
+
+    /** The same inputs, with the roots held until the given wall-clock point. */
+    private static DAG ordersWithLinesPointingAtProducts(Duration ordersAfter) {
         Embed product = new Embed("product", Map.of("sku_id", "sku_ref"), EmbedAs.OBJECT,
                 "product", null, null, null, null);
         Embed lines = new Embed("line", Map.of("order_id", "order_id"), EmbedAs.ARRAY,
@@ -191,7 +207,7 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();
         sources.put("orders", rowsSource("orders", List.of(new Timed(List.of(
-                one("order_id", 1), one("order_id", 2)), Duration.ofMillis(400), null))));
+                one("order_id", 1), one("order_id", 2)), ordersAfter, null))));
         sources.put("lines", rowsSource("lines", List.of(new Timed(List.of(
                 line(101, 1, 1, SHARED_SKU), line(102, 1, 2, 8),
                 line(201, 2, 1, SHARED_SKU)), Duration.ofMillis(700), null))));
