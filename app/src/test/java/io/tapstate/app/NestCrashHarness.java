@@ -151,7 +151,7 @@ public final class NestCrashHarness {
 
         report = new Report(reportFile);
         KeyedStateStore cold = new MongoKeyedStateStore(MongoClients.create(uri)
-                .getDatabase(MongoStorePort.NEST_STATE_DATABASE)
+                .getDatabase(MongoProperties.DEFAULT_OPERATOR_STATE_DATABASE)
                 .getCollection(MongoStorePort.OPERATOR_STATE));
 
         HazelcastInstance member = member();

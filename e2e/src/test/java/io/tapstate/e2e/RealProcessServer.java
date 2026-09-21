@@ -40,7 +40,12 @@ final class RealProcessServer implements ServerHandle {
 
     /** Launches the deliverable and returns once its health probe answers. */
     static RealProcessServer start(String storeUri) {
-        return start(storeUri, bootJar());
+        return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
+    }
+
+    /** Launches the deliverable with an explicit operator-state database. */
+    static RealProcessServer start(String storeUri, String operatorStateDatabase) {
+        return start(storeUri, operatorStateDatabase, bootJar());
     }
 
     /**
@@ -52,7 +57,11 @@ final class RealProcessServer implements ServerHandle {
      * named to it.
      */
     static RealProcessServer start(String storeUri, Path jar) {
-        RealProcessServer server = launching(storeUri, jar);
+        return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);
+    }
+
+    private static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar) {
+        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar);
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
@@ -70,18 +79,22 @@ final class RealProcessServer implements ServerHandle {
      * would then always land after the work rather than inside it.
      */
     static RealProcessServer launching(String storeUri) {
-        return launching(storeUri, bootJar());
+        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar());
     }
 
     /** The same, launching the jar named rather than the one this reactor built. See {@link #start(String, Path)}. */
     static RealProcessServer launching(String storeUri, Path jar) {
+        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);
+    }
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
         URI baseUrl = URI.create("http://127.0.0.1:" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
-        Process process = launch(jar, port, storeUri, workingDirectory, output);
+        Process process = launch(jar, port, storeUri, operatorStateDatabase, workingDirectory, output);
         return new RealProcessServer(process, baseUrl, output);
     }
 
@@ -152,7 +165,8 @@ final class RealProcessServer implements ServerHandle {
         }
     }
 
-    private static Process launch(Path jar, int port, String storeUri, Path workingDirectory, Path output) {
+    private static Process launch(
+            Path jar, int port, String storeUri, String operatorStateDatabase, Path workingDirectory, Path output) {
         List<String> command = List.of(
                 javaBinary(),
                 "-jar",
@@ -167,6 +181,7 @@ final class RealProcessServer implements ServerHandle {
                 "--server.port=" + port,
                 "--tapstate.store.mongo.enabled=true",
                 "--tapstate.store.mongo.uri=" + storeUri,
+                "--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                 "--tapstate.store.mongo.server-selection-timeout=5s",
                 // A staging directory of this launch's own, for the same reason the other tier gets one:
                 // the cache is content-addressed and reused, so a shared one serves a stale connector.

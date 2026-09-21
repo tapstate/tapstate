@@ -1,5 +1,8 @@
 package io.tapstate.e2e;
 
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
@@ -59,6 +62,10 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     private static final String VIEW = "order_state";
     private static final String PIPELINE_ID = "assembled_orders_leak";
     private static final String BOUNDARY_PIPELINE_ID = "assembled_orders_boundary";
+    private static final String CONFIGURED_PIPELINE_ID = "assembled_orders_configured_database";
+    private static final String CONFIGURED_VIEW = "configured_order_state";
+    private static final String CONFIGURED_STATE_A = "issue431_e2e_state_a";
+    private static final String CONFIGURED_STATE_B = "issue431_e2e_state_b";
 
     private static final String SEEDED = "seeded-customer";
     /** Written only by the first run, so reading it in the second says where it came from. */
@@ -112,6 +119,61 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                             + "first run's value, from a source this run never read")
                     .isEqualTo(ONLY_THE_FIRST_RUN);
         }
+    }
+
+    /**
+     * Two servers receive different deployment settings while every operator identity stays equal. The
+     * database-location assertions are what make this a wiring witness: fixing the adapter while ignoring
+     * the server setting, or reverting the assembly root to the compatibility default, leaves the named
+     * database empty and fails before later source events could mask the leak.
+     */
+    @Test
+    void configuredOperatorStateDatabasesKeepEqualPipelineIdentitiesApart() throws Exception {
+        dropDatabases(CONFIGURED_STATE_A, CONFIGURED_STATE_B, SharedMongo.OPERATOR_STATE_DATABASE);
+
+        Map<String, Object> firstSource = SharedMySql.settings("nest_configured_src_one");
+        seed(firstSource);
+        String firstWarehouse = SharedMongo.replicaSetUrl("nest_configured_warehouse_one");
+        try (ServerHandle server = Tiers.IN_PROCESS.launch(
+                        SharedMongo.replicaSetUrl("nest_configured_control_one"), CONFIGURED_STATE_A);
+                MongoEndpoints mongo = new MongoEndpoints()) {
+            start(server, firstSource, firstWarehouse, CONFIGURED_PIPELINE_ID, CONFIGURED_VIEW);
+            EndpointAddress warehouse = EndpointAddress.uri(firstWarehouse);
+            awaitCustomer(mongo, warehouse, CONFIGURED_VIEW, SEEDED,
+                    "the first configured deployment's assembly");
+            update(firstSource, ONLY_THE_FIRST_RUN);
+            awaitCustomer(mongo, warehouse, CONFIGURED_VIEW, ONLY_THE_FIRST_RUN,
+                    "the first configured deployment's change");
+        }
+
+        assertThat(operatorStateDocuments(CONFIGURED_STATE_A))
+                .as("state written through the first server's deployment setting")
+                .isPositive();
+        assertThat(operatorStateDocuments(CONFIGURED_STATE_B)).isZero();
+        assertThat(operatorStateDocuments(SharedMongo.OPERATOR_STATE_DATABASE))
+                .as("the compatibility default was not selected by either explicit deployment")
+                .isZero();
+
+        Map<String, Object> secondSource = SharedMySql.settings("nest_configured_src_two");
+        seed(secondSource);
+        String secondWarehouse = SharedMongo.replicaSetUrl("nest_configured_warehouse_two");
+        try (ServerHandle server = Tiers.IN_PROCESS.launch(
+                        SharedMongo.replicaSetUrl("nest_configured_control_two"), CONFIGURED_STATE_B);
+                MongoEndpoints mongo = new MongoEndpoints()) {
+            start(server, secondSource, secondWarehouse, CONFIGURED_PIPELINE_ID, CONFIGURED_VIEW);
+            EndpointAddress warehouse = EndpointAddress.uri(secondWarehouse);
+            awaitCustomer(mongo, warehouse, CONFIGURED_VIEW, SEEDED,
+                    "the second configured deployment's own assembly");
+            assertThat(customer(mongo, warehouse, CONFIGURED_VIEW))
+                    .as("the equal pipeline identity does not inherit the first deployment's value")
+                    .isEqualTo(SEEDED);
+        }
+
+        assertThat(operatorStateDocuments(CONFIGURED_STATE_A)).isPositive();
+        assertThat(operatorStateDocuments(CONFIGURED_STATE_B))
+                .as("state written through the second server's deployment setting")
+                .isPositive();
+        assertThat(operatorStateDocuments(SharedMongo.OPERATOR_STATE_DATABASE)).isZero();
     }
 
     /**
@@ -222,6 +284,22 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     private static Document only(List<Document> documents) {
         assertThat(documents).as("the documents the view holds").hasSize(1);
         return documents.getFirst();
+    }
+
+    private static void dropDatabases(String... databases) {
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(databases[0]))) {
+            for (String database : databases) {
+                client.getDatabase(database).drop();
+            }
+        }
+    }
+
+    private static long operatorStateDocuments(String database) {
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
+            return client.getDatabase(database)
+                    .getCollection(MongoStorePort.OPERATOR_STATE)
+                    .countDocuments();
+        }
     }
 
     private static String sourceYaml(String id, Map<String, Object> config, String table) {

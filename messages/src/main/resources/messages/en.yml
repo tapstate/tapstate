@@ -345,6 +345,9 @@ store.unreachable:
 store.not-replica-set:
   message: "The store at {target} is not a replica-set."
   solution: "Start MongoDB as a single-node replica-set; the checkpoint transaction requires one."
+store.invalid-operator-state-database:
+  message: "The operator-state database name is not valid for this deployment."
+  solution: "Set tapstate.store.mongo.operator-state-database to a non-blank name of at most 63 UTF-8 bytes, without a null character, slash, backslash, space, double quote, dot, or dollar sign. Do not use local, config, or the control database named by tapstate.store.mongo.uri."
 store.invalid-uri:
   message: "The store connection string is not a valid MongoDB URI."
   solution: "Check the store URI setting; it must start with mongodb:// or mongodb+srv://."
