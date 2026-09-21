@@ -270,6 +270,9 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
         assertThat(mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
                 .as("copying, switching, and later purging never delete the rollback source")
                 .isEqualTo(sourceStateCount);
+        assertThat(shapeRecordDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
+                .as("the rollback source keeps its shape record too")
+                .isEqualTo(sourceShapeCount);
         assertThat(deadLetterDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
                 .as("the rollback source keeps its dead letters too")
                 .isEqualTo(sourceDeadLetterCount);
