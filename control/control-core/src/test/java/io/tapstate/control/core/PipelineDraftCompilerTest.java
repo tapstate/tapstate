@@ -3,8 +3,10 @@ package io.tapstate.control.core;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.PipelineDraft;
@@ -53,6 +55,37 @@ class PipelineDraftCompilerTest {
 
         assertThat(first).isEqualTo(second);
         assertThat(CanonicalHash.of(first)).hasSize(64).isEqualTo(CanonicalHash.of(second));
+    }
+
+    @Test
+    void compilesCanvasGraphIntoViewAndTargetPublication() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("active-orders", "filter", null, null,
+                        Map.of("expr", "active == true"), Map.of()),
+                new PipelineDraft.Node("orders-view", "view", null, null, Map.of(), Map.of("viewId", "orders_view")),
+                new PipelineDraft.Node("warehouse-orders", "target", "warehouse", "orders_archive",
+                        Map.of("writeMode", "append"), Map.of())),
+                List.of(
+                        new PipelineDraft.Edge("source-to-filter", "source-orders", "active-orders"),
+                        new PipelineDraft.Edge("filter-to-view", "active-orders", "orders-view"),
+                        new PipelineDraft.Edge("filter-to-target", "active-orders", "warehouse-orders")),
+                new PipelineDraft.Viewport(0, 0, 1));
+        PipelineDraft draft = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.DAG,
+                "Orders", "", graph, null, null, null, null,
+                java.time.Instant.parse("2026-09-21T00:00:00Z"),
+                java.time.Instant.parse("2026-09-21T00:00:00Z"), "test");
+
+        PipelineResource compiled = compiler.compile(draft);
+
+        assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm", "warehouse");
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly("active-orders");
+        assertThat(compiled.view()).isEqualTo(new ViewBlock.Inline(
+                "orders_view", io.tapstate.core.model.FromRef.literal("active-orders"), null, null, null));
+        assertThat(compiled.serve()).isInstanceOf(ServeBlock.Inline.class);
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+        assertThat(serve.sync()).extracting(sync -> sync.source()).containsExactly("warehouse");
+        assertThat(serve.sync().getFirst().writeMode().yaml()).isEqualTo("append");
     }
 
     private static PipelineDraft wizardDraft() {

@@ -9,8 +9,12 @@ import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
+import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.model.WriteMode;
 import io.tapstate.spi.store.PipelineDraft;
 
 import java.util.ArrayDeque;
@@ -185,31 +189,119 @@ public final class PipelineDraftCompiler {
                 sourceIds.add(node.sourceId());
             }
         }
-        Map<String, List<String>> inputs = new HashMap<>();
-        graph.edges().forEach(edge -> inputs.computeIfAbsent(edge.target(), ignored -> new ArrayList<>()).add(edge.source()));
+        Map<String, List<String>> inputs = new LinkedHashMap<>();
+        for (PipelineDraft.Edge edge : graph.edges()) {
+            if (!nodes.containsKey(edge.source()) || !nodes.containsKey(edge.target())) {
+                throw new IllegalArgumentException("graph edge references an unknown node: " + edge.id());
+            }
+            inputs.computeIfAbsent(edge.target(), ignored -> new ArrayList<>()).add(edge.source());
+        }
         List<Step> steps = new ArrayList<>();
+        Map<String, List<String>> outputs = new LinkedHashMap<>();
+        Set<String> visiting = new HashSet<>();
+        ViewBlock view = null;
+        ServeBlock serve = null;
         for (PipelineDraft.Node node : graph.nodes()) {
-            if ("source".equals(node.type())) {
-                continue;
+            if ("view".equals(node.type())) {
+                if (view != null) {
+                    throw new IllegalArgumentException("graph has more than one view node");
+                }
+                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
+                if (refs.size() != 1) {
+                    throw new IllegalArgumentException("view node requires exactly one input: " + node.id());
+                }
+                String use = optionalText(node.config(), "use");
+                view = use == null
+                        ? new ViewBlock.Inline(optionalText(node.metadata(), "viewId", node.id()), FromRef.literal(refs.getFirst()),
+                                optionalText(node.config(), "primaryKey", "primary_key"), null, null)
+                        : new ViewBlock.Use(optionalText(node.metadata(), "viewId", node.id()), use, FromRef.literal(refs.getFirst()));
+            } else if ("target".equals(node.type())) {
+                if (serve != null) {
+                    throw new IllegalArgumentException("graph has more than one target node");
+                }
+                List<String> refs = graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
+                if (refs.isEmpty()) {
+                    throw new IllegalArgumentException("target node requires an input: " + node.id());
+                }
+                String targetSource = requiredNodeText(node.sourceId(), "target source", node.id());
+                serve = new ServeBlock.Inline(node.id(), FromClause.list(refs.stream().map(FromRef::literal).toArray(FromRef[]::new)),
+                        List.of(new SyncElement(node.id(), targetSource, writeMode(node.config(), node.id()), null, null, null)), null, null);
+            } else {
+                graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
             }
-            List<String> refs = inputs.getOrDefault(node.id(), List.of());
-            if (refs.isEmpty() && node.table() != null) {
-                refs = List.of(node.table());
-            }
-            if (refs.isEmpty()) {
-                continue;
-            }
-            TransformBody body = switch (node.type()) {
-                case "map" -> new TransformBody.MapProjection(mapFields(node.config()));
-                case "filter" -> new TransformBody.Filter(requiredText(node.config(), "expr"));
-                default -> throw new IllegalArgumentException("unsupported graph node: " + node.type());
-            };
-            steps.add(Step.inline(node.id(), FromClause.list(refs.stream().map(FromRef::literal).toArray(FromRef[]::new)),
-                    body, Map.of(), Map.of()));
         }
         return new PipelineResource(draft.pipelineId(), metadata(draft),
                 sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(),
-                steps, null, null, null, Map.of());
+                steps, view, serve, null, Map.of());
+    }
+
+    private static List<String> graphOutputs(String nodeId, Map<String, PipelineDraft.Node> nodes,
+            Map<String, List<String>> inputs, Map<String, List<String>> outputs, Set<String> visiting, List<Step> steps) {
+        List<String> existing = outputs.get(nodeId);
+        if (existing != null) {
+            return existing;
+        }
+        if (!visiting.add(nodeId)) {
+            throw new IllegalArgumentException("graph contains a cycle at: " + nodeId);
+        }
+        PipelineDraft.Node node = nodes.get(nodeId);
+        List<String> result;
+        if ("source".equals(node.type())) {
+            String sourceId = requiredNodeText(node.sourceId(), "source id", node.id());
+            String table = requiredNodeText(node.table(), "source table", node.id());
+            result = List.of(sourceId + "." + table);
+        } else {
+            List<String> refs = new ArrayList<>();
+            for (String input : inputs.getOrDefault(nodeId, List.of())) {
+                refs.addAll(graphOutputs(input, nodes, inputs, outputs, visiting, steps));
+            }
+            if (refs.isEmpty()) {
+                throw new IllegalArgumentException("graph node requires an input: " + node.id());
+            }
+            if ("map".equals(node.type()) || "filter".equals(node.type())) {
+                TransformBody body = "map".equals(node.type())
+                        ? new TransformBody.MapProjection(mapFields(node.config()))
+                        : new TransformBody.Filter(requiredText(node.config(), "expr"));
+                steps.add(Step.inline(node.id(), FromClause.list(refs.stream().map(FromRef::literal).toArray(FromRef[]::new)),
+                        body, Map.of(), Map.of()));
+                result = List.of(node.id());
+            } else if ("view".equals(node.type()) || "target".equals(node.type())) {
+                result = List.copyOf(refs);
+            } else {
+                throw new IllegalArgumentException("unsupported graph node: " + node.type());
+            }
+        }
+        visiting.remove(nodeId);
+        outputs.put(nodeId, result);
+        return result;
+    }
+
+    private static String requiredNodeText(String value, String field, String nodeId) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("graph " + field + " must be non-blank: " + nodeId);
+        }
+        return value;
+    }
+
+    private static String optionalText(Map<String, Object> values, String... names) {
+        for (String name : names) {
+            Object value = values.get(name);
+            if (value instanceof String text && !text.isBlank()) {
+                return text;
+            }
+        }
+        return null;
+    }
+
+    private static WriteMode writeMode(Map<String, Object> config, String nodeId) {
+        String value = optionalText(config, "writeMode", "write_mode");
+        if (value == null || "upsert".equals(value)) {
+            return WriteMode.UPSERT;
+        }
+        if ("append".equals(value)) {
+            return WriteMode.APPEND;
+        }
+        throw new IllegalArgumentException("unsupported target write mode: " + nodeId);
     }
 
     private static Metadata metadata(PipelineDraft draft) {
