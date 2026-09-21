@@ -132,6 +132,17 @@ public enum SystemCollections {
             new IndexSpec(List.of("observedAt"), false, MongoRateHistoryStore.DEFAULT_RETENTION.toSeconds()),
             new IndexSpec(List.of("pipelineId", "observedAt", "_id"), false)),
 
+    /**
+     * Durable SRS cursors, one document per consumer pipeline on a mining chain. Keeping each pipeline's
+     * table state out of the chain root prevents aggregate cursor growth from exhausting that root's room
+     * for source progress. The first index reads every cursor for one chain; the second finds every chain a
+     * departing pipeline must detach from.
+     */
+    SRS_CONSUMER_OFFSETS(MongoStorePort.SRS_CONSUMER_OFFSETS, Database.STORE, MongoSrsMetaStore.class,
+            Strategy.MIGRATED, 10,
+            new IndexSpec(List.of("miningChainId"), false),
+            new IndexSpec(List.of("pipelineId"), false)),
+
     // ---- the operator-state database: not versioned here, but still taken from here ----
 
     OPERATOR_STATE(MongoStorePort.OPERATOR_STATE, Database.NEST, MongoKeyedStateStore.class,

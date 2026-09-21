@@ -19,7 +19,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Upgrade witness for the stable equal-timestamp keyset index. */
 @RequiresDocker
-class V10RateHistoryKeysetIndexIT {
+class V11RateHistoryKeysetIndexIT {
 
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
@@ -29,14 +29,14 @@ class V10RateHistoryKeysetIndexIT {
     @Test
     void theNewKeysetIndexReplacesTheOldRangeIndexAndIsRerunnable() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoDatabase database = client.getDatabase("v10_history_keyset_index");
+            MongoDatabase database = client.getDatabase("v11_history_keyset_index");
             database.drop();
             MongoCollection<Document> collection = SystemCollections.PIPELINE_RATE_HISTORY.on(database);
             SystemCollections.IndexSpec old =
                     new SystemCollections.IndexSpec(List.of("pipelineId", "observedAt"), false);
             collection.createIndex(new Document("pipelineId", 1).append("observedAt", 1),
                     new com.mongodb.client.model.IndexOptions().name(old.indexName()));
-            V10RateHistoryKeysetIndex changeset = new V10RateHistoryKeysetIndex();
+            V11RateHistoryKeysetIndex changeset = new V11RateHistoryKeysetIndex();
 
             changeset.up(database, ChangeSet.Fence.HELD);
             changeset.up(database, ChangeSet.Fence.HELD);

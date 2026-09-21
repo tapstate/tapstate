@@ -1,0 +1,38 @@
+# A computed field reads the nullable side of a LEFT JOIN when no dimension row matches. The join
+# publishes the column with a null value; that is different from a map in which the key is absent.
+#
+# The expression deliberately cannot concatenate that null with text. The run is therefore owed the
+# row-expression diagnosis, before any target sees the value. Passing Java null straight to CEL used
+# to turn the present value into CEL's internal unknown marker. The map transform then put that marker
+# into the row, MongoDB rejected its private runtime class, and the failure was misreported as a target
+# write problem.
+#
+# What the assertions have to discriminate:
+#
+# - FAILED says the invalid operation was not silently accepted or dropped.
+# - failure_code says the expression boundary diagnosed it. The old leak also failed, but with
+#   connector.write-failed, so merely awaiting the lifecycle state would preserve the regression.
+# - The target stays empty. A transform that reported the error after forwarding the row would satisfy
+#   both readings above while still exposing an internal CEL value to the connector.
+name: a-null-joined-column-fails-with-an-expression-code
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+  shop_db.orders:
+    values:
+      # This order has no matching customer, so customer_name is present and null after the join.
+      - { id: 10, customer_id: 9 }
+steps:
+  - start
+  - await: { state: FAILED }
+  - assert: { failure_code: transform.expression-failed }
+  - assert: { count: { views.order_state: 0 } }

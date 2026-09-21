@@ -8,7 +8,7 @@ import io.tapstate.adapters.mongostore.SystemCollections;
 import java.util.List;
 
 /** Adds the generated document id to the rate-history range index for stable keyset pages. */
-public final class V10RateHistoryKeysetIndex implements ChangeSet {
+public final class V11RateHistoryKeysetIndex implements ChangeSet {
 
     private static final SystemCollections ROW = SystemCollections.PIPELINE_RATE_HISTORY;
     private static final SystemCollections.IndexSpec KEYSET_INDEX = ROW.indexes().get(1);
@@ -17,7 +17,7 @@ public final class V10RateHistoryKeysetIndex implements ChangeSet {
 
     @Override
     public int version() {
-        return 10;
+        return 11;
     }
 
     @Override
