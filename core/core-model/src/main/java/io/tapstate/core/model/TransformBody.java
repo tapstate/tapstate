@@ -138,15 +138,23 @@ public sealed interface TransformBody {
                     + "number the deployment was started with.",
                     key = "max_elements_per_document")
             Integer maxElementsPerDocument,
+            @Doc("Durable state placement for this nest; absent inherits the deployment default.")
+            NestStateStorage state,
             @Doc(value = "The root stream whose documents receive the nested children.", required = true)
             NestRoot root) implements TransformBody {
         public Nest {
             Objects.requireNonNull(root, "root");
         }
 
+        /** A nest with capacity fields but no state-placement override. */
+        public Nest(String primaryKey, NestOrder order, Integer entriesInMemory,
+                Integer maxElementsPerDocument, NestRoot root) {
+            this(primaryKey, order, entriesInMemory, maxElementsPerDocument, null, root);
+        }
+
         /** A nest that writes down no capacity of its own, and so runs on whatever the deployment set. */
         public Nest(String primaryKey, NestOrder order, NestRoot root) {
-            this(primaryKey, order, null, null, root);
+            this(primaryKey, order, null, null, null, root);
         }
 
         @Override

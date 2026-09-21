@@ -24,6 +24,7 @@ import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
+import io.tapstate.spi.store.ArtifactStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -86,10 +87,12 @@ class EngineLifecycleActuatorTest {
         // At stop the coordinator awaits the pipeline's job going terminal; that only happens if the cancel ran
         // before the capture stop, so it discriminates the stop ordering rather than racing it.
         coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
+        coordinator.jobAbsentProbe = () -> member.getJet().getJob(PIPE) == null;
 
         actuator.start(PIPE);
-        // Start fills the capture, then submits the job that reads the ring the capture fills.
-        assertThat(events).containsExactly("startCapture:" + PIPE, "submit:" + PIPE);
+        // Capture opens and fills the ring before the DAG is built and submitted against that generation.
+        assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
+        assertThat(coordinator.jobWasAbsentAtStart).isTrue();
         Job job = member.getJet().getJob(PIPE);
         assertThat(job).as("start submits a job named by the pipeline id").isNotNull();
         awaitStatus(job, JobStatus.RUNNING);
@@ -99,13 +102,13 @@ class EngineLifecycleActuatorTest {
         actuator.resume(PIPE);
         awaitStatus(job, JobStatus.RUNNING);
         // Pause and resume are engine-only: the capture keeps running, so the coordinator is never touched.
-        assertThat(events).containsExactly("startCapture:" + PIPE, "submit:" + PIPE);
+        assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
 
         actuator.stop(PIPE, true);
         awaitStatus(job, JobStatus.FAILED); // Jet reports a cancelled job as FAILED
         // Stop cancels the job, then stops the capture behind it: the job was already terminal when capture stopped.
         assertThat(events).containsExactly(
-                "startCapture:" + PIPE, "submit:" + PIPE,
+                "startCapture:" + PIPE, "buildDag:" + PIPE,
                 "stopCapture:" + PIPE + "[purge][jobTerminal]");
     }
 
@@ -139,6 +142,25 @@ class EngineLifecycleActuatorTest {
 
         assertThatThrownBy(() -> actuator.start(PIPE)).isSameAs(refused);
         assertThat(events).containsExactly("validate:" + PIPE);
+    }
+
+    @Test
+    void passesThePreparedArtifactSnapshotToCapture() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        ArtifactStore snapshot = ReadOnlyArtifactSnapshot.capture(new InMemoryArtifactStore());
+        dagSource.artifactSnapshot = snapshot;
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), dagSource, coordinator, teardown());
+        coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
+
+        actuator.start(PIPE);
+        try {
+            assertThat(coordinator.artifactSnapshot).isSameAs(snapshot);
+        } finally {
+            actuator.stop(PIPE, true);
+        }
     }
 
     @Test
@@ -182,9 +204,9 @@ class EngineLifecycleActuatorTest {
         actuator.resume(PIPE);
 
         assertThat(events).containsExactly(
-                "startCapture:" + PIPE, "submit:" + PIPE,
+                "startCapture:" + PIPE, "buildDag:" + PIPE,
                 "stopCapture:" + PIPE + "[keep][jobTerminal]",
-                "startCapture:" + PIPE, "submit:" + PIPE);
+                "startCapture:" + PIPE, "buildDag:" + PIPE);
         Job rebuilt = member.getJet().getJob(PIPE);
         assertThat(rebuilt).as("the rebuild submits a job of its own").isNotSameAs(held);
         awaitStatus(rebuilt, JobStatus.RUNNING);
@@ -297,6 +319,9 @@ class EngineLifecycleActuatorTest {
         private Supplier<Boolean> jobTerminalProbe = () -> false;
         private Throwable captureFailure;
         private boolean loadDelivered = true;
+        private ArtifactStore artifactSnapshot;
+        private Supplier<Boolean> jobAbsentProbe = () -> true;
+        private boolean jobWasAbsentAtStart;
 
         RecordingCaptureCoordinator(List<String> events) {
             this.events = events;
@@ -304,7 +329,14 @@ class EngineLifecycleActuatorTest {
 
         @Override
         public void startCapture(String pipelineId) {
+            jobWasAbsentAtStart = jobAbsentProbe.get();
             events.add("startCapture:" + pipelineId);
+        }
+
+        @Override
+        public void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
+            this.artifactSnapshot = artifactSnapshot;
+            startCapture(pipelineId);
         }
 
         @Override
@@ -326,17 +358,11 @@ class EngineLifecycleActuatorTest {
 
     /** Records each topology request into the shared log and returns the idle stand-in topology. */
     private static final class RecordingDagSource implements DagSource {
-    /** Keeps no state, so there is nothing for a budget to be applied to. */
-    @Override
-    public NestCapacity capacityOf(String pipelineId) {
-        return NestCapacity.none();
-    }
-
-
         private final List<String> events;
         private final IdleDagSource idle = new IdleDagSource();
         private Runnable validation = () -> {
         };
+        private ArtifactStore artifactSnapshot;
 
         RecordingDagSource(List<String> events) {
             this.events = events;
@@ -348,8 +374,26 @@ class EngineLifecycleActuatorTest {
         }
 
         @Override
+        public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
+            if (artifactSnapshot == null) {
+                return DagSource.super.prepareStart(pipelineId, defaultDatabase);
+            }
+            validateStart(pipelineId);
+            return new StartPreparation(
+                    capacityOf(pipelineId), stateLocations(pipelineId, defaultDatabase),
+                    Optional.of(artifactSnapshot),
+                    () -> dagFor(pipelineId));
+        }
+
+        /** Keeps no state, so there is nothing for a budget to be applied to. */
+        @Override
+        public NestCapacity capacityOf(String pipelineId) {
+            return NestCapacity.none();
+        }
+
+        @Override
         public DAG dagFor(String pipelineId) {
-            events.add("submit:" + pipelineId);
+            events.add("buildDag:" + pipelineId);
             return idle.dagFor(pipelineId);
         }
 

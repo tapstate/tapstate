@@ -14,6 +14,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.processor.Processors;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.Engine;
+import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -158,6 +159,25 @@ class APipelineBudgetReachesItsOwnMapsTest {
             assertThat(heapOnly.getConfig().getMapConfigs()).doesNotContainKey(MINE);
             assertThat(heapOnly.getConfig().findMapConfig(MINE).getEvictionConfig().getEvictionPolicy())
                     .describedAs("evicting with nothing to load the entry back from is losing it")
+                    .isEqualTo(EvictionPolicy.NONE);
+        } finally {
+            heapOnly.shutdown();
+        }
+    }
+
+    @Test
+    void aDatabasePlacementDoesNotInventAColdLayerForAnInMemoryNest() {
+        HazelcastInstance heapOnly = Hazelcast.newHazelcastInstance(memberConfig());
+        heapOnly.getConfig().addMapConfig(NestSettings.defaults().stateMaps());
+        try {
+            NestStatePlacement.applyTo(heapOnly, Map.of(MINE, "state_a"),
+                    NestSettings.defaults().withEntriesHeldInMemory(40_000L));
+
+            assertThat(heapOnly.getConfig().getMapConfigs()).doesNotContainKey(MINE);
+            assertThat(heapOnly.getConfig().findMapConfig(MINE).getMapStoreConfig().isEnabled())
+                    .isFalse();
+            assertThat(heapOnly.getConfig().findMapConfig(MINE).getEvictionConfig().getEvictionPolicy())
+                    .describedAs("database placement cannot turn heap-only capacity into silent loss")
                     .isEqualTo(EvictionPolicy.NONE);
         } finally {
             heapOnly.shutdown();

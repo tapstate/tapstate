@@ -8,6 +8,7 @@ import io.tapstate.core.model.TableRename;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetIndex;
 import io.tapstate.spi.sink.TargetTable;
+import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
@@ -35,9 +36,15 @@ import java.util.Optional;
 final class TargetModelResolver {
 
     private final StorePort storePort;
+    private final ArtifactStore artifacts;
 
     TargetModelResolver(StorePort storePort) {
+        this(storePort, Objects.requireNonNull(storePort, "storePort").artifacts());
+    }
+
+    TargetModelResolver(StorePort storePort, ArtifactStore artifacts) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
+        this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
     }
 
     /**
@@ -47,7 +54,7 @@ final class TargetModelResolver {
      */
     void requireAllDiscovered(Iterable<String> sourceIds) {
         for (String sourceId : sourceIds) {
-            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+            SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
             SourceModel discovered = SourceDiscovery.model(storePort, source);
             if (discovered == null) {
                 throw new TapstateException(
@@ -68,7 +75,7 @@ final class TargetModelResolver {
     Map<String, TargetTable> resolveAll(PipelineResource pipeline) {
         Map<String, TargetTable> targets = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
-            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+            SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
             resolveAll(source, SourceDiscovery.model(storePort, source)).forEach(targets::putIfAbsent);
         }
         return Collections.unmodifiableMap(new LinkedHashMap<>(targets));
@@ -76,13 +83,13 @@ final class TargetModelResolver {
 
     /** Resolves one target model per selected table of the source that feeds a sink. */
     Map<String, TargetTable> resolveAll(String sourceId) {
-        SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+        SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
         return resolveAll(source, SourceDiscovery.model(storePort, source));
     }
 
     /** Resolves the first selected table for callers that still require a single target. */
     ResolvedTarget resolve(String sourceId) {
-        SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+        SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
         SourceModel discovered = SourceDiscovery.model(storePort, source);
         String table = SourceCaptureResolution.of(source, discovered).table();
         return new ResolvedTarget(table, resolveAll(source, discovered).get(table));
