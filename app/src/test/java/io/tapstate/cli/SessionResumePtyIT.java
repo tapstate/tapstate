@@ -92,7 +92,7 @@ class SessionResumePtyIT {
                 # JLine may emit terminal-capability probes before it has installed the reader.
                 # For ordinary prompts, wait until line editing is enabled rather than treating those
                 # probes as a ready signal. Password input still waits for echo to be disabled.
-                ready = no_echo() if wait_no_echo else b"\x1b[?2004h>" in output
+                ready = no_echo() if wait_no_echo else b"\\x1b[?2004h>" in output
                 if not sent and ready:
                     os.write(fd, data)
                     sent = True
