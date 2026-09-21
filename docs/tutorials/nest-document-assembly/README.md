@@ -105,6 +105,8 @@ settings: { read_mode: snapshot_and_cdc }
 transforms:
   - id: doc
     type: nest
+    # Optional. Without this block, the deployment-wide operator-state database is used.
+    state: { database: order_doc_state }
     from: { o: orders, i: order_items }
     root:
       from: o                    # the document is an order
@@ -457,10 +459,10 @@ needs from the source.
 
 A nest holds partly assembled documents between events. That state is in memory up to the budget you
 set with `entries_in_memory`, and written through to MongoDB behind it, in a database of its own. The
-default name is `tapstate_nest`:
+pipeline above selects `order_doc_state`; without its `state` block the default is `tapstate_nest`:
 
 ```js
-use tapstate_nest
+use order_doc_state
 db.operator_state.aggregate([{ $group: { _id: "$_id.ns", n: { $sum: 1 } } }])
 // nest.<pipeline>.<transform>.$root : one entry per root
 ```
@@ -480,9 +482,12 @@ tapstate -c http://127.0.0.1:8080 -u admin metrics order_doc
 | `nestStatePendingHighWater.<ns>` | the deepest one key's pending queue has ever got; a high-water mark, it does not fall back |
 
 Two things to know: the state is dropped when the pipeline stops, so read these while it runs; and
-this is not the control store (`tapstate`) or your target. A deployment can choose another name with
-`tapstate.store.mongo.operator-state-database`. Changing the name selects a different state database;
-it does not copy the old one.
+this is not the control store (`tapstate`) or your target. A deployment can choose another default with
+`tapstate.store.mongo.operator-state-database`, and one Nest can override it with
+`state: { database: ... }`. Changing either name selects a different state database; it does not copy
+the old one. For an existing run, follow the stop, copy, verify, restart, and rollback procedure in
+[running on your own databases](../../running-on-your-own-databases.md#move-an-existing-nest-state-database),
+or clear the pipeline state and perform a full replay.
 
 ## 9. Clean up
 

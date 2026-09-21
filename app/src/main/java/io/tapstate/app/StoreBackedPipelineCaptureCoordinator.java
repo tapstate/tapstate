@@ -86,12 +86,18 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public void startCapture(String pipelineId) {
+        startCapture(pipelineId, artifacts());
+    }
+
+    @Override
+    public void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
         // Idempotent: a pipeline whose capture is already running is left running, so a repeated start does not
         // open a second capture behind the one already filling the ring.
         if (runsByPipeline.containsKey(pipelineId)) {
             return;
         }
-        PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
+        ArtifactStore captured = Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
+        PipelineResource pipeline = StoredArtifacts.requirePipeline(captured, pipelineId);
         ReadMode readMode = readModeOf(pipeline.settings());
         // A snapshot-only run has no change chain to supply a generation. Advance its own durable order
         // once for the whole pipeline run and above every retained chain generation, so every source in
@@ -110,7 +116,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         try {
             for (SourceRef ref : pipeline.sources()) {
                 String sourceId = ref.id();
-                SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
+                SourceResource source = StoredArtifacts.requireSource(captured, sourceId);
                 // Read once and used twice: it decides which streams this run reads, and it carries the
                 // row count the last discovery took of each of them. Asking the store again for the second
                 // use would pay for a second read per source on every start.
