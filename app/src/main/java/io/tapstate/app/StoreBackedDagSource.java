@@ -2067,7 +2067,11 @@ final class StoreBackedDagSource implements DagSource {
         return storePort.schemas().get(sourceId)
                 .map(DiscoveredSourceModel::model)
                 .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(table)).findFirst())
-                .map(discovered -> new NestTable(table, discovered.primaryKey(), uniqueIndexesOf(discovered)))
+                .map(discovered -> new NestTable(
+                        table,
+                        discovered.primaryKey(),
+                        uniqueIndexesOf(discovered),
+                        discovered.fields().stream().map(field -> field.name()).toList()))
                 .orElseGet(() -> new NestTable(table, List.of()));
     }
 

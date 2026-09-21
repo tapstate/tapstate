@@ -163,7 +163,7 @@ public final class DslParser {
     static final Set<String> REQUIRED_HOT_KEYS = Set.of("ttl");
     static final Set<String> REQUIRED_WARM_KEYS = Set.of("collection");
     static final Set<String> REQUIRED_NEST_ROOT_KEYS = Set.of("from");
-    static final Set<String> REQUIRED_EMBED_KEYS = Set.of("from", "on", "as", "path");
+    static final Set<String> REQUIRED_EMBED_KEYS = Set.of("from", "on", "as");
 
     /** Parses one YAML document into its {@link Resource} model. */
     public Resource parse(String yaml) {
@@ -583,28 +583,35 @@ public final class DslParser {
                 scalarList(r.seq("key"), "key"),
                 r.string("mode"),
                 boolValue(r, "trackKeyChanges"),
-                embeds(r.seq("embed")));
+                embeds(r.seq("embed"), r.childPath("embed")));
     }
 
-    private List<Embed> embeds(List<Node> items) {
+    private List<Embed> embeds(List<Node> items, String path) {
         if (items == null) {
             return null;
         }
         List<Embed> out = new ArrayList<>();
         for (Node n : items) {
-            YamlMap e = YamlMap.requireMapping(n, "embed[" + out.size() + "]");
+            YamlMap e = YamlMap.requireMapping(n, path + "[" + out.size() + "]");
             e.requireOnly(EMBED_KEYS);
             e.requirePresent(REQUIRED_EMBED_KEYS);
+            EmbedAs as = e.require("as", enumByYaml(EmbedAs.values(), EmbedAs::yaml, e, "as"));
+            if (as == EmbedAs.FLAT && e.has("path")) {
+                throw e.errorAt("path", DslError.FORBIDDEN_FIELD, Map.of("field", "path"));
+            }
+            if (as == EmbedAs.FLAT && e.has("arrayKey")) {
+                throw e.errorAt("arrayKey", DslError.FORBIDDEN_FIELD, Map.of("field", "arrayKey"));
+            }
             out.add(new Embed(
                     e.requireString("from"),
                     e.require("on", stringMap(e, "on")),
-                    e.require("as", enumByYaml(EmbedAs.values(), EmbedAs::yaml, e, "as")),
-                    e.requireString("path"),
+                    as,
+                    as == EmbedAs.FLAT ? null : e.requireString("path"),
                     scalarList(e.seq("key"), "key"),
                     scalarList(e.seq("arrayKey"), "arrayKey"),
                     boolValue(e, "ignoreUpdates"),
                     boolValue(e, "trackKeyChanges"),
-                    embeds(e.seq("embed"))));
+                    embeds(e.seq("embed"), e.childPath("embed"))));
         }
         return out;
     }

@@ -10,15 +10,15 @@ import java.util.Objects;
  * One embedded child of a nest tree. {@code from} names an alias of the step's {@code from:}
  * map; {@code on} maps child join fields to parent fields.
  */
-@Doc("One embedded child of a nest tree, joined onto its parent and placed at a target path.")
+@Doc("One child of a nest tree, joined onto its parent and either placed at a path or merged into it.")
 public record Embed(
         @Doc(value = "Alias of the nest step's from map that supplies this child's rows.", required = true)
         String from,
         @Doc(value = "Maps this child's join fields to the parent fields they match.", required = true)
         Map<String, String> on,
-        @Doc(value = "How the matched child rows are shaped under the parent: a single object or an array.", required = true)
+        @Doc(value = "How matched child rows contribute under the parent: an array, an object, or flat fields.", required = true)
         EmbedAs as,
-        @Doc(value = "Target field path under the parent where the embedded child is placed.", required = true)
+        @Doc("Target field path for array and object embeds. Flat embeds must omit it.")
         String path,
         @Doc(value = "Fields that identify one row of this embed's stream. Absent means the stream's own "
                 + "declared key is used, and a stream that declares none is refused.",
@@ -54,10 +54,28 @@ public record Embed(
         Objects.requireNonNull(from, "from");
         Objects.requireNonNull(on, "on");
         Objects.requireNonNull(as, "as");
-        Objects.requireNonNull(path, "path");
+        if (as == EmbedAs.FLAT) {
+            if (path != null) {
+                throw new IllegalArgumentException("a flat embed has no target path");
+            }
+            if (arrayKey != null) {
+                throw new IllegalArgumentException("a flat embed has no array key");
+            }
+        } else {
+            Objects.requireNonNull(path, "path");
+        }
         on = Collections.unmodifiableMap(new LinkedHashMap<>(on));
         key = key == null ? null : List.copyOf(key);
         arrayKey = arrayKey == null ? null : List.copyOf(arrayKey);
         embed = embed == null ? null : List.copyOf(embed);
+    }
+
+    /**
+     * The stable segment identifying this embed in the recursive tree. A flat embed has no output path,
+     * so its declared alias supplies the segment instead; aliases already identify streams inside one
+     * nest step.
+     */
+    public String treeSegment() {
+        return as == EmbedAs.FLAT ? "$flat[" + from + "]" : path;
     }
 }

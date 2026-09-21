@@ -39,6 +39,18 @@ public enum NestError implements TapstateErrorCode {
     EMBED_PATH_CONFLICT("nest.embed-path-conflict", Set.of("path", "embedPathA", "embedPathB")),
 
     /**
+     * Checking the tree: pathless flat siblings reuse one alias, so they would share one durable state
+     * identity and changes from one would be read as changes from the other.
+     */
+    FLAT_EMBED_ALIAS_CONFLICT("nest.flat-embed-alias-conflict", Set.of("parentPath", "alias")),
+
+    /**
+     * Checking or rendering the tree: a flat embed contributes a field already occupied by its parent,
+     * a path-based sibling, or another flat embed. Refused rather than resolved by declaration order.
+     */
+    FLAT_FIELD_CONFLICT("nest.flat-field-conflict", Set.of("embedPath", "fields", "occupiedBy")),
+
+    /**
      * Checking the tree: the root declares no key, so its documents have no identity for children to be
      * grouped under and nothing to partition the assembled documents by.
      */
@@ -86,6 +98,10 @@ public enum NestError implements TapstateErrorCode {
 
     /** Checking the tree: a nest may not pass its snapshot reads straight to the sink, unassembled. */
     SNAPSHOT_PASSTHROUGH_FORBIDDEN("nest.snapshot-passthrough-forbidden", Set.of("rootCollection")),
+
+    /** Running: more than one live row belongs to one flat embed of one parent document. */
+    FLAT_CARDINALITY_VIOLATION(
+            "nest.flat-cardinality-violation", Set.of("embedPath", "rows")),
 
     /**
      * Starting up: the memory budget a namespace was given is smaller than the partitions it is spent

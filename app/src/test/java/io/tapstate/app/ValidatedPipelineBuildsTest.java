@@ -115,6 +115,28 @@ class ValidatedPipelineBuildsTest {
               sync: [ { id: sync_1, source: orders_dest } ]
             """;
 
+    private static final String FLAT_NEST_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: flat
+            source: [ orders_src, items_src ]
+            transforms:
+              - id: doc
+                type: nest
+                from: { o: orders, i: order_items }
+                root:
+                  from: o
+                  key: [ id ]
+                  embed:
+                    - from: i
+                      on: { order_id: id }
+                      as: flat
+                      key: [ detail_id ]
+            serve:
+              from: doc
+              sync: [ { id: sync_1, source: orders_dest } ]
+            """;
+
     @Test
     void aValidatedNestPipelineBuildsIntoADag() {
         InMemoryStorePort store = validated(SOURCE, ITEMS_SOURCE, TARGET, NEST_PIPELINE);
@@ -127,6 +149,20 @@ class ValidatedPipelineBuildsTest {
         // assembly root supplies no nest binding, which is exactly what it had until now.
         assertThat(vertexNames(dag)).contains("orders_src", "items_src", "serve.sync_1");
         assertThat(vertexNames(dag)).anyMatch(name -> name.startsWith("nest:"));
+    }
+
+    @Test
+    void discoveredModelsRefuseAFlatFieldCollisionBeforeTheJobStarts() {
+        InMemoryStorePort store = validated(SOURCE, ITEMS_SOURCE, TARGET, FLAT_NEST_PIPELINE);
+        discovered(store, "orders_src", "orders", List.of("id"), "id", "name");
+        discovered(store, "items_src", "order_items", List.of("detail_id"),
+                "detail_id", "order_id", "name");
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store, discardingBinder()).dagFor("flat"))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code().code()).isEqualTo("nest.flat-field-conflict");
+                    assertThat(error.args()).containsEntry("fields", "name");
+                });
     }
 
     /**
@@ -376,8 +412,17 @@ class ValidatedPipelineBuildsTest {
 
     /** Persists a discovery model for one connection carrying one table and the key it declares. */
     private static void discovered(InMemoryStorePort store, String connectionId, String table, List<String> key) {
+        discovered(store, connectionId, table, key, "id");
+    }
+
+    /** The same fixture with the complete discovered field names used by flat preflight checks. */
+    private static void discovered(InMemoryStorePort store, String connectionId, String table, List<String> key,
+            String... fields) {
         store.schemas().save(new DiscoveredSourceModel(connectionId, "mysql", 0L,
-                new SourceModel(List.of(new SourceTable(table, List.of(new SourceField("id", "int")), key, null)))));
+                new SourceModel(List.of(new SourceTable(table,
+                        java.util.Arrays.stream(fields).map(field -> new SourceField(field, "text")).toList(),
+                        key,
+                        null)))));
     }
 
     private static StoreBackedDagSource.SinkWriterBinder discardingBinder() {

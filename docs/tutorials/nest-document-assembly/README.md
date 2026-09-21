@@ -253,81 +253,94 @@ the same emptiness, and the document says which is which:
 db.orders.findOne({ id: 4 })     // status "new": "invoice" in doc === false, shipments: []
 ```
 
-## 4. The rule that decides every shape you can build
+### A third shape: flat fields
 
-Everything above follows one rule, and it is worth stating precisely because guessing wrong is quiet:
+An `object` keeps the child row under one field. A `flat` embed contributes that row's fields directly
+to its parent and therefore has no `path` or `arrayKey`:
 
-> **A level has exactly one identity, and a child reaches its parent by carrying it.**
+```yaml
+        - from: invoice_fields
+          on: { invoice_order_id: id }
+          as: flat
+          key: [invoice_row_id]
+```
+
+The child join and identity fields still have to reach Nest. Rename them before the nest so they do not
+claim the order's own field names, then drop the internal names after assembly. The complete pattern,
+including two flat child tables and the many-to-one direction, is in
+[Flat embeds](../../nest/flat-embeds.md).
+
+If two live invoice rows name one order, the run stops with `nest.flat-cardinality-violation`. If a flat
+field overlaps the order, another flat child, or a nested path, model discovery rejects it before start
+when possible; an actual row catches anything the model could not see and stops with
+`nest.flat-field-conflict`.
+
+## 4. The rule that decides relationship direction
+
+Every `on` pair can point in either direction, and the declared or discovered keys decide which:
+
+> **If the parent side is the parent's key, child rows belong to that parent. If the child side is the
+> child's key, the parent points at one shared row.**
 
 In `on: { order_id: id }` the left side is a field of the child and the right side is a field of the
 parent - and that right side **is the level's identity**. It is not "the column to look things up by";
 it is the declaration of what this level is keyed on. The engine partitions the level by it and routes
 every child event to the parent that owns that key.
 
-Two consequences follow, and each has its own failure shape.
-
-### Siblings must agree, and disagreement is refused
-
-Every embed under one parent has to name the same parent field. Try to hang the customer off the order
-alongside the lines:
+The reverse form names the child's own identity on the left. For example, an order carrying
+`customer_id` can point at one customer row:
 
 ```yaml
         - from: c
-          on: { id: customer_id }        # customers.id matches orders.customer_id
+          on: { id: customer_id }        # customers.id is the child's own key
           as: object
           path: customer
 ```
 
-and starting the pipeline fails with:
+That customer does not redefine the order level's identity; it is a referenced row and may be shared by
+many orders. Grouped siblings still have to agree on the one parent identity they carry.
 
-```
-nest.sibling-embeds-target-different-parent-keys {embedPath=$root, fields=customer_id, id}
-```
-
-The lines say the level is keyed by `orders.id`; the customer says it is keyed by `orders.customer_id`.
-A level cannot be both, so the pipeline is refused rather than run.
-
-### A lookup is not a nest, and it is refused wherever you put it
-
-The refusal above leans on the siblings disagreeing. The same mistake with nothing to disagree with -
-the product a line points at - is caught by asking the level's own key instead:
+If neither side of `on` identifies its row, the direction cannot be inferred and the tree is refused.
+For example, `order_items.product_id` is not the line's key and `products.category` is not the product's
+key:
 
 ```yaml
-        - from: i
-          on: { order_id: id }
-          as: array
-          path: lines
-          arrayKey: [ id ]
-          embed:
             - from: p
-              on: { id: product_id }     # products.id matches order_items.product_id
+              on: { category: product_id }
               as: object
               path: product
 ```
 
-Starting the pipeline fails with:
+Starting the pipeline fails with a diagnostic such as:
 
 ```
-nest.embed-target-not-parent-key {embedPath=lines, fields=product_id, parentKey=id}
+nest.embed-target-not-parent-key {embedPath=lines.product, fields=product_id, parentKey=id}
 ```
 
-The reason follows directly from the rule. `on: { id: product_id }` declares that the lines level is
-identified by `product_id`, and `order_items` is keyed by `id`. Were it allowed to run, there would be
-600 lines but only 20 distinct products, so 600 lines would collapse into 20 identity slots and each
-product would attach to exactly one line: **20 of 600 lines coming back with a `product` and the other
-580 with none, and not a single failure counted anywhere**. That is the shape this refusal exists to
-prevent - it is the one failure here that no counter would have shown you.
+Declare the actual row identity with `key` when discovery cannot provide it. Do not change `on` merely to
+silence the error: its two sides define which updates and deletes reach which documents.
 
-**So: a nest embeds children that belong to a parent. It does not look up rows a parent refers to.**
-The test is one question - *does this row belong to exactly one parent, and does it carry that
-parent's identity?* An option belongs to its line and carries `item_id`: yes. A product is referred to
-by many lines and carries only its own id: no. The second one needs a fan-out from one product row to
-every line that references it, which is a different mechanism with a different cost.
+### The other direction is a shared referenced row
 
-When you need referred-to data in the document today there are two answers, and the shop has one of
-each: carry it on the row that belongs to the parent - `order_items.sku` is exactly that, a product
-field copied onto the line so it travels with it - or build a second document rooted at the table you
-were trying to look up, which is what section 6 does with `products`.
+When the child side of `on` is the child's own key, the direction reverses: the parent points at one
+shared row. This is a many-to-one relationship, and Nest keeps one copy of the shared row while fanning
+its changes out to every document that refers to it. A flat customer on an order is one example:
+
+```yaml
+        - from: customer_fields
+          on: { customer_key: customer_id }
+          as: flat
+          key: [ customer_key ]
+```
+
+Here `customer_key` identifies the customer row and `orders.customer_id` points at it. One customer may
+serve many order documents; each order still names only one customer. Updating or deleting that customer
+redraws every referring order. The field-collision rules are unchanged, so the upstream map gives the
+customer fields distinct public names and the internal key is dropped after Nest.
+
+The unsupported direction is one parent matching several rows under `as: flat`. That is an array shape,
+not a reference. It is detected from live rows and stops rather than selecting whichever row arrived
+first.
 
 ## 5. Turn the tree around: a customer document
 

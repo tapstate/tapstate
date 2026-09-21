@@ -197,6 +197,9 @@ nest.capacity-estimate-incomplete
 nest.chain-axis-limit-exceeded
 nest.embed-path-conflict
 nest.embed-target-not-parent-key
+nest.flat-cardinality-violation
+nest.flat-embed-alias-conflict
+nest.flat-field-conflict
 nest.key-ambiguous
 nest.key-change-tracking-requires-before-image
 nest.memory-budget-below-partition-count

@@ -1,6 +1,7 @@
 package io.tapstate.core.model.canonical;
 
 import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -366,7 +367,9 @@ public final class CanonicalWriter {
             b.scalar("from", e.from());
             b.freeMap("on", new TreeMap<>(e.on()));
             b.scalar("as", e.as().yaml());
-            b.scalar("path", e.path());
+            if (e.as() != EmbedAs.FLAT) {
+                b.scalar("path", e.path());
+            }
             b.scalarSeq("key", e.key());
             b.scalarSeq("arrayKey", e.arrayKey());
             b.scalar("ignoreUpdates", e.ignoreUpdates());
