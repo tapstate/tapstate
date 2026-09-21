@@ -169,7 +169,7 @@ public final class MongoStorePort implements StorePort {
         this.rateHistory = new MongoRateHistoryStore(
                 database, SystemCollections.PIPELINE_RATE_HISTORY.on(database), rateHistoryRetention);
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
-        this.meta = new MongoSrsMetaStore(
+        this.meta = new MongoSrsMetaStore(connection.client(),
                 SystemCollections.SRS_META.on(database), SystemCollections.SRS_CONSUMER_OFFSETS.on(database));
         this.srsLog = new MongoSrsLogStore(SystemCollections.SRS_LOG.on(database));
         this.derivedSchemas = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(database));

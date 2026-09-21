@@ -6,6 +6,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandSucceededEvent;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
@@ -738,10 +739,10 @@ class MongoSrsMetaStoreIT {
             roots.insertOne(MongoSrsMetaStore.toDocument(
                     new SrsMeta(CHAIN, null, List.of(departing, staying), List.of(), null)));
 
-            MongoSrsMetaStore staleStore = new MongoSrsMetaStore(
+            MongoSrsMetaStore staleStore = new MongoSrsMetaStore(staleClient,
                     staleClient.getDatabase("tapstate").getCollection("srs_meta"),
                     staleClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
-            MongoSrsMetaStore currentStore = new MongoSrsMetaStore(roots, consumers);
+            MongoSrsMetaStore currentStore = new MongoSrsMetaStore(currentClient, roots, consumers);
             Future<?> staleWrite = executor.submit(
                     () -> staleStore.advanceConsumerReadSeq(CHAIN, "staying", "orders", 21L));
 
@@ -801,6 +802,114 @@ class MongoSrsMetaStoreIT {
             store.create(CHAIN, null);
             assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).isEmpty();
         });
+    }
+
+    @Test
+    void droppingAnOldChainCannotDeleteACursorFromTheRecreatedChain() throws Exception {
+        CountDownLatch cursorCleanupPaused = new CountDownLatch(1);
+        CountDownLatch resumeCursorCleanup = new CountDownLatch(1);
+        CountDownLatch recreateStarted = new CountDownLatch(1);
+        CountDownLatch dropCommitted = new CountDownLatch(1);
+        AtomicBoolean paused = new AtomicBoolean();
+        AtomicBoolean recreating = new AtomicBoolean();
+        CommandListener pauseBeforeCursorCleanup = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if (!"delete".equals(event.getCommandName())
+                        || !"srs_consumer_offsets".equals(event.getCommand().getString("delete").getValue())
+                        || !paused.compareAndSet(false, true)) {
+                    return;
+                }
+                cursorCleanupPaused.countDown();
+                try {
+                    if (!resumeCursorCleanup.await(30, TimeUnit.SECONDS)) {
+                        throw new AssertionError("cursor cleanup was not resumed");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while holding cursor cleanup", e);
+                }
+            }
+        };
+        CommandListener observeRecreate = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if (recreating.get() && "insert".equals(event.getCommandName())
+                        && "srs_meta".equals(event.getCommand().getString("insert").getValue())) {
+                    recreateStarted.countDown();
+                }
+            }
+        };
+        MongoClientSettings droppingSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(pauseBeforeCursorCleanup)
+                .build();
+        MongoClientSettings currentSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(observeRecreate)
+                .build();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try (MongoClient droppingClient = MongoClients.create(droppingSettings);
+                MongoClient currentClient = MongoClients.create(currentSettings)) {
+            MongoCollection<Document> roots = currentClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers =
+                    currentClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            MongoSrsMetaStore droppingStore = new MongoSrsMetaStore(droppingClient,
+                    droppingClient.getDatabase("tapstate").getCollection("srs_meta"),
+                    droppingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+            MongoSrsMetaStore currentStore = new MongoSrsMetaStore(currentClient, roots, consumers);
+            currentStore.create(CHAIN, "old");
+            currentStore.upsertConsumerOffset(
+                    CHAIN, new ConsumerOffset("old", Map.of("orders", 7L), null));
+
+            Future<?> dropping = executor.submit(() -> droppingStore.dropChain(CHAIN));
+            assertThat(cursorCleanupPaused.await(10, TimeUnit.SECONDS))
+                    .as("the old chain's cursor cleanup is paused after its root delete ran")
+                    .isTrue();
+
+            ConsumerOffset replacement = new ConsumerOffset("new", Map.of("orders", 11L), null);
+            Future<?> provision = executor.submit(() -> {
+                recreating.set(true);
+                try {
+                    currentStore.create(CHAIN, "new");
+                } catch (IllegalStateException stillPresent) {
+                    try {
+                        if (!dropCommitted.await(30, TimeUnit.SECONDS)) {
+                            throw new AssertionError("chain drop did not commit");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError("interrupted while waiting for the chain drop", e);
+                    }
+                    currentStore.create(CHAIN, "new");
+                }
+                currentStore.upsertConsumerOffset(CHAIN, replacement);
+            });
+            assertThat(recreateStarted.await(10, TimeUnit.SECONDS))
+                    .as("the replacement provision attempts its insert while cursor cleanup is paused")
+                    .isTrue();
+            Document visibleRoot = roots.find(new Document("_id", CHAIN)).first();
+            assertThat(visibleRoot)
+                    .as("the old root remains visible until its cursor cleanup commits")
+                    .isNotNull();
+            assertThat(visibleRoot.getString("retention")).isEqualTo("old");
+
+            resumeCursorCleanup.countDown();
+            dropping.get(30, TimeUnit.SECONDS);
+            dropCommitted.countDown();
+            provision.get(30, TimeUnit.SECONDS);
+
+            SrsMeta recreated = currentStore.read(CHAIN).orElseThrow();
+            assertThat(recreated.retention()).isEqualTo("new");
+            assertThat(recreated.consumerOffsets()).containsExactly(replacement);
+        } finally {
+            resumeCursorCleanup.countDown();
+            dropCommitted.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        }
     }
 
     @Test
@@ -971,7 +1080,7 @@ class MongoSrsMetaStoreIT {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("srs_meta");
             collection.drop();
-            test.run(new MongoSrsMetaStore(collection, clock), collection);
+            test.run(new MongoSrsMetaStore(client, collection, clock), collection);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }

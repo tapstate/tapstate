@@ -59,7 +59,7 @@ class SrsConsumerOffsetsCeilingIT {
                     client.getDatabase("tapstate").getCollection("srs_consumer_offsets");
             roots.drop();
             consumerOffsets.drop();
-            MongoSrsMetaStore store = new MongoSrsMetaStore(
+            MongoSrsMetaStore store = new MongoSrsMetaStore(client,
                     roots, consumerOffsets, Clock.fixed(WRITTEN_AT, ZoneOffset.UTC));
             List<ConsumerOffset> consumers = consumersFillingTheRecord();
             Document record = recordDocument(consumers, null);

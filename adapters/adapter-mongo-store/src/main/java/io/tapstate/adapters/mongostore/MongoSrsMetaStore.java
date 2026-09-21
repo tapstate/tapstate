@@ -3,6 +3,8 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.Projections;
@@ -88,24 +90,28 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     private final MongoCollection<Document> collection;
     private final MongoCollection<Document> consumers;
+    private final MongoClient client;
     private final Clock clock;
 
-    public MongoSrsMetaStore(MongoCollection<Document> collection) {
-        this(collection, collection, Clock.systemUTC());
+    public MongoSrsMetaStore(MongoClient client, MongoCollection<Document> collection) {
+        this(client, collection, collection, Clock.systemUTC());
     }
 
     /** The same store reading a given clock, for a caller that needs the recorded time to be decidable. */
-    public MongoSrsMetaStore(MongoCollection<Document> collection, Clock clock) {
-        this(collection, collection, clock);
+    public MongoSrsMetaStore(MongoClient client, MongoCollection<Document> collection, Clock clock) {
+        this(client, collection, collection, clock);
     }
 
     /** A store whose chain roots and per-consumer cursors live in their declared collections. */
-    public MongoSrsMetaStore(MongoCollection<Document> collection, MongoCollection<Document> consumers) {
-        this(collection, consumers, Clock.systemUTC());
+    public MongoSrsMetaStore(
+            MongoClient client, MongoCollection<Document> collection, MongoCollection<Document> consumers) {
+        this(client, collection, consumers, Clock.systemUTC());
     }
 
     /** The same two-collection store reading a given clock. */
-    MongoSrsMetaStore(MongoCollection<Document> collection, MongoCollection<Document> consumers, Clock clock) {
+    MongoSrsMetaStore(MongoClient client, MongoCollection<Document> collection,
+            MongoCollection<Document> consumers, Clock clock) {
+        this.client = Objects.requireNonNull(client, "client");
         this.collection = Objects.requireNonNull(collection, "collection");
         this.consumers = Objects.requireNonNull(consumers, "consumers");
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -493,10 +499,19 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void dropChain(String miningChainId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        // Delete the root first: after that a partial cleanup can leave only unreachable cursor documents,
-        // never a live chain whose durable cursor vanished. A retry removes those cursor documents too.
-        StoreIo.run(() -> collection.deleteOne(new Document("_id", miningChainId)));
-        StoreIo.run(() -> consumers.deleteMany(consumersOfChain(miningChainId)));
+        // The root and its split cursors are one lifecycle fact, even though they occupy two collections.
+        // Deleting both in one transaction leaves no point at which the id can be seeded again while the
+        // old cleanup can still reach its new cursors. The driver may retry the body; both deletes are
+        // idempotent, so repeating them preserves the same end state.
+        StoreIo.run(miningChainId, () -> {
+            try (ClientSession session = client.startSession()) {
+                session.withTransaction(() -> {
+                    collection.deleteOne(session, new Document("_id", miningChainId));
+                    consumers.deleteMany(session, consumersOfChain(miningChainId));
+                    return null;
+                });
+            }
+        });
     }
 
     @Override
