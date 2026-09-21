@@ -43,9 +43,12 @@ import org.springframework.lang.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Wires the embedded Hazelcast member into the assembly root: exactly one full member per process,
@@ -67,6 +70,9 @@ class HazelcastConfiguration {
 
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
     private static final Logger LOG = LoggerFactory.getLogger(HazelcastConfiguration.class);
+
+    /** A single port, or an inclusive range, in the form the library itself accepts. */
+    private static final Pattern PORT_DEFINITION = Pattern.compile("(\\d{1,5})(?:-(\\d{1,5}))?");
 
     /**
      * The bounded capacity of each per-table SRS change ring. Headroom backpressure, not size, is the
@@ -405,6 +411,7 @@ class HazelcastConfiguration {
                     + "Keep it inside a private network or NetworkPolicy.", properties.getBindAddress());
         }
         applyAdvertisedMemberAddress(config, properties);
+        applyOutboundMemberPorts(config, properties);
         JoinConfig join = config.getNetworkConfig().getJoin();
         join.getAutoDetectionConfig().setEnabled(false);
         join.getMulticastConfig().setEnabled(false);
@@ -573,6 +580,54 @@ class HazelcastConfiguration {
         config.getNetworkConfig().setPublicAddress(advertised.trim());
         LOG.info("Hazelcast member advertises {} to the other members and binds {}.",
                 advertised.trim(), properties.getBindAddress());
+    }
+
+    /**
+     * Restricts which local ports this member dials the other members from, when the deployment says so.
+     *
+     * <p>An outgoing member connection takes an arbitrary ephemeral port otherwise, and an egress rule
+     * written against that has to allow the whole ephemeral range. Naming the ports here is what lets
+     * the rule name them too.
+     *
+     * <p>Refused outright while discovery is off, for the same reason as the reported address: a member
+     * that never dials anybody has no outgoing connection for this to apply to, so a value here is
+     * either a misconfiguration or a preparation for something this mode does not do.
+     */
+    private static void applyOutboundMemberPorts(Config config, HazelcastProperties properties) {
+        List<String> definitions = properties.getOutboundMemberPorts();
+        if (definitions.isEmpty()) {
+            return;
+        }
+        if (properties.getDiscovery().getMode() == HazelcastProperties.DiscoveryMode.NONE) {
+            throw invalidDiscovery(
+                    "outbound-member-ports needs a discovery mode: a member that dials nobody has no "
+                            + "outgoing connection to place");
+        }
+        for (String definition : definitions) {
+            config.getNetworkConfig().addOutboundPortDefinition(checkedPortDefinition(definition));
+        }
+        LOG.info("Hazelcast member dials the other members from local port(s) {}.", definitions);
+    }
+
+    /**
+     * Accepts {@code port} or {@code low-high} and refuses anything else here rather than deep inside
+     * the library, where a malformed definition surfaces as a start-up failure naming neither the
+     * setting nor the value.
+     */
+    private static String checkedPortDefinition(String definition) {
+        String trimmed = definition == null ? "" : definition.trim();
+        Matcher matcher = PORT_DEFINITION.matcher(trimmed);
+        if (!matcher.matches()) {
+            throw invalidDiscovery("outbound-member-ports takes a port or a low-high range, not '"
+                    + trimmed + "'");
+        }
+        int low = Integer.parseInt(matcher.group(1));
+        int high = matcher.group(2) == null ? low : Integer.parseInt(matcher.group(2));
+        if (low < 1 || high > 65535 || low > high) {
+            throw invalidDiscovery("outbound-member-ports needs 1-65535 with the low end first, not '"
+                    + trimmed + "'");
+        }
+        return trimmed;
     }
 
     private static TapstateException invalidDiscovery(String detail) {

@@ -17,6 +17,7 @@ class HazelcastProperties {
     private int memberPort = 5701;
     private String bindAddress = "127.0.0.1";
     private String advertisedMemberAddress;
+    private List<String> outboundMemberPorts = new ArrayList<>();
     private Duration heartbeatInterval = Duration.ofSeconds(5);
     private Duration maximumNoHeartbeat = Duration.ofSeconds(30);
     private final Discovery discovery = new Discovery();
@@ -64,6 +65,29 @@ class HazelcastProperties {
 
     void setAdvertisedMemberAddress(String advertisedMemberAddress) {
         this.advertisedMemberAddress = advertisedMemberAddress;
+    }
+
+    /**
+     * The local ports this member is allowed to dial the other members from; empty means any.
+     *
+     * <p>Outgoing member connections take an arbitrary ephemeral port by default, which is exactly
+     * what an egress firewall cannot be written against: the rule would have to allow the whole
+     * ephemeral range in both directions. Naming a range here makes member traffic leave from ports
+     * an operator can enumerate, so the rule can be as narrow as the member port itself.
+     *
+     * <p>Each entry is a single port or an inclusive {@code low-high} range. Give the range at least
+     * as many ports as this member holds connections, since they are used in turn and a port still
+     * in its close-wait is skipped; the size is not enforced here because only the deployment knows
+     * how many members it runs. This never changes what the member binds or reports -- it changes
+     * only which local port a dial leaves from.
+     */
+    List<String> getOutboundMemberPorts() {
+        return List.copyOf(outboundMemberPorts);
+    }
+
+    void setOutboundMemberPorts(List<String> outboundMemberPorts) {
+        this.outboundMemberPorts =
+                outboundMemberPorts == null ? new ArrayList<>() : new ArrayList<>(outboundMemberPorts);
     }
 
     Duration getHeartbeatInterval() {

@@ -205,6 +205,103 @@ class HazelcastMemberTest {
                 });
     }
 
+    /**
+     * Named outbound ports are what an egress rule can be written against.
+     *
+     * <p>Without them an outgoing member connection takes an arbitrary ephemeral port, so the only
+     * firewall rule that admits member traffic is one that admits the whole ephemeral range. All three
+     * readings belong in one case: what it dials from, what it binds, and what it reports are three
+     * different things, and a change that moved any one of them onto another would pass a case that
+     * only read the first.
+     */
+    @Test
+    void aMemberDialsFromThePortsItIsGivenAndStillBindsAndReportsWhatItWasTold() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "10.20.0.11:15701",
+                "tapstate.hz.bind-address", "10.0.0.5",
+                "tapstate.hz.member-port", "5701",
+                "tapstate.hz.advertised-member-address", "10.20.0.11:15701",
+                "tapstate.hz.outbound-member-ports[0]", "21000-21099",
+                "tapstate.hz.outbound-member-ports[1]", "21500"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+
+        assertThat(config.getNetworkConfig().getOutboundPortDefinitions())
+                .as("the local ports a dial may leave from")
+                .containsExactlyInAnyOrder("21000-21099", "21500");
+        assertThat(config.getNetworkConfig().getInterfaces().getInterfaces())
+                .as("what it binds, which naming outbound ports does not move")
+                .containsExactly("10.0.0.5");
+        assertThat(config.getNetworkConfig().getPublicAddress())
+                .as("what it reports, which naming outbound ports does not move either")
+                .isEqualTo("10.20.0.11:15701");
+    }
+
+    /** Left out, a dial takes any ephemeral port -- the behaviour of every deployment without a rule. */
+    @Test
+    void aMemberGivenNoOutboundPortsDialsFromAnyPort() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+
+        // Unrestricted has two spellings in the library -- never set is null, cleared is empty -- and
+        // both mean the same thing here, so neither is allowed to read as a restriction.
+        assertThat(config.getNetworkConfig().getOutboundPortDefinitions())
+                .as("nothing named, so nothing is restricted")
+                .isNullOrEmpty();
+    }
+
+    /**
+     * With discovery off the member dials nobody, so there is no outgoing connection for this to place.
+     * Accepted silently it would read as a working restriction that never applied to anything.
+     */
+    @Test
+    void outboundPortsAreRefusedWhileDiscoveryIsOff() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.outbound-member-ports[0]", "21000-21099"));
+
+        assertThatThrownBy(() -> HazelcastConfiguration.memberConfig(properties))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(BootError.DISCOVERY_CONFIG_INVALID);
+                    assertThat(refused.args().get("detail").toString())
+                            .contains("outbound-member-ports");
+                });
+    }
+
+    /**
+     * A definition that is not a port is refused here, naming the setting and the value.
+     *
+     * <p>Handed on as written it fails inside the library instead, where the message names neither --
+     * and the two halves are refused for different reasons, so both are read: a value of the wrong shape
+     * entirely, and one of the right shape that is not a port.
+     */
+    @Test
+    void anOutboundPortThatIsNotAPortOrARangeIsRefused() {
+        assertThatThrownBy(() -> HazelcastConfiguration.memberConfig(bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701",
+                "tapstate.hz.outbound-member-ports[0]", "*"))))
+                .as("not a port and not a range")
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.args().get("detail").toString()).contains("'*'"));
+
+        assertThatThrownBy(() -> HazelcastConfiguration.memberConfig(bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701",
+                "tapstate.hz.outbound-member-ports[0]", "0-5"))))
+                .as("the right shape, and still not a port a dial can leave from")
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.args().get("detail").toString()).contains("1-65535"));
+    }
+
     @Test
     void kubernetesModePrefersHeadlessServiceDnsAndLeavesEveryOtherJoinPathOff() {
         HazelcastProperties properties = bind(Map.of(
