@@ -7,6 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.IntFunction;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -56,12 +57,18 @@ final class PartitionableCluster implements AutoCloseable {
     private final Map<String, ControlPlane> planes;
     private final String clusterId;
 
+    private final String storeUri;
+    private final Map<String, IntFunction<List<String>>> launchArguments;
+
     private PartitionableCluster(List<String> nodeIds, Map<String, RealProcessServer> servers,
-            Map<String, CuttableLink> links, String clusterId) {
+            Map<String, CuttableLink> links, String clusterId, String storeUri,
+            Map<String, IntFunction<List<String>>> launchArguments) {
         this.nodeIds = List.copyOf(nodeIds);
         this.servers = servers;
         this.links = links;
         this.clusterId = clusterId;
+        this.storeUri = storeUri;
+        this.launchArguments = launchArguments;
         Map<String, ControlPlane> built = new LinkedHashMap<>();
         servers.forEach((nodeId, server) -> built.put(nodeId, new ControlPlane(server.baseUrl())));
         this.planes = built;
@@ -91,21 +98,28 @@ final class PartitionableCluster implements AutoCloseable {
         String seeds = String.join(",", links.values().stream().map(CuttableLink::address).toList());
 
         Map<String, RealProcessServer> servers = new LinkedHashMap<>();
+        // Kept per member, because what a member is told is fixed on its command line: a member that
+        // comes back has to come back as the same member, on the same port, behind the same link.
+        Map<String, IntFunction<List<String>>> launchArguments = new LinkedHashMap<>();
+        for (String nodeId : nodeIds) {
+            int memberPort = memberPorts.get(nodeId);
+            String advertised = links.get(nodeId).address();
+            int[] range = outbound.get(nodeId);
+            launchArguments.put(nodeId, httpPort -> arguments(clusterId, nodeId, memberPort, advertised,
+                    seeds, httpPort, bindAddress, nodeIds.size(), range));
+        }
         try {
             for (String nodeId : nodeIds) {
-                int memberPort = memberPorts.get(nodeId);
-                String advertised = links.get(nodeId).address();
-                int[] range = outbound.get(nodeId);
-                servers.put(nodeId, RealProcessServer.start(storeUri, "0.0.0.0",
-                        httpPort -> arguments(clusterId, nodeId, memberPort, advertised, seeds,
-                                httpPort, bindAddress, nodeIds.size(), range)));
+                servers.put(nodeId,
+                        RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
             }
         } catch (RuntimeException | Error failure) {
             servers.values().forEach(RealProcessServer::close);
             links.values().forEach(CuttableLink::close);
             throw failure;
         }
-        PartitionableCluster cluster = new PartitionableCluster(nodeIds, servers, links, clusterId);
+        PartitionableCluster cluster = new PartitionableCluster(
+                nodeIds, servers, links, clusterId, storeUri, launchArguments);
         try {
             cluster.planes.get(nodeIds.getFirst()).bootstrapAndLogin(ADMIN, PASSWORD);
             // The administrator lives in the store they all share, so the rest do not create one.
@@ -192,6 +206,31 @@ final class PartitionableCluster implements AutoCloseable {
     }
 
     /** One read of what a member currently reports, with no waiting at all. */
+    /**
+     * Stops one member's process and brings the same member back: same node id, same member port,
+     * same link in front of it, same ports to dial from. Only the control API port is new, because
+     * that one is taken from whatever is free.
+     *
+     * <p>For the cases that ask what happens on the way back. A member that took itself out of the
+     * cluster -- because its node session lapsed while the coordination store was away -- does not
+     * come back on its own, so a case that wants to see it rejoin has to restart it.
+     */
+    void restart(String nodeId) {
+        String known = requireKnown(nodeId);
+        servers.get(known).close();
+        RealProcessServer replacement =
+                RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(known));
+        servers.put(known, replacement);
+        ControlPlane plane = new ControlPlane(replacement.baseUrl());
+        plane.login(ADMIN, PASSWORD);
+        planes.put(known, plane);
+    }
+
+    /** Whether one member's process is still running -- what tells failing closed from falling over. */
+    boolean isAlive(String nodeId) {
+        return servers.get(requireKnown(nodeId)).isAlive();
+    }
+
     List<String> membership(String asSeenBy) {
         return member(asSeenBy).clusterMemberNodeIds();
     }
