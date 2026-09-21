@@ -138,7 +138,7 @@ class NestOverTwoSourcesDataFlowTest {
         actuator.start(PIPELINE);
         List<Map<String, Object>> documents;
         try {
-            awaitAssembled();
+            awaitAssembled("order-1");
             documents = List.copyOf(CapturingSinkWriter.collected());
         } finally {
             stopQuietly(actuator);
@@ -185,7 +185,7 @@ class NestOverTwoSourcesDataFlowTest {
 
         actuator.start(PIPELINE);
         try {
-            awaitAssembled();
+            awaitAssembled("order-1");
             Job job = member.getJet().getJob(PIPELINE);
             assertThat(job).isNotNull();
             assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
@@ -198,7 +198,7 @@ class NestOverTwoSourcesDataFlowTest {
             actuator.stop(PIPELINE, false);
             CapturingSinkWriter.reset();
             actuator.start(PIPELINE);
-            awaitAssembled();
+            awaitAssembled("order-1");
             assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
         } finally {
             stopQuietly(actuator);
@@ -219,7 +219,7 @@ class NestOverTwoSourcesDataFlowTest {
         LifecycleActuator actuator = wireRuntime(store, srsCoordinator, rowsByTable);
 
         actuator.start(PIPELINE);
-        awaitAssembled();
+        awaitAssembled("order-1");
         actuator.stop(PIPELINE, false);
 
         rowsByTable.put(PARENT_TABLE, List.of(
@@ -228,7 +228,7 @@ class NestOverTwoSourcesDataFlowTest {
         CapturingSinkWriter.reset();
         actuator.start(PIPELINE);
         try {
-            awaitAssembled();
+            awaitAssembled("order-1-after-stop");
             assertThat(latestPerRoot(new ArrayList<>(CapturingSinkWriter.collected())).get(1L))
                     .containsEntry("name", "order-1-after-stop");
             assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
@@ -418,14 +418,15 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     /**
-     * Waits until every root is present with every child attached. On timeout it reports what the job is
-     * actually doing: zero documents is a symptom shared by a job that failed, a job still starting and a
-     * job assembling nothing, and only the job status tells them apart.
+     * Waits until every root is current with every child attached. A retained root can be emitted when the
+     * other source arrives first, so shape alone does not say the current root row has reached the nest. On
+     * timeout it reports what the job is actually doing: zero documents is a symptom shared by a job that
+     * failed, a job still starting and a job assembling nothing, and only the job status tells them apart.
      */
-    private void awaitAssembled() {
+    private void awaitAssembled(String expectedRootName) {
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
         while (System.nanoTime() < deadline) {
-            if (settled(CapturingSinkWriter.collected())) {
+            if (settled(CapturingSinkWriter.collected(), expectedRootName)) {
                 return;
             }
             sleep();
@@ -450,10 +451,14 @@ class NestOverTwoSourcesDataFlowTest {
         }
     }
 
-    /** Whether every root is present and every child attached somewhere, so waiting can stop. */
-    private static boolean settled(Queue<Map<String, Object>> written) {
+    /** Whether every root is current and every child is attached somewhere, so waiting can stop. */
+    private static boolean settled(Queue<Map<String, Object>> written, String expectedRootName) {
         Map<Object, Map<String, Object>> latest = latestPerRoot(new ArrayList<>(written));
         if (latest.size() != 2) {
+            return false;
+        }
+        Map<String, Object> firstRoot = latest.get(1L);
+        if (firstRoot == null || !expectedRootName.equals(firstRoot.get("name"))) {
             return false;
         }
         int attached = 0;
