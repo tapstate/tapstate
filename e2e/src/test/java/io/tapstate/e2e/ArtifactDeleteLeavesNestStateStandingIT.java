@@ -78,8 +78,8 @@ class ArtifactDeleteLeavesNestStateStandingIT {
             throws Exception {
         String storeUri = storeUri("delete_keeps_nest_state", tier);
         // The tier rides on the pipeline ids rather than on the namespaces, and that placement is
-        // load-bearing twice over. The state database has a fixed name, so on one Mongo the two tiers
-        // would otherwise seed over each other. And a namespace is built from the pipeline id, so a
+        // load-bearing twice over. Both tiers use this test deployment's configured state database, so
+        // they would otherwise seed over each other. And a namespace is built from the pipeline id, so a
         // cleanup keyed off that id - the shape a careless one takes - has to be able to match what is
         // seeded here. A tier suffix bolted on after the id would leave this case passing against it.
         String departingId = DEPARTING_BASE + "_" + tier.name().toLowerCase(Locale.ROOT);
@@ -121,7 +121,8 @@ class ArtifactDeleteLeavesNestStateStandingIT {
             try (MongoConnection connection = new MongoConnection(
                     new MongoConnectionSettings(storeUri, null, Duration.ofSeconds(5)))) {
                 connection.verify();
-                KeyedStateStore nestState = new MongoStorePort(connection).keyedState();
+                KeyedStateStore nestState =
+                        new MongoStorePort(connection, SharedMongo.OPERATOR_STATE_DATABASE).keyedState();
 
                 // After the stop, so nothing that has already run can be what leaves these standing.
                 nestState.save(departingNamespace, KEY, HELD);

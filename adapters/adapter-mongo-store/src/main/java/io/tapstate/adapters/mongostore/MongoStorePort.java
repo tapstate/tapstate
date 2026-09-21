@@ -1,7 +1,9 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoNamespace;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.CatalogStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
@@ -21,8 +23,11 @@ import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The MongoDB implementation of the persistence port: it aggregates fourteen sub-stores — the artifact
@@ -32,12 +37,14 @@ import java.util.Objects;
  * per-pipeline observation store, the SRS meta store (one durable coordination record per mining chain),
  * and the editor-only Pipeline layout store — each bound to its own collection (or GridFS bucket) on the
  * verified connection's database.
- * Operator state is the one exception and sits in a database of its own on the same client, for the
- * reasons on {@link #NEST_STATE_DATABASE}. This is the store bridge the assembly root wires into the
- * platform under {@code --role=all}; the app sees only the driver-free {@link StorePort}, so no driver
- * type escapes this module (rule R3).
+ * Operator state is the one exception and sits in a separately named database on the same client. This
+ * is the store bridge the assembly root wires into the platform under {@code --role=all}; the app sees
+ * only the driver-free {@link StorePort}, so no driver type escapes this module (rule R3).
  */
 public final class MongoStorePort implements StorePort {
+
+    private static final int MAX_DATABASE_NAME_BYTES = 63;
+    private static final Set<String> RESERVED_OPERATOR_STATE_DATABASES = Set.of("config", "local");
 
     /** The collection holding the canonical artifact truth layer. */
     public static final String ARTIFACTS = "artifacts";
@@ -89,20 +96,6 @@ public final class MongoStorePort implements StorePort {
     public static final String NEST_DEAD_LETTERS = "nest_dead_letters";
 
     /**
-     * The database holding operator state, which is deliberately not the one holding everything else.
-     * What an operator configured and what a running job is holding have nothing in common but the
-     * connection: one is edited by hand and read rarely, the other is written at event rates and read
-     * back by key, and an operation aimed at one of them - a restore, a dump, a drop - should not be able
-     * to reach the other by accident.
-     *
-     * <p>The name is fixed rather than derived or configurable. Two installs pointed at one Mongo are
-     * meant to find the same database, and a pipeline of the same id in both of them then shares one
-     * state: the price of the fixed name, taken knowingly. Telling them apart later is a matter of what
-     * goes in the namespace, not of what the database is called.
-     */
-    public static final String NEST_STATE_DATABASE = "tapstate_nest";
-
-    /**
      * What an operator-state write is acknowledged on. Every other store here can take the client's
      * default, because what it holds can be worked out again from something else that survived. This one
      * cannot: it is where a change let past the source's read offset is being kept, it has no replica of
@@ -138,21 +131,23 @@ public final class MongoStorePort implements StorePort {
 
     /**
      * Binds the sub-stores to their own collections on the verified connection's database, bar operator
-     * state, which gets a database of its own on the same client ({@link #NEST_STATE_DATABASE}). The
-     * connection must have been verified first (its client opened); the sub-stores share that one
-     * client and are closed with it when the connection closes.
+     * state, which gets the separately configured {@code operatorStateDatabase} on the same client. The
+     * connection must have been verified first (its client opened); the sub-stores share that one client
+     * and are closed with it when the connection closes.
      */
-    public MongoStorePort(MongoConnection connection) {
-        this(connection, MongoRateHistoryStore.DEFAULT_RETENTION);
+    public MongoStorePort(MongoConnection connection, String operatorStateDatabase) {
+        this(connection, operatorStateDatabase, MongoRateHistoryStore.DEFAULT_RETENTION);
     }
 
     /**
      * A port whose sample history keeps samples for {@code rateHistoryRetention}: the one store here with
      * a configured bound, written onto its expiring index at construction.
      */
-    public MongoStorePort(MongoConnection connection, Duration rateHistoryRetention) {
+    public MongoStorePort(
+            MongoConnection connection, String operatorStateDatabase, Duration rateHistoryRetention) {
         Objects.requireNonNull(connection, "connection");
         MongoDatabase database = connection.database();
+        String stateDatabaseName = requireOperatorStateDatabase(operatorStateDatabase, database.getName());
         this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
         this.state = new MongoStateStore(SystemCollections.PIPELINE_STATE.on(database));
         this.desired = new MongoDesiredStore(SystemCollections.PIPELINE_DESIRED.on(database));
@@ -170,13 +165,35 @@ public final class MongoStorePort implements StorePort {
         this.meta = new MongoSrsMetaStore(SystemCollections.SRS_META.on(database));
         this.srsLog = new MongoSrsLogStore(SystemCollections.SRS_LOG.on(database));
         this.derivedSchemas = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(database));
-        // Operator state alone sits in its own database on the same client, for the reasons on the
-        // constant. Same connection, same credentials, same lifecycle - a different database. What that
-        // operator could not assemble goes in the same database, being produced by the same run.
-        MongoDatabase nestState = connection.client().getDatabase(NEST_STATE_DATABASE)
+        // Operator state alone sits in its configured database on the same client. Same connection, same
+        // credentials, same lifecycle - a different database. What that operator could not assemble goes
+        // in the same database, being produced by the same run.
+        MongoDatabase nestState = connection.client().getDatabase(stateDatabaseName)
                 .withWriteConcern(NEST_STATE_WRITE_CONCERN);
         this.keyedState = new MongoKeyedStateStore(SystemCollections.OPERATOR_STATE.on(nestState));
         this.nestDeadLetters = new MongoNestDeadLetterStore(SystemCollections.NEST_DEAD_LETTERS.on(nestState));
+    }
+
+    private static String requireOperatorStateDatabase(String name, String controlDatabase) {
+        if (name == null || name.isBlank()) {
+            throw invalidOperatorStateDatabase(null);
+        }
+        try {
+            MongoNamespace.checkDatabaseNameValidity(name);
+        } catch (IllegalArgumentException e) {
+            throw invalidOperatorStateDatabase(e);
+        }
+        if (name.indexOf('$') >= 0
+                || name.getBytes(StandardCharsets.UTF_8).length > MAX_DATABASE_NAME_BYTES
+                || RESERVED_OPERATOR_STATE_DATABASES.stream().anyMatch(name::equalsIgnoreCase)
+                || name.equalsIgnoreCase(controlDatabase)) {
+            throw invalidOperatorStateDatabase(null);
+        }
+        return name;
+    }
+
+    private static TapstateException invalidOperatorStateDatabase(Throwable cause) {
+        return new TapstateException(StoreError.INVALID_OPERATOR_STATE_DATABASE, Map.of(), cause);
     }
 
     @Override
