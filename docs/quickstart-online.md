@@ -570,7 +570,7 @@ not put it in command arguments:
 
 `--server` wins over `TAPSTATE_SERVER_URL`; the final default is
 `http://127.0.0.1:8080`. There is intentionally no `--token` option. Without
-`--allow-write`, the sidecar exposes exactly the 17 read tools. With it, eight write
+`--allow-write`, the sidecar exposes exactly the 19 read tools. With it, eight write
 tools are added, but the Server still enforces the token scope. A read token cannot
 write even when the tools are locally visible.
 
@@ -588,7 +588,8 @@ An agent should use this sequence:
    draft to `artifact_validate`. Fix all diagnostics before `artifact_apply`.
 5. Call `pipeline_start`, then use `pipeline_status`, `pipeline_metrics`,
    `pipeline_snapshot`, and `pipeline_logs` until the expected state and data are
-   visible. Finish with `pipeline_stop`.
+   visible. Use `pipeline_explain` for the shared diagnosis, or
+   `pipeline_metrics_history` for a retained time range. Finish with `pipeline_stop`.
 
 `source_draft` refuses to guess connector fields. If the connector is bundled-only,
 its runtime is unavailable, or the live response has no complete spec and content
@@ -612,8 +613,14 @@ tool for stopping its own process.
 tapstate(admin@127.0.0.1:8080)> status order_pipeline             # state, and why if it is not working
 tapstate(admin@127.0.0.1:8080)> status order_pipeline --watch    # live state; Ctrl-C to stop
 tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # records.out / errors.<code> / positions
+tapstate(admin@127.0.0.1:8080)> explain order_pipeline           # shared conclusion and typed evidence
+tapstate(admin@127.0.0.1:8080)> metrics order_pipeline --from 2026-09-20T10:00:00Z --to 2026-09-20T11:00:00Z --resolution 5m
 tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local operational log tail
 ```
+
+The last `metrics` form reads bounded, reset-aware history rather than the current counter map. See
+[Observe a pipeline](observability/) for target-acknowledged rate and lag semantics, table selection,
+pagination, REST and MCP forms, and the difference between an empty retained window and unavailable data.
 
 - The read faces lag the write verbs: they report observed state, which converges to
   what you asked for rather than changing with the command. Immediately after `start`
@@ -648,9 +655,10 @@ tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local op
   so totals stay right while the busiest thousand tables keep their names. The names are not a
   compatibility promise yet, the same as on the `metrics` face.
   Failures are counted per error code, and a pipeline that has failed nothing carries no such key.
-- **`status` answers "why is it not working" itself**, under the state line: it walks a short fixed
-  checklist over the same four faces you can read by hand and prints what it concluded, the face and
-  value it read, and where to look next. When nothing on the checklist matches it does **not** report
+- **`status` answers "why is it not working" itself**, under the state line: it renders the server's
+  shared `pipeline.explain` projection, including its conclusion, typed evidence, and where to look
+  next. REST, CLI, and MCP therefore use the same fixed checklist instead of each joining the raw
+  faces differently. When nothing on the checklist matches it does **not** report
   that all is well — it prints every reading it went through and names the questions these faces
   cannot answer, so you go and look at the thing the product genuinely cannot see instead of
   trusting a silence. `--watch` is unchanged: it streams the state only, and says nothing more.
