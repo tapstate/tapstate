@@ -313,24 +313,29 @@ class ThreeMemberNetworkPartitionFailsClosedIT {
     private static String stateOn(ControlPlane plane) {
         try {
             return String.valueOf(plane.state(PIPELINE));
-        } catch (RuntimeException refused) {
-            return "refused:" + refused.getClass().getSimpleName();
+        } catch (RuntimeException | AssertionError refused) {
+            // A diagnosis that throws replaces the failure it was written to explain. The read face
+            // refuses with an assertion of its own, which is exactly the state this is called in.
+            return "refused:" + refused.getClass().getSimpleName() + ": " + refused.getMessage();
         }
     }
 
     private static String ownersOn(ControlPlane plane) {
         try {
             return String.valueOf(plane.captureOwnersOf(PIPELINE).values());
-        } catch (RuntimeException refused) {
-            return "refused:" + refused.getClass().getSimpleName();
+        } catch (RuntimeException | AssertionError refused) {
+            // A diagnosis that throws replaces the failure it was written to explain. The read face
+            // refuses with an assertion of its own, which is exactly the state this is called in.
+            return "refused:" + refused.getClass().getSimpleName() + ": " + refused.getMessage();
         }
     }
 
     private static Optional<Long> countOn(ControlPlane plane) {
         try {
             return plane.recordCount(PIPELINE);
-        } catch (RuntimeException refused) {
-            // A side that refuses to answer for the pipeline at all is not advancing it either.
+        } catch (RuntimeException | AssertionError refused) {
+            // A side that refuses to answer for the pipeline at all is not advancing it either, and a
+            // refusal arrives from the read face as an assertion rather than as an exception.
             return Optional.empty();
         }
     }
@@ -353,8 +358,10 @@ class ThreeMemberNetworkPartitionFailsClosedIT {
     private static String failureOn(ControlPlane plane) {
         try {
             return String.valueOf(plane.failureCode(PIPELINE));
-        } catch (RuntimeException refused) {
-            return "refused:" + refused.getClass().getSimpleName();
+        } catch (RuntimeException | AssertionError refused) {
+            // A diagnosis that throws replaces the failure it was written to explain. The read face
+            // refuses with an assertion of its own, which is exactly the state this is called in.
+            return "refused:" + refused.getClass().getSimpleName() + ": " + refused.getMessage();
         }
     }
 
