@@ -190,10 +190,10 @@ public interface SrsMetaStore {
 
     /**
      * Lists the id of every mining chain that carries a cursor for {@code pipelineId} — exactly the
-     * chains a departing consumer still has to be detached from. It answers from the chains' own records
-     * rather than from the consumer's side, so a caller that cannot derive which chains a pipeline reads
-     * (chain identity is resolved where captures are built, not where artifacts are removed) can still
-     * detach from all of them, and a chain the pipeline never joined is never touched.
+     * chains a departing consumer still has to be detached from. It answers from durable cursor membership,
+     * so a caller that cannot derive which chains a pipeline reads (chain identity is resolved where captures
+     * are built, not where artifacts are removed) can still detach from all of them, and a chain the pipeline
+     * never joined is never touched.
      *
      * <p>It returns ids only, never reconstructed records, so enumerating never fails on a single corrupt
      * document.

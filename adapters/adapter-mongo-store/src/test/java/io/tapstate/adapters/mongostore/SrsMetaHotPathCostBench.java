@@ -98,7 +98,7 @@ class SrsMetaHotPathCostBench {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoDatabase database = client.getDatabase("tapstate");
             MongoCollection<Document> collection = database.getCollection("srs_meta");
-            MongoSrsMetaStore store = new MongoSrsMetaStore(collection);
+            MongoSrsMetaStore store = new MongoSrsMetaStore(client, collection);
 
             System.out.println("consumers,ddls,doc_bytes,path,p50_us,p99_us,max_us,ops_per_second");
             report(0, 0, 0, "ping", ping(database));
@@ -167,7 +167,7 @@ class SrsMetaHotPathCostBench {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoDatabase database = client.getDatabase("tapstate");
             MongoCollection<Document> collection = database.getCollection("srs_meta");
-            MongoSrsMetaStore store = new MongoSrsMetaStore(collection);
+            MongoSrsMetaStore store = new MongoSrsMetaStore(client, collection);
 
             System.out.println("consumers,ddls,doc_bytes,path,changes,elapsed_ms,sustained_ev_s");
             burst(store, collection, 16, 0);
@@ -438,7 +438,7 @@ class SrsMetaHotPathCostBench {
         try (MongoClient client = MongoClients.create(settings)) {
             MongoCollection<Document> collection =
                     client.getDatabase("tapstate").getCollection("srs_meta");
-            MongoSrsMetaStore store = new MongoSrsMetaStore(collection);
+            MongoSrsMetaStore store = new MongoSrsMetaStore(client, collection);
 
             long forOne = readsFor(counting, store, "count-c1", 1);
             long forSixteen = readsFor(counting, store, "count-c16", 16);
