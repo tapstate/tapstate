@@ -1,12 +1,7 @@
 package io.tapstate.e2e;
 
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
-import java.net.SocketException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Enumeration;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
@@ -90,7 +85,7 @@ final class TwoMemberCluster implements AutoCloseable {
      */
     static TwoMemberCluster start(String storeUri, String name, Duration nodeSessionTtl) {
         String clusterId = name + "-" + UUID.randomUUID();
-        String bindAddress = routableAddress();
+        String bindAddress = RoutableAddress.ofThisMachine();
         int memberPortA = RealProcessServer.reservePort();
         int memberPortB = RealProcessServer.reservePort();
         String seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
@@ -254,27 +249,4 @@ final class TwoMemberCluster implements AutoCloseable {
      * <p>Failing here rather than skipping. A machine with no address but the loopback cannot run this,
      * and saying so is the honest answer; skipping would report a pass for a case that never ran.
      */
-    private static String routableAddress() {
-        try {
-            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-            while (interfaces.hasMoreElements()) {
-                NetworkInterface candidate = interfaces.nextElement();
-                if (!candidate.isUp() || candidate.isLoopback()) {
-                    continue;
-                }
-                Enumeration<InetAddress> addresses = candidate.getInetAddresses();
-                while (addresses.hasMoreElements()) {
-                    InetAddress address = addresses.nextElement();
-                    if (address instanceof Inet4Address && !address.isLoopbackAddress()
-                            && !address.isLinkLocalAddress()) {
-                        return address.getHostAddress();
-                    }
-                }
-            }
-        } catch (SocketException unreachable) {
-            throw new AssertionError("could not read this machine's interfaces", unreachable);
-        }
-        throw new AssertionError("this machine has no address but the loopback, and a member with "
-                + "discovery on is refused there - two members cannot be brought up here");
-    }
 }
