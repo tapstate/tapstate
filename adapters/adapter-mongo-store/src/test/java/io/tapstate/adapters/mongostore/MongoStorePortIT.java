@@ -21,6 +21,7 @@ import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -223,8 +224,10 @@ class MongoStorePortIT {
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_STATE).countDocuments()).isZero();
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_DESIRED).countDocuments()).isZero();
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isZero();
-                // The chain is shared, so it stays — with only the departing consumer taken off it.
-                assertThat(database.getCollection(MongoStorePort.SRS_META).countDocuments()).isEqualTo(1);
+                // The chain is shared, so its root stays, as does the surviving cursor in its own storage.
+                assertThat(database.getCollection(MongoStorePort.SRS_META)
+                        .countDocuments(new Document("_id", "orders@mysql-1"))).isEqualTo(1);
+                assertThat(database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).countDocuments()).isEqualTo(1);
             }
             assertThat(port.meta().read("orders@mysql-1").orElseThrow().consumerOffsets())
                     .containsExactly(new ConsumerOffset("survivor", Map.of("orders", 9L),
@@ -240,6 +243,7 @@ class MongoStorePortIT {
             database.getCollection(MongoStorePort.PIPELINE_DESIRED).drop();
             database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).drop();
             database.getCollection(MongoStorePort.SRS_META).drop();
+            database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).drop();
         }
     }
 
@@ -259,7 +263,8 @@ class MongoStorePortIT {
                     MongoStorePort.CONNECTOR_ARTIFACTS + ".chunks",
                     MongoStorePort.CONNECTOR_SPECS,
                     MongoStorePort.CONNECTION_TEST_RESULTS,
-                    MongoStorePort.SRS_META
+                    MongoStorePort.SRS_META,
+                    MongoStorePort.SRS_CONSUMER_OFFSETS
             ).forEach(collection -> database.getCollection(collection).drop());
         }
     }

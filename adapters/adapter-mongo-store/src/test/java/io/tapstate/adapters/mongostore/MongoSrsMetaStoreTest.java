@@ -81,11 +81,10 @@ class MongoSrsMetaStoreTest {
         // same table again, and the mark is a set membership question -- "has this table drained?" -- so a
         // second mark must be a no-op rather than a second entry.
         //
-        // The path is scoped to the marking pipeline. Writing it at the document root instead is what let a
-        // second pipeline on the same chain read the first one's answer, skip a load it had never done, and
-        // leave its target short of every row of that table with nothing thrown and nothing logged.
+        // The containing document is scoped to the marking pipeline. Writing the mark in the chain document
+        // instead is what let another pipeline read the first one's answer and skip a load it had never done.
         assertThat(update).isEqualTo(new Document("$addToSet",
-                new Document("consumerOffsets.p1.snapshotCompletedTables", "orders")));
+                new Document("snapshotCompletedTables", "orders")));
     }
 
     @Test
@@ -192,13 +191,12 @@ class MongoSrsMetaStoreTest {
     @Test
     void consumerReadSeqUpdateTargetsOnlyThatTablesCursorPathNotTheWholeConsumer() {
         // The reader's per-table cursor advance is a path-scoped $set: it touches only
-        // consumerOffsets.<pipelineId>.perTableSeq.<table>, so a reader advancing its cursor never clobbers
-        // the sink-acked position the sink writes to the same consumer document -- the two are independent
-        // writers on one consumer record.
+        // perTableSeq.<table> in that pipeline's document, so a reader advancing its cursor never clobbers
+        // the sink-acked position the sink writes there -- the two are independent writers.
         Document update = MongoSrsMetaStore.consumerReadSeqUpdate("p1", "orders", 42L);
 
         assertThat(update.get("$set", Document.class))
-                .containsExactly(Map.entry("consumerOffsets.p1.perTableSeq.orders", 42L));
+                .containsExactly(Map.entry("perTableSeq.orders", 42L));
     }
 
     @Test
@@ -211,9 +209,9 @@ class MongoSrsMetaStoreTest {
         Document update = MongoSrsMetaStore.sinkAckedUpdate("p1", new ChainPosition(new SourceOrder(1, 99), "gtid:aaa-1:99"));
 
         assertThat(update.get("$set", Document.class)).containsOnly(
-                Map.entry("consumerOffsets.p1.sinkAckedEpoch", 1L),
-                Map.entry("consumerOffsets.p1.sinkAckedSeq", 99L),
-                Map.entry("consumerOffsets.p1.sinkAckedSrcpos", "gtid:aaa-1:99"));
+                Map.entry("sinkAckedEpoch", 1L),
+                Map.entry("sinkAckedSeq", 99L),
+                Map.entry("sinkAckedSrcpos", "gtid:aaa-1:99"));
     }
 
     @Test
@@ -226,23 +224,10 @@ class MongoSrsMetaStoreTest {
         Document update = MongoSrsMetaStore.sinkAckedUpdate("p1", new ChainPosition(new SourceOrder(1, 99), null));
 
         assertThat(update.get("$set", Document.class)).containsOnly(
-                Map.entry("consumerOffsets.p1.sinkAckedEpoch", 1L),
-                Map.entry("consumerOffsets.p1.sinkAckedSeq", 99L));
+                Map.entry("sinkAckedEpoch", 1L),
+                Map.entry("sinkAckedSeq", 99L));
         assertThat(update.get("$unset", Document.class))
-                .containsExactly(Map.entry("consumerOffsets.p1.sinkAckedSrcpos", ""));
-    }
-
-    @Test
-    void detachConsumerUpdateUnsetsOnlyThatConsumersEntryAndNothingElseOnTheChain() {
-        // A detach is a path-scoped $unset of consumerOffsets.<pipelineId>: it removes the departing
-        // consumer's whole entry -- not its positions -- so the consumer stops being folded into the two
-        // minimums taken over every consumer, while the chain's own offsets, schema history and every
-        // other consumer's cursor are outside the path and survive untouched.
-        Document update = MongoSrsMetaStore.detachConsumerUpdate("p1");
-
-        assertThat(update.get("$unset", Document.class))
-                .containsExactly(Map.entry("consumerOffsets.p1", ""));
-        assertThat(update.keySet()).containsExactly("$unset");
+                .containsExactly(Map.entry("sinkAckedSrcpos", ""));
     }
 
     @Test

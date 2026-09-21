@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
@@ -45,7 +46,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <h2>Why the unconfirmed table is arranged by selection rather than by timing</h2>
  *
- * <p>The state this case needs is a boundary inside one chain's record: some tables confirmed, one not.
+ * <p>The state this case needs is a boundary inside one pipeline's durable cursor: some tables confirmed,
+ * one not.
  * Reaching it by interrupting a running full load does not work, and both reasons are properties of the
  * shipped path rather than of this harness.
  *
@@ -61,7 +63,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>What does produce the boundary is widening the selection of a pipeline that is stopped with its
  * state kept -- which is what adding a table to a pipeline is. It reads two tables and confirms them, is
- * stopped without clearing anything, and comes back reading three: its own record names two of them, so
+ * stopped without clearing anything, and comes back reading three: its own cursor names two of them, so
  * the third is owed and the other two are not.
  *
  * <p>It used to be arranged with two pipelines instead, one reading two tables and one reading three, on
@@ -96,8 +98,6 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
         ROWS.put(OWED, 5);
     }
 
-    private static final String SRS_META = "srs_meta";
-    private static final String CONSUMERS = "consumerOffsets";
     private static final String COMPLETED = "snapshotCompletedTables";
 
     @TempDir
@@ -287,18 +287,12 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
         try (MongoClient client = MongoClients.create(storeUri)) {
             String database = new ConnectionString(storeUri).getDatabase();
             List<String> tables = new ArrayList<>();
-            for (Document chain : client.getDatabase(database).getCollection(SRS_META).find()) {
-                // Completion is recorded against the pipeline that confirmed it, under its own consumer
-                // entry: a chain-level list would hand every pipeline on the chain the first one's answer.
-                // One pipeline runs here, so gathering every consumer's marks is the same set.
-                if (!(chain.get(CONSUMERS) instanceof Document byPipeline)) {
-                    continue;
-                }
-                for (String pipelineId : byPipeline.keySet()) {
-                    if (byPipeline.get(pipelineId) instanceof Document record
-                            && record.get(COMPLETED) instanceof List<?> entries) {
-                        entries.forEach(entry -> tables.add(String.valueOf(entry)));
-                    }
+            for (Document consumer : client.getDatabase(database)
+                    .getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).find()) {
+                // Completion is recorded in the cursor of the pipeline that confirmed it. One pipeline
+                // runs here, so gathering every cursor's marks is the same set.
+                if (consumer.get(COMPLETED) instanceof List<?> entries) {
+                    entries.forEach(entry -> tables.add(String.valueOf(entry)));
                 }
             }
             return tables;
