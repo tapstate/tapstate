@@ -1,8 +1,12 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandSucceededEvent;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
@@ -24,6 +28,12 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.tapstate.adapters.mongostore.StoredBytes.DOCUMENT_CEILING;
 import static io.tapstate.adapters.mongostore.StoredBytes.bsonSize;
@@ -686,6 +696,96 @@ class MongoSrsMetaStoreIT {
 
             assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).isEmpty();
             assertThat(store.read("never_seeded")).isEmpty();
+        });
+    }
+
+    @Test
+    void aStaleLegacyMigrationCannotRestoreAConsumerAfterDetachCompletes() throws Exception {
+        CountDownLatch staleSnapshotRead = new CountDownLatch(1);
+        CountDownLatch resumeStaleMigration = new CountDownLatch(1);
+        AtomicBoolean paused = new AtomicBoolean();
+        CommandListener pauseAfterFirstFind = new CommandListener() {
+            @Override
+            public void commandSucceeded(CommandSucceededEvent event) {
+                if (!"find".equals(event.getCommandName()) || !paused.compareAndSet(false, true)) {
+                    return;
+                }
+                staleSnapshotRead.countDown();
+                try {
+                    if (!resumeStaleMigration.await(30, TimeUnit.SECONDS)) {
+                        throw new AssertionError("stale migration was not resumed");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while holding the stale migration", e);
+                }
+            }
+        };
+        MongoClientSettings staleSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(pauseAfterFirstFind)
+                .build();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try (MongoClient staleClient = MongoClients.create(staleSettings);
+                MongoClient currentClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoCollection<Document> roots = currentClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers =
+                    currentClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            ConsumerOffset departing = new ConsumerOffset("departing", Map.of("orders", 10L), null);
+            ConsumerOffset staying = new ConsumerOffset("staying", Map.of("orders", 20L), null);
+            roots.insertOne(MongoSrsMetaStore.toDocument(
+                    new SrsMeta(CHAIN, null, List.of(departing, staying), List.of(), null)));
+
+            MongoSrsMetaStore staleStore = new MongoSrsMetaStore(
+                    staleClient.getDatabase("tapstate").getCollection("srs_meta"),
+                    staleClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+            MongoSrsMetaStore currentStore = new MongoSrsMetaStore(roots, consumers);
+            Future<?> staleWrite = executor.submit(
+                    () -> staleStore.advanceConsumerReadSeq(CHAIN, "staying", "orders", 21L));
+
+            assertThat(staleSnapshotRead.await(10, TimeUnit.SECONDS))
+                    .as("the first writer is paused after reading the legacy cursors")
+                    .isTrue();
+            currentStore.detachConsumer(CHAIN, "departing");
+            assertThat(currentStore.read(CHAIN).orElseThrow().consumerOffsets())
+                    .extracting(ConsumerOffset::pipelineId)
+                    .containsExactly("staying");
+            assertThat(consumers.find(new Document("pipelineId", "departing")).first())
+                    .as("detach leaves only the durable fence that a stale insert cannot overwrite")
+                    .isEqualTo(new Document("_id", new Document("chain", CHAIN)
+                                    .append("pipeline", "departing"))
+                            .append("miningChainId", CHAIN)
+                            .append("pipelineId", "departing")
+                            .append("detached", true));
+
+            resumeStaleMigration.countDown();
+            staleWrite.get(30, TimeUnit.SECONDS);
+
+            assertThat(currentStore.read(CHAIN).orElseThrow().consumerOffsets())
+                    .extracting(ConsumerOffset::pipelineId)
+                    .containsExactly("staying");
+        } finally {
+            resumeStaleMigration.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void aConsumerWriteAfterDetachRemovesTheFenceAndAttachesItAgain() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("returning", Map.of("orders", 10L), null));
+            store.detachConsumer(CHAIN, "returning");
+
+            store.advanceConsumerReadSeq(CHAIN, "returning", "orders", 11L);
+
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffsets())
+                    .containsExactly(new ConsumerOffset("returning", Map.of("orders", 11L), null));
+            assertThat(collection.find(new Document("pipelineId", "returning")).first())
+                    .doesNotContainKey("detached");
         });
     }
 

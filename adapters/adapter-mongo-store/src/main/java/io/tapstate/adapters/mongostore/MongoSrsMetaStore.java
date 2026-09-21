@@ -44,8 +44,10 @@ import java.util.function.Supplier;
  * chain's {@code consumerOffsets} field. The first consumer write migrates them; a chain write that finds
  * an old record already at the endpoint ceiling does the same and retries. The copy is insert-only and the
  * embedded map is cleared only after every cursor has landed, so an interrupted migration loses nothing.
- * The schema history remains an append-only array on the chain document, advanced by an update that keeps
- * the newest entries inside a fixed byte budget. Nullable positions are stored only when present, never as
+ * Detach replaces a cursor with a marker rather than deleting it, so a migration that read the embedded
+ * cursor earlier cannot restore it; reads omit those markers and the next consumer write removes one. The
+ * schema history remains an append-only array on the chain document, advanced by an update that keeps the
+ * newest entries inside a fixed byte budget. Nullable positions are stored only when present, never as
  * explicit nulls.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
@@ -55,6 +57,9 @@ import java.util.function.Supplier;
  * its model is coded {@code io.document-unreadable}.
  */
 public final class MongoSrsMetaStore implements SrsMetaStore {
+
+    /** Marks a removed split cursor so an older migration snapshot cannot insert it again. */
+    private static final String DETACHED = "detached";
 
     /**
      * How much of a chain's schema history the record retains, in bytes of stored entries.
@@ -477,7 +482,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .projection(Projections.include("_id"))
                 .map(document -> document.getString("_id"))
                 .into(chains));
-        StoreIo.call(() -> consumers.find(new Document("pipelineId", pipelineId))
+        StoreIo.call(() -> consumers.find(new Document("pipelineId", pipelineId)
+                        .append(DETACHED, new Document("$ne", true)))
                 .projection(Projections.include("miningChainId"))
                 .map(document -> document.getString("miningChainId"))
                 .into(chains));
@@ -498,9 +504,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         // A detach is idempotent, so an absent chain is already the requested end state. Migration still
-        // runs when the chain exists, preserving every other legacy cursor before this one is removed.
+        // runs when the chain exists, preserving every other legacy cursor before this one is removed. A
+        // tombstone replaces an existing cursor rather than deleting it: an older migration may already
+        // hold the embedded cursor in memory, and its insert-only copy must find a document that it cannot
+        // recreate. A later consumer write removes the marker and attaches the pipeline again.
         migrateLegacyConsumers(miningChainId, false);
-        StoreIo.run(() -> consumers.deleteOne(consumerKey(miningChainId, pipelineId)));
+        StoreIo.run(() -> consumers.replaceOne(
+                consumerKey(miningChainId, pipelineId), detachedConsumerDocument(miningChainId, pipelineId)));
     }
 
     /**
@@ -545,6 +555,12 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         migrateLegacyConsumers(miningChainId, true);
+        Document unset = update.get("$unset", Document.class);
+        if (unset == null) {
+            update.append("$unset", new Document(DETACHED, ""));
+        } else {
+            unset.append(DETACHED, "");
+        }
         update.append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
         StoreIo.call(miningChainId, () -> consumers.updateOne(
                 consumerKey(miningChainId, pipelineId), update, new UpdateOptions().upsert(true)));
@@ -642,7 +658,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             merged.put(entry.getKey(),
                     consumerFromDocument(entry.getKey(), asDocument(entry.getValue(), miningChainId)));
         }
-        List<Document> split = StoreIo.call(() -> consumers.find(consumersOfChain(miningChainId))
+        List<Document> split = StoreIo.call(() -> consumers.find(activeConsumersOfChain(miningChainId))
                 .into(new ArrayList<>()));
         for (Document document : split) {
             String pipelineId = document.getString("pipelineId");
@@ -676,9 +692,22 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         return document;
     }
 
+    /** The durable fence left by detach, with no cursor state that could participate in a frontier. */
+    private static Document detachedConsumerDocument(String miningChainId, String pipelineId) {
+        Document document = consumerKey(miningChainId, pipelineId);
+        document.putAll(consumerIdentity(miningChainId, pipelineId));
+        document.append(DETACHED, true);
+        return document;
+    }
+
     /** All split cursor documents belonging to one chain. */
     private static Document consumersOfChain(String miningChainId) {
         return new Document("miningChainId", miningChainId);
+    }
+
+    /** All live split cursor documents belonging to one chain; detach tombstones are not consumers. */
+    private static Document activeConsumersOfChain(String miningChainId) {
+        return consumersOfChain(miningChainId).append(DETACHED, new Document("$ne", true));
     }
 
     /**
