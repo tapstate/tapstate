@@ -1,12 +1,16 @@
 package io.tapstate.runtime.srs;
 
 import com.hazelcast.config.Config;
+import com.hazelcast.core.IFunction;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.ringbuffer.OverflowPolicy;
+import com.hazelcast.ringbuffer.ReadResultSet;
 import com.hazelcast.ringbuffer.Ringbuffer;
+import com.hazelcast.splitbrainprotection.SplitBrainProtectionException;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
@@ -39,6 +43,8 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -614,6 +620,141 @@ class CdcPhaseTest {
         }
     }
 
+    /**
+     * A cluster that refuses the write for a moment pauses it; it does not end the capture.
+     *
+     * <p>Every ring this writes into is guarded by the cluster's split brain protection, and a member
+     * answers that protection from a verdict its library recomputes on its own schedule -- so just after a
+     * cluster forms, the member owning a partition can still be refusing while the member doing the writing
+     * has long since agreed. The refusal is transient by construction: it clears as the libraries converge,
+     * within seconds. Left to propagate it stops the change stream for good, and a condition that fixes
+     * itself in seconds is recorded as a dead pipeline somebody has to restart by hand.
+     *
+     * <p>So the reading is that the change is in the ring at the end and the stream reported no failure --
+     * with the refusals counted, because a case saying a write survived a refusal is worth nothing if no
+     * refusal happened. Nothing is lost by waiting: the protection is checked before the operation runs at
+     * all, so a refused write never wrote, and a retry cannot duplicate it.
+     */
+    @Test
+    void aClusterRefusalThatClearsItselfPausesTheWriteRatherThanEndingTheCapture() {
+        Ringbuffer<SrsItem> raw = hz.getRingbuffer("srs.chain.refused");
+        RefusingRing refusing = new RefusingRing(raw, 3, 0);
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(refusing));
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
+        CaptureHealth health = new CaptureHealth();
+        FakeCdcPort port = new FakeCdcPort(
+                List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())));
+
+        CdcPhase.run(port, config(), chain, List::of, health);
+
+        assertThat(refusing.refusalsServed)
+                .as("refusals the cluster served before it agreed -- without them this case asserts "
+                        + "nothing about a refusal at all")
+                .isEqualTo(3);
+        assertThat(raw.tailSequence())
+                .as("the change is in the ring: the write waited the refusal out instead of dying on it")
+                .isEqualTo(0L);
+        assertThat(health.failure())
+                .as("a transient refusal is not a dead tail, so nothing is recorded against the run")
+                .isEmpty();
+    }
+
+    /**
+     * The capacity read waits the same way the write does.
+     *
+     * <p>It is a guarded operation like any other and is taken once before anything is offered, so a
+     * refusal there lands earlier than any write could -- at exactly the moment a cluster is forming,
+     * which is when this refusal happens. Read outside the wait it ends the capture before a single change
+     * has been tried, and the fix above would never be reached.
+     *
+     * <p>This ring refuses only the capacity read, so nothing else in the case can account for the wait.
+     */
+    @Test
+    void aRefusalOfTheCapacityReadIsWaitedOutTheSameWay() {
+        Ringbuffer<SrsItem> raw = hz.getRingbuffer("srs.chain.refusedcap");
+        RefusingRing refusing = new RefusingRing(raw, 0, 2);
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(refusing));
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
+        CaptureHealth health = new CaptureHealth();
+        FakeCdcPort port = new FakeCdcPort(
+                List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())));
+
+        CdcPhase.run(port, config(), chain, List::of, health);
+
+        assertThat(refusing.refusalsServed)
+                .as("refusals served, all of them on the capacity read")
+                .isEqualTo(2);
+        assertThat(raw.tailSequence())
+                .as("the change still landed: the capacity read waited rather than ending the capture")
+                .isEqualTo(0L);
+        assertThat(health.failure()).isEmpty();
+    }
+
+    /**
+     * A cluster that never comes back stops the capture, with a code that says so.
+     *
+     * <p>Waiting is right while the refusal is the transient one; waiting for ever is not. A member being
+     * refused for good would otherwise hold a capture that reads as healthy and moves nothing, which is
+     * the failure nobody sees. So the wait carries a bound, and reaching it is a coded fault naming the
+     * table and how long it waited -- not the library's exception, which says only that some cluster size
+     * was not met.
+     *
+     * <p>Read at the instants either side of the bound rather than by running one: a case that has to
+     * sleep the whole bound out to reach the branch is a case that gets deleted the first time somebody is
+     * in a hurry, and sleeping proves nothing the instants do not. The refusal is kept as the cause, so
+     * what the cluster actually said survives into the report.
+     */
+    @Test
+    void aClusterThatNeverComesBackStopsTheCaptureWithACodeRatherThanWaitingForEver() {
+        RuntimeException refused = new RuntimeException("the cluster said no");
+        long until = 1_000_000_000L;
+
+        // A moment before the bound: still waiting, and the wait is what keeps a converging cluster alive.
+        CdcPhase.stopIfTheClusterNeverCameBack(refused, until, until - 1, "orders");
+
+        // At the bound and past it: stopped. The boundary itself is read, because a bound that only fires
+        // strictly after it is one nobody can state.
+        for (long now : new long[] {until, until + 1}) {
+            assertThatThrownBy(() -> CdcPhase.stopIfTheClusterNeverCameBack(refused, until, now, "orders"))
+                    .isInstanceOfSatisfying(TapstateException.class, stopped -> {
+                        assertThat(stopped.code()).isEqualTo(CaptureError.CLUSTER_REFUSED_WRITES);
+                        assertThat(stopped.args()).containsEntry("table", "orders");
+                        assertThat(stopped.args()).containsKey("seconds");
+                        assertThat(stopped.getCause())
+                                .as("what the cluster said is carried, not replaced")
+                                .isSameAs(refused);
+                    });
+        }
+    }
+
+    /**
+     * A refusal while the capture is being torn down stops waiting instead of spinning the bound out.
+     *
+     * <p>Closing a subscription interrupts the thread the source reads on. An interrupted thread's park
+     * returns immediately, every time -- so a wait that ignored the interrupt would stop being a wait and
+     * become a tight loop hammering a cluster that is saying no, for the whole bound, on a capture that is
+     * already going away. The refusal is what comes out, not the coded verdict: the cluster never got the
+     * chance to come back, and saying it did not would be a diagnosis of the wrong thing.
+     */
+    @Test
+    void aRefusalWhileTheCaptureIsClosingStopsWaitingRatherThanSpinningOutTheBound() {
+        Ringbuffer<SrsItem> raw = hz.getRingbuffer("srs.chain.refusedclosing");
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(new RefusingRing(raw, 1, 0)));
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
+        FakeCdcPort port = new FakeCdcPort(
+                List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())));
+
+        Thread.currentThread().interrupt();
+        try {
+            assertThatThrownBy(() -> CdcPhase.run(port, config(), chain, List::of, new CaptureHealth()))
+                    .as("the refusal itself, rather than a wait that cannot wait")
+                    .isInstanceOf(RingWriteRefusedException.class);
+        } finally {
+            // Clear it, or every case after this one inherits an interrupted thread.
+            Thread.interrupted();
+        }
+    }
+
     @Test
     void stopsTheStreamThroughTheReturnedSubscription() {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.sub")));
@@ -718,6 +859,134 @@ class CdcPhaseTest {
         @Override
         public DiscoveredSchema discoverSchema(CaptureConfig config) {
             throw new UnsupportedOperationException();
+        }
+    }
+
+    /**
+     * A ring that refuses its first {@code refusals} write operations the way a Hazelcast member does while
+     * the cluster's split brain protection has not agreed yet, then delegates everything to the real ring
+     * behind it.
+     *
+     * <p>It raises the library's own exception, from the two calls admitting a write actually makes -- the
+     * tail read the headroom precheck takes, and the append itself -- and raises each the way the library
+     * does: the tail read throws where it is called, the append reports through its future. A refusal shaped
+     * any other way would make this a case about this double rather than about a member.
+     */
+    private static final class RefusingRing implements Ringbuffer<SrsItem> {
+
+        private final Ringbuffer<SrsItem> delegate;
+        private int writeRefusalsLeft;
+        private int capacityRefusalsLeft;
+        int refusalsServed;
+
+        RefusingRing(Ringbuffer<SrsItem> delegate, int writeRefusals, int capacityRefusals) {
+            this.delegate = delegate;
+            this.writeRefusalsLeft = writeRefusals;
+            this.capacityRefusalsLeft = capacityRefusals;
+        }
+
+        private boolean stillRefusingTheWrite() {
+            if (writeRefusalsLeft <= 0) {
+                return false;
+            }
+            writeRefusalsLeft--;
+            refusalsServed++;
+            return true;
+        }
+
+        private boolean stillRefusingTheCapacity() {
+            if (capacityRefusalsLeft <= 0) {
+                return false;
+            }
+            capacityRefusalsLeft--;
+            refusalsServed++;
+            return true;
+        }
+
+        private static SplitBrainProtectionException refusal() {
+            return new SplitBrainProtectionException(
+                    "Split brain protection exception: tapstate-committed-membership has failed!");
+        }
+
+        @Override
+        public long tailSequence() {
+            if (stillRefusingTheWrite()) {
+                throw refusal();
+            }
+            return delegate.tailSequence();
+        }
+
+        @Override
+        public CompletionStage<Long> addAllAsync(
+                Collection<? extends SrsItem> collection, OverflowPolicy overflowPolicy) {
+            if (stillRefusingTheWrite()) {
+                return CompletableFuture.failedFuture(refusal());
+            }
+            return delegate.addAllAsync(collection, overflowPolicy);
+        }
+
+        @Override
+        public long capacity() {
+            if (stillRefusingTheCapacity()) {
+                throw refusal();
+            }
+            return delegate.capacity();
+        }
+
+        @Override
+        public long size() {
+            return delegate.size();
+        }
+
+        @Override
+        public long headSequence() {
+            return delegate.headSequence();
+        }
+
+        @Override
+        public long remainingCapacity() {
+            return delegate.remainingCapacity();
+        }
+
+        @Override
+        public long add(SrsItem item) {
+            return delegate.add(item);
+        }
+
+        @Override
+        public CompletionStage<Long> addAsync(SrsItem item, OverflowPolicy overflowPolicy) {
+            return delegate.addAsync(item, overflowPolicy);
+        }
+
+        @Override
+        public SrsItem readOne(long sequence) throws InterruptedException {
+            return delegate.readOne(sequence);
+        }
+
+        @Override
+        public CompletionStage<ReadResultSet<SrsItem>> readManyAsync(
+                long startSequence, int minCount, int maxCount, IFunction<SrsItem, Boolean> filter) {
+            return delegate.readManyAsync(startSequence, minCount, maxCount, filter);
+        }
+
+        @Override
+        public String getPartitionKey() {
+            return delegate.getPartitionKey();
+        }
+
+        @Override
+        public String getName() {
+            return delegate.getName();
+        }
+
+        @Override
+        public String getServiceName() {
+            return delegate.getServiceName();
+        }
+
+        @Override
+        public void destroy() {
+            delegate.destroy();
         }
     }
 

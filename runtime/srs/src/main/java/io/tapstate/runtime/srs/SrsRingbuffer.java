@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import com.hazelcast.ringbuffer.OverflowPolicy;
 import com.hazelcast.ringbuffer.Ringbuffer;
+import com.hazelcast.splitbrainprotection.SplitBrainProtectionException;
 
 import java.util.List;
 import java.util.Objects;
@@ -15,6 +16,13 @@ import java.util.concurrent.CompletionException;
  * <p>Append is a raw write. Overflow safety — the headroom precheck that refuses a write which would
  * overwrite a change no consumer has read yet, and the backpressure that follows — is layered by the
  * caller, not here: this class only writes and reports the ring's bounds.
+ *
+ * <p>One thing is translated rather than passed on: the cluster's own refusal of an operation. Every ring
+ * is guarded by the cluster's split brain protection, and this is the class that holds the library, so
+ * this is where its exception type ends — the write path raises {@link RingWriteRefusedException} instead,
+ * which says the one thing a caller can act on: nothing was written, and the refusal clears on its own.
+ * Only the write path: a read refused the same way has no caller waiting on it, so renaming its failure
+ * would disguise it rather than handle it.
  */
 public final class SrsRingbuffer {
 
@@ -46,7 +54,11 @@ public final class SrsRingbuffer {
      */
     public long append(SrsItem item) {
         Objects.requireNonNull(item, "item");
-        return ringbuffer.add(item);
+        try {
+            return ringbuffer.add(item);
+        } catch (RuntimeException raised) {
+            throw translate(raised);
+        }
     }
 
     /**
@@ -70,9 +82,13 @@ public final class SrsRingbuffer {
             // store said rather than the plumbing that carried it -- a change the store refused is not in
             // the ring, which is the outcome that has to reach the caller intact.
             if (e.getCause() instanceof RuntimeException cause) {
-                throw cause;
+                throw translate(cause);
             }
             throw e;
+        } catch (RuntimeException raised) {
+            // A refusal decided before the operation is even sent arrives here instead, raised where it is
+            // called rather than carried by the future.
+            throw translate(raised);
         }
     }
 
@@ -98,11 +114,33 @@ public final class SrsRingbuffer {
 
     /** The sequence of the most recent item, or {@code -1} when the ring is empty. */
     public long tailSequence() {
-        return ringbuffer.tailSequence();
+        try {
+            return ringbuffer.tailSequence();
+        } catch (RuntimeException raised) {
+            throw translate(raised);
+        }
     }
 
     /** The fixed capacity of the ring — the bound the headroom precheck measures against. */
     public long capacity() {
-        return ringbuffer.capacity();
+        try {
+            return ringbuffer.capacity();
+        } catch (RuntimeException raised) {
+            throw translate(raised);
+        }
+    }
+
+    /**
+     * The cluster's refusal restated in this module's terms, or the original failure when it is not one.
+     *
+     * <p>Every reading the write path takes is a guarded operation, not just the append: the tail the
+     * headroom precheck compares against is a partition operation, and the capacity read is checked
+     * locally against the same protection. A refusal of any of them means the write did not happen, which
+     * is the one thing a caller needs in order to wait and try again.
+     */
+    private RuntimeException translate(RuntimeException raised) {
+        return raised instanceof SplitBrainProtectionException refused
+                ? new RingWriteRefusedException(ringbuffer.getName(), refused)
+                : raised;
     }
 }

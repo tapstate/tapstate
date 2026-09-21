@@ -50,6 +50,7 @@ boot.node-session-ttl-invalid
 boot.workload-claim-renew-interval-invalid
 boot.workload-claim-ttl-invalid
 capture.claim-lost
+capture.cluster-refused-writes
 capture.event-table-not-selected
 capture.snapshot-reports-no-seam
 capture.start-from-outside-window

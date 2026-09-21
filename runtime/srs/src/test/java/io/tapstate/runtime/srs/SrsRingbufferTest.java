@@ -4,9 +4,12 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.SerializerConfig;
+import com.hazelcast.config.SplitBrainProtectionConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.ringbuffer.Ringbuffer;
+import com.hazelcast.splitbrainprotection.SplitBrainProtectionException;
+import com.hazelcast.splitbrainprotection.SplitBrainProtectionOn;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.AfterAll;
@@ -59,6 +62,76 @@ class SrsRingbufferTest {
 
     private static SrsItem insert(String token) {
         return new SrsItem(new SourcePosition(token), Op.INSERT, 1L, null, Map.of("id", 1), 0L);
+    }
+
+    /**
+     * A member the cluster has not qualified refuses the ring, and this class says so in its own terms.
+     *
+     * <p>The refusal is the real one: the member below runs the same split brain protection production
+     * installs on every ring -- {@code READ_WRITE}, a function of the cluster's own choosing -- with a
+     * function that has not agreed. What comes back is therefore whatever the library actually raises on
+     * each of these calls, not a stand-in for it, and the calls are the ones admitting a write makes: the
+     * capacity, the tail the headroom precheck compares against, and the append itself. The library raises
+     * them differently -- two where they are called, one through a future -- and a translation that missed
+     * either shape would leave the caller holding an exception it cannot act on.
+     *
+     * <p>What the caller needs from it is that the write did not happen. The library's own type says only
+     * that some minimum cluster size was not met, and it reaches the capture as a dead change stream.
+     */
+    @Test
+    void aClusterThatHasNotQualifiedThisMemberRefusesTheWriteInTapstatesOwnTerms() {
+        Config config = new Config();
+        config.setClusterName("srs-refusal-test-" + System.nanoTime());
+        config.setProperty("hazelcast.phone.home.enabled", "false");
+        config.setProperty("hazelcast.shutdownhook.enabled", "false");
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
+        config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
+        config.getJetConfig().setEnabled(false);
+        config.getSerializationConfig().addSerializerConfig(
+                new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
+        // The protection production installs, with a verdict that never comes -- the state a member is in
+        // between joining and its own library agreeing, held still.
+        String protection = "never-qualified";
+        config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(protection, true)
+                .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
+                .setFunctionImplementation(members -> false));
+        config.addRingBufferConfig(new RingbufferConfig("srs.*")
+                .setCapacity(8)
+                .setInMemoryFormat(InMemoryFormat.OBJECT)
+                .setTimeToLiveSeconds(0)
+                .setBackupCount(0)
+                .setSplitBrainProtectionName(protection));
+
+        HazelcastInstance refusing = Hazelcast.newHazelcastInstance(config);
+        // Taken while the member is up: the proxy cannot be looked up on a member that is gone, and the
+        // last reading below needs the one this held on to.
+        SrsRingbuffer ring = new SrsRingbuffer(refusing.getRingbuffer("srs.chain-1.refused"));
+        try {
+            assertThatThrownBy(ring::capacity)
+                    .as("the capacity read is checked against the same protection, locally")
+                    .isInstanceOf(RingWriteRefusedException.class)
+                    .hasCauseInstanceOf(SplitBrainProtectionException.class);
+            assertThatThrownBy(ring::tailSequence)
+                    .as("the tail read is a partition operation and throws where it is called")
+                    .isInstanceOf(RingWriteRefusedException.class)
+                    .hasCauseInstanceOf(SplitBrainProtectionException.class);
+            assertThatThrownBy(() -> ring.appendAll(java.util.List.of(insert("w1"))))
+                    .as("the append reports through its future, and is unwrapped to the same answer")
+                    .isInstanceOf(RingWriteRefusedException.class)
+                    .hasCauseInstanceOf(SplitBrainProtectionException.class);
+        } finally {
+            refusing.shutdown();
+        }
+
+        // And nothing else is dressed up as a refusal. The translation says "nothing was written and this
+        // clears itself", which is true of the protection and of nothing else; a failure wearing that
+        // label would be waited on for the whole bound and then reported as a cluster that never came
+        // back -- the wrong diagnosis, arrived at slowly. The member is down by now, which is a failure
+        // from the very same library and must come through as itself.
+        assertThatThrownBy(ring::tailSequence)
+                .as("a member that is gone is not a cluster that is about to agree")
+                .isNotInstanceOf(RingWriteRefusedException.class);
     }
 
     @Test

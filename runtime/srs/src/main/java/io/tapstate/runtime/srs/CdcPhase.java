@@ -11,6 +11,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
 
+import java.time.Duration;
 import java.util.Collection;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -50,6 +51,31 @@ public final class CdcPhase {
      * A signal-driven wake on true consumer advance is a later refinement.
      */
     private static final long BACKPRESSURE_PARK_NANOS = 1_000_000L;
+
+    /**
+     * The off-CPU pause between attempts while the cluster itself is refusing the write. Coarser than the
+     * headroom pause because what clears it is not a consumer moving but a member's library recomputing
+     * the cluster's verdict, which happens on the cluster's schedule -- measured in seconds.
+     */
+    private static final long REFUSAL_PARK_NANOS = 50_000_000L;
+
+    /**
+     * How long a run of cluster refusals is waited out before the capture stops with a coded failure.
+     *
+     * <p>The refusal this absorbs is the one that clears as members' verdicts converge, seconds after a
+     * cluster forms; the bound is an order of magnitude past that, so a transient refusal is never turned
+     * into a terminal one. What the bound keeps is the other half: a member being refused for good has to
+     * say so rather than pause for ever, because a capture waiting in silence is indistinguishable from
+     * one that is running, and a pipeline that reads as healthy while nothing moves is worse than one that
+     * failed.
+     *
+     * <p>Its size is the workload claim's default lease: once the cluster has refused this member's writes
+     * for as long as its work could legitimately have been handed to somebody else, waiting longer cannot
+     * be the right answer. A deployment that shortens that lease only makes this bound generous -- a
+     * capture that has genuinely lost its claim is stopped by the lease itself, on its own thread, and
+     * this bound governs the other case: the claim still held, and the cluster still saying no.
+     */
+    private static final long REFUSAL_BOUND_NANOS = Duration.ofSeconds(30).toNanos();
 
     private CdcPhase() {
     }
@@ -266,18 +292,28 @@ public final class CdcPhase {
      * connector hands over is the connector's to decide.
      */
     private static Admitted admit(TableRoute route, String table, List<SrsItem> items) {
-        int capacity = (int) Math.min(route.chain().gate().capacity(), Integer.MAX_VALUE);
+        SrsWriteGate gate = route.chain().gate();
+        int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table), Integer.MAX_VALUE);
         long lastSeq = -1;
         Collection<ConsumerOffset> offsets = List.of();
         for (int from = 0; from < items.size(); from += capacity) {
             List<SrsItem> piece = items.subList(from, Math.min(from + capacity, items.size()));
+            OptionalLong refusedUntil = OptionalLong.empty();
             while (true) {
                 // Re-read on every attempt, not once for the run: this is the only thing that can tell a
                 // parked write that a consumer has moved, so a bound hoisted out of the loop would park
                 // for ever waiting for room it could no longer see being freed.
                 offsets = route.consumers().get();
-                OptionalLong appended = route.chain().gate()
-                        .appendAll(piece, headroomBound(offsets, table));
+                OptionalLong appended;
+                try {
+                    appended = gate.appendAll(piece, headroomBound(offsets, table));
+                } catch (RingWriteRefusedException refused) {
+                    // The cluster refused, not the headroom: nothing was written, and what refused clears
+                    // itself as the members' verdicts converge. Waiting here is what pauses the source
+                    // read, which is the same answer a full ring already gets.
+                    refusedUntil = OptionalLong.of(waitOutTheRefusal(refused, refusedUntil, table));
+                    continue;
+                }
                 if (appended.isPresent()) {
                     lastSeq = appended.getAsLong();
                     break;
@@ -286,5 +322,61 @@ public final class CdcPhase {
             }
         }
         return new Admitted(lastSeq, offsets);
+    }
+
+    /**
+     * The ring's capacity, waited for the same way a write is.
+     *
+     * <p>Reading it is a guarded operation like any other, so taking it outside the wait would end the
+     * capture on precisely the refusal the wait exists to absorb -- and would do so before a single change
+     * had been offered, which is the moment just after a cluster forms.
+     */
+    private static long capacityOnceTheClusterAllowsIt(SrsWriteGate gate, String table) {
+        OptionalLong refusedUntil = OptionalLong.empty();
+        while (true) {
+            try {
+                return gate.capacity();
+            } catch (RingWriteRefusedException refused) {
+                refusedUntil = OptionalLong.of(waitOutTheRefusal(refused, refusedUntil, table));
+            }
+        }
+    }
+
+    /**
+     * Waits out one refusal and returns the instant this run of them has to end by — armed on the first
+     * refusal and carried across the rest, so the bound measures the stretch the cluster has been saying
+     * no rather than one attempt.
+     */
+    private static long waitOutTheRefusal(
+            RingWriteRefusedException refused, OptionalLong refusedUntil, String table) {
+        if (Thread.currentThread().isInterrupted()) {
+            // The capture is being torn down: closing a subscription interrupts the thread the source
+            // reads on before it stops the connector. Waiting on through that would not be waiting at all
+            // -- an interrupt makes every park return at once, so the wait becomes a spin -- and it would
+            // end in a verdict about the cluster for what is an ordinary close.
+            throw refused;
+        }
+        long now = System.nanoTime();
+        long until = refusedUntil.orElse(now + REFUSAL_BOUND_NANOS);
+        stopIfTheClusterNeverCameBack(refused, until, now, table);
+        LockSupport.parkNanos(REFUSAL_PARK_NANOS);
+        return until;
+    }
+
+    /**
+     * Ends the capture when the cluster has been refusing for the whole bound.
+     *
+     * <p>Split out from the waiting so the decision can be read at the instants that matter rather than by
+     * sleeping the bound out: a case that has to wait thirty seconds to reach a branch is a case that gets
+     * deleted the first time somebody is in a hurry.
+     */
+    static void stopIfTheClusterNeverCameBack(
+            RuntimeException refused, long untilNanos, long nowNanos, String table) {
+        if (nowNanos - untilNanos >= 0) {
+            throw new TapstateException(
+                    CaptureError.CLUSTER_REFUSED_WRITES,
+                    Map.of("table", table, "seconds", REFUSAL_BOUND_NANOS / 1_000_000_000L),
+                    refused);
+        }
     }
 }

@@ -12,14 +12,24 @@ import java.util.Set;
  *
  * <p>{@code placeholders()} is the named-argument contract: every throw site supplies a value for each
  * name, and the build-time placeholder gate checks the message catalog templates against it. Bounded
- * control flow (a refused headroom write, a frontier that cannot yet advance) and connector read faults
- * (already coded {@code connector.*} by the pdk bridge) are deliberately not here — only genuine
- * capture-configuration errors are.
+ * control flow (a refused headroom write, a ring operation the cluster refuses while its members'
+ * verdicts converge, a frontier that cannot yet advance) and connector read faults (already coded
+ * {@code connector.*} by the pdk bridge) are deliberately not here — only genuine capture-configuration
+ * errors are. Where such a wait carries a bound, reaching that bound is a fault and is coded; being
+ * inside it is not.
  */
 public enum CaptureError implements TapstateErrorCode {
 
     /** A live capture could no longer renew the cluster ownership generation that fences its writes. */
     CLAIM_LOST("capture.claim-lost", Set.of("captureId")),
+
+    /**
+     * The cluster refused this member's writes into a change ring for the whole stretch the capture waits
+     * such a refusal out. A refusal while members' verdicts converge is transient and is waited out rather
+     * than coded; this is the one that never cleared, which says this member is not in a cluster that
+     * qualifies to hold the work. {@code table} names the ring's table, {@code seconds} how long it waited.
+     */
+    CLUSTER_REFUSED_WRITES("capture.cluster-refused-writes", Set.of("table", "seconds")),
 
     /** A {@code start_from} value that is neither the {@code earliest} / {@code latest} keyword nor a
      *  parseable ISO-8601 instant; {@code value} carries the offending token. */

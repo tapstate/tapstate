@@ -138,6 +138,9 @@ capture.event-table-not-selected:
 capture.claim-lost:
   message: "Capture `{captureId}` lost its cluster ownership claim."
   solution: "Let the current owner continue from the durable position; do not restart the fenced process."
+capture.cluster-refused-writes:
+  message: "The cluster refused writes for table `{table}` for {seconds}s, so the capture stopped."
+  solution: "Check that every member can reach the coordination store and see the others; start the pipeline again once the cluster reports its full membership."
 capture.snapshot-reports-no-seam:
   message: "The snapshot of chain `{chain}` reported no position for the change tail to resume from."
   solution: "This source cannot hand its full load over to an incremental tail; read it as snapshot only, or use a connector build that reports a stream position."
