@@ -2,6 +2,11 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineMetricsHistory;
+import tools.jackson.core.JacksonException;
+import tools.jackson.core.JsonGenerator;
+import tools.jackson.databind.SerializationContext;
+import tools.jackson.databind.annotation.JsonSerialize;
+import tools.jackson.databind.ser.std.StdScalarSerializer;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -31,7 +36,23 @@ record PipelineHistoryResponse(
     record Point(String intervalStart, String intervalEnd, Rate recordsOut, Rate bytesOut, List<Lag> lag) {
     }
 
-    record Rate(BigDecimal delta, BigDecimal averageRate, BigDecimal maxRate) {
+    record Rate(
+            @JsonSerialize(using = PlainBigDecimalSerializer.class) BigDecimal delta,
+            @JsonSerialize(using = PlainBigDecimalSerializer.class) BigDecimal averageRate,
+            @JsonSerialize(using = PlainBigDecimalSerializer.class) BigDecimal maxRate) {
+    }
+
+    static final class PlainBigDecimalSerializer extends StdScalarSerializer<BigDecimal> {
+
+        PlainBigDecimalSerializer() {
+            super(BigDecimal.class);
+        }
+
+        @Override
+        public void serialize(BigDecimal value, JsonGenerator generator, SerializationContext context)
+                throws JacksonException {
+            generator.writeNumber(value.toPlainString());
+        }
     }
 
     record Lag(String table, String observedAt, long last, long max) {

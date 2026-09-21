@@ -101,6 +101,13 @@ class ControlApiSchemaTest {
         assertThat(historyResult.get("additionalProperties")).isEqualTo(false);
         assertThat(((List<?>) historyResult.get("required")).stream().map(String::valueOf).toList())
                 .contains("segments", "gaps", "unavailable", "nextCursor", "consistency");
+        Map<?, ?> historyProperties = (Map<?, ?>) historyResult.get("properties");
+        Map<?, ?> segments = (Map<?, ?>) historyProperties.get("segments");
+        Map<?, ?> segment = (Map<?, ?>) segments.get("items");
+        Map<?, ?> segmentProperties = (Map<?, ?>) segment.get("properties");
+        Map<?, ?> startReason = (Map<?, ?>) segmentProperties.get("startReason");
+        assertThat(((List<?>) startReason.get("enum")).stream().map(String::valueOf).toList())
+                .containsExactly("WINDOW_START", "CONTINUATION", "COUNTER_RESET", "GAP");
 
         Map<?, ?> explainResult = ControlApiSchema.resolve(ControlOperations.PIPELINE_EXPLAIN.schema().result());
         assertThat(explainResult.get("additionalProperties")).isEqualTo(false);

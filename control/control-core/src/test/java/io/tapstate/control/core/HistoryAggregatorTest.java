@@ -37,12 +37,14 @@ class HistoryAggregatorTest {
         assertThat(first.point().intervalStart()).isEqualTo(FROM);
         assertThat(first.point().intervalEnd()).isEqualTo(Instant.parse("2026-09-21T10:30:00Z"));
         assertThat(first.point().recordsOut().delta()).isEqualByComparingTo("230");
+        assertThat(first.point().recordsOut().delta().toString()).isEqualTo("230");
         assertThat(first.point().recordsOut().averageRate()).isEqualByComparingTo("0.166666667");
         assertThat(first.point().lag()).extracting(PipelineMetricsHistory.Lag::last).containsExactly(2L);
 
         assertThat(second.point().intervalStart()).isEqualTo(Instant.parse("2026-09-21T10:30:00Z"));
         assertThat(second.point().intervalEnd()).isEqualTo(TO);
         assertThat(second.point().recordsOut().delta()).isEqualByComparingTo("160");
+        assertThat(second.point().recordsOut().delta().toString()).isEqualTo("160");
         assertThat(second.point().recordsOut().averageRate()).isEqualByComparingTo("0.205128205");
         assertThat(second.point().recordsOut().maxRate()).isEqualByComparingTo("0.333333333");
         assertThat(second.point().lag()).extracting(PipelineMetricsHistory.Lag::last).containsExactly(12L);

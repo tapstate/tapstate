@@ -266,9 +266,6 @@ public final class PipelineHistoryQueryService {
             }
             tables.add(table);
         }
-        if (tables.size() > PipelineHistoryQuery.MAX_TABLES) {
-            throw malformed("at most " + PipelineHistoryQuery.MAX_TABLES + " table selectors are allowed");
-        }
         if (2 + tables.size() > MAX_SERIES) {
             throw budget("SERIES", MAX_SERIES);
         }
@@ -405,11 +402,7 @@ public final class PipelineHistoryQueryService {
         BigDecimal delta = BigDecimal.valueOf(after - before);
         long nanos = Math.addExact(Math.multiplyExact(elapsed.getSeconds(), 1_000_000_000L), elapsed.getNano());
         BigDecimal rate = delta.multiply(NANOS_PER_SECOND)
-                .divide(BigDecimal.valueOf(nanos), 9, RoundingMode.HALF_EVEN)
-                .stripTrailingZeros();
-        if (rate.signum() == 0) {
-            rate = BigDecimal.ZERO;
-        }
+                .divide(BigDecimal.valueOf(nanos), 9, RoundingMode.HALF_EVEN);
         return new Rate(delta, rate, rate);
     }
 

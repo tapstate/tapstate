@@ -182,7 +182,7 @@ class PipelineObservationApiTest {
         history.append(new RateSample("pl1", NOW.minusSeconds(120),
                 Map.of("records.out", 100L, "bytes.out", 1_000L), Map.of("orders", 5L), COUNTING_SINCE));
         history.append(new RateSample("pl1", NOW.minusSeconds(60),
-                Map.of("records.out", 160L, "bytes.out", 2_200L), Map.of("orders", 2L), COUNTING_SINCE));
+                Map.of("records.out", 700L, "bytes.out", 13_000L), Map.of("orders", 2L), COUNTING_SINCE));
         context.getBean(FakeChainStore.class).reset();
         context.getBean(FakeStoppedPipelines.class).reset();
     }
@@ -409,10 +409,21 @@ class PipelineObservationApiTest {
         assertThat(points).hasSize(2);
         assertThat(points.getFirst()).doesNotContainKeys("recordsOut", "bytesOut");
         assertThat((Map<String, Object>) points.getLast().get("recordsOut"))
-                .containsEntry("delta", 60).containsEntry("averageRate", 1);
+                .containsEntry("delta", 600).containsEntry("averageRate", 10);
         assertThat((List<Map<String, Object>>) points.getLast().get("lag"))
                 .singleElement().satisfies(lag -> assertThat(lag)
                         .containsEntry("table", "orders").containsEntry("last", 2));
+
+        String wire = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/metrics/history")
+                        .queryParam("from", "2026-07-12T11:58:00Z")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .queryParam("resolution", "raw")
+                        .queryParam("table", "orders")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(String.class);
+        assertThat(wire).contains("\"recordsOut\":{\"delta\":600,\"averageRate\":10,\"maxRate\":10}");
     }
 
     @Test

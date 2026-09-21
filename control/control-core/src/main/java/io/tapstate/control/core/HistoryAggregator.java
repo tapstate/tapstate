@@ -30,7 +30,6 @@ public final class HistoryAggregator {
     public static final String BYTES_OUT = "bytes.out";
 
     private static final int INTERNAL_SCALE = 30;
-    private static final int WIRE_SCALE = 9;
     private static final BigDecimal NANOS_PER_SECOND = BigDecimal.valueOf(1_000_000_000L);
 
     /** One completed point and the stateless position from which a later page recomputes. */
@@ -297,11 +296,6 @@ public final class HistoryAggregator {
         return left.isAfter(right) ? left : right;
     }
 
-    private static BigDecimal wire(BigDecimal value) {
-        BigDecimal rounded = value.setScale(WIRE_SCALE, RoundingMode.HALF_EVEN).stripTrailingZeros();
-        return rounded.signum() == 0 ? BigDecimal.ZERO : rounded;
-    }
-
     private record CounterInterval(BigDecimal delta, long nanos, BigDecimal rate) {
     }
 
@@ -328,7 +322,7 @@ public final class HistoryAggregator {
             }
             BigDecimal average = delta.multiply(NANOS_PER_SECOND)
                     .divide(BigDecimal.valueOf(nanos), INTERNAL_SCALE, RoundingMode.HALF_EVEN);
-            return new Rate(wire(delta), wire(average), wire(maxRate));
+            return new Rate(delta, average, maxRate);
         }
     }
 

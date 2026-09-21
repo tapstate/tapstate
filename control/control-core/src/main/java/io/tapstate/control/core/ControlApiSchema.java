@@ -312,7 +312,7 @@ public final class ControlApiSchema {
                         "intervalStart", instant("Inclusive beginning of this continuous segment"),
                         "intervalEnd", instant("Exclusive end of this continuous segment"),
                         "startReason", enumString(
-                                "WINDOW_START", "CONTINUATION", "COUNTER_RESET", "GAP", "EXECUTION_CHANGE"),
+                                "WINDOW_START", "CONTINUATION", "COUNTER_RESET", "GAP"),
                         "points", array(point)),
                 false);
         Map<String, Object> gap = object(

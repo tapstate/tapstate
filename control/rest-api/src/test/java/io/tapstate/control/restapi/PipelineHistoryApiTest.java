@@ -155,7 +155,8 @@ class PipelineHistoryApiTest {
                     assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(selectors.code()).isEqualTo("control.malformed-request");
+        assertThat(selectors.code()).isEqualTo("monitor.query-budget-exceeded");
+        assertThat(selectors.params()).containsEntry("budget", "SERIES").containsEntry("limit", 22);
 
         ApiError unbounded = client().get().uri(uri -> uri
                         .path("/api/pipelines/pl1/metrics/history")

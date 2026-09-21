@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
@@ -20,6 +21,8 @@ public record PipelineMetricsHistory(
         List<Gap> gaps,
         List<Unavailable> unavailable,
         String nextCursor) {
+
+    private static final int WIRE_SCALE = 9;
 
     public PipelineMetricsHistory {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -49,8 +52,7 @@ public record PipelineMetricsHistory(
         WINDOW_START,
         CONTINUATION,
         COUNTER_RESET,
-        GAP,
-        EXECUTION_CHANGE
+        GAP
     }
 
     public enum GapReason {
@@ -78,10 +80,18 @@ public record PipelineMetricsHistory(
 
     public record Rate(BigDecimal delta, BigDecimal averageRate, BigDecimal maxRate) {
         public Rate {
-            Objects.requireNonNull(delta, "delta");
-            Objects.requireNonNull(averageRate, "averageRate");
-            Objects.requireNonNull(maxRate, "maxRate");
+            delta = wireNumber(Objects.requireNonNull(delta, "delta"));
+            averageRate = wireNumber(Objects.requireNonNull(averageRate, "averageRate"));
+            maxRate = wireNumber(Objects.requireNonNull(maxRate, "maxRate"));
         }
+    }
+
+    private static BigDecimal wireNumber(BigDecimal value) {
+        BigDecimal rounded = value.setScale(WIRE_SCALE, RoundingMode.HALF_EVEN).stripTrailingZeros();
+        if (rounded.signum() == 0) {
+            return BigDecimal.ZERO;
+        }
+        return rounded.scale() < 0 ? rounded.setScale(0) : rounded;
     }
 
     public record Lag(String table, Instant observedAt, long last, long max) {

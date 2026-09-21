@@ -120,10 +120,9 @@ Every segment has one `startReason`:
 | `CONTINUATION` | First segment on a later page |
 | `COUNTER_RESET` | Outbound counter start changed or the counter decreased |
 | `GAP` | Samples were too far apart to connect |
-| `EXECUTION_CHANGE` | Internal execution ownership changed without claiming a counter reset |
 
-Only `COUNTER_RESET` means reset. Do not treat every new segment as one, and never join across a `GAP`
-or an `EXECUTION_CHANGE`. The top-level `gaps` array gives explicit `SAMPLE_GAP` intervals related to
+Only `COUNTER_RESET` means reset. Do not treat every new segment as one, and never join across a `GAP`.
+The top-level `gaps` array gives explicit `SAMPLE_GAP` intervals related to
 the current page. Merge pages before claiming you have the complete set of gaps for a window.
 
 Points, segments, gaps, and selected table lag are ordered. Samples with the same observation timestamp

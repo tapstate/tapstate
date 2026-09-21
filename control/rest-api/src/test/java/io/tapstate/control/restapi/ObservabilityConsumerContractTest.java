@@ -97,11 +97,7 @@ class ObservabilityConsumerContractTest {
                         segment("2026-09-20T10:30:00Z", "2026-09-20T10:45:00Z",
                                 StartReason.GAP,
                                 point("2026-09-20T10:30:00Z", "2026-09-20T10:45:00Z",
-                                        rate(9000, 10, 12), null, List.of())),
-                        segment("2026-09-20T10:45:00Z", "2026-09-20T11:00:00Z",
-                                StartReason.EXECUTION_CHANGE,
-                                point("2026-09-20T10:45:00Z", "2026-09-20T11:00:00Z",
-                                        rate(9000, 10, 20), null, List.of()))),
+                                        rate(9000, 10, 12), null, List.of()))),
                 List.of(new Gap(Instant.parse("2026-09-20T10:06:00Z"),
                         Instant.parse("2026-09-20T10:30:00Z"), GapReason.SAMPLE_GAP)),
                 List.of(new Unavailable("bytes.out", null)), null);
@@ -131,6 +127,15 @@ class ObservabilityConsumerContractTest {
 
         assertGolden(PipelineHistoryResponse.of(auto), "history-auto-page-1.golden.json");
         assertGolden(PipelineHistoryResponse.of(missing), "history-single-metric-missing.golden.json");
+    }
+
+    @Test
+    void historyRatesAlwaysSerializeAsPlainJsonNumbers() throws Exception {
+        PipelineHistoryResponse.Rate rate = new PipelineHistoryResponse.Rate(
+                new BigDecimal("1200"), new BigDecimal("0.000000001"), new BigDecimal("1000000000000"));
+
+        assertThat(JSON.writeValueAsString(rate)).isEqualTo(
+                "{\"delta\":1200,\"averageRate\":0.000000001,\"maxRate\":1000000000000}");
     }
 
     @Test
