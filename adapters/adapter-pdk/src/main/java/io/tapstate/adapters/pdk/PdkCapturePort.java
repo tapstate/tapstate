@@ -31,13 +31,17 @@ import io.tapdata.pdk.apis.functions.connector.source.TimestampToStreamOffsetFun
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -61,17 +65,35 @@ public final class PdkCapturePort implements CapturePort {
     private static final int SAMPLE_SIZE = 10;
     private static final long SHUTDOWN_JOIN_MILLIS = 2000;
 
+    /** The longest an Oracle LogMiner start waits for connector initialization and schema discovery. */
+    public static final Duration DEFAULT_PREFLIGHT_TIMEOUT = Duration.ofSeconds(30);
+
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
+    private final Duration preflightTimeout;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
-        this(provisioner, null);
+        this(provisioner, null, DEFAULT_PREFLIGHT_TIMEOUT);
     }
 
     public PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore) {
+        this(provisioner, stateStore, DEFAULT_PREFLIGHT_TIMEOUT);
+    }
+
+    public PdkCapturePort(
+            ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout) {
         this.provisioner = provisioner;
         this.stateStore = stateStore;
+        this.preflightTimeout = requirePositive(preflightTimeout);
+    }
+
+    private static Duration requirePositive(Duration timeout) {
+        Objects.requireNonNull(timeout, "preflightTimeout");
+        if (timeout.isZero() || timeout.isNegative()) {
+            throw new IllegalArgumentException("preflightTimeout must be positive");
+        }
+        return timeout;
     }
 
     @Override
@@ -162,18 +184,26 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     /** Waits until LogMiner's worker has accepted its discovered identifiers, cleaning up a refusal. */
-    private static void awaitPreflight(
+    private void awaitPreflight(
             CompletableFuture<Void> preflight, PdkConnector connector, Thread thread) {
         if (preflight == null) {
             return;
         }
         try {
-            preflight.join();
-        } catch (CompletionException failure) {
-            thread.interrupt();
-            connector.stopQuietly();
-            joinQuietly(thread);
-            connector.close();
+            preflight.get(preflightTimeout.toNanos(), TimeUnit.NANOSECONDS);
+        } catch (TimeoutException failure) {
+            shutDown(connector, thread);
+            throw new TapstateException(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT,
+                    Map.of("connector", connector.connectorId(),
+                            "timeout", preflightTimeout.toMillis() + "ms"), failure);
+        } catch (InterruptedException failure) {
+            shutDown(connector, thread);
+            Thread.currentThread().interrupt();
+            throw new TapstateException(ConnectorError.CAPTURE_FAILED,
+                    Map.of("connector", connector.connectorId(),
+                            "detail", "change-capture preflight was interrupted"), failure);
+        } catch (ExecutionException failure) {
+            shutDown(connector, thread);
             Throwable cause = failure.getCause();
             if (cause instanceof RuntimeException runtime) {
                 throw runtime;
@@ -183,6 +213,14 @@ public final class PdkCapturePort implements CapturePort {
             }
             throw new IllegalStateException(cause);
         }
+    }
+
+    /** Ends a worker whose preflight cannot be returned, then discards its connector handle. */
+    private static void shutDown(PdkConnector connector, Thread thread) {
+        thread.interrupt();
+        connector.stopQuietly();
+        joinQuietly(thread);
+        connector.close();
     }
 
     @Override

@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -440,6 +441,47 @@ class PdkCapturePortTest {
                             .containsEntry("identifier", longColumn)
                             .containsEntry("limit", 30);
                 });
+    }
+
+    @Test
+    void aBlockedLogMinerPreflightTimesOutAndDoesNotStarveTheNextPipeline(@TempDir Path dir) throws Exception {
+        Path blocked = Synthetic.blockingDiscoverySource(dir.resolve("blocked"));
+        Path healthy = Synthetic.emittingSource(dir.resolve("healthy"));
+        ConnectorRef blockedRef = new ConnectorRef(
+                List.of(blocked), "synthetic.BlockingDiscoverySource", "2.0.8", null);
+        ConnectorRef healthyRef = new ConnectorRef(
+                List.of(healthy), "synthetic.EmittingSource", "2.0.8", null);
+        ConnectorProvisioner provisioner = connectorId -> "oracle".equals(connectorId) ? blockedRef : healthyRef;
+        Duration timeout = Duration.ofMillis(100);
+        PdkCapturePort port = new PdkCapturePort(provisioner, null, timeout);
+        CaptureConfig blockedConfig = new CaptureConfig(
+                "oracle", Map.of("schema", "SUPPORTED", "autoLog", false), List.of());
+
+        long started = System.nanoTime();
+        assertThatThrownBy(() -> port.cdc(blockedConfig, CaptureStart.present(), (events, position) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    TapstateException timeoutFailure = (TapstateException) error;
+                    assertThat(timeoutFailure.code()).isEqualTo(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT);
+                    assertThat(timeoutFailure.args())
+                            .containsEntry("connector", "oracle")
+                            .containsEntry("timeout", "100ms");
+                });
+        assertThat(Duration.ofNanos(System.nanoTime() - started))
+                .as("the blocked preflight releases the reconciliation caller")
+                .isLessThan(Duration.ofSeconds(3));
+        assertThat(Thread.getAllStackTraces().keySet())
+                .as("the stopped connector's preflight worker was joined")
+                .noneMatch(thread -> thread.isAlive() && "tapstate-cdc-oracle".equals(thread.getName()));
+
+        CountDownLatch delivered = new CountDownLatch(1);
+        try (Subscription ignored = port.cdc(
+                new CaptureConfig("demo", Map.of(), List.of("t1")), CaptureStart.present(),
+                (events, position) -> delivered.countDown())) {
+            assertThat(delivered.await(5, TimeUnit.SECONDS))
+                    .as("the next pipeline reconciles after the first preflight times out")
+                    .isTrue();
+        }
     }
 
     /**

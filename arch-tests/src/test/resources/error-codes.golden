@@ -103,6 +103,7 @@ connector.instance-limit-reached
 connector.instances-busy
 connector.load-failed
 connector.logminer-identifier-too-long
+connector.logminer-preflight-timeout
 connector.no-connector-class
 connector.not-found
 connector.not-official

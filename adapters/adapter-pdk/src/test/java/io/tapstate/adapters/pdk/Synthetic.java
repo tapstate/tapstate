@@ -38,6 +38,13 @@ final class Synthetic {
     /** The shared source scaffold with a caller-supplied discovery body. */
     private static String source(
             String simpleName, String ctorBody, String registerBody, String members, String discoveryBody) {
+        return source(simpleName, ctorBody, registerBody, members, discoveryBody, "");
+    }
+
+    /** The shared source scaffold with caller-supplied discovery and stop bodies. */
+    private static String source(
+            String simpleName, String ctorBody, String registerBody, String members,
+            String discoveryBody, String stopBody) {
         return ""
                 + "package synthetic;"
                 + "import io.tapdata.pdk.apis.TapConnector;"
@@ -64,7 +71,7 @@ final class Synthetic {
                 + registerBody
                 + "  }"
                 + "  public void init(TapConnectionContext c) {}"
-                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {" + stopBody + "}"
                 + "  public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> s) {"
                 + discoveryBody
                 + "  }"
@@ -75,6 +82,17 @@ final class Synthetic {
                 + "  public int tableCount(TapConnectionContext c) { return 1; }"
                 + members
                 + "}";
+    }
+
+    /** A stream source whose schema discovery does not return until the host stops the connector. */
+    static Path blockingDiscoverySource(Path dir) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  throw new IllegalStateException(\"stream read must not start\");"
+                + "});";
+        String members = "private volatile boolean stopped;";
+        String discovery = "while (!stopped) { java.util.concurrent.locks.LockSupport.parkNanos(1000000L); }";
+        return SyntheticJar.compileToJar(dir, "synthetic.BlockingDiscoverySource",
+                source("BlockingDiscoverySource", "", register, members, discovery, "stopped = true;"));
     }
 
     /** A stream source whose discovered table and column names are supplied by the caller. */

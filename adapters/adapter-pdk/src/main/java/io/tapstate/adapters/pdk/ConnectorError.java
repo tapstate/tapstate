@@ -117,6 +117,13 @@ public enum ConnectorError implements TapstateErrorCode {
             Set.of("connector", "kind", "identifier", "limit")),
 
     /**
+     * Oracle LogMiner did not finish connector initialization and schema discovery within the start
+     * deadline, so its worker and connector were stopped instead of holding the reconciliation loop.
+     * {@code connector} is the Oracle connector id; {@code timeout} is how long preflight was given.
+     */
+    LOGMINER_PREFLIGHT_TIMEOUT("connector.logminer-preflight-timeout", Set.of("connector", "timeout")),
+
+    /**
      * The connector requires a newer PDK API level than the bridge provides, so it is refused rather
      * than silently downgraded. {@code connector} is the connector id; {@code required} is the level
      * it asked for; {@code provided} is the level the bridge provides.
