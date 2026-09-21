@@ -17,10 +17,14 @@ import org.junit.jupiter.api.Test;
  * asserting that nothing broke. The cut has to be reaching something before any conclusion drawn from
  * it means anything.
  *
- * <p>So the reading is in two halves and both are needed. They became one cluster of three — the same
- * thing a two-member case asserts, and the half that fails if reporting a link address stops the
- * cluster forming at all. And every link carried connections — the half that fails if the members
- * found each other directly, which looks identical from the membership alone.
+ * <p>So the reading is in three halves and all of them are needed. They became one cluster of three —
+ * the same thing a two-member case asserts, and the half that fails if reporting a link address stops
+ * the cluster forming at all. Every link carried connections — the half that fails if the members
+ * found each other directly, which looks identical from the membership alone. And every one of those
+ * connections was attributed to the member that dialled it — the half that fails if members stop
+ * dialling from the ports they were told to, which is the only thing telling the links apart who is
+ * calling. Without the third, a later cut aimed at one member would let its traffic through and the
+ * partition case would pass by asserting that a cluster nobody separated stayed separate.
  */
 class ThreeMembersJoinThroughCuttableLinksIT {
 
@@ -30,7 +34,7 @@ class ThreeMembersJoinThroughCuttableLinksIT {
     }
 
     @Test
-    void threeProcessesJoinThroughTheirLinksAndEveryLinkCarriesTraffic() {
+    void threeProcessesJoinThroughTheirLinksAndEveryLinkKnowsWhoDialledIt() {
         String store = SharedMongo.replicaSetUrl("e2e_three_members");
         List<String> nodes = List.of("node-a", "node-b", "node-c");
 
@@ -56,6 +60,17 @@ class ThreeMembersJoinThroughCuttableLinksIT {
                     .describedAs("and the pair that does not involve the first member also went through "
                             + "a link, which is what a cut has to leave alone")
                     .isGreaterThan(0);
+            assertThat(cluster.linkTo("node-a").carriedFrom("node-b")
+                            + cluster.linkTo("node-a").carriedFrom("node-c"))
+                    .describedAs("the first member's link could say which member each connection came "
+                            + "from. Nought here with a positive total above means every one of them "
+                            + "arrived unattributed and no cut could pick one out")
+                    .isGreaterThan(0);
+            assertThat(cluster.unattributedConnections())
+                    .describedAs("and none of them arrived from a port belonging to no member. Any at "
+                            + "all would survive a cut aimed at its dialler, so a partition read off "
+                            + "this cluster would be reading a cluster that was never separated")
+                    .isZero();
         }
     }
 }
