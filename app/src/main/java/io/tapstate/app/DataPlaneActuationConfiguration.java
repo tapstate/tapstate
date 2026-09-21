@@ -18,6 +18,7 @@ import java.time.Duration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.lang.Nullable;
 
 /**
@@ -58,8 +59,9 @@ class DataPlaneActuationConfiguration {
 
     @Bean
     CapturePort capturePort(ConnectorProvisioner connectorProvisioner,
-            @Nullable KeyedStateStore keyedStateStore) {
-        return new PdkCapturePort(connectorProvisioner, keyedStateStore);
+            @Nullable KeyedStateStore keyedStateStore,
+            @Value("${tapstate.capture.log-miner-preflight-timeout:30s}") Duration preflightTimeout) {
+        return new PdkCapturePort(connectorProvisioner, keyedStateStore, preflightTimeout);
     }
 
     @Bean
