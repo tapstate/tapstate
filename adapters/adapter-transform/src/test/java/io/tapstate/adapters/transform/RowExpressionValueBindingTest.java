@@ -87,6 +87,17 @@ class RowExpressionValueBindingTest {
     }
 
     @Test
+    @DisplayName("carries a present null through an expression as a row null")
+    void carriesPresentNullThroughAsNull() {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("customer", null);
+
+        Map<String, Object> after = compute("moved", "after.customer", row);
+
+        assertThat(after).containsEntry("moved", null);
+    }
+
+    @Test
     @DisplayName("refuses an integral value too large for an int64 rather than wrapping it")
     void refusesIntegralValueBeyondInt64() {
         // A value this wide is one the value model names no lossless target for, so it reaches the

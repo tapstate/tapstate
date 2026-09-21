@@ -1,6 +1,7 @@
 package io.tapstate.adapters.transform;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.NullValue;
 import dev.cel.common.CelAbstractSyntaxTree;
 import dev.cel.runtime.CelEvaluationException;
 import dev.cel.runtime.CelRuntime;
@@ -25,8 +26,8 @@ import java.util.function.UnaryOperator;
  * {@code op} as its wire symbol, {@code ts} / {@code src} as scalars, and {@code before} / {@code
  * after} / {@code schema} as maps (an absent map binds empty, so a present-field test is well
  * defined rather than a null dereference). The row's values already speak the tapstate value model,
- * having been carried into it where the columns' types were resolved; the only thing binding adds is
- * the byte string this language uses for bytes, which evaluation takes back off again.
+ * having been carried into it where the columns' types were resolved; binding adds the representations
+ * this language uses for null and bytes, which evaluation takes back off again.
  */
 final class RowExpressionProgram {
 
@@ -94,9 +95,10 @@ final class RowExpressionProgram {
     // expression can do arithmetic on. Nothing here re-decides that: a second widening would be a
     // second opinion about what a column is, and the one thing it could add is a disagreement.
     //
-    // What is left is the one representation this language needs and the row does not have. Bytes
-    // travel as the language's own byte string, which is a wrapper rather than a value: it goes on
-    // here and comes back off in unbound, so a sink is still owed the row's own bytes.
+    // What is left are the representations this language needs and the row does not have. A Java null
+    // is the evaluator's marker for an unknown lookup, so a present null has to travel as CEL's null
+    // value instead. Bytes travel as the language's own byte string. Both wrappers go on here and come
+    // back off in unbound, so a sink is still owed the row's own values.
     //
     // Nested values are wrapped too, since a document's own fields and an array's elements are as
     // reachable from an expression as a top-level column. A container whose contents all pass through
@@ -109,16 +111,22 @@ final class RowExpressionProgram {
         if (value instanceof ConvertedValue carried) {
             return bound(carried.value());
         }
+        if (value == null) {
+            return NullValue.NULL_VALUE;
+        }
         if (value instanceof byte[] bytes) {
             return ByteString.copyFrom(bytes);
         }
         return mapped(value, RowExpressionProgram::bound);
     }
 
-    // The reverse, for what an expression hands back. The byte string is the expression language's
-    // own wrapper; a sink is owed the row's bytes, so a value that merely travelled through an
-    // expression leaves as the kind of value it arrived as.
+    // The reverse, for what an expression hands back. CEL null and the byte string are the expression
+    // language's own wrappers; a sink is owed the row's values, so a value that merely travelled
+    // through an expression leaves as the kind of value it arrived as.
     private static Object unbound(Object value) {
+        if (value == NullValue.NULL_VALUE) {
+            return null;
+        }
         if (value instanceof ByteString bytes) {
             return bytes.toByteArray();
         }

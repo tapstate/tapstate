@@ -75,6 +75,8 @@ public final class MongoStorePort implements StorePort {
     public static final String CONNECTION_TEST_RESULTS = "connection_test_results";
     /** The collection holding one SRS coordination record per mining chain. */
     public static final String SRS_META = "srs_meta";
+    /** The collection holding one durable SRS cursor per consumer pipeline and mining chain. */
+    public static final String SRS_CONSUMER_OFFSETS = "srs_consumer_offsets";
 
     /** The durable change log: one document per change that entered a chain's per-table ring. */
     public static final String SRS_LOG = "srs_log";
@@ -164,7 +166,8 @@ public final class MongoStorePort implements StorePort {
         this.rateHistory = new MongoRateHistoryStore(
                 database, SystemCollections.PIPELINE_RATE_HISTORY.on(database), rateHistoryRetention);
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
-        this.meta = new MongoSrsMetaStore(SystemCollections.SRS_META.on(database));
+        this.meta = new MongoSrsMetaStore(connection.client(),
+                SystemCollections.SRS_META.on(database), SystemCollections.SRS_CONSUMER_OFFSETS.on(database));
         this.srsLog = new MongoSrsLogStore(SystemCollections.SRS_LOG.on(database));
         this.derivedSchemas = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(database));
         // Operator state alone sits in its configured database on the same client. Same connection, same
