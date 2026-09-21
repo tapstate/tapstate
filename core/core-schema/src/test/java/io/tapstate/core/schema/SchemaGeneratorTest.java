@@ -219,8 +219,8 @@ class SchemaGeneratorTest {
 
         Json.Obj nest = (Json.Obj) ((Json.Obj) defs.get("TransformBody.Nest")).get("properties");
         Json.Obj state = (Json.Obj) nest.get("state");
-        assertThat(state).isEqualTo(
-                new Json.Obj(List.of(new Json.Entry("$ref", new Json.Str("#/$defs/NestStateStorage")))));
+        assertThat(state.get("$ref")).isEqualTo(new Json.Str("#/$defs/NestStateStorage"));
+        assertThat(state.get("description")).isNotNull();
         Json.Obj stateProperties =
                 (Json.Obj) ((Json.Obj) defs.get("NestStateStorage")).get("properties");
         assertThat(stateProperties.get("database")).isNotNull();

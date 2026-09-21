@@ -3,7 +3,6 @@ package io.tapstate.e2e;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
-import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -222,8 +221,7 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                 MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.login("e2e", "e2e-password");
-            control.apply(Map.of("pipeline.tap.yml",
-                    pipelineYaml(MIGRATION_PIPELINE, MIGRATION_VIEW, MIGRATION_NEW)));
+            applyMigrationResources(control, source, warehouse, MIGRATION_NEW);
             control.lifecycle(MIGRATION_PIPELINE, LifecycleVerb.START);
             Await.until("the migrated pipeline is running before the parent arrives",
                     () -> control.state(MIGRATION_PIPELINE).orElse(null) == PipelineState.RUNNING,
@@ -420,16 +418,23 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
         Document shape = new Document("_id.ns", "nest.shape." + pipelineId).append("_id.k", stepId);
         Document stateFilter = new Document("$or", List.of(mapNamespaces, shape));
         try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(from))) {
-            copy(client.getDatabase(from).getCollection(MongoStorePort.OPERATOR_STATE),
-                    client.getDatabase(to).getCollection(MongoStorePort.OPERATOR_STATE), stateFilter);
-            copy(client.getDatabase(from).getCollection(MongoStorePort.NEST_DEAD_LETTERS),
-                    client.getDatabase(to).getCollection(MongoStorePort.NEST_DEAD_LETTERS), mapNamespaces);
+            merge(client.getDatabase(from).getCollection(MongoStorePort.OPERATOR_STATE),
+                    to, MongoStorePort.OPERATOR_STATE, stateFilter);
+            merge(client.getDatabase(from).getCollection(MongoStorePort.NEST_DEAD_LETTERS),
+                    to, MongoStorePort.NEST_DEAD_LETTERS, mapNamespaces);
         }
     }
 
-    private static void copy(MongoCollection<Document> from, MongoCollection<Document> to, Document filter) {
-        from.find(filter).forEach(document -> to.replaceOne(
-                new Document("_id", document.get("_id")), document, new ReplaceOptions().upsert(true)));
+    private static void merge(
+            MongoCollection<Document> source, String targetDatabase, String targetCollection, Document filter) {
+        source.aggregate(List.of(
+                        new Document("$match", filter),
+                        new Document("$merge", new Document("into", new Document("db", targetDatabase)
+                                        .append("coll", targetCollection))
+                                .append("on", "_id")
+                                .append("whenMatched", "replace")
+                                .append("whenNotMatched", "insert"))))
+                .toCollection();
     }
 
     private static boolean migratedDocumentHasChild(MongoEndpoints mongo, EndpointAddress target) {
