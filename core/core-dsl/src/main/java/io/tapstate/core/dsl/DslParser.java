@@ -114,8 +114,8 @@ public final class DslParser {
     static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", OPTIONS_FIELD);
     private static final Set<String> NEST_ROOT_KEYS =
             Set.of("from", "key", "mode", "trackKeyChanges", "embed");
-    private static final Set<String> NEST_STATE_KEYS = Set.of("database");
-    private static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
+    static final Set<String> NEST_STATE_KEYS = Set.of("database");
+    static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
             "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
     private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD);
