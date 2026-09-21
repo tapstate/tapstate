@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
@@ -42,6 +43,7 @@ import java.net.ServerSocket;
 import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The embedded Hazelcast member wired by the assembly root: exactly one full member per process,
@@ -130,6 +132,77 @@ class HazelcastMemberTest {
         assertThat(join.getKubernetesConfig().isEnabled()).isFalse();
         assertThat(config.getNetworkConfig().getPort()).isEqualTo(5702);
         assertThat(config.getNetworkConfig().isPortAutoIncrement()).isFalse();
+    }
+
+    /**
+     * A member reports the address the deployment gives it, and still binds the one it was told to bind.
+     *
+     * <p>Members exchange the address each reports for itself and dial that from then on, so a member
+     * behind a port mapping is unreachable unless it can report the outside of the mapping. The two have
+     * to be read together: reporting the outside while binding the inside is the whole arrangement, and a
+     * change that quietly made the member bind what it reports would pass a case that only read one.
+     */
+    @Test
+    void aMemberReportsTheAddressItIsGivenAndStillBindsTheOneItWasTold() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "10.20.0.11:15701",
+                "tapstate.hz.bind-address", "10.0.0.5",
+                "tapstate.hz.member-port", "5701",
+                "tapstate.hz.advertised-member-address", "10.20.0.11:15701"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+
+        assertThat(config.getNetworkConfig().getPublicAddress())
+                .as("what the others are told to dial")
+                .isEqualTo("10.20.0.11:15701");
+        assertThat(config.getNetworkConfig().getInterfaces().getInterfaces())
+                .as("what it actually binds, which the report does not move")
+                .containsExactly("10.0.0.5");
+        assertThat(config.getNetworkConfig().getPort())
+                .as("and the port it actually binds, which a mapped port does not move either")
+                .isEqualTo(5701);
+    }
+
+    /**
+     * Left out, a member reports what it binds -- the byte-for-byte behaviour of every deployment that
+     * has nothing in front of it.
+     */
+    @Test
+    void aMemberGivenNoAddressToReportReportsNothingAndIsLeftAsItWas() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+
+        assertThat(config.getNetworkConfig().getPublicAddress())
+                .as("nothing is reported, so the member reports what it binds")
+                .isNull();
+    }
+
+    /**
+     * With discovery off there is nobody to be reached by, so an address to report is refused rather than
+     * accepted and ignored.
+     *
+     * <p>A loopback-only member has no other members. An address here is either a misconfiguration or a
+     * preparation for something this mode does not do; accepted silently, both look like a working
+     * cluster right up until somebody asks why nothing joined.
+     */
+    @Test
+    void anAddressToReportIsRefusedWhileDiscoveryIsOff() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.advertised-member-address", "10.20.0.11:15701"));
+
+        assertThatThrownBy(() -> HazelcastConfiguration.memberConfig(properties))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(BootError.DISCOVERY_CONFIG_INVALID);
+                    assertThat(refused.args().get("detail").toString())
+                            .contains("advertised-member-address");
+                });
     }
 
     @Test

@@ -404,6 +404,7 @@ class HazelcastConfiguration {
             LOG.warn("Hazelcast member port is exposed on {} and serves an unauthenticated protocol. "
                     + "Keep it inside a private network or NetworkPolicy.", properties.getBindAddress());
         }
+        applyAdvertisedMemberAddress(config, properties);
         JoinConfig join = config.getNetworkConfig().getJoin();
         join.getAutoDetectionConfig().setEnabled(false);
         join.getMulticastConfig().setEnabled(false);
@@ -546,6 +547,32 @@ class HazelcastConfiguration {
 
     private static boolean hasText(String value) {
         return value != null && !value.isBlank();
+    }
+
+    /**
+     * Tells the member to report an address other than the one it binds, when the deployment says so.
+     *
+     * <p>What this changes is where the other members dial, and nothing else -- the interfaces above
+     * still decide what this member listens on, and therefore who can reach it at all. Reporting an
+     * address nobody can route to is not a way to hide a member that binds a routable interface.
+     *
+     * <p>Refused outright while discovery is off: a single loopback-only member has no others to be
+     * reached by, so an address here is either a misconfiguration or a preparation for something this
+     * mode does not do, and both are worth saying out loud rather than accepting silently.
+     */
+    private static void applyAdvertisedMemberAddress(Config config, HazelcastProperties properties) {
+        String advertised = properties.getAdvertisedMemberAddress();
+        if (!hasText(advertised)) {
+            return;
+        }
+        if (properties.getDiscovery().getMode() == HazelcastProperties.DiscoveryMode.NONE) {
+            throw invalidDiscovery(
+                    "advertised-member-address needs a discovery mode: a loopback-only member has "
+                            + "nobody to advertise to");
+        }
+        config.getNetworkConfig().setPublicAddress(advertised.trim());
+        LOG.info("Hazelcast member advertises {} to the other members and binds {}.",
+                advertised.trim(), properties.getBindAddress());
     }
 
     private static TapstateException invalidDiscovery(String detail) {

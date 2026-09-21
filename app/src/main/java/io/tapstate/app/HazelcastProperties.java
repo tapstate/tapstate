@@ -16,6 +16,7 @@ class HazelcastProperties {
     private String clusterName = "tapstate";
     private int memberPort = 5701;
     private String bindAddress = "127.0.0.1";
+    private String advertisedMemberAddress;
     private Duration heartbeatInterval = Duration.ofSeconds(5);
     private Duration maximumNoHeartbeat = Duration.ofSeconds(30);
     private final Discovery discovery = new Discovery();
@@ -43,6 +44,26 @@ class HazelcastProperties {
 
     void setBindAddress(String bindAddress) {
         this.bindAddress = bindAddress;
+    }
+
+    /**
+     * The address this member tells the others to reach it at, when that is not the address it binds.
+     *
+     * <p>Members exchange the address each one reports for itself, and every later connection dials
+     * that -- so a member behind a port mapping or a translated address is unreachable unless it can
+     * report the outside of that mapping rather than the inside. Absent, a member reports what it
+     * binds, which is what every deployment without one in front of it wants.
+     *
+     * <p>{@code host} or {@code host:port}; the port may differ from the bound one, which is the whole
+     * of a port mapping. It never changes what the member binds, and therefore never changes who can
+     * reach it.
+     */
+    String getAdvertisedMemberAddress() {
+        return advertisedMemberAddress;
+    }
+
+    void setAdvertisedMemberAddress(String advertisedMemberAddress) {
+        this.advertisedMemberAddress = advertisedMemberAddress;
     }
 
     Duration getHeartbeatInterval() {
