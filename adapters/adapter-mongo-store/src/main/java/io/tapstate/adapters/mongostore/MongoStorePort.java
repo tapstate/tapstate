@@ -15,6 +15,7 @@ import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -48,6 +49,8 @@ public final class MongoStorePort implements StorePort {
     public static final String PIPELINE_OBSERVATION = "pipeline_observation";
     /** The collection holding one editor-only canvas layout per pipeline. */
     public static final String PIPELINE_LAYOUTS = "pipeline_layouts";
+    /** The collection holding durable, server-owned Pipeline authoring drafts. */
+    public static final String PIPELINE_DRAFTS = "pipeline_drafts";
     /** The collection holding the registered connection configurations. */
     public static final String CONNECTIONS = "connections";
     /** The collection holding one discovered source model per connection. */
@@ -126,6 +129,7 @@ public final class MongoStorePort implements StorePort {
     private final ConnectionTestResultStore connectionTestResults;
     private final ObservationStore observations;
     private final PipelineLayoutStore layouts;
+    private final PipelineDraftStore drafts;
     private final SrsMetaStore meta;
     private final SrsLogStore srsLog;
     private final DerivedSchemaStore derivedSchemas;
@@ -153,6 +157,8 @@ public final class MongoStorePort implements StorePort {
                 new MongoConnectionTestResultStore(database.getCollection(CONNECTION_TEST_RESULTS));
         this.observations = new MongoObservationStore(database.getCollection(PIPELINE_OBSERVATION));
         this.layouts = new MongoPipelineLayoutStore(database.getCollection(PIPELINE_LAYOUTS));
+        this.drafts = new MongoPipelineDraftStore(connection.client(), database.getCollection(PIPELINE_DRAFTS),
+                database.getCollection(ARTIFACTS));
         this.meta = new MongoSrsMetaStore(database.getCollection(SRS_META));
         this.srsLog = new MongoSrsLogStore(database.getCollection(SRS_LOG));
         this.derivedSchemas = new MongoDerivedSchemaStore(database.getCollection(DERIVED_SCHEMAS));
@@ -223,6 +229,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public PipelineLayoutStore layouts() {
         return layouts;
+    }
+
+    @Override
+    public PipelineDraftStore drafts() {
+        return drafts;
     }
 
     @Override

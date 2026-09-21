@@ -64,6 +64,11 @@ public interface StorePort {
     /** The editor-only canvas layout store; it never changes a Pipeline artifact's content hash. */
     PipelineLayoutStore layouts();
 
+    /** Durable Pipeline authoring drafts; runtime and CLI never read this store. */
+    default PipelineDraftStore drafts() {
+        throw new UnsupportedOperationException("pipeline draft store is not configured");
+    }
+
     /**
      * The cold layer under a stateful operator: one opaque state document per key, within a namespace.
      * Read and written on the data path as keys are handled, never enumerated.
