@@ -131,6 +131,46 @@ class ExecutionAuthorizationTest {
     }
 
     @Test
+    void aRunItsOwnHolderRebuiltOverStopsWritingAndAcknowledgingAtItsDeadline() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence fence = nodeA.beginExecution("orders").fence();
+        CountingWriter target = new CountingWriter();
+        AtomicInteger acked = new AtomicInteger();
+        ExecutionAuthorization guard = guard(claims);
+        SinkWriter writer = FencedSinkWriterFactory.guarded(target, fence, guard);
+        SinkAck ack = FencedSinkAckFactory.guarded((chain, position) -> acked.incrementAndGet(), fence, guard);
+        writer.write(List.of());
+
+        // A member went out from under the run and the member already driving the pipeline rebuilt it.
+        // Nobody took the pipeline over, so this is the supersession the claim generation cannot see:
+        // it stands still, and the two runs are told apart by the execution generation alone.
+        ExecutionFence rebuilt = nodeA.beginExecution("orders").fence();
+        assertThat(rebuilt.claimGeneration())
+                .as("the same member is still driving it, so ownership did not change hands")
+                .isEqualTo(fence.claimGeneration());
+        assertThat(rebuilt.executionGeneration())
+                .as("and the rebuild is a different run all the same")
+                .isEqualTo(fence.executionGeneration() + 1);
+
+        int writtenBefore = target.batches.get();
+        nanos.addAndGet(WINDOW.toNanos());
+
+        assertThatThrownBy(() -> writer.write(List.of()))
+                .as("a member that holds the two generations as one number cannot tell a rebuilt-over run"
+                        + " from the run that replaced it, and keeps writing on behalf of both")
+                .isInstanceOf(TapstateException.class)
+                .extracting(thrown -> ((TapstateException) thrown).code())
+                .isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED);
+        assertThatThrownBy(() -> ack.advance("orders", new ChainPosition(new SourceOrder(1, 2), "w2")))
+                .isInstanceOf(TapstateException.class);
+        assertThat(target.batches.get() - writtenBefore)
+                .as("no batch of the rebuilt-over run is sent after its local deadline").isZero();
+        assertThat(acked)
+                .as("and no durable position is advanced by it either").hasValue(0);
+    }
+
+    @Test
     void aRunWhoseOwnerStoppedRenewingStopsAtTheLeaseEvenThoughNobodyHasTakenItOver() {
         ExecutionFence fence = submittedRun();
         CountingWriter target = new CountingWriter();
