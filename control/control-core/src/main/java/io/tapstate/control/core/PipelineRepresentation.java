@@ -331,6 +331,7 @@ public final class PipelineRepresentation {
             if (embed.as() != EmbedAs.FLAT) {
                 value.put("path", embed.path());
             }
+            value.put("key", embed.key());
             value.put("arrayKey", embed.arrayKey());
             value.put("ignoreUpdates", embed.ignoreUpdates());
             value.put("trackKeyChanges", embed.trackKeyChanges());
@@ -520,25 +521,29 @@ public final class PipelineRepresentation {
         }
         List<Embed> result = new ArrayList<>(values.size());
         for (int index = 0; index < values.size(); index++) {
-            Map<String, Object> value = object(values.get(index), path + "[" + index + "]");
-            EmbedAs as = enumValue(value.get("as"), EmbedAs.values(), EmbedAs::yaml, path + ".as");
-            String embedPath = textOrNull(value.get("path"), path + ".path");
-            List<String> arrayKey = stringsOrNull(value(value, "arrayKey", "array_key"), path + ".arrayKey");
+            String entryPath = path + "[" + index + "]";
+            Map<String, Object> value = object(values.get(index), entryPath);
+            EmbedAs as = enumValue(value.get("as"), EmbedAs.values(), EmbedAs::yaml, entryPath + ".as");
+            String embedPath = textOrNull(value.get("path"), entryPath + ".path");
+            List<String> key = stringsOrNull(value.get("key"), entryPath + ".key");
+            List<String> arrayKey = stringsOrNull(
+                    value(value, "arrayKey", "array_key"), entryPath + ".arrayKey");
             if (as == EmbedAs.FLAT && embedPath != null) {
-                throw malformed(path + "[" + index + "].path is forbidden when as is flat");
+                throw malformed(entryPath + ".path is forbidden when as is flat");
             }
             if (as == EmbedAs.FLAT && arrayKey != null) {
-                throw malformed(path + "[" + index + "].arrayKey is forbidden when as is flat");
+                throw malformed(entryPath + ".arrayKey is forbidden when as is flat");
             }
             result.add(new Embed(
-                    requiredText(value, "from", path),
-                    stringMap(requiredObject(value, "on", path), path + ".on"),
+                    requiredText(value, "from", entryPath),
+                    stringMap(requiredObject(value, "on", entryPath), entryPath + ".on"),
                     as,
-                    as == EmbedAs.FLAT ? null : requiredText(value, "path", path),
+                    as == EmbedAs.FLAT ? null : requiredText(value, "path", entryPath),
+                    key,
                     arrayKey,
-                    booleanOrNull(value(value, "ignoreUpdates", "ignore_updates"), path + ".ignoreUpdates"),
-                    booleanOrNull(value(value, "trackKeyChanges", "track_key_changes"), path + ".trackKeyChanges"),
-                    embeds(listOrNull(value(value, "embed"), path + ".embed"), path + ".embed")));
+                    booleanOrNull(value(value, "ignoreUpdates", "ignore_updates"), entryPath + ".ignoreUpdates"),
+                    booleanOrNull(value(value, "trackKeyChanges", "track_key_changes"), entryPath + ".trackKeyChanges"),
+                    embeds(listOrNull(value(value, "embed"), entryPath + ".embed"), entryPath + ".embed")));
         }
         return List.copyOf(result);
     }

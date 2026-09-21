@@ -22,12 +22,14 @@ class PipelineRepresentationFlatNestTest {
         PipelineResource pipeline = representation.toModel(input(Map.of(
                 "from", "profile",
                 "on", Map.of("customer_id", "id"),
-                "as", "flat")), null);
+                "as", "flat",
+                "key", List.of("profile_id"))), null);
 
         Step.Inline step = (Step.Inline) pipeline.transforms().getFirst();
         Embed embed = ((TransformBody.Nest) step.body()).root().embed().getFirst();
         assertThat(embed.as()).isEqualTo(EmbedAs.FLAT);
         assertThat(embed.path()).isNull();
+        assertThat(embed.key()).containsExactly("profile_id");
 
         PipelineView view = representation.toView(
                 pipeline,
@@ -37,7 +39,10 @@ class PipelineRepresentationFlatNestTest {
         Map<String, Object> root = (Map<String, Object>) view.transforms().getFirst().get("root");
         @SuppressWarnings("unchecked")
         Map<String, Object> represented = ((List<Map<String, Object>>) root.get("embed")).getFirst();
-        assertThat(represented).containsEntry("as", "FLAT").doesNotContainKey("path");
+        assertThat(represented)
+                .containsEntry("as", "FLAT")
+                .containsEntry("key", List.of("profile_id"))
+                .doesNotContainKey("path");
     }
 
     @Test
