@@ -1,12 +1,14 @@
 package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
+import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
@@ -47,6 +49,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 /**
  * That editing a row pointed at from inside an array element reaches every document holding such an
@@ -66,11 +69,14 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
 
     private static final String STEP = "order_doc";
     private static final String PIPELINE = "p-deep";
+    private static final Duration JOB_COMPLETION_BUDGET = Duration.ofSeconds(15);
+    private static final Duration MISSING_RENDERING_BUDGET = Duration.ofMillis(500);
+    private static final Duration EDIT_AFTER = Duration.ofMillis(1800);
 
     /** The one product both orders have a line for. */
     private static final int SHARED_SKU = 7;
 
-    private static final Set<Integer> ORDER_IDS = Set.of(1, 2);
+    private static final List<Integer> ORDER_IDS = List.of(1, 2);
 
     /** What the sink was handed. Static because the writer is built on the member. */
     private static final List<Envelope> WRITTEN = Collections.synchronizedList(new ArrayList<>());
@@ -107,7 +113,7 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
     @Test
     @DisplayName("editing a shared product reaches the lines of every order holding one")
     void bothDocumentsFollowAnEditToTheProductTheirLinesPointAt() {
-        member.getJet().newJob(ordersWithLinesPointingAtProducts()).join();
+        joinWithin(member.getJet().newJob(ordersWithLinesPointingAtProducts()), JOB_COMPLETION_BUDGET);
 
         assertThat(namesSeenForTheSharedProduct())
                 .describedAs("the line carrying that product was rendered with its old name and then with "
@@ -131,13 +137,54 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
 
     @Test
     void aLateRenderingStillSeesThePreEditName() {
-        member.getJet().newJob(ordersWithLinesPointingAtProducts(Duration.ofSeconds(3))).join();
+        joinWithin(member.getJet().newJob(ordersWithLinesPointingAtProducts(Duration.ofSeconds(3))),
+                JOB_COMPLETION_BUDGET);
 
         assertThat(namesSeenForTheSharedProduct())
                 .describedAs("even when reactor load postpones document rendering past the wall-clock "
                         + "edit deadline, the shared product is rendered under its pre-edit name as well "
                         + "as its new one")
                 .containsExactlyInAnyOrder("Widget", "Cog");
+    }
+
+    @Test
+    @Timeout(20)
+    void aMissingPreEditRenderingCancelsTheJobAndReportsWhatReachedTheSink() {
+        Job job = member.getJet().newJob(
+                ordersWithLinesPointingAtProducts(Duration.ofMillis(400), List.of(1), Duration.ZERO));
+        JobWatch.until(job, JOB_COMPLETION_BUDGET, () -> PRE_EDIT_ORDERS.contains(1),
+                AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest::sinkEvidence);
+
+        assertThatThrownBy(() -> joinWithin(job, MISSING_RENDERING_BUDGET))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("missing pre-edit renderings for orders [2]")
+                .hasMessageContaining("collected documents:")
+                .hasMessageContaining("order_id=1")
+                .hasMessageContaining("name=Widget");
+        assertThat(job.isUserCancelled()).isTrue();
+    }
+
+    private static void joinWithin(Job job, Duration budget) {
+        try {
+            JobWatch.until(job, budget, () -> job.getStatus().isTerminal(),
+                    AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest::sinkEvidence);
+        } catch (AssertionError timedOut) {
+            job.cancel();
+            throw timedOut;
+        }
+        job.join();
+    }
+
+    private static String sinkEvidence() {
+        List<Integer> missing = ORDER_IDS.stream()
+                .filter(order -> !PRE_EDIT_ORDERS.contains(order))
+                .toList();
+        List<Map<String, Object>> documents;
+        synchronized (WRITTEN) {
+            documents = WRITTEN.stream().map(Envelope::after).toList();
+        }
+        return "missing pre-edit renderings for orders " + missing
+                + "; collected documents: " + documents;
     }
 
     /** Every distinct name the shared product was rendered under, anywhere in any document. */
@@ -193,6 +240,12 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
 
     /** The same inputs, with the roots held until the given wall-clock point. */
     private static DAG ordersWithLinesPointingAtProducts(Duration ordersAfter) {
+        return ordersWithLinesPointingAtProducts(ordersAfter, ORDER_IDS, EDIT_AFTER);
+    }
+
+    /** The same inputs, with configurable order roots and edit timing. */
+    private static DAG ordersWithLinesPointingAtProducts(
+            Duration ordersAfter, List<Integer> orderIds, Duration editAfter) {
         Embed product = new Embed("product", Map.of("sku_id", "sku_ref"), EmbedAs.OBJECT,
                 "product", null, null, null, null);
         Embed lines = new Embed("line", Map.of("order_id", "order_id"), EmbedAs.ARRAY,
@@ -213,8 +266,8 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
                 null, null);
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();
-        sources.put("orders", rowsSource("orders", List.of(new Timed(List.of(
-                one("order_id", 1), one("order_id", 2)), ordersAfter, null))));
+        sources.put("orders", rowsSource("orders", List.of(new Timed(
+                orderIds.stream().map(order -> one("order_id", order)).toList(), ordersAfter, null))));
         sources.put("lines", rowsSource("lines", List.of(new Timed(List.of(
                 line(101, 1, 1, SHARED_SKU), line(102, 1, 2, 8),
                 line(201, 2, 1, SHARED_SKU)), Duration.ofMillis(700), null))));
@@ -222,7 +275,7 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
                 new Timed(List.of(product(SHARED_SKU, "Widget"), product(8, "Bolt")),
                         Duration.ZERO, null),
                 // Reactor load can postpone rendering past a deadline, so the edit follows sink evidence.
-                new Timed(List.of(product(SHARED_SKU, "Cog")), Duration.ofMillis(1800),
+                new Timed(List.of(product(SHARED_SKU, "Cog")), editAfter,
                         product(SHARED_SKU, "Widget"), true))));
 
         Map<String, NestTable> tables = new LinkedHashMap<>();
