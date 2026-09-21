@@ -24,6 +24,13 @@ public final class NestStatePlacement {
         Objects.requireNonNull(settings, "settings");
         Set<String> alreadyMade = mapsAlreadyOn(member);
         databases.forEach((namespace, database) -> {
+            MapConfig inherited = member.getConfig().findMapConfig(namespace);
+            // A database target has meaning only when a cold layer is actually bound behind the map.
+            // Adding a backed configuration to a heap-only member would enable eviction with nowhere to
+            // reload from and would also make the factory fail over a store that was deliberately absent.
+            if (!inherited.getMapStoreConfig().isEnabled()) {
+                return;
+            }
             MapConfig wanted = settings.backedStateMaps(namespace, database);
             MapConfig pinned = member.getConfig().getMapConfigs().get(namespace);
             if (pinned != null) {
