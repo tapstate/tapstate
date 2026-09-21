@@ -265,7 +265,7 @@
   ],
   "provenance": {
     "specPath": "connectors/mongodb-connector/src/main/resources/spec.json",
-    "specContentHash": "74b86127d2ec8e3a",
+    "specContentHash": "8dafcf876e0baacb",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {
