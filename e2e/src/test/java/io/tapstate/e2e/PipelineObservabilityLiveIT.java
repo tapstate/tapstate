@@ -140,7 +140,7 @@ class PipelineObservabilityLiveIT {
 
                 first.close();
                 first = null;
-                createMissingSampleInterval();
+                awaitMissingSampleInterval();
 
                 second = RealProcessServer.start(storeUri, serverSettings);
                 control = new ControlPlane(second.baseUrl());
@@ -498,13 +498,12 @@ class PipelineObservabilityLiveIT {
         return (Map<String, Object>) result.get("structuredContent");
     }
 
-    private static void createMissingSampleInterval() {
-        try {
-            Thread.sleep(DELIBERATE_GAP.toMillis());
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted while creating a deliberate sample gap", error);
-        }
+    private static void awaitMissingSampleInterval() {
+        long startedAt = System.nanoTime();
+        Await.until("the server process to remain absent long enough to create a missing sample interval",
+                DELIBERATE_GAP.plusSeconds(2),
+                () -> System.nanoTime() - startedAt >= DELIBERATE_GAP.toNanos(),
+                () -> Duration.ofNanos(Math.max(0L, System.nanoTime() - startedAt)) + " elapsed");
     }
 
     private static void writeEvidence(String version, Instant from, Instant to,

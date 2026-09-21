@@ -60,7 +60,7 @@ class MigrateCommandIT {
         Output output = run("migrate", "--status", uriArgument(database));
 
         assertThat(output.exitCode).isZero();
-        assertThat(output.out).contains("installed: 0").contains("supported: 9")
+        assertThat(output.out).contains("installed: 0").contains("supported: 10")
                 .contains("V1BaselineIndexes").contains("V2StructuredArtifacts")
                 .contains("V3RecordedSrsSwitches")
                 .contains("V4DiscardInventedPositions")
