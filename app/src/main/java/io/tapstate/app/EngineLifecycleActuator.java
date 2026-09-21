@@ -61,26 +61,33 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     public void start(String pipelineId) {
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
-        dagSource.validateStart(pipelineId);
+        DagSource.StartPreparation prepared = dagSource.prepareStart(pipelineId);
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
         // what leaves a run that died without a stop with its state - and so with a shape to be held to.
         stateTeardown.finishPending(pipelineId);
-        DagSource.NestCapacity capacity = dagSource.capacityOf(pipelineId);
+        DagSource.NestCapacity capacity = prepared.capacity();
         engine.configureNestState(capacity.mapDatabases(), capacity.settings());
         if (!capacity.mapDatabases().isEmpty()) {
             LOG.info("Nest state placement resolved before pipeline '{}' starts: {}",
                     pipelineId, capacity.mapDatabases());
         }
         // Where this run keeps state, said before anything can write any: the pipeline is only certainly
-        // the one this run is built from now, and an apply may move it out from under the run at any point
-        // after. Said after the drop above, which is the one thing entitled to clear what earlier runs said.
-        stateTeardown.willKeepStateAt(pipelineId, dagSource.stateLocations(pipelineId));
-        captureCoordinator.startCapture(pipelineId);
+        // the one this run is built from now. The locations and DAG came from the same immutable artifact
+        // snapshot, so an apply cannot move one without the others. Said after the drop above, which is the
+        // one thing entitled to clear what earlier runs said.
+        stateTeardown.willKeepStateAt(pipelineId, prepared.stateLocations());
+        prepared.artifactSnapshot().ifPresentOrElse(
+                snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
+                () -> captureCoordinator.startCapture(pipelineId));
+        // Capture opens the SRS generation that source vertices compile into the DAG. Build only now, but
+        // from the same frozen artifacts used above; placement and teardown were already fixed, so any
+        // shape record this writes remains named even if construction refuses the start.
+        DagSource.StartPlan plan = prepared.build();
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
-        engine.submit(pipelineId, dagSource.dagFor(pipelineId),
+        engine.submit(pipelineId, plan.dag(),
                 capacity.mapDatabases(), capacity.settings());
     }
 

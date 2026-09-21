@@ -169,10 +169,12 @@ printjson({
 
 The current collections require only their automatic `_id_` indexes. Still compare the index lists: a
 future release may add another required index, and `$merge` copies documents rather than index definitions.
+If the source has any additional index, recreate it on the target and compare the lists again before cutover.
 Copying by `"_id.ns"` is intentionally an offline scan; it is not an event-path query.
 
-5. Add or change `state.database` in that Nest, apply the artifact while the pipeline remains stopped,
-   restart every server process, and start the pipeline.
+5. Restart every Tapstate server process with the intended deployment-wide database setting while the
+   pipeline remains stopped. Once every server is healthy, add or change `state.database`, apply the complete
+   artifact workspace, and start the pipeline.
 6. Verify the pipeline is running, the target counts still match, the target shape record exists, and new
    writes increase only the new database. Keep the old database and backup until this verification has
    survived normal traffic.
@@ -189,12 +191,13 @@ before that position will not be replayed, while the pending documents that held
 
 The supported clean-start procedure is destructive by design:
 
-1. Stop all writers and take a backup if the old state may be needed later.
-2. Clear the pipeline continuation with `stop <pipeline-id> -y`, or use
-   `restart <pipeline-id> --rerun -y` when keeping the same artifact. This removes the old operator state
-   and read position rather than pretending they still agree.
-3. Apply the artifact with the new `state.database`, restart the servers, and start the pipeline so a full
-   snapshot/replay rebuilds the Nest.
+1. Take a backup if the old state may be needed later, then clear the continuation while the current servers
+   are still available: `stop <pipeline-id> -y`. This removes the old operator state and read position rather
+   than pretending they still agree.
+2. Stop every server process, then restart all of them with the intended deployment-wide database setting.
+   The pipeline's desired state remains stopped; wait until every server is healthy.
+3. Add or change `state.database` when the move uses an operator override, apply the complete artifact
+   workspace, and start the pipeline so a full snapshot/replay rebuilds the Nest.
 
 Do not use `--keep-state` for this path: keeping the old read position while selecting an empty state
 database is precisely the inconsistent combination the full replay avoids.

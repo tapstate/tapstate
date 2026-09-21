@@ -63,6 +63,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Pattern;
@@ -90,6 +91,7 @@ import java.util.regex.PatternSyntaxException;
 final class StoreBackedDagSource implements DagSource {
 
     private final StorePort storePort;
+    private final ArtifactStore artifactStore;
     private final SinkWriterBinder sinkWriterBinder;
     private final TargetModelResolver targetModelResolver;
     private final NestSettings nestSettings;
@@ -136,6 +138,18 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     @Override
+    public StartPreparation prepareStart(String pipelineId) {
+        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
+        StoreBackedDagSource captured = new StoreBackedDagSource(
+                storePort, sinkWriterBinder, nestSettings, storeReachability, snapshot);
+        captured.validateStart(pipelineId);
+        NestCapacity capacity = captured.capacityOf(pipelineId);
+        Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId);
+        return new StartPreparation(
+                capacity, locations, Optional.of(snapshot), () -> captured.dagFor(pipelineId));
+    }
+
+    @Override
     public void validateStart(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
@@ -175,9 +189,17 @@ final class StoreBackedDagSource implements DagSource {
     StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability,
+                Objects.requireNonNull(storePort, "storePort").artifacts());
+    }
+
+    private StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, ArtifactStore artifactStore) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
+        this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
-        this.targetModelResolver = new TargetModelResolver(this.storePort);
+        this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore);
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
         this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
@@ -329,8 +351,11 @@ final class StoreBackedDagSource implements DagSource {
             });
             PipelineDagBuilder.nestStateDatabasesByStep(pipeline, defaultDatabase).values().stream()
                     .distinct()
-                    .forEach(database -> locations.add(new OperatorStateLocation(
-                            database, StoreBackedNestStateLedger.namespaceOf(pipelineId))));
+                    .forEach(database -> {
+                        stores.inDatabase(database);
+                        locations.add(new OperatorStateLocation(
+                                database, StoreBackedNestStateLedger.namespaceOf(pipelineId)));
+                    });
         }
 
         for (PipelineStateHolding holding : stateHeldBy(pipelineId)) {
@@ -2376,7 +2401,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private ArtifactStore artifacts() {
-        return storePort.artifacts();
+        return artifactStore;
     }
 
     /**

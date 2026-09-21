@@ -132,6 +132,28 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
                 .isEmpty();
     }
 
+    @Test
+    void oneStartPreparationKeepsOneArtifactRevisionAcrossEveryDerivedAnswer() {
+        InMemoryStorePort store = seedStore("items");
+        String firstDatabase = "orders_state_first";
+        String laterDatabase = "orders_state_later";
+        store.artifacts().save(pipeline("items", firstDatabase));
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+
+        DagSource.StartPreparation prepared = source.prepareStart(PIPELINE);
+        store.artifacts().save(pipeline("items", laterDatabase));
+        DagSource.StartPlan plan = prepared.build();
+
+        assertThat(plan.capacity().mapDatabases().values()).containsOnly(firstDatabase);
+        assertThat(plan.stateLocations())
+                .filteredOn(location -> location.namespace().startsWith("nest."))
+                .allMatch(location -> location.database().equals(firstDatabase));
+        assertThat(store.operatorStateStores().inDatabase(firstDatabase).state()
+                .load("nest.shape." + PIPELINE, STEP)).isPresent();
+        assertThat(store.operatorStateStores().inDatabase(laterDatabase).state()
+                .load("nest.shape." + PIPELINE, STEP)).isEmpty();
+    }
+
     // ---- fixtures ---------------------------------------------------------------------
 
     /** The two sources, the sink connection, a discovered model each, and the nest pipeline. */
