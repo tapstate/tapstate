@@ -669,13 +669,14 @@ class ControlPlaneConfiguration {
     }
 
     /** One startup key shared by session tokens and independently domain-separated history cursors. */
-    record SigningSecret(byte[] bytes) {
-        SigningSecret {
-            bytes = bytes.clone();
+    static final class SigningSecret {
+        private final byte[] bytes;
+
+        SigningSecret(byte[] bytes) {
+            this.bytes = bytes.clone();
         }
 
-        @Override
-        public byte[] bytes() {
+        byte[] bytes() {
             return bytes.clone();
         }
     }
