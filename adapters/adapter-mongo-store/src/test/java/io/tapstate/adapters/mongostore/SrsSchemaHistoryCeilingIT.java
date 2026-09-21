@@ -68,7 +68,7 @@ class SrsSchemaHistoryCeilingIT {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection =
                     client.getDatabase("tapstate").getCollection("srs_meta");
-            MongoSrsMetaStore store = new MongoSrsMetaStore(collection);
+            MongoSrsMetaStore store = new MongoSrsMetaStore(client, collection);
 
             store.create(CHAIN, null);
             int entries = driveHistoryToTheCeiling(collection);
