@@ -280,7 +280,8 @@ class MigrationRunnerIT {
         assertThat(before.pending())
                 .containsExactly("V1BaselineIndexes", "V2StructuredArtifacts", "V3RecordedSrsSwitches",
                         "V4DiscardInventedPositions", "V5SplitSourceSchemas", "V6SplitDerivedSchemas",
-                        "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes");
+                        "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
+                        "V10RateHistoryKeysetIndex");
 
         MigrationRunner.migrate(database);
 

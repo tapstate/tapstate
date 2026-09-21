@@ -66,7 +66,8 @@ class MigrateCommandIT {
                 .contains("V4DiscardInventedPositions")
                 .contains("V5SplitSourceSchemas").contains("V6SplitDerivedSchemas")
                 .contains("V7RepairBlankPipelines").contains("V8DiscardViewSchemaPolicies")
-                .contains("V9RateHistoryIndexes");
+                .contains("V9RateHistoryIndexes")
+                .contains("V10RateHistoryKeysetIndex");
         assertThat(collectionNames(database))
                 .as("the command is read-only; it must not bring the store part way forward while "
                         + "reporting on it")

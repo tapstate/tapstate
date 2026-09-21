@@ -5,6 +5,8 @@ import io.tapstate.core.lifecycle.RateSample;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The per-pipeline history of movement samples: one document per sample, appended on a fixed cadence and
@@ -23,14 +25,71 @@ import java.util.List;
  */
 public interface RateHistoryStore {
 
+    /** The largest number of samples one store round-trip may return to a caller. */
+    int MAX_PAGE_SIZE = 1024;
+
+    /**
+     * A stable position in the store ordering. The second component is deliberately opaque outside the
+     * adapter: callers may carry it in a signed cursor, but must not infer a database type or expose it.
+     */
+    record Key(Instant observedAt, String internalKey) {
+        public Key {
+            Objects.requireNonNull(observedAt, "observedAt");
+            Objects.requireNonNull(internalKey, "internalKey");
+            if (internalKey.isBlank()) {
+                throw new IllegalArgumentException("a rate-history internal key is not blank");
+            }
+        }
+    }
+
+    /** One stored sample together with the opaque key that makes equal timestamps stable. */
+    record Entry(Key key, RateSample sample) {
+        public Entry {
+            Objects.requireNonNull(key, "key");
+            Objects.requireNonNull(sample, "sample");
+            if (!key.observedAt().equals(sample.observedAt())) {
+                throw new IllegalArgumentException("a rate-history key and sample name different instants");
+            }
+        }
+    }
+
+    /** A bounded keyset page, ordered by {@code (observedAt, internalKey)}. */
+    record Page(List<Entry> entries, boolean hasMore) {
+        public Page {
+            entries = List.copyOf(Objects.requireNonNull(entries, "entries"));
+            if (entries.size() > MAX_PAGE_SIZE) {
+                throw new IllegalArgumentException("a rate-history page exceeds " + MAX_PAGE_SIZE);
+            }
+            if (hasMore && entries.isEmpty()) {
+                throw new IllegalArgumentException("an empty rate-history page cannot have a successor");
+            }
+        }
+
+        /** The key a following page starts strictly after. */
+        public Optional<Key> lastKey() {
+            return entries.isEmpty() ? Optional.empty() : Optional.of(entries.get(entries.size() - 1).key());
+        }
+    }
+
     /** Adds one sample. Never overwrites: a second sample at the same instant is a second document. */
     void append(RateSample sample);
 
     /**
-     * The samples of {@code pipelineId} taken from {@code from} up to and including {@code to}, oldest
-     * first; empty when there are none in the range, which is also what a pipeline never sampled reads as.
+     * Reads at most {@code limit} samples of one pipeline in {@code [from, to)}, oldest first and with
+     * equal timestamps ordered by their opaque internal key. When {@code after} is present, the page
+     * starts strictly after that key. Implementations read one extra document to decide {@link Page#hasMore}
+     * but never return more than {@link #MAX_PAGE_SIZE} entries.
      */
-    List<RateSample> readBetween(String pipelineId, Instant from, Instant to);
+    Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit);
+
+    /** Reads one exact opaque key when it still exists, for continuity across an external page. */
+    Optional<Entry> read(String pipelineId, Key key);
+
+    /** The last sample strictly before {@code at}, used only as the left boundary of a rate interval. */
+    Optional<Entry> predecessor(String pipelineId, Instant at);
+
+    /** The first sample at or after {@code at}, used only as the right boundary of an aggregate interval. */
+    Optional<Entry> successor(String pipelineId, Instant at);
 
     /**
      * Removes every sample of {@code pipelineId}, so a pipeline that no longer exists leaves no history.
