@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/nest
+---
+
 # Nest
 
 A `nest` transform assembles rows from several tables into one document and then keeps that document

@@ -1,3 +1,9 @@
+---
+status: engineering-draft
+publication: handoff
+target: https://tapstate.dev/docs/nest/flat-embeds
+---
+
 # Flat embeds
 
 A flat embed contributes one related row's fields directly to its parent document. It is the third
@@ -62,6 +68,8 @@ transforms:
     fields:
       invoice_row_id: $id
       invoice_order_id: $order_id
+      id: false
+      order_id: false
 
   - id: customer_fields
     type: map
@@ -70,6 +78,9 @@ transforms:
       customer_key: $id
       customer_name: $name
       customer_email: $email
+      id: false
+      name: false
+      email: false
 
   - id: assembled
     type: nest
