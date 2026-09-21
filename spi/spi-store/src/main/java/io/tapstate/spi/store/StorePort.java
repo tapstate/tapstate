@@ -81,4 +81,12 @@ public interface StorePort {
      * can be looked at rather than only counted. Written on the data path, read by whoever is looking.
      */
     NestDeadLetterStore nestDeadLetters();
+
+    /**
+     * Operator state routed by database. Store implementations with one physical target inherit a fixed
+     * view; adapters that support per-operator placement override it.
+     */
+    default OperatorStateStores operatorStateStores() {
+        return OperatorStateStores.fixed("default", keyedState(), nestDeadLetters());
+    }
 }

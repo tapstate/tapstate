@@ -7,6 +7,7 @@ import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.NestStateStorage;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.PushFormat;
@@ -325,6 +326,9 @@ public final class CanonicalWriter {
                 }
                 b.scalar("entries_in_memory", n.entriesInMemory());
                 b.scalar("max_elements_per_document", n.maxElementsPerDocument());
+                if (n.state() != null) {
+                    b.put("state", nestStateStorage(n.state()));
+                }
                 b.put("root", nestRoot(n.root()));
             }
             case TransformBody.Join j -> {
@@ -354,6 +358,12 @@ public final class CanonicalWriter {
         b.scalar("mode", root.mode());
         b.scalar("trackKeyChanges", root.trackKeyChanges());
         b.put("embed", embeds(root.embed()));
+        return b.build();
+    }
+
+    private Node nestStateStorage(NestStateStorage state) {
+        B b = new B();
+        b.scalar("database", state.database());
         return b.build();
     }
 

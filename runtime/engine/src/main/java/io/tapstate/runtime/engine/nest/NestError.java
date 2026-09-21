@@ -124,6 +124,11 @@ public enum NestError implements TapstateErrorCode {
             "nest.memory-budget-changed-while-running",
             Set.of("namespace", "configured", "requested")),
 
+    /** Starting up: this process already fixed a namespace to another operator-state database. */
+    STATE_DATABASE_CHANGED_WHILE_RUNNING(
+            "nest.state-database-changed-while-running",
+            Set.of("namespace", "configured", "requested")),
+
     /**
      * Starting up: the tree keeps its state under names it no longer compiles to, because an embed path
      * was renamed or a level inserted. What was stored is left where nothing reads it and the new names

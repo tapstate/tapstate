@@ -35,6 +35,7 @@ import java.util.Properties;
 final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLifecycleSupport {
 
     private final String namespace;
+    private final String database;
 
     /**
      * The layer this files under, and where a trip made here is counted. Neither can be handed in: the
@@ -48,12 +49,19 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     private NestStateStats stats;
 
     NestStateMapStore(String namespace) {
+        this(namespace, null);
+    }
+
+    NestStateMapStore(String namespace, String database) {
         this.namespace = Objects.requireNonNull(namespace, "namespace");
+        this.database = database;
     }
 
     @Override
     public void init(HazelcastInstance member, Properties properties, String mapName) {
-        this.store = NestStateMapStoreFactory.boundTo(member);
+        var stores = NestStateMapStoreFactory.boundTo(member);
+        String resolved = database == null ? stores.defaultDatabase() : database;
+        this.store = stores.inDatabase(resolved).state();
         this.stats = NestStateStats.of(member);
     }
 

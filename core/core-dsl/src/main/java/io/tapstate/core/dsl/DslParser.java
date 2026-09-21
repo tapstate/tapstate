@@ -12,6 +12,7 @@ import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestOrder;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.NestStateStorage;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.PushFormat;
@@ -113,6 +114,8 @@ public final class DslParser {
     static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", OPTIONS_FIELD);
     private static final Set<String> NEST_ROOT_KEYS =
             Set.of("from", "key", "mode", "trackKeyChanges", "embed");
+    static final Set<String> NEST_STATE_KEYS = Set.of("database");
+    static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
             "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
     private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD);
@@ -490,7 +493,8 @@ public final class DslParser {
                     "preserve_null_and_empty_arrays", "element_key", "element_type");
             case "union" -> Set.of();
             case "nest" -> Set.of(
-                    PRIMARY_KEY_FIELD, "order", "entries_in_memory", "max_elements_per_document", "root");
+                    PRIMARY_KEY_FIELD, "order", "entries_in_memory", "max_elements_per_document",
+                    "state", "root");
             case "join" -> Set.of("engine", "sql");
             default -> Set.of();
         };
@@ -535,6 +539,7 @@ public final class DslParser {
                     enumByYaml(NestOrder.values(), NestOrder::yaml, s, "order"),
                     positiveIntValue(s, "entries_in_memory"),
                     positiveIntValue(s, "max_elements_per_document"),
+                    nestStateStorage(s.mapping("state")),
                     nestRoot(s.require("root", s.mapping("root"))));
             case "join" -> {
                 JoinEngine engine =
@@ -584,6 +589,15 @@ public final class DslParser {
                 r.string("mode"),
                 boolValue(r, "trackKeyChanges"),
                 embeds(r.seq("embed"), r.childPath("embed")));
+    }
+
+    private NestStateStorage nestStateStorage(YamlMap state) {
+        if (state == null) {
+            return null;
+        }
+        state.requireOnly(NEST_STATE_KEYS);
+        state.requirePresent(REQUIRED_NEST_STATE_KEYS);
+        return new NestStateStorage(state.requireString("database"));
     }
 
     private List<Embed> embeds(List<Node> items, String path) {

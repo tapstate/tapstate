@@ -228,7 +228,7 @@ class NestOverTwoSourcesDataFlowTest {
         CapturingSinkWriter.reset();
         actuator.start(PIPELINE);
         try {
-            awaitAssembled();
+            awaitAssembled("order-1-after-stop");
             assertThat(latestPerRoot(new ArrayList<>(CapturingSinkWriter.collected())).get(1L))
                     .containsEntry("name", "order-1-after-stop");
             assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
@@ -423,9 +423,19 @@ class NestOverTwoSourcesDataFlowTest {
      * job assembling nothing, and only the job status tells them apart.
      */
     private void awaitAssembled() {
+        awaitAssembled(null);
+    }
+
+    /** Also waits for the named parent value when retained state can emit the complete old shape first. */
+    private void awaitAssembled(String expectedFirstParentName) {
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
         while (System.nanoTime() < deadline) {
-            if (settled(CapturingSinkWriter.collected())) {
+            Map<Object, Map<String, Object>> latest = latestPerRoot(
+                    new ArrayList<>(CapturingSinkWriter.collected()));
+            boolean expectedParentArrived = expectedFirstParentName == null
+                    || expectedFirstParentName.equals(
+                            latest.getOrDefault(1L, Map.of()).get("name"));
+            if (settled(CapturingSinkWriter.collected()) && expectedParentArrived) {
                 return;
             }
             sleep();

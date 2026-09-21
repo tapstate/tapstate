@@ -256,6 +256,20 @@
       ],
       "additionalProperties": false
     },
+    "NestStateStorage": {
+      "type": "object",
+      "description": "Durable operator-state placement for one nest.",
+      "properties": {
+        "database": {
+          "description": "MongoDB database holding this nest's state, shape record, and dead letters.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "database"
+      ],
+      "additionalProperties": false
+    },
     "OnFullLoad": {
       "type": "string",
       "description": "Treatment of existing target rows before a new full load; recovery and CDC-only runs never clear rows.",
@@ -1155,6 +1169,10 @@
         "max_elements_per_document": {
           "description": "How many embedded elements one document of this nest may hold before the run is failed. Per document rather than per nest: a document is assembled whole, so no layer behind the memory can absorb one that outgrows it. Absent leaves the number the deployment was started with.",
           "type": "integer"
+        },
+        "state": {
+          "description": "Durable state placement for this nest; absent inherits the deployment default.",
+          "$ref": "#/$defs/NestStateStorage"
         },
         "root": {
           "description": "The root stream whose documents receive the nested children.",
