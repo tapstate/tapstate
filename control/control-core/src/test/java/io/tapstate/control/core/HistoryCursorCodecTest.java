@@ -76,6 +76,27 @@ class HistoryCursorCodecTest {
     }
 
     @Test
+    void aCursorCannotBeReusedForAnotherPipelineOrRange() {
+        HistoryCursorCodec codec = codecAt(T0);
+        String token = codec.issue(BINDING, T0.minusSeconds(3600), T0,
+                T0.minus(Duration.ofDays(15)), KEY, T0.minusSeconds(15));
+        List<HistoryCursorCodec.QueryBinding> changed = List.of(
+                new HistoryCursorCodec.QueryBinding(
+                        "payments", BINDING.from(), BINDING.to(), BINDING.resolution(),
+                        BINDING.limit(), BINDING.tables()),
+                new HistoryCursorCodec.QueryBinding(
+                        BINDING.pipelineId(), BINDING.from().minusSeconds(1), BINDING.to(),
+                        BINDING.resolution(), BINDING.limit(), BINDING.tables()));
+
+        for (HistoryCursorCodec.QueryBinding query : changed) {
+            TapstateException refusal = catchThrowableOfType(() -> codec.read(token, query),
+                    TapstateException.class);
+            assertThat(refusal.code()).isEqualTo(MonitorError.INVALID_CURSOR);
+            assertThat(refusal.args()).containsEntry("reason", "QUERY_MISMATCH");
+        }
+    }
+
+    @Test
     void tenMinutesIsExpiredRatherThanAQueryMismatch() {
         String token = codecAt(T0).issue(BINDING, T0.minusSeconds(3600), T0,
                 T0.minus(Duration.ofDays(15)), KEY, T0.minusSeconds(15));

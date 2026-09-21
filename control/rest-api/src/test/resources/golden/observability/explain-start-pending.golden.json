@@ -1,0 +1,1 @@
+{"pipelineId":"orders","state":"NEW","kind":"NO_MATCH","message":"No diagnostic rule matched.","observedAt":"2026-09-20T10:00:00Z","observedAgeMillis":1000,"freshness":"FRESH","evidence":[{"source":"lifecycle","field":"pending","value":"START_CAPACITY"}],"cannotSay":["Whether the source has changes waiting is not measured."],"next":null,"pending":{"reason":"START_CAPACITY"}}

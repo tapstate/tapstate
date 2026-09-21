@@ -27,7 +27,7 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Exact public consumer fixtures written by the same DTOs the HTTP controllers return. */
-class ObservabilityWireContractTest {
+class ObservabilityConsumerContractTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Instant FROM = Instant.parse("2026-09-20T10:00:00Z");
@@ -47,10 +47,18 @@ class ObservabilityWireContractTest {
         assertThat(((List<?>) manifest.get("fixtures")).stream().map(String::valueOf).toList()).containsExactly(
                 "history-raw-page-1.golden.json",
                 "history-raw-page-2.golden.json",
+                "history-auto-page-1.golden.json",
                 "history-aggregate-boundaries.golden.json",
+                "history-single-metric-missing.golden.json",
                 "history-empty.golden.json",
                 "explain-stale.golden.json",
-                "explain-no-match.golden.json");
+                "explain-coded-failure.golden.json",
+                "explain-reconcile-failures.golden.json",
+                "explain-no-movement.golden.json",
+                "explain-frontier-stalled.golden.json",
+                "explain-no-match.golden.json",
+                "explain-unknown.golden.json",
+                "explain-start-pending.golden.json");
     }
 
     @Test
@@ -82,16 +90,20 @@ class ObservabilityWireContractTest {
                                 point("2026-09-20T10:00:00Z", "2026-09-20T10:05:00Z",
                                         rate(3000, 10, 25), null,
                                         List.of(lag("2026-09-20T10:04:00Z", 2, 12)))),
-                        segment("2026-09-20T10:05:00Z", "2026-09-20T10:30:00Z",
+                        segment("2026-09-20T10:05:00Z", "2026-09-20T10:06:00Z",
                                 StartReason.COUNTER_RESET,
-                                point("2026-09-20T10:05:00Z", "2026-09-20T10:30:00Z",
-                                        rate(7500, 5, 9), null, List.of())),
-                        segment("2026-09-20T10:45:00Z", "2026-09-20T11:00:00Z",
+                                point("2026-09-20T10:05:00Z", "2026-09-20T10:06:00Z",
+                                        rate(600, 10, 10), null, List.of())),
+                        segment("2026-09-20T10:30:00Z", "2026-09-20T10:45:00Z",
                                 StartReason.GAP,
+                                point("2026-09-20T10:30:00Z", "2026-09-20T10:45:00Z",
+                                        rate(9000, 10, 12), null, List.of())),
+                        segment("2026-09-20T10:45:00Z", "2026-09-20T11:00:00Z",
+                                StartReason.EXECUTION_CHANGE,
                                 point("2026-09-20T10:45:00Z", "2026-09-20T11:00:00Z",
-                                        rate(4500, 5, 8), null, List.of()))),
-                List.of(new Gap(Instant.parse("2026-09-20T10:30:00Z"),
-                        Instant.parse("2026-09-20T10:45:00Z"), GapReason.SAMPLE_GAP)),
+                                        rate(9000, 10, 20), null, List.of()))),
+                List.of(new Gap(Instant.parse("2026-09-20T10:06:00Z"),
+                        Instant.parse("2026-09-20T10:30:00Z"), GapReason.SAMPLE_GAP)),
                 List.of(new Unavailable("bytes.out", null)), null);
         PipelineMetricsHistory empty = new PipelineMetricsHistory(
                 "orders", Instant.parse("2026-08-20T10:00:00Z"), Instant.parse("2026-08-20T11:00:00Z"),
@@ -103,7 +115,26 @@ class ObservabilityWireContractTest {
     }
 
     @Test
-    void staleAndNoMatchExplanationsMatchTheConsumerFixturesExactly() throws Exception {
+    void autoPaginationAndSingleMetricAbsenceMatchTheConsumerFixturesExactly() throws Exception {
+        PipelineMetricsHistory auto = history(EffectiveHistoryResolution.PT30M,
+                List.of(segment("2026-09-20T10:00:00Z", "2026-09-20T10:30:00Z",
+                        StartReason.WINDOW_START,
+                        point("2026-09-20T10:00:00Z", "2026-09-20T10:30:00Z",
+                                rate(18000, 10, 25), rate(3600000, 2000, 4000), List.of()))),
+                List.of(), List.of(), "example-auto-page-2");
+        PipelineMetricsHistory missing = history(EffectiveHistoryResolution.PT1M,
+                List.of(segment("2026-09-20T10:00:00Z", "2026-09-20T10:01:00Z",
+                        StartReason.WINDOW_START,
+                        point("2026-09-20T10:00:00Z", "2026-09-20T10:01:00Z",
+                                rate(60, 1, 1), null, List.of()))),
+                List.of(), List.of(new Unavailable("bytes.out", null)), null);
+
+        assertGolden(PipelineHistoryResponse.of(auto), "history-auto-page-1.golden.json");
+        assertGolden(PipelineHistoryResponse.of(missing), "history-single-metric-missing.golden.json");
+    }
+
+    @Test
+    void everyExplanationRuleAndOptionalStateMatchesTheConsumerFixturesExactly() throws Exception {
         PipelineExplanation stale = new PipelineExplanation(
                 "orders", PipelineState.RUNNING, PipelineExplanation.Kind.OBSERVATION_STALE,
                 "The latest observation is 45s old, so the publisher may have stopped.",
@@ -127,9 +158,80 @@ class ObservabilityWireContractTest {
                         "Whether the source has changes waiting is not measured.",
                         "Whether an initial load is still running cannot be determined from loaded rows alone."),
                 null, null);
+        Instant freshAt = Instant.parse("2026-09-20T10:00:43Z");
+        PipelineExplanation coded = new PipelineExplanation(
+                "orders", PipelineState.FAILED, PipelineExplanation.Kind.CODED_FAILURE,
+                "The run failed, and said why: engine.job-failed.", freshAt, 2_000L,
+                PipelineExplanation.Freshness.FRESH,
+                List.of(evidence(PipelineExplanation.Source.STATUS, "failure",
+                        new PipelineExplanation.Failure("engine.job-failed",
+                                Map.of("pipeline", "orders", "cause", "the sink rejected the batch"),
+                                "Pipeline orders stopped because its job failed: the sink rejected the batch."))),
+                List.of(), new PipelineExplanation.Next(
+                        PipelineExplanation.NextAction.OPEN_PIPELINE_LOGS,
+                        "Open the logs for pipeline orders."), null);
+        PipelineExplanation reconcile = new PipelineExplanation(
+                "orders", PipelineState.NEW, PipelineExplanation.Kind.RECONCILE_FAILURES,
+                "The server keeps failing to bring this pipeline up: 3 passes in a row have thrown.",
+                freshAt, 2_000L, PipelineExplanation.Freshness.FRESH,
+                List.of(
+                        evidence(PipelineExplanation.Source.METRICS, "reconcileFailuresInARow", 3L),
+                        evidence(PipelineExplanation.Source.STATUS, "state", PipelineState.NEW)),
+                List.of("Whether the job itself is still alive is unknown; no failure was observed, "
+                        + "so state remains new."),
+                new PipelineExplanation.Next(PipelineExplanation.NextAction.CHECK_SERVER,
+                        "Check that the server is running and converging."), null);
+        PipelineExplanation noMovement = new PipelineExplanation(
+                "orders", PipelineState.RUNNING, PipelineExplanation.Kind.NO_MOVEMENT,
+                "Nothing has moved: no records driven and no rows loaded.", freshAt, 2_000L,
+                PipelineExplanation.Freshness.FRESH,
+                List.of(
+                        evidence(PipelineExplanation.Source.METRICS, "recordCount", null),
+                        evidence(PipelineExplanation.Source.SNAPSHOT, "rowsDone", 0L)),
+                List.of("Whether the source has changes waiting is not measured."),
+                new PipelineExplanation.Next(PipelineExplanation.NextAction.OPEN_PIPELINE_LOGS,
+                        "Open the logs for pipeline orders."), null);
+        PipelineExplanation stalled = new PipelineExplanation(
+                "orders", PipelineState.RUNNING, PipelineExplanation.Kind.FRONTIER_STALLED,
+                "A chain has stopped advancing: orders.", freshAt, 2_000L,
+                PipelineExplanation.Freshness.FRESH,
+                List.of(evidence(PipelineExplanation.Source.METRICS,
+                        "frontierStalledMillis.orders", 96_000L)), List.of(),
+                new PipelineExplanation.Next(PipelineExplanation.NextAction.CHECK_TARGET,
+                        "Check that the target is accepting writes."), null);
+        PipelineExplanation unknown = new PipelineExplanation(
+                "orders", PipelineState.PAUSED, PipelineExplanation.Kind.NO_MATCH,
+                "No diagnostic rule matched.", null, null, PipelineExplanation.Freshness.UNKNOWN,
+                List.of(
+                        evidence(PipelineExplanation.Source.STATUS, "observedAgeMillis", null),
+                        evidence(PipelineExplanation.Source.STATUS, "failure", null),
+                        evidence(PipelineExplanation.Source.METRICS, "reconcileFailuresInARow", null),
+                        evidence(PipelineExplanation.Source.METRICS, "recordCount", 128L),
+                        evidence(PipelineExplanation.Source.METRICS, "frontierStalledMillis", Map.of()),
+                        evidence(PipelineExplanation.Source.SNAPSHOT, "rowsDone", 1L)),
+                List.of(
+                        "How old this observation is cannot be determined because it carries no observation time.",
+                        "Whether the source has changes waiting is not measured.",
+                        "Whether a paused run's job is still alive is not measured; failures are detected only "
+                                + "while it is meant to run.",
+                        "Whether an initial load is still running cannot be determined from loaded rows alone."),
+                null, null);
+        PipelineExplanation pending = new PipelineExplanation(
+                "orders", PipelineState.NEW, PipelineExplanation.Kind.NO_MATCH,
+                "No diagnostic rule matched.", FROM, 1_000L, PipelineExplanation.Freshness.FRESH,
+                List.of(evidence(PipelineExplanation.Source.LIFECYCLE,
+                        "pending", "START_CAPACITY")),
+                List.of("Whether the source has changes waiting is not measured."), null,
+                new PipelineExplanation.Pending(PipelineExplanation.PendingReason.START_CAPACITY));
 
         assertGolden(PipelineExplanationResponse.of(stale), "explain-stale.golden.json");
+        assertGolden(PipelineExplanationResponse.of(coded), "explain-coded-failure.golden.json");
+        assertGolden(PipelineExplanationResponse.of(reconcile), "explain-reconcile-failures.golden.json");
+        assertGolden(PipelineExplanationResponse.of(noMovement), "explain-no-movement.golden.json");
+        assertGolden(PipelineExplanationResponse.of(stalled), "explain-frontier-stalled.golden.json");
         assertGolden(PipelineExplanationResponse.of(noMatch), "explain-no-match.golden.json");
+        assertGolden(PipelineExplanationResponse.of(unknown), "explain-unknown.golden.json");
+        assertGolden(PipelineExplanationResponse.of(pending), "explain-start-pending.golden.json");
     }
 
     private static PipelineMetricsHistory history(
@@ -165,7 +267,7 @@ class ObservabilityWireContractTest {
     }
 
     private static String golden(String name) throws IOException {
-        try (var input = ObservabilityWireContractTest.class.getResourceAsStream(
+        try (var input = ObservabilityConsumerContractTest.class.getResourceAsStream(
                 "/golden/observability/" + name)) {
             if (input == null) {
                 throw new IOException("missing observability wire golden: " + name);
