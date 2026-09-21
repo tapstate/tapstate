@@ -42,6 +42,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -69,14 +70,20 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
     /** The one product both orders have a line for. */
     private static final int SHARED_SKU = 7;
 
+    private static final Set<Integer> ORDER_IDS = Set.of(1, 2);
+
     /** What the sink was handed. Static because the writer is built on the member. */
     private static final List<Envelope> WRITTEN = Collections.synchronizedList(new ArrayList<>());
+
+    /** Which orders have reached the sink carrying the shared product's pre-edit name. */
+    private static final Set<Object> PRE_EDIT_ORDERS = ConcurrentHashMap.newKeySet();
 
     private HazelcastInstance member;
 
     @BeforeEach
     void startMember() {
         WRITTEN.clear();
+        PRE_EDIT_ORDERS.clear();
         Config config = new Config();
         config.setClusterName("nest-deep-reference-test-" + System.nanoTime());
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
@@ -214,9 +221,9 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
         sources.put("products", rowsSource("products", List.of(
                 new Timed(List.of(product(SHARED_SKU, "Widget"), product(8, "Bolt")),
                         Duration.ZERO, null),
-                // Long after both documents are downstream carrying the old name.
+                // Reactor load can postpone rendering past a deadline, so the edit follows sink evidence.
                 new Timed(List.of(product(SHARED_SKU, "Cog")), Duration.ofMillis(1800),
-                        product(SHARED_SKU, "Widget")))));
+                        product(SHARED_SKU, "Widget"), true))));
 
         Map<String, NestTable> tables = new LinkedHashMap<>();
         tables.put("order", new NestTable("orders", List.of("order_id")));
@@ -265,9 +272,15 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
         return row;
     }
 
-    /** One batch of rows, when it is due, and the row each replaces where there is one. */
-    private record Timed(List<Map<String, Object>> rows, Duration after, Map<String, Object> replacing)
+    /** One batch of rows, when it is due, what it replaces, and whether the initial documents precede it. */
+    private record Timed(List<Map<String, Object>> rows, Duration after,
+            Map<String, Object> replacing, boolean afterPreEditRendering)
             implements Serializable {
+
+        private Timed(List<Map<String, Object>> rows, Duration after,
+                Map<String, Object> replacing) {
+            this(rows, after, replacing, false);
+        }
     }
 
     /** Emits its batches in order, each held until it is due, yielding rather than sleeping. */
@@ -295,6 +308,9 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
                 if (System.currentTimeMillis() - startedAt < due.after().toMillis()) {
                     return false;
                 }
+                if (due.afterPreEditRendering() && !PRE_EDIT_ORDERS.containsAll(ORDER_IDS)) {
+                    return false;
+                }
                 while (next < due.rows().size()) {
                     Map<String, Object> row = due.rows().get(next);
                     Envelope event = due.replacing() == null
@@ -318,7 +334,25 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             WRITTEN.addAll(records);
+            rememberPreEditOrders(records);
             return CompletableFuture.completedFuture(new WriteResult(records.size()));
+        }
+
+        private static void rememberPreEditOrders(List<Envelope> records) {
+            for (Envelope written : records) {
+                Map<String, Object> document = written.after();
+                if (document == null || !(document.get("lines") instanceof List<?> lines)) {
+                    continue;
+                }
+                for (Object line : lines) {
+                    if (line instanceof Map<?, ?> held
+                            && held.get("product") instanceof Map<?, ?> product
+                            && SHARED_SKU == (int) product.get("sku_id")
+                            && "Widget".equals(product.get("name"))) {
+                        PRE_EDIT_ORDERS.add(document.get("order_id"));
+                    }
+                }
+            }
         }
 
         @Override
