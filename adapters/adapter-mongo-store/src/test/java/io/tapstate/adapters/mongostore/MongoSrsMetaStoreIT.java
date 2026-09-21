@@ -754,12 +754,8 @@ class MongoSrsMetaStoreIT {
                     .extracting(ConsumerOffset::pipelineId)
                     .containsExactly("staying");
             assertThat(consumers.find(new Document("pipelineId", "departing")).first())
-                    .as("detach leaves only the durable fence that a stale insert cannot overwrite")
-                    .isEqualTo(new Document("_id", new Document("chain", CHAIN)
-                                    .append("pipeline", "departing"))
-                            .append("miningChainId", CHAIN)
-                            .append("pipelineId", "departing")
-                            .append("detached", true));
+                    .as("detach leaves neither a cursor nor a cleanup marker for the departed pipeline")
+                    .isNull();
 
             resumeStaleMigration.countDown();
             staleWrite.get(30, TimeUnit.SECONDS);
@@ -775,7 +771,7 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
-    void aConsumerWriteAfterDetachRemovesTheFenceAndAttachesItAgain() {
+    void aConsumerWriteAfterDetachAttachesItAgain() {
         withCollection((store, collection) -> {
             store.create(CHAIN, null);
             store.upsertConsumerOffset(CHAIN, new ConsumerOffset("returning", Map.of("orders", 10L), null));

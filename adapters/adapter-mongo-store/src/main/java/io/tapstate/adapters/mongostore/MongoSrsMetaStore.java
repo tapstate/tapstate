@@ -46,11 +46,10 @@ import java.util.function.Supplier;
  * chain's {@code consumerOffsets} field. The first consumer write migrates them; a chain write that finds
  * an old record already at the endpoint ceiling does the same and retries. The copy is insert-only and the
  * embedded map is cleared only after every cursor has landed, so an interrupted migration loses nothing.
- * Detach replaces a cursor with a marker rather than deleting it, so a migration that read the embedded
- * cursor earlier cannot restore it; reads omit those markers and the next consumer write removes one. The
- * schema history remains an append-only array on the chain document, advanced by an update that keeps the
- * newest entries inside a fixed byte budget. Nullable positions are stored only when present, never as
- * explicit nulls.
+ * That read/copy/clear is one transaction: concurrent migrations serialize before a detach deletes its
+ * cursor, so a copier holding an older snapshot cannot restore the departed consumer. The schema history
+ * remains an append-only array on the chain document, advanced by an update that keeps the newest entries
+ * inside a fixed byte budget. Nullable positions are stored only when present, never as explicit nulls.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A re-seed of an existing chain (which would discard its accumulated truth) and a mutate of
@@ -59,9 +58,6 @@ import java.util.function.Supplier;
  * its model is coded {@code io.document-unreadable}.
  */
 public final class MongoSrsMetaStore implements SrsMetaStore {
-
-    /** Marks a removed split cursor so an older migration snapshot cannot insert it again. */
-    private static final String DETACHED = "detached";
 
     /**
      * How much of a chain's schema history the record retains, in bytes of stored entries.
@@ -488,8 +484,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .projection(Projections.include("_id"))
                 .map(document -> document.getString("_id"))
                 .into(chains));
-        StoreIo.call(() -> consumers.find(new Document("pipelineId", pipelineId)
-                        .append(DETACHED, new Document("$ne", true)))
+        StoreIo.call(() -> consumers.find(new Document("pipelineId", pipelineId))
                 .projection(Projections.include("miningChainId"))
                 .map(document -> document.getString("miningChainId"))
                 .into(chains));
@@ -519,13 +514,11 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         // A detach is idempotent, so an absent chain is already the requested end state. Migration still
-        // runs when the chain exists, preserving every other legacy cursor before this one is removed. A
-        // tombstone replaces an existing cursor rather than deleting it: an older migration may already
-        // hold the embedded cursor in memory, and its insert-only copy must find a document that it cannot
-        // recreate. A later consumer write removes the marker and attaches the pipeline again.
+        // runs when the chain exists, preserving every other legacy cursor before this one is removed.
+        // Its transaction also serializes any older migration snapshot before the delete, so no durable
+        // marker has to remain merely to keep a stale copier from recreating this cursor.
         migrateLegacyConsumers(miningChainId, false);
-        StoreIo.run(() -> consumers.replaceOne(
-                consumerKey(miningChainId, pipelineId), detachedConsumerDocument(miningChainId, pipelineId)));
+        StoreIo.run(() -> consumers.deleteOne(consumerKey(miningChainId, pipelineId)));
     }
 
     /**
@@ -570,12 +563,6 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         migrateLegacyConsumers(miningChainId, true);
-        Document unset = update.get("$unset", Document.class);
-        if (unset == null) {
-            update.append("$unset", new Document(DETACHED, ""));
-        } else {
-            unset.append(DETACHED, "");
-        }
         update.append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
         StoreIo.call(miningChainId, () -> consumers.updateOne(
                 consumerKey(miningChainId, pipelineId), update, new UpdateOptions().upsert(true)));
@@ -612,51 +599,71 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
                 .projection(Projections.include("consumerOffsets"))
                 .first());
-        if (root == null) {
-            if (requireSeeded) {
-                throw unseededChain(miningChainId);
-            }
+        Document embedded = embeddedConsumers(root, miningChainId, requireSeeded);
+        if (embedded == null || embedded.isEmpty()) {
             return;
         }
-        Object raw = root.get("consumerOffsets");
-        if (!(raw instanceof Document embedded)) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                    Map.of("id", miningChainId, "field", "consumerOffsets"), null);
-        }
-        if (embedded.isEmpty()) {
+        StoreIo.run(miningChainId, () -> {
+            try (ClientSession session = client.startSession()) {
+                session.withTransaction(() -> {
+                    migrateLegacyConsumers(session, miningChainId, requireSeeded);
+                    return null;
+                });
+            }
+        });
+    }
+
+    /** The transactional body of legacy migration, kept separate because transaction callbacks may retry. */
+    private void migrateLegacyConsumers(
+            ClientSession session, String miningChainId, boolean requireSeeded) {
+        Document root = collection.find(session, new Document("_id", miningChainId))
+                .projection(Projections.include("consumerOffsets"))
+                .first();
+        Document embedded = embeddedConsumers(root, miningChainId, requireSeeded);
+        if (embedded == null || embedded.isEmpty()) {
             return;
         }
         for (Map.Entry<String, Object> entry : embedded.entrySet()) {
             String pipelineId = entry.getKey();
             Document identityAndCursor = consumerIdentity(miningChainId, pipelineId);
             identityAndCursor.putAll(asDocument(entry.getValue(), miningChainId));
-            insertLegacyConsumer(miningChainId, pipelineId, identityAndCursor);
+            insertLegacyConsumer(session, miningChainId, pipelineId, identityAndCursor);
         }
-        UpdateResult cleared = StoreIo.call(miningChainId, () -> collection.updateOne(
+        UpdateResult cleared = collection.updateOne(session,
                 new Document("_id", miningChainId),
-                new Document("$set", new Document("consumerOffsets", new Document()))));
+                new Document("$set", new Document("consumerOffsets", new Document())));
         if (cleared.getMatchedCount() == 0 && requireSeeded) {
             throw unseededChain(miningChainId);
         }
     }
 
-    /**
-     * Lands one legacy cursor unless another migration landed it first. Concurrent upserts can race at
-     * the unique id and make one driver call report a duplicate; that means the cursor now exists, which
-     * is the requested postcondition, while every other Mongo failure still goes through the translator.
-     */
-    private void insertLegacyConsumer(String miningChainId, String pipelineId, Document identityAndCursor) {
-        try {
-            StoreIo.call(miningChainId, () -> consumers.updateOne(
-                    consumerKey(miningChainId, pipelineId),
-                    new Document("$setOnInsert", identityAndCursor),
-                    new UpdateOptions().upsert(true)));
-        } catch (TapstateException e) {
-            if (!(e.getCause() instanceof MongoWriteException write)
-                    || write.getError().getCategory() != ErrorCategory.DUPLICATE_KEY) {
-                throw e;
+    /** Reads and validates the legacy cursor map, or answers absent for an allowed missing chain. */
+    private static Document embeddedConsumers(
+            Document root, String miningChainId, boolean requireSeeded) {
+        if (root == null) {
+            if (requireSeeded) {
+                throw unseededChain(miningChainId);
             }
+            return null;
         }
+        Object raw = root.get("consumerOffsets");
+        if (raw instanceof Document embedded) {
+            return embedded;
+        }
+        throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", miningChainId, "field", "consumerOffsets"), null);
+    }
+
+    /**
+     * Lands one legacy cursor unless an earlier attempt landed it first. This runs in the same transaction
+     * as the root clear, so a competing migration either precedes this one or makes its callback retry.
+     */
+    private void insertLegacyConsumer(ClientSession session, String miningChainId,
+            String pipelineId, Document identityAndCursor) {
+        consumers.updateOne(session,
+                consumerKey(miningChainId, pipelineId),
+                new Document("$setOnInsert", identityAndCursor),
+                new UpdateOptions().upsert(true));
     }
 
     /** Reads legacy and split cursors, with the split document winning during an interrupted migration. */
@@ -673,7 +680,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             merged.put(entry.getKey(),
                     consumerFromDocument(entry.getKey(), asDocument(entry.getValue(), miningChainId)));
         }
-        List<Document> split = StoreIo.call(() -> consumers.find(activeConsumersOfChain(miningChainId))
+        List<Document> split = StoreIo.call(() -> consumers.find(consumersOfChain(miningChainId))
                 .into(new ArrayList<>()));
         for (Document document : split) {
             String pipelineId = document.getString("pipelineId");
@@ -707,22 +714,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         return document;
     }
 
-    /** The durable fence left by detach, with no cursor state that could participate in a frontier. */
-    private static Document detachedConsumerDocument(String miningChainId, String pipelineId) {
-        Document document = consumerKey(miningChainId, pipelineId);
-        document.putAll(consumerIdentity(miningChainId, pipelineId));
-        document.append(DETACHED, true);
-        return document;
-    }
-
     /** All split cursor documents belonging to one chain. */
     private static Document consumersOfChain(String miningChainId) {
         return new Document("miningChainId", miningChainId);
-    }
-
-    /** All live split cursor documents belonging to one chain; detach tombstones are not consumers. */
-    private static Document activeConsumersOfChain(String miningChainId) {
-        return consumersOfChain(miningChainId).append(DETACHED, new Document("$ne", true));
     }
 
     /**
