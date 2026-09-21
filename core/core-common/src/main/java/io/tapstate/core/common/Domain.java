@@ -70,6 +70,8 @@ public enum Domain {
     SOURCE,
     // pipeline-specific control operations: identity, optimistic concurrency and editor metadata
     PIPELINE,
+    // Pipeline authoring operations: draft revisions, compilation, publication and discard
+    PIPELINE_DRAFT,
     // local MCP presentation: sidecar input, connector-spec and upstream-response failures
     MCP,
     // runtime data plane: reading a source's snapshot / cdc into the replay store — diagnosable

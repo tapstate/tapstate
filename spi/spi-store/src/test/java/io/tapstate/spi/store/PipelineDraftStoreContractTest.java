@@ -62,6 +62,16 @@ class PipelineDraftStoreContractTest {
         assertThat(store.artifacts).containsEntry("orders", artifact);
     }
 
+    @Test
+    void discardUsesTheSameRevisionCasAsAutosave() {
+        InMemoryDraftStore store = new InMemoryDraftStore();
+        store.create(draft(PipelineDraft.Mode.DAG, 1, graph(), null));
+
+        assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+        assertThat(store.delete("orders", 1)).isEqualTo(PipelineDraftMutation.DELETED);
+        assertThat(store.get("orders")).isEmpty();
+    }
+
     private static PipelineDraft draft(PipelineDraft.Mode mode, long revision, PipelineDraft.Graph graph,
             PipelineDraft.Wizard wizard) {
         Instant now = Instant.parse("2026-09-21T00:00:00Z");
@@ -122,6 +132,19 @@ class PipelineDraftStoreContractTest {
             }
             drafts.put(pipelineId, replacement);
             return PipelineDraftMutation.REPLACED;
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation delete(String pipelineId, long expectedRevision) {
+            PipelineDraft current = drafts.get(pipelineId);
+            if (current == null) {
+                return PipelineDraftMutation.NOT_FOUND;
+            }
+            if (current.revision() != expectedRevision) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
+            drafts.remove(pipelineId);
+            return PipelineDraftMutation.DELETED;
         }
 
         @Override

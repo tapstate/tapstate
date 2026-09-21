@@ -72,9 +72,11 @@ class ControlFaceProjectionGatesTest {
                         || type.isMetaAnnotatedWith(RequestMapping.class));
     }
 
-    /** Every operation the registry opens on the CLI face — the online verb surface. */
+    /** Every operation the registry opens on a face served by the HTTP surface. */
     private static Set<String> registeredVerbs() {
-        return ControlOperations.registry().exposedOn(Frontend.CLI).stream()
+        return java.util.stream.Stream.concat(
+                        ControlOperations.registry().exposedOn(Frontend.CLI).stream(),
+                        ControlOperations.registry().exposedOn(Frontend.REST).stream())
                 .map(Operation::id)
                 .collect(toCollection(TreeSet::new));
     }
@@ -83,7 +85,7 @@ class ControlFaceProjectionGatesTest {
     @DisplayName("every HTTP handler projects a registered operation")
     void everyProjectedVerbIsRegistered() {
         assertThat(projectedVerbs())
-                .as("an endpoint may only project a registered, CLI-exposed operation — a face composes "
+                .as("an endpoint may only project a registered operation on an HTTP-served face — a face composes "
                         + "registered operations, it never invents an endpoint")
                 .isSubsetOf(registeredVerbs());
     }
@@ -117,7 +119,7 @@ class ControlFaceProjectionGatesTest {
         unreachable.removeAll(DEFERRED_WITH_NO_FACE);
 
         assertThat(unreachable)
-                .as("the CLI drives the server over this HTTP face, so an operation the registry opens on "
+                .as("an operation the registry opens on an HTTP-served face with no endpoint behind it "
                         + "the CLI face with no endpoint behind it cannot be invoked at all — give it an "
                         + "endpoint, or record it as deliberately deferred")
                 .isEmpty();

@@ -26,6 +26,7 @@ import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
@@ -66,6 +67,9 @@ import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
@@ -87,6 +91,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -101,6 +106,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -151,6 +157,7 @@ class PipelineApiTest {
         context.getBean(FakeTokenStore.class).clear();
         context.getBean(FakeDesiredStore.class).clear();
         context.getBean(FakePipelineLayoutStore.class).clear();
+        context.getBean(FakePipelineDraftStore.class).clear();
         context.getBean(RecordingAuditStore.class).clear();
         FakeArtifactStore artifacts = context.getBean(FakeArtifactStore.class);
         artifacts.clear();
@@ -203,6 +210,84 @@ class PipelineApiTest {
         assertThat(body).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING,
                 revisionOf(PIPELINE_V1), false, assemblyOf(PIPELINE_V1), false));
         assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).contains(body);
+    }
+
+    @Test
+    void draftAuthoringUsesRevisionEtagsAndPublishesThroughTheDraftContract() {
+        String token = machineToken(Scope.WRITE);
+        String draft = """
+                {"pipelineId":"draft-p1","mode":"dag","name":"Orders","description":"",
+                 "graph":{"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """;
+
+        ResponseEntity<Map> created = client().post().uri("/api/pipelines/draft-p1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toEntity(Map.class);
+
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getHeaders().getETag()).isEqualTo("\"1\"");
+        assertThat(created.getBody()).containsEntry("mode", "dag").containsEntry("revision", 1);
+        assertThat(created.getBody().get("updatedBy")).isInstanceOf(String.class);
+
+        ResponseEntity<Map> replaced = client().put().uri("/api/pipelines/draft-p1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header(HttpHeaders.IF_MATCH, "\"1\"")
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toEntity(Map.class);
+        assertThat(replaced.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(replaced.getHeaders().getETag()).isEqualTo("\"2\"");
+        assertThat(replaced.getBody()).containsEntry("revision", 2);
+
+        ApiError stale = client().put().uri("/api/pipelines/draft-p1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header(HttpHeaders.IF_MATCH, "\"1\"")
+                .contentType(MediaType.APPLICATION_JSON).body(draft)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_FAILED);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(stale.code()).isEqualTo("pipeline-draft.revision-conflict");
+
+        ResponseEntity<Map> published = client().post().uri("/api/pipelines/draft-p1/draft:publish")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("revision", 2)).retrieve().toEntity(Map.class);
+        assertThat(published.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(published.getBody()).containsEntry("published", true).containsKey("artifactHash");
+
+        ResponseEntity<Void> deleted = client().method(HttpMethod.DELETE)
+                .uri("/api/pipelines/draft-p1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header(HttpHeaders.IF_MATCH, "\"2\"")
+                .retrieve().toBodilessEntity();
+        assertThat(deleted.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("draft-p1")).isEmpty();
+    }
+
+    @Test
+    void draftPreviewReturnsAStableClientErrorForAnUncompilableDraft() {
+        String token = machineToken(Scope.WRITE);
+        String draft = """
+                {"pipelineId":"invalid-preview","mode":"dag","name":"Orders",
+                 "graph":{"nodes":[
+                   {"id":"source","type":"source","sourceId":"orders","config":{},"metadata":{}},
+                   {"id":"filter","type":"filter","config":{"expr":""},"metadata":{}}],
+                   "edges":[{"id":"source-filter","source":"source","target":"filter"}],
+                   "viewport":{"x":0,"y":0,"zoom":1}}}
+                """;
+
+        client().post().uri("/api/pipelines/invalid-preview/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toBodilessEntity();
+
+        ApiError error = client().post().uri("/api/pipelines/invalid-preview/draft:preview")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(Map.of("revision", 1))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(error.code()).isEqualTo("pipeline-draft.invalid");
+        assertThat(error.params()).containsEntry("id", "invalid-preview");
     }
 
     @Test
@@ -750,6 +835,16 @@ class PipelineApiTest {
         }
 
         @Bean
+        FakePipelineDraftStore pipelineDraftStore() {
+            return new FakePipelineDraftStore();
+        }
+
+        @Bean
+        PipelineDraftService pipelineDraftService(FakePipelineDraftStore store, AuditGate auditGate) {
+            return new PipelineDraftService(store, auditGate);
+        }
+
+        @Bean
         FakeHasher passwordHasher() {
             return new FakeHasher();
         }
@@ -1164,6 +1259,82 @@ class PipelineApiTest {
         @Override
         public List<String> pipelineIds() {
             return List.copyOf(byId.keySet());
+        }
+    }
+
+    /** An in-memory draft store that preserves the same revision and publication preconditions as Mongo. */
+    static final class FakePipelineDraftStore implements PipelineDraftStore {
+        private final Map<String, PipelineDraft> drafts = new LinkedHashMap<>();
+
+        synchronized void clear() {
+            drafts.clear();
+        }
+
+        @Override
+        public synchronized Optional<PipelineDraft> get(String pipelineId) {
+            return Optional.ofNullable(drafts.get(pipelineId));
+        }
+
+        @Override
+        public synchronized List<PipelineDraft> list() {
+            return List.copyOf(drafts.values());
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation create(PipelineDraft draft) {
+            return drafts.putIfAbsent(draft.pipelineId(), draft) == null
+                    ? PipelineDraftMutation.CREATED : PipelineDraftMutation.ALREADY_EXISTS;
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation replace(String pipelineId, long expectedRevision,
+                PipelineDraft replacement) {
+            PipelineDraft current = drafts.get(pipelineId);
+            if (current == null) {
+                return PipelineDraftMutation.NOT_FOUND;
+            }
+            if (current.mode() != replacement.mode()) {
+                return PipelineDraftMutation.MODE_CONFLICT;
+            }
+            if (current.revision() != expectedRevision) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
+            drafts.put(pipelineId, replacement);
+            return PipelineDraftMutation.REPLACED;
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation delete(String pipelineId, long expectedRevision) {
+            PipelineDraft current = drafts.get(pipelineId);
+            if (current == null) {
+                return PipelineDraftMutation.NOT_FOUND;
+            }
+            if (current.revision() != expectedRevision) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
+            drafts.remove(pipelineId);
+            return PipelineDraftMutation.DELETED;
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation publish(PipelineDraft.Publication publication) {
+            PipelineDraft current = drafts.get(publication.pipelineId());
+            if (current == null) {
+                return PipelineDraftMutation.NOT_FOUND;
+            }
+            if (current.revision() != publication.expectedDraftRevision()) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
+            if (!Objects.equals(current.baseArtifactHash(), publication.expectedArtifactHash())) {
+                return PipelineDraftMutation.ARTIFACT_CONFLICT;
+            }
+            drafts.put(publication.pipelineId(), new PipelineDraft(
+                    current.pipelineId(), current.schemaVersion(), current.revision(), current.mode(),
+                    current.name(), current.description(), current.graph(), current.wizard(),
+                    publication.publishedArtifactHash(), publication.expectedDraftRevision(),
+                    publication.publishedArtifactHash(), current.createdAt(), publication.publishedAt(),
+                    publication.updatedBy()));
+            return PipelineDraftMutation.PUBLISHED;
         }
     }
 

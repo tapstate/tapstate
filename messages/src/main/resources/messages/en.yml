@@ -534,6 +534,27 @@ pipeline.precondition-required:
 pipeline.version-conflict:
   message: "Pipeline '{id}' changed after it was read."
   solution: "Read the current Pipeline and retry the operation with its new ETag."
+pipeline-draft.not-found:
+  message: "No Pipeline draft with id '{id}' exists."
+  solution: "Create the draft or list Pipeline drafts to find an existing id."
+pipeline-draft.already-exists:
+  message: "A Pipeline draft with id '{id}' already exists."
+  solution: "Choose a different Pipeline id, or edit the existing draft."
+pipeline-draft.precondition-required:
+  message: "Pipeline draft '{id}' requires its current revision for this operation."
+  solution: "Read the draft, then retry with its revision in If-Match."
+pipeline-draft.revision-conflict:
+  message: "Pipeline draft '{id}' changed after it was read."
+  solution: "Read the current draft and retry with its new revision."
+pipeline-draft.invalid:
+  message: "Pipeline draft '{id}' cannot be compiled: {reason}."
+  solution: "Fix the draft at the reported location, then preview or publish it again."
+pipeline-draft.mode-conflict:
+  message: "Pipeline draft '{id}' cannot change authoring mode after creation."
+  solution: "Keep the existing draft mode, or create a new draft with the desired mode."
+pipeline-draft.artifact-conflict:
+  message: "Pipeline draft '{id}' is based on an artifact that changed after it was read."
+  solution: "Read the current Pipeline and draft, then retry the publish operation."
 transform.expression-failed:
   message: "Expression {expr} could not be evaluated for a row: {detail}."
   solution: "Check the expression against the fields and types the row actually carries at runtime."

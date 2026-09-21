@@ -102,6 +102,22 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
     }
 
     @Override
+    public PipelineDraftMutation delete(String pipelineId, long expectedRevision) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        if (expectedRevision < 1) {
+            throw new IllegalArgumentException("expected revision must be positive");
+        }
+        return StoreIo.call(() -> {
+            if (drafts.deleteOne(new Document("_id", pipelineId).append(REVISION, expectedRevision))
+                    .getDeletedCount() == 1) {
+                return PipelineDraftMutation.DELETED;
+            }
+            return drafts.find(new Document("_id", pipelineId)).first() == null
+                    ? PipelineDraftMutation.NOT_FOUND : PipelineDraftMutation.REVISION_CONFLICT;
+        });
+    }
+
+    @Override
     public PipelineDraftMutation publish(PipelineDraft.Publication publication) {
         Objects.requireNonNull(publication, "publication");
         return StoreIo.call(() -> publishInTransaction(publication));

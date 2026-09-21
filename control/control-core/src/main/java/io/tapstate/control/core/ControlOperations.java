@@ -27,6 +27,7 @@ public final class ControlOperations {
     private static final Map<Frontend, Maturity> CLI_ONLY = Map.of(Frontend.CLI, Maturity.CURRENT);
     private static final Map<Frontend, Maturity> CLI_AND_MCP =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT);
+    private static final Map<Frontend, Maturity> REST_ONLY = Map.of(Frontend.REST, Maturity.CURRENT);
 
     // system domain
     public static final Operation SYSTEM_VERSION = new Operation(
@@ -189,6 +190,30 @@ public final class ControlOperations {
     public static final Operation PIPELINE_UPDATE = new Operation(
             "pipeline.update", Scope.WRITE, true, null,
             "Replace one Pipeline definition while its content hash precondition still matches.", CLI_ONLY);
+
+    // Draft operations are the web authoring contract. They stay REST-only while the existing pipeline
+    // operations remain the compatibility surface for CLI and MCP clients.
+    public static final Operation PIPELINE_DRAFT_LIST = new Operation(
+            "pipeline-draft.list", Scope.READ, false, null,
+            "List editable Pipeline drafts with their revisions and publication state.", REST_ONLY);
+    public static final Operation PIPELINE_DRAFT_GET = new Operation(
+            "pipeline-draft.get", Scope.READ, false, null,
+            "Get one editable Pipeline draft and its revision.", REST_ONLY);
+    public static final Operation PIPELINE_DRAFT_CREATE = new Operation(
+            "pipeline-draft.create", Scope.WRITE, true, null,
+            "Create one editable Pipeline draft.", REST_ONLY);
+    public static final Operation PIPELINE_DRAFT_REPLACE = new Operation(
+            "pipeline-draft.replace", Scope.WRITE, true, null,
+            "Replace one Pipeline draft using its current revision.", REST_ONLY);
+    public static final Operation PIPELINE_DRAFT_DELETE = new Operation(
+            "pipeline-draft.delete", Scope.WRITE, true, null,
+            "Discard one Pipeline draft using its current revision.", REST_ONLY);
+    public static final Operation PIPELINE_DRAFT_PREVIEW = new Operation(
+            "pipeline-draft.preview", Scope.READ, false, null,
+            "Compile one Pipeline draft without publishing or changing the applied artifact.", REST_ONLY);
+    public static final Operation PIPELINE_DRAFT_PUBLISH = new Operation(
+            "pipeline-draft.publish", Scope.WRITE, true, null,
+            "Compile and atomically publish one Pipeline draft after its revision and artifact checks.", REST_ONLY);
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
@@ -297,6 +322,13 @@ public final class ControlOperations {
             PIPELINE_LAYOUT_UPDATE,
             PIPELINE_CREATE,
             PIPELINE_UPDATE,
+            PIPELINE_DRAFT_LIST,
+            PIPELINE_DRAFT_GET,
+            PIPELINE_DRAFT_CREATE,
+            PIPELINE_DRAFT_REPLACE,
+            PIPELINE_DRAFT_DELETE,
+            PIPELINE_DRAFT_PREVIEW,
+            PIPELINE_DRAFT_PUBLISH,
             PIPELINE_START,
             PIPELINE_STOP,
             PIPELINE_PAUSE,

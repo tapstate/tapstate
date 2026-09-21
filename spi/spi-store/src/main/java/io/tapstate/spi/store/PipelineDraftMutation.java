@@ -4,6 +4,7 @@ package io.tapstate.spi.store;
 public enum PipelineDraftMutation {
     CREATED,
     REPLACED,
+    DELETED,
     PUBLISHED,
     NOT_FOUND,
     ALREADY_EXISTS,

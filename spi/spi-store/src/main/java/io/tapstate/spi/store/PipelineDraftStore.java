@@ -14,6 +14,8 @@ public interface PipelineDraftStore {
 
     PipelineDraftMutation replace(String pipelineId, long expectedRevision, PipelineDraft replacement);
 
+    PipelineDraftMutation delete(String pipelineId, long expectedRevision);
+
     /** Atomically writes the candidate Artifact and advances the draft publication markers. */
     PipelineDraftMutation publish(PipelineDraft.Publication publication);
 }
