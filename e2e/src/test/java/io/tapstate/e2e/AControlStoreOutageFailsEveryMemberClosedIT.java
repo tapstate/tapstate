@@ -45,13 +45,22 @@ import org.junit.jupiter.api.io.TempDir;
  * fifteen seconds of connecting and never got it back, while the same relay carried an ordinary
  * request by hand. Whatever that is, it is not this product, and a case cannot rest on it.
  *
- * <p><strong>What this settles and what it does not.</strong> It settles that the outage stops every
- * member and that each of them stops by leaving the cluster: a member whose node session cannot be
- * renewed shuts its own cluster participation down, which is a stronger answer than refusing each
- * call and is the reason no member can carry on writing. It does not settle what happens on the way
- * back, because on the way back nothing happens on its own -- a member that took itself out stays out
- * until its process is restarted, measured here. Whether the run resumes under exactly one owner
- * after such a restart is the last thing it asks, and it asks it by restarting them.
+ * <p><strong>What this settles, and what it does not.</strong> It settles that nothing crosses while
+ * no member can reach the store, that every process stays up and every member link stays open while
+ * that is true, and that the work resumes under exactly one owner once the members are restarted. It
+ * does <em>not</em> settle that the fencing rules are what stopped them. Removing the rule that ends
+ * a member's cluster participation when its session cannot be renewed leaves this case green;
+ * removing that rule and the majority rule together also leaves it green. With the store frozen the
+ * engine has nowhere to write its positions either, so "nothing crossed" is overdetermined here, and
+ * a case cannot claim more than it can tell apart.
+ *
+ * <p>The rules are discriminated where they can be: in the unit cases that take the store away from
+ * one member while another still reads it, and in the partition case, where the store stays reachable
+ * throughout and only the members' view of each other is cut. What this case adds is the scenario
+ * neither of those reaches -- every member losing the store at once, with everything else healthy --
+ * and the half that exists only on the way back. A member that took itself out stays out, nothing
+ * rejoining on its own, so without the restart the question of one owner versus two could not be
+ * asked at all.
  */
 class AControlStoreOutageFailsEveryMemberClosedIT {
 
@@ -160,8 +169,9 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
                                         + "this is a store outage and not a partition", nodeId)
                                 .isZero();
                         assertThat(clusterFaceRefuses(cluster, nodeId))
-                                .describedAs("%s stopped answering for a cluster it can no longer prove "
-                                        + "it belongs to, rather than answering from what it remembers",
+                                .describedAs("%s stops answering for the cluster rather than answering "
+                                        + "from what it last remembers -- which is the read face's half "
+                                        + "of the same rule, and is not evidence about why it stopped",
                                         nodeId)
                                 .isTrue();
                     }
