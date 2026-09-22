@@ -101,7 +101,7 @@ boot.discovery-config-invalid:
   solution: "Choose one explicit discovery mode and provide all inputs required by that mode."
 boot.hazelcast-unavailable:
   message: "The embedded Hazelcast member could not start."
-  solution: "Another process may already be using the member port on loopback; stop it or set a different port, then restart."
+  solution: "Another process may already be using the member port; free it, or set tapstate.hz.member-port to one that is free, then restart."
 boot.heartbeat-config-invalid:
   message: "The member heartbeat settings cannot detect failure safely."
   solution: "Use whole-second positive durations and set maximum-no-heartbeat longer than heartbeat-interval."

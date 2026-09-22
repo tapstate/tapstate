@@ -14,9 +14,15 @@ Every cluster member needs:
 - one shared `tapstate.cluster.id`;
 - one stable, unique `tapstate.cluster.node-id`;
 - an absolute, routable `tapstate.control.advertise-url`;
+- one shared `tapstate.control.auth.jwt-secret`;
 - an explicit member discovery mode and a routable `tapstate.hz.bind-address`;
 - at least 4 GiB of JVM heap; and
 - a MongoDB replica set available to the members as the majority coordination store.
+
+Leave the signing secret out and each member mints its own at startup, which is a working
+single-node default and a confusing cluster: a client authenticates against the member it logged in
+to and is refused by every other one, because a session token is verified with the key that signed
+it. The startup log warns about it. Set the same value on every member.
 
 The member port serves an unauthenticated Hazelcast protocol. Expose it only on a private network or
 behind a NetworkPolicy. Cluster mode does not add transport authentication or TLS to that port.
@@ -42,6 +48,12 @@ from twice a join step's resident budget for every join map a member runs.
 | `single` | one | Default. Discovery stays off and the member port stays on loopback. |
 | `process-failure-only` | exactly two | Supports process-loss recovery testing. It does not provide network-partition safety and emits a warning at startup. |
 | `production-ha` | at least three | Business work requires a strict majority of the last committed active member set. A four-member 2-2 split fails closed on both sides. |
+
+The bootstrap-members column is a second setting, not a description of the profile:
+`tapstate.cluster.bootstrap-min-members` must be **exactly 2** under `process-failure-only` and **3
+or more** under `production-ha`. Its default is 3, so a `process-failure-only` member started without
+it is refused at boot with `boot.cluster-profile-invalid` rather than quietly running with the wrong
+threshold.
 
 Before the production threshold is reached, members may discover each other but cannot acquire or
 renew business-workload claims. A node-session claim is different: it reserves a stable node ID
