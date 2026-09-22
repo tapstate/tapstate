@@ -8,6 +8,7 @@ import io.tapstate.control.core.PipelineExplanation.Next;
 import io.tapstate.control.core.PipelineExplanation.NextAction;
 import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.FrontierStallPressure;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
@@ -111,7 +112,7 @@ public final class PipelineExplainService {
                 evidence(Source.STATUS, "failure", null),
                 evidence(Source.METRICS, RECONCILE_STREAK, facts.reconcileFailures()),
                 evidence(Source.METRICS, RECORD_COUNT, facts.recordCount()),
-                evidence(Source.METRICS, "frontierStalledMillis", facts.stalledChains()),
+                evidence(Source.METRICS, "frontierStalledMillis", facts.frontierStalledMillis()),
                 evidence(Source.SNAPSHOT, "rowsDone", facts.snapshotRowsDone()));
         List<String> cannotSay = new ArrayList<>();
         if (time.freshness() == Freshness.UNKNOWN) {
@@ -133,15 +134,21 @@ public final class PipelineExplainService {
     }
 
     private Facts facts(Observation observation) {
+        Map<String, Long> frontierStalledMillis = new TreeMap<>();
         Map<String, Long> stalled = new TreeMap<>();
         observation.metrics().forEach((name, value) -> {
-            if (name.startsWith(STALLED_PREFIX) && value != null && value > 0) {
-                stalled.put(name.substring(STALLED_PREFIX.length()), value);
+            if (name.startsWith(STALLED_PREFIX) && value != null) {
+                String chain = name.substring(STALLED_PREFIX.length());
+                frontierStalledMillis.put(chain, value);
+                if (FrontierStallPressure.EXPLAIN.isOver(value)) {
+                    stalled.put(chain, value);
+                }
             }
         });
         long rowsDone = observation.snapshot().values().stream().mapToLong(snapshot -> snapshot.rowsDone()).sum();
         return new Facts(observation.metrics().get(RECONCILE_STREAK),
                 observation.metrics().get(RECORD_COUNT),
+                Collections.unmodifiableMap(new LinkedHashMap<>(frontierStalledMillis)),
                 Collections.unmodifiableMap(new LinkedHashMap<>(stalled)), rowsDone);
     }
 
@@ -201,6 +208,7 @@ public final class PipelineExplainService {
     }
 
     private record Facts(Long reconcileFailures, Long recordCount,
-            Map<String, Long> stalledChains, long snapshotRowsDone) {
+            Map<String, Long> frontierStalledMillis, Map<String, Long> stalledChains,
+            long snapshotRowsDone) {
     }
 }

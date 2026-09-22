@@ -23,6 +23,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -157,7 +158,8 @@ class ObservabilityConsumerContractTest {
                         evidence(PipelineExplanation.Source.STATUS, "failure", null),
                         evidence(PipelineExplanation.Source.METRICS, "reconcileFailuresInARow", 0L),
                         evidence(PipelineExplanation.Source.METRICS, "recordCount", 1_200L),
-                        evidence(PipelineExplanation.Source.METRICS, "frontierStalledMillis", Map.of()),
+                        evidence(PipelineExplanation.Source.METRICS, "frontierStalledMillis",
+                                new TreeMap<>(Map.of("orders", 196L, "shipments", 9L))),
                         evidence(PipelineExplanation.Source.SNAPSHOT, "rowsDone", 1_200L)),
                 List.of(
                         "Whether the source has changes waiting is not measured.",
