@@ -8,6 +8,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -43,6 +44,11 @@ final class RealProcessServer implements ServerHandle {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
     }
 
+    /** Launches this build with additional command-line settings owned by one focused witness. */
+    static RealProcessServer start(String storeUri, List<String> additionalArguments) {
+        return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), additionalArguments);
+    }
+
     /** Launches the deliverable with an explicit operator-state database. */
     static RealProcessServer start(String storeUri, String operatorStateDatabase) {
         return start(storeUri, operatorStateDatabase, bootJar());
@@ -61,7 +67,12 @@ final class RealProcessServer implements ServerHandle {
     }
 
     private static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar) {
-        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar);
+        return start(storeUri, operatorStateDatabase, jar, List.of());
+    }
+
+    private static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
+            List<String> additionalArguments) {
+        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, additionalArguments);
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
@@ -88,13 +99,19 @@ final class RealProcessServer implements ServerHandle {
     }
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar) {
+        return launching(storeUri, operatorStateDatabase, jar, List.of());
+    }
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            List<String> additionalArguments) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
         URI baseUrl = URI.create("http://127.0.0.1:" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
-        Process process = launch(jar, port, storeUri, operatorStateDatabase, workingDirectory, output);
+        Process process = launch(jar, port, storeUri, operatorStateDatabase, workingDirectory, output,
+                additionalArguments);
         return new RealProcessServer(process, baseUrl, output);
     }
 
@@ -166,8 +183,9 @@ final class RealProcessServer implements ServerHandle {
     }
 
     private static Process launch(
-            Path jar, int port, String storeUri, String operatorStateDatabase, Path workingDirectory, Path output) {
-        List<String> command = List.of(
+            Path jar, int port, String storeUri, String operatorStateDatabase, Path workingDirectory,
+            Path output, List<String> additionalArguments) {
+        List<String> command = new ArrayList<>(List.of(
                 javaBinary(),
                 "-jar",
                 jar.toString(),
@@ -186,7 +204,8 @@ final class RealProcessServer implements ServerHandle {
                 // A staging directory of this launch's own, for the same reason the other tier gets one:
                 // the cache is content-addressed and reused, so a shared one serves a stale connector.
                 "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + ServerHandle.privateStagingDirectory(),
-                "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID);
+                "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
+        command.addAll(additionalArguments);
         try {
             return new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())

@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
-import java.time.Duration;
+import io.tapstate.core.lifecycle.FrontierStallPressure;
+
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -39,9 +40,6 @@ import java.util.TreeMap;
  */
 record MetricsFacts(Long reconcileFailuresInARow, Long recordCount, Map<String, Long> stalledChains,
         MovementReading movement) {
-
-    /** A minute pinned separates an ordinary frontier pause from a chain worth diagnosing as stopped. */
-    static final Duration CHAIN_STALL_THRESHOLD = Duration.ofMinutes(1);
 
     /**
      * How many convergence passes in a row have thrown, published only while a streak is running.
@@ -91,7 +89,7 @@ record MetricsFacts(Long reconcileFailuresInARow, Long recordCount, Map<String, 
         Map<String, Long> stalled = new LinkedHashMap<>();
         metrics.forEach((name, value) -> {
             if (name.startsWith(STALLED_PREFIX) && value != null
-                    && value >= CHAIN_STALL_THRESHOLD.toMillis()) {
+                    && FrontierStallPressure.EXPLAIN.isOver(value)) {
                 stalled.put(name.substring(STALLED_PREFIX.length()), value);
             }
         });

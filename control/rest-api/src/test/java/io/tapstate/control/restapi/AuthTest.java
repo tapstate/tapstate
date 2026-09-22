@@ -735,7 +735,7 @@ class AuthTest {
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             PipelinePositionTestConfiguration.class,
-            DerivedSchemaTestConfiguration.class})
+            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class})
     static class TestApp {
 
         @Bean

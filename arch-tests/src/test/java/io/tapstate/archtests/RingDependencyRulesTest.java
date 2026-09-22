@@ -349,6 +349,7 @@ class RingDependencyRulesTest {
         classes().that().resideInAPackage("io.tapstate.control.core..")
                 .should().onlyDependOnClassesThat().resideInAnyPackage(
                         "java..",
+                        "javax.crypto..",
                         "io.tapstate.control.core..",
                         "io.tapstate.core..",
                         // control-core decouples from the runtime through the storage port
