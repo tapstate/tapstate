@@ -35,6 +35,8 @@ class PipelineActuationOwnershipTest {
     private static final Instant T0 = Instant.parse("2026-09-18T00:00:00Z");
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Duration RENEW = Duration.ofSeconds(10);
+    /** The stretch a departure is asked to answer over; what the production caller spends its budget in. */
+    private static final long SETTLING = TTL.multipliedBy(ClusterRebuildAdmission.MAX_ATTEMPTS).toNanos();
     private static final WorkloadOwner NODE_A = new WorkloadOwner("node-a", "boot-a");
     private static final WorkloadOwner NODE_B = new WorkloadOwner("node-b", "boot-b");
     private static final WorkloadClaimKey ORDERS =
@@ -170,11 +172,11 @@ class PipelineActuationOwnershipTest {
     void theRunAKilledMemberLeftBehindIsAdmittedForRebuildingByTheOneThatInheritsIt() {
         PipelineActuationOwnership nodeA = ownership(NODE_A);
         assertThat(nodeA.permit("orders").granted()).isTrue();
-        assertThat(nodeA.aMemberLeftUnderTheRun("orders"))
+        assertThat(nodeA.aMemberLeftUnderTheRun("orders", SETTLING))
                 .as("a pipeline nobody has run yet is not a run anybody left behind")
                 .isFalse();
         assertThat(nodeA.beginExecution("orders").allowed()).isTrue();
-        assertThat(nodeA.aMemberLeftUnderTheRun("orders"))
+        assertThat(nodeA.aMemberLeftUnderTheRun("orders", SETTLING))
                 .as("and nothing has moved under the member that submitted it")
                 .isFalse();
 
@@ -186,7 +188,7 @@ class PipelineActuationOwnershipTest {
         assertThat(nodeB.permit("orders").granted())
                 .as("the pipeline changes hands once the dead holder's lease expires")
                 .isTrue();
-        assertThat(nodeB.aMemberLeftUnderTheRun("orders"))
+        assertThat(nodeB.aMemberLeftUnderTheRun("orders", SETTLING))
                 .as("the member that inherits a claim already carrying an execution is holding a run "
                         + "nobody is driving, and that is the whole of what it needs to know to replace it")
                 .isTrue();

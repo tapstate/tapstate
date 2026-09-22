@@ -76,13 +76,22 @@ final class PipelineActuationOwnership {
          */
         private Set<String> runMembers;
         /**
-         * Whether any of those members has been missing from the committed set at a moment this member
-         * looked. Remembered rather than recomputed, because a member that leaves and comes back is a
-         * member that left: the run it was carrying pieces of died either way, and by the time anybody
-         * asks, a comparison against the set committed now cannot see that it was ever gone.
+         * The last moment any of those members was missing from the committed set while this member
+         * looked, or {@link #NEVER}. Remembered rather than recomputed, because a member that leaves and
+         * comes back is a member that left: the run it was carrying pieces of died either way, and by
+         * the time anybody asks, a comparison against the set committed now cannot see that it was ever
+         * gone.
+         *
+         * <p>A moment rather than a flag, and it outlives the run it was taken under, because what it
+         * has to answer is asked about the runs that come after: a departure goes on ending them for a
+         * stretch, and every one of those is planned over members that are all still here. How long a
+         * stretch is the asker's to decide, so it is kept raw here.
          */
-        private boolean lostAMember;
+        private long lostAMemberAtNanos = NEVER;
     }
+
+    /** No member has been seen missing under this run. Not a time, so no arithmetic is done on it. */
+    private static final long NEVER = Long.MIN_VALUE;
 
     private PipelineActuationOwnership() {
         this.clusterId = "single";
@@ -207,14 +216,29 @@ final class PipelineActuationOwnership {
         // nobody", and nobody can never go missing.
         ClusterMembership planned = membership.committed();
         state.runMembers = planned == null ? null : planned.activeNodeIds();
-        state.lostAMember = false;
+        // The departure is deliberately not forgotten here. This run is planned over members that are
+        // all present, so the comparison below will find nothing missing from it -- and the run is being
+        // submitted because a member went away, into a cluster that is still settling from it. Clearing
+        // the moment here would make the very next death of this run read as the pipeline's own.
         return new Execution(true, new ExecutionFence(
                 pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()));
     }
 
     /**
-     * Whether a member the run this member last submitted for {@code pipelineId} was planned over has
-     * gone away since.
+     * Whether a member the run this member last submitted for {@code pipelineId} was planned over is
+     * gone, or went within {@code settlingNanos} of now.
+     *
+     * <p><b>Why a stretch and not an instant.</b> A member going away does not end one run; it ends the
+     * run it was carrying pieces of, and then goes on ending the ones submitted to replace it while the
+     * cluster settles - a reconnection, a topology that changed again, a fence the new execution moved
+     * out from under the old one. Every one of those replacements is planned over members that are all
+     * still present, so an instant reading calls them the pipeline's own deaths and leaves it failed for
+     * a person over a member that left. The caller chooses the stretch, because what bounds it is the
+     * caller's budget and spacing rather than anything ownership knows.
+     *
+     * <p>While the member is actually still missing the stretch never runs out: every look that finds it
+     * absent takes the moment again. What the stretch bounds is only the tail after it is back, or after
+     * a run was re-planned without it.
      *
      * <p>This is the product's own answer to "did a member leave", and it is its own rather than the
      * engine's for a measured reason: a run ended by a member leaving and a run ended by a connector
@@ -246,7 +270,7 @@ final class PipelineActuationOwnership {
      * driver was killed is picked up rather than left failed - without pretending to a check it cannot
      * make.
      */
-    boolean aMemberLeftUnderTheRun(String pipelineId) {
+    boolean aMemberLeftUnderTheRun(String pipelineId, long settlingNanos) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (!fenced) {
             return false;
@@ -256,10 +280,22 @@ final class PipelineActuationOwnership {
             return false;
         }
         if (state.runMembers == null) {
-            return inheritedARunNobodyIsDriving(state);
+            if (!inheritedARunNobodyIsDriving(state)) {
+                return false;
+            }
+            // The member that submitted this run is the member that went away, so this one never saw the
+            // absence itself and has nothing to compare against. Take the moment here, or the stretch
+            // below would have nothing to run from: the replacement about to be submitted is planned
+            // over the members that are here, and its own death would read as the pipeline's own. Taken
+            // again on every look, like the comparison below, until a run of this member's own exists.
+            state.lostAMemberAtNanos = nanoTime.getAsLong();
+            return true;
         }
         observeMembership(state);
-        return state.lostAMember;
+        if (state.lostAMemberAtNanos == NEVER) {
+            return false;
+        }
+        return nanoTime.getAsLong() - (state.lostAMemberAtNanos + settlingNanos) < 0;
     }
 
     /**
@@ -296,14 +332,20 @@ final class PipelineActuationOwnership {
         return Map.copyOf(byNode);
     }
 
-    /** Records an absence while it can still be seen; a member back before anybody asked still left. */
+    /**
+     * Records an absence while it can still be seen; a member back before anybody asked still left.
+     *
+     * <p>Taken again on every look that still finds it missing, so a member that has not come back never
+     * stops counting as gone however long it stays away. The moment only stops moving once the run's
+     * members are all present again - which is where the caller's stretch takes over.
+     */
     private void observeMembership(Held state) {
-        if (state.runMembers == null || state.lostAMember) {
+        if (state.runMembers == null) {
             return;
         }
         ClusterMembership current = membership.committed();
         if (current != null && !current.activeNodeIds().containsAll(state.runMembers)) {
-            state.lostAMember = true;
+            state.lostAMemberAtNanos = nanoTime.getAsLong();
         }
     }
 

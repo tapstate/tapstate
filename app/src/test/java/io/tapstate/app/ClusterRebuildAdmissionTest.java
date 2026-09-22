@@ -107,19 +107,52 @@ class ClusterRebuildAdmissionTest {
         assertThat(admission.admits("orders")).isFalse();
     }
 
+    /**
+     * The failure this class was reported for: a pipeline left failed for a person over a member that
+     * went away, with the budget meant to bring it back never reaching it.
+     *
+     * <p>A rebuilt run is planned over the members that are here now, so nothing is missing from it -
+     * and it is started into a cluster still settling from the departure, which goes on ending runs for
+     * seconds afterwards. Read at the instant of that second death, the departure has already stopped
+     * being the answer, and nothing replaces the run: the pipeline stays failed, unasked and for good.
+     */
     @Test
-    void aRebuiltRunGivesTheBudgetBackByBeingPlannedOverTheClusterThatIsThereNow() {
-        committed(7, "node-a", "node-b", "node-c");
+    void aRebuiltRunThatDiesWhileTheDepartureIsStillSettlingIsRebuiltToo() {
+        committed(7, "node-a", "node-b");
         submitRunUnder(7);
-        committed(8, "node-a", "node-b");
+        committed(8, "node-a");
+
         assertThat(admission.admits("orders")).isTrue();
 
         // What a rebuild does: the holder takes the next execution generation, and the run it submits is
-        // planned over the members committed now. Nothing has to clear the count -- the member that was
-        // missing is not one of this run's, so the question stops answering yes.
+        // planned over the members committed now. The member that went is not one of this run's.
         submitRunUnder(8);
+        nanos.addAndGet(BACKOFF.toNanos());
 
-        assertThat(admission.admits("orders")).isFalse();
+        assertThat(admission.admits("orders"))
+                .as("what killed the replacement is what the departure left behind, so refusing here "
+                        + "leaves the pipeline failed over a member that left - which is the one death "
+                        + "this loop exists to answer, and nothing else will come back for it")
+                .isTrue();
+    }
+
+    /**
+     * And the spacing holds across the pass that saw an intact run, which is the other half of the same
+     * report: two attempts were spent 2.2 seconds apart, both inside the window the transient was still
+     * open, so the budget was gone before the cluster had stopped moving.
+     */
+    @Test
+    void thePassThatSeesAnIntactRunDoesNotHandTheSpacingBack() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        committed(8, "node-a", "node-b");
+
+        assertThat(admission.admits("orders")).isTrue();
+        submitRunUnder(8);
+        assertThat(admission.admits("orders"))
+                .as("nothing is missing from the run submitted in its place, and the spacing has not "
+                        + "elapsed either")
+                .isFalse();
 
         // A second loss, out of the members this run does have. Written as a real one because the only
         // membership a cluster ever commits is one whose node set differs from the last: a bare revision
@@ -127,8 +160,71 @@ class ClusterRebuildAdmissionTest {
         committed(9, "node-a");
 
         assertThat(admission.admits("orders"))
-                .as("and the next loss under it is a fresh budget, not the tail of the previous one")
+                .as("a rebuild a moment after the last one goes into the same half-formed membership - "
+                        + "which is what the spacing is for, and a pass that happened to see an intact "
+                        + "run in between is not a reason to have spent none of it")
+                .isFalse();
+        nanos.addAndGet(BACKOFF.toNanos());
+        assertThat(admission.admits("orders")).isTrue();
+    }
+
+    /**
+     * The same, on the road the reported failure actually takes: the member that went away is the one
+     * that was driving, so the member picking the pipeline up never saw the absence - it has no run of
+     * its own to compare a membership against, and the claim carrying somebody else's execution is the
+     * whole of what tells it anything happened.
+     *
+     * <p>Held apart from the case above because they are two different readings of the same question,
+     * and only this one is what a killed driver produces. A stretch that started only where a member
+     * compared its own run would cover the pipelines a member kept and none of the ones it inherited.
+     */
+    @Test
+    void theReplacementForAnInheritedRunIsRebuiltTooWhileTheDepartureIsStillSettling() {
+        committed(7, "node-a", "node-b");
+        PipelineActuationOwnership driver = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-b", "boot-b"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(driver.permit("orders").granted()).isTrue();
+        assertThat(driver.beginExecution("orders").allowed()).isTrue();
+
+        // It is killed: it stops renewing, the lease it never released runs out, and it leaves the
+        // committed set. What it does not leave is anything saying what its run was planned over.
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        committed(8, "node-a");
+        assertThat(ownership.permit("orders").granted())
+                .as("the pipeline changes hands once the dead holder's lease expires").isTrue();
+
+        assertThat(admission.admits("orders")).isTrue();
+        assertThat(ownership.beginExecution("orders").allowed()).isTrue();
+        nanos.addAndGet(BACKOFF.toNanos());
+
+        assertThat(admission.admits("orders"))
+                .as("the run this member submitted in place of the dead one is planned over itself "
+                        + "alone, so nothing is ever missing from it - and what ended it is what the "
+                        + "killed member left behind")
                 .isTrue();
+    }
+
+    @Test
+    void onceTheSettlingIsOverADeathIsThePipelinesOwnAgain() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a");
+
+        assertThat(admission.admits("orders")).isTrue();
+        submitRunUnder(8);
+
+        // Well past the whole stretch the departure answers for, which is as long as spending the budget
+        // takes. Not up to its edge: where that edge falls depends on how many round trips the handover
+        // above took, and this is about what is true after it, not about the boundary itself.
+        nanos.addAndGet(BACKOFF.multipliedBy(2L * ClusterRebuildAdmission.MAX_ATTEMPTS).toNanos());
+
+        assertThat(admission.admits("orders"))
+                .as("a run that kept dying long after the cluster stopped moving is dying of its own "
+                        + "trouble, and restarting it every backoff for ever is the restart loop this "
+                        + "budget exists to stop")
+                .isFalse();
     }
 
     /** Installs a committed membership at {@code revision} and lets the gate see those nodes. */

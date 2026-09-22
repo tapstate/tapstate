@@ -23,10 +23,18 @@ import org.slf4j.LoggerFactory;
  * from a restart loop from the outside. The spacing is there because the cluster is often still settling:
  * rebuilding into the same half-formed membership is how a handover turns into a sequence of them.
  *
- * <p>The count resets by itself. Once a rebuilt run is submitted, it is planned over the members that
- * are here now, so nobody is missing from it and the budget is given back -- there is nothing to clear
- * and nobody has to remember to. A pipeline that changes hands to another member is refused here for a
- * different reason: this member is not driving it, so no run of its own is recorded against it.
+ * <p><b>A departure answers for more than the run it ended.</b> The run submitted in its place is
+ * planned over the members that are here now, so nothing is missing from it -- and it is being started
+ * into a cluster still settling from the departure, which goes on ending runs: a member reconnecting, a
+ * topology that moved again, an execution fenced out by the one replacing it. Asked at the instant of
+ * each death, every one of those reads as the pipeline's own, and the pipeline is left failed for a
+ * person over a member that left. So the question carries a stretch, and it is over that stretch that
+ * the count and the spacing below are spent.
+ *
+ * <p>The count resets by itself, once the stretch is over and nothing is missing: the departure has
+ * stopped being the answer, and whatever ends a run after that is the pipeline's own. A pipeline that
+ * changes hands to another member is refused here for a different reason: this member is not driving
+ * it, so no run of its own is recorded against it.
  *
  * <p>Not synchronized: one convergence pass at a time asks this, on a single scheduler thread with a
  * fixed delay, so passes never overlap.
@@ -67,9 +75,15 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     @Override
     public boolean admits(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        if (!actuation.aMemberLeftUnderTheRun(pipelineId)) {
-            // Either every member it was planned over is still here -- so this death is the pipeline's
-            // own and stays its own -- or this member is not the one driving it. Both give the budget back.
+        if (!actuation.aMemberLeftUnderTheRun(pipelineId, MAX_ATTEMPTS * backoffNanos)) {
+            // Either no member it was planned over is gone, and none went recently enough to still be
+            // answering for this death -- so it is the pipeline's own and stays its own -- or this member
+            // is not the one driving it. Both give the budget back.
+            //
+            // The stretch is as long as spending the whole budget takes at the spacing below, so the two
+            // numbers are one idea rather than two that can disagree: shorter and part of the budget
+            // would be unreachable, longer and a departure would go on answering after its answer ran
+            // out.
             attempts.remove(pipelineId);
             return false;
         }
