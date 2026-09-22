@@ -10,6 +10,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StateStore;
 
 import java.util.ArrayList;
@@ -174,8 +175,21 @@ public final class LivePipelines {
      */
     public void refuseBufferingChangeWhileLive(
             SourceResource stored, SourceResource replacement, List<Resource> allStored) {
+        refuseBufferingChangeWhileLive(stored, replacement, allStored, List.of());
+    }
+
+    /**
+     * The source-side refusal with the pipeline rows whose bodies could not be reconstructed. Their
+     * references are unknowable, so a live one fails closed rather than being treated as a non-reader.
+     */
+    void refuseBufferingChangeWhileLive(
+            SourceResource stored,
+            SourceResource replacement,
+            List<Resource> allStored,
+            List<String> unreadablePipelineIds) {
         Objects.requireNonNull(replacement, "replacement");
         Objects.requireNonNull(allStored, "allStored");
+        Objects.requireNonNull(unreadablePipelineIds, "unreadablePipelineIds");
         if (stored == null || stored.srsEnabled() == replacement.srsEnabled()) {
             return;
         }
@@ -193,6 +207,17 @@ public final class LivePipelines {
             throw new TapstateException(
                     SourceError.SRS_CHANGE_WHILE_RUNNING,
                     Map.of("id", stored.id(), "pipelines", live),
+                    null);
+        }
+        List<String> unreadableLive = unreadablePipelineIds.stream()
+                .distinct()
+                .filter(this::changeWouldGoUnreported)
+                .sorted()
+                .toList();
+        if (!unreadableLive.isEmpty()) {
+            throw new TapstateException(
+                    IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", unreadableLive.getFirst(), "field", "body"),
                     null);
         }
     }

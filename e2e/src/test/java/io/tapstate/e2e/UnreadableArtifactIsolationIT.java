@@ -23,12 +23,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A stored artifact this build cannot read is isolated from tolerant read-only listings but still makes
- * a destructive reference check fail closed.
+ * safety checks that need its references fail closed.
  *
- * <p>The unreadable row is made in the real Mongo store after both pipelines are accepted over HTTP.
- * The list and deletion are then driven over HTTP, so these cases cover both inventory policies against
- * the real stored shape. One tier is enough: the behavior under test sits between the HTTP controller and
- * the same real store used by both launchers, not at the process boundary.
+ * <p>The unreadable row is made in the real Mongo store after its surrounding workspace is accepted over
+ * HTTP. The list, deletion and live source edit are then driven over HTTP, so these cases cover both
+ * inventory policies against the real stored shape. One tier is enough: the behavior under test sits
+ * between the HTTP controller and the same real store used by both launchers, not at the process boundary.
  */
 class UnreadableArtifactIsolationIT {
 
@@ -80,6 +80,30 @@ class UnreadableArtifactIsolationIT {
                     .hasMessageContaining("got 500")
                     .hasMessageContaining("io.document-unreadable");
             assertThat(control.artifact(SOURCE_ID)).contains(source);
+        }
+    }
+
+    @Test
+    void anUnreadableRunningPipelineCannotLetItsSourceBufferingChange(@TempDir Path directory)
+            throws Exception {
+        String storeUri = SharedMongo.replicaSetUrl("unreadable_live_pipeline");
+        try (ServerHandle server = InProcessServer.start(storeUri);
+                MongoClient store = MongoClients.create(storeUri)) {
+            RunningPipeline running = RunningPipeline.started(server, directory);
+            ControlPlane control = running.control();
+            ControlPlane.StoredArtifact source = control.artifact(running.sourceId()).orElseThrow();
+
+            makeBodyUnreadable(store, storeUri, running.pipelineId());
+            String replacement = source.canonicalForm() + """
+                    srs:
+                      enabled: false
+                    """;
+
+            assertThatThrownBy(() -> control.apply(Map.of("source.tap.yml", replacement)))
+                    .isInstanceOf(AssertionError.class)
+                    .hasMessageContaining("got 500")
+                    .hasMessageContaining("io.document-unreadable");
+            assertThat(control.artifact(running.sourceId())).contains(source);
         }
     }
 

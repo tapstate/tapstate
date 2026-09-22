@@ -17,10 +17,21 @@ final class ReadableArtifactInventory {
     }
 
     static List<Resource> list(ArtifactStore store) {
+        return scan(store).resources();
+    }
+
+    /**
+     * Resolves readable resources while retaining the identities of pipeline rows that could not be
+     * reconstructed. Most validation can ignore those rows, but a live-change guard cannot turn an
+     * unknown source edge into no edge.
+     */
+    static Snapshot scan(ArtifactStore store) {
         Objects.requireNonNull(store, "store");
         List<Resource> resources = new ArrayList<>();
+        List<String> unreadablePipelineIds = new ArrayList<>();
         for (StoredArtifactRecord row : store.listStored()) {
             if (!row.readable()) {
+                retainUnreadablePipeline(row, unreadablePipelineIds);
                 continue;
             }
             try {
@@ -30,8 +41,24 @@ final class ReadableArtifactInventory {
                     throw failure;
                 }
                 // The row became unreadable between the browse projection and this typed lookup.
+                retainUnreadablePipeline(row, unreadablePipelineIds);
             }
         }
-        return List.copyOf(resources);
+        return new Snapshot(resources, unreadablePipelineIds);
+    }
+
+    private static void retainUnreadablePipeline(
+            StoredArtifactRecord row, List<String> unreadablePipelineIds) {
+        if ("pipeline".equals(row.kind())) {
+            unreadablePipelineIds.add(row.id());
+        }
+    }
+
+    record Snapshot(List<Resource> resources, List<String> unreadablePipelineIds) {
+
+        Snapshot {
+            resources = List.copyOf(resources);
+            unreadablePipelineIds = List.copyOf(unreadablePipelineIds);
+        }
     }
 }
