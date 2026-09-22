@@ -157,20 +157,41 @@ class ThreeMemberNetworkPartitionFailsClosedIT {
 
                 // Nothing is asked of the product from here until the assertions below.
                 ControlPlane survivor = cluster.member(majority.getFirst());
-                long rowsAtTheCut = files.count(targetAddress, TABLE);
+
+                // The takeover is waited for before anything is changed at the source, and that order is
+                // the whole point. A cut is not a kill: the stranded member's process is alive and its
+                // store is reachable, so its run stays authorized until the lease it proved runs out --
+                // and the pair cannot take the pipeline over until that same lease expires, because that
+                // is what frees the claim. In the stretch between, a change made at the source is
+                // carried across by the side that is about to stop. Made before the takeover, the change
+                // that is supposed to be the proof of one is the one thing that cannot be.
+                //
+                // Measured on a shard: the pair took over 26 seconds after the run died, and a change
+                // made at the cut had already reached the target well before that, so the reading below
+                // was taken while the handover was still owed. The product was doing what it promises --
+                // a budget, not an instant. On the kill lane there is no such stretch, because a killed
+                // process carries nothing across, which is why only this case needed the order fixed.
+                Await.until("the pair to take the pipeline over, which waits out the lease the stranded "
+                                + "holder never released", TAKEOVER,
+                        () -> survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> "the majority reports " + survivor.state(PIPELINE) + " at execution "
+                                + survivor.executionGenerationOf(PIPELINE) + ", captures owned by "
+                                + survivor.captureOwnersOf(PIPELINE).values());
+
+                long rowsAtTheTakeover = files.count(targetAddress, TABLE);
                 files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
 
-                Await.until("a change made after the cut to reach the target, which no reading of the "
-                                + "job's state can stand in for", TAKEOVER,
-                        () -> files.count(targetAddress, TABLE) > rowsAtTheCut,
+                Await.until("a change made after the takeover to reach the target, which no reading of "
+                                + "the job's state can stand in for", TAKEOVER,
+                        () -> files.count(targetAddress, TABLE) > rowsAtTheTakeover,
                         () -> "rows at target = " + files.count(targetAddress, TABLE)
-                                + ", was " + rowsAtTheCut + " when the network was cut; the majority "
+                                + ", was " + rowsAtTheTakeover + " when the pair took over; the majority "
                                 + "reports " + survivor.state(PIPELINE) + " and captures owned by "
                                 + survivor.captureOwnersOf(PIPELINE).values());
 
                 assertThat(survivor.state(PIPELINE))
-                        .describedAs("the pipeline runs on the side that kept a majority, and nobody "
-                                + "asked it to")
+                        .describedAs("the pipeline is still running on the side that kept a majority, "
+                                + "and nobody asked it to be")
                         .contains(PipelineState.RUNNING);
                 assertThat(survivor.captureOwnersOf(PIPELINE).values())
                         .describedAs("and the source is read from that side. A job back at RUNNING over "
