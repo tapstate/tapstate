@@ -98,6 +98,32 @@ class PipelineExplainServiceTest {
         assertThat(answer.cannotSay()).containsExactly("explain.cannot-source-head");
     }
 
+    /**
+     * An absent record count and one standing at nought are not two spellings of one state. The count
+     * is absent when there is no live job to read it from, and present at nought when a job is live
+     * and has driven nothing through it. Both have moved nothing and both belong here, but the second
+     * is the alarming one -- something is running and carrying nothing -- and it is the one a real
+     * cluster reports. The case above covers the absent reading; this covers the live one, which
+     * otherwise falls to "no rule matched": nothing driven, nothing loaded, and no conclusion drawn.
+     *
+     * <p>The nought has to survive into the evidence as a nought rather than a null, because the
+     * evidence is what the reader is shown, and those two values are the difference between a job
+     * that is running and one that is not there.
+     */
+    @Test
+    void noMovementAlsoAnswersARecordCountPublishedAsNought() {
+        Observation observation = observation(PipelineState.RUNNING, Map.of("recordCount", 0L), 0,
+                NOW.minusSeconds(2));
+
+        PipelineExplanation answer = service(observation).explain(ID);
+
+        assertThat(answer.kind()).isEqualTo(Kind.NO_MOVEMENT);
+        assertThat(answer.evidence()).containsExactly(
+                new Evidence(Source.METRICS, "recordCount", 0L),
+                new Evidence(Source.SNAPSHOT, "rowsDone", 0L));
+        assertThat(answer.next().action()).isEqualTo(NextAction.OPEN_PIPELINE_LOGS);
+    }
+
     @Test
     void stalledChainsAreEvidenceInDictionaryOrder() {
         Map<String, Long> metrics = new LinkedHashMap<>();
