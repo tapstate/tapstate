@@ -115,7 +115,7 @@ class PipelineExplainServiceTest {
     }
 
     @Test
-    void millisecondScalePausesAreNotCalledStoppedChains() {
+    void subThresholdPausesRemainTypedEvidenceWithoutAStoppedChainDiagnosis() {
         Observation observation = observation(PipelineState.RUNNING, Map.of(
                 "reconcileFailuresInARow", 0L,
                 "recordCount", 11L,
@@ -127,7 +127,10 @@ class PipelineExplainServiceTest {
         assertThat(answer.kind()).isEqualTo(Kind.NO_MATCH);
         assertThat(answer.evidence())
                 .filteredOn(evidence -> evidence.field().equals("frontierStalledMillis"))
-                .containsExactly(new Evidence(Source.METRICS, "frontierStalledMillis", Map.of()));
+                .containsExactly(new Evidence(Source.METRICS, "frontierStalledMillis", Map.of(
+                        "orders", 196L,
+                        "shipments", 9L)));
+        assertThat(answer.next()).isNull();
     }
 
     @Test

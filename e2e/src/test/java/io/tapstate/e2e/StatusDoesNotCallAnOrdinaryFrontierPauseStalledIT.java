@@ -60,7 +60,7 @@ class StatusDoesNotCallAnOrdinaryFrontierPauseStalledIT {
             assertThat(status.stdout())
                     .contains(PIPELINE + "  running")
                     .contains("kind       NO_MATCH")
-                    .contains("read       metrics.frontierStalledMillis = {}")
+                    .contains("read       metrics.frontierStalledMillis = {orders=196, shipments=9}")
                     .doesNotContain("FRONTIER_STALLED", "CHECK_TARGET");
         }
     }
