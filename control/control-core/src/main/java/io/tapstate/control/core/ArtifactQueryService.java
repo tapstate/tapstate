@@ -62,7 +62,7 @@ public final class ArtifactQueryService {
 
     /** Lists typed stored resources and their canonical hashes without exposing canonical text. */
     public List<StoredResource> listResources() {
-        return store.list().stream().map(this::typedView).toList();
+        return ReadableArtifactInventory.list(store).stream().map(this::typedView).toList();
     }
 
     /**

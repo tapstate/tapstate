@@ -10,6 +10,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /** Typed Source projection over the generic artifact query and mutation paths. */
 public final class SourceProjectionService {
@@ -32,7 +33,11 @@ public final class SourceProjectionService {
 
     /** Lists stored Sources in stable id order. */
     public List<SourceView> list() {
-        return artifacts.listResources().stream()
+        return artifacts.list("source").stream()
+                .filter(ArtifactListEntry::readable)
+                .map(ArtifactListEntry::id)
+                .map(artifacts::getResource)
+                .flatMap(Optional::stream)
                 .filter(stored -> stored.resource() instanceof SourceResource)
                 .sorted(Comparator.comparing(stored -> stored.resource().id()))
                 .map(this::view)

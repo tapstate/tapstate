@@ -248,7 +248,7 @@ public final class ArtifactMutationService {
         Resource target = store.get(id)
                 .orElseThrow(() -> error(ArtifactError.NOT_FOUND, Map.of("id", id)));
 
-        refuseWhenReferenced(id, store.list());
+        refuseWhenReferenced(id, ReadableArtifactInventory.list(store));
         if (target instanceof PipelineResource) {
             refuseWhenNotStopped(id);
         }
