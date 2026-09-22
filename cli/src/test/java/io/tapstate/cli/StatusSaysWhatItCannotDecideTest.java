@@ -58,7 +58,7 @@ class StatusSaysWhatItCannotDecideTest {
                 "status.failure = none",
                 "metrics.reconcileFailuresInARow = not published",
                 "metrics.recordCount = 128",
-                "metrics.frontierStalledMillis = none above zero",
+                "metrics.frontierStalledMillis = none at or above 1m0s",
                 "snapshot = 1 row(s) loaded");
     }
 

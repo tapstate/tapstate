@@ -181,7 +181,8 @@ final class StatusDiagnosis {
                             ? "not published" : metrics.reconcileFailuresInARow()));
             readings.add("metrics.recordCount = "
                     + (metrics.recordCount() == null ? "not published" : metrics.recordCount()));
-            readings.add("metrics.frontierStalledMillis = none above zero");
+            readings.add("metrics.frontierStalledMillis = none at or above "
+                    + human(MetricsFacts.CHAIN_STALL_THRESHOLD.toMillis()));
         }
         readings.add("snapshot = " + (snapshotRowsLoaded == null ? "could not be read"
                 : snapshotRowsLoaded == 0 ? "no rows loaded" : snapshotRowsLoaded + " row(s) loaded"));

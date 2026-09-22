@@ -134,11 +134,29 @@ class StatusExplainsWhereItIsStuckTest {
 
     @Test
     void aChainThatHasNotAdvancedIsNamedWithHowLongItHasStood() {
+        MetricsFacts metrics = MetricsFacts.of(Map.of(
+                "recordCount", 128L,
+                "frontierStalledMillis.orders", 96_000L));
+
         StatusDiagnosis.Answer answer = StatusDiagnosis.of(
-                ID, "RUNNING", null, null, FRESH, new MetricsFacts(0L, 128L, Map.of("orders", 96_000L)), 0L);
+                ID, "RUNNING", null, null, FRESH, metrics, 0L);
 
         assertThat(answer.conclusion()).contains("stopped advancing").contains("orders");
         assertThat(answer.readings()).contains("metrics.frontierStalledMillis.orders = 1m36s");
+    }
+
+    @Test
+    void millisecondScalePausesAreNotCalledStoppedChains() {
+        MetricsFacts metrics = MetricsFacts.of(Map.of(
+                "reconcileFailuresInARow", 0L,
+                "recordCount", 11L,
+                "frontierStalledMillis.shipments", 9L,
+                "frontierStalledMillis.orders", 196L));
+
+        StatusDiagnosis.Answer answer =
+                StatusDiagnosis.of(ID, "RUNNING", null, null, FRESH, metrics, 11L);
+
+        assertThat(answer.conclusion()).contains("nothing on this checklist matched");
     }
 
     @Test

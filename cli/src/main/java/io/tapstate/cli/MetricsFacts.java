@@ -1,5 +1,6 @@
 package io.tapstate.cli;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -30,14 +31,17 @@ import java.util.TreeMap;
  * @param recordCount   records the live job has driven to its sinks, or null when there is no live job to
  *                      ask — which is a different answer from nought and is kept apart from it
  * @param stalledChains chains whose durable position has not advanced, mapped to how long, in milliseconds.
- *                      Only entries above zero are kept: zero is the healthy reading and carrying it would
- *                      make "a chain is stuck" true of every running pipeline
+ *                      Only entries at or above the status threshold are kept: shorter pauses are ordinary
+ *                      time between frontier advances and do not mean a chain has stopped
  * @param movement      what the run had moved and how far behind it stood, read off the measured facts
  *                      rather than the open map, or null when the face carried neither -- which is how a
  *                      pipeline with no live job reads, and is kept apart from a run that moved nothing
  */
 record MetricsFacts(Long reconcileFailuresInARow, Long recordCount, Map<String, Long> stalledChains,
         MovementReading movement) {
+
+    /** A minute pinned separates an ordinary frontier pause from a chain worth diagnosing as stopped. */
+    static final Duration CHAIN_STALL_THRESHOLD = Duration.ofMinutes(1);
 
     /**
      * How many convergence passes in a row have thrown, published only while a streak is running.
@@ -86,7 +90,8 @@ record MetricsFacts(Long reconcileFailuresInARow, Long recordCount, Map<String, 
     static MetricsFacts of(Map<String, Long> metrics, List<MetricsOutcome.FactPoint> facts) {
         Map<String, Long> stalled = new LinkedHashMap<>();
         metrics.forEach((name, value) -> {
-            if (name.startsWith(STALLED_PREFIX) && value != null && value > 0) {
+            if (name.startsWith(STALLED_PREFIX) && value != null
+                    && value >= CHAIN_STALL_THRESHOLD.toMillis()) {
                 stalled.put(name.substring(STALLED_PREFIX.length()), value);
             }
         });
