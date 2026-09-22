@@ -128,7 +128,8 @@ public final class PipelinePositionService {
                 // pipeline finished are answers about work that did happen, and moving the tail says
                 // nothing about either.
                 meta.upsertConsumerOffset(chainId, new ConsumerOffset(offset.pipelineId(),
-                        offset.perTableSeq(), null, offset.snapshotCompletedTables()));
+                        offset.perTableSeq(), null, offset.snapshotCompletedTables(),
+                        offset.cdcStartPosition(), offset.snapshotEpoch()));
             }
         }
     }
@@ -219,7 +220,7 @@ public final class PipelinePositionService {
 
     /** The stored pipelines declaring {@code sourceId}, whether or not any of them has ever run. */
     private List<String> declaring(String sourceId) {
-        List<Resource> stored = artifacts.list();
+        List<Resource> stored = ReadableArtifactInventory.list(artifacts);
         Set<String> pipelines = new LinkedHashSet<>();
         for (Resource resource : stored) {
             if (resource instanceof PipelineResource) {

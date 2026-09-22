@@ -169,6 +169,11 @@ class FailureSceneTest {
         }
 
         @Override
+        public Optional<Long> recordsOut(String pipelineId) {
+            return Optional.of(0L);
+        }
+
+        @Override
         public void registerConnector(String connectorId) {
         }
 

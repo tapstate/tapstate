@@ -1,0 +1,1 @@
+{"pipelineId":"orders","from":"2026-08-20T10:00:00Z","to":"2026-08-20T11:00:00Z","effectiveFrom":"2026-09-05T11:00:00Z","effectiveTo":"2026-09-05T11:00:00Z","retentionCutoff":"2026-09-05T11:00:00Z","effectiveResolution":"PT1M","status":"NO_RETAINED_SAMPLES","consistency":"EVENTUAL","segments":[],"gaps":[],"unavailable":[],"nextCursor":null}

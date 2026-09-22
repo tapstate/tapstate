@@ -451,6 +451,12 @@ public final class NestSettings implements Serializable {
         return NestMaps.backedStateMaps(entriesHeldInMemory);
     }
 
+    /** The process-wide map pattern carrying the deployment's default state database. */
+    public MapConfig backedStateMapsForDatabase(String database) {
+        return NestMaps.backedStateMaps(entriesHeldInMemory,
+                Objects.requireNonNull(database, "database"));
+    }
+
     /**
      * As above, for the one namespace {@code namespace} rather than for all of them, so that this budget
      * applies to that namespace alone. This is the form a pipeline's own budget takes: it names a
@@ -459,5 +465,11 @@ public final class NestSettings implements Serializable {
      */
     public MapConfig backedStateMaps(String namespace) {
         return NestMaps.backedStateMaps(Objects.requireNonNull(namespace, "namespace"), entriesHeldInMemory);
+    }
+
+    /** As above, carrying the database this exact namespace resolves to. */
+    public MapConfig backedStateMaps(String namespace, String database) {
+        return NestMaps.backedStateMaps(Objects.requireNonNull(namespace, "namespace"), entriesHeldInMemory,
+                Objects.requireNonNull(database, "database"));
     }
 }

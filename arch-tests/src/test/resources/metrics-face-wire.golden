@@ -1,0 +1,181 @@
+# The metrics face of one pipeline, as the HTTP control plane renders it: GET /api/pipelines/{id}/metrics.
+#
+# Every reader of this face is outside this build -- a dashboard, a script, the command line of a
+# release already shipped -- and none of them is told when a field moves. This file is what tells the
+# build. A line here changing means one of them has to be told, in the release note, which field it was.
+#
+# The fixture is fixed and renders one of everything the face carries: the flat map with a squeezed
+# family and a bare key, an acked position, the names of the positions not collected, and the facts --
+# a counter broken down by attributes with one overflow series, a gauge with no attributes, a gauge per
+# table, a counter per code, and a distribution over the registered bounds.
+#
+# Rendered with two-space indentation so it reads as lines; the server sends the same bytes without the
+# whitespace. Blank lines and lines starting with # are prose and are not compared.
+
+{
+  "pipelineId" : "orders_sync",
+  "metrics" : {
+    "errors.sink.write-rejected" : 1,
+    "lag.orders" : 4,
+    "recordCount" : 98,
+    "records.in" : 90112,
+    "records.out" : 98
+  },
+  "targetAckedPosition" : {
+    "orders" : "w7"
+  },
+  "positionsNotCollected" : [
+    "sourceHeadPosition",
+    "processedPosition"
+  ],
+  "facts" : [
+    {
+      "name" : "tapstate.pipeline.errors",
+      "type" : "counter",
+      "unit" : "{error}",
+      "points" : [
+        {
+          "attributes" : {
+            "code" : "sink.write-rejected",
+            "tapstate.pipeline.id" : "orders_sync"
+          },
+          "startTime" : "2026-09-17T09:00:00Z",
+          "observedAt" : "2026-09-17T10:00:00.250Z",
+          "value" : 1
+        }
+      ]
+    },
+    {
+      "name" : "tapstate.pipeline.lag",
+      "type" : "gauge",
+      "unit" : "s",
+      "points" : [
+        {
+          "attributes" : {
+            "tapstate.pipeline.id" : "orders_sync",
+            "tapstate.table.id" : "orders"
+          },
+          "observedAt" : "2026-09-17T10:00:00.250Z",
+          "value" : 4
+        }
+      ]
+    },
+    {
+      "name" : "tapstate.pipeline.record.delivery.duration",
+      "type" : "histogram",
+      "unit" : "s",
+      "points" : [
+        {
+          "attributes" : {
+            "tapstate.pipeline.id" : "orders_sync",
+            "tapstate.table.id" : "orders"
+          },
+          "startTime" : "2026-09-17T09:00:00Z",
+          "observedAt" : "2026-09-17T10:00:00.250Z",
+          "count" : 7,
+          "sum" : 0.63,
+          "bounds" : [
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.5,
+            5.0,
+            10.0,
+            30.0,
+            60.0,
+            300.0,
+            900.0,
+            3600.0
+          ],
+          "bucketCounts" : [
+            0,
+            0,
+            0,
+            7,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name" : "tapstate.pipeline.records",
+      "type" : "counter",
+      "unit" : "{record}",
+      "points" : [
+        {
+          "attributes" : {
+            "direction" : "in",
+            "op" : "insert",
+            "tapstate.pipeline.id" : "orders_sync",
+            "tapstate.table.id" : "orders"
+          },
+          "startTime" : "2026-09-17T09:00:00Z",
+          "observedAt" : "2026-09-17T10:00:00.250Z",
+          "value" : 100
+        },
+        {
+          "attributes" : {
+            "direction" : "in",
+            "op" : "read",
+            "tapstate.pipeline.id" : "orders_sync",
+            "tapstate.table.id" : "orders"
+          },
+          "startTime" : "2026-09-17T09:00:00Z",
+          "observedAt" : "2026-09-17T10:00:00.250Z",
+          "value" : 90000
+        },
+        {
+          "attributes" : {
+            "direction" : "in",
+            "op" : "update",
+            "otel.metric.overflow" : "true",
+            "tapstate.pipeline.id" : "orders_sync"
+          },
+          "startTime" : "2026-09-17T09:00:00Z",
+          "observedAt" : "2026-09-17T10:00:00.250Z",
+          "value" : 12
+        },
+        {
+          "attributes" : {
+            "direction" : "out",
+            "op" : "insert",
+            "tapstate.pipeline.id" : "orders_sync",
+            "tapstate.table.id" : "orders"
+          },
+          "startTime" : "2026-09-17T09:00:00Z",
+          "observedAt" : "2026-09-17T10:00:00.250Z",
+          "value" : 98
+        }
+      ]
+    },
+    {
+      "name" : "tapstate.pipeline.records.driven",
+      "type" : "gauge",
+      "unit" : "{record}",
+      "points" : [
+        {
+          "attributes" : {
+            "tapstate.pipeline.id" : "orders_sync"
+          },
+          "observedAt" : "2026-09-17T10:00:00.250Z",
+          "value" : 98
+        }
+      ]
+    }
+  ]
+}

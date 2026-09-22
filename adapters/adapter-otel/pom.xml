@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.tapstate</groupId>
+    <artifactId>adapters</artifactId>
+    <version>${revision}</version>
+  </parent>
+  <artifactId>adapter-otel</artifactId>
+  <name>Tapstate :: Adapters :: OpenTelemetry</name>
+  <!-- The only module allowed to depend on OpenTelemetry (rule R3). It implements the metrics export
+       port: the facts a convergence pass measured are projected, as they are, onto the SDK's public
+       metric data interfaces and handed to its readers: a Prometheus scrape endpoint, an OTLP push, or
+       both. The SDK owns the cadence and the wire; the facts own the names, the attributes and the
+       numbers, which is what lets the observation document and this export never disagree. -->
+  <description>OpenTelemetry metrics adapter: implements the metrics export port by projecting the measured facts onto the OpenTelemetry SDK's metric data model and serving them to a Prometheus scrape endpoint and/or an OTLP endpoint, with the cardinality budget applied before anything reaches the SDK</description>
+  <dependencies>
+    <!-- The facts, their budget and the fold that applies it (rule R2/R3: the adapter reads the core ring). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-lifecycle</artifactId>
+      <version>${revision}</version>
+    </dependency>
+    <!-- The port this adapter implements. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>spi-metrics</artifactId>
+      <version>${revision}</version>
+    </dependency>
+    <!-- The SDK: meter provider, readers and the public metric data interfaces the facts are projected
+         onto. Rule R3: this is the only module permitted to depend on it. -->
+    <dependency>
+      <groupId>io.opentelemetry</groupId>
+      <artifactId>opentelemetry-sdk-metrics</artifactId>
+    </dependency>
+    <!-- OTLP over HTTP/protobuf and over gRPC, for a collector that is pushed to. -->
+    <dependency>
+      <groupId>io.opentelemetry</groupId>
+      <artifactId>opentelemetry-exporter-otlp</artifactId>
+    </dependency>
+    <!-- The Prometheus scrape endpoint, for a Prometheus that pulls. -->
+    <dependency>
+      <groupId>io.opentelemetry</groupId>
+      <artifactId>opentelemetry-exporter-prometheus</artifactId>
+    </dependency>
+    <!-- The logging facade, for saying once at start which readers were brought up and where. -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

@@ -30,10 +30,15 @@ enum MatcherWord {
     DOC,
 
     /**
-     * The count of observable errors the pipeline has published. Its source is the metrics read face,
-     * which the runtime derives from the pipeline's actual state - one while it is FAILED, zero otherwise -
-     * so a dead data-plane job is an assertable statistic and not only a log line. The other run
-     * statistics have no source wired yet, so no word offers them.
+     * How many failures the pipeline has counted, added up over the codes it counted them under. Its
+     * source is the metrics read face, which counts a failed operation once each - a count of things
+     * that happened, not a reading derived from the state the pipeline is in, which is what this word
+     * used to be given and what made "how many" unanswerable.
+     *
+     * <p>A nought asserted here is satisfied by a publisher that has stopped, because the face carries
+     * no entry for a pipeline that has failed at nothing. It still discriminates whenever a sibling in
+     * the same specification has to read a live observation - a state awaited ahead of it, say - since
+     * that sibling is what rules out a face nobody is writing to. On its own it rules out nothing.
      */
     ERROR_COUNT,
 
@@ -54,6 +59,21 @@ enum MatcherWord {
      * rather than only greppable in a log.
      */
     FAILURE_CODE,
+
+    /**
+     * How many rows the pipeline has had confirmed by its targets, added up over its tables and source
+     * operations. Its source is the metrics read face, which carries one total per direction.
+     *
+     * <p>Counted where the target confirmed them and nowhere earlier, which is the whole of what this word
+     * is for: a pipeline handing rows to a sink that rejects every one of them reads the same as a healthy
+     * one on every other word here - the rows left the source, the job runs, nothing was discarded - and
+     * differs only in that this total stays at nought.
+     *
+     * <p><strong>A nought here needs a sibling asserting a real total to mean anything.</strong> The face
+     * publishes no entry until something settles, and no entry reads as nought, so this word alone is
+     * satisfied by a pipeline that published nothing at all.
+     */
+    RECORDS_OUT,
 
     /** The pipeline's published lifecycle state. */
     STATE;

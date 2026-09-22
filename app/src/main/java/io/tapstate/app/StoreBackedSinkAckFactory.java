@@ -7,7 +7,6 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SrsDurableFrontier;
-import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -26,7 +25,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * sink still runs before the assembly layer makes the member SRS-capable. A stream the map does not carry
  * is a builder-side wiring defect (the sink saw a chain the pipeline never sourced) and crashes bare.
  *
- * <p>A snapshot row is ordered but carries no token, and what is persisted for it is the chain's cdc
+ * <p>A snapshot row is ordered but carries no token, and what is persisted for it is the pipeline's cdc
  * start position: the read has confirmed rows of a snapshot but no change at all, so a resume belongs
  * where changes begin. Resolving it here rather than at the sink is what keeps the durable store out of
  * the engine — the sink says which position it reached, this says what that spells on disk.
@@ -66,7 +65,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                         "sink acked a chain the pipeline never sourced: '" + chain + "'");
             }
             String token = position.token() != null ? position.token()
-                    : isSnapshotOf(position) ? cdcStart(meta, miningChainId) : null;
+                    : isSnapshotOf(position) ? cdcStart(meta, miningChainId, pipelineId) : null;
             ChainPosition acked = new ChainPosition(position.order(), token);
             meta.advanceSinkAcked(miningChainId, pipelineId, acked);
             if (isSnapshotOf(position)) {
@@ -139,15 +138,17 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
     }
 
     /**
-     * Where changes begin on {@code miningChainId}, for a frontier that has only reached snapshot rows. The
-     * capture writes it before it drains a snapshot, so a snapshot row reaching a sink without one means the
-     * chain was never seeded — the same caller-ordering defect as acking an unseeded chain, and it crashes
-     * bare rather than writing an absent position over a real one.
+     * Where changes begin for {@code pipelineId} on {@code miningChainId}, for a frontier that has only
+     * reached snapshot rows. The capture writes it before it drains that pipeline's snapshot, so a snapshot
+     * row reaching a sink without one means the pipeline was never seeded — the same caller-ordering defect
+     * as acking an unseeded chain, and it crashes bare rather than borrowing another pipeline's position.
      */
-    private static String cdcStart(SrsMetaStore meta, String miningChainId) {
+    private static String cdcStart(SrsMetaStore meta, String miningChainId, String pipelineId) {
         return meta.read(miningChainId)
-                .map(SrsMeta::cdcStartPosition)
+                .flatMap(record -> record.consumerOffset(pipelineId))
+                .map(offset -> offset.cdcStartPosition())
                 .orElseThrow(() -> new IllegalStateException("sink acked snapshot rows of mining chain '"
-                        + miningChainId + "', which has no recorded position for changes to begin at"));
+                        + miningChainId + "' for pipeline '" + pipelineId
+                        + "', which has no recorded position for changes to begin at"));
     }
 }

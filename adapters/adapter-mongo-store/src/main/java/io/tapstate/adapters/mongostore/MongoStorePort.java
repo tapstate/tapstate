@@ -1,7 +1,9 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoNamespace;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.CatalogStore;
 import io.tapstate.spi.store.ClusterMembershipStore;
@@ -14,6 +16,9 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.OperatorStateStore;
+import io.tapstate.spi.store.OperatorStateStores;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SrsLogStore;
@@ -22,7 +27,11 @@ import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaimStore;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The MongoDB implementation of the persistence port: it aggregates the product sub-stores — the artifact
@@ -32,12 +41,14 @@ import java.util.Objects;
  * per-pipeline observation store, the SRS meta store (one durable coordination record per mining chain),
  * and the editor-only Pipeline layout store — each bound to its own collection (or GridFS bucket) on the
  * verified connection's database.
- * Operator state is the one exception and sits in a database of its own on the same client, for the
- * reasons on {@link #NEST_STATE_DATABASE}. This is the store bridge the assembly root wires into the
- * platform under {@code --role=all}; the app sees only the driver-free {@link StorePort}, so no driver
- * type escapes this module (rule R3).
+ * Operator state is the one exception and sits in a separately named database on the same client. This
+ * is the store bridge the assembly root wires into the platform under {@code --role=all}; the app sees
+ * only the driver-free {@link StorePort}, so no driver type escapes this module (rule R3).
  */
 public final class MongoStorePort implements StorePort {
+
+    private static final int MAX_DATABASE_NAME_BYTES = 63;
+    private static final Set<String> RESERVED_OPERATOR_STATE_DATABASES = Set.of("config", "local");
 
     /** The collection holding the canonical artifact truth layer. */
     public static final String ARTIFACTS = "artifacts";
@@ -51,6 +62,8 @@ public final class MongoStorePort implements StorePort {
     public static final String WORKLOAD_CLAIMS = "workload_claims";
     /** The last majority-committed ACTIVE node set per cluster. */
     public static final String CLUSTER_MEMBERSHIP = "cluster_membership";
+    /** One document per movement sample, left to expire by the server; the one series among these. */
+    public static final String PIPELINE_RATE_HISTORY = "pipeline_rate_history";
     /** The collection holding one editor-only canvas layout per pipeline. */
     public static final String PIPELINE_LAYOUTS = "pipeline_layouts";
     /** The collection holding the registered connection configurations. */
@@ -68,6 +81,8 @@ public final class MongoStorePort implements StorePort {
     public static final String CONNECTION_TEST_RESULTS = "connection_test_results";
     /** The collection holding one SRS coordination record per mining chain. */
     public static final String SRS_META = "srs_meta";
+    /** The collection holding one durable SRS cursor per consumer pipeline and mining chain. */
+    public static final String SRS_CONSUMER_OFFSETS = "srs_consumer_offsets";
 
     /** The durable change log: one document per change that entered a chain's per-table ring. */
     public static final String SRS_LOG = "srs_log";
@@ -89,20 +104,6 @@ public final class MongoStorePort implements StorePort {
      * operator configured should not carry a pipeline's discarded rows along with it.
      */
     public static final String NEST_DEAD_LETTERS = "nest_dead_letters";
-
-    /**
-     * The database holding operator state, which is deliberately not the one holding everything else.
-     * What an operator configured and what a running job is holding have nothing in common but the
-     * connection: one is edited by hand and read rarely, the other is written at event rates and read
-     * back by key, and an operation aimed at one of them - a restore, a dump, a drop - should not be able
-     * to reach the other by accident.
-     *
-     * <p>The name is fixed rather than derived or configurable. Two installs pointed at one Mongo are
-     * meant to find the same database, and a pipeline of the same id in both of them then shares one
-     * state: the price of the fixed name, taken knowingly. Telling them apart later is a matter of what
-     * goes in the namespace, not of what the database is called.
-     */
-    public static final String NEST_STATE_DATABASE = "tapstate_nest";
 
     /**
      * What an operator-state write is acknowledged on. Every other store here can take the client's
@@ -130,6 +131,7 @@ public final class MongoStorePort implements StorePort {
     private final ConnectorSpecStore connectorSpecs;
     private final ConnectionTestResultStore connectionTestResults;
     private final ObservationStore observations;
+    private final RateHistoryStore rateHistory;
     private final PipelineLayoutStore layouts;
     private final WorkloadClaimStore workloadClaims;
     private final ClusterMembershipStore clusterMembership;
@@ -138,14 +140,24 @@ public final class MongoStorePort implements StorePort {
     private final DerivedSchemaStore derivedSchemas;
     private final KeyedStateStore keyedState;
     private final NestDeadLetterStore nestDeadLetters;
+    private final OperatorStateStores operatorStateStores;
 
     /**
      * Binds the sub-stores to their own collections on the verified connection's database, bar operator
-     * state, which gets a database of its own on the same client ({@link #NEST_STATE_DATABASE}). The
-     * connection must have been verified first (its client opened); the sub-stores share that one
-     * client and are closed with it when the connection closes.
+     * state, which gets the separately configured {@code operatorStateDatabase} on the same client. The
+     * connection must have been verified first (its client opened); the sub-stores share that one client
+     * and are closed with it when the connection closes.
      */
-    public MongoStorePort(MongoConnection connection) {
+    public MongoStorePort(MongoConnection connection, String operatorStateDatabase) {
+        this(connection, operatorStateDatabase, MongoRateHistoryStore.DEFAULT_RETENTION);
+    }
+
+    /**
+     * A port whose sample history keeps samples for {@code rateHistoryRetention}: the one store here with
+     * a configured bound, written onto its expiring index at construction.
+     */
+    public MongoStorePort(
+            MongoConnection connection, String operatorStateDatabase, Duration rateHistoryRetention) {
         Objects.requireNonNull(connection, "connection");
         MongoDatabase database = connection.database();
         this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
@@ -159,22 +171,48 @@ public final class MongoStorePort implements StorePort {
         this.connectionTestResults =
                 new MongoConnectionTestResultStore(SystemCollections.CONNECTION_TEST_RESULTS.on(database));
         this.observations = new MongoObservationStore(SystemCollections.PIPELINE_OBSERVATION.on(database));
+        this.rateHistory = new MongoRateHistoryStore(
+                database, SystemCollections.PIPELINE_RATE_HISTORY.on(database), rateHistoryRetention);
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
         this.workloadClaims = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database));
         this.clusterMembership =
                 new MongoClusterMembershipStore(SystemCollections.CLUSTER_MEMBERSHIP.on(database));
-        this.meta = new MongoSrsMetaStore(SystemCollections.SRS_META.on(database));
+        this.meta = new MongoSrsMetaStore(connection.client(),
+                SystemCollections.SRS_META.on(database), SystemCollections.SRS_CONSUMER_OFFSETS.on(database));
         this.srsLog = new MongoSrsLogStore(
                 connection.client(), SystemCollections.SRS_LOG.on(database),
                 SystemCollections.WORKLOAD_CLAIMS.on(database));
         this.derivedSchemas = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(database));
-        // Operator state alone sits in its own database on the same client, for the reasons on the
-        // constant. Same connection, same credentials, same lifecycle - a different database. What that
-        // operator could not assemble goes in the same database, being produced by the same run.
-        MongoDatabase nestState = connection.client().getDatabase(NEST_STATE_DATABASE)
-                .withWriteConcern(NEST_STATE_WRITE_CONCERN);
-        this.keyedState = new MongoKeyedStateStore(SystemCollections.OPERATOR_STATE.on(nestState));
-        this.nestDeadLetters = new MongoNestDeadLetterStore(SystemCollections.NEST_DEAD_LETTERS.on(nestState));
+        // Operator state alone sits in its configured database on the same client. Same connection, same
+        // credentials, same lifecycle - a different database. What that operator could not assemble goes
+        // in the same database, being produced by the same run.
+        this.operatorStateStores = new MongoOperatorStateStores(
+                connection.client(), database.getName(), operatorStateDatabase);
+        OperatorStateStore defaultState = operatorStateStores.inDatabase(operatorStateStores.defaultDatabase());
+        this.keyedState = defaultState.state();
+        this.nestDeadLetters = defaultState.deadLetters();
+    }
+
+    static String requireOperatorStateDatabase(String name, String controlDatabase) {
+        if (name == null || name.isBlank()) {
+            throw invalidOperatorStateDatabase(null);
+        }
+        try {
+            MongoNamespace.checkDatabaseNameValidity(name);
+        } catch (IllegalArgumentException e) {
+            throw invalidOperatorStateDatabase(e);
+        }
+        if (name.indexOf('$') >= 0
+                || name.getBytes(StandardCharsets.UTF_8).length > MAX_DATABASE_NAME_BYTES
+                || RESERVED_OPERATOR_STATE_DATABASES.stream().anyMatch(name::equalsIgnoreCase)
+                || name.equalsIgnoreCase(controlDatabase)) {
+            throw invalidOperatorStateDatabase(null);
+        }
+        return name;
+    }
+
+    private static TapstateException invalidOperatorStateDatabase(Throwable cause) {
+        return new TapstateException(StoreError.INVALID_OPERATOR_STATE_DATABASE, Map.of(), cause);
     }
 
     @Override
@@ -228,6 +266,11 @@ public final class MongoStorePort implements StorePort {
     }
 
     @Override
+    public RateHistoryStore rateHistory() {
+        return rateHistory;
+    }
+
+    @Override
     public SrsLogStore srsLog() {
         return srsLog;
     }
@@ -265,5 +308,10 @@ public final class MongoStorePort implements StorePort {
     @Override
     public NestDeadLetterStore nestDeadLetters() {
         return nestDeadLetters;
+    }
+
+    @Override
+    public OperatorStateStores operatorStateStores() {
+        return operatorStateStores;
     }
 }

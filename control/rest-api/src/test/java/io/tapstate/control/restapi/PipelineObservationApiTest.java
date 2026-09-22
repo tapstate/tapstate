@@ -5,12 +5,15 @@ import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.Frontend;
 import io.tapstate.control.core.GeneratedSecret;
+import io.tapstate.control.core.HistoryCursorCodec;
 import io.tapstate.control.core.Operation;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PipelineMetrics;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.PipelineChains;
+import io.tapstate.control.core.PipelineExplainService;
+import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineSnapshot;
@@ -25,15 +28,21 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -44,6 +53,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
+import io.tapstate.messages.ExplanationCatalog;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -58,11 +68,13 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -116,6 +128,31 @@ class PipelineObservationApiTest {
             new ObservationFailure("engine.job-failed",
                     Map.of("pipeline", "pl3", "cause", "the sink rejected the batch")));
 
+    private static final Instant COUNTING_SINCE = Instant.parse("2026-07-12T11:00:00Z");
+
+    /** One pipeline publishing its measured facts beside the flat map: a counter with attributes, a gauge, a distribution. */
+    private static final Observation PL_FACTS = new Observation("pl4", PipelineState.RUNNING,
+            Map.of("records.in", 100L, "recordCount", 98L), Map.of(), Map.of(), null, NOW,
+            List.of(
+                    new MetricFact("tapstate.pipeline.records", MetricType.COUNTER, "{record}", List.of(
+                            MetricPoint.accumulated(Map.of("tapstate.pipeline.id", "pl4", "tapstate.table.id",
+                                    "orders", "direction", "in", "op", "insert"), COUNTING_SINCE, NOW, 100L))),
+                    MetricFact.single("recordCount", MetricType.GAUGE, "{record}",
+                            MetricPoint.reading(Map.of(), NOW, 98L)),
+                    MetricFact.single(HistogramBounds.RECORD_DELIVERY_DURATION.instrument(), MetricType.HISTOGRAM,
+                            HistogramBounds.UNIT, MetricPoint.distribution(
+                                    Map.of("tapstate.pipeline.id", "pl4", "tapstate.table.id", "orders"),
+                                    COUNTING_SINCE, NOW, HistogramBounds.RECORD_DELIVERY_DURATION.value(
+                                            1, 0.2, sixteenBucketsWithOneIn(4))))));
+
+    private static List<Long> sixteenBucketsWithOneIn(int bucket) {
+        List<Long> counts = new ArrayList<>();
+        for (int i = 0; i < HistogramBounds.RECORD_DELIVERY_DURATION.buckets(); i++) {
+            counts.add(i == bucket ? 1L : 0L);
+        }
+        return counts;
+    }
+
     private static ConfigurableApplicationContext context;
     private static int port;
 
@@ -139,6 +176,13 @@ class PipelineObservationApiTest {
         observations.save(PL1);
         observations.save(PL_POS);
         observations.save(PL_DEAD);
+        observations.save(PL_FACTS);
+        FakeRateHistoryStore history = context.getBean(FakeRateHistoryStore.class);
+        history.clear();
+        history.append(new RateSample("pl1", NOW.minusSeconds(120),
+                Map.of("records.out", 100L, "bytes.out", 1_000L), Map.of("orders", 5L), COUNTING_SINCE));
+        history.append(new RateSample("pl1", NOW.minusSeconds(60),
+                Map.of("records.out", 700L, "bytes.out", 13_000L), Map.of("orders", 2L), COUNTING_SINCE));
         context.getBean(FakeChainStore.class).reset();
         context.getBean(FakeStoppedPipelines.class).reset();
     }
@@ -192,12 +236,60 @@ class PipelineObservationApiTest {
 
     @Test
     void metricsReturnsTheOpenStatMap() {
-        PipelineMetrics body = client().get().uri("/api/pipelines/pl1/metrics")
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/metrics")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
-                .retrieve().toEntity(PipelineMetrics.class).getBody();
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
 
-        assertThat(body.pipelineId()).isEqualTo("pl1");
-        assertThat(body.metrics()).containsEntry("recordCount", 42L).containsEntry("errorCount", 0L);
+        assertThat(body.get("pipelineId")).isEqualTo("pl1");
+        assertThat((Map<String, Object>) body.get("metrics"))
+                .containsEntry("recordCount", 42).containsEntry("errorCount", 0);
+    }
+
+    @Test
+    void metricsCarriesTheMeasuredFactsBesideTheFlatMap() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl4/metrics")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        // The flat map is untouched by the facts arriving beside it: same keys, same numbers.
+        assertThat((Map<String, Object>) body.get("metrics"))
+                .containsEntry("records.in", 100).containsEntry("recordCount", 98);
+        List<Map<String, Object>> facts = (List<Map<String, Object>>) body.get("facts");
+        // Sorted by name, so two reads of one observation are one document.
+        assertThat(facts).extracting(fact -> fact.get("name")).containsExactly(
+                "recordCount", "tapstate.pipeline.record.delivery.duration", "tapstate.pipeline.records");
+        // The kind is the lower-case word, the unit rides as metadata, and the instants are ISO-8601 text
+        // -- through the real server and its codec, which is what the golden over this shape stands for.
+        Map<String, Object> records = facts.get(2);
+        assertThat(records).containsEntry("type", "counter").containsEntry("unit", "{record}");
+        Map<String, Object> inbound = ((List<Map<String, Object>>) records.get("points")).get(0);
+        assertThat(inbound).containsEntry("startTime", "2026-07-12T11:00:00Z")
+                .containsEntry("observedAt", "2026-07-12T12:00:00Z")
+                .containsEntry("value", 100)
+                .doesNotContainKeys("count", "sum", "bounds", "bucketCounts");
+        // Attributes are an object of their own, keys sorted, values as the fact carries them.
+        assertThat(((Map<String, Object>) inbound.get("attributes")).keySet())
+                .containsExactly("direction", "op", "tapstate.pipeline.id", "tapstate.table.id");
+        // A reading has no start, and the field is absent rather than null.
+        Map<String, Object> reading = ((List<Map<String, Object>>) facts.get(0).get("points")).get(0);
+        assertThat(reading).doesNotContainKey("startTime").containsEntry("value", 98);
+        // A distribution is its four parts inline on the point, and carries no single value.
+        Map<String, Object> distribution = ((List<Map<String, Object>>) facts.get(1).get("points")).get(0);
+        assertThat(facts.get(1)).containsEntry("type", "histogram").containsEntry("unit", "s");
+        assertThat(distribution).containsEntry("count", 1).containsEntry("sum", 0.2).doesNotContainKey("value");
+        assertThat((List<Object>) distribution.get("bounds")).hasSize(15).startsWith(0.01);
+        assertThat((List<Object>) distribution.get("bucketCounts")).hasSize(16);
+    }
+
+    @Test
+    void metricsOfAnObservationPublishedWithoutFactsCarriesAnEmptyList() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/metrics")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        // Present and empty, not absent: "nothing carried" is a reading, and a document written before
+        // facts travelled says so the same way an observation with no measurements does.
+        assertThat(body.get("facts")).isEqualTo(List.of());
     }
 
     @Test
@@ -267,6 +359,137 @@ class PipelineObservationApiTest {
         assertThat(body.snapshot()).containsEntry("orders", new TableSnapshot(10, 100L, 10));
     }
 
+    @Test
+    void explainReturnsTheSharedTypedShapeWithoutCachingIt() {
+        ResponseEntity<Map<String, Object>> response = client().get().uri("/api/pipelines/pl1/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+        Map<String, Object> body = response.getBody();
+        assertThat(body).containsEntry("pipelineId", "pl1")
+                .containsEntry("state", "RUNNING")
+                .containsEntry("kind", "NO_MATCH")
+                .containsEntry("freshness", "UNKNOWN")
+                .containsKey("next")
+                .doesNotContainKeys("observedAt", "observedAgeMillis", "pending");
+        assertThat(body.get("next")).isNull();
+        List<Map<String, Object>> evidence = (List<Map<String, Object>>) body.get("evidence");
+        assertThat(evidence).anySatisfy(reading -> {
+            assertThat(reading).containsEntry("source", "status")
+                    .containsEntry("field", "observedAgeMillis")
+                    .containsKey("value");
+            assertThat(reading.get("value")).isNull();
+        });
+        assertThat((List<String>) body.get("cannotSay")).isNotEmpty();
+    }
+
+    @Test
+    void historyReturnsResetAwareTypedPointsWithoutCachingThem() {
+        ResponseEntity<Map<String, Object>> response = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/metrics/history")
+                        .queryParam("from", "2026-07-12T11:58:00Z")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .queryParam("resolution", "raw")
+                        .queryParam("table", "orders")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+        Map<String, Object> body = response.getBody();
+        assertThat(body).containsEntry("pipelineId", "pl1")
+                .containsEntry("effectiveResolution", "PT1M")
+                .containsEntry("status", "OK")
+                .containsEntry("consistency", "EVENTUAL")
+                .containsKey("nextCursor");
+        assertThat(body.get("nextCursor")).isNull();
+        List<Map<String, Object>> segments = (List<Map<String, Object>>) body.get("segments");
+        List<Map<String, Object>> points = (List<Map<String, Object>>) segments.getFirst().get("points");
+        assertThat(points).hasSize(2);
+        assertThat(points.getFirst()).doesNotContainKeys("recordsOut", "bytesOut");
+        assertThat((Map<String, Object>) points.getLast().get("recordsOut"))
+                .containsEntry("delta", 600).containsEntry("averageRate", 10);
+        assertThat((List<Map<String, Object>>) points.getLast().get("lag"))
+                .singleElement().satisfies(lag -> assertThat(lag)
+                        .containsEntry("table", "orders").containsEntry("last", 2));
+
+        String wire = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/metrics/history")
+                        .queryParam("from", "2026-07-12T11:58:00Z")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .queryParam("resolution", "raw")
+                        .queryParam("table", "orders")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(String.class);
+        assertThat(wire).contains("\"recordsOut\":{\"delta\":600,\"averageRate\":10,\"maxRate\":10}");
+    }
+
+    @Test
+    void aMalformedHistoryRangeIsACodedBadRequest() {
+        ApiError body = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/metrics/history")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.params()).containsEntry("reason", "from is required");
+    }
+
+    @Test
+    void historyDoesNotRequireALatestObservation() {
+        context.getBean(FakeObservationStore.class).clear();
+
+        Map<String, Object> body = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/metrics/history")
+                        .queryParam("from", "2026-07-12T11:58:00Z")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        assertThat(body).containsEntry("status", "OK");
+    }
+
+    @Test
+    void explainWithoutALatestObservationUsesTheSameCodedPendingWindow() {
+        context.getBean(FakeObservationStore.class).clear();
+
+        ApiError body = client().get().uri("/api/pipelines/pl1/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("monitor.no-observation");
+        assertThat(body.params()).containsEntry("pipeline", "pl1");
+    }
+
+    @Test
+    void historyOfAnUnknownPipelineIsNotAnEmptyWindow() {
+        ApiError body = client().get().uri(uri -> uri
+                        .path("/api/pipelines/ghost/metrics/history")
+                        .queryParam("from", "2026-07-12T11:58:00Z")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+    }
+
     // ---- a read of a pipeline with no published observation is a 404 coded body, never a bare 500 ----
 
     @Test
@@ -306,6 +529,7 @@ class PipelineObservationApiTest {
         ApiError body = client().get().uri("/api/pipelines/pl1/status")
                 .exchange((request, response) -> {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
                     return response.bodyTo(ApiError.class);
                 });
 
@@ -337,6 +561,7 @@ class PipelineObservationApiTest {
         assertThat(projectedReadFaces)
                 .as("every pipeline face imported here projects onto the authenticated /api surface")
                 .containsExactlyInAnyOrder("pipeline.status", "pipeline.metrics", "pipeline.snapshot",
+                        "pipeline.metrics.history", "pipeline.explain",
                         "pipeline.position", "pipeline.set-position");
     }
 
@@ -349,7 +574,8 @@ class PipelineObservationApiTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class,
-            PipelineObservationController.class, PipelinePositionController.class,
+            PipelineObservationController.class, PipelineObservabilityController.class,
+            PipelinePositionController.class,
             ApiExceptionHandler.class})
     static class TestApp {
 
@@ -374,6 +600,25 @@ class PipelineObservationApiTest {
         @Bean
         PipelineObservationQueryService pipelineObservationQueryService(ObservationStore observations) {
             return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations);
+        }
+
+        @Bean
+        FakeRateHistoryStore rateHistoryStore() {
+            return new FakeRateHistoryStore();
+        }
+
+        @Bean
+        PipelineHistoryQueryService pipelineHistoryQueryService(
+                FakeRateHistoryStore history, Clock clock) {
+            return new PipelineHistoryQueryService(new ArtifactQueryService(appliedPipelines()), history,
+                    Duration.ofMinutes(1), clock, new HistoryCursorCodec("test-history-secret".getBytes(), clock));
+        }
+
+        @Bean
+        PipelineExplainService pipelineExplainService(ObservationStore observations, Clock clock) {
+            ExplanationCatalog messages = ExplanationCatalog.bundled();
+            return new PipelineExplainService(new ArtifactQueryService(appliedPipelines()), observations,
+                    clock, messages::render);
         }
 
         @Bean
@@ -446,6 +691,74 @@ class PipelineObservationApiTest {
         @Override
         public Optional<Observation> read(String pipelineId) {
             return Optional.ofNullable(byId.get(pipelineId));
+        }
+    }
+
+    static final class FakeRateHistoryStore implements RateHistoryStore {
+        private final List<Entry> entries = new ArrayList<>();
+        private int sequence;
+
+        void clear() {
+            entries.clear();
+            sequence = 0;
+        }
+
+        @Override
+        public void append(RateSample sample) {
+            sequence++;
+            entries.add(new Entry(new Key(sample.observedAt(), String.format("%08d", sequence)), sample));
+            entries.sort(FakeRateHistoryStore::compare);
+        }
+
+        @Override
+        public Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit) {
+            List<Entry> matches = entries.stream()
+                    .filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> !entry.sample().observedAt().isBefore(from)
+                            && entry.sample().observedAt().isBefore(to))
+                    .filter(entry -> after == null || compare(entry.key(), after) > 0)
+                    .toList();
+            boolean hasMore = matches.size() > limit;
+            return new Page(matches.subList(0, Math.min(limit, matches.size())), hasMore);
+        }
+
+        @Override
+        public Optional<Entry> read(String pipelineId, Key key) {
+            return entries.stream().filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> entry.key().equals(key)).findFirst();
+        }
+
+        @Override
+        public Optional<Entry> predecessor(String pipelineId, Instant at) {
+            return entries.stream().filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> entry.sample().observedAt().isBefore(at))
+                    .max(FakeRateHistoryStore::compare);
+        }
+
+        @Override
+        public Optional<Entry> successor(String pipelineId, Instant at) {
+            return entries.stream().filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> !entry.sample().observedAt().isBefore(at))
+                    .min(FakeRateHistoryStore::compare);
+        }
+
+        @Override
+        public void deleteAll(String pipelineId) {
+            entries.removeIf(entry -> entry.sample().pipelineId().equals(pipelineId));
+        }
+
+        @Override
+        public Duration retention() {
+            return Duration.ofDays(15);
+        }
+
+        private static int compare(Entry left, Entry right) {
+            return compare(left.key(), right.key());
+        }
+
+        private static int compare(Key left, Key right) {
+            int time = left.observedAt().compareTo(right.observedAt());
+            return time != 0 ? time : left.internalKey().compareTo(right.internalKey());
         }
     }
 
@@ -681,7 +994,7 @@ class PipelineObservationApiTest {
             return new SrsMeta("shop@mysql-1",
                     new ChainPosition(new SourceOrder(3L, 91201L), "mysql-bin.000004:154"),
                     List.of(new ConsumerOffset("pl2", Map.of(), null)),
-                    null, List.of(), null, 3L, 0L, NOW);
+                    List.of(), null, 3L, NOW);
         }
 
         void reset() {
@@ -696,8 +1009,7 @@ class PipelineObservationApiTest {
         @Override
         public void rewindSourceReadOffset(String miningChainId, String token) {
             held = new SrsMeta(miningChainId, new ChainPosition(null, token), held.consumerOffsets(),
-                    held.cdcStartPosition(), held.schemaHistory(), held.retention(), held.epoch(),
-                    held.snapshotEpoch(), NOW);
+                    held.schemaHistory(), held.retention(), held.epoch(), NOW);
         }
 
         @Override
@@ -713,8 +1025,7 @@ class PipelineObservationApiTest {
         @Override
         public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
             held = new SrsMeta(miningChainId, held.sourceRead(), List.of(offset),
-                    held.cdcStartPosition(), held.schemaHistory(), held.retention(), held.epoch(),
-                    held.snapshotEpoch(), held.sourceReadAt());
+                    held.schemaHistory(), held.retention(), held.epoch(), held.sourceReadAt());
         }
 
         @Override
@@ -729,7 +1040,8 @@ class PipelineObservationApiTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             throw new AssertionError("setCdcStart");
         }
 

@@ -363,6 +363,75 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
+    void aPurgeDropsStateAndDeadLettersFromTheDatabaseTheNestSelected() {
+        InMemoryStorePort store = seedStore();
+        String database = "orders_operator_state";
+        var routed = store.operatorStateStores().inDatabase(database);
+        routed.state().save(ROOT_NAMESPACE, "k", "held".getBytes(StandardCharsets.UTF_8));
+        routed.deadLetters().record(new NestDeadLetterRecord(
+                ROOT_NAMESPACE, "e1", "orders", "1:1", 0L, 0L, Map.of("id", 1)));
+        store.keyedState().save(OTHER_PIPELINE_NAMESPACE, "k", "other".getBytes(StandardCharsets.UTF_8));
+        member.getMap(ROOT_NAMESPACE).put("k", "held");
+
+        NestStateTeardown teardown = new NestStateTeardown(member, store.operatorStateStores());
+        Set<OperatorStateLocation> locations = Set.of(
+                new OperatorStateLocation(database, ROOT_NAMESPACE));
+        teardown.willKeepStateAt(PIPELINE, locations);
+        teardown.noteLocations(PIPELINE, Set.of());
+        teardown.finishPending(PIPELINE);
+
+        assertThat(routed.state().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(routed.deadLetters().read(ROOT_NAMESPACE, 10)).isEmpty();
+        assertThat(member.getMap(ROOT_NAMESPACE).size()).isZero();
+        assertThat(store.keyedState().load(OTHER_PIPELINE_NAMESPACE, "k")).isPresent();
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept")).isEmpty();
+    }
+
+    @Test
+    void aPurgeAfterRelocationLeavesTheOldDatabaseAsARollbackCopy() {
+        InMemoryStorePort store = seedStore();
+        String oldDatabase = "orders_state_old";
+        String newDatabase = "orders_state_new";
+        var oldStores = store.operatorStateStores().inDatabase(oldDatabase);
+        var newStores = store.operatorStateStores().inDatabase(newDatabase);
+        oldStores.state().save(ROOT_NAMESPACE, "k", "old".getBytes(StandardCharsets.UTF_8));
+        newStores.state().save(ROOT_NAMESPACE, "k", "new".getBytes(StandardCharsets.UTF_8));
+        oldStores.deadLetters().record(new NestDeadLetterRecord(
+                ROOT_NAMESPACE, "old-e", "orders", "1:1", 0L, 0L, Map.of("id", 1)));
+        newStores.deadLetters().record(new NestDeadLetterRecord(
+                ROOT_NAMESPACE, "new-e", "orders", "1:1", 0L, 0L, Map.of("id", 1)));
+
+        NestStateTeardown teardown = new NestStateTeardown(member, store.operatorStateStores());
+        teardown.willKeepStateAt(PIPELINE, Set.of(
+                new OperatorStateLocation(oldDatabase, ROOT_NAMESPACE)));
+        teardown.willKeepStateAt(PIPELINE, Set.of(
+                new OperatorStateLocation(newDatabase, ROOT_NAMESPACE)));
+        teardown.noteLocations(PIPELINE, Set.of(
+                new OperatorStateLocation(newDatabase, ROOT_NAMESPACE)));
+        teardown.finishPending(PIPELINE);
+
+        assertThat(newStores.state().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(newStores.deadLetters().read(ROOT_NAMESPACE, 10)).isEmpty();
+        assertThat(oldStores.state().load(ROOT_NAMESPACE, "k"))
+                .describedAs("the pre-migration copy remains available for rollback")
+                .isPresent();
+        assertThat(oldStores.deadLetters().read(ROOT_NAMESPACE, 10)).hasSize(1);
+    }
+
+    @Test
+    void aLegacyNamespaceOnlyTeardownRecordStillMeansTheDeploymentDefaultDatabase() {
+        InMemoryStorePort store = seedStore();
+        seedState(store, ROOT_NAMESPACE);
+        store.keyedState().save(TEARDOWN_NAMESPACE, "namespaces",
+                ROOT_NAMESPACE.getBytes(StandardCharsets.UTF_8));
+
+        new NestStateTeardown(member, store.operatorStateStores()).finishPending(PIPELINE);
+
+        assertThat(store.keyedState().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "namespaces")).isEmpty();
+    }
+
+    @Test
     @DisplayName("a pipeline that nests nothing records connector state and drops its record after purge")
     void aPipelineWithoutNestsRecordsConnectorState() {
         InMemoryStorePort store = seedStore();
@@ -373,7 +442,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))
                 .hasValueSatisfying(bytes -> assertThat(new String(bytes, StandardCharsets.UTF_8))
-                        .contains(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE));
+                        .startsWith("v2:")
+                        .doesNotContain(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE));
         actuator.stop(PIPELINE, true);
 
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))

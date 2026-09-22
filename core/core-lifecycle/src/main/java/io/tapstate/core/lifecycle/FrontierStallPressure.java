@@ -24,6 +24,13 @@ import java.util.Objects;
 public record FrontierStallPressure(Duration pinnedFor) {
 
     /**
+     * A minute pinned before an on-demand explanation calls a chain stopped. This excludes the ordinary
+     * millisecond-scale pauses sampled between advances while retaining the established minute-scale
+     * diagnostic. The persistent alert stays deliberately less sensitive through {@link #DEFAULT}.
+     */
+    public static final FrontierStallPressure EXPLAIN = new FrontierStallPressure(Duration.ofMinutes(1));
+
+    /**
      * An hour pinned. Provisional, and provisional in a specific way: the number that would justify it is
      * the deployment's own log retention, which the product does not know — the retention configured on a
      * source is carried as an opaque string and enforced by nobody here. An hour is chosen as two orders
@@ -45,6 +52,11 @@ public record FrontierStallPressure(Duration pinnedFor) {
      * below by a continuous quantity, so reaching it exactly is reaching it.
      */
     public boolean isOver(FrontierStall stall) {
-        return stall.pinnedMillis() >= pinnedFor.toMillis();
+        return isOver(stall.pinnedMillis());
+    }
+
+    /** Whether a raw pinned-for reading has reached this pressure. */
+    public boolean isOver(long pinnedMillis) {
+        return pinnedMillis >= pinnedFor.toMillis();
     }
 }

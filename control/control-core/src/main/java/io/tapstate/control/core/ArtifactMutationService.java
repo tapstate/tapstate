@@ -13,6 +13,7 @@ import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 
@@ -68,6 +69,7 @@ public final class ArtifactMutationService {
     private final StateStore state;
     private final ObservationStore observations;
     private final PipelineLayoutStore layouts;
+    private final RateHistoryStore rateHistory;
     private final SrsMetaStore srsMeta;
     private final DerivedSchemaStore derivedSchemas;
     private final AuditGate auditGate;
@@ -134,6 +136,7 @@ public final class ArtifactMutationService {
 
             @Override
             public void delete(String pipelineId) {
+                throw new UnsupportedOperationException("pipeline layouts are not configured");
             }
         }, srsMeta, derivedSchemas, auditGate, follows);
     }
@@ -148,11 +151,67 @@ public final class ArtifactMutationService {
             DerivedSchemaStore derivedSchemas,
             AuditGate auditGate,
             DataBrowserFollows follows) {
+        this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, new RateHistoryStore() {
+            @Override
+            public void append(io.tapstate.core.lifecycle.RateSample sample) {
+                throw new UnsupportedOperationException("rate history is not configured");
+            }
+
+            @Override
+            public Page readPage(String pipelineId, java.time.Instant from, java.time.Instant to,
+                    Key after, int limit) {
+                return new Page(java.util.List.of(), false);
+            }
+
+            @Override
+            public java.util.Optional<Entry> predecessor(String pipelineId, java.time.Instant at) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public java.util.Optional<Entry> read(String pipelineId, Key key) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public java.util.Optional<Entry> successor(String pipelineId, java.time.Instant at) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public void deleteAll(String pipelineId) {
+                // Refusing, and not returning quietly like a store with nothing to delete. A reclaim
+                // through this shape runs every step and is reported whole; a step that did nothing
+                // leaves every sample the pipeline ever took in the collection, to be read as the past of
+                // whatever is applied under that id next. "This store is not configured" is what this
+                // object knows, and it is the answer to both halves.
+                throw new UnsupportedOperationException("rate history is not configured");
+            }
+
+            @Override
+            public java.time.Duration retention() {
+                return java.time.Duration.ZERO;
+            }
+        }, auditGate, follows);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            PipelineLayoutStore layouts,
+            SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
+            RateHistoryStore rateHistory,
+            AuditGate auditGate,
+            DataBrowserFollows follows) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.layouts = Objects.requireNonNull(layouts, "layouts");
+        this.rateHistory = Objects.requireNonNull(rateHistory, "rateHistory");
         this.srsMeta = Objects.requireNonNull(srsMeta, "srsMeta");
         this.derivedSchemas = Objects.requireNonNull(derivedSchemas, "derivedSchemas");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -189,6 +248,9 @@ public final class ArtifactMutationService {
         Resource target = store.get(id)
                 .orElseThrow(() -> error(ArtifactError.NOT_FOUND, Map.of("id", id)));
 
+        // A read-only inventory may omit a row this build cannot reconstruct. A destructive check may
+        // not: without the resource, its references are unknown rather than absent, so the strict list
+        // fails closed before any audit record or deletion is written.
         refuseWhenReferenced(id, store.list());
         if (target instanceof PipelineResource) {
             refuseWhenNotStopped(id);
@@ -264,25 +326,49 @@ public final class ArtifactMutationService {
      * neither of which this store port offers.
      */
     private void reclaim(String id) {
+        List<ReclaimStep> steps = reclaimStepsOf(id);
         if (!isAtRest(id)) {
-            throw reclaimIncomplete(id, "pipeline-live",
-                    List.of("mining-chain-consumer", "desired", "state", "observation", "layout", "derived-schema"),
+            throw reclaimIncomplete(id, "pipeline-live", steps.stream().map(ReclaimStep::name).toList(),
                     List.of());
         }
         List<RuntimeException> failures = new ArrayList<>();
         List<String> residue = new ArrayList<>();
-        attempt(failures, residue, "mining-chain-consumer", () -> detachFromEveryChain(id));
-        attempt(failures, residue, "desired", () -> desired.delete(id));
-        attempt(failures, residue, "state", () -> state.delete(id));
-        attempt(failures, residue, "observation", () -> observations.delete(id));
-        attempt(failures, residue, "layout", () -> layouts.delete(id));
-        // Left behind, this record would be read as the derivation history of whatever is applied under
-        // the id next, and would refuse to start it over a difference against a schema belonging to
-        // something that no longer exists.
-        attempt(failures, residue, "derived-schema", () -> derivedSchemas.delete(id));
+        for (ReclaimStep step : steps) {
+            attempt(failures, residue, step.name(), step.action());
+        }
         if (!failures.isEmpty()) {
             throw reclaimIncomplete(id, "step-failed", residue, failures);
         }
+    }
+
+    /**
+     * One step of the reclaim: the name a report calls it by, and what it does. The name is what a
+     * failed reclaim, and the refusal over a pipeline that is live, both put in front of the person who
+     * has to clear the residue by hand; a name that did not match a step would send them looking for
+     * something the reclaim never touched, or leave them unaware of something it did.
+     */
+    private record ReclaimStep(String name, Runnable action) {
+    }
+
+    /**
+     * Everything a removed pipeline owns, in the order it is reclaimed. One list serves both the reclaim
+     * and the report of what a live pipeline would have lost, so a step cannot be added to the one and
+     * left out of the other. Nothing runs while the list is built.
+     */
+    private List<ReclaimStep> reclaimStepsOf(String id) {
+        return List.of(
+                new ReclaimStep("mining-chain-consumer", () -> detachFromEveryChain(id)),
+                new ReclaimStep("desired", () -> desired.delete(id)),
+                new ReclaimStep("state", () -> state.delete(id)),
+                new ReclaimStep("observation", () -> observations.delete(id)),
+                new ReclaimStep("layout", () -> layouts.delete(id)),
+                // Left behind, this record would be read as the derivation history of whatever is applied
+                // under the id next, and would refuse to start it over a difference against a schema
+                // belonging to something that no longer exists.
+                new ReclaimStep("derived-schema", () -> derivedSchemas.delete(id)),
+                // The samples the pipeline took while it ran. Nothing else bounds them but their age, and
+                // a history left behind would be read as the past of whatever is applied under the id next.
+                new ReclaimStep("rate-history", () -> rateHistory.deleteAll(id)));
     }
 
     /**

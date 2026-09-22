@@ -3,9 +3,14 @@ package io.tapstate.app;
 import com.hazelcast.jet.core.DAG;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.runtime.engine.nest.NestSettings;
+import io.tapstate.spi.store.ArtifactStore;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Supplies the Jet topology a pipeline runs, and the namespaces that topology keeps state in. The actuator
@@ -19,6 +24,19 @@ import java.util.Set;
  * state behind under names nothing would ever name again.
  */
 interface DagSource {
+
+    /**
+     * Captures and validates the pipeline revision this start will use, then returns a deferred builder.
+     * The deferment lets an outstanding teardown finish before DAG construction reads or records shape
+     * state, while the captured artifact revision remains fixed across every answer below.
+     */
+    default StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
+        validateStart(pipelineId);
+        NestCapacity capacity = capacityOf(pipelineId);
+        Set<OperatorStateLocation> locations = stateLocations(pipelineId, defaultDatabase);
+        return new StartPreparation(
+                capacity, locations, Optional.empty(), fence -> dagFor(pipelineId, fence));
+    }
 
     /**
      * Validates the pipeline's start preconditions before the actuator starts capture or submits a job.
@@ -65,6 +83,19 @@ interface DagSource {
     List<PipelineStateHolding> stateHeldBy(String pipelineId);
 
     /**
+     * The physical locations behind {@link #stateHeldBy}. The generic answer resolves every declared
+     * namespace through the deployment default supplied by the store-owning actuator; the store-backed
+     * source overrides it to route Nest namespaces to their per-operator databases.
+     */
+    default Set<OperatorStateLocation> stateLocations(String pipelineId, String defaultDatabase) {
+        Objects.requireNonNull(defaultDatabase, "defaultDatabase");
+        java.util.LinkedHashSet<OperatorStateLocation> locations = new java.util.LinkedHashSet<>();
+        stateHeldBy(pipelineId).forEach(holding -> holding.namespaces().forEach(namespace ->
+                locations.add(new OperatorStateLocation(defaultDatabase, namespace))));
+        return Set.copyOf(locations);
+    }
+
+    /**
      * What {@code pipelineId}'s nests are held to, and the map namespaces those numbers apply to.
      *
      * <p>Both together rather than one each, for the reason the two above are: they come from the same
@@ -78,11 +109,63 @@ interface DagSource {
     NestCapacity capacityOf(String pipelineId);
 
     /** A pipeline's nest settings, and the state map namespaces they apply to. */
-    record NestCapacity(Set<String> mapNamespaces, NestSettings settings) {
+    record NestCapacity(Map<String, String> mapDatabases, NestSettings settings) {
+
+        Set<String> mapNamespaces() {
+            return mapDatabases.keySet();
+        }
 
         /** A pipeline with no nest in it: no namespaces to hold, and nothing asking to be held. */
         static NestCapacity none() {
-            return new NestCapacity(Set.of(), NestSettings.defaults());
+            return new NestCapacity(Map.of(), NestSettings.defaults());
+        }
+    }
+
+    /**
+     * The validated, artifact-derived inputs available before placement is configured. DAG construction is
+     * deferred until after placement and pending teardown because it may inspect and record operator shape.
+     */
+    record StartPreparation(
+            NestCapacity capacity,
+            Set<OperatorStateLocation> stateLocations,
+            Optional<ArtifactStore> artifactSnapshot,
+            Function<ExecutionFence, DAG> dagBuilder) {
+
+        public StartPreparation {
+            Objects.requireNonNull(capacity, "capacity");
+            stateLocations = Set.copyOf(Objects.requireNonNull(stateLocations, "stateLocations"));
+            Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
+            Objects.requireNonNull(dagBuilder, "dagBuilder");
+        }
+
+        /**
+         * Builds the topology, with every external effect in it held to {@code fence}'s run. Taking the
+         * fence here rather than at preparation is what keeps the two in step: the run is fenced before
+         * the first side effect of a start, and the topology is built after placement and teardown, so
+         * the generation the build is held to is the one this member has just been granted.
+         *
+         * <p>A null fence is the single-member path, where there is one run of anything and so nothing
+         * for a second one to be held against. Deliberately the only way to get an unfenced topology
+         * from a preparation: a no-argument build would let a clustered start drop its fence without
+         * anything in the call saying so.
+         */
+        StartPlan build(ExecutionFence fence) {
+            return new StartPlan(dagBuilder.apply(fence), capacity, stateLocations, artifactSnapshot);
+        }
+    }
+
+    /** Every artifact-derived input to one start, resolved from one immutable snapshot. */
+    record StartPlan(
+            DAG dag,
+            NestCapacity capacity,
+            Set<OperatorStateLocation> stateLocations,
+            Optional<ArtifactStore> artifactSnapshot) {
+
+        public StartPlan {
+            Objects.requireNonNull(dag, "dag");
+            Objects.requireNonNull(capacity, "capacity");
+            stateLocations = Set.copyOf(Objects.requireNonNull(stateLocations, "stateLocations"));
+            Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
         }
     }
 }

@@ -29,14 +29,13 @@ class SrsMetaTest {
     void holdsTheMiningChainMetaFields() {
         SrsMeta meta = new SrsMeta("chain-1",
                 new ChainPosition(new SourceOrder(1L, 120L), "gtid:aaa-1:120"),
-                List.of(consumer()), "gtid:aaa-1:0", List.of(schema()), "7d");
+                List.of(consumer()), List.of(schema()), "7d");
         assertThat(meta.miningChainId()).isEqualTo("chain-1");
         // The pair, and the token on its own: the order is what a later comparison runs on, the token is
         // what a read resumes from, and dropping either leaves a record no advance can be ranked against.
         assertThat(meta.sourceRead()).isEqualTo(new ChainPosition(new SourceOrder(1L, 120L), "gtid:aaa-1:120"));
         assertThat(meta.sourceReadOffset()).isEqualTo("gtid:aaa-1:120");
         assertThat(meta.consumerOffsets()).containsExactly(consumer());
-        assertThat(meta.cdcStartPosition()).isEqualTo("gtid:aaa-1:0");
         assertThat(meta.schemaHistory()).containsExactly(schema());
         assertThat(meta.retention()).isEqualTo("7d");
     }
@@ -54,7 +53,7 @@ class SrsMetaTest {
     void readsSnapshotCompletionPerPipelineBecauseEachWritesToItsOwnTarget() {
         SrsMeta meta = new SrsMeta("chain-1", null,
                 List.of(consumer("pipe-a", "orders", "order_items"), consumer("pipe-b", "orders")),
-                null, List.of(), null);
+                List.of(), null);
 
         assertThat(meta.snapshotCompletedTables("pipe-a")).containsExactly("orders", "order_items");
         assertThat(meta.snapshotCompletedTables("pipe-b")).containsExactly("orders");
@@ -70,7 +69,7 @@ class SrsMetaTest {
     @Test
     void aPipelineWithNoRecordOnTheChainHasFinishedNothing() {
         SrsMeta meta = new SrsMeta("chain-1", null, List.of(consumer("pipe-a", "orders")),
-                null, List.of(), null);
+                List.of(), null);
         assertThat(meta.snapshotCompletedTables("pipe-b")).isEmpty();
     }
 
@@ -82,15 +81,20 @@ class SrsMetaTest {
     @Test
     void tracksSnapshotCompletionPerTableBecauseOneChainCarriesManyTables() {
         SrsMeta meta = new SrsMeta("chain-1", null, List.of(consumer("pipe-a", "orders", "order_items")),
-                null, List.of(), null);
+                List.of(), null);
         assertThat(meta.snapshotCompletedTables("pipe-a")).containsExactly("orders", "order_items");
     }
 
     @Test
     void carriesTheRingGenerationAndTheGenerationItsSnapshotIsPinnedTo() {
-        SrsMeta meta = new SrsMeta("chain-1", null, List.of(), "gtid:aaa-1:0", List.of(), null, 4L, 3L);
+        SrsMeta meta = new SrsMeta("chain-1", null,
+                List.of(new ConsumerOffset(
+                        "pipe-a", Map.of(), null, List.of(), "gtid:aaa-1:0", 3L)),
+                List.of(), null, 4L);
         assertThat(meta.epoch()).isEqualTo(4L);
-        assertThat(meta.snapshotEpoch()).isEqualTo(3L);
+        assertThat(meta.consumerOffset("pipe-a")).get()
+                .extracting(ConsumerOffset::snapshotEpoch)
+                .isEqualTo(3L);
     }
 
     @Test
@@ -99,25 +103,26 @@ class SrsMetaTest {
         // began in -- so its rows can never win against changes the earlier generation already applied.
         // One field could not hold both, and reading the current generation for a rerun's rows is exactly
         // the reversal this record exists to prevent.
-        SrsMeta midSnapshotRestart = new SrsMeta("chain-1", null, List.of(), "gtid:aaa-1:0", List.of(), null,
-                5L, 4L);
-        assertThat(midSnapshotRestart.epoch()).isNotEqualTo(midSnapshotRestart.snapshotEpoch());
+        SrsMeta midSnapshotRestart = new SrsMeta("chain-1", null,
+                List.of(new ConsumerOffset(
+                        "pipe-a", Map.of(), null, List.of(), "gtid:aaa-1:0", 4L)),
+                List.of(), null, 5L);
+        assertThat(midSnapshotRestart.epoch()).isNotEqualTo(
+                midSnapshotRestart.consumerOffset("pipe-a").orElseThrow().snapshotEpoch());
     }
 
     @Test
-    void theShorterConstructorOpensNoGenerationAndPinsNoSnapshot() {
-        SrsMeta sixArg = new SrsMeta("chain-1", null, List.of(), null, List.of(), null);
-        assertThat(sixArg.epoch()).isZero();
-        assertThat(sixArg.snapshotEpoch()).isZero();
+    void theShorterConstructorOpensNoGeneration() {
+        SrsMeta fiveArg = new SrsMeta("chain-1", null, List.of(), List.of(), null);
+        assertThat(fiveArg.epoch()).isZero();
     }
 
     @Test
     void allowsNullableOffsetsBeforeAnyCdcHasBeenRead() {
         // A freshly seeded mining chain: no source read offset yet, no cdc-start position, no retention
         // set, and no consumers or schema versions attached.
-        SrsMeta meta = new SrsMeta("chain-1", null, List.of(), null, List.of(), null);
+        SrsMeta meta = new SrsMeta("chain-1", null, List.of(), List.of(), null);
         assertThat(meta.sourceReadOffset()).isNull();
-        assertThat(meta.cdcStartPosition()).isNull();
         assertThat(meta.retention()).isNull();
         assertThat(meta.consumerOffsets()).isEmpty();
         assertThat(meta.schemaHistory()).isEmpty();
@@ -127,7 +132,7 @@ class SrsMetaTest {
     void copiesTheConsumerListSoALaterMutationDoesNotLeakIn() {
         List<ConsumerOffset> live = new ArrayList<>();
         live.add(consumer());
-        SrsMeta meta = new SrsMeta("chain-1", null, live, null, List.of(), null);
+        SrsMeta meta = new SrsMeta("chain-1", null, live, List.of(), null);
         live.clear();
         assertThat(meta.consumerOffsets()).containsExactly(consumer());
     }
@@ -136,14 +141,14 @@ class SrsMetaTest {
     void copiesTheSchemaHistorySoALaterMutationDoesNotLeakIn() {
         List<SchemaVersion> live = new ArrayList<>();
         live.add(schema());
-        SrsMeta meta = new SrsMeta("chain-1", null, List.of(), null, live, null);
+        SrsMeta meta = new SrsMeta("chain-1", null, List.of(), live, null);
         live.clear();
         assertThat(meta.schemaHistory()).containsExactly(schema());
     }
 
     @Test
     void rejectsMutationOfTheReturnedLists() {
-        SrsMeta meta = new SrsMeta("chain-1", null, List.of(), null, List.of(), null);
+        SrsMeta meta = new SrsMeta("chain-1", null, List.of(), List.of(), null);
         assertThatThrownBy(() -> meta.consumerOffsets().add(consumer()))
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> meta.schemaHistory().add(schema()))
@@ -152,15 +157,15 @@ class SrsMetaTest {
 
     @Test
     void rejectsABlankMiningChainId() {
-        assertThatThrownBy(() -> new SrsMeta("  ", null, List.of(), null, List.of(), null))
+        assertThatThrownBy(() -> new SrsMeta("  ", null, List.of(), List.of(), null))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
     void rejectsNullLists() {
-        assertThatThrownBy(() -> new SrsMeta("chain-1", null, null, null, List.of(), null))
+        assertThatThrownBy(() -> new SrsMeta("chain-1", null, null, List.of(), null))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new SrsMeta("chain-1", null, List.of(), null, null, null))
+        assertThatThrownBy(() -> new SrsMeta("chain-1", null, List.of(), null, null))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 }

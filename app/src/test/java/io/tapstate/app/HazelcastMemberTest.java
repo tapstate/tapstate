@@ -803,7 +803,8 @@ class HazelcastMemberTest {
             throw new UnsupportedOperationException();
         }
 
-        @Override public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        @Override public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             throw new UnsupportedOperationException();
         }
 

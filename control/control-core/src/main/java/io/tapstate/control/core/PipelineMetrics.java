@@ -1,16 +1,26 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.MetricFact;
+
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /**
- * The metrics read face: a pipeline's open map of numeric run statistics ({@code name -> value}) plus the
- * one source position this product records, per table ({@code table -> opaque srcpos}). The field set is
- * deliberately not fixed — adding a metric is a map entry, not a contract-shape change. The position rides
- * in its own map rather than the numeric one because a srcpos (binlog/GTID/LSN) is an opaque String, not a
- * count; a read face presents the two together. Either map is empty when its source is not wired yet
- * (unavailable), never faked.
+ * The metrics read face: a pipeline's open map of numeric run statistics ({@code name -> value}), the same
+ * statistics as the facts they were measured as, plus the one source position this product records, per
+ * table ({@code table -> opaque srcpos}). The field set is deliberately not fixed — adding a metric is a
+ * map entry, not a contract-shape change. The position rides in its own map rather than the numeric one
+ * because a srcpos (binlog/GTID/LSN) is an opaque String, not a count; a read face presents the two
+ * together. Either map is empty when its source is not wired yet (unavailable), never faked.
+ *
+ * <p><strong>The facts are the same measurements the flat map shows, kept whole.</strong> The flat map is
+ * one number per name, and a metric broken down by table or by direction, or measured as a distribution,
+ * has no single number to be there — it is squeezed to one key per direction, or absent. The facts carry
+ * every point with its attributes, the kind of measurement, its unit and what an accumulation is counted
+ * from, and they are what a reader groups, filters or takes a percentile over. The two are taken from one
+ * measurement in one pass, so they cannot disagree; a reader that finds a name in one and not the other has
+ * found the flat map's limit, not a missing measurement. Empty when the publisher recorded none.
  *
  * <p><strong>The position recorded here is the target-acked one, and its name says so.</strong> It is how
  * far the target has confirmed writes — not how far the source could be read to, and not how far this
@@ -31,7 +41,8 @@ import java.util.Objects;
  * quietly held a per-chain fact would be the name claiming a measurement nobody takes.
  */
 public record PipelineMetrics(
-        String pipelineId, Map<String, Long> metrics, Map<String, String> targetAckedPosition) {
+        String pipelineId, Map<String, Long> metrics, Map<String, String> targetAckedPosition,
+        List<MetricFact> facts) {
 
     /**
      * The positions this face names but does not record, in the order a reader meets them along a pipeline:
@@ -50,5 +61,11 @@ public record PipelineMetrics(
         Objects.requireNonNull(pipelineId, "pipelineId");
         metrics = metrics == null ? Map.of() : Map.copyOf(metrics);
         targetAckedPosition = targetAckedPosition == null ? Map.of() : Map.copyOf(targetAckedPosition);
+        facts = facts == null ? List.of() : List.copyOf(facts);
+    }
+
+    /** The face without facts, the shape it had before the measured facts travelled with it. */
+    public PipelineMetrics(String pipelineId, Map<String, Long> metrics, Map<String, String> targetAckedPosition) {
+        this(pipelineId, metrics, targetAckedPosition, List.of());
     }
 }

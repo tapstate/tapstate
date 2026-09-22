@@ -10,8 +10,10 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
@@ -36,6 +38,7 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsRingbuffer;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -82,9 +85,8 @@ import org.junit.jupiter.api.Test;
  * is drawn and the assembler is fed by both sources directly. Two roots rather than one, because a single
  * root is satisfied by an implementation that piles every child onto whichever root arrived first.
  *
- * <p>Read mode is {@code snapshot_and_cdc} rather than {@code snapshot_only} deliberately: a stateful node
- * needs every row to carry its order, and a source reading no chain of its own supplies none. The seeded
- * rows arrive as snapshot reads; the chain is what puts an order on them.
+ * <p>Read mode is {@code snapshot_and_cdc} because this case exercises the complete snapshot-to-tail path.
+ * The seeded rows arrive as snapshot reads and the changes behind them keep both chains live.
  */
 class NestOverTwoSourcesDataFlowTest {
 
@@ -136,7 +138,7 @@ class NestOverTwoSourcesDataFlowTest {
         actuator.start(PIPELINE);
         List<Map<String, Object>> documents;
         try {
-            awaitAssembled();
+            awaitAssembled("order-1");
             documents = List.copyOf(CapturingSinkWriter.collected());
         } finally {
             stopQuietly(actuator);
@@ -156,6 +158,83 @@ class NestOverTwoSourcesDataFlowTest {
                 .containsExactlyInAnyOrder("sku-1", "sku-2", "sku-3");
         assertThat(elementsOf(latest.get(2L))).singleElement()
                 .satisfies(item -> assertThat(item).containsEntry("sku", "sku-4"));
+    }
+
+    /**
+     * Mutation evidence: forwarding the drain unchanged fails before the first document with "no order";
+     * pinning every run to generation one lets the first half pass and makes the second await time out with
+     * an empty sink. The snapshot-and-cdc sibling above stays green under both mutations.
+     */
+    @Test
+    @DisplayName("a snapshot-only nest assembles with no change chain behind its ordered rows")
+    void snapshotOnlyRowsAreAssembledWithoutInventingAResumePosition() {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_ONLY);
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        // A neighbouring pipeline has the same physical source open and has already put a current change in
+        // its shared ring. This bounded run shares the ring name as a buffer coordinate, but must neither
+        // consume that change nor publish a durable cursor that can hold the neighbour's ring open.
+        SourceResource parent = StoredArtifacts.requireSource(store.artifacts(), PARENT_SOURCE);
+        SourceCaptureResolution shared = SourceCaptureResolution.of(parent, SourceDiscovery.model(store, parent));
+        srsCoordinator.provisionSource("neighbouring-source", shared.chainId(),
+                List.of(PARENT_TABLE, CHILD_TABLE), null);
+        srsCoordinator.attachConsumer(shared.chainId(), "neighbouring-pipeline");
+        new SrsRingbuffer(member.getRingbuffer(shared.ringName(PARENT_TABLE))).append(
+                new SrsItem(new SourcePosition("neighbour-0"), Op.UPDATE, 1L,
+                        Map.of("id", 1L, "name", "old"), Map.of("id", 1L, "name", "changed"), 0L));
+        LifecycleActuator actuator = wireRuntime(store, srsCoordinator);
+
+        actuator.start(PIPELINE);
+        try {
+            awaitAssembled("order-1");
+            Job job = member.getJet().getJob(PIPELINE);
+            assertThat(job).isNotNull();
+            assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
+            assertThat(store.meta().miningChainIdsWithConsumer(PIPELINE))
+                    .describedAs("an ordering generation is not a durable change-chain position")
+                    .isEmpty();
+
+            // Keep the assembled state and run the same bounded read again. A constant made-up order
+            // would lose every strict comparison against that state and emit no documents on this run.
+            actuator.stop(PIPELINE, false);
+            CapturingSinkWriter.reset();
+            actuator.start(PIPELINE);
+            awaitAssembled("order-1");
+            assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
+        } finally {
+            stopQuietly(actuator);
+        }
+    }
+
+    /**
+     * A bounded read that follows a chain-backed run enters the same stateful operators, so its first
+     * generation must outrank the chain generation those operators retained rather than start a second
+     * ordering domain at one. Equal generations lose the nest's strict comparison and emit nothing.
+     */
+    @Test
+    @DisplayName("a snapshot-only run outranks chain-backed state kept from the preceding run")
+    void snapshotOnlyRunOutranksRetainedChainBackedState() {
+        InMemoryStorePort store = seedStore();
+        SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
+        Map<String, List<Envelope>> rowsByTable = snapshotRows();
+        LifecycleActuator actuator = wireRuntime(store, srsCoordinator, rowsByTable);
+
+        actuator.start(PIPELINE);
+        awaitAssembled("order-1");
+        actuator.stop(PIPELINE, false);
+
+        rowsByTable.put(PARENT_TABLE, List.of(
+                order(1, "order-1-after-stop"), order(2, "order-2-after-stop")));
+        store.artifacts().save(pipeline(ReadMode.SNAPSHOT_ONLY));
+        CapturingSinkWriter.reset();
+        actuator.start(PIPELINE);
+        try {
+            awaitAssembled("order-1-after-stop");
+            assertThat(latestPerRoot(new ArrayList<>(CapturingSinkWriter.collected())).get(1L))
+                    .containsEntry("name", "order-1-after-stop");
+            assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
+        } finally {
+            stopQuietly(actuator);
+        }
     }
 
     /**
@@ -213,6 +292,13 @@ class NestOverTwoSourcesDataFlowTest {
      * the production path.
      */
     private LifecycleActuator wireRuntime(InMemoryStorePort store, SrsCoordinator srsCoordinator) {
+        return wireRuntime(store, srsCoordinator, snapshotRows());
+    }
+
+    private LifecycleActuator wireRuntime(
+            InMemoryStorePort store,
+            SrsCoordinator srsCoordinator,
+            Map<String, List<Envelope>> rowsByTable) {
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
         member.getUserContext().put(PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY,
@@ -224,10 +310,6 @@ class NestOverTwoSourcesDataFlowTest {
 
         // One fake connector for both capture units, telling them apart by the stream each asks for -
         // which is what a single-table capture unit names.
-        Map<String, List<Envelope>> rowsByTable = new LinkedHashMap<>();
-        rowsByTable.put(PARENT_TABLE, List.of(order(1), order(2)));
-        rowsByTable.put(CHILD_TABLE, List.of(item(1, 1), item(2, 1), item(3, 1), item(4, 2)));
-
         CaptureRunUnit captureRunUnit =
                 new CaptureRunUnit(new FakeSource(rowsByTable), srsCoordinator, meta, member);
         PipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
@@ -240,27 +322,25 @@ class NestOverTwoSourcesDataFlowTest {
                 new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
     }
 
+    private static Map<String, List<Envelope>> snapshotRows() {
+        Map<String, List<Envelope>> rowsByTable = new LinkedHashMap<>();
+        rowsByTable.put(PARENT_TABLE, List.of(order(1), order(2)));
+        rowsByTable.put(CHILD_TABLE, List.of(item(1, 1), item(2, 1), item(3, 1), item(4, 2)));
+        return rowsByTable;
+    }
+
     /** The two sources, the sink connection and the nest pipeline, plus a discovered model for each source. */
     private static InMemoryStorePort seedStore() {
+        return seedStore(ReadMode.SNAPSHOT_AND_CDC);
+    }
+
+    private static InMemoryStorePort seedStore(ReadMode readMode) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source(PARENT_SOURCE, PARENT_TABLE));
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
         artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
 
-        Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, EMBED_PATH, List.of("id"),
-                null, null, null);
-        TransformBody.Nest body = new TransformBody.Nest(null, null,
-                new NestRoot("o", List.of("id"), null, null, List.of(item)));
-        Map<String, FromRef> aliases = new LinkedHashMap<>();
-        aliases.put("o", FromRef.literal(PARENT_TABLE));
-        aliases.put("i", FromRef.literal(CHILD_TABLE));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
-
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
-                List.of(step), null,
-                new ServeBlock.Inline(null, FromRef.literal(STEP),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
-                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
+        artifacts.save(pipeline(readMode));
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         // Both models are discovered: the parent's resolves the target the sink writes, and each supplies
@@ -277,6 +357,23 @@ class NestOverTwoSourcesDataFlowTest {
         return store;
     }
 
+    private static PipelineResource pipeline(ReadMode readMode) {
+        Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, EMBED_PATH, List.of("id"),
+                null, null, null);
+        TransformBody.Nest body = new TransformBody.Nest(null, null,
+                new NestRoot("o", List.of("id"), null, null, List.of(item)));
+        Map<String, FromRef> aliases = new LinkedHashMap<>();
+        aliases.put("o", FromRef.literal(PARENT_TABLE));
+        aliases.put("i", FromRef.literal(CHILD_TABLE));
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
+        return new PipelineResource(PIPELINE, null,
+                List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
+                List.of(step), null,
+                new ServeBlock.Inline(null, FromRef.literal(STEP),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
+                new Settings(null, null, null, null, readMode, "earliest"), null);
+    }
+
     private static SourceResource source(String id, String table) {
         return new SourceResource(id, null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal(table)), null, null);
@@ -287,7 +384,11 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     private static Envelope order(long id) {
-        return Envelope.read(id, PARENT_TABLE, Map.of("id", id, "name", "order-" + id), Map.of());
+        return order(id, "order-" + id);
+    }
+
+    private static Envelope order(long id, String name) {
+        return Envelope.read(id, PARENT_TABLE, Map.of("id", id, "name", name), Map.of());
     }
 
     private static Envelope item(long id, long orderId) {
@@ -317,14 +418,15 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     /**
-     * Waits until every root is present with every child attached. On timeout it reports what the job is
-     * actually doing: zero documents is a symptom shared by a job that failed, a job still starting and a
-     * job assembling nothing, and only the job status tells them apart.
+     * Waits until every root is current with every child attached. A retained root can be emitted when the
+     * other source arrives first, so shape alone does not say the current root row has reached the nest. On
+     * timeout it reports what the job is actually doing: zero documents is a symptom shared by a job that
+     * failed, a job still starting and a job assembling nothing, and only the job status tells them apart.
      */
-    private void awaitAssembled() {
+    private void awaitAssembled(String expectedRootName) {
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
         while (System.nanoTime() < deadline) {
-            if (settled(CapturingSinkWriter.collected())) {
+            if (settled(CapturingSinkWriter.collected(), expectedRootName)) {
                 return;
             }
             sleep();
@@ -349,10 +451,14 @@ class NestOverTwoSourcesDataFlowTest {
         }
     }
 
-    /** Whether every root is present and every child attached somewhere, so waiting can stop. */
-    private static boolean settled(Queue<Map<String, Object>> written) {
+    /** Whether every root is current and every child is attached somewhere, so waiting can stop. */
+    private static boolean settled(Queue<Map<String, Object>> written, String expectedRootName) {
         Map<Object, Map<String, Object>> latest = latestPerRoot(new ArrayList<>(written));
         if (latest.size() != 2) {
+            return false;
+        }
+        Map<String, Object> firstRoot = latest.get(1L);
+        if (firstRoot == null || !expectedRootName.equals(firstRoot.get("name"))) {
             return false;
         }
         int attached = 0;

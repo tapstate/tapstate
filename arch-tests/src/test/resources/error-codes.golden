@@ -119,6 +119,8 @@ connector.discover-failed
 connector.instance-limit-reached
 connector.instances-busy
 connector.load-failed
+connector.logminer-identifier-too-long
+connector.logminer-preflight-timeout
 connector.no-connector-class
 connector.not-found
 connector.not-official
@@ -188,6 +190,7 @@ engine.job-failed
 engine.job-still-ending
 engine.join-dimension-row-displaced
 engine.no-such-job
+engine.view-key-missing-from-before-image
 io.document-too-large
 io.document-unreadable
 io.schema-read-contention
@@ -207,7 +210,10 @@ mcp.server-rejected
 migration.changeset-failed
 migration.data-newer-than-binary
 migration.lock-timeout
+monitor.cursor-expired
+monitor.invalid-cursor
 monitor.no-observation
+monitor.query-budget-exceeded
 nest.append-mode-conflicts-with-key-tracking
 nest.array-key-unresolvable
 nest.capacity-estimate-incomplete
@@ -229,6 +235,7 @@ nest.root-fanout-limit-exceeded
 nest.root-key-required
 nest.sibling-embeds-target-different-parent-keys
 nest.snapshot-passthrough-forbidden
+nest.state-database-changed-while-running
 nest.state-far-exceeds-memory-budget
 nest.state-paths-changed
 nest.state-served-from-cold-layer
@@ -251,12 +258,14 @@ source.not-found
 source.precondition-required
 source.srs-change-while-running
 source.version-conflict
+store.invalid-operator-state-database
 store.invalid-uri
 store.not-replica-set
 store.tls-ca-unreadable
 store.unreachable
 transform.expression-failed
 transform.script-compile-failed
+transform.script-decimal-out-of-range
 transform.script-failed
 transform.script-no-process
 transform.script-output-invalid

@@ -154,8 +154,10 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.resume", "resume"),
             Map.entry("pipeline.status", "status"),
             Map.entry("pipeline.metrics", "metrics"),
+            Map.entry("pipeline.metrics.history", "metrics"),
             Map.entry("pipeline.snapshot", "snapshot"),
             Map.entry("pipeline.logs", "logs"),
+            Map.entry("pipeline.explain", "explain"),
             Map.entry("pipeline.position", "position"),
             Map.entry("pipeline.set-position", "position"),
             // Both on one verb, as the three token operations are: what a reader is doing is looking at
@@ -262,10 +264,10 @@ public final class Cli implements Runnable {
                     "Pause a running pipeline, holding its position.")),
             Map.entry("resume", new VerbHelp("<pipeline-id>",
                     "Resume a paused pipeline from where it stopped.")),
-            Map.entry("status", new VerbHelp("<pipeline-id> [--watch]",
-                    "Show a pipeline's current state; --watch streams it until Ctrl-C.")),
-            Map.entry("metrics", new VerbHelp("<pipeline-id>",
-                    "Show a pipeline's counters and per-table positions.")),
+            Map.entry("status", new VerbHelp("<pipeline-id> [--watch] [--rate]",
+                    "Show a pipeline's state, rate and lag; --watch streams them until Ctrl-C.")),
+            Map.entry("metrics", new VerbHelp("<pipeline-id> [HISTORY OPTIONS]",
+                    "Show current counters, or bounded history with paired --from/--to.")),
             Map.entry("snapshot", new VerbHelp("<pipeline-id>",
                     "Show a pipeline's per-table snapshot progress.")),
             Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
@@ -488,6 +490,13 @@ public final class Cli implements Runnable {
      * direct seed or saved context makes it ask the running server for the second half of the report.
      */
     static boolean bypassesSessionResolution(LaunchOptions launch) {
+        if (launch.isOneShot() && !launch.command().isEmpty()
+                && launch.command().getFirst().equals("explain")
+                && (launch.command().size() == 1
+                        || launch.command().stream().anyMatch(
+                                word -> word.equals("-h") || word.equals("--help")))) {
+            return true;
+        }
         if (!launch.isOneShot() || Repl.isOnlineVerb(launch.command().getFirst())) {
             return false;
         }

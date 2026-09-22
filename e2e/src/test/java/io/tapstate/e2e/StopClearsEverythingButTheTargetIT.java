@@ -61,9 +61,9 @@ class StopClearsEverythingButTheTargetIT {
             throws Exception {
         String storeUri = SharedMongo.replicaSetUrl(
                 "stop_clears_everything_" + tier.name().toLowerCase(Locale.ROOT));
-        // The tier rides on the pipeline id, not on the namespace: the state database has a fixed name, so
-        // on one Mongo the two tiers would otherwise seed over each other, and a namespace is built from
-        // the id, so a cleanup keyed off that id has to be able to match what is seeded here.
+        // The tier rides on the pipeline id, not on the namespace: both tiers use this test deployment's
+        // configured state database, so they would otherwise seed over each other. A namespace is built
+        // from the id, so a cleanup keyed off that id has to be able to match what is seeded here.
         String pipelineId = PIPELINE_BASE + "_" + tier.name().toLowerCase(Locale.ROOT);
         Path targetDirectory = Files.createDirectories(directory.resolve(TARGET_ID));
 

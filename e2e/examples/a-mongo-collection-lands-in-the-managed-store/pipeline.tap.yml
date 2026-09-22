@@ -6,4 +6,4 @@ settings: { read_mode: snapshot_and_cdc }
 view:
   id: order_state
   from: orders
-  primary_key: _id
+  primary_key: id

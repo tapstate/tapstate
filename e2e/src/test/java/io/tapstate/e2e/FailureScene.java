@@ -62,6 +62,7 @@ final class FailureScene {
         reading(scene, "failure code", () -> binding.failureCode(pipelineId));
         reading(scene, "error count", () -> binding.errorCount(pipelineId));
         reading(scene, "changes that could not be placed", () -> binding.deadLettered(pipelineId));
+        reading(scene, "rows a target confirmed", () -> binding.recordsOut(pipelineId));
 
         scene.append("\n## how many rows each place holds\n");
         for (TableAlias table : placesNamedBy(envelope)) {

@@ -38,8 +38,8 @@ import org.junit.jupiter.api.Test;
 /**
  * Coverage for how the store-backed DAG source feeds a sink's resolved target models: the write-side target
  * tables resolved from the pipeline sources' discovered models reach the sink binder, so the sink creates
- * each target by that model and keys an upsert on its primary key. A sync start refuses any reaching source
- * whose model has not been discovered, while view-only materialization retains its pre-discovery path.
+ * each target by that model and keys an upsert on its primary key. A materializing start refuses any reaching
+ * source whose model has not been discovered, whether it writes a view or a sync.
  */
 class StoreBackedDagSourceTargetModelTest {
 
@@ -119,8 +119,10 @@ class StoreBackedDagSourceTargetModelTest {
                 List.of(new io.tapstate.spi.store.SourceIndex("code_unique", List.of("code"), true)))));
         List<TargetTable> bound = new ArrayList<>();
         new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+        // The unique bit survives the projection because the column did not change. What it is worth
+        // does not travel with it: the source named the index plainly, so nothing proved the claim.
         assertThat(bound.getFirst().indexes()).containsExactly(
-                new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), true));
+                new TargetIndex(List.of("id"), true), new TargetIndex(List.of("code"), true, false));
     }
 
     @Test
@@ -305,7 +307,7 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
-    void does_not_require_an_undiscovered_view_source_when_sync_reads_another_source() {
+    void requires_discovery_for_a_view_source_when_sync_reads_another_source() {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("address_src"));
         store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src"), SourceRef.bare("address_src")), null,
                 new ViewBlock.Inline("orders_view", FromRef.literal("orders_src"), "id", null),
@@ -315,12 +317,14 @@ class StoreBackedDagSourceTargetModelTest {
         store.schemas().save(discovered("address_src", "mysql", new SourceTable(
                 "PlayerAddress", List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
 
-        assertThatCode(() -> new StoreBackedDagSource(store).validateStart("p"))
-                .doesNotThrowAnyException();
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("orders_src");
     }
 
     @Test
-    void leaves_a_view_only_pipeline_allowed_before_source_schema_discovery() {
+    void refuses_a_view_over_a_literal_table_when_the_source_schema_was_never_discovered() {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
@@ -330,7 +334,10 @@ class StoreBackedDagSourceTargetModelTest {
                 new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null),
                 null, null, null));
 
-        new StoreBackedDagSource(store).validateStart("p");
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("orders_src");
     }
 
     @Test

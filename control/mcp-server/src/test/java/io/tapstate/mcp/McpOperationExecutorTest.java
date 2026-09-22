@@ -58,6 +58,14 @@ class McpOperationExecutorTest {
             Map<String, Object> stop = Map.of("id", "orders", "purgeState", true);
             Map<String, Object> logs = new LinkedHashMap<>(pipeline);
             logs.put("limit", 999);
+            Map<String, Object> history = Map.of(
+                    "id", "orders",
+                    "from", "2026-09-20T10:00:00Z",
+                    "to", "2026-09-20T11:00:00Z",
+                    "resolution", "raw",
+                    "limit", 10,
+                    "table", List.of("public.orders"),
+                    "cursor", "next page");
 
             List<Map.Entry<io.tapstate.control.core.Operation, Map<String, Object>>> calls = List.of(
                     Map.entry(ControlOperations.SYSTEM_VERSION, Map.of()),
@@ -84,6 +92,8 @@ class McpOperationExecutorTest {
                     Map.entry(ControlOperations.PIPELINE_METRICS, pipeline),
                     Map.entry(ControlOperations.PIPELINE_SNAPSHOT, pipeline),
                     Map.entry(ControlOperations.PIPELINE_LOGS, logs),
+                    Map.entry(ControlOperations.PIPELINE_METRICS_HISTORY, history),
+                    Map.entry(ControlOperations.PIPELINE_EXPLAIN, pipeline),
                     Map.entry(ControlOperations.DATA_BROWSER_COLLECTIONS, Map.of("sourceId", "views")),
                     Map.entry(ControlOperations.DATA_BROWSER_STATS,
                             Map.of("sourceId", "views", "collection", "order_state")),
@@ -117,9 +127,76 @@ class McpOperationExecutorTest {
                     "/api/pipelines/orders:pause", "/api/pipelines/orders:resume",
                     "/api/pipelines/orders/status", "/api/pipelines/orders/metrics",
                     "/api/pipelines/orders/snapshot", "/api/pipelines/orders/logs?limit=200",
+                    "/api/pipelines/orders/metrics/history?from=2026-09-20T10%3A00%3A00Z"
+                            + "&to=2026-09-20T11%3A00%3A00Z&resolution=raw&limit=10"
+                            + "&table=public.orders&cursor=next%20page",
+                    "/api/pipelines/orders/explain",
                     "/api/sources/views/collections",
                     "/api/sources/views/collections/order_state/stats",
                     "/api/sources/views/collections/order_state:find");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void everySharedExplanationFixtureReachesMcpWithoutASecondProjection() throws Exception {
+        List<String> fixtures = List.of(
+                "explain-stale.golden.json",
+                "explain-coded-failure.golden.json",
+                "explain-reconcile-failures.golden.json",
+                "explain-no-movement.golden.json",
+                "explain-frontier-stalled.golden.json",
+                "explain-no-match.golden.json",
+                "explain-unknown.golden.json",
+                "explain-start-pending.golden.json");
+        AtomicReference<String> response = new AtomicReference<>();
+        HttpServer server = server(exchange -> answer(exchange, 200, response.get()));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "read-token", Map.of(), client);
+            for (String fixture : fixtures) {
+                String json = observabilityFixture(fixture);
+                response.set(json);
+
+                McpResult result = executor.execute(
+                        ControlOperations.PIPELINE_EXPLAIN, Map.of("id", "orders"));
+
+                assertThat(result.error()).as(fixture).isFalse();
+                assertThat(result.body()).as(fixture).isEqualTo(JsonReader.parse(json));
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void everySharedHistoryFixtureReachesMcpWithoutASecondProjection() throws Exception {
+        List<String> fixtures = List.of(
+                "history-raw-page-1.golden.json",
+                "history-raw-page-2.golden.json",
+                "history-auto-page-1.golden.json",
+                "history-aggregate-boundaries.golden.json",
+                "history-single-metric-missing.golden.json",
+                "history-empty.golden.json");
+        AtomicReference<String> response = new AtomicReference<>();
+        HttpServer server = server(exchange -> answer(exchange, 200, response.get()));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "read-token", Map.of(), client);
+            Map<String, Object> request = Map.of(
+                    "id", "orders",
+                    "from", "2026-09-20T10:00:00Z",
+                    "to", "2026-09-20T11:00:00Z");
+            for (String fixture : fixtures) {
+                String json = observabilityFixture(fixture);
+                response.set(json);
+
+                McpResult result = executor.execute(ControlOperations.PIPELINE_METRICS_HISTORY, request);
+
+                assertThat(result.error()).as(fixture).isFalse();
+                assertThat(result.body()).as(fixture).isEqualTo(JsonReader.parse(json));
+            }
         } finally {
             server.stop(0);
         }
@@ -665,6 +742,16 @@ class McpOperationExecutorTest {
     }
 
     private record SourceDraftExchange(McpResult result, Map<?, ?> posted) { }
+
+    private static String observabilityFixture(String name) throws IOException {
+        try (var input = McpOperationExecutorTest.class.getResourceAsStream(
+                "/golden/observability/" + name)) {
+            if (input == null) {
+                throw new IOException("missing shared explanation fixture: " + name);
+            }
+            return new String(input.readAllBytes(), StandardCharsets.UTF_8).stripTrailing();
+        }
+    }
 
     private static void assertSourceDraftUnavailable(
             int connectorStatus, String connectorBody, String draftBody) throws Exception {

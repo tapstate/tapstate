@@ -1124,6 +1124,275 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public HistoryOutcome history(
+            URI baseUrl, String credential, String pipelineId, HistoryRequest request) {
+        StringBuilder path = new StringBuilder("/api/pipelines/")
+                .append(urlSegment(pipelineId))
+                .append("/metrics/history?from=")
+                .append(encode(request.from()))
+                .append("&to=")
+                .append(encode(request.to()));
+        if (request.resolution() != null) {
+            path.append("&resolution=").append(encode(request.resolution()));
+        }
+        if (request.limit() != null) {
+            path.append("&limit=").append(request.limit());
+        }
+        request.tables().forEach(table -> path.append("&table=").append(encode(table)));
+        if (request.cursor() != null) {
+            path.append("&cursor=").append(encode(request.cursor()));
+        }
+        ControlResponse response = sharedClient.get(baseUrl, credential, path.toString());
+        return switch (response) {
+            case ControlResponse.Success success -> {
+                HistoryOutcome.Found found = historyFound(success.body());
+                yield found == null ? new HistoryOutcome.Unreachable() : found;
+            }
+            case ControlResponse.Rejected rejected ->
+                    new HistoryOutcome.Rejected(rejected.code(), rejected.message());
+            case ControlResponse.Unreachable ignored -> new HistoryOutcome.Unreachable();
+            default -> new HistoryOutcome.Unreachable();
+        };
+    }
+
+    @Override
+    public ExplainOutcome explain(URI baseUrl, String credential, String pipelineId) {
+        ControlResponse response = sharedClient.get(
+                baseUrl, credential, "/api/pipelines/" + urlSegment(pipelineId) + "/explain");
+        return switch (response) {
+            case ControlResponse.Success success -> {
+                ExplainOutcome.Found found = explanationFound(success.body());
+                yield found == null ? new ExplainOutcome.Unreachable() : found;
+            }
+            case ControlResponse.Rejected rejected ->
+                    new ExplainOutcome.Rejected(rejected.code(), rejected.message());
+            case ControlResponse.Unreachable ignored -> new ExplainOutcome.Unreachable();
+            default -> new ExplainOutcome.Unreachable();
+        };
+    }
+
+    private static HistoryOutcome.Found historyFound(Object body) {
+        if (!(body instanceof Map<?, ?> map)
+                || !(map.get("pipelineId") instanceof String pipelineId)
+                || !(map.get("from") instanceof String from)
+                || !(map.get("to") instanceof String to)
+                || !(map.get("effectiveFrom") instanceof String effectiveFrom)
+                || !(map.get("effectiveTo") instanceof String effectiveTo)
+                || !(map.get("retentionCutoff") instanceof String retentionCutoff)
+                || !(map.get("effectiveResolution") instanceof String effectiveResolution)
+                || !(map.get("status") instanceof String status)
+                || !(map.get("consistency") instanceof String consistency)
+                || !map.containsKey("nextCursor")) {
+            return null;
+        }
+        List<HistoryOutcome.Segment> segments = historySegments(map.get("segments"));
+        List<HistoryOutcome.Gap> gaps = historyGaps(map.get("gaps"));
+        List<HistoryOutcome.Unavailable> unavailable = unavailable(map.get("unavailable"));
+        Object rawCursor = map.get("nextCursor");
+        if (segments == null || gaps == null || unavailable == null
+                || rawCursor != null && !(rawCursor instanceof String)) {
+            return null;
+        }
+        return new HistoryOutcome.Found(pipelineId, from, to, effectiveFrom, effectiveTo,
+                retentionCutoff, effectiveResolution, status, consistency, segments, gaps,
+                unavailable, (String) rawCursor);
+    }
+
+    private static List<HistoryOutcome.Segment> historySegments(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Segment> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> segment)
+                    || !(segment.get("intervalStart") instanceof String start)
+                    || !(segment.get("intervalEnd") instanceof String end)
+                    || !(segment.get("startReason") instanceof String reason)) {
+                return null;
+            }
+            List<HistoryOutcome.Point> points = historyPoints(segment.get("points"));
+            if (points == null) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Segment(start, end, reason, points));
+        }
+        return List.copyOf(out);
+    }
+
+    private static List<HistoryOutcome.Point> historyPoints(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Point> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> point)
+                    || !(point.get("intervalStart") instanceof String start)
+                    || !(point.get("intervalEnd") instanceof String end)) {
+                return null;
+            }
+            HistoryOutcome.Rate records = rate(point, "recordsOut");
+            HistoryOutcome.Rate bytes = rate(point, "bytesOut");
+            List<HistoryOutcome.Lag> lag = historyLag(point.get("lag"));
+            if (lag == null || point.containsKey("recordsOut") && records == null
+                    || point.containsKey("bytesOut") && bytes == null) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Point(start, end, records, bytes, lag));
+        }
+        return List.copyOf(out);
+    }
+
+    private static HistoryOutcome.Rate rate(Map<?, ?> point, String name) {
+        Object raw = point.get(name);
+        if (raw == null) {
+            return null;
+        }
+        if (raw instanceof Map<?, ?> rate
+                && rate.get("delta") instanceof Number delta
+                && rate.get("averageRate") instanceof Number average
+                && rate.get("maxRate") instanceof Number max) {
+            return new HistoryOutcome.Rate(delta, average, max);
+        }
+        return null;
+    }
+
+    private static List<HistoryOutcome.Lag> historyLag(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Lag> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> lag)
+                    || !(lag.get("table") instanceof String table)
+                    || !(lag.get("observedAt") instanceof String observedAt)
+                    || !(lag.get("last") instanceof Number last)
+                    || !(lag.get("max") instanceof Number max)) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Lag(table, observedAt, last.longValue(), max.longValue()));
+        }
+        return List.copyOf(out);
+    }
+
+    private static List<HistoryOutcome.Gap> historyGaps(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Gap> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> gap)
+                    || !(gap.get("intervalStart") instanceof String start)
+                    || !(gap.get("intervalEnd") instanceof String end)
+                    || !(gap.get("reason") instanceof String reason)) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Gap(start, end, reason));
+        }
+        return List.copyOf(out);
+    }
+
+    private static List<HistoryOutcome.Unavailable> unavailable(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Unavailable> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> unavailable)
+                    || !(unavailable.get("metric") instanceof String metric)) {
+                return null;
+            }
+            Object table = unavailable.get("table");
+            if (table != null && !(table instanceof String)) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Unavailable(metric, (String) table));
+        }
+        return List.copyOf(out);
+    }
+
+    private static ExplainOutcome.Found explanationFound(Object body) {
+        if (!(body instanceof Map<?, ?> map)
+                || !(map.get("pipelineId") instanceof String pipelineId)
+                || !(map.get("state") instanceof String state)
+                || !(map.get("kind") instanceof String kind)
+                || !(map.get("message") instanceof String message)
+                || !(map.get("freshness") instanceof String freshness)
+                || !map.containsKey("next")) {
+            return null;
+        }
+        List<ExplainOutcome.Evidence> evidence = explanationEvidence(map.get("evidence"));
+        List<String> cannotSay = strings(map.get("cannotSay"));
+        Object rawObservedAt = map.get("observedAt");
+        Object rawAge = map.get("observedAgeMillis");
+        if (evidence == null || cannotSay == null
+                || rawObservedAt != null && !(rawObservedAt instanceof String)
+                || rawAge != null && !(rawAge instanceof Number)
+                || (rawObservedAt == null) != (rawAge == null)) {
+            return null;
+        }
+        ExplainOutcome.Next next = explanationNext(map.get("next"));
+        if (map.get("next") != null && next == null) {
+            return null;
+        }
+        ExplainOutcome.Pending pending = explanationPending(map.get("pending"));
+        if (map.get("pending") != null && pending == null) {
+            return null;
+        }
+        return new ExplainOutcome.Found(pipelineId, state, kind, message, (String) rawObservedAt,
+                rawAge == null ? null : ((Number) rawAge).longValue(), freshness,
+                evidence, cannotSay, next, pending);
+    }
+
+    private static List<ExplainOutcome.Evidence> explanationEvidence(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<ExplainOutcome.Evidence> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> evidence)
+                    || !(evidence.get("source") instanceof String source)
+                    || !(evidence.get("field") instanceof String field)
+                    || !evidence.containsKey("value")) {
+                return null;
+            }
+            out.add(new ExplainOutcome.Evidence(source, field, evidence.get("value")));
+        }
+        return List.copyOf(out);
+    }
+
+    private static ExplainOutcome.Next explanationNext(Object raw) {
+        if (raw == null) {
+            return null;
+        }
+        return raw instanceof Map<?, ?> next
+                && next.get("action") instanceof String action
+                && next.get("message") instanceof String message
+                ? new ExplainOutcome.Next(action, message) : null;
+    }
+
+    private static ExplainOutcome.Pending explanationPending(Object raw) {
+        if (raw == null) {
+            return null;
+        }
+        return raw instanceof Map<?, ?> pending && pending.get("reason") instanceof String reason
+                ? new ExplainOutcome.Pending(reason) : null;
+    }
+
+    private static List<String> strings(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<String> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof String value)) {
+                return null;
+            }
+            out.add(value);
+        }
+        return List.copyOf(out);
+    }
+
+    @Override
     public PositionOutcome position(URI baseUrl, String credential, String pipelineId) {
         return positionCall(() -> authed(
                 baseUrl, "/api/pipelines/" + pipelineId + "/position", credential).GET().build());
@@ -1283,9 +1552,55 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     }
                 }
             }
-            return new MetricsOutcome.Found(id, stats, targetAckedPosition, notCollected);
+            return new MetricsOutcome.Found(id, stats, targetAckedPosition, notCollected, factPoints(m.get("facts")));
         }
         return null;
+    }
+
+    /**
+     * The single-valued points of the body's {@code facts}, or none from a server that sends no facts. A
+     * point without a value is a distribution, which nothing here reads, and is passed over; a point whose
+     * time does not parse keeps its value and loses its time, which the reader of the time treats as "not
+     * said" rather than as now.
+     */
+    private static List<MetricsOutcome.FactPoint> factPoints(Object rawFacts) {
+        List<MetricsOutcome.FactPoint> points = new ArrayList<>();
+        if (!(rawFacts instanceof List<?> facts)) {
+            return points;
+        }
+        for (Object rawFact : facts) {
+            if (!(rawFact instanceof Map<?, ?> fact) || !(fact.get("name") instanceof String name)
+                    || !(fact.get("points") instanceof List<?> rawPoints)) {
+                continue;
+            }
+            for (Object rawPoint : rawPoints) {
+                if (!(rawPoint instanceof Map<?, ?> point) || !(point.get("value") instanceof Number value)) {
+                    continue;
+                }
+                Map<String, String> attributes = new LinkedHashMap<>();
+                if (point.get("attributes") instanceof Map<?, ?> rawAttributes) {
+                    for (Map.Entry<?, ?> attribute : rawAttributes.entrySet()) {
+                        if (attribute.getKey() instanceof String key && attribute.getValue() instanceof String text) {
+                            attributes.put(key, text);
+                        }
+                    }
+                }
+                points.add(new MetricsOutcome.FactPoint(name, attributes, instantOrNull(point.get("observedAt")),
+                        value.longValue()));
+            }
+        }
+        return points;
+    }
+
+    private static Instant instantOrNull(Object text) {
+        if (!(text instanceof String iso)) {
+            return null;
+        }
+        try {
+            return Instant.parse(iso);
+        } catch (java.time.format.DateTimeParseException malformed) {
+            return null;
+        }
     }
 
     /**

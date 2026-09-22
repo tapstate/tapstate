@@ -1,8 +1,9 @@
 package io.tapstate.app;
 
-import io.tapstate.core.lifecycle.TableSnapshot;
+import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.spi.store.ArtifactStore;
 
-import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -15,6 +16,14 @@ interface PipelineCaptureCoordinator {
 
     /** Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop. */
     void startCapture(String pipelineId);
+
+    /**
+     * Starts from the same immutable artifact snapshot used to build the pipeline's DAG and state plan.
+     * Lightweight coordinators that do not read artifacts keep their existing implementation.
+     */
+    default void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
+        startCapture(pipelineId);
+    }
 
     /**
      * Stops the cdc capture started for the pipeline, tearing down each source run and giving back its hold
@@ -61,14 +70,38 @@ interface PipelineCaptureCoordinator {
     }
 
     /**
-     * How far each of the pipeline's tables got through its initial load, keyed by table, or empty when no
-     * capture is running for it. A coordinator that runs no capture reports none.
+     * How far each of the pipeline's tables got through its initial load, keyed by table, with the moment
+     * that load began; nothing when no capture is running for it. A coordinator that runs no capture
+     * reports nothing.
+     *
+     * <p>The start rides along because the rows are a total and a total without what it accumulates from
+     * cannot be read: a pipeline restarted onto a fresh load and one whose count went backwards are the
+     * same observation otherwise.
      *
      * <p>What this reports is the finished load, not a live position in one: a table's bounded snapshot read
      * drains in one blocking pass, so its row count exists only once that pass returns. Until then the table
      * is simply absent, which the read face publishes as unavailable rather than as a table at zero rows.
      */
-    default Map<String, TableSnapshot> snapshotProgress(String pipelineId) {
-        return Map.of();
+    default SnapshotReading snapshotProgress(String pipelineId) {
+        return SnapshotReading.NONE;
+    }
+
+    /**
+     * How many rows the pipeline's capture has taken from its sources, by table and source operation, with
+     * the moment it began counting; nothing for a pipeline with no capture running. A coordinator that runs
+     * no capture reports nothing.
+     *
+     * <p>This is the source side of the same question the target side answers, and the two are worth having
+     * separately for the window where they disagree: everything read but not yet confirmed sits between
+     * them, and that gap is the only thing distinguishing a pipeline that is keeping up from one whose
+     * reading is fine and whose writing has stopped.
+     *
+     * <p><strong>A bounded load lands in one step.</strong> Its read drains in one blocking pass before the
+     * pipeline has a job or a registered run at all, so its rows appear here the moment that pass returns
+     * and not while it runs -- the same window {@link #snapshotProgress} is blind through, for the same
+     * reason. What follows the load is counted as it arrives.
+     */
+    default CaptureReading capturedRows(String pipelineId) {
+        return CaptureReading.NONE;
     }
 }

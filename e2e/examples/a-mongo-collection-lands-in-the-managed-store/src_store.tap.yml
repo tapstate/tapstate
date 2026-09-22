@@ -2,6 +2,6 @@ version: tapstate/v1
 kind: source
 id: src_store
 connector: mongodb
-config: { uri: "${SRC_STORE_URI}" }
+config: { uri: "${SRC_STORE_URI}", preImage: true }
 mode: cdc
 tables: [ orders ]

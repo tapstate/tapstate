@@ -55,6 +55,21 @@ class ConsumerOffsetTest {
         assertThat(offset.snapshotCompletedTables()).containsExactly("orders", "order_items");
     }
 
+    @Test
+    void holdsTheSeamAndGenerationAtWhichThisPipelinesLoadBegan() {
+        ConsumerOffset offset = new ConsumerOffset(
+                "orders-pipeline", Map.of(), null, List.of("orders"), "binlog.000042:1024", 3L);
+
+        assertThat(offset.cdcStartPosition()).isEqualTo("binlog.000042:1024");
+        assertThat(offset.snapshotEpoch()).isEqualTo(3L);
+    }
+
+    @Test
+    void rejectsANegativeSnapshotGeneration() {
+        assertThatThrownBy(() -> new ConsumerOffset("p", Map.of(), null, List.of(), "w0", -1L))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     /**
      * The three-argument shape leaves the completion set empty rather than absent.
      *

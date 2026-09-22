@@ -2,7 +2,7 @@ version: tapstate/v1
 kind: pipeline
 id: assembled_orders
 source: [ src_orders, src_items ]
-settings: { read_mode: snapshot_and_cdc }
+settings: { read_mode: snapshot_only }
 transforms:
   - id: order_doc
     type: nest

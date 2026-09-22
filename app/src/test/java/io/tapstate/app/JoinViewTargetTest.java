@@ -31,9 +31,9 @@ import org.junit.jupiter.api.Test;
  * with {@code tables=orders, customers}. The validator accepted the pipeline and the builder would
  * not build it, which is the one disagreement between the two halves that nothing else looks for.
  *
- * <p>A join is one stream, and its identity is the target model registered for the step - so the
- * gate that refuses a view whose key is not the identity of its feed now has something true to
- * compare against, rather than two tables it was never fed by.
+ * <p>A join is one stream, and its target model is registered for the step rather than for either
+ * table below it. Its published fact key is the identity the view must preserve unless another
+ * independently unique identity is available.
  */
 class JoinViewTargetTest {
 
@@ -66,13 +66,8 @@ class JoinViewTargetTest {
         assertThat(build(VIEW_PIPELINE, List.of("id"))).isTrue();
     }
 
-    /**
-     * The gate still bites, on the thing it is for. A view carries one key column, so a join whose
-     * fact key is composite has an identity the view cannot converge on - two orders differing only
-     * in the column the view leaves out would take turns overwriting one document.
-     */
     @Test
-    void aViewKeyedOnLessThanTheJoinsIdentityIsStillRefused() {
+    void aViewKeyedOnLessThanTheJoinsIdentityIsRefused() {
         assertThatThrownBy(() -> build(VIEW_PIPELINE, List.of("region", "id")))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())

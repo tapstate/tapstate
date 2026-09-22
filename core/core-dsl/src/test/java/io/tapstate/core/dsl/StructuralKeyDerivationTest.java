@@ -4,6 +4,7 @@ import io.tapstate.core.model.Doc;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.NestStateStorage;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.QueryElement;
@@ -124,6 +125,7 @@ class StructuralKeyDerivationTest {
         assertWhitelist(DslParser.STEP_BASE_KEYS, Step.Inline.class, Set.of("type", "options"));
         assertWhitelist(DslParser.STEP_USE_KEYS, Step.Use.class, Set.of("options"));
         assertWhitelist(DslParser.SOURCE_REF_KEYS, SourceRef.Spec.class, Set.of());
+        assertWhitelist(DslParser.NEST_STATE_KEYS, NestStateStorage.class, Set.of());
     }
 
     private static Set<String> union(Set<String> a, Set<String> b) {
@@ -183,6 +185,7 @@ class StructuralKeyDerivationTest {
         assertRequired(DslParser.REQUIRED_HOT_KEYS, Storage.Hot.class);
         assertRequired(DslParser.REQUIRED_WARM_KEYS, Storage.Warm.class);
         assertRequired(DslParser.REQUIRED_NEST_ROOT_KEYS, NestRoot.class);
+        assertRequired(DslParser.REQUIRED_NEST_STATE_KEYS, NestStateStorage.class);
         assertRequired(DslParser.REQUIRED_EMBED_KEYS, Embed.class);
         // The three definition bodies each require an id and nothing else of their own, so one set
         // serves all three; TransformResource's other required component is its flattened body.
@@ -207,7 +210,7 @@ class StructuralKeyDerivationTest {
     private static final Set<Class<?>> DEMANDED_OF_THE_DOCUMENT = Set.of(
             SourceResource.class, PipelineResource.class, TableRef.Spec.class, SyncElement.class,
             PushElement.class, QueryElement.class, Storage.Hot.class, Storage.Warm.class,
-            NestRoot.class, Embed.class, ViewResource.class, ServeResource.class,
+            NestRoot.class, NestStateStorage.class, Embed.class, ViewResource.class, ServeResource.class,
             ViewBlock.Inline.class,
             TransformResource.class, TransformBody.Js.class, TransformBody.MapProjection.class,
             TransformBody.Filter.class, TransformBody.Unwind.class, TransformBody.Nest.class,
@@ -243,7 +246,8 @@ class StructuralKeyDerivationTest {
             ServeResource.class, Metadata.class, Srs.class, Settings.class, Storage.Hot.class,
             Storage.Warm.class, Storage.Cold.class, RenameSpec.class,
             TableRef.Literal.class, TableRef.Regex.class, TableRef.Spec.class, SyncElement.class,
-            PushElement.class, QueryElement.class, NestRoot.class, Embed.class, Step.Inline.class,
+            PushElement.class, QueryElement.class, NestRoot.class, NestStateStorage.class,
+            Embed.class, Step.Inline.class,
             Step.Use.class, ViewBlock.Inline.class, ViewBlock.Use.class, ServeBlock.Inline.class,
             ServeBlock.Use.class, TransformBody.Js.class, TransformBody.MapProjection.class,
             TransformBody.Filter.class, TransformBody.Unwind.class, TransformBody.Union.class,
@@ -287,7 +291,7 @@ class StructuralKeyDerivationTest {
     private static final Set<String> DERIVED = Set.of(
             "SOURCE_KEYS", "PIPELINE_KEYS", "TRANSFORM_DEF_KEYS", "METADATA_KEYS", "SRS_KEYS",
             "TABLE_SPEC_KEYS", "SYNC_KEYS", "PUSH_KEYS", "STEP_BASE_KEYS", "STEP_USE_KEYS",
-            "SOURCE_REF_KEYS");
+            "SOURCE_REF_KEYS", "NEST_STATE_KEYS");
 
     /** The required-key sets, re-derived above from their record's {@code @Doc(required = true)}. */
     private static final Set<String> REQUIRED_DERIVED = Set.of(
@@ -295,7 +299,7 @@ class StructuralKeyDerivationTest {
             "REQUIRED_TABLE_SPEC_KEYS", "REQUIRED_SYNC_KEYS", "REQUIRED_PUSH_KEYS",
             "REQUIRED_QUERY_KEYS", "REQUIRED_HOT_KEYS", "REQUIRED_WARM_KEYS",
             "REQUIRED_VIEW_DEF_KEYS", "REQUIRED_VIEW_INLINE_KEYS",
-            "REQUIRED_NEST_ROOT_KEYS", "REQUIRED_EMBED_KEYS");
+            "REQUIRED_NEST_ROOT_KEYS", "REQUIRED_NEST_STATE_KEYS", "REQUIRED_EMBED_KEYS");
 
     @Test
     @DisplayName("every key set in the parser is either derived here or named as not record-backed")

@@ -132,13 +132,13 @@ enum ActuationError implements TapstateErrorCode {
     VIEW_STORE_UNREACHABLE("actuation.view-store-unreachable", Set.of("store", "reason")),
 
     /**
-     * A view's declared key is not the identity of what feeds it; {@code view} is its id, {@code key}
-     * the view's key, {@code identity} the feed's - a nest's root key, or a table's discovered key.
+     * A view's declared key is not a unique identity of what feeds it; {@code view} is its id,
+     * {@code key} the view's key, and {@code identity} an identity the feed does declare.
      * The sink upserts on the view's key and indexes it uniquely, so records that differ only on the
      * columns the view's key leaves out would silently replace each other. Refused where the pipeline
      * is built, because at write time the loss is invisible: right collection, right count on any
-     * single snapshot. A feed with no identity on record - an undiscovered table - is not held to
-     * this; there the view's key is the only identity there is.
+     * single snapshot. A discovered primary key is only a default and does not override a different
+     * explicitly selected identity when discovery records that identity as unique too.
      */
     VIEW_KEY_NOT_FEED_IDENTITY("actuation.view-key-not-feed-identity", Set.of("view", "key", "identity")),
 

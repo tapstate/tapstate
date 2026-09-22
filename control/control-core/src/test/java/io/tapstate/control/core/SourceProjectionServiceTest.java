@@ -333,7 +333,8 @@ class SourceProjectionServiceTest {
         @Override public void advanceConsumerReadSeq(
                 String miningChainId, String pipelineId, String table, long lastReadSeq) { }
         @Override public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) { }
-        @Override public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) { }
+        @Override public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) { }
         @Override public long openEpoch(String miningChainId) { return 0; }
         @Override public void appendSchemaVersion(String miningChainId, SchemaVersion version) { }
         @Override public void markSnapshotComplete(String miningChainId, String pipelineId, String table) { }

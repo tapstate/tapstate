@@ -16,6 +16,7 @@ import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
@@ -28,6 +29,7 @@ import io.tapstate.runtime.engine.FrontierBinding;
 import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.engine.PipelineDagBuilder;
 import io.tapstate.runtime.engine.SinkAckFactory;
+import io.tapstate.runtime.engine.ViewSinkWriters;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinBinding;
 import io.tapstate.runtime.engine.join.JoinStoresBinding;
@@ -61,6 +63,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Pattern;
@@ -88,6 +91,7 @@ import java.util.regex.PatternSyntaxException;
 final class StoreBackedDagSource implements DagSource {
 
     private final StorePort storePort;
+    private final ArtifactStore artifactStore;
     private final SinkWriterBinder sinkWriterBinder;
     private final TargetModelResolver targetModelResolver;
     private final NestSettings nestSettings;
@@ -134,18 +138,44 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     @Override
+    public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
+        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
+        StoreBackedDagSource captured = new StoreBackedDagSource(
+                storePort, sinkWriterBinder, nestSettings, storeReachability, snapshot);
+        captured.validateStart(pipelineId);
+        NestCapacity capacity = captured.capacityOf(pipelineId);
+        Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
+        return new StartPreparation(
+                capacity, locations, Optional.of(snapshot),
+                fence -> captured.dagFor(pipelineId, fence));
+    }
+
+    @Override
     public void validateStart(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        boolean writesView = pipeline.view() instanceof ViewBlock.Inline;
+        boolean writesSync = pipeline.serve() instanceof ServeBlock.Inline serve
+                && serve.sync() != null && !serve.sync().isEmpty();
+        if (!writesView && !writesSync) {
+            return;
+        }
+        Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> stepIds = stepIds(pipeline);
+        Set<String> sourceIds = new LinkedHashSet<>();
         if (pipeline.serve() instanceof ServeBlock.Inline serve
                 && serve.sync() != null && !serve.sync().isEmpty()) {
-            Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
-            Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
-            Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
-            targetModelResolver.requireAllDiscovered(sourceIdsReaching(
-                    pipeline, serve.from(), sourceKeyByTable, sourceKeysById, sourceVertices,
-                    stepIds(pipeline)));
+            sourceIds.addAll(sourceIdsReaching(
+                    pipeline, serve.from(), sourceKeyByTable, sourceKeysById, sourceVertices, stepIds));
         }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            sourceIds.addAll(sourceIdsReaching(
+                    pipeline, FromClause.list(view.from()), sourceKeyByTable, sourceKeysById,
+                    sourceVertices, stepIds));
+        }
+        targetModelResolver.requireAllDiscovered(sourceIds);
     }
 
     StoreBackedDagSource(StorePort storePort, SinkWriterBinder sinkWriterBinder) {
@@ -160,9 +190,17 @@ final class StoreBackedDagSource implements DagSource {
     StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability,
+                Objects.requireNonNull(storePort, "storePort").artifacts());
+    }
+
+    private StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, ArtifactStore artifactStore) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
+        this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
-        this.targetModelResolver = new TargetModelResolver(this.storePort);
+        this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore);
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
         this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
@@ -231,6 +269,7 @@ final class StoreBackedDagSource implements DagSource {
                 assembledTargets(pipeline, bySourceTable, sourceVertices, compiledJoins);
         Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
         targets.putAll(assembled);
+        Map<String, TargetTable> viewTargets = new LinkedHashMap<>(targets);
         Set<String> serveStreams = pipeline.serve() instanceof ServeBlock.Inline serve
                 && serve.sync() != null && !serve.sync().isEmpty()
                 ? streamsReaching(pipeline, serve.from(), sourceKeyByTable, sourceKeysById,
@@ -241,18 +280,24 @@ final class StoreBackedDagSource implements DagSource {
                         sourceVertices, stepIds)
                 : Set.of();
         // Each stream a sink receives, narrowed to what the pipeline actually publishes on it rather
-        // than to what its source table holds. Only the serve terminal is narrowed here: a view
-        // composes its own descriptor around the key it names, and a stream reaching both terminals
-        // would otherwise be answered twice with nothing saying which answer the map holds.
+        // than to what its source table holds. The two terminals keep independent maps because the
+        // same stream can reach them through different transform paths.
         if (pipeline.serve() instanceof ServeBlock.Inline serving && !serveStreams.isEmpty()) {
             targets.putAll(publishedTargets(pipelineId, pipeline, serving.from(), serveStreams,
+                    bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
+        }
+        // A view validates and binds against the rows at its own input, not against the source model
+        // those rows started from.
+        if (pipeline.view() instanceof ViewBlock.Inline viewing && !viewStreams.isEmpty()) {
+            viewTargets.putAll(publishedTargets(pipelineId, pipeline,
+                    FromClause.list(viewing.from()), viewStreams,
                     bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
         }
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
         FrontierBinding frontier = frontierBinding(sourceVertices);
         return PipelineDagBuilder.build(
                 pipeline,
-                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets,
+                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
                 FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId), fence), frontier);
     }
@@ -285,8 +330,54 @@ final class StoreBackedDagSource implements DagSource {
         if (!operatorNamespaces.isEmpty()) {
             holdings.add(PipelineStateInventory.OPERATOR_STATE.in(operatorNamespaces));
         }
-        holdings.add(PipelineStateInventory.CONNECTOR_STATE.in(connectorStateNamespaces(pipeline)));
+        Set<String> driveNamespaces = new LinkedHashSet<>(connectorStateNamespaces(pipeline));
+        if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
+            // This is capture-side state kept for the next drive, just as a connector's own notes are.
+            // Clearing that state clears the generation too; keeping it lets a reread outrank operator
+            // state the prior drive left behind without adding a new user-facing kind of state.
+            driveNamespaces.add(SnapshotRunOrder.namespaceOf(pipelineId));
+        }
+        holdings.add(PipelineStateInventory.CONNECTOR_STATE.in(driveNamespaces));
         return List.copyOf(holdings);
+    }
+
+    @Override
+    public Set<OperatorStateLocation> stateLocations(String pipelineId, String defaultDatabase) {
+        Objects.requireNonNull(defaultDatabase, "defaultDatabase");
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        var stores = storePort.operatorStateStores();
+        Set<OperatorStateLocation> locations = new LinkedHashSet<>();
+
+        Set<String> routedNestNamespaces = new LinkedHashSet<>();
+        if (PipelineDagBuilder.hasNest(pipeline)) {
+            Map<String, NestTable> byAlias = nestTablesByAlias(
+                    pipeline, sourceIdByTable(sourceVertices(pipeline)));
+            Map<String, String> mapDatabases = PipelineDagBuilder.nestStateDatabases(
+                    pipeline, byAlias::get, defaultDatabase);
+            mapDatabases.forEach((namespace, database) -> {
+                stores.inDatabase(database);
+                routedNestNamespaces.add(namespace);
+                locations.add(new OperatorStateLocation(database, namespace));
+            });
+            PipelineDagBuilder.nestStateDatabasesByStep(pipeline, defaultDatabase).values().stream()
+                    .distinct()
+                    .forEach(database -> {
+                        stores.inDatabase(database);
+                        locations.add(new OperatorStateLocation(
+                                database, StoreBackedNestStateLedger.namespaceOf(pipelineId)));
+                    });
+        }
+
+        for (PipelineStateHolding holding : stateHeldBy(pipelineId)) {
+            for (String namespace : holding.namespaces()) {
+                if (!routedNestNamespaces.contains(namespace)
+                        && !namespace.equals(StoreBackedNestStateLedger.namespaceOf(pipelineId))) {
+                    locations.add(new OperatorStateLocation(defaultDatabase, namespace));
+                }
+            }
+        }
+        return Set.copyOf(locations);
     }
 
     /**
@@ -1125,6 +1216,12 @@ final class StoreBackedDagSource implements DagSource {
      * coordinates ship.
      */
     private SinkAckFactory sinkAckFactory(PipelineResource pipeline, String pipelineId) {
+        // A snapshot-only read deliberately has no durable change-chain position. Its order exists for
+        // stateful processing, not as a position a later tail can resume from, so settling it must not
+        // manufacture a chain acknowledgement or ask for a cdc seam that cannot exist.
+        if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
+            return SinkAckFactory.NONE;
+        }
         return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId);
     }
 
@@ -1157,6 +1254,7 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, String> sourceKeyByTable,
             Map<String, List<String>> sourceKeysById,
             Map<String, TargetTable> targets,
+            Map<String, TargetTable> viewTargets,
             Set<String> serveStreams,
             Set<String> viewStreams,
             Set<String> stepIds,
@@ -1164,17 +1262,21 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, CompiledJoin> compiledJoins,
             ExecutionFence fence) {
         ChainAxes axes = frontier.axes();
+        boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
+        long snapshotEpoch = snapshotOnly
+                ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id())
+                : 0L;
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         return new DagBindings(
-                key -> sourceVertex(sourceVertices.get(key), axes),
+                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
                         sinkWriter(pipeline, element, targets, serveStreams), fence),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
-                        viewSink(pipeline, view, targets, viewStreams, sourceKeysById), fence),
+                        viewSink(pipeline, view, viewTargets, viewStreams, sourceKeysById), fence),
                 nestBinding(pipeline, sourceIdByTable(sourceVertices)),
                 joinBinding(compiledJoins));
     }
@@ -1401,7 +1503,8 @@ final class StoreBackedDagSource implements DagSource {
         // key has nothing for the identity gate to compare. Review found the reverse order turning the
         // coded missing-key refusal into a bare NullPointerException inside the gate.
         ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(inline);
-        requireKeyIsTheFeedIdentity(pipeline, inline, targets, tablesBySourceId);
+        boolean alternateKey = requireKeyIsTheFeedIdentity(
+                pipeline, inline, targets, tablesBySourceId);
         // Coded rather than bare, unlike a source the author named: this store is the deployment's, so
         // its absence is a condition an operator acts on rather than a defect on this side.
         SourceResource store = artifacts().get(target.sourceId())
@@ -1432,13 +1535,22 @@ final class StoreBackedDagSource implements DagSource {
             bySourceTable.put(sourceTable,
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
-        return sinkWriterBinder.bind(
+        SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bind(
                 store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable,
                 new PipelineNode(pipeline.id(), inline.id()));
+        String viewId = inline.id();
+        String viewKey = inline.primaryKey();
+        // A unique current value says nothing about what the capture stream puts in an earlier image.
+        // Guard only an accepted alternate identity: the discovered primary identity is the capture
+        // contract already used throughout the pipeline, while an alternate has no such guarantee.
+        return alternateKey
+                ? () -> ViewSinkWriters.requireAlternateKeyInBeforeImage(
+                        writer.get(), viewId, viewKey)
+                : writer;
     }
 
     /**
-     * Refuses a view whose single key is not the identity of what feeds it, before anything binds.
+     * Refuses a view whose single key cannot safely identify what feeds it, before anything binds.
      *
      * <p>The view sink upserts every stream on the view's declared key and indexes it uniquely, so the
      * key has to be what the feed converges on. Two shapes break that and neither says anything at
@@ -1448,10 +1560,20 @@ final class StoreBackedDagSource implements DagSource {
      * any single snapshot, which is why they are refused here by name instead.
      *
      * <p>What feeds the view is resolved by walking its from-reference down to leaves: a nest step is
-     * one assembled stream carrying its root's key, a source id is each of its tables, anything else
-     * is one table. A regex names many upstreams by construction and is refused as such.
+     * one assembled stream carrying its explicitly declared root key, a source id is each of its
+     * tables, anything else is one table. A regex names many upstreams by construction and is refused
+     * as such.
+     *
+     * <p>A discovered primary key is only a default, and an explicitly selected view key takes
+     * precedence over it - but precedence is not a waiver of proof that the chosen key can do the job.
+     * So an alternate is accepted only from an index discovery established constrains every row. A
+     * bare unique bit is not that: stores report it for indexes that skip the rows they do not qualify
+     * and for columns whose nulls they never compare, and most discovery carries the bit with nothing
+     * beside it to tell those apart. Where nothing proved the alternate, the primary key is what the
+     * view has to key on. The return value says the accepted identity is such an alternate, so its
+     * writer can require the key in update and delete before images before applying either change.
      */
-    private static void requireKeyIsTheFeedIdentity(PipelineResource pipeline, ViewBlock.Inline view,
+    private static boolean requireKeyIsTheFeedIdentity(PipelineResource pipeline, ViewBlock.Inline view,
             Map<String, TargetTable> targets, Map<String, List<String>> tablesBySourceId) {
         List<String> streams = new ArrayList<>();
         List<TransformBody.Nest> assemblies = new ArrayList<>();
@@ -1462,31 +1584,54 @@ final class StoreBackedDagSource implements DagSource {
         }
         if (assemblies.size() == 1) {
             requireKeyIs(view, assemblies.getFirst().root().key());
-            return;
+            return false;
         }
-        // A single table: its identity is whatever discovery recorded. An undiscovered table has no
-        // identity on record, and the view's own key is then the only identity there is - which is the
-        // path that lets materialization run before any discovery has.
+        // An undiscovered table has no identity claim to compare, so the view remains usable before
+        // discovery. Once discovery has supplied a model, the selected key is either the identity that
+        // model records for every row, or an index discovery proved constrains every one of them.
         if (streams.size() == 1 && targets != null) {
             TargetTable model = targets.get(streams.getFirst());
             if (model != null) {
-                List<String> identity = model.fields().stream()
+                List<String> selected = List.of(view.primaryKey());
+                List<String> discoveredKey = model.fields().stream()
                         .filter(TargetField::primaryKey).map(TargetField::name).toList();
-                if (!identity.isEmpty()) {
-                    requireKeyIs(view, identity);
+                if (selected.equals(discoveredKey)) {
+                    return false;
                 }
+                if (model.indexes().stream().filter(TargetIndex::constrainsEveryRow)
+                        .anyMatch(index -> index.fields().equals(selected))) {
+                    return true;
+                }
+                refuseKey(view, discoveredKey.isEmpty() ? claimedIdentity(model) : discoveredKey);
             }
         }
+        return false;
+    }
+
+    /**
+     * What a refusal names where discovery recorded no primary key: the first uniqueness the source
+     * claimed, which is the nearest thing to an identity there is to point an author at, or nothing
+     * where it claimed none. Naming it is not accepting it - the gate above has already refused it for
+     * want of proof, and an author reading that refusal still has to be told what discovery did record.
+     */
+    private static List<String> claimedIdentity(TargetTable model) {
+        return model.indexes().stream().filter(TargetIndex::unique)
+                .map(TargetIndex::fields).findFirst().orElse(List.of());
     }
 
     /** One refusal for every feed shape: the view's single key must be exactly this identity. */
     private static void requireKeyIs(ViewBlock.Inline view, List<String> identity) {
         if (identity == null || !identity.equals(List.of(view.primaryKey()))) {
-            throw new TapstateException(ActuationError.VIEW_KEY_NOT_FEED_IDENTITY,
-                    Map.of("view", view.id(), "key", String.valueOf(view.primaryKey()),
-                            "identity", identity == null ? "(none)" : String.join(", ", identity)),
-                    null);
+            refuseKey(view, identity);
         }
+    }
+
+    /** The refusal itself, naming the identity the view should have keyed on. */
+    private static void refuseKey(ViewBlock.Inline view, List<String> identity) {
+        throw new TapstateException(ActuationError.VIEW_KEY_NOT_FEED_IDENTITY,
+                Map.of("view", view.id(), "key", String.valueOf(view.primaryKey()),
+                        "identity", identity == null ? "(none)" : String.join(", ", identity)),
+                null);
     }
 
     /** Resolves one from-reference to the leaf streams it names; see the gate above for the reading. */
@@ -1755,7 +1900,12 @@ final class StoreBackedDagSource implements DagSource {
             return NestCapacity.none();
         }
         Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
-        return new NestCapacity(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get),
+        var stores = storePort.operatorStateStores();
+        String defaultDatabase = stores.defaultDatabase();
+        Map<String, String> databases = PipelineDagBuilder.nestStateDatabases(
+                pipeline, byAlias::get, defaultDatabase);
+        databases.values().stream().distinct().forEach(stores::inDatabase);
+        return new NestCapacity(databases,
                 PipelineDagBuilder.nestSettings(pipeline, byAlias::get, nestSettings));
     }
 
@@ -1932,10 +2082,13 @@ final class StoreBackedDagSource implements DagSource {
 
     private NestBinding nestBinding(PipelineResource pipeline, Map<String, String> sourceIdByTable) {
         Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable);
+        var operatorStateStores = storePort.operatorStateStores();
         return new NestBinding(byAlias::get, NestBinding.onMap(),
                 new LoggingNestDeadLetter(new DurableNestDeadLetter()),
                 new StoreBackedReplayFloorFactory(chainIdByTable(pipeline), pipeline.id()),
-                new StoreBackedNestStateLedger(storePort.keyedState()),
+                new StoreBackedNestStateLedger(operatorStateStores,
+                        PipelineDagBuilder.nestStateDatabasesByStep(
+                                pipeline, operatorStateStores.defaultDatabase())),
                 // What the deployment was started with, with what this pipeline's author wrote over it.
                 // Laid on here rather than held as one value for the process because the shape each
                 // number bounds is the pipeline's, not the process's: one tree is deep and narrow and
@@ -2023,7 +2176,8 @@ final class StoreBackedDagSource implements DagSource {
      * Resolving the same ring identity the capture side resolves is what points the reader at the ring the
      * writer fills.
      */
-    private ProcessorMetaSupplier sourceVertex(SourceVertex vertex, ChainAxes axes) {
+    private ProcessorMetaSupplier sourceVertex(
+            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -2032,6 +2186,11 @@ final class StoreBackedDagSource implements DagSource {
         // here rather than reached for from the source.
         String chain = vertex.table();
         byte axis = axes.axisOf(chain);
+        if (snapshotOnly) {
+            return SrsSourceProcessor.snapshotOnlyMetaSupplier(
+                    vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), snapshotEpoch,
+                    order -> new Watermark(FrontierOrders.pack(chain, order), axis));
+        }
         return SrsSourceProcessor.metaSupplier(
                 vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
                 ringGeneration(vertex.resolution()),
@@ -2041,17 +2200,20 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * The generation the source's ring is open under, read once while the job is assembled, and zero for a
-     * source that reads no chain of its own.
+     * The generation the source's ring is open under, read once while the job is assembled, and zero where
+     * no ring-backed tail was opened.
      *
-     * <p>Only a read with an incremental tail through the shared ring opens a chain, so a snapshot-only or
-     * srs-disabled read has no record here and no ring anyone fills — its rows reach the sink from the
-     * snapshot buffer rather than the ring, and there is no stream of changes for them to be ordered
-     * against. Reading the record rather than re-deriving the plan keeps one answer to that question: the
-     * capture run writes the record, so its presence is what "this source reads a shared ring" means.
+     * <p>A snapshot-only read does not use this value: its durable per-run generation is selected before
+     * this method is reached. Reading the record for every other mode rather than re-deriving the plan keeps
+     * one answer to which ring generation is running: the capture opens it before this job is assembled.
      */
     private long ringGeneration(SourceCaptureResolution resolution) {
         return storePort.meta().read(resolution.chainId().value()).map(SrsMeta::epoch).orElse(0L);
+    }
+
+    private static ReadMode readModeOf(PipelineResource pipeline) {
+        return pipeline.settings() != null && pipeline.settings().readMode() != null
+                ? pipeline.settings().readMode() : ReadMode.SNAPSHOT_AND_CDC;
     }
 
     /**
@@ -2253,7 +2415,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private ArtifactStore artifacts() {
-        return storePort.artifacts();
+        return artifactStore;
     }
 
     /**
