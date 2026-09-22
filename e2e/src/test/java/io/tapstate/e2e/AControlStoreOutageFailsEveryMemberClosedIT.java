@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -169,12 +170,14 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
                                 .describedAs("nothing between the members was ever cut in front of %s, so "
                                         + "this is a store outage and not a partition", nodeId)
                                 .isZero();
-                        assertThat(clusterFaceRefuses(cluster, nodeId))
+                        assertThat(clusterFaceRefusalOn(cluster, nodeId))
                                 .describedAs("%s stops answering for the cluster rather than answering "
                                         + "from what it last remembers -- which is the read face's half "
-                                        + "of the same rule, and is not evidence about why it stopped",
+                                        + "of the same rule, and is not evidence about why it stopped. "
+                                        + "It says so in a code: measured here as io.store-unavailable, "
+                                        + "the durable half of the answer being what it cannot reach",
                                         nodeId)
-                                .isTrue();
+                                .isPresent();
                     }
                     assertThat(cluster.unattributedConnections())
                             .describedAs("and no member connection arrived from a port nobody claims")
@@ -227,14 +230,18 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
         }
     }
 
-    /** Whether one member has stopped answering for the cluster, which is how it leaves one. */
-    private static boolean clusterFaceRefuses(PartitionableCluster cluster, String nodeId) {
-        try {
-            cluster.membership(nodeId);
-            return false;
-        } catch (RuntimeException | AssertionError refused) {
-            return true;
-        }
+    /**
+     * The code one member refuses the cluster read with, or nothing when it answered after all.
+     *
+     * <p>Two different paths refuse on this face and the code is what tells them apart: while the
+     * store is away the durable half of the answer cannot be read, and once it is back the member
+     * that shut its own engine down cannot supply the live half. Asserting that something was thrown
+     * would be satisfied by either, and by an uncoded page as well -- and an uncoded page is the one
+     * answer a caller cannot tell from this member having fallen over. So the reading is the code,
+     * and a refusal carrying none fails inside this rather than being counted as one.
+     */
+    private static Optional<String> clusterFaceRefusalOn(PartitionableCluster cluster, String nodeId) {
+        return cluster.member(nodeId).clusterReadRefusal();
     }
 
     /** {@code count} further generated rows, continuing after the {@code alreadyThere} already written. */
