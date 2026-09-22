@@ -74,8 +74,53 @@ public final class PipelineDraftCompiler {
             steps.add(step);
             previous = step.id();
         }
+        ServeBlock serve = compileWizardOutput(wizard.output(), previous, sourceIds);
         return new PipelineResource(draft.pipelineId(), metadata(draft),
-                sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(), steps, null, null, null, Map.of());
+                sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(), steps, null, serve, null, Map.of());
+    }
+
+    private static ServeBlock compileWizardOutput(PipelineDraft.Output output, String from,
+            Set<String> sourceIds) {
+        if (output == null) {
+            throw new IllegalArgumentException("wizard output is required for publication");
+        }
+        if (!"atlas".equals(output.kind())) {
+            throw new IllegalArgumentException("unsupported wizard output: " + output.kind());
+        }
+        String destinationId = firstText(output.config(), "sourceId", "destinationId", "source");
+        String destinationTable = firstText(output.config(), "table", "destinationTable");
+        if (destinationId == null || destinationTable == null) {
+            throw new IllegalArgumentException("wizard atlas output requires sourceId and table");
+        }
+        sourceIds.add(destinationId);
+        String syncId = firstText(output.config(), "syncId");
+        if (syncId == null) {
+            syncId = destinationId + "_" + destinationTable;
+        }
+        return new ServeBlock.Inline("atlas", FromClause.list(FromRef.literal(from)),
+                List.of(new SyncElement(syncId, destinationId,
+                        outputWriteMode(output.config()), null, null, null)), null, null);
+    }
+
+    private static String firstText(Map<String, Object> values, String... names) {
+        for (String name : names) {
+            Object value = values.get(name);
+            if (value instanceof String text && !text.isBlank()) {
+                return text;
+            }
+        }
+        return null;
+    }
+
+    private static WriteMode outputWriteMode(Map<String, Object> config) {
+        String value = firstText(config, "writeMode", "write_mode");
+        if (value == null || "upsert".equals(value)) {
+            return WriteMode.UPSERT;
+        }
+        if ("append".equals(value)) {
+            return WriteMode.APPEND;
+        }
+        throw new IllegalArgumentException("unsupported wizard output write mode: " + value);
     }
 
     private static boolean containsRelated(List<PipelineDraft.Related> related, String id) {

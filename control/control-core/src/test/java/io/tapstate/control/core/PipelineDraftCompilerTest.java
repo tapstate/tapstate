@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PipelineDraftCompilerTest {
 
@@ -43,6 +44,11 @@ class PipelineDraftCompilerTest {
         assertThat(policy.embed()).extracting(Embed::from).containsExactly("claim");
         assertThat(policy.embed().getFirst().as()).isEqualTo(EmbedAs.ARRAY);
         assertThat(policy.embed().getFirst().path()).isEqualTo("claims");
+        assertThat(compiled.serve()).isEqualTo(new ServeBlock.Inline(
+                "atlas", io.tapstate.core.model.FromRef.literal("only-active"),
+                List.of(new io.tapstate.core.model.SyncElement(
+                        "atlas_customer_orders", "atlas", io.tapstate.core.model.WriteMode.UPSERT,
+                        null, null)), null, null));
     }
 
     @Test
@@ -55,6 +61,39 @@ class PipelineDraftCompilerTest {
 
         assertThat(first).isEqualTo(second);
         assertThat(CanonicalHash.ofText(first)).hasSize(64).isEqualTo(CanonicalHash.ofText(second));
+    }
+
+    @Test
+    void refusesWizardCompilationWithoutAnOutput() {
+        PipelineDraft complete = wizardDraft();
+        PipelineDraft.Wizard wizard = complete.wizard();
+        PipelineDraft incomplete = new PipelineDraft(
+                complete.pipelineId(), complete.schemaVersion(), complete.revision(), complete.mode(),
+                complete.name(), complete.description(), complete.graph(),
+                new PipelineDraft.Wizard(wizard.root(), wizard.related(), wizard.transforms(), null),
+                complete.baseArtifactHash(), complete.publishedDraftRevision(), complete.publishedArtifactHash(),
+                complete.createdAt(), complete.updatedAt(), complete.updatedBy());
+
+        assertThatThrownBy(() -> compiler.compile(incomplete))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("wizard output is required for publication");
+    }
+
+    @Test
+    void refusesUnsupportedWizardOutputKinds() {
+        PipelineDraft complete = wizardDraft();
+        PipelineDraft.Wizard wizard = complete.wizard();
+        PipelineDraft incomplete = new PipelineDraft(
+                complete.pipelineId(), complete.schemaVersion(), complete.revision(), complete.mode(),
+                complete.name(), complete.description(), complete.graph(),
+                new PipelineDraft.Wizard(wizard.root(), wizard.related(), wizard.transforms(),
+                        new PipelineDraft.Output("kafka", Map.of("sourceId", "kafka", "table", "orders"))),
+                complete.baseArtifactHash(), complete.publishedDraftRevision(), complete.publishedArtifactHash(),
+                complete.createdAt(), complete.updatedAt(), complete.updatedBy());
+
+        assertThatThrownBy(() -> compiler.compile(incomplete))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("unsupported wizard output: kafka");
     }
 
     @Test
@@ -104,7 +143,7 @@ class PipelineDraftCompilerTest {
         PipelineDraft.Wizard wizard = new PipelineDraft.Wizard(
                 new PipelineDraft.Root("orders", "crm", "orders", List.of("id"), List.of()),
                 List.of(policy, claim), List.of(postFilter),
-                new PipelineDraft.Output("atlas", Map.of()));
+                new PipelineDraft.Output("atlas", Map.of("sourceId", "atlas", "table", "customer_orders")));
         return new PipelineDraft("customer-orders", 1, 1, PipelineDraft.Mode.WIZARD,
                 "Customer orders", "", null, wizard, null, null, null,
                 java.time.Instant.parse("2026-09-21T00:00:00Z"),
