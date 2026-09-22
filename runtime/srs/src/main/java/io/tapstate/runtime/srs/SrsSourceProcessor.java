@@ -13,8 +13,11 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.core.common.TapstateException;
 import java.util.ArrayDeque;
+import java.util.Map;
 import java.util.Objects;
+import java.util.function.LongConsumer;
 
 /**
  * The core-API self-built source for one table: a Jet processor with no inbound edge that drains this
@@ -58,7 +61,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final RingTail ringTail;
     private final ArrayDeque<Envelope> pending = new ArrayDeque<>();
     private SnapshotBuffer buffered;
+    private SrsRingbuffer ring;
+    private LongConsumer cursor;
     private SrsRingReader reader;
+    // When this run of refusals began, so the bound below measures the stretch the cluster has been
+    // saying no rather than one attempt. Armed on the first refusal; an answer clears it, because a
+    // later refusal is a new stretch and not a continuation of one the cluster already came back from.
+    private boolean refused;
+    private long refusedSinceNanos;
     private SourceOrder read;
     private Watermark unannounced;
     private long announced;
@@ -99,10 +109,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         buffered = bound instanceof SnapshotBuffer resolved ? resolved : null;
         drainBuffered();
         if (ringTail != null) {
+            // Both of these are local lookups. Where the reader starts is not -- it is a guarded operation on
+            // the ring -- and it is deliberately left to the first pass below. Asking for it here would put
+            // the ring's first refusable operation on the initialisation path, which has nowhere to wait: the
+            // refusal a forming cluster answers with would end the run before it had read anything, and
+            // nothing submits another.
             Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
-            SrsRingbuffer ring = new SrsRingbuffer(rb);
-            reader = SrsRingReader.from(
-                    ring, ringTail.start(), ringTail.publisherFactory().resolve(context.hazelcastInstance()));
+            ring = new SrsRingbuffer(rb);
+            cursor = ringTail.publisherFactory().resolve(context.hazelcastInstance());
         }
     }
 
@@ -141,7 +155,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // The ring's sequence pairs with the generation this reader runs under to give each change its
         // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
         // again, so a change of the new ring would otherwise read as older than one of the ring before it.
-        if (ringTail != null) {
+        if (ringTail != null && openReader()) {
             reader.fill((item, seq) -> {
                 SourceOrder order = orderOf(seq);
                 pending.add(SrsProjection.toEnvelope(item, src, order));
@@ -159,6 +173,48 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // being non-cooperative, its worker backs off before the next call rather than spinning. Keeping a
         // buffer-only source live also keeps Jet from advancing the downstream frontier past its last bound.
         return false;
+    }
+
+    /**
+     * Positions the ring reader, on the first pass the cluster lets it, and answers whether it is open.
+     *
+     * <p>Where a fresh reader starts is a guarded operation on the ring, so it can be refused -- and just
+     * after a cluster forms it is, for as long as the members' verdicts take to agree. Asking for it here
+     * rather than while the processor is being initialised is the whole of what makes that refusal
+     * survivable: this runs on the source's own thread, inside a loop whose job is to come back, so a
+     * refused pass reads nothing from the ring and the next pass asks again. It is the same answer the
+     * write side gives the same refusal, in the place that path already waits.
+     *
+     * <p>A refused pass is not an idle one: the member-local buffer is still drained around it, because a
+     * tail running with the shared ring switched off reaches the sink through that buffer alone and has no
+     * reason to be held up by a ring it never reads.
+     *
+     * <p>Bounded, and by the stretch the write side waits rather than one of its own. A source that waited
+     * forever would leave the run healthy, quiet and delivering nothing -- which reads exactly like a
+     * source with nothing to read, and is the state this whole path exists to stop being silent.
+     */
+    private boolean openReader() {
+        if (reader != null) {
+            return true;
+        }
+        try {
+            reader = SrsRingReader.from(ring, ringTail.start(), cursor);
+            refused = false;
+            return true;
+        } catch (RingWriteRefusedException refusal) {
+            long now = System.nanoTime();
+            if (!refused) {
+                refused = true;
+                refusedSinceNanos = now;
+            }
+            if (now - (refusedSinceNanos + CdcPhase.REFUSAL_BOUND_NANOS) >= 0) {
+                throw new TapstateException(
+                        CaptureError.CLUSTER_REFUSED_THE_READ,
+                        Map.of("ring", ringName, "seconds", CdcPhase.REFUSAL_BOUND_NANOS / 1_000_000_000L),
+                        refusal);
+            }
+            return false;
+        }
     }
 
     /**

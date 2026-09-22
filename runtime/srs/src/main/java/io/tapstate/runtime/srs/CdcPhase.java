@@ -75,7 +75,7 @@ public final class CdcPhase {
      * capture that has genuinely lost its claim is stopped by the lease itself, on its own thread, and
      * this bound governs the other case: the claim still held, and the cluster still saying no.
      */
-    private static final long REFUSAL_BOUND_NANOS = Duration.ofSeconds(30).toNanos();
+    static final long REFUSAL_BOUND_NANOS = Duration.ofSeconds(30).toNanos();
 
     private CdcPhase() {
     }

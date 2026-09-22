@@ -31,6 +31,15 @@ public enum CaptureError implements TapstateErrorCode {
      */
     CLUSTER_REFUSED_WRITES("capture.cluster-refused-writes", Set.of("table", "seconds")),
 
+    /**
+     * The cluster refused this member's reads of a change ring for the whole stretch a source waits such a
+     * refusal out. The mirror of the one above, on the path a source takes to work out where it starts:
+     * that reading is guarded like every other ring operation, and a forming cluster refuses it. Waiting is
+     * the answer while the verdicts converge; this is the one that never cleared. {@code ring} names the
+     * ring, {@code seconds} how long it waited.
+     */
+    CLUSTER_REFUSED_THE_READ("capture.cluster-refused-the-read", Set.of("ring", "seconds")),
+
     /** A {@code start_from} value that is neither the {@code earliest} / {@code latest} keyword nor a
      *  parseable ISO-8601 instant; {@code value} carries the offending token. */
     START_FROM_UNPARSABLE("capture.start-from-unparsable", Set.of("value")),

@@ -104,12 +104,18 @@ public final class SrsRingbuffer {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("interrupted reading srs ring at seq " + seq, e);
+        } catch (RuntimeException raised) {
+            throw translate(raised);
         }
     }
 
     /** The sequence of the oldest change still in the ring — where a fresh reader starts its replay. */
     public long headSequence() {
-        return ringbuffer.headSequence();
+        try {
+            return ringbuffer.headSequence();
+        } catch (RuntimeException raised) {
+            throw translate(raised);
+        }
     }
 
     /** The sequence of the most recent item, or {@code -1} when the ring is empty. */
@@ -133,10 +139,15 @@ public final class SrsRingbuffer {
     /**
      * The cluster's refusal restated in this module's terms, or the original failure when it is not one.
      *
-     * <p>Every reading the write path takes is a guarded operation, not just the append: the tail the
-     * headroom precheck compares against is a partition operation, and the capacity read is checked
-     * locally against the same protection. A refusal of any of them means the write did not happen, which
-     * is the one thing a caller needs in order to wait and try again.
+     * <p>Every reading either path takes is a guarded operation, not just the append: the tail the headroom
+     * precheck compares against is a partition operation, the capacity read is checked locally against the
+     * same protection, and so are the head and the item read a fresh reader is positioned by. A refusal of
+     * any of them means the operation did not happen, which is the one thing a caller needs in order to
+     * wait and try again.
+     *
+     * <p>The read side is here for the same reason the write side is, and it was added later at the cost of
+     * a defect: a reader positioned during a forming cluster met the refusal as a bare library exception,
+     * which nothing on that path recognised, so the run ended instead of waiting.
      */
     private RuntimeException translate(RuntimeException raised) {
         return raised instanceof SplitBrainProtectionException refused
