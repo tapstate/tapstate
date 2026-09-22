@@ -2,9 +2,11 @@ package io.tapstate.app;
 
 import io.tapstate.runtime.engine.nest.NestStateLedger;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.OperatorStateStores;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
@@ -32,15 +34,21 @@ final class StoreBackedNestStateLedger implements NestStateLedger {
 
     private static final String SEPARATOR = "\n";
 
-    private final transient KeyedStateStore store;
+    private final transient OperatorStateStores stores;
+    private final Map<String, String> databaseByNode;
 
     StoreBackedNestStateLedger(KeyedStateStore store) {
-        this.store = Objects.requireNonNull(store, "store");
+        this(OperatorStateStores.stateOnly("default", store), Map.of());
+    }
+
+    StoreBackedNestStateLedger(OperatorStateStores stores, Map<String, String> databaseByNode) {
+        this.stores = Objects.requireNonNull(stores, "stores");
+        this.databaseByNode = Map.copyOf(Objects.requireNonNull(databaseByNode, "databaseByNode"));
     }
 
     @Override
     public Set<String> recall(String pipelineId, String nodeId) {
-        return store.load(namespaceOf(pipelineId), nodeId)
+        return store(nodeId).load(namespaceOf(pipelineId), nodeId)
                 .map(bytes -> new String(bytes, StandardCharsets.UTF_8))
                 .filter(recorded -> !recorded.isEmpty())
                 .<Set<String>>map(recorded -> new LinkedHashSet<>(List.of(recorded.split(SEPARATOR, -1))))
@@ -49,8 +57,13 @@ final class StoreBackedNestStateLedger implements NestStateLedger {
 
     @Override
     public void record(String pipelineId, String nodeId, Set<String> paths) {
-        store.save(namespaceOf(pipelineId), nodeId,
+        store(nodeId).save(namespaceOf(pipelineId), nodeId,
                 String.join(SEPARATOR, new TreeSet<>(paths)).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private KeyedStateStore store(String nodeId) {
+        String database = databaseByNode.getOrDefault(nodeId, stores.defaultDatabase());
+        return stores.inDatabase(database).state();
     }
 
     /**

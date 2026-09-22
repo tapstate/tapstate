@@ -1,4 +1,3 @@
 rule: illegal-value
-adr: "ADR-0016 §8 (X5)"
 path: serve.sync[0].ddl
 note: "'skip' is not in the ddl enum {apply, ignore, fail}"

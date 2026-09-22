@@ -43,7 +43,7 @@
     },
     {
       "name": "mqPort",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "MQ port"
       },
@@ -55,7 +55,7 @@
     },
     {
       "name": "apiPort",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "API Port"
       },

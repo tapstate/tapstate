@@ -5,6 +5,7 @@ import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.messages.MessageCatalog;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.CacheControl;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -43,7 +44,7 @@ class ApiExceptionHandler {
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
         ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
-        return ResponseEntity.status(statusFor(e.code())).body(body);
+        return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
@@ -64,7 +65,7 @@ class ApiExceptionHandler {
     ResponseEntity<ApiError> handle(BadRequestCodedException e) {
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).cacheControl(CacheControl.noStore()).body(body);
     }
 
     /**
@@ -126,6 +127,8 @@ class ApiExceptionHandler {
             // A status / metrics / snapshot read of a pipeline that has published no observation is a 404: the
             // observation resource does not exist yet, like a get of an unknown artifact.
             case "monitor.no-observation" -> HttpStatus.NOT_FOUND;
+            case "monitor.invalid-cursor", "monitor.query-budget-exceeded" -> HttpStatus.BAD_REQUEST;
+            case "monitor.cursor-expired" -> HttpStatus.GONE;
             // A browse of a collection the source's database does not hold is a 404 — the collection a caller
             // named does not exist, like a get of an unknown artifact; a size this face will not serve is
             // input it refused before reaching a connector, so it is a 400. Both are the caller's to fix, and

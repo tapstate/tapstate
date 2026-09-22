@@ -62,13 +62,14 @@ final class FailureScene {
         reading(scene, "failure code", () -> binding.failureCode(pipelineId));
         reading(scene, "error count", () -> binding.errorCount(pipelineId));
         reading(scene, "changes that could not be placed", () -> binding.deadLettered(pipelineId));
+        reading(scene, "rows a target confirmed", () -> binding.recordsOut(pipelineId));
 
         scene.append("\n## how many rows each place holds\n");
         for (TableAlias table : placesNamedBy(envelope)) {
             scene.append("  ").append(table).append(" = ");
             try {
                 scene.append(binding.count(table));
-            } catch (RuntimeException couldNotRead) {
+            } catch (RuntimeException | AssertionError couldNotRead) {
                 scene.append("unreadable (").append(couldNotRead.getClass().getSimpleName()).append(": ")
                         .append(scrubbed(couldNotRead.getMessage())).append(')');
             }
@@ -107,7 +108,7 @@ final class FailureScene {
         try {
             Optional<Map<String, Object>> found = binding.fetch(table, doc.where());
             scene.append(found.map(FailureScene::scrubbed).orElse("no document matches"));
-        } catch (RuntimeException couldNotRead) {
+        } catch (RuntimeException | AssertionError couldNotRead) {
             scene.append("unreadable (").append(scrubbed(couldNotRead.getMessage())).append(')');
         }
         scene.append('\n');
@@ -144,7 +145,7 @@ final class FailureScene {
         scene.append("  ").append(what).append(" = ");
         try {
             scene.append(reading.take().map(FailureScene::scrubbed).orElse("nothing published yet"));
-        } catch (RuntimeException couldNotRead) {
+        } catch (RuntimeException | AssertionError couldNotRead) {
             scene.append("unreadable (").append(scrubbed(couldNotRead.getMessage())).append(')');
         }
         scene.append('\n');

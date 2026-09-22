@@ -3,6 +3,7 @@ package io.tapstate.adapters.pdk;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureBatch;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
@@ -18,6 +19,8 @@ import io.tapdata.entity.event.TapBaseEvent;
 import io.tapdata.entity.event.TapEvent;
 import io.tapdata.entity.event.control.ControlEvent;
 import io.tapdata.entity.schema.TapTable;
+import io.tapdata.entity.utils.InstanceFactory;
+import io.tapdata.entity.utils.JsonParser;
 import io.tapdata.entity.utils.cache.Entry;
 import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.entity.utils.cache.KVReadOnlyMap;
@@ -28,11 +31,17 @@ import io.tapdata.pdk.apis.functions.connector.source.TimestampToStreamOffsetFun
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -56,17 +65,35 @@ public final class PdkCapturePort implements CapturePort {
     private static final int SAMPLE_SIZE = 10;
     private static final long SHUTDOWN_JOIN_MILLIS = 2000;
 
+    /** The longest an Oracle LogMiner start waits for connector initialization and schema discovery. */
+    public static final Duration DEFAULT_PREFLIGHT_TIMEOUT = Duration.ofSeconds(30);
+
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
+    private final Duration preflightTimeout;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
-        this(provisioner, null);
+        this(provisioner, null, DEFAULT_PREFLIGHT_TIMEOUT);
     }
 
     public PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore) {
+        this(provisioner, stateStore, DEFAULT_PREFLIGHT_TIMEOUT);
+    }
+
+    public PdkCapturePort(
+            ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout) {
         this.provisioner = provisioner;
         this.stateStore = stateStore;
+        this.preflightTimeout = requirePositive(preflightTimeout);
+    }
+
+    private static Duration requirePositive(Duration timeout) {
+        Objects.requireNonNull(timeout, "preflightTimeout");
+        if (timeout.isZero() || timeout.isNegative()) {
+            throw new IllegalArgumentException("preflightTimeout must be positive");
+        }
+        return timeout;
     }
 
     @Override
@@ -102,6 +129,7 @@ public final class PdkCapturePort implements CapturePort {
      */
     @Override
     public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+        OracleLogMinerIdentifiers.validateConfigured(config);
         PdkConnector connector = open(config);
         StreamReadFunction stream;
         Object resumeAt;
@@ -132,10 +160,17 @@ public final class PdkCapturePort implements CapturePort {
             throw e;
         }
         Long startAt = startAt(start);
-        Thread thread = new Thread(() -> streamLoop(connector, config, resumeAt, startAt, listener, stream),
+        // Keep connector initialization and streamRead on the same worker, while waiting for LogMiner's
+        // discovery-based preflight before returning a subscription. An unsupported table or column then
+        // refuses the start instead of letting the pipeline report RUNNING before its tail fails.
+        CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config)
+                ? new CompletableFuture<>() : null;
+        Thread thread = new Thread(
+                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
+        awaitPreflight(preflight, connector, thread);
         AtomicBoolean closed = new AtomicBoolean();
         return () -> {
             if (!closed.compareAndSet(false, true)) {
@@ -146,6 +181,46 @@ public final class PdkCapturePort implements CapturePort {
             joinQuietly(thread);
             connector.close();
         };
+    }
+
+    /** Waits until LogMiner's worker has accepted its discovered identifiers, cleaning up a refusal. */
+    private void awaitPreflight(
+            CompletableFuture<Void> preflight, PdkConnector connector, Thread thread) {
+        if (preflight == null) {
+            return;
+        }
+        try {
+            preflight.get(preflightTimeout.toNanos(), TimeUnit.NANOSECONDS);
+        } catch (TimeoutException failure) {
+            shutDown(connector, thread);
+            throw new TapstateException(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT,
+                    Map.of("connector", connector.connectorId(),
+                            "timeout", preflightTimeout.toMillis() + "ms"), failure);
+        } catch (InterruptedException failure) {
+            shutDown(connector, thread);
+            Thread.currentThread().interrupt();
+            throw new TapstateException(ConnectorError.CAPTURE_FAILED,
+                    Map.of("connector", connector.connectorId(),
+                            "detail", "change-capture preflight was interrupted"), failure);
+        } catch (ExecutionException failure) {
+            shutDown(connector, thread);
+            Throwable cause = failure.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException(cause);
+        }
+    }
+
+    /** Ends a worker whose preflight cannot be returned, then discards its connector handle. */
+    private static void shutDown(PdkConnector connector, Thread thread) {
+        thread.interrupt();
+        connector.stopQuietly();
+        joinQuietly(thread);
+        connector.close();
     }
 
     @Override
@@ -181,7 +256,7 @@ public final class PdkCapturePort implements CapturePort {
      * so the full load and the change tail of one run file under one name and read each other's.
      */
     private PdkConnector open(CaptureConfig config) {
-        return open(config, ConnectorStateNamespace.of(config.node()));
+        return open(config, config.node());
     }
 
     /**
@@ -195,14 +270,14 @@ public final class PdkCapturePort implements CapturePort {
         return open(config, null);
     }
 
-    private PdkConnector open(CaptureConfig config, String stateNamespace) {
+    private PdkConnector open(CaptureConfig config, PipelineNode node) {
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                stateNamespace, stateStore);
+                node, stateStore);
     }
 
     /**
-     * Inits the connector once, samples the seam, then batch-reads the configured streams (or every
-     * discovered stream).
+     * Inits the connector once, discovers its tables, samples the seam, then batch-reads the configured
+     * streams (or every discovered stream).
      *
      * <p>The seam is sampled <em>before</em> the first row is read, which is what makes the join to the
      * change tail gapless. A change made while the snapshot runs then falls after the seam and is
@@ -212,10 +287,14 @@ public final class PdkCapturePort implements CapturePort {
      */
     private Read batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) throws Throwable {
         connector.connector().init(connector.context());
-        Object seam = startOffset(connector, null);
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
         Map<String, TapTable> discovered = byId(discoverTables(connector, config.streams()));
+        discovered.values().forEach(connector::fillFieldTypes);
+        connector.context().setTableMap(tableMap(discovered));
+        // Position discovery may inspect the selected tables too. Populate their context first, while
+        // still sampling before any snapshot row is read so the snapshot-to-stream transition has no gap.
+        Object seam = startOffset(connector, null);
         List<String> streams = config.streams().isEmpty()
                 ? new ArrayList<>(discovered.keySet()) : config.streams();
         List<TapEvent> raw = new ArrayList<>();
@@ -225,9 +304,6 @@ public final class PdkCapturePort implements CapturePort {
                 throw new IllegalStateException(
                         "stream " + stream + " was requested but the connector did not discover it");
             }
-            // The connector reads by each field's PDK type, which discovery leaves unset; fill it from the
-            // connector's own type mapping before the read, or the read meets a null field type.
-            connector.fillFieldTypes(table);
             batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> raw.addAll(events));
         }
         return new Read(raw, discovered, seam);
@@ -345,20 +421,31 @@ public final class PdkCapturePort implements CapturePort {
         return new Probe(tables, sample);
     }
 
+    /** Initializes a stream connector and places its discovered, typed tables on its context. */
+    private Map<String, TapTable> prepareStream(PdkConnector connector, CaptureConfig config) throws Throwable {
+        connector.connector().init(connector.context());
+        List<TapTable> discovered = discoverTables(connector, config.streams());
+        OracleLogMinerIdentifiers.validateDiscovered(config, discovered);
+        Map<String, TapTable> tables = byId(discovered);
+        tables.values().forEach(connector::fillFieldTypes);
+        connector.context().setTableMap(tableMap(tables));
+        return tables;
+    }
+
     private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt, Long startAt,
-            CaptureListener listener, StreamReadFunction stream) {
+            CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight) {
         try {
             connector.underLoader(() -> {
-                connector.connector().init(connector.context());
                 // streamRead is handed only stream names, so the connector reads each changed table's
                 // schema off the context's table map and its resume position off the offset argument -
                 // neither is assembled by open(). Discover-and-fill the tables onto the context the way the
                 // snapshot read does, and derive a current stream position, or the tail cannot decode a
                 // change (null table map) or even position (a null offset drives a schema-only recovery
                 // that has no stored offset to recover from).
-                Map<String, TapTable> tables = byId(discoverTables(connector, config.streams()));
-                tables.values().forEach(connector::fillFieldTypes);
-                connector.context().setTableMap(tableMap(tables));
+                Map<String, TapTable> tables = prepareStream(connector, config);
+                if (preflight != null) {
+                    preflight.complete(null);
+                }
                 // Resuming uses the position the caller recorded; every other start asks the connector to
                 // name one, which also keeps a null offset out of the connector -- that drives a
                 // schema-only recovery with no stored offset to recover from. Which position it names is
@@ -387,7 +474,9 @@ public final class PdkCapturePort implements CapturePort {
                     }
                     listener.onBatch(decoded, position(connector, offset));
                 });
-                stream.streamRead(connector.context(), config.streams(), startOffset, BATCH_SIZE, consumer);
+                Object readerOffset = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
+                        connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
+                stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer);
                 return null;
             });
         } catch (Throwable t) {
@@ -401,11 +490,15 @@ public final class PdkCapturePort implements CapturePort {
             // cause chain for something coded. Handed on uncoded, a connector that refused to start for a
             // reason it stated precisely arrives as "the job died", with the sentence naming what to
             // reconfigure surviving only in a log line.
-            LOG.warn("cdc stream for connector {} stopped on a failure", connector.connectorId(), t);
-            listener.onError(t instanceof TapstateException coded
+            TapstateException reported = t instanceof TapstateException coded
                     ? coded
                     : new TapstateException(ConnectorError.CAPTURE_FAILED,
-                            Map.of("connector", connector.connectorId(), "detail", detail(t)), t));
+                            Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
+            if (preflight != null && preflight.completeExceptionally(reported)) {
+                return;
+            }
+            LOG.warn("cdc stream for connector {} stopped on a failure", connector.connectorId(), t);
+            listener.onError(reported);
         }
     }
 
@@ -497,10 +590,15 @@ public final class PdkCapturePort implements CapturePort {
      * needing a position has to refuse rather than invent one that no connector could be started from.
      */
     private static Optional<SourcePosition> position(PdkConnector connector, Object offset) {
-        return offset == null
-                ? Optional.empty()
-                : Optional.of(new SourcePosition(
-                        ConnectorOffsetCodec.toToken(connector.connectorId(), offset)));
+        if (offset == null) {
+            return Optional.empty();
+        }
+        // A snapshot renders its seam after the read's loader scope has ended. The
+        // connector's native JSON service must still resolve under that same loader.
+        Object represented = read(connector, () -> SqlServerOffset.forStorage(
+                connector.connectorId(), offset, () -> InstanceFactory.instance(JsonParser.class)));
+        return Optional.of(new SourcePosition(
+                ConnectorOffsetCodec.toToken(connector.connectorId(), represented)));
     }
 
     /** Runs a read action under the connector loader, mapping a connector-side failure to a code. */

@@ -54,11 +54,20 @@ class ApplyServiceRowExpressionTypeTest {
                 """.formatted(tables);
     }
 
+    /** The write target: this release installs a sync only onto the mongodb connector. */
+    private static final String TARGET = """
+            version: tapstate/v1
+            kind: source
+            id: tgt_mg
+            connector: mongodb
+            config: { uri: "mongodb://10.30.0.11:27017/ods" }
+            """;
+
     private final InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
     private final ApplyService service = new ApplyService(
             TapstateCatalog::load, artifacts, new AuditGate(record -> { }, FIXED_CLOCK), schemas,
-            PlanAdvisories.none());
+            PlanAdvisories.none(), SchemaDerivation.none());
 
     private static String pipeline(String expr) {
         return pipeline("orders", expr);
@@ -75,7 +84,7 @@ class ApplyServiceRowExpressionTypeTest {
                   - { id: keep, from: [%s], type: filter, expr: "%s" }
                 serve:
                   from: keep
-                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                  sync: [ { id: out, source: tgt_mg, write_mode: upsert } ]
                 """.formatted(from, expr);
     }
 
@@ -85,11 +94,13 @@ class ApplyServiceRowExpressionTypeTest {
 
     private List<ArtifactDraft> batch(String source, String expr) {
         return List.of(new ArtifactDraft("src_orders.tap.yml", source),
+                new ArtifactDraft("tgt_mg.tap.yml", TARGET),
                 new ArtifactDraft("orders_out.tap.yml", pipeline(expr)));
     }
 
     private List<ArtifactDraft> batch(String source, String from, String expr) {
         return List.of(new ArtifactDraft("src_orders.tap.yml", source),
+                new ArtifactDraft("tgt_mg.tap.yml", TARGET),
                 new ArtifactDraft("orders_out.tap.yml", pipeline(from, expr)));
     }
 

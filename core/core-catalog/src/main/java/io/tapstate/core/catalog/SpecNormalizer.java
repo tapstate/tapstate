@@ -21,6 +21,9 @@ public final class SpecNormalizer {
     private static final Pattern SELF_VALUE =
             Pattern.compile("\\$self\\.value\\s*(===|==|!==|!=)\\s*(?:'([^']*)'|\"([^\"]*)\"|(true|false))");
 
+    /** A form component whose value the connector reads as a number, regardless of schema spelling. */
+    private static final String NUMBER_COMPONENT = "InputNumber";
+
     private static final String DEFAULT_LOCALE = "en_US";
 
     private SpecNormalizer() {
@@ -191,7 +194,7 @@ public final class SpecNormalizer {
             if ("hidden".equals(str(def.get("x-display")))) {
                 continue;
             }
-            ConfigType type = mapType(str(def.get("type")));
+            ConfigType type = mapType(def);
             Map<String, String> label = resolveLabel(str(def.get("title")), key, defaultLocale, locales);
             boolean required = Boolean.TRUE.equals(def.get("required"));
             String defaultValue = textOf(def.get("default"));
@@ -215,7 +218,14 @@ public final class SpecNormalizer {
         return "object".equals(t) && def.get("properties") != null;
     }
 
-    private static ConfigType mapType(String formilyType) {
+    private static ConfigType mapType(Map<String, Object> def) {
+        // Most shipped numeric fields use the Formily string schema type but render through
+        // InputNumber, and their connector config beans read Number. The component is therefore the
+        // effective type declaration; following the schema token alone publishes those fields as text.
+        if (NUMBER_COMPONENT.equals(str(def.get("x-component")))) {
+            return ConfigType.NUMBER;
+        }
+        String formilyType = str(def.get("type"));
         if (formilyType == null) {
             return ConfigType.STRING;
         }

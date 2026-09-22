@@ -25,6 +25,7 @@ import io.tapstate.runtime.srs.SrsItemSerializer;
 import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
+import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -63,7 +64,8 @@ class HazelcastConfiguration {
     HazelcastInstance hazelcastMember(HazelcastProperties properties, @Nullable SrsMetaStore srsMetaStore,
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
             @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
-            @Nullable NestDeadLetterStore nestDeadLetterStore, @Nullable SrsLogStore srsLogStore) {
+            @Nullable NestDeadLetterStore nestDeadLetterStore,
+            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore) {
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         HazelcastInstance member = startMember(() -> Hazelcast.newHazelcastInstance(config));
         // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
@@ -110,25 +112,44 @@ class HazelcastConfiguration {
         // The configuration carries the name and not the instance because a configuration added once the
         // member is running is written down and broadcast, and a live store does not survive that. A run
         // with no store (mongo disabled) binds nothing, and its maps declare no store to resolve.
-        if (nestStateStore != null) {
+        if (operatorStateStores != null) {
+            NestStateMapStoreFactory.bindTo(member, operatorStateStores);
+        } else if (nestStateStore != null) {
             NestStateMapStoreFactory.bindTo(member, nestStateStore);
+        }
+        if (nestStateStore != null) {
             // The same layer, bound again under the join's own key. One key shared between them would
             // read as tidier and would make "these two are told about different layers" impossible to
             // say - which is a thing a deployment may one day want to say, and a thing neither of them
             // could then express without the other noticing.
             JoinStateMapStoreFactory.bindTo(member, nestStateStore);
         }
-        makeNestCapable(member, nestStateStore, nestSettings);
+        if (operatorStateStores != null) {
+            makeNestCapable(member, operatorStateStores, nestSettings);
+        } else {
+            makeNestCapable(member, nestStateStore, nestSettings);
+        }
         makeJoinCapable(member, nestStateStore);
         // Bind the channel behind the nest dead letters onto the member for the same reason: the channel is
         // carried onto the vertex and resolved member-side, because somewhere durable to put a row is
         // reached through a handle that does not survive being written into a graph. A run with no store
         // (mongo disabled) binds nothing, and a nest vertex then refuses to start rather than running on
         // with nowhere to put what it cannot assemble -- which is the failure this channel exists to stop.
-        if (nestDeadLetterStore != null) {
+        if (operatorStateStores != null) {
+            DurableNestDeadLetter.bindTo(member, operatorStateStores);
+        } else if (nestDeadLetterStore != null) {
             DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
         }
         return member;
+    }
+
+    /** Compatibility assembly seam retained for focused tests that supply the pre-routing bean set. */
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, SrsMetaStore srsMetaStore,
+            ConnectorProvisioner connectorProvisioner, SnapshotBuffer snapshotBuffer,
+            KeyedStateStore nestStateStore, NestSettings nestSettings,
+            NestDeadLetterStore nestDeadLetterStore, SrsLogStore srsLogStore) {
+        return hazelcastMember(properties, srsMetaStore, connectorProvisioner, snapshotBuffer,
+                nestStateStore, nestSettings, nestDeadLetterStore, null, srsLogStore);
     }
 
     /**
@@ -159,6 +180,16 @@ class HazelcastConfiguration {
             return;
         }
         member.getConfig().addMapConfig(nestSettings.backedStateMaps());
+    }
+
+    /** Declares the nest map pattern with the deployment's resolved default database. */
+    static void makeNestCapable(HazelcastInstance member, OperatorStateStores stores,
+            NestSettings nestSettings) {
+        if (stores == null) {
+            return;
+        }
+        member.getConfig().addMapConfig(
+                nestSettings.backedStateMapsForDatabase(stores.defaultDatabase()));
     }
 
     /**

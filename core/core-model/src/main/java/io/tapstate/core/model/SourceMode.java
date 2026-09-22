@@ -1,7 +1,7 @@
 package io.tapstate.core.model;
 
 /**
- * Source read mode (ADR-0016 §4): two axes — boundedness × change-awareness. Legality of
+ * Source read mode (§4): two axes — boundedness × change-awareness. Legality of
  * a connector × mode pair is ruled by the capability matrix at validate time, not here.
  */
 @Doc("Source read mode: how the connector reads, along boundedness × change-awareness.")

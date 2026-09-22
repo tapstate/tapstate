@@ -35,7 +35,8 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Process-boundary coverage for launch behavior that must happen before a REPL and its transport exist.
+ * Process-boundary coverage for launch behavior that must happen before a REPL and its transport exist,
+ * and for the status a whole session leaves behind, which is only readable where the process ends.
  */
 class CliMainFreshProcessTest {
 
@@ -47,6 +48,68 @@ class CliMainFreshProcessTest {
     private static final String HUMAN_ACCESS_TOKEN = "human-access-token";
     private static final String MACHINE_TOKEN = "machine-token-secret";
     private static final String ISSUER = "urn:tapstate:cluster:TEST";
+
+    @Test
+    void defaultInstallWithUmask022AllowsContextResolution(@TempDir Path temporary) throws Exception {
+        Assumptions.assumeTrue(Files.getFileStore(temporary).supportsFileAttributeView("posix"));
+        Path home = Files.createDirectory(temporary.resolve("home"));
+        Path installer = Path.of("..").toAbsolutePath().normalize().resolve("install/install.sh");
+        assertThat(installer).isRegularFile();
+        Path installLog = temporary.resolve("install.log");
+        // Only the release payload is stubbed; directory creation runs through the real installer.
+        ProcessBuilder setup = new ProcessBuilder("sh", "-eu", "-c", """
+                installer="$1"
+                fixture="$2"
+                version=$(sed -n 's/^PINNED_VERSION="\\(.*\\)"$/\\1/p' "$installer")
+                platform=$(sh "$installer" --print-platform)
+                bundle="tapstate-cli-$version"
+                mkdir -p "$fixture/stage/$bundle/bin" "$fixture/stage/$bundle/libexec"
+                printf '#!/bin/sh\\nexit 0\\n' > "$fixture/stage/$bundle/bin/tapstate"
+                printf '#!/bin/sh\\nexit 0\\n' > "$fixture/stage/$bundle/libexec/tapstate-mcp"
+                chmod +x "$fixture/stage/$bundle/bin/tapstate" "$fixture/stage/$bundle/libexec/tapstate-mcp"
+                release="$fixture/releases/download/v$version"
+                mkdir -p "$release"
+                asset="tapstate-$version-$platform.tar.gz"
+                tar -czf "$release/$asset" -C "$fixture/stage" "$bundle"
+                cd "$release"
+                if command -v sha256sum >/dev/null 2>&1; then
+                    sha256sum "$asset" > "$asset.sha256"
+                else
+                    shasum -a 256 "$asset" > "$asset.sha256"
+                fi
+                umask 022
+                exec sh "$installer"
+                """, "install-context-test", installer.toString(), temporary.toString());
+        setup.environment().put("HOME", home.toString());
+        setup.environment().remove("TAPSTATE_INSTALL_DIR");
+        setup.environment().remove("TAPSTATE_VERSION");
+        setup.environment().put("TAPSTATE_BASE_URL", temporary.resolve("releases").toUri().toString()
+                .replaceAll("/$", ""));
+        setup.environment().put("TAPSTATE_TELEMETRY", "off");
+        setup.redirectErrorStream(true).redirectOutput(installLog.toFile());
+        Process installation = setup.start();
+        installation.getOutputStream().close();
+        assertThat(awaitExit(installation)).withFailMessage("Installer failed: %s", Files.readString(installLog))
+                .isZero();
+        Path configDirectory = home.resolve(".tapstate");
+        assertThat(directoryEntries(configDirectory)).containsExactly("bin");
+        assertThat(home.resolve(".tapstate/bin/tapstate")).isExecutable();
+        assertThat(Files.getOwner(configDirectory)).isEqualTo(Files.getOwner(home));
+        Set<PosixFilePermission> installedMode = Files.getPosixFilePermissions(configDirectory);
+
+        ProcessResult installed = runCli(home, home, Map.of(), "apply", "--help");
+
+        // Capture the existing missing-context behavior when only the directory mode changes.
+        Files.setPosixFilePermissions(configDirectory, Set.of(PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
+        ProcessResult ownerOnly = runCli(home, home, Map.of(), "apply", "--help");
+        assertThat(ownerOnly.stderr()).contains("error: cli.context-required")
+                .doesNotContain("cli.context-config-permissions");
+        assertThat(installed.stderr())
+                .withFailMessage("apply --help must accept the installer-created directory (mode %s): %s",
+                        installedMode, installed.stderr())
+                .isEqualTo(ownerOnly.stderr());
+    }
 
     @Test
     void offlineMainBypassesConfiguredTransportAndAuth(@TempDir Path home) throws Exception {
@@ -264,6 +327,27 @@ class CliMainFreshProcessTest {
         }
     }
 
+    @Test
+    void aPipedSessionYieldsTheStatusOfARefusedLine(@TempDir Path home) throws Exception {
+        Path workspace = Files.createDirectory(home.resolve("orders"));
+        // The reported shape: a script pipes its lines in and reads the status the run leaves behind.
+        // `apply` is refused because no context names a server, but the verb is not the point -- any
+        // refused line is. `exit` follows it because that is how a script ends the session, and because
+        // it leaves the refusal somewhere other than the last line, which is the only place a status
+        // read off the end would find it.
+        Path script = Files.writeString(home.resolve("session.txt"), "apply nope\nexit\n");
+
+        ProcessResult result = runCli(home, workspace, Map.of(), script);
+
+        assertThat(result.stderr())
+                .withFailMessage("the line was not refused, so this is not the reported run: %s", result.stderr())
+                .contains("error: cli.context-required");
+        assertThat(result.exitCode())
+                .withFailMessage("a refused line left the session exiting %s: stdout=%s stderr=%s",
+                        result.exitCode(), result.stdout(), result.stderr())
+                .isNotZero();
+    }
+
     private static void persistContextAndHumanSession(Path home, Path workspace, URI seed) throws IOException {
         ContextDefinition definition = new ContextDefinition(CONTEXT_ID, List.of(seed), new ContextTls(true), AUTH_REF);
         ContextConfig config = new ContextConfig(ContextConfig.CURRENT_VERSION, "dev", Map.of("dev", definition),
@@ -343,6 +427,12 @@ class CliMainFreshProcessTest {
 
     private static ProcessResult runCli(Path home, Path workspace, Map<String, String> environment, String... arguments)
             throws Exception {
+        return runCli(home, workspace, environment, null, arguments);
+    }
+
+    /** The same run with standard input piped from a file, which is how a script drives a session. */
+    private static ProcessResult runCli(Path home, Path workspace, Map<String, String> environment,
+                                        Path input, String... arguments) throws Exception {
         Path stdout = Files.createTempFile(home, "tapstate-stdout-", ".log");
         Path stderr = Files.createTempFile(home, "tapstate-stderr-", ".log");
         Process process = null;
@@ -356,8 +446,13 @@ class CliMainFreshProcessTest {
             builder.environment().putAll(environment);
             builder.redirectOutput(stdout.toFile());
             builder.redirectError(stderr.toFile());
+            if (input != null) {
+                builder.redirectInput(input.toFile());
+            }
             process = builder.start();
-            process.getOutputStream().close();
+            if (input == null) {
+                process.getOutputStream().close();
+            }
             int exitCode = awaitExit(process);
             return new ProcessResult(exitCode, Files.readString(stdout), Files.readString(stderr));
         } finally {

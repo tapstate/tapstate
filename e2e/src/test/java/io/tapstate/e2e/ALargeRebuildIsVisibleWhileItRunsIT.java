@@ -9,7 +9,9 @@ import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -45,9 +47,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li><b>The quiet customer's edit is made first and is shown to have landed</b> before anything is
  *       asserted about it. Without that fence "no reading appeared for them" is equally well explained by
  *       a pipeline that had stopped consuming, and would pass with the whole feature removed.</li>
- *   <li><b>The loud customer's rebuild is read back by name, and its size against the threshold.</b> A
- *       reading that arrived under a name nobody can tie to a dimension row would satisfy "something is
- *       happening" and answer none of what an operator asks next.</li>
+ *   <li><b>The loud customer's rebuild is read back under the dimension it rebuilds, and its size against
+ *       the threshold.</b> A reading that arrived under a name nobody can tie to a dimension would satisfy
+ *       "something is happening" and answer none of what an operator asks next. Which row of that
+ *       dimension is being rebuilt is a value out of the row, and a reading's name never carries one:
+ *       the rebuilds of one dimension are reported added together.</li>
  *   <li><b>The rows-sent reading equals the rows that actually carry the new name.</b> Not the size
  *       beside it: that one is read off the index as pages times a page, so it is an upper bound and is
  *       exact only for a single-page bucket. This is the assertion that would catch a reading written to
@@ -112,7 +116,7 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
     }
 
     @Test
-    void aLargeRebuildIsReportedByTheKeyItIsAboutAndASmallOneIsNotReportedAtAll() throws Exception {
+    void aLargeRebuildIsReportedUnderItsDimensionAndASmallOneIsNotReportedAtAll() throws Exception {
         Map<String, Object> mysql = SharedMySql.settings(DATABASE);
         seed(mysql);
 
@@ -158,9 +162,11 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
                     () -> !control.metricsNamed(PIPELINE_ID, DONE).isEmpty(),
                     () -> String.valueOf(rebuildReadings(control)));
 
-            String subject = "join." + PIPELINE_ID + ".widen.index.c/" + LOUD_CUSTOMER;
+            // The namespace the customers dimension is mirrored in, and nothing of the row: the key a
+            // rebuild is about is a value out of the row and never becomes part of a reading's name.
+            String subject = "join." + PIPELINE_ID + ".widen.index.c";
             assertThat(control.metricsNamed(PIPELINE_ID, EXPECTED))
-                    .as("the reading says which dimension row is being rebuilt and about how far it "
+                    .as("the reading says which dimension is being rebuilt and about how far it "
                             + "has to go; a size below the reporting threshold would mean the wrong "
                             + "fan-out is being reported")
                     .hasEntrySatisfying(EXPECTED + subject, rows -> assertThat(rows)
@@ -209,10 +215,44 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
                     .isGreaterThan(0L)
                     .isLessThanOrEqualTo(finished.get(EXPECTED + subject));
 
-            assertThat(rebuildReadings(control).keySet())
-                    .as("and the three-row customer is still not reported, after a rebuild that was")
-                    .noneMatch(name -> name.endsWith("/" + QUIET_CUSTOMER));
+            assertThat(rebuildReadings(control))
+                    .as("and the three-row customer is still not reported, after a rebuild that was: the "
+                            + "dimension's readings are the loud rebuild alone, and no reading carries a "
+                            + "row's key in its name")
+                    .containsOnlyKeys(DONE + subject, EXPECTED + subject);
+            assertThat(finished.get(EXPECTED + subject))
+                    .as("the size reported for the dimension is the loud rebuild's alone; three rows added "
+                            + "to it would say the quiet customer's rebuild was reported after all")
+                    .isEqualTo(settled.get(EXPECTED + subject));
+
+            // The same two readings as facts: the dimension's namespace is an attribute a point is selected
+            // by, the name carries none of it, and the number on the point is the number under the flat key.
+            assertThat(pointOf(control, "tapstate.pipeline.join.recompute.rows", subject))
+                    .as("the rows-sent reading is a point selected by the namespace attribute, carrying the "
+                            + "same number the flat face shows under its key")
+                    .contains(finished.get(DONE + subject));
+            assertThat(pointOf(control, "tapstate.pipeline.join.recompute.rows.total", subject))
+                    .contains(finished.get(EXPECTED + subject));
+            assertThat(control.metricFacts(PIPELINE_ID))
+                    .extracting(fact -> (String) fact.get("name"))
+                    .as("and no fact carries the namespace, let alone a row's key, in its name")
+                    .noneMatch(name -> name.contains(subject) || name.contains("/"));
         }
+    }
+
+    /**
+     * The value of the point of the fact named {@code name} whose join namespace attribute is
+     * {@code namespace}, or empty when no such fact or point is published.
+     */
+    @SuppressWarnings("unchecked")
+    private static Optional<Long> pointOf(ControlPlane control, String name, String namespace) {
+        return control.metricFacts(PIPELINE_ID).stream()
+                .filter(fact -> name.equals(fact.get("name")))
+                .flatMap(fact -> ((List<Map<String, Object>>) fact.get("points")).stream())
+                .filter(point -> point.get("attributes") instanceof Map<?, ?> attributes
+                        && namespace.equals(attributes.get("tapstate.join.namespace")))
+                .map(point -> ((Number) point.get("value")).longValue())
+                .findFirst();
     }
 
     /** Every reading published about a rebuild, whichever of the two numbers it is. */

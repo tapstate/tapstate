@@ -14,7 +14,9 @@ import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
+import io.tapstate.control.core.DocumentKeyAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
+import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactQueryService;
@@ -36,6 +38,9 @@ import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineChains;
+import io.tapstate.control.core.HistoryCursorCodec;
+import io.tapstate.control.core.PipelineExplainService;
+import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineProjectionService;
@@ -45,6 +50,8 @@ import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DerivedSchemas;
+import io.tapstate.control.core.SourceConnectionResolver;
+import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
@@ -75,6 +82,7 @@ import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.DataBrowser;
 import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.messages.ExplanationCatalog;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
@@ -185,8 +193,18 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    TokenSigner tokenSigner(ControlAuthProperties properties, Clock clock) {
-        return new HmacTokenSigner(resolveSigningSecret(properties), HmacTokenSigner.DEFAULT_TTL, clock);
+    SigningSecret signingSecret(ControlAuthProperties properties) {
+        return new SigningSecret(resolveSigningSecret(properties));
+    }
+
+    @Bean
+    TokenSigner tokenSigner(SigningSecret secret, Clock clock) {
+        return new HmacTokenSigner(secret.bytes(), HmacTokenSigner.DEFAULT_TTL, clock);
+    }
+
+    @Bean
+    HistoryCursorCodec historyCursorCodec(SigningSecret secret, Clock clock) {
+        return new HistoryCursorCodec(secret.bytes(), clock);
     }
 
     // ---- the control-core services (stateless, composed over the ports above) ----
@@ -236,7 +254,8 @@ class ControlPlaneConfiguration {
     @Bean
     ApplyService applyService(
             ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
-            SchemaStore schemaStore, @Nullable NestSettings nestSettings, LivePipelines livePipelines) {
+            SchemaStore schemaStore, @Nullable NestSettings nestSettings,
+            SchemaDerivation derivation, LivePipelines livePipelines) {
         // The online apply validates against the live catalog view (the bundled snapshot union the
         // connectors registered so far), so a connector registered at runtime is honoured without a restart.
         // It also reads the schema store, which is what lets it judge a row expression against the columns
@@ -250,8 +269,18 @@ class ControlPlaneConfiguration {
         // wherever it does run, absent a deployment saying otherwise. Requiring the bean instead would
         // take the whole control plane down in exactly the shape that never nests anything locally.
         NestSettings settings = nestSettings == null ? NestSettings.defaults() : nestSettings;
+        // Applying re-derives every pipeline in the batch, whether or not it was written: a source that
+        // moved under a pipeline nobody edited leaves that pipeline's content hash byte-identical, so
+        // the write is skipped in exactly the case the model most needs refreshing.
+        // Beside the sizing, the columns the batch would write: a column whose own name holds a dot
+        // lands in a document store as a key that store reads as a path, so the ordinary read for it
+        // answers nothing and no index can be declared over it. Nothing downstream of apply says this,
+        // and the discovered model already holds the name, so this is the one moment it can be said.
         return new ApplyService(connectorCatalogView::merged, artifactStore, auditGate, schemaStore,
-                new NestSizingAdvisories(settings.entriesHeldInMemory()), livePipelines);
+                PlanAdvisories.all(
+                        new NestSizingAdvisories(settings.entriesHeldInMemory()),
+                        new DocumentKeyAdvisories()),
+                derivation, livePipelines);
     }
 
     @Bean
@@ -277,12 +306,12 @@ class ControlPlaneConfiguration {
         // off the store port: those facets have no service in front of them.
         return new ArtifactMutationService(
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
-                storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), auditGate,
-                follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+                storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), storePort.rateHistory(),
+                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE));
     }
 
     @Bean
-    DerivedSchemas derivedSchemas(StorePort storePort, AuditGate auditGate) {
+    StoreBackedDerivedSchemas derivedSchemas(StorePort storePort, AuditGate auditGate) {
         // Wired on the control plane rather than beside the data plane on purpose: the read exists to be
         // available when a start has just been refused, which is exactly the moment a data plane may not
         // be running at all.
@@ -402,8 +431,8 @@ class ControlPlaneConfiguration {
     @Bean
     ConnectionTestService connectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
-            ConnectorConfigValidator configValidator) {
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator);
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections);
     }
 
     @Bean
@@ -432,8 +461,15 @@ class ControlPlaneConfiguration {
     @Bean
     SchemaDiscoveryService schemaDiscoveryService(
             SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock,
-            ConnectorConfigValidator configValidator) {
-        return new SchemaDiscoveryService(probe, schemaStore, auditGate, clock, configValidator);
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
+        return new SchemaDiscoveryService(
+                probe, schemaStore, auditGate, clock, configValidator, sourceConnections);
+    }
+
+    @Bean
+    SourceConnectionResolver sourceConnectionResolver(
+            ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView) {
+        return new SourceConnectionResolver(artifactStore, connectorCatalogView::merged);
     }
 
     @Bean
@@ -504,6 +540,25 @@ class ControlPlaneConfiguration {
     PipelineObservationQueryService pipelineObservationQueryService(
             ArtifactQueryService artifactQueryService, StorePort storePort) {
         return new PipelineObservationQueryService(artifactQueryService, storePort.observations());
+    }
+
+    @Bean
+    PipelineHistoryQueryService pipelineHistoryQueryService(
+            ArtifactQueryService artifactQueryService,
+            StorePort storePort,
+            MetricsHistoryProperties history,
+            Clock clock,
+            HistoryCursorCodec cursors) {
+        return new PipelineHistoryQueryService(
+                artifactQueryService, storePort.rateHistory(), history.getSampleInterval(), clock, cursors);
+    }
+
+    @Bean
+    PipelineExplainService pipelineExplainService(
+            ArtifactQueryService artifactQueryService, StorePort storePort, Clock clock) {
+        ExplanationCatalog messages = ExplanationCatalog.bundled();
+        return new PipelineExplainService(
+                artifactQueryService, storePort.observations(), clock, messages::render);
     }
 
     /**
@@ -617,5 +672,18 @@ class ControlPlaneConfiguration {
                 + "secret. Tokens will not survive a restart or work across nodes -- set a secret for a "
                 + "restart-stable or multi-node deployment.");
         return ephemeral;
+    }
+
+    /** One startup key shared by session tokens and independently domain-separated history cursors. */
+    static final class SigningSecret {
+        private final byte[] bytes;
+
+        SigningSecret(byte[] bytes) {
+            this.bytes = bytes.clone();
+        }
+
+        byte[] bytes() {
+            return bytes.clone();
+        }
     }
 }

@@ -111,6 +111,16 @@ final class NoReclaimStores {
             }
 
             @Override
+            public void pin(String pipelineId, String stepId, long version) {
+                throw unexpected("DerivedSchemaStore.pin");
+            }
+
+            @Override
+            public Optional<DerivedSchema> pinned(String pipelineId, String stepId) {
+                throw unexpected("DerivedSchemaStore.pinned");
+            }
+
+            @Override
             public void record(String pipelineId, String stepId, Map<String, String> schema,
                     String statement, String derivedFrom, String derivedBy) {
                 throw unexpected("DerivedSchemaStore.record");
@@ -163,7 +173,8 @@ final class NoReclaimStores {
             }
 
             @Override
-            public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+            public void setCdcStart(
+                    String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
                 throw unexpected("SrsMetaStore.setCdcStart");
             }
 

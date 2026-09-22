@@ -66,7 +66,7 @@ public final class PipelineDraftCompiler {
         String nestId = draft.pipelineId() + "__nest";
         TransformBody.Nest nest = new TransformBody.Nest(null, null,
                 new NestRoot(root.id(), root.key(), null, null, embeds));
-        steps.add(new Step.Inline(nestId, FromClause.aliases(aliases), nest, Map.of(), Map.of()));
+        steps.add(new Step.Inline(nestId, FromClause.aliases(aliases), nest, Map.of()));
 
         String previous = nestId;
         for (PipelineDraft.Transform transform : wizard.transforms()) {
@@ -152,7 +152,7 @@ public final class PipelineDraftCompiler {
             case "filter" -> new TransformBody.Filter(requiredText(transform.fields(), "expr"));
             default -> throw new IllegalArgumentException("unsupported wizard transform: " + transform.type());
         };
-        return Step.inline(transform.id(), from, body, Map.of(), Map.of());
+        return Step.inline(transform.id(), from, body, Map.of());
     }
 
     private static Map<String, FieldRule> mapFields(Map<String, Object> fields) {
@@ -213,7 +213,7 @@ public final class PipelineDraftCompiler {
                 String use = optionalText(node.config(), "use");
                 view = use == null
                         ? new ViewBlock.Inline(optionalText(node.metadata(), "viewId", node.id()), FromRef.literal(refs.getFirst()),
-                                optionalText(node.config(), "primaryKey", "primary_key"), null, null)
+                                optionalText(node.config(), "primaryKey", "primary_key"), null)
                         : new ViewBlock.Use(optionalText(node.metadata(), "viewId", node.id()), use, FromRef.literal(refs.getFirst()));
             } else if ("target".equals(node.type())) {
                 if (serve != null) {
@@ -263,7 +263,7 @@ public final class PipelineDraftCompiler {
                         ? new TransformBody.MapProjection(mapFields(node.config()))
                         : new TransformBody.Filter(requiredText(node.config(), "expr"));
                 steps.add(Step.inline(node.id(), FromClause.list(refs.stream().map(FromRef::literal).toArray(FromRef[]::new)),
-                        body, Map.of(), Map.of()));
+                        body, Map.of()));
                 result = List.of(node.id());
             } else if ("view".equals(node.type()) || "target".equals(node.type())) {
                 result = List.copyOf(refs);

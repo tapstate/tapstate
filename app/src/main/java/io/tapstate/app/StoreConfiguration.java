@@ -3,8 +3,10 @@ package io.tapstate.app;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.control.restapi.SystemDataVersion;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
+import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
@@ -23,7 +25,7 @@ import org.springframework.context.annotation.Configuration;
  * substrate check, say — turns it off and starts without one.
  */
 @Configuration
-@EnableConfigurationProperties(MongoProperties.class)
+@EnableConfigurationProperties({MongoProperties.class, MetricsHistoryProperties.class})
 class StoreConfiguration {
 
     @Bean(destroyMethod = "close")
@@ -45,8 +47,35 @@ class StoreConfiguration {
      */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    StorePort storePort(MongoConnection storeConnection) {
-        return new MongoStorePort(storeConnection);
+    StorePort storePort(
+            MongoConnection storeConnection, MongoProperties mongo, MetricsHistoryProperties history) {
+        // The one configured bound among the stores: how long a movement sample is kept. Written onto
+        // the history's expiring index as the port comes up, so a changed retention is a changed index.
+        return new MongoStorePort(
+                storeConnection, mongo.getOperatorStateDatabase(), history.getRetention());
+    }
+
+    /** The deployment's default and per-Nest operator-state databases over the verified store client. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    OperatorStateStores operatorStateStores(StorePort storePort) {
+        return storePort.operatorStateStores();
+    }
+
+    /**
+     * What schema version the store this process opened is at, for the version endpoint to report.
+     *
+     * <p>Read once, here. The migration has already run by the time this bean is built -- it runs
+     * inside the connection -- so the answer is settled for the life of the process, and asking the
+     * store again on every request would spend a round trip to be told the same thing. Gated with the
+     * store: a run without one reports no data version rather than reporting zero, which is what a
+     * store nobody has migrated yet would say.
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    SystemDataVersion systemDataVersion(MongoConnection storeConnection) {
+        int version = storeConnection.systemDataStatus().installed();
+        return () -> version;
     }
 
     /**
@@ -80,8 +109,8 @@ class StoreConfiguration {
      */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    KeyedStateStore nestStateStore(StorePort storePort) {
-        return storePort.keyedState();
+    KeyedStateStore nestStateStore(OperatorStateStores stores) {
+        return stores.inDatabase(stores.defaultDatabase()).state();
     }
 
     /**
@@ -91,7 +120,7 @@ class StoreConfiguration {
      */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    NestDeadLetterStore nestDeadLetterStore(StorePort storePort) {
-        return storePort.nestDeadLetters();
+    NestDeadLetterStore nestDeadLetterStore(OperatorStateStores stores) {
+        return stores.inDatabase(stores.defaultDatabase()).deadLetters();
     }
 }

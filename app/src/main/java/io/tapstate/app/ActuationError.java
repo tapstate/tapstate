@@ -39,6 +39,7 @@ enum ActuationError implements TapstateErrorCode {
     SOURCE_TABLE_REGEX_INVALID("actuation.source-table-regex-invalid", Set.of("source", "regex")),
 
     /** A bare table name is selected by several sources; {@code sources} lists the conflicting source ids. */
+    UNWIND_PARENT_KEY_UNRESOLVED("actuation.unwind-parent-key-unresolved", Set.of("step", "stream", "reason")),
     SOURCE_TABLE_AMBIGUOUS("actuation.source-table-ambiguous", Set.of("table", "sources")),
 
     /** A table object carries settings the current capture path does not implement; fields lists their names. */
@@ -131,13 +132,13 @@ enum ActuationError implements TapstateErrorCode {
     VIEW_STORE_UNREACHABLE("actuation.view-store-unreachable", Set.of("store", "reason")),
 
     /**
-     * A view's declared key is not the identity of what feeds it; {@code view} is its id, {@code key}
-     * the view's key, {@code identity} the feed's - a nest's root key, or a table's discovered key.
+     * A view's declared key is not a unique identity of what feeds it; {@code view} is its id,
+     * {@code key} the view's key, and {@code identity} an identity the feed does declare.
      * The sink upserts on the view's key and indexes it uniquely, so records that differ only on the
      * columns the view's key leaves out would silently replace each other. Refused where the pipeline
      * is built, because at write time the loss is invisible: right collection, right count on any
-     * single snapshot. A feed with no identity on record - an undiscovered table - is not held to
-     * this; there the view's key is the only identity there is.
+     * single snapshot. A discovered primary key is only a default and does not override a different
+     * explicitly selected identity when discovery records that identity as unique too.
      */
     VIEW_KEY_NOT_FEED_IDENTITY("actuation.view-key-not-feed-identity", Set.of("view", "key", "identity")),
 
@@ -155,7 +156,15 @@ enum ActuationError implements TapstateErrorCode {
      * written into: the store is resolved by its id alone, and materializing a view into a database an
      * author is capturing from writes into one the deployment does not own.
      */
-    VIEW_STORE_IS_A_CAPTURE_SOURCE("actuation.view-store-is-a-capture-source", Set.of("store"));
+    VIEW_STORE_IS_A_CAPTURE_SOURCE("actuation.view-store-is-a-capture-source", Set.of("store")),
+
+    /**
+     * A model refresh was requested before the pipeline was at rest. Both actual and desired states
+     * matter: an actual run may still be stopping, or a new run may already have been requested.
+     * A paused run also retains its assembly, which a resume with an unchanged artifact may reuse.
+     */
+    SCHEMA_SYNC_WHILE_RUNNING("actuation.schema-sync-while-running",
+            Set.of("pipeline", "state", "desired"));
 
     private final String code;
     private final Set<String> placeholders;

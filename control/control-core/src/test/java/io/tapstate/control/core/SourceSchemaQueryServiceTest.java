@@ -25,7 +25,7 @@ class SourceSchemaQueryServiceTest {
         SourceResource source = source(List.of(
                 TableRef.literal("orders"),
                 TableRef.regex("audit_.*"),
-                TableRef.spec("customers", "active == true", List.of("id"), Map.of())));
+                TableRef.spec("customers", "active == true", List.of("id"))));
         DiscoveredSourceModel discovered = discovery("orders", "orders", "payments", "audit_log", "customers");
         SchemaStore schemas = schemaStore(discovered);
 
@@ -52,7 +52,7 @@ class SourceSchemaQueryServiceTest {
     }
 
     private static SourceResource source(List<TableRef> tables) {
-        return new SourceResource("orders", null, "mysql", Map.of(), null, tables, null, null, null);
+        return new SourceResource("orders", null, "mysql", Map.of(), null, tables, null, null);
     }
 
     private static DiscoveredSourceModel discovery(String connectionId, String... names) {

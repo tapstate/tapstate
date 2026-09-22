@@ -87,6 +87,10 @@ This sentence is collected into the release notes, unedited, when a release is c
 CONTRIBUTING.md, "Release notes".
 -->
 
+## CI cost
+
+- **CI cost delta and lane placement:** <!-- Read .github/workflows/README.md. Paste the ci-timing.sh baseline/current wall-clock medians, signed delta, sample counts, comparable event/runner, and run links. Explain any new lane placement; say "no new lane" when unchanged. If measurement is unavailable, state why and how it will be obtained; do not report zero. -->
+
 ## Checks
 
 - [ ] `mvn verify` is green locally

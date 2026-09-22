@@ -20,6 +20,12 @@ target: https://tapstate.dev/docs/quickstart-online
 > installer names what the build expects and continues, and whether it runs from there
 > is yours to own.
 
+> **If you just want to see it run.** The guided path is two commands after installing
+> the CLI — `tapstate new`, then `tapstate up` — and is written up in
+> [First run](first-run/README.md). The one-line demo that brings up this page's whole
+> stack is `curl -sSL https://install.tapstate.dev/demo | sh`. This page is the same
+> flow by hand, for when you want to see each verb.
+
 What you'll do: bring up a Docker Compose stack — databases, the server, and the
 first-admin bootstrap all seeded and started together — then drive two sources through
 one pipeline from the CLI, so that rows from two different database engines are assembled
@@ -27,11 +33,93 @@ into a single object and kept fresh: snapshot first, then live change-data-captu
 
 The worked example is **MySQL + PostgreSQL → one materialized object**. An order lives in
 MySQL, its shipments live in PostgreSQL, and neither database can see the other — so no
-view and no join can produce the result. The runtime itself is connector-agnostic (every
-connector is loaded through the same plugin interface), but this release **registers
-MySQL, PostgreSQL and MongoDB only**: they are the connectors it supports end to end
-today, and registering any other one is refused. The set grows as connectors are
-certified.
+view and no join can produce the result. The runtime itself is connector-agnostic: every
+connector is loaded through the same plugin interface.
+
+## Connector support boundary
+
+This preview certifies the following database kinds, with certification scoped by direction:
+
+| Database | Connector kind | Certified use |
+|---|---|---|
+| MySQL | `mysql` | Read |
+| PostgreSQL | `postgres` | Read |
+| MongoDB | `mongodb` | Read and write |
+| Oracle | `oracle` | Read |
+| SQL Server | `sqlserver` | Read |
+
+A `serve.sync` element installs onto the `mongodb` kind and no other,
+on any of its accepted ids. Applying a pipeline whose sync names one of the other
+certified connectors is refused, naming that connector and the document the element is
+written in; reading through it is unaffected. A connector outside the accepted set is not
+judged, so a deployment that widened its own accepted ids still decides for itself.
+
+Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other
+kinds, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
+negative fractions and CDC updates. This is not an exhaustive cross-version or
+all-data-type matrix. The default accepted set contains 16 connector ids
+across these five database kinds, including existing managed variants of MySQL,
+PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
+Other managed variants of Oracle and SQL Server are outside the default accepted set.
+
+`tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
+on this server. Configuring it puts that server outside the supported configuration;
+acceptance does not certify the added connectors. The setting is empty by default and
+is not configured in release or quickstart artifacts. A `connector.not-official` refusal
+reports the server's actual accepted set, including any additional ids configured there.
+Registration through an upload and registration through the seed directory use the same
+acceptance check.
+
+Numeric source attributes, including precision, scale and value bounds, are preserved
+through schema storage and target preparation. Decimal columns whose metadata was
+stored by an older build need schema rediscovery before automatic target creation.
+Missing or inconsistent decimal metadata is refused before writing; computed decimal
+outputs without a declared numeric domain cannot be auto-created safely.
+
+Oracle and SQL Server connector jars are published as separate assets on the floating
+`connectors-preview` release. They remain outside versioned Tapstate releases and are not
+downloaded by the three-database quickstart unless you explicitly run `register oracle` or
+`register sqlserver`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
+the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
+the MIT License. Those dependency terms govern only the bundled drivers and do not change
+Tapstate's Apache-2.0 license. The Oracle and SQL Server implementations are paid connector
+implementations; their use remains subject to the applicable Tapdata agreement. The upstream
+enterprise connector repository has no LICENSE file;
+publishing these binary assets does not relicense that source repository.
+
+The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
+miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
+mined schema, table and column identifiers within 30 characters. A 63-character
+schema passed snapshot reads in the live check, but Oracle LogMiner marked its
+changes unsupported, so CDC delivered no rows. Tapstate does not yet reject that
+schema configuration before starting.
+
+## Existing rows in the target
+
+A target collection is created from the source model when it is absent. Existing
+target rows are governed by `on_full_load` on each `serve.sync` element:
+
+| Policy | Before a new full load |
+|---|---|
+| `append` (default) | Keep existing rows and use the configured `write_mode`. |
+| `clear` | Clear existing rows before writing the new full load. |
+| `fail` | Refuse to start writing if the target collection is not empty. |
+
+For example, a sync to the `warehouse` connection can request a clean full load:
+
+```yaml
+serve:
+  from: orders
+  sync:
+    - source: warehouse
+      on_full_load: clear
+```
+
+An empty or newly created collection is allowed with `fail`. Resume, failure recovery,
+and `cdc_only` runs never clear the target, even when `clear` is declared.
+`restart --rerun` resets the pipeline's progress and starts a new full load; it
+still follows `on_full_load`, so use `clear` explicitly when existing target rows
+should be removed. A failed clear stops the pipeline before it writes rows.
 
 ## The one-command demo
 
@@ -41,7 +129,7 @@ the demo workspace, brings the stack up, and runs the pipeline — then prints t
 target row count and the commands to drive CDC and tear down:
 
 ```sh
-curl -sSL https://install.tapstate.dev | sh
+curl -sSL https://install.tapstate.dev/demo | sh
 ```
 
 To read the script before running it, download it into a directory of your own
@@ -49,7 +137,7 @@ first — it then works right there:
 
 ```sh
 mkdir tapstate-demo && cd tapstate-demo
-curl -sSL https://install.tapstate.dev -o quickstart.sh
+curl -sSL https://install.tapstate.dev/demo -o quickstart.sh
 sh quickstart.sh
 ```
 
@@ -199,12 +287,24 @@ curl -fL -O "$base/postgres-connector.jar"
 curl -fL -O "$base/mongodb-connector.jar"
 ```
 
-These three are what this release registers, and they are published so this page runs
-without building the connector repositories first. A jar declaring any other connector
-is refused with `connector.not-official`, whether it is uploaded with `register` or
-staged in the seed directory. They are shaded and carry their own drivers on an
-isolated loader; `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0
-with the Universal FOSS Exception (see [`NOTICE`](../NOTICE)).
+These three jars are published so this walkthrough runs without building the connector
+repositories first. The download list is the demo's selection; the full accepted set and
+certification directions are described in [Connector support boundary](#connector-support-boundary).
+The jars are shaded and carry their own drivers on an isolated loader;
+`mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
+FOSS Exception (see [`NOTICE`](../NOTICE)).
+
+The same release carries Oracle and SQL Server for an explicit registration. From an
+authenticated CLI session, give `register` the published connector id instead of a local path:
+
+```console
+tapstate(admin@127.0.0.1:8080)> register oracle
+tapstate(admin@127.0.0.1:8080)> register sqlserver
+```
+
+The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to
+the connected server. Set `TAPSTATE_CONNECTORS_URL` to an HTTPS mirror when GitHub Releases
+is not reachable.
 
 ## 5. Author the resources
 
@@ -408,10 +508,12 @@ requires a context or contacts the server. `auth login` is intentionally unavail
 while a machine token is selected.
 
 - **`register`** uploads a connector jar to the server (content-addressed and
-  idempotent; re-registering the same jar is a no-op). Its paths resolve against the
-  workspace root — `work/` here — which is why the jars beside it are reached as
-  `../mysql-connector.jar`. An absolute path works too, as does naming a directory:
-  `register ..` uploads every `*.jar` under it as one batch.
+  idempotent; re-registering the same jar is a no-op). An exact published connector id,
+  such as `oracle` or `sqlserver`, is downloaded from `connectors-preview` first. Local
+  paths resolve against the workspace root — `work/` here — which is why the jars beside
+  it are reached as `../mysql-connector.jar`. An absolute path works too, as does naming
+  a directory: `register ..` uploads every `*.jar` under it as one batch. An existing
+  local file or directory always wins over a release id with the same name.
 - **`apply`** with no argument applies the whole workspace as one batch. The batch is
   the reference closure — a pipeline and the sources it names must be applied
   together, so apply the workspace, not one file at a time.
@@ -468,7 +570,7 @@ not put it in command arguments:
 
 `--server` wins over `TAPSTATE_SERVER_URL`; the final default is
 `http://127.0.0.1:8080`. There is intentionally no `--token` option. Without
-`--allow-write`, the sidecar exposes exactly the 10 read tools. With it, five write
+`--allow-write`, the sidecar exposes exactly the 19 read tools. With it, eight write
 tools are added, but the Server still enforces the token scope. A read token cannot
 write even when the tools are locally visible.
 
@@ -486,7 +588,8 @@ An agent should use this sequence:
    draft to `artifact_validate`. Fix all diagnostics before `artifact_apply`.
 5. Call `pipeline_start`, then use `pipeline_status`, `pipeline_metrics`,
    `pipeline_snapshot`, and `pipeline_logs` until the expected state and data are
-   visible. Finish with `pipeline_stop`.
+   visible. Use `pipeline_explain` for the shared diagnosis, or
+   `pipeline_metrics_history` for a retained time range. Finish with `pipeline_stop`.
 
 `source_draft` refuses to guess connector fields. If the connector is bundled-only,
 its runtime is unavailable, or the live response has no complete spec and content
@@ -507,19 +610,80 @@ tool for stopping its own process.
 ## 7. Observe and verify
 
 ```console
+tapstate(admin@127.0.0.1:8080)> status order_pipeline             # state, and why if it is not working
 tapstate(admin@127.0.0.1:8080)> status order_pipeline --watch    # live state; Ctrl-C to stop
-tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # recordCount / errorCount / per-table offset
+tapstate(admin@127.0.0.1:8080)> metrics order_pipeline           # records.out / errors.<code> / positions
+tapstate(admin@127.0.0.1:8080)> explain order_pipeline           # shared conclusion and typed evidence
+tapstate(admin@127.0.0.1:8080)> metrics order_pipeline --from 2026-09-20T10:00:00Z --to 2026-09-20T11:00:00Z --resolution 5m
 tapstate(admin@127.0.0.1:8080)> logs order_pipeline              # node-local operational log tail
 ```
+
+The last `metrics` form reads bounded, reset-aware history rather than the current counter map. See
+[Observe a pipeline](observability/) for target-acknowledged rate and lag semantics, table selection,
+pagination, REST and MCP forms, and the difference between an empty retained window and unavailable data.
 
 - The read faces lag the write verbs: they report observed state, which converges to
   what you asked for rather than changing with the command. Immediately after `start`
   the first `status`/`metrics` may report no observation yet, and a `status` right
   after `stop` can still say `running`. Use `--watch`, or retry after a second.
-- `metrics` is the signal for progress: `recordCount` climbing, `errorCount` at 0.
-- **Metric names are unstable in this preview.** They may be renamed as the metric model
-  settles, so treat them as something to read, not something to build on: a dashboard or
-  an alert wired to these names will need revisiting. The `metrics` output says so too.
+- Under the answer, `status` prints two more lines. `moving` is how fast the pipeline moves, in rows
+  per second per direction, measured between two readings of the pipeline's own observation time —
+  never this machine's clock, which keeps running while a stalled publisher's reading stands still. A
+  one-shot `status` takes the second reading itself, waiting up to a few seconds for a newer
+  observation; while there is only one reading it says `not known`, not `0`, because a pipeline
+  observed once and a pipeline that moved nothing call for different next steps. `lag` is how far
+  behind each table stands. `status --watch` prints a `moving` line every five seconds beside the
+  state changes it streams, the first of which is `not known yet` for the same reason. A rate needs two
+  readings, so `status` waits about a second for the second one when you are at a terminal; run from a
+  script it answers at once and says the rate is not known, unless you ask for it with `status <id>
+  --rate`.
+- `metrics` is the signal for progress: `records.out` climbing and no `errors.<code>` key appearing.
+- **The same facts can go to your monitoring.** Export is off unless you turn it on, and turning it on
+  changes nothing the CLI reads. To serve a Prometheus scrape endpoint, start the server with
+  `--tapstate.metrics.export.prometheus.port=9464` and point Prometheus at `/metrics` on that port. It
+  listens on `127.0.0.1` unless you widen it with `--tapstate.metrics.export.prometheus.host=0.0.0.0`,
+  which a scraper running outside this container needs; what it serves is an inventory of pipeline,
+  table and namespace ids, and a scrape endpoint carries no authentication, so widen it to a network the
+  scraper is already inside. To
+  push to an OpenTelemetry collector, set `--tapstate.metrics.export.otlp.endpoint=http://collector:4318/v1/metrics`
+  (`--tapstate.metrics.export.otlp.protocol=grpc` with a `host:port` endpoint for gRPC; the push interval
+  defaults to a minute). What arrives is what `metrics` shows: counters such as
+  `tapstate.pipeline.records` with `direction`, `tapstate.table.id` and `op` as attributes, gauges such as
+  `tapstate.pipeline.lag`, histograms such as `tapstate.pipeline.record.delivery.duration` with their
+  buckets, and `tapstate.pipeline.state` as one series per state with the current one at 1. A pipeline
+  wider than the per-metric budget folds its extra tables into one series marked `otel.metric.overflow`,
+  so totals stay right while the busiest thousand tables keep their names. The names are not a
+  compatibility promise yet, the same as on the `metrics` face.
+  Failures are counted per error code, and a pipeline that has failed nothing carries no such key.
+- **`status` answers "why is it not working" itself**, under the state line: it renders the server's
+  shared `pipeline.explain` projection, including its conclusion, typed evidence, and where to look
+  next. REST, CLI, and MCP therefore use the same fixed checklist instead of each joining the raw
+  faces differently. When nothing on the checklist matches it does **not** report
+  that all is well — it prints every reading it went through and names the questions these faces
+  cannot answer, so you go and look at the thing the product genuinely cannot see instead of
+  trusting a silence. `--watch` is unchanged: it streams the state only, and says nothing more.
+- **The position it prints is `targetAckedPosition`: how far the target has confirmed writes.**
+  It is not how far the source could be read to and not how far the pipeline has processed. Those
+  two are printed by name as `not collected`, because a position that is simply missing reads the
+  same as one this product has no concept of — and only one of those is an answer. A target that
+  has stopped accepting writes freezes this position while the other two would still be moving, so
+  reading it as either of them turns a stalled target into a quiet source.
+- **`logs` carries what the connector itself said, not only what the host could tell from outside.**
+  When a source refuses a connection, the connector is the only thing that knows why -- the password,
+  the permission, the database that is not there -- and that sentence is now written into the tail of
+  the pipeline it was driving, alongside the host's own coded failure. Two limits, said plainly: a
+  connector's routine progress chatter is kept out of this tail on purpose (it would push the one line
+  you came for out of a bounded window), and a line that reaches the log by neither of the routes the
+  host attributes -- the contract's shared, process-wide channel, which names no pipeline of its own,
+  and the driver a connector bundles logging from a thread of its own -- reaches the server's console
+  without being filed under any pipeline, because nothing there can say which run it belonged to. What
+  the connector itself writes through the log it was driven with is filed against its pipeline whatever
+  thread writes it. A schema discovery's lines are filed under no pipeline for a different reason:
+  any number of pipelines may read the same source.
+- **The names this face prints are unstable in this preview** — the position's included, not
+  only the metrics'. They may be renamed as the model settles, so treat them as something to
+  read, not something to build on: a dashboard or an alert wired to these names will need
+  revisiting. The `metrics` output says so too.
   The lifecycle state in `status` is not affected — that one is a stable contract.
 
 Verify the objects landed, straight from the store — `mongosh` runs inside the Mongo
@@ -621,7 +785,9 @@ pipeline and keep all of it — so the next start carries on from where this run
 reading the whole source again — use `stop order_pipeline --keep-state`, which asks nothing because
 nothing is going. In a script or a CI step, where there is no terminal to answer at, a plain `stop`
 is refused rather than either waiting on input that never arrives or clearing unasked: add `-y` to
-go ahead, or use `--keep-state`.
+go ahead, or use `--keep-state`. Neither spelling touches the pipeline's sampled metrics history:
+the samples stay through a stop, and leave only by age — fifteen days unless configured — or when
+the pipeline is deleted.
 
 Then stop the stack and delete its data:
 
@@ -715,6 +881,7 @@ the server and databases are hosted changes.
    mkdir -p ./plugins       # a writable cache the server unpacks registered connectors into
    java -jar app/target/app-<version>-boot.jar --role=all \
      --tapstate.store.mongo.uri="mongodb://127.0.0.1:27017/tapstate?replicaSet=rs0" \
+     --tapstate.store.mongo.operator-state-database=tapstate_nest \
      --tapstate.connectors.plugins-dir=./plugins
    ```
 
@@ -742,8 +909,9 @@ the server and databases are hosted changes.
    `config: { host: 127.0.0.1, port: 5432, … }` in `fulfillment_db`. Both of them, not one:
    a source left pointing at a compose service name resolves to nothing from the host, and
    the pipeline names every source it reads. The pipeline itself needs no change — the
-   managed store it materializes into is addressed by the server, through the
-   `--tapstate.store.mongo.uri` you passed in step 3, not by a resource here.
+   managed store it materializes into is addressed by the server, through the store settings you
+   passed in step 3, not by a resource here. The operator-state database defaults to `tapstate_nest`;
+   changing its setting selects another database and does not copy the old state.
 
 6. **Online verbs, observe, CDC** are identical to steps 6–8, except you reach the
    databases with your own client (`docker exec tapstate-mysql …` /

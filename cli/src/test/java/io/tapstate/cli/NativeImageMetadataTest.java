@@ -12,6 +12,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 class NativeImageMetadataTest {
 
     @Test
+    void publishedConnectorDownloadsKeepHttpsEnabledInTheNativeImage() throws IOException {
+        InputStream metadata = NativeImageMetadataTest.class.getResourceAsStream(
+                "/META-INF/native-image/io.tapstate/cli/native-image.properties");
+
+        assertThat(metadata).as("native URL protocol configuration").isNotNull();
+        try (metadata) {
+            assertThat(new String(metadata.readAllBytes(), StandardCharsets.UTF_8))
+                    .contains("--enable-url-protocols=https");
+        }
+    }
+
+    @Test
     void launchOptionsRemainReflectiveInTheNativeImage() throws IOException {
         InputStream metadata = NativeImageMetadataTest.class.getResourceAsStream(
                 "/META-INF/native-image/io.tapstate/cli/reflect-config.json");
@@ -26,6 +38,20 @@ class NativeImageMetadataTest {
                     .contains("\"name\" : \"token\"")
                     .contains("\"name\" : \"workdir\"")
                     .contains("\"name\" : \"command\"");
+        }
+    }
+
+    @Test
+    void calciteParserMetadataRemainsReflectiveInTheNativeImage() throws IOException {
+        InputStream metadata = NativeImageMetadataTest.class.getResourceAsStream(
+                "/META-INF/native-image/io.tapstate/cli/reflect-config.json");
+
+        assertThat(metadata).as("Calcite parser native reflection metadata").isNotNull();
+        try (metadata) {
+            String json = new String(metadata.readAllBytes(), StandardCharsets.UTF_8);
+            assertThat(json)
+                    .contains("\"name\" : \"org.apache.calcite.sql.parser.impl.SqlParserImpl\"")
+                    .contains("\"allDeclaredMethods\" : true");
         }
     }
 }

@@ -6,6 +6,7 @@ import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.NestStateStorage;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.PushFormat;
@@ -27,12 +28,15 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewResource;
-import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 import io.tapstate.core.model.DdlPolicy;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.ErrorPolicy;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -46,14 +50,87 @@ import java.util.TreeMap;
 public final class CanonicalWriter {
 
     public String write(Resource resource) {
-        Node.MapN tree = switch (resource) {
+        return new YamlEmitter().emit(render(resource));
+    }
+
+    /**
+     * The same canonical form as {@link #write}, carried as plain maps, lists and scalars instead of
+     * text. Key order, default omission and sugar normalization are decided in one place and shared:
+     * this is the tree the emitter renders, not a second arrangement of the model that happens to
+     * agree with it today.
+     *
+     * <p>Only plain values come out -- {@link String}, {@link Integer}, {@link Long}, {@link Double},
+     * {@link Boolean}, {@code null}, and maps and lists of those -- because the caller is a document
+     * store, and a render node reaching one would fail at the storage boundary rather than here.
+     *
+     * <p>Numbers are narrowed to those three because a free-form config may hold any {@link Number} the
+     * JSON face accepted, and the three are what a document store hands back: a byte, a short and a
+     * float widen on the way through, a {@link java.math.BigDecimal} comes back as a decimal type of the
+     * store's own, and a {@link java.math.BigInteger} cannot be written at all. Nothing is lost that was
+     * not already lost -- the canonical text has always read back to these same three -- and a value
+     * that changes type between writing and reading would change the resource's identity by being
+     * stored.
+     */
+    public Map<String, Object> tree(Resource resource) {
+        return plainMap(render(resource));
+    }
+
+    private Node.MapN render(Resource resource) {
+        return switch (resource) {
             case SourceResource s -> source(s);
             case PipelineResource p -> pipeline(p);
             case TransformResource t -> transformDefinition(t);
             case ViewResource v -> viewDefinition(v);
             case ServeResource s -> serveDefinition(s);
         };
-        return new YamlEmitter().emit(tree);
+    }
+
+    private static Map<String, Object> plainMap(Node.MapN map) {
+        // Insertion-ordered: the tree's key order is the canonical key order, and a store that keeps
+        // the document as written keeps it. Nothing downstream reads order, but a document whose
+        // fields move between writes makes every diff of the stored form unreadable.
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Node.Entry entry : map.entries()) {
+            out.put(entry.key(), plain(entry.value()));
+        }
+        return out;
+    }
+
+    private static Object plain(Node node) {
+        return switch (node) {
+            case Node.MapN m -> plainMap(m);
+            case Node.SeqN s -> s.items().stream().map(CanonicalWriter::plain).toList();
+            // Style is presentation -- quoting and block form -- so it is dropped here and rebuilt by
+            // the emitter from the same tree. A carrier that has no notion of quoting has no use for it.
+            case Node.ScalarN sc -> plainScalar(sc.value());
+        };
+    }
+
+    private static Object plainScalar(Object value) {
+        return switch (value) {
+            case Byte b -> b.intValue();
+            case Short s -> s.intValue();
+            case Float f -> f.doubleValue();
+            // The two wide types below are refused rather than narrowed, and reaching either is an
+            // invariant violation rather than an authoring mistake: a number no store can hold is
+            // refused where it is admitted -- the JSON face against the list of types it accepts, the
+            // parser against the widths a whole number may take -- both of which name the field and the
+            // position the caller wrote. What is left here is the case those two missed, and a crash is
+            // the only honest answer to it. Storing a different number than the one configured is the
+            // outcome worth refusing: it reads back as a value somebody chose.
+            case BigDecimal d -> exactly(d);
+            case BigInteger i -> i.longValueExact();
+            case null, default -> value;
+        };
+    }
+
+    /** The decimal as a double, refusing one that would not survive the narrowing. */
+    private static double exactly(BigDecimal value) {
+        double narrowed = value.doubleValue();
+        if (BigDecimal.valueOf(narrowed).compareTo(value) != 0) {
+            throw new ArithmeticException("BigDecimal " + value + " does not fit in a double");
+        }
+        return narrowed;
     }
 
     // ---- top-level resources ------------------------------------------------------
@@ -69,7 +146,6 @@ public final class CanonicalWriter {
         if (s.tables() != null) {
             b.put("tables", tables(s.tables()));
         }
-        b.freeMap("options", s.options());
         if (s.srs() != null) {
             b.put("srs", srs(s.srs()));
         }
@@ -80,7 +156,7 @@ public final class CanonicalWriter {
     private Node.MapN pipeline(PipelineResource p) {
         B b = new B();
         header(b, p);
-        b.put("source", sources(p.sources()));
+        b.putRequired("source", sources(p.sources()));
         if (p.transforms() != null) {
             List<Node> steps = new ArrayList<>();
             for (Step st : p.transforms()) {
@@ -106,7 +182,6 @@ public final class CanonicalWriter {
         header(b, t);
         b.scalar("type", t.body().type());
         body(b, t.body());
-        b.freeMap("options", t.options());
         b.freeMap("experimental", t.experimental());
         return b.build();
     }
@@ -117,9 +192,6 @@ public final class CanonicalWriter {
         b.scalar("primary_key", v.primaryKey());
         if (v.storage() != null) {
             b.put("storage", storage(v.storage()));
-        }
-        if (v.schema() != null) {
-            b.put("schema", viewSchema(v.schema()));
         }
         b.freeMap("experimental", v.experimental());
         return b.build();
@@ -161,7 +233,6 @@ public final class CanonicalWriter {
                     e.scalar("name", sp.name());
                     e.expression("filter", sp.filter());
                     e.scalarSeq("pk", sp.pk());
-                    e.freeMap("options", sp.options());
                     items.add(e.build());
                 }
             }
@@ -216,7 +287,6 @@ public final class CanonicalWriter {
                 b.scalar("type", s.body().type());
                 b.put("from", fromClause(s.from()));
                 body(b, s.body());
-                b.freeMap("options", s.options());
                 b.freeMap("experimental", s.experimental());
             }
             case Step.Use u -> {
@@ -225,7 +295,6 @@ public final class CanonicalWriter {
                 }
                 b.scalar("use", u.use());
                 b.put("from", fromClause(u.from()));
-                b.freeMap("options", u.options());
             }
         }
         return b.build();
@@ -236,6 +305,17 @@ public final class CanonicalWriter {
             case TransformBody.Js js -> b.literal("script", js.script());
             case TransformBody.MapProjection mp -> b.put("fields", fieldRules(mp.fields()));
             case TransformBody.Filter f -> b.expression("expr", f.expr());
+            // Declared order, which is the order the grammar declares them in: the one required key,
+            // then the two an author already knows from a document store's own unwind, then the two
+            // this side adds. An omitted optional key writes nothing rather than its default - the
+            // canonical form is what the author said, and a default written out reads as a choice.
+            case TransformBody.Unwind u -> {
+                b.scalar("path", u.path());
+                b.scalar("include_array_index", u.includeArrayIndex());
+                b.scalar("preserve_null_and_empty_arrays", u.preserveNullAndEmptyArrays());
+                b.scalar("element_key", u.elementKey());
+                b.scalar("element_type", u.elementType());
+            }
             case TransformBody.Union ignored -> {
             }
             case TransformBody.Nest n -> {
@@ -245,6 +325,9 @@ public final class CanonicalWriter {
                 }
                 b.scalar("entries_in_memory", n.entriesInMemory());
                 b.scalar("max_elements_per_document", n.maxElementsPerDocument());
+                if (n.state() != null) {
+                    b.put("state", nestStateStorage(n.state()));
+                }
                 b.put("root", nestRoot(n.root()));
             }
             case TransformBody.Join j -> {
@@ -274,6 +357,12 @@ public final class CanonicalWriter {
         b.scalar("mode", root.mode());
         b.scalar("trackKeyChanges", root.trackKeyChanges());
         b.put("embed", embeds(root.embed()));
+        return b.build();
+    }
+
+    private Node nestStateStorage(NestStateStorage state) {
+        B b = new B();
+        b.scalar("database", state.database());
         return b.build();
     }
 
@@ -335,9 +424,6 @@ public final class CanonicalWriter {
                 b.scalar("primary_key", v.primaryKey());
                 if (v.storage() != null) {
                     b.put("storage", storage(v.storage()));
-                }
-                if (v.schema() != null) {
-                    b.put("schema", viewSchema(v.schema()));
                 }
             }
             case ViewBlock.Use u -> {
@@ -419,7 +505,9 @@ public final class CanonicalWriter {
         if (e.ddl() != null && e.ddl() != DdlPolicy.FAIL) {
             b.scalar("ddl", e.ddl().yaml());
         }
-        b.freeMap("options", dropDefault(e.options(), "auto_create_table", Boolean.TRUE));
+        if (e.onFullLoad() != null && e.onFullLoad() != OnFullLoad.APPEND) {
+            b.scalar("on_full_load", e.onFullLoad().yaml());
+        }
         return b.build();
     }
 
@@ -448,7 +536,6 @@ public final class CanonicalWriter {
             case null -> {
             }
         }
-        b.freeMap("options", e.options());
         return b.build();
     }
 
@@ -494,13 +581,6 @@ public final class CanonicalWriter {
         return b.build();
     }
 
-    private Node viewSchema(ViewSchema schema) {
-        B b = new B();
-        b.scalar("enforce", schema.enforce());
-        b.scalar("evolution", schema.evolution());
-        return b.build();
-    }
-
     // ---- shared helpers -----------------------------------------------------------
 
     /** Drops an entry whose value equals its documented constant default (§4). */
@@ -541,9 +621,13 @@ public final class CanonicalWriter {
         return new Node.ScalarN(v, Node.Style.AUTO);
     }
 
-    /** Ordered map builder; null / empty values are silently skipped (§4 empty-container rule). */
+    /** Ordered map builder; optional null / empty values are silently skipped (§4 empty-container rule). */
     private static final class B {
         private final List<Node.Entry> entries = new ArrayList<>();
+
+        void putRequired(String key, Node value) {
+            entries.add(new Node.Entry(key, value));
+        }
 
         void put(String key, Node value) {
             if (value instanceof Node.MapN m && m.entries().isEmpty()) {

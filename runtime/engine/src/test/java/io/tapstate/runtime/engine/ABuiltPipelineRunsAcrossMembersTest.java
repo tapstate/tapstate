@@ -102,10 +102,10 @@ class ABuiltPipelineRunsAcrossMembersTest {
                 List.of(SourceRef.bare("orders_src")),
                 List.of(Step.inline("keep_even",
                         FromClause.list(FromRef.literal("orders_src")),
-                        new TransformBody.Filter("row.id % 2 == 0"), null, null)),
+                        new TransformBody.Filter("row.id % 2 == 0"), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("keep_even"),
-                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null, null)),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)),
                         null, null),
                 null, null);
 
@@ -139,10 +139,10 @@ class ABuiltPipelineRunsAcrossMembersTest {
                 List.of(SourceRef.bare("a_src"), SourceRef.bare("b_src")),
                 List.of(Step.inline("u",
                         FromClause.list(FromRef.literal("a_src"), FromRef.literal("b_src")),
-                        new TransformBody.Union(), null, null)),
+                        new TransformBody.Union(), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("u"),
-                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null, null)),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)),
                         null, null),
                 null, null);
 

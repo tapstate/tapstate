@@ -1,4 +1,4 @@
-# ADR-0016 §14.3 — shared-SRS second consumer (same source definition as s02; batches are
+# §14.3 — shared-SRS second consumer (same source definition as s02; batches are
 # per-directory workspaces, so the definition is repeated here to keep the batch closed).
 version: tapstate/v1
 kind: source

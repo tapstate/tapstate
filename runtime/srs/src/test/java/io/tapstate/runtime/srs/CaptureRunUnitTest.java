@@ -28,6 +28,7 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -164,7 +165,7 @@ class CaptureRunUnitTest {
         SrsMeta record = meta.read(chain).orElseThrow();
         String start = record.sourceReadOffset() != null
                 ? record.sourceReadOffset()
-                : record.cdcStartPosition();
+                : record.consumerOffset("pipe-1").map(ConsumerOffset::cdcStartPosition).orElse(null);
         return Objects.requireNonNull(start, "the first run recorded nothing for the second to pick up");
     }
     /** A run spec for a config-derived chain (no srs.key). */
@@ -208,6 +209,8 @@ class CaptureRunUnitTest {
         // snapshot_only is a bounded pass straight to the sink: no shared chain a cdc tail resumes against,
         // so nothing is provisioned, no cdc-start is recorded, and no tail is attached.
         assertThat(passthrough).extracting(e -> e.after().get("id")).containsExactly(1, 2, 3);
+        assertThat(passthrough).extracting(event -> event.position().order())
+                .containsOnly(SourceOrder.snapshotRow(1L));
         assertThat(run.snapshotCount()).isEqualTo(3);
         assertThat(run.snapshotCounts()).containsEntry("orders", 3L);
         assertThat(run.chainId()).isEmpty();
@@ -215,6 +218,33 @@ class CaptureRunUnitTest {
         assertThat(run.cdcSubscription()).isEmpty();
         assertThat(meta.created).isEmpty();
         assertThat(port.cdcStarted).isFalse();
+    }
+
+    @Test
+    void directSnapshotOnlyRunsWithoutAnAssignedGenerationStillAdvanceLocally() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunUnit unit = runUnit(new FakeSource(List.of(row(1)), List.of()), meta);
+        List<SourceOrder> accepted = new ArrayList<>();
+
+        unit.start(spec(ReadMode.SNAPSHOT_ONLY, true), event -> accepted.add(event.position().order()));
+        unit.start(spec(ReadMode.SNAPSHOT_ONLY, true), event -> accepted.add(event.position().order()));
+
+        assertThat(accepted).containsExactly(
+                SourceOrder.snapshotRow(1L), SourceOrder.snapshotRow(2L));
+    }
+
+    @Test
+    @DisplayName("what the load read is on the run's own account, under the operation the source performed")
+    void theLoadsRowsAreCountedOnTheRunsAccountAsReads() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1), row(2), row(3)), List.of());
+
+        CaptureRun run = runUnit(port, meta).start(spec(ReadMode.SNAPSHOT_ONLY, true), event -> { });
+
+        // The account is opened before the load, not with the tail that follows it. Opened after, a run
+        // would report having read nothing until its first change arrived - and for a snapshot_only run,
+        // which never opens a tail at all, for ever.
+        assertThat(run.health().receivedRows()).containsExactly(Map.entry("orders", Map.of("r", 3L)));
     }
 
     /**
@@ -365,6 +395,46 @@ class CaptureRunUnitTest {
                 .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-joiner-began-at")));
     }
 
+    @Test
+    void aPipelineWhoseCompletedLoadSamplesNoSeamRestartsAtItsOwnSeam() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-chain-birth");
+        CaptureRun firstRun = runUnit(first, meta)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
+        String chainId = firstRun.chainId().orElseThrow().value();
+        meta.markSnapshotComplete(chainId, "pipe-a", "orders");
+
+        FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-join");
+        runUnit(joiner, meta)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
+        meta.markSnapshotComplete(chainId, "pipe-b", "orders");
+
+        FakeSource restarted = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-not-sampled");
+        runUnit(restarted, meta)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
+
+        assertThat(restarted.cdcStart)
+                .as("pipe-b owes no table on restart, so its tail must not adopt pipe-a's older seam")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-join")));
+    }
+
+    @Test
+    void aCdcOnlyPipelineDoesNotAdoptAnotherPipelinesSnapshotSeam() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource loader = new FakeSource(List.of(row(1)), List.of(), "seam-loader");
+        runUnit(loader, meta)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-cdc-only-join"), e -> { });
+
+        FakeSource cdcOnly = new FakeSource(List.of(), List.of(), "seam-never-sampled");
+        CaptureRun run = runUnit(cdcOnly, meta)
+                .start(specFor("pipe-b", ReadMode.CDC_ONLY, "chain-cdc-only-join"), e -> { });
+
+        assertThat(run.snapshotCount()).as("cdc_only has no load from which to sample a seam").isZero();
+        assertThat(cdcOnly.cdcStart)
+                .as("with no shared read or seam of its own, pipe-b uses the start for this run")
+                .isEqualTo(CaptureStart.present());
+    }
+
     /**
      * A pipeline told to re-read everything does, on a chain another pipeline is still using -- and the
      * other one is not made to re-read anything.
@@ -432,7 +502,9 @@ class CaptureRunUnitTest {
         assertThat(meta.created).containsExactly(chainId);
         // The seam the source itself sampled, not a constant this layer supplied: the recorded value is
         // the batch's own, which is what makes the tail's join to the snapshot a real one.
-        assertThat(meta.read(chainId)).get().extracting(SrsMeta::cdcStartPosition).isEqualTo("seam-0");
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1")).get()
+                .extracting(ConsumerOffset::cdcStartPosition)
+                .isEqualTo("seam-0");
 
         Ringbuffer<SrsItem> ring = hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders"));
         assertThat(ring.tailSequence()).isEqualTo(1L);
@@ -457,7 +529,7 @@ class CaptureRunUnitTest {
         assertThat(run.cdcSubscription()).isPresent();
 
         String chainId = run.chainId().get().value();
-        assertThat(meta.read(chainId)).get().extracting(SrsMeta::cdcStartPosition).isNull();
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1")).isEmpty();
         Ringbuffer<SrsItem> ring = hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders"));
         assertThat(ring.tailSequence()).isEqualTo(1L);
     }
@@ -734,10 +806,10 @@ class CaptureRunUnitTest {
      * how far the durable read offset may advance -- are functions of the consumer cursors alone, so a run
      * asks for those and nothing else.
      *
-     * <p>The record also carries a schema history that grows by one entry per DDL and is never trimmed.
-     * Fetching the whole record per run therefore carries that history back on every change, and the cost
-     * of doing so climbs for the life of the chain: measured against a real endpoint, a chain with 500
-     * DDLs behind it reads at 6.4 ms where the cursors alone read at 0.5 ms.
+     * <p>The record also carries a schema history that grows by one entry per DDL, up to the bound the
+     * store keeps it under. Fetching the whole record per run therefore carries that history back on every
+     * change, and the cost of doing so climbs with what the record holds: measured against a real endpoint,
+     * a chain with 500 DDLs behind it reads at 6.4 ms where the cursors alone read at 0.5 ms.
      *
      * <p>So this pins two things at once, and the second is the one that would rot silently: a run reads
      * the cursors once rather than once per bound, and the number of whole-record fetches does not move
@@ -924,8 +996,7 @@ class CaptureRunUnitTest {
                     .filter(c -> !c.pipelineId().equals(pipelineId))
                     .toList();
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), kept,
-                    m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(),
-                    m.snapshotEpoch()));
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         final List<String> created = new ArrayList<>();
@@ -957,7 +1028,7 @@ class CaptureRunUnitTest {
                 throw new IllegalStateException("mining chain already seeded: " + miningChainId);
             }
             created.add(miningChainId);
-            records.put(miningChainId, new SrsMeta(miningChainId, null, List.of(), null, List.of(), retention));
+            records.put(miningChainId, new SrsMeta(miningChainId, null, List.of(), List.of(), retention));
         }
 
         @Override
@@ -970,8 +1041,8 @@ class CaptureRunUnitTest {
         public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), position, m.consumerOffsets(), m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
+                    m.miningChainId(), position, m.consumerOffsets(),
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         @Override
@@ -981,8 +1052,8 @@ class CaptureRunUnitTest {
             next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
             next.add(offset);
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
+                    m.miningChainId(), m.sourceRead(), next,
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         @Override
@@ -1000,10 +1071,16 @@ class CaptureRunUnitTest {
             Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
             perTable.put(table, lastReadSeq);
             ChainPosition ack = existing == null ? null : existing.sinkAcked();
-            next.add(new ConsumerOffset(pipelineId, perTable, ack));
+            next.add(new ConsumerOffset(
+                    pipelineId,
+                    perTable,
+                    ack,
+                    existing == null ? List.of() : existing.snapshotCompletedTables(),
+                    existing == null ? null : existing.cdcStartPosition(),
+                    existing == null ? 0L : existing.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
+                    m.miningChainId(), m.sourceRead(), next,
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         @Override
@@ -1019,18 +1096,41 @@ class CaptureRunUnitTest {
                 }
             }
             Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
-            next.add(new ConsumerOffset(pipelineId, perTable, position));
+            next.add(new ConsumerOffset(
+                    pipelineId,
+                    perTable,
+                    position,
+                    existing == null ? List.of() : existing.snapshotCompletedTables(),
+                    existing == null ? null : existing.cdcStartPosition(),
+                    existing == null ? 0L : existing.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceRead(), next, m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), m.epoch(), m.snapshotEpoch()));
+                    m.miningChainId(), m.sourceRead(), next,
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             SrsMeta m = require(miningChainId);
+            List<ConsumerOffset> next = new ArrayList<>();
+            ConsumerOffset existing = null;
+            for (ConsumerOffset consumer : m.consumerOffsets()) {
+                if (consumer.pipelineId().equals(pipelineId)) {
+                    existing = consumer;
+                } else {
+                    next.add(consumer);
+                }
+            }
+            next.add(new ConsumerOffset(
+                    pipelineId,
+                    existing == null ? Map.of() : existing.perTableSeq(),
+                    existing == null ? null : existing.sinkAcked(),
+                    existing == null ? List.of() : existing.snapshotCompletedTables(),
+                    cdcStartPosition,
+                    snapshotEpoch));
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(), cdcStartPosition,
-                    m.schemaHistory(), m.retention(), m.epoch(), snapshotEpoch));
+                    m.miningChainId(), m.sourceRead(), next,
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         @Override
@@ -1038,8 +1138,8 @@ class CaptureRunUnitTest {
             SrsMeta m = require(miningChainId);
             long opened = m.epoch() + 1;
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
-                    m.schemaHistory(), m.retention(), opened, m.snapshotEpoch()));
+                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
+                    m.schemaHistory(), m.retention(), opened));
             return opened;
         }
 
@@ -1049,8 +1149,8 @@ class CaptureRunUnitTest {
             List<SchemaVersion> next = new ArrayList<>(m.schemaHistory());
             next.add(version);
             records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(), m.cdcStartPosition(),
-                    next, m.retention(), m.epoch(), m.snapshotEpoch()));
+                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
+                    next, m.retention(), m.epoch()));
         }
 
         @Override
@@ -1073,10 +1173,11 @@ class CaptureRunUnitTest {
                 completed.add(table);
             }
             consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
-                    mine == null ? null : mine.sinkAcked(), completed));
+                    mine == null ? null : mine.sinkAcked(), completed,
+                    mine == null ? null : mine.cdcStartPosition(),
+                    mine == null ? 0L : mine.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
-                    m.cdcStartPosition(), m.schemaHistory(), m.retention(), m.epoch(),
-                    m.snapshotEpoch()));
+                    m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         private SrsMeta require(String miningChainId) {

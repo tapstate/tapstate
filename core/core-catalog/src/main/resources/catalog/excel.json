@@ -126,7 +126,7 @@
     },
     {
       "name": "ftpPort",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Port"
       },
@@ -194,7 +194,7 @@
     },
     {
       "name": "ftpConnectTimeout",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Connect Timeout(second)"
       },
@@ -211,7 +211,7 @@
     },
     {
       "name": "ftpDataTimeout",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Data Timeout(second)"
       },
@@ -245,7 +245,7 @@
     },
     {
       "name": "sftpPort",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Port"
       },
@@ -465,7 +465,7 @@
     },
     {
       "name": "streamReadReconnectInterval",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Incremental Reconnect Interval(minute)"
       },

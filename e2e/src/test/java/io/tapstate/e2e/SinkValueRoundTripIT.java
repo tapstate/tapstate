@@ -14,14 +14,15 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * A value written to a target of the same kind as its source arrives as the type it left as.
+ * A value passed untouched through javascript and written to a target of the same kind as its source
+ * arrives as the type it left as.
  *
  * <p>The read path converts a driver's own type into something portable so that everything between
  * the two ends can hold it. The write path has to undo that, or a key that travelled as text is
  * written as text: the row lands, the write reports success, and only the target's own column type is
  * wrong - which nothing on the read side can see, and no count or row comparison would move.
  *
- * <p>Three columns, each opening a different hole:
+ * <p>Four columns, each opening a different hole:
  *
  * <ul>
  *   <li>the <b>identity</b>, which comes back only if the write side hands the target the object the
@@ -32,12 +33,17 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>a plain <b>integer</b>, which says the two lanes did not get mixed up. An ordinary box takes
  *       the bare lane and must stay bare; an implementation that boxed it too for the sake of a
  *       uniform row would find no way back for that box and write null - a column that is there, has
- *       the right name, and holds nothing.</li>
+ *       the right name, and holds nothing;</li>
+ *   <li>an <b>identity inside an array</b>, which the source's schema cannot name at all: elements
+ *       are positional and may each be a different type, so discovery names the array and stops.
+ *       It comes back only if the write side reads what that schema calls this type where it does
+ *       name it - the collection's own identity column. Unrestored it is a plain string sitting
+ *       beside a restored identity in the same document, from the same run.</li>
  * </ul>
  *
- * <p>A 128-bit decimal is deliberately not among them. Its conversion loses digits on the way in and
- * that loss is accepted knowingly, so asserting it round-trips would be asserting something already
- * decided against.
+ * <p>A 128-bit decimal is covered separately by {@link MongoDecimal128RoundTripIT}. It goes directly
+ * from source to sink there because this case's JavaScript step produces a derived decimal column,
+ * whose precision and bounds the target model deliberately does not invent.
  *
  * <p>Java rather than a declarative example, and the reason is a missing word rather than a
  * preference: the claim is about the storage type of a column at the target, and the specification
@@ -71,7 +77,7 @@ class SinkValueRoundTripIT {
     }
 
     @Test
-    void anIdentityABinaryColumnAndAnIntegerKeepTheirTypesAcrossTheChain() {
+    void anIdentityABinaryColumnAnIntegerAndAnIdentityInsideAnArrayKeepTheirTypesAcrossAnUntouchedJavascriptStep() {
         String storeUri = SharedMongo.replicaSetUrl("e2e_round_trip_store");
         String sourceUri = SharedMongo.replicaSetUrl(SOURCE_DATABASE);
         String targetUri = SharedMongo.replicaSetUrl(TARGET_DATABASE);
@@ -80,11 +86,15 @@ class SinkValueRoundTripIT {
 
         try (ServerHandle server = InProcessServer.start(storeUri);
                 MongoEndpoints mongo = new MongoEndpoints()) {
+            // One the array carries, which no schema names a place for, beside the document's own
+            // identity below - which the driver assigns, and which the schema does name.
+            ObjectId insideTheArray = new ObjectId();
             // No identity of its own, so the driver assigns one - the ordinary case, and the only one
             // that exercises the way back at all.
             Document seeded = new Document()
                     .append("bin", new Binary(BYTES))
-                    .append("qty", QUANTITY);
+                    .append("qty", QUANTITY)
+                    .append("refs", List.of(insideTheArray));
             mongo.insert(source, COLLECTION, seeded);
             ObjectId identity = seeded.getObjectId("_id");
 
@@ -128,6 +138,12 @@ class SinkValueRoundTripIT {
                     // way it boxes a driver type would find no way back for that box and write null.
                     .isEqualTo((long) QUANTITY)
                     .isNotInstanceOf(String.class);
+            assertThat(arrived.get("refs"))
+                    // Equality rather than a type check on the element: an identity and the text it
+                    // travelled as print alike and are never equal, so this fails on exactly the
+                    // difference under test.
+                    .as("the identity inside the array, which the schema names no place for")
+                    .isEqualTo(List.of(insideTheArray));
         }
     }
 
@@ -163,7 +179,13 @@ class SinkValueRoundTripIT {
                 source: %s
                 settings: { read_mode: snapshot_and_cdc }
                 transforms:
-                  - { id: rows_through, from: [ %s ], type: filter, expr: "op == 'r' || op == 'i'" }
+                  - id: rows_through
+                    from: [ %s ]
+                    type: js
+                    script: |
+                      function process(record, ctx) {
+                        return record.op === 'r' || record.op === 'i' ? record : null;
+                      }
                 serve:
                   from: rows_through
                   sync:

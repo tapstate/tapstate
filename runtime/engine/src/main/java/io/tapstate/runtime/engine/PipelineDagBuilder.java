@@ -25,6 +25,7 @@ import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -81,6 +82,55 @@ public final class PipelineDagBuilder {
             }
         }
         return namespaces;
+    }
+
+    /**
+     * Every map namespace of every nest, paired with the database that nest resolves to. An absent
+     * per-nest state block inherits {@code defaultDatabase}; the artifact remains absent rather than being
+     * rewritten with that environmental value.
+     */
+    public static Map<String, String> nestStateDatabases(PipelineResource pipeline,
+            Function<String, NestTable> tables, String defaultDatabase) {
+        if (pipeline.transforms() == null) {
+            return Map.of();
+        }
+        Map<String, String> databases = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms()) {
+            TransformBody.Nest nest = nestOf(step);
+            if (nest == null) {
+                continue;
+            }
+            String database = stateDatabase(nest, defaultDatabase);
+            for (String namespace :
+                    NestTopology.compile(pipeline.id(), step.id(), nest, tables).stateNamespaces()) {
+                String previous = databases.putIfAbsent(namespace, database);
+                if (previous != null && !previous.equals(database)) {
+                    throw new IllegalStateException("nest namespace '" + namespace
+                            + "' resolves to both " + previous + " and " + database);
+                }
+            }
+        }
+        return Map.copyOf(databases);
+    }
+
+    /** Each nest step's resolved state database, used by the shape ledger beside that step's state. */
+    public static Map<String, String> nestStateDatabasesByStep(
+            PipelineResource pipeline, String defaultDatabase) {
+        if (pipeline.transforms() == null) {
+            return Map.of();
+        }
+        Map<String, String> databases = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms()) {
+            TransformBody.Nest nest = nestOf(step);
+            if (nest != null) {
+                databases.put(step.id(), stateDatabase(nest, defaultDatabase));
+            }
+        }
+        return Map.copyOf(databases);
+    }
+
+    private static String stateDatabase(TransformBody.Nest nest, String defaultDatabase) {
+        return nest.state() == null ? defaultDatabase : nest.state().database();
     }
 
     /**
@@ -299,9 +349,10 @@ public final class PipelineDagBuilder {
                     JoinPlan plan = bindings.join().plans().apply(step);
                     byKey.put(step.id(), JoinDag.attach(dag, plan, pipeline.id(), step.id(),
                             bindings.join().factKeyColumns().apply(step),
+                            bindings.join().dimensionRowKeyColumns().apply(step),
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
-                            bindings.join().stores()));
+                            bindings.join().stores(), bindings.join().displaced()));
                     if (chains != null) {
                         chains.derived(step.id(), nestUpstream(inline.from(), bindings));
                     }

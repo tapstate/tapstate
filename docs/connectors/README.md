@@ -16,9 +16,12 @@ regenerated from an upstream repository on a schedule, and adding to it means ru
 regeneration.
 
 **Registering with a running server** is the other path: `tapstate register <path>` uploads a
-connector artifact, the server reads the connector's own declarations back out of it, and
-`tapstate connectors` lists what a given server ended up with. This path accepts only the connectors
-this release officially supports, so it is not a way to widen what the catalog offers.
+local connector artifact, while `tapstate register <connector-id>` downloads an exact published
+id from the `connectors-preview` release and uploads it. The server reads the connector's own
+declarations back out of the artifact, and `tapstate connectors` lists what a given server ended
+up with. This path accepts only the connectors this release officially supports, so it is not a
+way to widen what the catalog offers. Existing local files and directories take precedence over
+published ids; `TAPSTATE_CONNECTORS_URL` points the download form at an HTTPS mirror.
 
 The two do not have to agree, and where they disagree the release is the honest one: a row can sit in
 the bundled catalog describing a connector that this release will not install.

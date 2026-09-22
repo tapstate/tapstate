@@ -257,12 +257,12 @@ class ARowPointedAtFromInsideAnArrayIsResolvedAndSharedTest {
         aliases.put("order", FromRef.literal("orders"));
         aliases.put("item", FromRef.literal("items"));
         aliases.put("sku", FromRef.literal("skus"));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
 
         PipelineResource pipeline = new PipelineResource(PIPELINE, null,
                 List.of(SourceRef.bare("orders"), SourceRef.bare("items"), SourceRef.bare("skus")), List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(STEP),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();

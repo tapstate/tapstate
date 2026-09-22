@@ -35,7 +35,7 @@ public final class E2eExecutor {
     private final Duration timeout;
     private final Duration pollInterval;
 
-    /** The table the last cdc step changed, until an await confirms the change arrived. */
+    /** The last replay-eligible changed table, until an await confirms the change arrived. */
     private TableAlias lastChanged;
 
     /**
@@ -186,7 +186,12 @@ public final class E2eExecutor {
                     case Step.Change.Delete delete -> binding.delete(cdc.table(), delete.where());
                     case Step.Change.Insert insert -> binding.insert(cdc.table(), insert.values());
                 }
-                lastChanged = cdc.table();
+                // A delete-and-insert replay would replace an update with different operations,
+                // making a sink that discards every update satisfy the changed-value assertion.
+                boolean update = cdc.change() instanceof Step.Change.Update
+                        || cdc.change() instanceof Step.Change.Generated generated
+                        && generated.op() == CdcOp.UPDATE;
+                lastChanged = update ? null : cdc.table();
             }
             case Step.Assertion assertion -> check(assertion.matcher(), pipelineId);
             case Step.Await await -> {
@@ -253,6 +258,7 @@ public final class E2eExecutor {
             case Matcher.ErrorCount errorCount -> errorCountMismatch(errorCount.expected(), pipelineId);
             case Matcher.FailureCode failureCode -> failureCodeMismatch(failureCode.expected(), pipelineId);
             case Matcher.DeadLettered discarded -> deadLetteredMismatch(discarded.expected(), pipelineId);
+            case Matcher.RecordsOut rows -> recordsOutMismatch(rows.expected(), pipelineId);
         };
     }
 
@@ -287,7 +293,52 @@ public final class E2eExecutor {
                 mismatches.add(doc.table() + " at " + path + " expected " + expected + " elements, found " + list.size());
             }
         });
+        // Read the other way round from the two above: here the path being there is the mismatch and
+        // its absence is the agreement. Nothing else this matcher can say fails on a document that
+        // carries more than it was asked about, which is exactly the shape of a target built one
+        // column too wide.
+        //
+        // Asked as "is the path there", never as "does it hold a value": a column a target was created
+        // with and no row ever filled reads as an empty value, and that is the very shape this exists
+        // to catch - a table built to a column the pipeline does not produce. Reading the value instead
+        // would call that column absent and agree with a target that has it.
+        doc.absent().forEach(path -> {
+            if (pathPresent(document, path)) {
+                mismatches.add(doc.table() + " carries " + path + " ("
+                        + valueAt(document, path).map(String::valueOf).orElse("empty")
+                        + "), and that path should not be there at all");
+            }
+        });
         return mismatches.isEmpty() ? Optional.empty() : Optional.of(String.join("; ", mismatches));
+    }
+
+    /**
+     * Whether a path is there at all, whatever it holds - the question {@link #valueAt} cannot answer,
+     * because a path present and empty and a path that does not exist are one answer to it.
+     */
+    private static boolean pathPresent(Map<String, Object> document, String path) {
+        Object current = document;
+        for (String segment : path.split("\\.")) {
+            int bracket = segment.indexOf('[');
+            String field = bracket < 0 ? segment : segment.substring(0, bracket);
+            if (!(current instanceof Map<?, ?> mapping) || !mapping.containsKey(field)) {
+                return false;
+            }
+            current = mapping.get(field);
+            while (bracket >= 0) {
+                int close = segment.indexOf(']', bracket);
+                if (close < 0) {
+                    throw new EnvelopeException("the path " + path + " leaves an index unclosed");
+                }
+                int index = Integer.parseInt(segment.substring(bracket + 1, close));
+                if (!(current instanceof List<?> list) || index >= list.size()) {
+                    return false;
+                }
+                current = list.get(index);
+                bracket = segment.indexOf('[', close);
+            }
+        }
+        return true;
     }
 
     /**
@@ -402,6 +453,25 @@ public final class E2eExecutor {
                         + " expected "
                         + expected
                         + " changes that could not be placed in a document, found "
+                        + actual.map(Object::toString).orElse("no published observation"));
+    }
+
+    /**
+     * Reads the same unobserved window the same way as the matchers above. An observed nought and an
+     * observed nothing are the same answer here, as with discarded changes: the face carries no total until
+     * something settles. What that costs is that asserting nought is only an assertion beside a sibling
+     * asserting a real total - on its own it is satisfied by a pipeline that published no totals at all.
+     */
+    private Optional<String> recordsOutMismatch(long expected, String pipelineId) {
+        Optional<Long> actual = binding.recordsOut(pipelineId);
+        if (actual.filter(published -> published == expected).isPresent()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                pipelineId
+                        + " expected "
+                        + expected
+                        + " rows confirmed by a target, found "
                         + actual.map(Object::toString).orElse("no published observation"));
     }
 

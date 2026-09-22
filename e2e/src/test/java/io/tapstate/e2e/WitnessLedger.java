@@ -15,7 +15,9 @@ import java.nio.file.StandardOpenOption;
  * is written only at the end of a run that held every assertion, so a witness that was skipped,
  * aborted, or never discovered simply is not there, and the release gate reads the absence.
  *
- * <p>The ledger is truncated once per JVM, before the first line is written. That alone does not make
+ * <p>CI selections write separate files per JVM, so a second sweep cannot truncate the first.
+ * The default full sweep retains the manifest-compatible single ledger. That ledger is truncated
+ * once per JVM, before the first line is written. That alone does not make
  * a stale file impossible: a build whose witnesses were never discovered, or all of which aborted,
  * never reaches this class at all and would leave an earlier run's file standing. So the build deletes
  * the file before the phase that writes it, and this truncation covers the run started outside the
@@ -30,10 +32,19 @@ final class WitnessLedger {
      * reads, and the gate would fail for absence with the evidence sitting in another directory.
      */
     private static final Path LEDGER =
-            Path.of(System.getProperty("tapstate.e2e.build-directory", "target"), "witness-ledger.txt");
+            Path.of(System.getProperty("tapstate.e2e.build-directory", "target"),
+                    System.getProperty(PublishedExampleSelection.PROPERTY) == null ? "witness-ledger.txt"
+                            : "witness-ledgers/" + ProcessHandle.current().pid() + ".txt");
     private static boolean truncated;
 
     private WitnessLedger() {
+    }
+
+    static void record(Path specification, Tiers tier) {
+        String example = System.getProperty(PublishedExampleSelection.PROPERTY) == null
+                ? specification.getParent().getFileName().toString()
+                : specification.toString().replace('\\', '/');
+        record(example, tier);
     }
 
     /** Records one witness as executed and passed, in the form the manifest names it. */

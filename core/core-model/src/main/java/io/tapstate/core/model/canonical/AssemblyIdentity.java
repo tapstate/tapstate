@@ -30,20 +30,18 @@ import java.util.List;
  * why the answer there stays a refusal rather than becoming a rebuild.
  *
  * <p>Erasing rather than listing field names is the point: the switch is removed from the resource and
- * the remainder is re-serialized, so any field this class does not know about is still in the text being
+ * the remainder is hashed whole, so any field this class does not know about is still in what is being
  * compared. A field added to a pipeline tomorrow is outside the whitelist by default, which is the safe
  * direction for a whitelist to fail in.
  */
 public final class AssemblyIdentity {
-
-    private static final CanonicalWriter WRITER = new CanonicalWriter();
 
     private AssemblyIdentity() {
     }
 
     /** The content hash of {@code resource} with every whitelisted field erased. */
     public static String of(Resource resource) {
-        return CanonicalHash.of(WRITER.write(withWhitelistedFieldsErased(resource)));
+        return CanonicalHash.of(withWhitelistedFieldsErased(resource));
     }
 
     private static Resource withWhitelistedFieldsErased(Resource resource) {

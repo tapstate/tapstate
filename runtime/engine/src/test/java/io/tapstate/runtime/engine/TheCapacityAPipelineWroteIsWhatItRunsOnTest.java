@@ -52,14 +52,14 @@ class TheCapacityAPipelineWroteIsWhatItRunsOnTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("customer", FromRef.literal("customers"));
         aliases.put("policy", FromRef.literal("policies"));
-        return Step.inline(nodeId, FromClause.aliases(aliases), body, null, null);
+        return Step.inline(nodeId, FromClause.aliases(aliases), body, null);
     }
 
     private static PipelineResource pipelineOf(Step... steps) {
         List<Step> transforms = new ArrayList<>(List.of(steps));
         return new PipelineResource(PIPELINE, null, List.of(SourceRef.bare("customers"), SourceRef.bare("policies")), transforms, null,
                 new ServeBlock.Inline("serve", FromRef.literal(transforms.get(transforms.size() - 1).id()),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
     }
 
@@ -126,7 +126,7 @@ class TheCapacityAPipelineWroteIsWhatItRunsOnTest {
         NestSettings base = NestSettings.defaults().withEntriesHeldInMemory(40_000);
         PipelineResource pipeline = new PipelineResource(PIPELINE, null, List.of(SourceRef.bare("customers")), null, null,
                 new ServeBlock.Inline("serve", FromRef.literal("customers"),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         assertThat(settingsFor(pipeline, base)).isSameAs(base);

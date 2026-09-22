@@ -76,6 +76,8 @@ public final class CaptureRunUnit {
     private final SrsCoordinator coordinator;
     private final SrsMetaStore meta;
     private final HazelcastInstance hz;
+    /** The fallback for direct callers that do not supply the product's durable per-pipeline generation. */
+    private final AtomicLong chainlessSnapshotEpoch = new AtomicLong();
 
     public CaptureRunUnit(CapturePort port, SrsCoordinator coordinator, SrsMetaStore meta, HazelcastInstance hz) {
         this.port = Objects.requireNonNull(port, "port");
@@ -129,6 +131,9 @@ public final class CaptureRunUnit {
                 chainCreated = !merged;
             }
 
+            // Opened before the load, not with the tail: the load's rows are this run's too, and an
+            // account opened after them would report a run that had read nothing until its first change.
+            CaptureHealth health = new CaptureHealth();
             long snapshotCount = 0;
             // The seam this run's own load began at, for the tail that follows it -- null when no load ran
             // here. Carried from the phase rather than read back off the chain, because the chain records
@@ -145,22 +150,30 @@ public final class CaptureRunUnit {
             // first's answer and skip a load it never did.
             if (plan.snapshot()) {
                 Consumer<Envelope> snapshotPassthrough = event -> {
+                    // Two tallies of rows that overlap, kept apart because they answer different
+                    // questions: this one is what the load read, reported once it finishes and used to
+                    // say which tables it covered; the other is what the run has received at all, which
+                    // goes on climbing over the tail that follows.
                     snapshotCounts.merge(event.src(), 1L, Long::sum);
+                    health.received(event);
                     passthrough.accept(event);
                 };
-                // A chainless read has no ring and so no generation to order its rows against: they carry no
-                // order at all, which a stateful node downstream rejects rather than guesses at.
+                // A chainless read has no ring generation, but its rows still enter the same stateful graph.
+                // Its caller therefore assigns a run generation of its own; the drain stamps it at the one
+                // shared boundary every chainless snapshot passes through.
                 if (chainId != null) {
                     SnapshotPhase.Outcome loaded = SnapshotPhase.run(port, spec.config(), chainId.value(),
                             spec.pipelineId(), tables, epoch, meta, snapshotPassthrough);
                     snapshotCount = loaded.rows();
                     ownSeam = loaded.tailSeam();
                 } else {
-                    snapshotCount = SnapshotPhase.drain(port, spec.config(), snapshotPassthrough);
+                    long snapshotEpoch = spec.snapshotEpoch() > 0
+                            ? spec.snapshotEpoch() : chainlessSnapshotEpoch.incrementAndGet();
+                    snapshotCount = SnapshotPhase.drain(
+                            port, spec.config(), snapshotEpoch, snapshotPassthrough);
                 }
             }
 
-            CaptureHealth health = new CaptureHealth();
             Optional<StreamSource<SrsItem>> ringSource = Optional.empty();
             if (plan.sharedRing()) {
                 String cid = chainId.value();
@@ -192,7 +205,8 @@ public final class CaptureRunUnit {
                     LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
                     routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
                 }
-                CaptureStart minerStart = tailStart(meta, cid, ownSeam, CaptureStart.present());
+                CaptureStart minerStart = tailStart(
+                        meta, cid, spec.pipelineId(), ownSeam, CaptureStart.present());
                 refuseAnInstantThisBufferWillNeverReach(
                         spec.startFrom(), minerStart, spec.retention());
                 subscription = Optional.of(CdcPhase.run(
@@ -224,7 +238,8 @@ public final class CaptureRunUnit {
                 AtomicLong forwarded = new AtomicLong();
                 AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
                 subscription = Optional.of(port.cdc(
-                        spec.config(), tailStart(meta, directChain, ownSeam, sourceStart(spec.startFrom())),
+                        spec.config(), tailStart(
+                                meta, directChain, spec.pipelineId(), ownSeam, sourceStart(spec.startFrom())),
                         health.recording((events, position) -> forwardDirect(
                                 events, position, directChain, directEpoch, forwarded,
                                 directConsumers, directLastWritten, passthrough))));
@@ -335,7 +350,7 @@ public final class CaptureRunUnit {
     }
 
     /**
-     * Where this chain's tail begins, read back from the durable record rather than assumed.
+     * Where this pipeline run's tail begins, read back from the durable record rather than assumed.
      *
      * <p>Four states, in this order, and the order is the whole of it:
      *
@@ -344,9 +359,9 @@ public final class CaptureRunUnit {
      *       cover every change since, or a row this load read and the source then changed is left at the
      *       value the load saw;</li>
      *   <li>a recorded read offset — the tail ran before and got this far, so it picks up there;</li>
-     *   <li>no read offset but a recorded seam — the snapshot ran and the tail has not advanced past
-     *       where the snapshot began, so it starts at the seam and the idempotent sink absorbs the
-     *       overlap;</li>
+     *   <li>no read offset but this pipeline's recorded seam — its snapshot ran and the tail has not
+     *       advanced past where that snapshot began, so it starts at the seam and the idempotent sink
+     *       absorbs the overlap;</li>
      *   <li>none of those — nothing has read this chain, so {@code firstRun} decides: the start the
      *       caller resolved for a run that has no position to pick up from.</li>
      * </ol>
@@ -362,7 +377,11 @@ public final class CaptureRunUnit {
      * the tail comes up healthy, and every change between where it had reached and now is simply gone.
      */
     private static CaptureStart tailStart(
-            SrsMetaStore meta, String miningChainId, String ownSnapshotSeam, CaptureStart firstRun) {
+            SrsMetaStore meta,
+            String miningChainId,
+            String pipelineId,
+            String ownSnapshotSeam,
+            CaptureStart firstRun) {
         if (ownSnapshotSeam != null) {
             return CaptureStart.resume(new SourcePosition(ownSnapshotSeam));
         }
@@ -371,9 +390,11 @@ public final class CaptureRunUnit {
                     if (record.sourceReadOffset() != null) {
                         return CaptureStart.resume(new SourcePosition(record.sourceReadOffset()));
                     }
-                    return record.cdcStartPosition() == null
-                            ? firstRun
-                            : CaptureStart.resume(new SourcePosition(record.cdcStartPosition()));
+                    return record.consumerOffset(pipelineId)
+                            .map(consumer -> consumer.cdcStartPosition() == null
+                                    ? firstRun
+                                    : CaptureStart.resume(new SourcePosition(consumer.cdcStartPosition())))
+                            .orElse(firstRun);
                 })
                 .orElse(firstRun);
     }

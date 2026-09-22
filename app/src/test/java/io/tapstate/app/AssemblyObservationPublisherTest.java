@@ -42,7 +42,7 @@ class AssemblyObservationPublisherTest {
     @Test
     void projectsThePerTableSinkAckedPositionAndKeepsRecordCountAbsentWithNoLiveJob() {
         SourceResource source = new SourceResource("orders_src", null, "fake", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal(TABLE)), null, null, null);
+                SourceMode.CDC, List.of(TableRef.literal(TABLE)), null, null);
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source);
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("orders_src", true)), null, null, null, null, null));
@@ -68,8 +68,8 @@ class AssemblyObservationPublisherTest {
                 .as("the factory binds the position port and the publisher projects it, keyed by table")
                 .containsExactly(entry(TABLE, "w7"));
         assertThat(observed.metrics())
-                .as("recordCount is absent with no live job (present-only); errorCount stays present at 0")
-                .containsEntry("errorCount", 0L)
+                .as("recordCount is absent with no live job (present-only), and so is any failure count")
+                .doesNotContainKey("errorCount")
                 .doesNotContainKey("recordCount");
     }
 

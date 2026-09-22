@@ -4,11 +4,16 @@ import io.tapstate.control.core.AuditContext;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.DerivedSchemas;
+import io.tapstate.control.core.LivePipelines;
+import io.tapstate.control.core.SchemaDerivation;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.SyncElement;
-import io.tapstate.core.sql.OutputField;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
@@ -25,7 +30,14 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Reports and accepts what a pipeline's join steps work their own columns out to be.
+ * Reports and accepts what a pipeline's steps work their own columns out to be, and re-takes the
+ * pipeline's copy of what its sources hold.
+ *
+ * <p>Three entry points, and the difference between them is only what they are allowed to refuse: the
+ * report reads, the accept re-copies and records, and the derivation an apply runs re-copies without
+ * holding anything to what it was recorded producing. The copy itself is the assembly's, borrowed
+ * rather than written a second time here - two ways of taking one copy would drift apart, and the shape
+ * that takes is a record a start then refuses.
  *
  * <p>The comparison is deliberately assembled from the same compile a start runs, borrowed rather than
  * repeated. A second implementation of the derivation would be two answers with nothing comparing
@@ -38,7 +50,7 @@ import java.util.Set;
  * as agreement - an unknown reported as agreement is the one answer here that sends someone to start a
  * pipeline that then truncates.
  */
-final class StoreBackedDerivedSchemas implements DerivedSchemas {
+final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivation {
 
     private final StorePort storePort;
     private final StoreBackedDagSource joins;
@@ -54,14 +66,34 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas {
     public List<StepReport> compare(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Map<String, Map<String, String>> targetColumns = targetColumns(pipelineId);
+        // While a job is carrying the pipeline, the recorded side is the version that job was assembled
+        // from rather than the newest one on file. The two are the same answer until somebody records a
+        // shape while the pipeline runs, and that is exactly when this report is read: answering with
+        // the newest would describe a pipeline that is not the one going on.
+        boolean live = aRunExists(pipelineId);
+        // Every node with a model of its own, not only the joins. A pipeline without a join used to
+        // answer with an empty list, which is also what an unknown id answers - so the one face anyone
+        // can ask said nothing at all about a source table that grew a column between two runs.
+        Map<String, StoreBackedDagSource.CompiledJoin> compiledJoins =
+                joins.compiledJoinsOf(pipelineId);
         List<StepReport> reports = new ArrayList<>();
-        joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> {
-            Map<String, String> derived = columnsOf(compiled);
-            Map<String, String> recorded = storePort.derivedSchemas().latest(pipelineId, stepId)
+        joins.derivedNodesOf(pipelineId).forEach((nodeId, node) -> {
+            // A node nobody can describe - a script, or anything under one - is left out rather than
+            // reported with no columns: an empty row reads as a node that produces nothing, and the
+            // two want opposite reactions.
+            if (!node.known()) {
+                return;
+            }
+            Map<String, String> derived = node.columns();
+            Map<String, String> recorded = heldBy(live, pipelineId, nodeId)
                     .map(DerivedSchema::schema)
                     .orElse(Map.of());
-            String table = compiled.factTable();
-            Map<String, String> target = targetColumns.get(table);
+            // Only a join writes into a table of its own here; a source node reads one and a step
+            // passes rows on, so naming a table for either would report what it reads as what it
+            // writes.
+            StoreBackedDagSource.CompiledJoin compiled = compiledJoins.get(nodeId);
+            String table = compiled == null ? null : compiled.factTable();
+            Map<String, String> target = table == null ? null : targetColumns.get(table);
             Set<String> names = new LinkedHashSet<>(recorded.keySet());
             names.addAll(derived.keySet());
             List<ColumnReport> columns = new ArrayList<>();
@@ -69,7 +101,7 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas {
                 columns.add(new ColumnReport(name, recorded.get(name), derived.get(name),
                         target == null ? null : target.get(name)));
             }
-            reports.add(new StepReport(stepId, table, target != null, columns));
+            reports.add(new StepReport(nodeId, table, target != null, columns));
         });
         return List.copyOf(reports);
     }
@@ -78,25 +110,81 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas {
     public void accept(String principal, String pipelineId) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(pipelineId, "pipelineId");
+        refuseUnlessAtRest(pipelineId);
         auditGate.dispatch(ControlOperations.PIPELINE_ACCEPT_DERIVED_SCHEMA,
                 new AuditContext(principal, pipelineId), () -> {
+                    // The physical model first, then everything worked out from it. This order is what
+                    // makes the act one thing rather than two: a re-derivation over source copies that
+                    // were not refreshed records today's answer to yesterday's question, and the report
+                    // afterwards agrees with itself while agreeing with nothing outside.
+                    joins.copySourceSchemas(pipelineId);
                     // Recorded through the same class the gate records through, so accepting cannot
                     // write a shape a start would then refuse - which is what a second write path here
                     // would eventually do.
                     JoinSchemaDrift accepting = new JoinSchemaDrift(storePort.derivedSchemas());
                     joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> accepting.record(
-                            pipelineId, stepId, compiled.sql(), compiled.plan(), compiled.tables()));
+                            pipelineId, stepId, compiled.body(), compiled.plan(), compiled.tables()));
+                    joins.refreshStepSchemas(pipelineId);
                     return null;
                 });
     }
 
-    /** The columns a join publishes: output name to declared type, in the order it publishes them. */
-    private static Map<String, String> columnsOf(StoreBackedDagSource.CompiledJoin compiled) {
-        Map<String, String> columns = new LinkedHashMap<>();
-        for (OutputField field : compiled.plan().outputFields()) {
-            columns.put(field.name(), JoinSchemaDrift.declaredType(field));
+    @Override
+    public void derive(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        // Apply converts this coded refusal into a warning after committing its artifacts. The held
+        // run keeps its models; pipelines that are at rest can still refresh in the same batch.
+        refuseUnlessAtRest(pipelineId);
+        joins.copySourceSchemas(pipelineId);
+        joins.refreshStepSchemas(pipelineId);
+    }
+
+    /**
+     * A paused run still holds its original assembly, and a resume with an unchanged artifact revision
+     * may reuse it. Model refresh does not change that revision, so both actual and desired lifecycle
+     * states must be at rest before any record is moved.
+     */
+    private void refuseUnlessAtRest(String pipelineId) {
+        PipelineState actual = actualStateOf(pipelineId);
+        PipelineState desired = desiredStateOf(pipelineId);
+        if (!LivePipelines.isAtRest(actual, desired)) {
+            throw new TapstateException(ActuationError.SCHEMA_SYNC_WHILE_RUNNING,
+                    Map.of("pipeline", pipelineId, "state", actual.name(), "desired", desired.name()),
+                    null);
         }
-        return columns;
+    }
+
+    /** Whether a run of this pipeline exists to be holding anything - one going on, or one paused. */
+    private boolean aRunExists(String pipelineId) {
+        PipelineState actual = actualStateOf(pipelineId);
+        return actual == PipelineState.RUNNING || actual == PipelineState.PAUSED;
+    }
+
+    /**
+     * The derivation a reader should be shown: what the run holds while one exists, and what is on file
+     * otherwise. A run whose step was never pinned - one started before this was written down - falls
+     * back to the latest rather than reporting nothing, which is the answer that side used to give.
+     */
+    private Optional<DerivedSchema> heldBy(boolean live, String pipelineId, String stepId) {
+        if (live) {
+            Optional<DerivedSchema> pinned = storePort.derivedSchemas().pinned(pipelineId, stepId);
+            if (pinned.isPresent()) {
+                return pinned;
+            }
+        }
+        return storePort.derivedSchemas().latest(pipelineId, stepId);
+    }
+
+    private PipelineState actualStateOf(String pipelineId) {
+        return storePort.state().read(pipelineId)
+                .map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
+                .orElse(PipelineState.NEW);
+    }
+
+    private PipelineState desiredStateOf(String pipelineId) {
+        return storePort.desired().read(pipelineId)
+                .map(DesiredState::targetState)
+                .orElse(PipelineState.NEW);
     }
 
     /**

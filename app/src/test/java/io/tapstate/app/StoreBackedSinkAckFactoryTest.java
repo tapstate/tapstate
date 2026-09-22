@@ -54,7 +54,7 @@ class StoreBackedSinkAckFactoryTest {
     void persistsTheChainsCdcStartForAPositionThatCarriesNoTokenOfItsOwn() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);
-        store.setCdcStart("mc-orders", "w0", 1L);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
         HazelcastInstance member = memberWith(store);
 
         SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
@@ -70,7 +70,7 @@ class StoreBackedSinkAckFactoryTest {
     void marksTheTableSnapshotCompleteWhenTheFrontierConfirmsItsSnapshotRows() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);
-        store.setCdcStart("mc-orders", "w0", 1L);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
         HazelcastInstance member = memberWith(store);
 
         SinkAck ack = new StoreBackedSinkAckFactory(
@@ -96,7 +96,7 @@ class StoreBackedSinkAckFactoryTest {
     void theSnapshotMarkSurvivesTheAdvancesThatFollowIt() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);
-        store.setCdcStart("mc-orders", "w0", 1L);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
         HazelcastInstance member = memberWith(store);
 
         SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
@@ -140,11 +140,25 @@ class StoreBackedSinkAckFactoryTest {
         SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
 
         // The capture writes where cdc begins before it drains a snapshot, so a snapshot row reaching a sink
-        // without one means the chain was never seeded. Writing an absent position over a real one would be
-        // a frontier that silently went backwards.
+        // without one means this pipeline was never seeded. Writing an absent position over a real one would
+        // be a frontier that silently went backwards.
         assertThatThrownBy(() -> ack.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("mc-orders");
+    }
+
+    @Test
+    void aSnapshotAckDoesNotBorrowAnotherPipelinesCdcStart() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
+        HazelcastInstance member = memberWith(store);
+
+        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-2").resolve(member);
+
+        assertThatThrownBy(() -> ack.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("pipe-2");
     }
 
     @Test

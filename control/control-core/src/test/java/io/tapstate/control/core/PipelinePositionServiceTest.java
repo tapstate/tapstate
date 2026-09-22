@@ -61,7 +61,7 @@ class PipelinePositionServiceTest {
                 List.of(new ConsumerOffset("orders_sync", Map.of(),
                         new ChainPosition(new SourceOrder(3L, 91100L), "mysql-bin.000004:100")),
                         new ConsumerOffset("orders_audit", Map.of(), null)),
-                null, List.of(), null, 3L, 0L, WRITTEN_AT));
+                List.of(), null, 3L, WRITTEN_AT));
 
         PipelinePosition.Chain chain = service.read("orders_sync").chains().getFirst();
 
@@ -71,7 +71,7 @@ class PipelinePositionServiceTest {
         assertThat(chain.resumeFrom())
                 .isEqualTo(new PipelinePosition.Point("mysql-bin.000004:154", 3L, 91201L));
         assertThat(chain.recordedAt()).isEqualTo("2026-09-03T10:12:44Z");
-        assertThat(chain.sinkAcked())
+        assertThat(chain.targetAcked())
                 .isEqualTo(new PipelinePosition.Point("mysql-bin.000004:100", 3L, 91100L));
         // The other pipeline on the chain is named, because a write-back moves the chain for it too.
         assertThat(chain.sharedWith()).containsExactly("orders_audit");
@@ -86,7 +86,7 @@ class PipelinePositionServiceTest {
         assertThat(chain.chainId()).isEqualTo(CHAIN);
         assertThat(chain.resumeFrom()).isNull();
         assertThat(chain.recordedAt()).isNull();
-        assertThat(chain.sinkAcked()).isNull();
+        assertThat(chain.targetAcked()).isNull();
     }
 
     /**
@@ -98,7 +98,7 @@ class PipelinePositionServiceTest {
     void reportsAWrittenBackPositionWithNoRingCoordinate() {
         onOneChain("orders_sync");
         meta.put(new SrsMeta(CHAIN, new ChainPosition(null, "mysql-bin.000001:4"),
-                List.of(), null, List.of(), null, 3L, 0L, WRITTEN_AT));
+                List.of(), List.of(), null, 3L, WRITTEN_AT));
 
         assertThat(service.read("orders_sync").chains().getFirst().resumeFrom())
                 .isEqualTo(new PipelinePosition.Point("mysql-bin.000001:4", null, null));
@@ -136,11 +136,11 @@ class PipelinePositionServiceTest {
         atRest("orders_audit");
         meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(3L, 91201L), "mysql-bin.000004:154"),
                 List.of(new ConsumerOffset("orders_sync", Map.of("orders", 12L),
-                                new ChainPosition(new SourceOrder(3L, 91100L), "mysql-bin.000004:100"),
-                                List.of("orders")),
+                        new ChainPosition(new SourceOrder(3L, 91100L), "mysql-bin.000004:100"),
+                        List.of("orders"), "mysql-bin.000003:1", 2L),
                         new ConsumerOffset("orders_audit", Map.of(),
                                 new ChainPosition(new SourceOrder(3L, 5L), "mysql-bin.000004:5"))),
-                null, List.of(), null, 3L, 0L, WRITTEN_AT));
+                List.of(), null, 3L, WRITTEN_AT));
 
         service.writeBack("alice", "orders_sync",
                 new PipelinePosition("orders_sync",
@@ -156,6 +156,8 @@ class PipelinePositionServiceTest {
                 .filter(offset -> offset.pipelineId().equals("orders_sync")).findFirst().orElseThrow();
         assertThat(mine.perTableSeq()).containsEntry("orders", 12L);
         assertThat(mine.snapshotCompletedTables()).containsExactly("orders");
+        assertThat(mine.cdcStartPosition()).isEqualTo("mysql-bin.000003:1");
+        assertThat(mine.snapshotEpoch()).isEqualTo(2L);
     }
 
     @Test
@@ -186,7 +188,7 @@ class PipelinePositionServiceTest {
         running("orders_audit");
         meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(3L, 9L), "mysql-bin.000004:154"),
                 List.of(new ConsumerOffset("orders_audit", Map.of(), null)),
-                null, List.of(), null, 3L, 0L, WRITTEN_AT));
+                List.of(), null, 3L, WRITTEN_AT));
 
         TapstateException refused = refuse("orders_sync", CHAIN, "mysql-bin.000001:4");
 
@@ -237,7 +239,7 @@ class PipelinePositionServiceTest {
         meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(3L, 9L), "mysql-bin.000004:154"),
                 List.of(new ConsumerOffset("orders_sync", Map.of(),
                         new ChainPosition(new SourceOrder(3L, 5L), "mysql-bin.000004:100"))),
-                null, List.of(), null, 3L, 0L, WRITTEN_AT));
+                List.of(), null, 3L, WRITTEN_AT));
 
         TapstateException refused = catchThrowableOfType(TapstateException.class,
                 () -> service.writeBack("alice", "orders_sync",
@@ -246,7 +248,7 @@ class PipelinePositionServiceTest {
                                 null, PipelinePosition.Point.at("mysql-bin.000009:1"), List.of())))));
 
         assertThat(refused.code()).isEqualTo(PositionError.FIELD_NOT_EDITABLE);
-        assertThat(refused.args()).containsEntry("field", "sinkAcked");
+        assertThat(refused.args()).containsEntry("field", "targetAcked");
         assertThat(meta.rewinds).isEmpty();
     }
 
@@ -279,7 +281,7 @@ class PipelinePositionServiceTest {
         atRest("orders_sync");
         meta.put(seeded("mysql-bin.000004:154"));
         meta.put(new SrsMeta(OTHER_CHAIN, new ChainPosition(new SourceOrder(1L, 1L), "mysql-bin.000002:9"),
-                List.of(), null, List.of(), null, 1L, 0L, WRITTEN_AT));
+                List.of(), List.of(), null, 1L, WRITTEN_AT));
 
         TapstateException refused = catchThrowableOfType(TapstateException.class,
                 () -> service.writeBack("alice", "orders_sync",
@@ -311,7 +313,7 @@ class PipelinePositionServiceTest {
 
     private static SrsMeta seeded(String token) {
         return new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(3L, 91201L), token),
-                List.of(), null, List.of(), null, 3L, 0L, WRITTEN_AT);
+                List.of(), List.of(), null, 3L, WRITTEN_AT);
     }
 
     private void atRest(String pipelineId) {
@@ -325,7 +327,7 @@ class PipelinePositionServiceTest {
     }
 
     private static SourceResource source(String id) {
-        return new SourceResource(id, null, "mysql", Map.of(), null, null, null,
+        return new SourceResource(id, null, "mysql", Map.of(), null, null,
                 new Srs(null, null, null, null, true), null);
     }
 
@@ -382,8 +384,8 @@ class PipelinePositionServiceTest {
             rewinds.add(Map.entry(miningChainId, token));
             SrsMeta held = records.get(miningChainId);
             records.put(miningChainId, new SrsMeta(miningChainId, new ChainPosition(null, token),
-                    held.consumerOffsets(), held.cdcStartPosition(), held.schemaHistory(),
-                    held.retention(), held.epoch(), held.snapshotEpoch(), WRITTEN_AT));
+                    held.consumerOffsets(), held.schemaHistory(),
+                    held.retention(), held.epoch(), WRITTEN_AT));
         }
 
         @Override
@@ -404,8 +406,7 @@ class PipelinePositionServiceTest {
                 next.add(existing.pipelineId().equals(offset.pipelineId()) ? offset : existing);
             }
             records.put(miningChainId, new SrsMeta(miningChainId, held.sourceRead(), next,
-                    held.cdcStartPosition(), held.schemaHistory(), held.retention(), held.epoch(),
-                    held.snapshotEpoch(), held.sourceReadAt()));
+                    held.schemaHistory(), held.retention(), held.epoch(), held.sourceReadAt()));
         }
 
         @Override
@@ -420,7 +421,8 @@ class PipelinePositionServiceTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             throw new UnsupportedOperationException("setCdcStart");
         }
 

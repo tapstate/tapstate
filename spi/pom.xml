@@ -27,6 +27,7 @@
     <module>spi-sink</module>
     <module>spi-store</module>
     <module>spi-transform</module>
+    <module>spi-metrics</module>
   </modules>
 
   <dependencyManagement>

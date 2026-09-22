@@ -59,6 +59,31 @@
       }
     },
     {
+      "name": "schemaRegistryType",
+      "type": "string",
+      "label": {
+        "en_US": "Schema Registry Type"
+      },
+      "required": false,
+      "default": "CONFLUENT",
+      "secret": false,
+      "options": [
+        {
+          "value": "CONFLUENT",
+          "label": {
+            "en_US": "CONFLUENT"
+          }
+        },
+        {
+          "value": "HORTONWORKS",
+          "label": {
+            "en_US": "HORTONWORKS"
+          }
+        }
+      ],
+      "visibleWhen": null
+    },
+    {
       "name": "registrySchemaType",
       "type": "string",
       "label": {
@@ -518,7 +543,7 @@
     },
     {
       "name": "batchMaxDelay",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Consumption timeout (ms)"
       },
@@ -671,7 +696,7 @@
   ],
   "provenance": {
     "specPath": "connectors/kafka-enhanced-connector/src/main/resources/spec_kafka_enhanced.json",
-    "specContentHash": "b6cc097f3cfa4036",
+    "specContentHash": "216470726861d3dc",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

@@ -99,6 +99,31 @@ public enum ConnectorError implements TapstateErrorCode {
     SPEC_INVALID("connector.spec-invalid", Set.of("artifact", "spec", "detail")),
 
     /**
+     * A connection config value cannot be converted to the type the connector's own connection form
+     * declares for that field, so the connector would cast it and crash. Refused with a diagnosis
+     * instead. {@code connector} is the connector id; {@code field} is the config field; {@code expected}
+     * is the type its form declares; {@code value} is what the connection holds.
+     */
+    CONFIG_TYPE_MISMATCH("connector.config-type-mismatch",
+            Set.of("connector", "field", "expected", "value")),
+
+    /**
+     * Oracle LogMiner cannot represent an identifier longer than its documented limit, so starting CDC
+     * with one would produce a healthy-looking stream that silently omits its changes. {@code connector}
+     * is the Oracle connector id; {@code kind} is schema, table or column; {@code identifier} is the
+     * refused name; {@code limit} is the supported character count.
+     */
+    LOGMINER_IDENTIFIER_TOO_LONG("connector.logminer-identifier-too-long",
+            Set.of("connector", "kind", "identifier", "limit")),
+
+    /**
+     * Oracle LogMiner did not finish connector initialization and schema discovery within the start
+     * deadline, so its worker and connector were stopped instead of holding the reconciliation loop.
+     * {@code connector} is the Oracle connector id; {@code timeout} is how long preflight was given.
+     */
+    LOGMINER_PREFLIGHT_TIMEOUT("connector.logminer-preflight-timeout", Set.of("connector", "timeout")),
+
+    /**
      * The connector requires a newer PDK API level than the bridge provides, so it is refused rather
      * than silently downgraded. {@code connector} is the connector id; {@code required} is the level
      * it asked for; {@code provided} is the level the bridge provides.

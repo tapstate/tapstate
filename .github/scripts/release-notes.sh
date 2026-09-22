@@ -120,15 +120,31 @@ Preview build — single-node, in-memory runtime, not for production.
 ${grouped}
 ## Known limits in this preview
 
-These are disclosed rather than fixed, and no shipped scenario covers either one. For a change
-the connector has read, delivery is at-least-once — never exactly-once. The second limit below
-is a change the connector never reads at all, which no delivery guarantee can cover.
+The first two limits below concern delivery and have no shipped scenario coverage. For a change
+the connector has read, delivery is at-least-once — never exactly-once. The positioning limit
+concerns a change the connector never reads, which no delivery guarantee can cover.
 
 * **Duplicate rows on an insert-only target.** Where the target does not upsert, the snapshot
   read and the change-data-capture read overlap, and a row seen by both is written twice.
 * **Changes lost while the change stream positions itself.** The position is recorded before
   the snapshot runs and is not handed to the connector's stream read until afterwards, so a
   change written to the source inside that window can be missed.
+
+* **Join does not produce fan-out.** Keep each dimension unique on its complete join key.
+  Duplicate dimension keys replace the earlier match with the later-arriving row; there is no
+  uniqueness guard. One fact row cannot produce multiple joined rows.
+* **Join accepts a restricted SQL shape.** Use equality joins from the driving fact source to
+  each dimension. FULL OUTER and non-equality joins, dimension-to-dimension chains,
+  WHERE, aggregation, subqueries, and ordering/pagination are unsupported. This is not a general
+  SQL query engine.
+* **Join output keys must be published for keyed writes.** For default/upsert sync, publish every fact primary-key column
+  as a direct column reference in SELECT (aliases are allowed). Expressions cannot substitute
+  for key columns, and composite keys must be complete. Append-only sync is exempt from this
+  projection requirement; views validate their own declared keys. This does not change delivery
+  guarantees or make append-only output a maintained current-state table.
+
+See the [Join limits and usage engineering draft](https://github.com/tapstate/tapstate/blob/${sha}/docs/join/README.md)
+for the complete SQL subset and configuration requirements for this revision.
 
 <!-- Known issues: paste the user-visible defects this release is knowingly shipping with, and
      delete this section if there are none. The list of them is not fetched for you and must not

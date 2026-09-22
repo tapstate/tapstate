@@ -4,7 +4,6 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.canonical.CanonicalHash;
-import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
 import io.tapstate.testsupport.RequiresDocker;
@@ -47,7 +46,7 @@ class MongoPipelineDraftStoreIT {
             assertThat(store.create(initial)).isEqualTo(PipelineDraftMutation.CREATED);
 
             Resource artifact = artifact("orders");
-            String artifactHash = CanonicalHash.of(new CanonicalWriter().write(artifact));
+            String artifactHash = CanonicalHash.of(artifact);
             assertThat(store.publish(new PipelineDraft.Publication("orders", 1, null, artifact, artifactHash,
                     Instant.parse("2026-09-21T01:00:00Z"), "publisher")))
                     .isEqualTo(PipelineDraftMutation.PUBLISHED);

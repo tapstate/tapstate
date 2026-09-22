@@ -100,8 +100,8 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         assertThat(chain.sourceRead())
                 .as("how far the chain had read")
                 .isEqualTo(new ChainPosition(new SourceOrder(1L, 500L), "token-500"));
-        assertThat(chain.cdcStartPosition())
-                .as("the seam its tail resumes from -- losing this is what makes a survivor re-read")
+        assertThat(chain.consumerOffset("q").orElseThrow().cdcStartPosition())
+                .as("the seam the survivor's tail resumes from -- losing this makes it re-read")
                 .isEqualTo("seam-1");
         assertThat(chain.schemaHistory()).as("the schema the chain saw").hasSize(1);
         assertThat(fixture.consumersOnTheChain())
@@ -246,7 +246,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         private final SrsCoordinator srsCoordinator;
         private final StoreBackedPipelineCaptureCoordinator coordinator;
         private final SourceResource source = new SourceResource("orders_src", null, "mysql",
-                Map.of("host", "h"), SourceMode.CDC, List.of(TableRef.literal("orders")), null, null, null);
+                Map.of("host", "h"), SourceMode.CDC, List.of(TableRef.literal("orders")), null, null);
 
         Fixture() {
             InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
@@ -282,11 +282,13 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
             store.meta().upsertConsumerOffset(chainId(), new ConsumerOffset(pipelineId, Map.of(), null));
         }
 
-        /** The chain's own three fields, each written by the path that really writes it. */
+        /** The chain fields and each recorded consumer's seam, written by the paths that really write them. */
         void leaveWhatTheChainAccumulated() {
             store.meta().advanceSourceReadOffset(
                     chainId(), new ChainPosition(new SourceOrder(1L, 500L), "token-500"));
-            store.meta().setCdcStart(chainId(), "seam-1", 1L);
+            store.meta().consumerOffsets(chainId())
+                    .forEach(consumer -> store.meta().setCdcStart(
+                            chainId(), consumer.pipelineId(), "seam-1", 1L));
             store.meta().appendSchemaVersion(chainId(), new SchemaVersion(0, Map.of("id", "int"), 0));
         }
 
@@ -316,7 +318,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         private static PipelineResource pipeline(String id) {
             return new PipelineResource(id, null, List.of(SourceRef.spec("orders_src", true)), null, null,
                     new ServeBlock.Inline(null, FromRef.literal("orders_src"),
-                            List.of(new SyncElement("sync_1", "orders_src", null, null, null, null)), null, null),
+                            List.of(new SyncElement("sync_1", "orders_src", null, null, null)), null, null),
                     new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);
         }
     }

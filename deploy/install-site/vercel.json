@@ -2,11 +2,15 @@
   "rewrites": [
     {
       "source": "/",
-      "destination": "/quickstart.sh"
+      "destination": "/install.sh"
     },
     {
       "source": "/cli",
       "destination": "/install.sh"
+    },
+    {
+      "source": "/demo",
+      "destination": "/quickstart.sh"
     },
     {
       "source": "/e",

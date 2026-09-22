@@ -10,5 +10,3 @@ config:
   username: cdc_user
 mode: cdc
 tables: [ORDERS, ORDER_ITEMS, CUSTOMERS]
-options:
-  include_ddl: true

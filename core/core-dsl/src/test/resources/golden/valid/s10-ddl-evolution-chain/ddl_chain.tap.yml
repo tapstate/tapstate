@@ -15,9 +15,6 @@ view:
   storage:
     warm:
       collection: emp_mirror
-  schema:
-    enforce: true
-    evolution: additive
 serve:
   id: serve
   from: emp_mirror

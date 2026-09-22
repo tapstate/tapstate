@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.OutputField;
 import io.tapstate.core.sql.SourceColumn;
@@ -85,10 +87,10 @@ final class JoinSchemaDrift {
      * because it is not obvious: a reordering leaves the recorded order stale, so the report renders
      * the order last recorded rather than today's.
      */
-    void checkAndRecord(String pipelineId, String stepId, String sql, JoinPlan plan,
+    void checkAndRecord(String pipelineId, String stepId, TransformBody.Join body, JoinPlan plan,
             List<SourceTable> tables) {
-        Map<String, String> columns = columnsOf(plan);
-        String statement = fingerprintOf(sql);
+        Map<String, String> columns = columnsOf(body, plan);
+        String statement = fingerprintOf(body.sql());
         String derivedFrom = fingerprintOf(tables);
         Optional<DerivedSchema> recorded = records.latest(pipelineId, stepId);
         if (recorded.isPresent()
@@ -110,14 +112,61 @@ final class JoinSchemaDrift {
      * drift from this one eventually, and the shape that takes is an accept that does not clear the
      * refusal it was run for.
      */
-    void record(String pipelineId, String stepId, String sql, JoinPlan plan, List<SourceTable> tables) {
-        records.record(pipelineId, stepId, columnsOf(plan), fingerprintOf(sql), fingerprintOf(tables),
-                DERIVED_BY);
+    void record(String pipelineId, String stepId, TransformBody.Join body, JoinPlan plan,
+            List<SourceTable> tables) {
+        records.record(pipelineId, stepId, columnsOf(body, plan), fingerprintOf(body.sql()),
+                fingerprintOf(tables), DERIVED_BY);
     }
 
     /** How one derived column's type is written down, on every side that writes one down. */
     static String declaredType(OutputField field) {
-        return field.type() + (field.nullable() ? " NULL" : " NOT NULL");
+        return declaredType(field.type(), field.nullable());
+    }
+
+    /**
+     * The same rendering for a column that is not a join output - a source node copying a discovered
+     * column, say. It is an overload rather than a second renderer on purpose: two renderings of the
+     * same column drift apart eventually, and the shape that takes is a recorded schema that no longer
+     * equals the one the next start computes, which reads as a difference nobody made.
+     */
+    static String declaredType(TapstateType type, boolean nullable) {
+        return type + (nullable ? " NULL" : " NOT NULL");
+    }
+
+    /**
+     * The type half of a declared type, read back. It sits beside the renderer for the reason the
+     * renderer is single: a reader written somewhere else drifts from the writer eventually, and the
+     * shape that takes is a recorded column read back as a type it was never written as - which is a
+     * computed column judged in an environment that does not match the one it will run in.
+     *
+     * <p><b>An unreadable string bare-crashes rather than answering UNKNOWN.</b> Everything this reads
+     * was written by the renderer above, so a string it cannot read means a second writer exists
+     * somewhere - and that is the defect itself. Answering UNKNOWN would file it away as a column
+     * whose type merely failed to resolve, which is an ordinary state nobody investigates.
+     */
+    static TapstateType typeOf(String declaredType) {
+        int space = declaredType.indexOf(' ');
+        return TapstateType.valueOf(space < 0 ? declaredType : declaredType.substring(0, space));
+    }
+
+    /**
+     * The nullability half of a declared type, read back. It sits here for the reason {@link #typeOf}
+     * does - one writer, one reader - and it crashes on a string it cannot read for the same reason:
+     * everything it is handed came from the renderer above, so anything else means a second writer.
+     *
+     * <p>Read as the whole of what follows the type rather than as a suffix. {@code "INT64 NOT NULL"}
+     * ends with {@code " NULL"}, so a suffix test answers that a column which can never be absent may
+     * be - and a merge built on that answer widens every column it touches while looking correct.
+     */
+    static boolean nullableOf(String declaredType) {
+        int space = declaredType.indexOf(' ');
+        String rest = space < 0 ? "" : declaredType.substring(space + 1);
+        return switch (rest) {
+            case "NULL" -> true;
+            case "NOT NULL" -> false;
+            default -> throw new IllegalArgumentException(
+                    "not a declared type this renders: '" + declaredType + "'");
+        };
     }
 
     /**
@@ -144,13 +193,16 @@ final class JoinSchemaDrift {
                 ActuationError.JOIN_OUTPUT_SCHEMA_SOURCE_CHANGED, Map.copyOf(params), null);
     }
 
-    /** The columns this join publishes: output name to declared type, in the order it publishes them. */
-    private static Map<String, String> columnsOf(JoinPlan plan) {
-        Map<String, String> columns = new LinkedHashMap<>();
-        for (OutputField field : plan.outputFields()) {
-            columns.put(field.name(), declaredType(field));
-        }
-        return columns;
+    /**
+     * The columns this join publishes: output name to declared type, in the order it publishes them.
+     *
+     * <p>Asked of the same dispatch every other node's columns are worked out through, rather than
+     * worked out again here. Two answers to one question drift apart eventually, and the shape that
+     * takes is a start refused over a difference nobody made - which is precisely the report this
+     * class exists to make trustworthy.
+     */
+    private static Map<String, String> columnsOf(TransformBody.Join body, JoinPlan plan) {
+        return NodeColumns.of(body, Map.of(), plan).columns();
     }
 
     /** A fingerprint of what the author wrote. */

@@ -38,7 +38,7 @@ class ViewStoreSeedRunnerTest {
         SourceResource mine = new SourceResource(
                 ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "mongodb",
                 java.util.Map.of("isUri", true, "uri", "mongodb://elsewhere:27017/mine"),
-                null, null, null, null, null);
+                null, null, null, null);
         store.artifacts().create(mine);
 
         new ViewStoreSeedRunner(store.artifacts(), "mongodb://mongo:27017/tapstate", null).seed();

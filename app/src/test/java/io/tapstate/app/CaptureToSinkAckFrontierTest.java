@@ -300,16 +300,16 @@ class CaptureToSinkAckFrontierTest {
     private static InMemoryStorePort seedStore() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(SOURCE_ID, null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(TABLE)), null, null, null));
-        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
+                List.of(TableRef.literal(TABLE)), null, null));
+        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
         // A passthrough filter (keeps every change), so every fed position reaches the sink and the sink size
         // tracks the number of changes fed. cdc_only, so only the change tail runs.
         artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(SOURCE_ID, true)),
                 List.of(Step.inline("keep_all", FromClause.list(FromRef.literal(SOURCE_ID)),
-                        new TransformBody.Filter("true"), null, null)),
+                        new TransformBody.Filter("true"), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("keep_all"),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel(SOURCE_ID, "fake", 0L, new SourceModel(List.of(
@@ -483,10 +483,10 @@ class CaptureToSinkAckFrontierTest {
         store.artifacts().save(new PipelineResource(DIRECT_PIPELINE, null,
                 List.of(SourceRef.spec(SOURCE_ID, false)),
                 List.of(Step.inline("keep_all", FromClause.list(FromRef.literal(SOURCE_ID)),
-                        new TransformBody.Filter("true"), null, null)),
+                        new TransformBody.Filter("true"), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("keep_all"),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
         return store;
     }

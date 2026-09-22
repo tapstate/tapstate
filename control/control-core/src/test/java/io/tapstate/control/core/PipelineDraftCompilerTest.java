@@ -54,7 +54,7 @@ class PipelineDraftCompilerTest {
         String second = writer.write(compiler.compile(draft));
 
         assertThat(first).isEqualTo(second);
-        assertThat(CanonicalHash.of(first)).hasSize(64).isEqualTo(CanonicalHash.of(second));
+        assertThat(CanonicalHash.ofText(first)).hasSize(64).isEqualTo(CanonicalHash.ofText(second));
     }
 
     @Test
@@ -81,7 +81,7 @@ class PipelineDraftCompilerTest {
         assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm", "warehouse");
         assertThat(compiled.transforms()).extracting(Step::id).containsExactly("active-orders");
         assertThat(compiled.view()).isEqualTo(new ViewBlock.Inline(
-                "orders_view", io.tapstate.core.model.FromRef.literal("active-orders"), null, null, null));
+                "orders_view", io.tapstate.core.model.FromRef.literal("active-orders"), null, null));
         assertThat(compiled.serve()).isInstanceOf(ServeBlock.Inline.class);
         ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
         assertThat(serve.sync()).extracting(sync -> sync.source()).containsExactly("warehouse");

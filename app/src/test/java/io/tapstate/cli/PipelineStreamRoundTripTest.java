@@ -140,7 +140,8 @@ class PipelineStreamRoundTripTest {
         // production HttpControlPlaneClient. Proves the reason a pipeline died actually reaches a CLI-side
         // caller end to end, not just that some intermediate layer encodes it correctly in isolation.
         FakeObservationStore observations = context.getBean(FakeObservationStore.class);
-        observations.save(new Observation("pl1", PipelineState.FAILED, Map.of("errorCount", 1L),
+        observations.save(new Observation("pl1", PipelineState.FAILED,
+                Map.of("errors.engine.job-failed", 1L),
                 Map.of(), Map.of(), new ObservationFailure(
                         "engine.job-failed", Map.of("pipeline", "pl1", "cause", "sink refused the batch"))));
 

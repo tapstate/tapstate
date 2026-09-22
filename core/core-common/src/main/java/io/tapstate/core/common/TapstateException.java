@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /**
- * The carrier for every user-facing / diagnosable first-party error (ADR-0024 D4). Unchecked,
+ * The carrier for every user-facing / diagnosable first-party error. Unchecked,
  * so it never pollutes signatures; the base class for per-domain typed subclasses (the first is
  * {@code DslException}) that add catch-by-kind and typed accessors.
  *
@@ -17,11 +17,11 @@ import java.util.TreeMap;
  *
  * <p>{@link #getMessage()} is the deterministic developer / log string assembled from the code
  * and the named arguments — zero third-party, never reads the catalog. The user-facing message
- * is rendered by the presentation layer from the per-locale catalog (ADR-0024 D3).
+ * is rendered by the presentation layer from the per-locale catalog.
  *
  * <p>Programmer errors / invariant violations (NPE, {@code IllegalStateException}) stay bare and
  * are allowed to crash with a stack trace — they must not be laundered into a pretty
- * {@code *.unknown} code that hides the defect (ADR-0024 D4).
+ * {@code *.unknown} code that hides the defect.
  */
 public class TapstateException extends RuntimeException {
 
@@ -50,7 +50,7 @@ public class TapstateException extends RuntimeException {
      * Deterministic developer / log string: the canonical code, then the named arguments sorted
      * by key (so the same error always renders identically), or the bare code when there are none.
      * This is not the user-facing message — that is rendered from the catalog by the presentation
-     * layer (ADR-0024 D3 / D4).
+     * layer.
      */
     @Override
     public String getMessage() {

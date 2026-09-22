@@ -441,6 +441,7 @@ public final class EnvelopeParser {
             case DOC -> doc(only.getValue());
             case ERROR_COUNT -> new Matcher.ErrorCount(rowCount(only.getValue(), "error_count"));
             case FAILURE_CODE -> new Matcher.FailureCode(failureCode(only.getValue()));
+            case RECORDS_OUT -> new Matcher.RecordsOut(rowCount(only.getValue(), "records_out"));
             case STATE -> new Matcher.State(pipelineState(only.getValue()));
         };
     }
@@ -480,10 +481,14 @@ public final class EnvelopeParser {
                                 size.put(path, rowCount(length, at + ".size." + path));
                             });
         }
-        if (expect.isEmpty() && size.isEmpty()) {
-            throw new EnvelopeException(at + " holds the document to nothing: carry expect or size");
+        List<String> absent = stringList(body.get("absent"), at + ".absent");
+        absent.forEach(path -> requirePath(path, at + ".absent"));
+
+        if (expect.isEmpty() && size.isEmpty() && absent.isEmpty()) {
+            throw new EnvelopeException(
+                    at + " holds the document to nothing: carry expect, size or absent");
         }
-        return new Matcher.Doc(alias(only.getKey()), where, expect, size);
+        return new Matcher.Doc(alias(only.getKey()), where, expect, size, absent);
     }
 
     private static Matcher count(Object node) {

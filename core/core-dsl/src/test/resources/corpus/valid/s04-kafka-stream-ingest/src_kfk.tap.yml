@@ -1,4 +1,4 @@
-# ADR-0016 §14.4 — Kafka -> cleanse -> MySQL (stream ingestion).
+# §14.4 — Kafka -> cleanse -> MySQL (stream ingestion).
 # topic <-> table addressing (§4 per-table streams); consume position = pipeline start_from (§1).
 version: tapstate/v1
 kind: source

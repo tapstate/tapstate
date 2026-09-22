@@ -1,11 +1,18 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
+import com.mongodb.event.CommandSucceededEvent;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.testsupport.RequiresDocker;
@@ -18,9 +25,20 @@ import org.testcontainers.utility.DockerImageName;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import static io.tapstate.adapters.mongostore.StoredBytes.DOCUMENT_CEILING;
+import static io.tapstate.adapters.mongostore.StoredBytes.bsonSize;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -39,6 +57,36 @@ class MongoSrsMetaStoreIT {
     private static final String CHAIN = "orders@mysql-1";
     private static final Instant WRITTEN_AT = Instant.parse("2026-09-03T10:12:44Z");
 
+    /**
+     * Columns of the wide table the history case drives: as wide as a table gets, so that a few hundred
+     * versions of it weigh past what one document carries and the case reaches that size in writes a test
+     * can afford rather than in thousands of them.
+     */
+    private static final int WIDE_COLUMNS = 1_000;
+
+    /** The width of the table whose schema the damaged-history cases append versions of. */
+    private static final int HISTORY_COLUMNS = 20;
+
+    /**
+     * Versions written straight into a record before a damaged-history case appends through the mutator:
+     * enough of them, at that width, to weigh past what the record retains, so the trim is live throughout
+     * and a bound that stopped bounding shows as a record that keeps growing.
+     */
+    private static final int SEEDED_VERSIONS = 900;
+
+    /**
+     * Where the element that is not a version goes. Among the newest, because that is where it decides
+     * anything: at the oldest end the window has already closed by the time the walk arrives, so a record
+     * damaged there cannot tell a bound that holds from one that does not.
+     */
+    private static final int DAMAGED_AT = 895;
+
+    /** Versions appended through the store's own mutator once such a record is seeded. */
+    private static final int APPENDED_VERSIONS = 40;
+
+    /** What the size case leaves between the record it seeds and the ceiling. */
+    private static final int UNDER_THE_CEILING = 4_096;
+
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
@@ -51,7 +99,6 @@ class MongoSrsMetaStoreIT {
             assertThat(seeded.miningChainId()).isEqualTo(CHAIN);
             assertThat(seeded.retention()).isEqualTo("7d");
             assertThat(seeded.sourceReadOffset()).isNull();
-            assertThat(seeded.cdcStartPosition()).isNull();
             assertThat(seeded.consumerOffsets()).isEmpty();
             assertThat(seeded.schemaHistory()).isEmpty();
         });
@@ -179,6 +226,30 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void aConsumerWriteSplitsEveryLegacyCursorBeforeItAdvancesOne() {
+        withCollection((store, collection) -> {
+            ConsumerOffset advancing = new ConsumerOffset("p1", Map.of("orders", 10L),
+                    new ChainPosition(new SourceOrder(1L, 10L), "gtid:aaa-1:10"));
+            ConsumerOffset untouched = new ConsumerOffset("p2", Map.of("orders", 20L),
+                    new ChainPosition(new SourceOrder(1L, 20L), "gtid:aaa-1:20"));
+            collection.insertOne(MongoSrsMetaStore.toDocument(
+                    new SrsMeta(CHAIN, null, List.of(advancing, untouched), List.of(), null)));
+
+            store.advanceConsumerReadSeq(CHAIN, "p1", "orders", 11L);
+
+            Document root = collection.find(new Document("_id", CHAIN)).first();
+            assertThat(root).isNotNull();
+            assertThat(root.get("consumerOffsets", Document.class)).isEmpty();
+            assertThat(collection.find(new Document("miningChainId", CHAIN))
+                    .into(new ArrayList<>()))
+                    .hasSize(2);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).containsExactlyInAnyOrder(
+                    new ConsumerOffset("p1", Map.of("orders", 11L), advancing.sinkAcked()),
+                    untouched);
+        });
+    }
+
+    @Test
     void advanceConsumerReadSeqAdvancesTheReadCursorWithoutClobberingTheSinkAckedPosition() {
         withStore(store -> {
             store.create(CHAIN, null);
@@ -241,15 +312,20 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
-    void setCdcStartPersistsTheSeamPositionAndItsGeneration() {
+    void setCdcStartPersistsEachPipelinesSeamPositionAndGenerationIndependently() {
         withStore(store -> {
             store.create(CHAIN, null);
 
-            store.setCdcStart(CHAIN, "binlog.000042:1024", 3L);
+            store.setCdcStart(CHAIN, "p1", "binlog.000042:1024", 3L);
+            store.setCdcStart(CHAIN, "p2", "binlog.000099:2048", 7L);
 
             SrsMeta record = store.read(CHAIN).orElseThrow();
-            assertThat(record.cdcStartPosition()).isEqualTo("binlog.000042:1024");
-            assertThat(record.snapshotEpoch()).isEqualTo(3L);
+            ConsumerOffset p1 = record.consumerOffset("p1").orElseThrow();
+            assertThat(p1.cdcStartPosition()).isEqualTo("binlog.000042:1024");
+            assertThat(p1.snapshotEpoch()).isEqualTo(3L);
+            ConsumerOffset p2 = record.consumerOffset("p2").orElseThrow();
+            assertThat(p2.cdcStartPosition()).isEqualTo("binlog.000099:2048");
+            assertThat(p2.snapshotEpoch()).isEqualTo(7L);
         });
     }
 
@@ -272,7 +348,7 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, null);
             long running = store.openEpoch(CHAIN);
-            store.setCdcStart(CHAIN, "binlog.000042:1024", running);
+            store.setCdcStart(CHAIN, "p1", "binlog.000042:1024", running);
 
             store.openEpoch(CHAIN);
 
@@ -281,7 +357,7 @@ class MongoSrsMetaStoreIT {
             // and let them overwrite changes the older one had already applied.
             SrsMeta record = store.read(CHAIN).orElseThrow();
             assertThat(record.epoch()).isEqualTo(2L);
-            assertThat(record.snapshotEpoch()).isEqualTo(1L);
+            assertThat(record.consumerOffset("p1").orElseThrow().snapshotEpoch()).isEqualTo(1L);
         });
     }
 
@@ -290,11 +366,10 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, null);
 
-            // The meta field set is append-only: a document an older build wrote carries neither
-            // generation, and that has to read back as "no generation opened" rather than as corruption.
+            // A freshly seeded document carries no chain generation and no pipeline snapshot state.
             SrsMeta record = store.read(CHAIN).orElseThrow();
             assertThat(record.epoch()).isZero();
-            assertThat(record.snapshotEpoch()).isZero();
+            assertThat(record.consumerOffsets()).isEmpty();
         });
     }
 
@@ -377,6 +452,145 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * A chain keeps recording schema changes after its history has passed what one document can carry, and
+     * what survives is the newest run of versions.
+     *
+     * <p>The record is one document and the schema history is the only facet of it that grows for the life
+     * of a chain, so the write that records a schema change is the write that has to make room for itself —
+     * there is nothing else in the record to give up. This drives the store's own mutator past the point
+     * where every version appended would fit in one document, and holds the shape of what is left: the
+     * newest versions, contiguous, and more than the one just appended. A bound that kept only that one
+     * would leave every change already read unresolvable, and a bound that dropped entries from anywhere
+     * else would leave versions that never were adjacent looking as though they were.
+     */
+    @Test
+    void aChainKeepsRecordingSchemaChangesPastTheCeilingItsWholeHistoryWouldHaveReached() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            // Measured, not assumed: what one entry costs is a function of the table's width, so the count
+            // that reaches the ceiling is derived from the entry's own stored bytes and the case keeps
+            // meaning what it says if that shape ever moves.
+            long entryBytes = bsonSize(MongoSrsMetaStore.toDocument(new SrsMeta(CHAIN, null, List.of(),
+                    List.of(new SchemaVersion(1, wideSchema(), 1)), null, 0L, null)));
+            int appended = (int) (3 * DOCUMENT_CEILING / (2 * entryBytes));
+            assertThat(entryBytes * appended)
+                    .as("the premise: %d versions of this shape are %d bytes of history between them, past "
+                                    + "the %d-byte ceiling one document may take, so a chain that kept them "
+                                    + "all would have stopped recording schema changes partway through",
+                            appended, entryBytes * appended, DOCUMENT_CEILING)
+                    .isGreaterThan(DOCUMENT_CEILING);
+
+            for (int version = 1; version <= appended; version++) {
+                store.appendSchemaVersion(CHAIN, new SchemaVersion(version, wideSchema(), version));
+            }
+
+            List<SchemaVersion> retained = store.read(CHAIN).orElseThrow().schemaHistory();
+            List<Long> versions = retained.stream().map(SchemaVersion::version).toList();
+
+            assertThat(versions)
+                    .as("the oldest versions are dropped -- %d of the %d appended survive -- and what "
+                                    + "survives is the newest run of them: a contiguous window of the "
+                                    + "history, ending at the version just appended",
+                            versions.size(), appended)
+                    .hasSizeGreaterThan(1)
+                    .hasSizeLessThan(appended)
+                    .isEqualTo(newestRun(versions.size(), appended));
+        });
+    }
+
+    /**
+     * A chain whose record carries no schema history field at all still records its next schema change.
+     *
+     * <p>Nothing here writes such a record — {@code create} seeds the field and no path unsets it — so what
+     * this holds is the repair case, and what getting it wrong costs. This is the only write that can
+     * record a schema change, so an append that read a missing array as nothing it could work with would
+     * not defer one change: it would leave the chain permanently unable to say that its source's schema
+     * moved, and would say so as a store that could not be reached.
+     */
+    @Test
+    void aRecordWithNoSchemaHistoryFieldStillRecordsItsNextSchemaChange() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            collection.updateOne(new Document("_id", CHAIN),
+                    new Document("$unset", new Document("schemaHistory", "")));
+
+            store.appendSchemaVersion(CHAIN, new SchemaVersion(7L, Map.of("id", "int"), 7L));
+
+            assertThat(store.read(CHAIN).orElseThrow().schemaHistory())
+                    .as("the change is recorded, on a record that had nowhere to record it")
+                    .extracting(SchemaVersion::version)
+                    .containsExactly(7L);
+        });
+    }
+
+    /**
+     * An element of the history that is not a version stops neither the append nor the bound.
+     *
+     * <p>Two ways a record reaches that state and one answer to both: an element left null, and one left as
+     * something that is not a document at all. Asking either how much it weighs answers nothing — literally
+     * nothing, for the first, and a refusal of the whole update for the second — and the difference between
+     * the two is only how loudly the record breaks. A weight of nothing is the dangerous one: it compares
+     * as under every budget, so the walk would keep every older entry, the trim would stop trimming, and
+     * the history would go back to growing by an entry per change with nothing said, which is the state the
+     * bound exists to end.
+     *
+     * <p>The control is the same drive over an undamaged record, because what is under witness is not that
+     * the append survived — it is that the record is held to the same bound either way.
+     */
+    @Test
+    void anElementThatIsNotAVersionStopsNeitherTheAppendNorTheBound() {
+        withCollection((store, collection) -> {
+            long clean = appendPast(store, collection, "undamaged", -1, null);
+            long lastVersion = SEEDED_VERSIONS + APPENDED_VERSIONS;
+
+            for (Object damage : new Object[] {null, "not a version"}) {
+                String chain = "damaged-" + (damage == null ? "null" : "text");
+
+                long damaged = appendPast(store, collection, chain, DAMAGED_AT, damage);
+
+                assertThat(damaged)
+                        .as("a record with an unsizable element among its newest entries is held to the "
+                                        + "same bound as one without: %d bytes against the undamaged "
+                                        + "record's %d, after the same %d appends",
+                                damaged, clean, APPENDED_VERSIONS)
+                        .isLessThanOrEqualTo(clean);
+                assertThat(store.read(chain).orElseThrow().schemaHistory())
+                        .as("and the record reads back, ending at the version just appended: the element "
+                                + "that is not a version is gone, with everything older than it")
+                        .extracting(SchemaVersion::version)
+                        .endsWith(lastVersion);
+            }
+        });
+    }
+
+    /**
+     * A write the endpoint refuses because the record it would leave behind is too large is reported as
+     * exactly that, not as a store that could not be reached.
+     *
+     * <p>The history budget keeps ordinary chain records below the ceiling, but a record can still be
+     * seeded with another field that leaves less room than one schema entry needs. What that refusal must
+     * not do is send whoever reads it to check a store that is healthy: nothing is wrong with the store and
+     * no retry can help. The endpoint reports this as an ordinary command failure, so it is only told apart
+     * by being named.
+     */
+    @Test
+    void aWriteRefusedForTheSizeOfItsRecordIsReportedAsTheSizeItIs() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, retentionFillingTheRecord());
+            assertThat(bsonSize(collection.find(new Document("_id", CHAIN)).first()))
+                    .as("the premise: the seeded record is under the ceiling, so what follows is refused "
+                            + "for what it would add rather than for what is already there")
+                    .isLessThan(DOCUMENT_CEILING);
+
+            assertThatThrownBy(() -> store.appendSchemaVersion(
+                    CHAIN, new SchemaVersion(1L, wideSchema(), 1L)))
+                    .isInstanceOf(TapstateException.class)
+                    .extracting(thrown -> ((TapstateException) thrown).code())
+                    .isEqualTo(IoError.DOCUMENT_TOO_LARGE);
+        });
+    }
+
     @Test
     void mutateOnAnUnminedChainIsAnOrderingError() {
         // every mutator requires the chain to have been seeded by create first; a mutate on an unseeded
@@ -390,7 +604,7 @@ class MongoSrsMetaStoreIT {
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.advanceSinkAcked("nope", "p", new ChainPosition(new SourceOrder(1, 1), "gtid:aaa-1:1")))
                     .isInstanceOf(IllegalStateException.class);
-            assertThatThrownBy(() -> store.setCdcStart("nope", "x", 1L))
+            assertThatThrownBy(() -> store.setCdcStart("nope", "p", "x", 1L))
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.appendSchemaVersion("nope", new SchemaVersion(0, Map.of(), 0)))
                     .isInstanceOf(IllegalStateException.class);
@@ -406,12 +620,12 @@ class MongoSrsMetaStoreIT {
         withStore(store -> {
             store.create(CHAIN, "7d");
             store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1L, 500L), "gtid:aaa-1:500"));
-            store.setCdcStart(CHAIN, "gtid:aaa-1:1", 1L);
             store.appendSchemaVersion(CHAIN, new SchemaVersion(0, Map.of("id", "int"), 0));
             store.upsertConsumerOffset(CHAIN, new ConsumerOffset("departing", Map.of("orders", 100L),
                     new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100")));
             store.upsertConsumerOffset(CHAIN, new ConsumerOffset("staying", Map.of("orders", 900L),
                     new ChainPosition(new SourceOrder(1, 900), "gtid:aaa-1:900")));
+            store.setCdcStart(CHAIN, "staying", "gtid:aaa-1:1", 1L);
 
             store.detachConsumer(CHAIN, "departing");
 
@@ -419,10 +633,16 @@ class MongoSrsMetaStoreIT {
             // The chain record outlives its consumers: it is keyed by the chain, so removing it would be
             // cross-pipeline data loss, and everything on it that is not the departing cursor is untouched.
             assertThat(after.consumerOffsets())
-                    .containsExactly(new ConsumerOffset("staying", Map.of("orders", 900L),
-                            new ChainPosition(new SourceOrder(1, 900), "gtid:aaa-1:900")));
+                    .containsExactly(new ConsumerOffset(
+                            "staying",
+                            Map.of("orders", 900L),
+                            new ChainPosition(new SourceOrder(1, 900), "gtid:aaa-1:900"),
+                            List.of(),
+                            "gtid:aaa-1:1",
+                            1L));
             assertThat(after.sourceReadOffset()).isEqualTo("gtid:aaa-1:500");
-            assertThat(after.cdcStartPosition()).isEqualTo("gtid:aaa-1:1");
+            assertThat(after.consumerOffset("staying").orElseThrow().cdcStartPosition())
+                    .isEqualTo("gtid:aaa-1:1");
             assertThat(after.schemaHistory()).hasSize(1);
             assertThat(after.retention()).isEqualTo("7d");
         });
@@ -479,6 +699,285 @@ class MongoSrsMetaStoreIT {
             assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).isEmpty();
             assertThat(store.read("never_seeded")).isEmpty();
         });
+    }
+
+    @Test
+    void aStaleLegacyMigrationCannotRestoreAConsumerAfterDetachCompletes() throws Exception {
+        CountDownLatch staleSnapshotRead = new CountDownLatch(1);
+        CountDownLatch resumeStaleMigration = new CountDownLatch(1);
+        AtomicBoolean paused = new AtomicBoolean();
+        CommandListener pauseAfterFirstFind = new CommandListener() {
+            @Override
+            public void commandSucceeded(CommandSucceededEvent event) {
+                if (!"find".equals(event.getCommandName()) || !paused.compareAndSet(false, true)) {
+                    return;
+                }
+                staleSnapshotRead.countDown();
+                try {
+                    if (!resumeStaleMigration.await(30, TimeUnit.SECONDS)) {
+                        throw new AssertionError("stale migration was not resumed");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while holding the stale migration", e);
+                }
+            }
+        };
+        MongoClientSettings staleSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(pauseAfterFirstFind)
+                .build();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try (MongoClient staleClient = MongoClients.create(staleSettings);
+                MongoClient currentClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoCollection<Document> roots = currentClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers =
+                    currentClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            ConsumerOffset departing = new ConsumerOffset("departing", Map.of("orders", 10L), null);
+            ConsumerOffset staying = new ConsumerOffset("staying", Map.of("orders", 20L), null);
+            roots.insertOne(MongoSrsMetaStore.toDocument(
+                    new SrsMeta(CHAIN, null, List.of(departing, staying), List.of(), null)));
+
+            MongoSrsMetaStore staleStore = new MongoSrsMetaStore(staleClient,
+                    staleClient.getDatabase("tapstate").getCollection("srs_meta"),
+                    staleClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+            MongoSrsMetaStore currentStore = new MongoSrsMetaStore(currentClient, roots, consumers);
+            Future<?> staleWrite = executor.submit(
+                    () -> staleStore.advanceConsumerReadSeq(CHAIN, "staying", "orders", 21L));
+
+            assertThat(staleSnapshotRead.await(10, TimeUnit.SECONDS))
+                    .as("the first writer is paused after reading the legacy cursors")
+                    .isTrue();
+            currentStore.detachConsumer(CHAIN, "departing");
+            assertThat(currentStore.read(CHAIN).orElseThrow().consumerOffsets())
+                    .extracting(ConsumerOffset::pipelineId)
+                    .containsExactly("staying");
+            assertThat(consumers.find(new Document("pipelineId", "departing")).first())
+                    .as("detach leaves neither a cursor nor a cleanup marker for the departed pipeline")
+                    .isNull();
+
+            resumeStaleMigration.countDown();
+            staleWrite.get(30, TimeUnit.SECONDS);
+
+            assertThat(currentStore.read(CHAIN).orElseThrow().consumerOffsets())
+                    .extracting(ConsumerOffset::pipelineId)
+                    .containsExactly("staying");
+        } finally {
+            resumeStaleMigration.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void aConsumerWriteAfterDetachAttachesItAgain() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("returning", Map.of("orders", 10L), null));
+            store.detachConsumer(CHAIN, "returning");
+
+            store.advanceConsumerReadSeq(CHAIN, "returning", "orders", 11L);
+
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffsets())
+                    .containsExactly(new ConsumerOffset("returning", Map.of("orders", 11L), null));
+            assertThat(collection.find(new Document("pipelineId", "returning")).first())
+                    .doesNotContainKey("detached");
+        });
+    }
+
+    @Test
+    void aConsumerAdvanceAfterItsRootCheckCannotSurviveAConcurrentDrop() throws Exception {
+        CountDownLatch rootChecked = new CountDownLatch(1);
+        CountDownLatch resumeConsumerWrite = new CountDownLatch(1);
+        AtomicBoolean paused = new AtomicBoolean();
+        CommandListener pauseAfterRootCheck = new CommandListener() {
+            @Override
+            public void commandSucceeded(CommandSucceededEvent event) {
+                if (!"find".equals(event.getCommandName()) || !paused.compareAndSet(false, true)) {
+                    return;
+                }
+                rootChecked.countDown();
+                try {
+                    if (!resumeConsumerWrite.await(30, TimeUnit.SECONDS)) {
+                        throw new AssertionError("consumer write was not resumed");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while holding the consumer write", e);
+                }
+            }
+        };
+        MongoClientSettings writingSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(pauseAfterRootCheck)
+                .build();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try (MongoClient writingClient = MongoClients.create(writingSettings);
+                MongoClient currentClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoCollection<Document> roots = currentClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers =
+                    currentClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            MongoSrsMetaStore writingStore = new MongoSrsMetaStore(writingClient,
+                    writingClient.getDatabase("tapstate").getCollection("srs_meta"),
+                    writingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+            MongoSrsMetaStore currentStore = new MongoSrsMetaStore(currentClient, roots, consumers);
+            currentStore.create(CHAIN, null);
+
+            Future<?> staleAdvance = executor.submit(
+                    () -> writingStore.advanceConsumerReadSeq(CHAIN, "stale", "orders", 9L));
+            assertThat(rootChecked.await(10, TimeUnit.SECONDS))
+                    .as("the consumer writer is paused after confirming that the root exists")
+                    .isTrue();
+
+            currentStore.dropChain(CHAIN);
+            assertThat(roots.find(new Document("_id", CHAIN)).first()).isNull();
+            assertThat(consumers.countDocuments(new Document("miningChainId", CHAIN))).isZero();
+            resumeConsumerWrite.countDown();
+
+            assertThatThrownBy(() -> staleAdvance.get(30, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(IllegalStateException.class)
+                    .hasRootCauseMessage("srs meta mutate on an unseeded mining chain: " + CHAIN
+                            + " (create must seed it first)");
+            assertThat(consumers.countDocuments(new Document("miningChainId", CHAIN)))
+                    .as("the refused writer leaves no orphan cursor")
+                    .isZero();
+
+            currentStore.create(CHAIN, null);
+            assertThat(currentStore.read(CHAIN).orElseThrow().consumerOffsets())
+                    .as("a later chain incarnation cannot adopt state from the refused writer")
+                    .isEmpty();
+        } finally {
+            resumeConsumerWrite.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void droppingAChainRemovesItsSplitConsumersBeforeThatIdCanBeSeededAgain() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("p1", Map.of("orders", 7L), null));
+
+            store.dropChain(CHAIN);
+
+            assertThat(collection.countDocuments()).isZero();
+            store.create(CHAIN, null);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).isEmpty();
+        });
+    }
+
+    @Test
+    void droppingAnOldChainCannotDeleteACursorFromTheRecreatedChain() throws Exception {
+        CountDownLatch cursorCleanupPaused = new CountDownLatch(1);
+        CountDownLatch resumeCursorCleanup = new CountDownLatch(1);
+        CountDownLatch recreateStarted = new CountDownLatch(1);
+        CountDownLatch dropCommitted = new CountDownLatch(1);
+        AtomicBoolean paused = new AtomicBoolean();
+        AtomicBoolean recreating = new AtomicBoolean();
+        CommandListener pauseBeforeCursorCleanup = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if (!"delete".equals(event.getCommandName())
+                        || !"srs_consumer_offsets".equals(event.getCommand().getString("delete").getValue())
+                        || !paused.compareAndSet(false, true)) {
+                    return;
+                }
+                cursorCleanupPaused.countDown();
+                try {
+                    if (!resumeCursorCleanup.await(30, TimeUnit.SECONDS)) {
+                        throw new AssertionError("cursor cleanup was not resumed");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while holding cursor cleanup", e);
+                }
+            }
+        };
+        CommandListener observeRecreate = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if (recreating.get() && "insert".equals(event.getCommandName())
+                        && "srs_meta".equals(event.getCommand().getString("insert").getValue())) {
+                    recreateStarted.countDown();
+                }
+            }
+        };
+        MongoClientSettings droppingSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(pauseBeforeCursorCleanup)
+                .build();
+        MongoClientSettings currentSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(observeRecreate)
+                .build();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try (MongoClient droppingClient = MongoClients.create(droppingSettings);
+                MongoClient currentClient = MongoClients.create(currentSettings)) {
+            MongoCollection<Document> roots = currentClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers =
+                    currentClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            MongoSrsMetaStore droppingStore = new MongoSrsMetaStore(droppingClient,
+                    droppingClient.getDatabase("tapstate").getCollection("srs_meta"),
+                    droppingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+            MongoSrsMetaStore currentStore = new MongoSrsMetaStore(currentClient, roots, consumers);
+            currentStore.create(CHAIN, "old");
+            currentStore.upsertConsumerOffset(
+                    CHAIN, new ConsumerOffset("old", Map.of("orders", 7L), null));
+
+            Future<?> dropping = executor.submit(() -> droppingStore.dropChain(CHAIN));
+            assertThat(cursorCleanupPaused.await(10, TimeUnit.SECONDS))
+                    .as("the old chain's cursor cleanup is paused after its root delete ran")
+                    .isTrue();
+
+            ConsumerOffset replacement = new ConsumerOffset("new", Map.of("orders", 11L), null);
+            Future<?> provision = executor.submit(() -> {
+                recreating.set(true);
+                try {
+                    currentStore.create(CHAIN, "new");
+                } catch (IllegalStateException stillPresent) {
+                    try {
+                        if (!dropCommitted.await(30, TimeUnit.SECONDS)) {
+                            throw new AssertionError("chain drop did not commit");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError("interrupted while waiting for the chain drop", e);
+                    }
+                    currentStore.create(CHAIN, "new");
+                }
+                currentStore.upsertConsumerOffset(CHAIN, replacement);
+            });
+            assertThat(recreateStarted.await(10, TimeUnit.SECONDS))
+                    .as("the replacement provision attempts its insert while cursor cleanup is paused")
+                    .isTrue();
+            Document visibleRoot = roots.find(new Document("_id", CHAIN)).first();
+            assertThat(visibleRoot)
+                    .as("the old root remains visible until its cursor cleanup commits")
+                    .isNotNull();
+            assertThat(visibleRoot.getString("retention")).isEqualTo("old");
+
+            resumeCursorCleanup.countDown();
+            dropping.get(30, TimeUnit.SECONDS);
+            dropCommitted.countDown();
+            provision.get(30, TimeUnit.SECONDS);
+
+            SrsMeta recreated = currentStore.read(CHAIN).orElseThrow();
+            assertThat(recreated.retention()).isEqualTo("new");
+            assertThat(recreated.consumerOffsets()).containsExactly(replacement);
+        } finally {
+            resumeCursorCleanup.countDown();
+            dropCommitted.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        }
     }
 
     @Test
@@ -558,6 +1057,63 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /** The newest {@code kept} of the {@code appended} versions, in the order they were appended. */
+    private static List<Long> newestRun(int kept, int appended) {
+        List<Long> versions = new ArrayList<>();
+        for (int version = appended - kept + 1; version <= appended; version++) {
+            versions.add((long) version);
+        }
+        return versions;
+    }
+
+    /**
+     * Seeds a chain with a history already past what the record retains — with one of its newest elements
+     * replaced, where {@code damagedAt} names one — then appends versions through the store's own mutator
+     * and answers what the record weighs afterwards. The seeding is a raw write because the mutator under
+     * witness is the thing that trims: there is no way through it to build a record it has not already cut.
+     */
+    private static long appendPast(MongoSrsMetaStore store, MongoCollection<Document> collection,
+            String chain, int damagedAt, Object damage) {
+        store.create(chain, null);
+        List<Object> seeded = new ArrayList<>(storedHistory(chain, SEEDED_VERSIONS));
+        if (damagedAt >= 0) {
+            seeded.set(damagedAt, damage);
+        }
+        collection.updateOne(new Document("_id", chain), new Document("$push",
+                new Document("schemaHistory", new Document("$each", seeded))));
+        for (int version = SEEDED_VERSIONS + 1; version <= SEEDED_VERSIONS + APPENDED_VERSIONS; version++) {
+            store.appendSchemaVersion(chain,
+                    new SchemaVersion(version, StoredBytes.schemaOfWidth(HISTORY_COLUMNS), version));
+        }
+        return bsonSize(collection.find(new Document("_id", chain)).first());
+    }
+
+    /** That many history entries, serialised as the store's own mapping serialises them. */
+    private static List<Document> storedHistory(String chain, int versions) {
+        List<SchemaVersion> history = new ArrayList<>();
+        for (int version = 1; version <= versions; version++) {
+            history.add(new SchemaVersion(version, StoredBytes.schemaOfWidth(HISTORY_COLUMNS), version));
+        }
+        return MongoSrsMetaStore.toDocument(
+                        new SrsMeta(chain, null, List.of(), history, null, 0L, null))
+                .getList("schemaHistory", Document.class);
+    }
+
+    /**
+     * A retention string long enough to leave the seeded record just under the ceiling — measured off the
+     * record the mapping writes without one, so it stays just under if the mapping ever gains a field.
+     */
+    private static String retentionFillingTheRecord() {
+        long empty = bsonSize(MongoSrsMetaStore.toDocument(
+                new SrsMeta(CHAIN, null, List.of(), List.of(), "", 0L, null)));
+        return "r".repeat((int) (DOCUMENT_CEILING - empty - UNDER_THE_CEILING));
+    }
+
+    /** A table's field schema at the width the history case drives. */
+    private static Map<String, Object> wideSchema() {
+        return StoredBytes.schemaOfWidth(WIDE_COLUMNS);
+    }
+
     /** The single consumer cursor on the test chain — the shape the per-consumer advance tests read back. */
     private static ConsumerOffset onlyConsumer(MongoSrsMetaStore store) {
         List<ConsumerOffset> cursors = store.read(CHAIN).orElseThrow().consumerOffsets();
@@ -592,7 +1148,7 @@ class MongoSrsMetaStoreIT {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("srs_meta");
             collection.drop();
-            test.run(new MongoSrsMetaStore(collection, clock), collection);
+            test.run(new MongoSrsMetaStore(client, collection, clock), collection);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }

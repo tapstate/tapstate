@@ -147,7 +147,7 @@
     },
     {
       "name": "schemaLimit",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Fields Load Limit For Each Collection"
       },

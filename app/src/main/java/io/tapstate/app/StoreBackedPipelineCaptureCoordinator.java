@@ -7,6 +7,7 @@ import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureError;
 import io.tapstate.runtime.srs.CaptureRunSpec;
@@ -17,8 +18,15 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
+
+import java.time.Instant;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -54,8 +62,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private final SnapshotBuffer snapshotBuffer;
     private final Map<String, List<CaptureRun>> runsByPipeline = new ConcurrentHashMap<>();
 
-    /** What each running pipeline's tables loaded, keyed by pipeline then table; dropped when it stops. */
-    private final Map<String, Map<String, TableSnapshot>> snapshotsByPipeline = new ConcurrentHashMap<>();
+    /** What each running pipeline's load read, keyed by pipeline; dropped when it stops. */
+    private final Map<String, SnapshotReading> snapshotsByPipeline = new ConcurrentHashMap<>();
 
     /**
      * The tables each running pipeline's snapshot covers, per chain; dropped when it stops. Only the
@@ -78,26 +86,50 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public void startCapture(String pipelineId) {
+        startCapture(pipelineId, artifacts());
+    }
+
+    @Override
+    public void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
         // Idempotent: a pipeline whose capture is already running is left running, so a repeated start does not
         // open a second capture behind the one already filling the ring.
         if (runsByPipeline.containsKey(pipelineId)) {
             return;
         }
-        PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);
+        ArtifactStore captured = Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
+        PipelineResource pipeline = StoredArtifacts.requirePipeline(captured, pipelineId);
+        ReadMode readMode = readModeOf(pipeline.settings());
+        // A snapshot-only run has no change chain to supply a generation. Advance its own durable order
+        // once for the whole pipeline run and above every retained chain generation, so every source in
+        // one assembly is comparable and the first run after a mode switch also outranks preserved state.
+        long snapshotEpoch = readMode == ReadMode.SNAPSHOT_ONLY
+                ? SnapshotRunOrder.next(storePort.keyedState(), pipelineId, retainedChainGeneration(pipelineId))
+                : 1L;
         List<CaptureRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
+        // Taken before the first source is opened, because the load is what these totals accumulate from
+        // and its first row is read inside the loop below. Stamping it afterwards would date the whole
+        // load to the moment it ended, and a rate computed across the first two scrapes would divide by a
+        // window that had already closed.
+        Instant loadBegan = Instant.now();
         try {
             for (SourceRef ref : pipeline.sources()) {
                 String sourceId = ref.id();
-                SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-                SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
+                SourceResource source = StoredArtifacts.requireSource(captured, sourceId);
+                // Read once and used twice: it decides which streams this run reads, and it carries the
+                // row count the last discovery took of each of them. Asking the store again for the second
+                // use would pay for a second read per source on every start.
+                SourceModel discovered = SourceDiscovery.model(storePort, source);
+                SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discovered);
                 CaptureRunSpec spec = deriveSpec(
-                        pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref));
+                        pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref),
+                        snapshotEpoch);
                 Map<String, Long> observedSnapshotCounts = new LinkedHashMap<>();
-                CaptureRun run = captureStarter.start(spec, snapshotPassthrough(resolution, observedSnapshotCounts));
+                CaptureRun run = captureStarter.start(
+                        spec, snapshotPassthrough(pipelineId, resolution, observedSnapshotCounts));
                 runs.add(run);
-                recordSnapshot(attributed, sourceId, spec, run, observedSnapshotCounts);
+                recordSnapshot(attributed, sourceId, spec, run, observedSnapshotCounts, discovered);
                 snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
             }
         } catch (RuntimeException | Error failure) {
@@ -111,12 +143,28 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             throw failure;
         }
         runsByPipeline.put(pipelineId, runs);
-        snapshotsByPipeline.put(pipelineId, keyByTableOrQualifyOnCollision(attributed));
+        snapshotsByPipeline.put(pipelineId, reading(attributed, loadBegan));
         snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
     }
 
-    /** One source run's snapshot: the chain that records its completion, and the tables it covers. */
-    private record SnapshotOnChain(String chainId, List<String> tables) {
+    /**
+     * The highest chain generation whose durable consumer record says this pipeline reached it.
+     *
+     * <p>A stop that preserves state leaves that record beside the operator state it ordered. Looking
+     * across every such chain also covers a pipeline whose source binding changed while stopped; using
+     * only the source it names now would lose the generation of the state the earlier binding left behind.
+     */
+    private long retainedChainGeneration(String pipelineId) {
+        return storePort.meta().miningChainIdsWithConsumer(pipelineId).stream()
+                .map(storePort.meta()::read)
+                .flatMap(Optional::stream)
+                .mapToLong(SrsMeta::epoch)
+                .max()
+                .orElse(0L);
+    }
+
+    /** One source run's snapshot: its completion chain, if any, and the tables it covers. */
+    private record SnapshotOnChain(Optional<String> chainId, List<String> tables) {
     }
 
     /**
@@ -124,15 +172,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      *
      * <p>A run whose read mode has no snapshot has no load to deliver. A run with no chain is a
      * snapshot-only read: it opens no tail, so nothing seeds a record and no completion is ever written
-     * for it. That one contributes nothing rather than counting as never delivered -- a question the
-     * record cannot answer must not be answered by guessing, and guessing that way round would re-read
-     * the whole source on every resume with no state that could ever end it.
+     * for it. Keep its tables with an absent chain so they remain owed: without delivery evidence, a
+     * resume must re-read the load rather than restart a vertex over an empty snapshot hand-off.
      */
     private static Optional<SnapshotOnChain> snapshotOnChain(CaptureRunSpec spec, CaptureRun run) {
         if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
             return Optional.empty();
         }
-        return run.chainId().map(chain -> new SnapshotOnChain(chain.value(), spec.config().streams()));
+        return Optional.of(new SnapshotOnChain(run.chainId().map(MiningChainId::value), spec.config().streams()));
     }
 
     /** One source's attributed snapshot load: which source, which table, and what it loaded. */
@@ -149,7 +196,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             String sourceId,
             CaptureRunSpec spec,
             CaptureRun run,
-            Map<String, Long> observedSnapshotCounts) {
+            Map<String, Long> observedSnapshotCounts,
+            SourceModel discovered) {
         List<String> streams = spec.config().streams();
         if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
             return;
@@ -159,10 +207,66 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             long count = streams.size() == 1
                     ? counts.getOrDefault(table, run.snapshotCount())
                     : counts.getOrDefault(table, 0L);
-            // The total is reported by no source today, so it stays null and the percentage with it -- progress
-            // with no total is honest partial data, never a faked complete load.
-            attributed.add(new AttributedSnapshot(sourceId, table, new TableSnapshot(count, null, null)));
+            Long total = estimatedRows(discovered, table);
+            attributed.add(new AttributedSnapshot(sourceId, table, new TableSnapshot(count, total, share(count, total))));
         }
+    }
+
+    /**
+     * About how many rows {@code table} holds, as the last discovery of this source counted it, or null
+     * where nothing counted it -- a connector that cannot count, a count that was not reached, a model
+     * discovered before counting existed, or no discovered model at all.
+     *
+     * <p>It is an estimate and is treated as one everywhere it goes: it was taken at discovery time and
+     * nothing has maintained it since, so a table that grew while nobody looked reports a load past its own
+     * total. Null is not narrowed to zero on the way through, because a table nothing counted and a table
+     * counted as empty are the two readings a progress figure must never confuse.
+     */
+    private static Long estimatedRows(SourceModel discovered, String table) {
+        if (discovered == null) {
+            return null;
+        }
+        return discovered.tables().stream()
+                .filter(candidate -> candidate.name().equals(table))
+                .findFirst()
+                .map(SourceTable::approximateRowCount)
+                .orElse(null);
+    }
+
+    /**
+     * What share of {@code total} the {@code loaded} rows are, as whole percent, or null where the share is
+     * not a number anybody could act on.
+     *
+     * <p>Two cases have no share rather than a computed one. Without a total there is nothing to take a
+     * share of, which is the read face's standing rule -- progress with no total is honest partial data and
+     * is never dressed up as a complete load. A total of zero is the sharper case: it is kept, because it
+     * is what discovery counted, but a load that read rows out of a table counted as empty says the count
+     * is stale, and no percentage describes that.
+     *
+     * <p>A share past a hundred is reported as a hundred. The load is finished by the time this is asked,
+     * so overshooting a stale estimate means complete, and a progress figure above full is not a state
+     * anything can be in -- publishing one would leave every reader to decide for themselves what it meant.
+     */
+    private static Integer share(long loaded, Long total) {
+        if (total == null || total <= 0L) {
+            return null;
+        }
+        return (int) Math.min(100L, loaded * 100L / total);
+    }
+
+    /**
+     * What {@code attributed} amounts to for the whole pipeline: the per-table loads keyed for the read
+     * face, counted from {@code loadBegan}.
+     *
+     * <p>A pipeline that ran no bounded load reports nothing at all rather than a start with no rows. The
+     * two are not the same claim: one says no load ran, and the other would say a load ran and read
+     * nothing, which is a real and different state that a table entry at zero rows already expresses.
+     */
+    private static SnapshotReading reading(List<AttributedSnapshot> attributed, Instant loadBegan) {
+        if (attributed.isEmpty()) {
+            return SnapshotReading.NONE;
+        }
+        return new SnapshotReading(keyByTableOrQualifyOnCollision(attributed), loadBegan);
     }
 
     /**
@@ -185,8 +289,45 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     @Override
-    public Map<String, TableSnapshot> snapshotProgress(String pipelineId) {
-        return snapshotsByPipeline.getOrDefault(pipelineId, Map.of());
+    public SnapshotReading snapshotProgress(String pipelineId) {
+        return snapshotsByPipeline.getOrDefault(pipelineId, SnapshotReading.NONE);
+    }
+
+    /**
+     * What this pipeline's source runs have taken in, added together. A pipeline reads through one run per
+     * source and each counts its own tables, so the sum is over runs that do not overlap -- except where two
+     * sources name a table the same, and there the sum is still the answer: both arrivals are rows this
+     * pipeline read.
+     *
+     * <p>The <strong>latest</strong> start among the runs, for the reason the target side takes the latest
+     * of its own. A start is how a consumer is told the series began again, and a total that falls with no
+     * such signal beside it is a counter going backwards; a run that is replaced resets its own count, and
+     * moving this instant forward with it makes the fall read as the restart it is.
+     */
+    @Override
+    public CaptureReading capturedRows(String pipelineId) {
+        List<CaptureRun> runs = runsByPipeline.get(pipelineId);
+        if (runs == null) {
+            return CaptureReading.NONE;
+        }
+        // No second guard for a run list that is empty: nothing would be summed and no start taken, which
+        // is what nothing reported already is. A guard for it would be a branch no case can enter, and a
+        // branch nothing can enter is where a different answer hides.
+        Map<String, Map<String, Long>> rows = new LinkedHashMap<>();
+        Map<String, Long> bytes = new LinkedHashMap<>();
+        Instant since = null;
+        for (CaptureRun run : runs) {
+            CaptureHealth health = run.health();
+            health.receivedRows().forEach((table, byOp) -> byOp.forEach((symbol, count) ->
+                    rows.computeIfAbsent(table, ignored -> new LinkedHashMap<>())
+                            .merge(symbol, count, Long::sum)));
+            // Added across this pipeline's runs like the counts, and for the same reason: two sources
+            // reading one table is twice the work and twice the payload, not one of them.
+            health.receivedBytes().forEach((table, size) -> bytes.merge(table, size, Long::sum));
+            Instant start = health.countingSince();
+            since = since == null || start.isAfter(since) ? start : since;
+        }
+        return new CaptureReading(rows, bytes, since);
     }
 
     /**
@@ -206,7 +347,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     @Override
     public boolean loadDelivered(String pipelineId) {
         for (SnapshotOnChain snapshot : snapshotTablesByPipeline.getOrDefault(pipelineId, List.of())) {
-            if (!SnapshotPhase.stillOwed(storePort.meta().read(snapshot.chainId()), pipelineId,
+            if (!SnapshotPhase.stillOwed(snapshot.chainId().flatMap(storePort.meta()::read), pipelineId,
                     snapshot.tables()).isEmpty()) {
                 return false;
             }
@@ -254,12 +395,29 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      */
     private RuntimeException closeRuns(List<CaptureRun> runs, String pipelineId, boolean purgeState) {
         RuntimeException firstFailure = null;
+        boolean capturesStopped = true;
         Set<MiningChainId> chains = new LinkedHashSet<>();
         for (CaptureRun run : runs) {
-            firstFailure = runCleanup(run::close, firstFailure);
+            try {
+                run.close();
+            } catch (RuntimeException failure) {
+                capturesStopped = false;
+                if (firstFailure == null) {
+                    firstFailure = failure;
+                } else {
+                    firstFailure.addSuppressed(failure);
+                }
+            }
             // Collected whether or not the close succeeded: a daemon that refused to stop does not make the
             // consumer membership this pipeline holds any less this pipeline's to give back.
             run.chainId().ifPresent(chains::add);
+        }
+        // A live drain cannot detach an empty queue: capture may already hold that queue and append into it
+        // after the drain returns. Lifecycle teardown has no such race once every capture close returned, so
+        // this is where all of the pipeline's queues and their coordinate strings are released. Keep them when
+        // a close failed because that capture may still be appending.
+        if (capturesStopped) {
+            snapshotBuffer.release(pipelineId);
         }
         // Once per chain, never once per run. Two sources reading one connection are one chain with a ring
         // per table, which is what a pipeline over a parent and a child table is; releasing it per run would
@@ -373,8 +531,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     static CaptureRunSpec deriveSpec(
             String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution,
             boolean srsEnabled) {
-        ReadMode readMode = settings != null && settings.readMode() != null
-                ? settings.readMode() : ReadMode.SNAPSHOT_AND_CDC;
+        return deriveSpec(pipelineId, settings, source, resolution, srsEnabled, 1L);
+    }
+
+    private static CaptureRunSpec deriveSpec(
+            String pipelineId, Settings settings, SourceResource source, SourceCaptureResolution resolution,
+            boolean srsEnabled, long snapshotEpoch) {
+        ReadMode readMode = readModeOf(settings);
         String startFromRaw = settings != null && settings.startFrom() != null
                 ? settings.startFrom() : "latest";
         String retention = source.srs() != null ? source.srs().retention() : null;
@@ -390,7 +553,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 pipelineId,
                 StartFrom.parse(startFromRaw),
                 retention,
-                MOCK_SCHEMA_VER);
+                MOCK_SCHEMA_VER,
+                snapshotEpoch);
+    }
+
+    private static ReadMode readModeOf(Settings settings) {
+        return settings != null && settings.readMode() != null
+                ? settings.readMode() : ReadMode.SNAPSHOT_AND_CDC;
     }
 
     /**
@@ -433,14 +602,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /**
-     * The snapshot pass-through for one source: it appends each snapshot row to the shared buffer under the
-     * source's change-ring name. The source vertex reading that ring drains the buffer and emits its rows ahead
-     * of the cdc tail, so the snapshot flows through the same transform-to-sink chain as cdc, strictly before
-     * it. A read mode that runs no snapshot never calls this, so the buffer for that ring stays empty and the
-     * source is a pure tail.
+     * The snapshot pass-through for one source: it appends each snapshot row to the shared buffer under this
+     * consumer pipeline and the source's change-ring name. Only that pipeline's source vertex can drain the
+     * rows, then emits them ahead of the cdc tail, so the snapshot flows through the same transform-to-sink
+     * chain as cdc, strictly before it. A read mode that runs no snapshot never calls this, so the buffer for
+     * that pipeline and ring stays empty and the source is a pure tail.
      */
     private Consumer<Envelope> snapshotPassthrough(
-            SourceCaptureResolution resolution, Map<String, Long> observedSnapshotCounts) {
+            String pipelineId, SourceCaptureResolution resolution, Map<String, Long> observedSnapshotCounts) {
         Set<String> selectedTables = Set.copyOf(resolution.tables());
         return event -> {
             if (!selectedTables.contains(event.src())) {
@@ -448,7 +617,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                         CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
             }
             observedSnapshotCounts.merge(event.src(), 1L, Long::sum);
-            snapshotBuffer.append(resolution.ringName(event.src()), event);
+            snapshotBuffer.append(pipelineId, resolution.ringName(event.src()), event);
         };
     }
 

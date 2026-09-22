@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
@@ -26,15 +27,16 @@ import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
-import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
@@ -132,6 +134,7 @@ public final class PipelineRepresentation {
 
     private static Step transform(Map<String, Object> value, String path) {
         Map<String, Object> step = object(value, path);
+        requireNoOptions(step, path);
         String id = text(step.get("id"), path + ".id");
         Map<String, Object> body = objectOrNull(step.get("body"), path + ".body");
         Map<String, Object> payload = new LinkedHashMap<>();
@@ -145,13 +148,12 @@ public final class PipelineRepresentation {
         }
         String use = textOrNull(step.get("use"), path + ".use");
         FromClause from = fromClause(step.get("from"), path + ".from");
-        Map<String, Object> options = copyJson(objectOrNull(step.get("options"), path + ".options"));
         if (use != null) {
-            return Step.use(id, use, from, options);
+            return Step.use(id, use, from);
         }
         String type = transformType(step.get("type"), body, path);
         TransformBody transform = body(type, payload, path);
-        return Step.inline(id, from, transform, options,
+        return Step.inline(id, from, transform,
                 copyJson(objectOrNull(step.get("experimental"), path + ".experimental")));
     }
 
@@ -174,6 +176,9 @@ public final class PipelineRepresentation {
         if (body.containsKey("root")) {
             return "nest";
         }
+        if (body.containsKey("path")) {
+            return "unwind";
+        }
         if (body.containsKey("sql") || body.containsKey("engine")) {
             return "join";
         }
@@ -190,6 +195,18 @@ public final class PipelineRepresentation {
                     fieldRules(requiredObject(payload, "fields", path), path + ".fields"));
             case "filter" -> new TransformBody.Filter(requiredText(payload, "expr", path));
             case "union" -> new TransformBody.Union();
+            // An expansion's four optional keys are read as absent when absent, never defaulted:
+            // this face round-trips what it wrote, and answering with a spelled-out false for a
+            // key nobody wrote turns reading a pipeline into editing it.
+            case "unwind" -> new TransformBody.Unwind(
+                    requiredText(payload, "path", path),
+                    textOrNull(value(payload, "include_array_index", "includeArrayIndex"),
+                            path + ".include_array_index"),
+                    booleanOrNull(value(payload, "preserve_null_and_empty_arrays",
+                            "preserveNullAndEmptyArrays"), path + ".preserve_null_and_empty_arrays"),
+                    textOrNull(value(payload, "element_key", "elementKey"), path + ".element_key"),
+                    elementType(value(payload, "element_type", "elementType"),
+                            path + ".element_type"));
             case "nest" -> new TransformBody.Nest(
                     textOrNull(value(payload, "primary_key", "primaryKey"), path + ".primary_key"),
                     enumValue(value(payload, "order"), NestOrder.values(), NestOrder::yaml, path + ".order"),
@@ -256,7 +273,6 @@ public final class PipelineRepresentation {
             value.putAll(bodyValue(inline.body()));
             value.put("experimental", copyJson(inline.experimental()));
         }
-        value.put("options", copyJson(step.options()));
         return Collections.unmodifiableMap(value);
     }
 
@@ -266,6 +282,16 @@ public final class PipelineRepresentation {
             case TransformBody.Js js -> value.put("script", js.script());
             case TransformBody.MapProjection map -> value.put("fields", fieldRuleValues(map.fields()));
             case TransformBody.Filter filter -> value.put("expr", filter.expr());
+            // Every key, including the ones the author omitted: this face reports what a pipeline
+            // is, and a key left out of the answer is indistinguishable from a key this face does
+            // not know about - which is the reading a reader of an unfamiliar type arrives with.
+            case TransformBody.Unwind unwind -> {
+                value.put("path", unwind.path());
+                value.put("includeArrayIndex", unwind.includeArrayIndex());
+                value.put("preserveNullAndEmptyArrays", unwind.preserveNullAndEmptyArrays());
+                value.put("elementKey", unwind.elementKey());
+                value.put("elementType", unwind.elementType());
+            }
             case TransformBody.Union ignored -> {
             }
             case TransformBody.Nest nest -> {
@@ -356,7 +382,6 @@ public final class PipelineRepresentation {
             value.put("from", fromRefValue(inline.from()));
             value.put("primaryKey", inline.primaryKey());
             value.put("storage", storageValue(inline.storage()));
-            value.put("schema", viewSchemaValue(inline.schema()));
         }
         return Collections.unmodifiableMap(value);
     }
@@ -380,16 +405,6 @@ public final class PipelineRepresentation {
         } else {
             value.put("cold", Collections.singletonMap("partitionBy", storage.cold().partitionBy()));
         }
-        return Collections.unmodifiableMap(value);
-    }
-
-    private static Map<String, Object> viewSchemaValue(ViewSchema schema) {
-        if (schema == null) {
-            return null;
-        }
-        Map<String, Object> value = new LinkedHashMap<>();
-        value.put("enforce", schema.enforce());
-        value.put("evolution", schema.evolution());
         return Collections.unmodifiableMap(value);
     }
 
@@ -423,7 +438,7 @@ public final class PipelineRepresentation {
             value.put("writeMode", element.writeMode() == null ? null : element.writeMode().name());
             value.put("rename", renameValue(element.rename()));
             value.put("ddl", element.ddl() == null ? null : element.ddl().name());
-            value.put("options", copyJson(element.options()));
+            value.put("onFullLoad", element.onFullLoad() == null ? null : element.onFullLoad().name());
             return Collections.unmodifiableMap(value);
         }).toList();
     }
@@ -462,7 +477,6 @@ public final class PipelineRepresentation {
             value.put("source", element.source());
             value.put("topic", element.topic());
             value.put("format", pushFormatValue(element.format()));
-            value.put("options", copyJson(element.options()));
             return Collections.unmodifiableMap(value);
         }).toList();
     }
@@ -523,6 +537,9 @@ public final class PipelineRepresentation {
             return null;
         }
         String path = "view";
+        if (value.containsKey("schema")) {
+            throw malformed("view.schema is not supported; remove the field");
+        }
         String use = textOrNull(value.get("use"), path + ".use");
         FromRef from = fromRef(value(value, "from"), path + ".from");
         String id = textOrNull(value.get("id"), path + ".id");
@@ -533,8 +550,7 @@ public final class PipelineRepresentation {
                 id == null ? "view" : id,
                 from,
                 textOrNull(value(value, "primary_key", "primaryKey"), path + ".primary_key"),
-                storage(objectOrNull(value.get("storage"), path + ".storage")),
-                viewSchema(objectOrNull(value.get("schema"), path + ".schema")));
+                storage(objectOrNull(value.get("storage"), path + ".storage")));
     }
 
     private static ServeBlock serve(Map<String, Object> value) {
@@ -564,6 +580,7 @@ public final class PipelineRepresentation {
         List<SyncElement> result = new ArrayList<>(values.size());
         for (int index = 0; index < values.size(); index++) {
             Map<String, Object> value = object(values.get(index), path + "[" + index + "]");
+            requireNoOptions(value, path + "[" + index + "]");
             result.add(new SyncElement(
                     textOrNull(value.get("id"), path + ".id"),
                     requiredText(value, "source", path),
@@ -571,7 +588,8 @@ public final class PipelineRepresentation {
                             path + ".writeMode"),
                     rename(objectOrNull(value.get("rename"), path + ".rename")),
                     enumValue(value.get("ddl"), DdlPolicy.values(), DdlPolicy::yaml, path + ".ddl"),
-                    copyJson(objectOrNull(value.get("options"), path + ".options"))));
+                    enumValue(value(value, "on_full_load", "onFullLoad"), OnFullLoad.values(), OnFullLoad::yaml,
+                            path + ".onFullLoad")));
         }
         return List.copyOf(result);
     }
@@ -599,12 +617,12 @@ public final class PipelineRepresentation {
         List<PushElement> result = new ArrayList<>(values.size());
         for (int index = 0; index < values.size(); index++) {
             Map<String, Object> value = object(values.get(index), path + "[" + index + "]");
+            requireNoOptions(value, path + "[" + index + "]");
             result.add(new PushElement(
                     textOrNull(value.get("id"), path + ".id"),
                     requiredText(value, "source", path),
                     textOrNull(value.get("topic"), path + ".topic"),
-                    pushFormat(value.get("format"), path + ".format"),
-                    copyJson(objectOrNull(value.get("options"), path + ".options"))));
+                    pushFormat(value.get("format"), path + ".format")));
         }
         return List.copyOf(result);
     }
@@ -644,12 +662,6 @@ public final class PipelineRepresentation {
                         stringsOrNull(warm.get("indexes"), "storage.warm.indexes")),
                 cold == null ? null : new Storage.Cold(
                         stringsOrNull(value(cold, "partition_by", "partitionBy"), "storage.cold.partitionBy")));
-    }
-
-    private static ViewSchema viewSchema(Map<String, Object> value) {
-        return value == null ? null : new ViewSchema(
-                booleanOrNull(value.get("enforce"), "schema.enforce"),
-                textOrNull(value.get("evolution"), "schema.evolution"));
     }
 
     private static Settings settings(Map<String, Object> value) {
@@ -831,6 +843,19 @@ public final class PipelineRepresentation {
         return result;
     }
 
+    /**
+     * An expansion's declared element type, refused here rather than carried on as text. The
+     * declaration reaching this face has not been through the parser that checks it, so a word
+     * outside the shared vocabulary would otherwise be written down and only be noticed - if at
+     * all - as a target column nobody could build. Held as its lower-case spelling, the same as
+     * every other side writes it.
+     */
+    private static String elementType(Object value, String path) {
+        TapstateType declared = enumValue(
+                value, TapstateType.values(), t -> t.name().toLowerCase(Locale.ROOT), path);
+        return declared == null ? null : declared.name().toLowerCase(Locale.ROOT);
+    }
+
     private static <E> E enumValue(Object value, E[] candidates, Function<E, String> spelling, String path) {
         if (value == null) {
             return null;
@@ -872,12 +897,33 @@ public final class PipelineRepresentation {
         requiredString(value, path);
     }
 
+    /**
+     * Options are the engine's own configuration and its vocabulary is empty today, so the model has
+     * nowhere to put one. Refusing here rather than dropping it silently: a request that carries an
+     * option and loses it on the way in reads as accepted and configures nothing. The source face
+     * refuses the same key, and so does the authoring grammar; this face used to be the one that
+     * took it and said nothing.
+     */
+    private static void requireNoOptions(Map<String, Object> value, String path) {
+        Object options = value.get("options");
+        if (options == null || (options instanceof Map<?, ?> map && map.isEmpty())) {
+            return;
+        }
+        throw malformed(path + ".options carries no engine option today; remove the field");
+    }
+
     private static TapstateException malformed(String reason) {
         String detail = reason == null || reason.isBlank() ? "invalid pipeline payload" : reason;
         return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", detail), null);
     }
 
     private static final class SetOf {
+        /**
+         * The keys a step carries in its own right. Everything else on a step is transform payload,
+         * so a key dropped from here is not removed - it is re-read as payload. "options" stays for
+         * that reason: the refusal above lets an empty one through, and without this entry that
+         * empty map would arrive in the transform body.
+         */
         private static final java.util.Set<String> STEP_META = java.util.Set.of(
                 "id", "from", "type", "use", "options", "experimental", "body");
 

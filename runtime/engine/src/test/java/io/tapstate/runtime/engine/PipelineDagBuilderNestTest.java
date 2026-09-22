@@ -69,7 +69,7 @@ class PipelineDagBuilderNestTest {
         for (int i = 0; i < aliasToSource.length; i += 2) {
             aliases.put(aliasToSource[i], FromRef.literal(aliasToSource[i + 1]));
         }
-        return Step.inline(id, FromClause.aliases(aliases), body, null, null);
+        return Step.inline(id, FromClause.aliases(aliases), body, null);
     }
 
     private static DAG buildWith(TransformBody.Nest body, String... aliasToSource) {
@@ -78,7 +78,7 @@ class PipelineDagBuilderNestTest {
                 List.of(SourceRef.bare("customers"), SourceRef.bare("policies"), SourceRef.bare("claims"), SourceRef.bare("profiles")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
         return PipelineDagBuilder.build(pipeline, bindings());
     }
@@ -158,7 +158,7 @@ class PipelineDagBuilderNestTest {
                 List.of(SourceRef.bare("customers"), SourceRef.bare("policies"), SourceRef.bare("claims"), SourceRef.bare("profiles")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
         DagBindings withoutNest = new DagBindings(
                 srcId -> stubMeta(),

@@ -40,7 +40,7 @@ class APipelineRecordsItsOwnSrsSwitchTest {
     private final InMemoryArtifactStore store = new InMemoryArtifactStore();
     private final ApplyService service = new ApplyService(
             TapstateCatalog::load, store, new AuditGate(new DiscardingAuditStore(), FIXED_CLOCK),
-            new EmptySchemaStore(), PlanAdvisories.none());
+            new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none());
 
     /** A cdc source that buffers through the shared replay store. */
     private static final String BUFFERED = """

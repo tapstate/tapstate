@@ -27,7 +27,8 @@ public final class ControlOperations {
     private static final Map<Frontend, Maturity> CLI_ONLY = Map.of(Frontend.CLI, Maturity.CURRENT);
     private static final Map<Frontend, Maturity> CLI_AND_MCP =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT);
-    private static final Map<Frontend, Maturity> REST_ONLY = Map.of(Frontend.REST, Maturity.CURRENT);
+    private static final Map<Frontend, Maturity> CLI_AND_REST =
+            Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.REST, Maturity.CURRENT);
 
     // system domain
     public static final Operation SYSTEM_VERSION = new Operation(
@@ -65,8 +66,8 @@ public final class ControlOperations {
                     + "version has moved on, if another resource still references the id, or if the id is a "
                     + "pipeline that is not stopped.");
 
-    // Source CRUD remains available to the authenticated REST face while its MCP projection is retired.
-    // The draft operation is the only Source operation exposed to MCP.
+    // Source mutations and single-resource reads remain off MCP; source.list and source.draft are the
+    // read-only Source operations exposed to model-facing clients.
     public static final Operation SOURCE_CREATE = new Operation(
             "source.create", Scope.WRITE, true, ControlApiSchema.ref("source.create"),
             "Create and persist one Source through the Server control API.", CLI_ONLY);
@@ -76,7 +77,9 @@ public final class ControlOperations {
                     + " This does not create an artifact or audit record.");
     public static final Operation SOURCE_LIST = new Operation(
             "source.list", Scope.READ, false, ControlApiSchema.ref("source.list"),
-            "List Sources with secret-redacted config and configured-secret field names.", CLI_ONLY);
+            "List a bounded page of Sources by id, connector, and display metadata. Configuration is "
+                    + "intentionally omitted, including secret and non-secret fields. Use limit (1-200) "
+                    + "and offset to page.", CLI_AND_MCP);
     public static final Operation SOURCE_GET = new Operation(
             "source.get", Scope.READ, false, ControlApiSchema.ref("source.get"),
             "Get one Source with secret-redacted config and configured-secret field names.", CLI_ONLY);
@@ -172,8 +175,9 @@ public final class ControlOperations {
     // pipeline's desired state (an intent the runtime later converges). There is no rewind verb — a re-dig
     // is stop then start composed at the surface.
     public static final Operation PIPELINE_LIST = new Operation(
-            "pipeline.list", Scope.READ, false, null,
-            "List static Pipeline artifacts with resolved Source summaries.", CLI_ONLY);
+            "pipeline.list", Scope.READ, false, ControlApiSchema.ref("pipeline.list"),
+            "List a bounded page of Pipeline artifacts with resolved Source summaries and live status. "
+                    + "Use limit (1-200) and offset to page; each item can include its DAG and transforms.", CLI_AND_MCP);
     public static final Operation PIPELINE_GET = new Operation(
             "pipeline.get", Scope.READ, false, null,
             "Get one static Pipeline artifact with resolved Source summaries.", CLI_ONLY);
@@ -191,29 +195,30 @@ public final class ControlOperations {
             "pipeline.update", Scope.WRITE, true, null,
             "Replace one Pipeline definition while its content hash precondition still matches.", CLI_ONLY);
 
-    // Draft operations are the web authoring contract. They stay REST-only while the existing pipeline
-    // operations remain the compatibility surface for CLI and MCP clients.
+    // Draft operations are the web authoring contract. They are also registered on the CLI face so the
+    // operation catalog remains complete across the command surface; REST is the currently implemented
+    // protocol adapter for these verbs.
     public static final Operation PIPELINE_DRAFT_LIST = new Operation(
             "pipeline-draft.list", Scope.READ, false, null,
-            "List editable Pipeline drafts with their revisions and publication state.", REST_ONLY);
+            "List editable Pipeline drafts with their revisions and publication state.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_GET = new Operation(
             "pipeline-draft.get", Scope.READ, false, null,
-            "Get one editable Pipeline draft and its revision.", REST_ONLY);
+            "Get one editable Pipeline draft and its revision.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_CREATE = new Operation(
             "pipeline-draft.create", Scope.WRITE, true, null,
-            "Create one editable Pipeline draft.", REST_ONLY);
+            "Create one editable Pipeline draft.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_REPLACE = new Operation(
             "pipeline-draft.replace", Scope.WRITE, true, null,
-            "Replace one Pipeline draft using its current revision.", REST_ONLY);
+            "Replace one Pipeline draft using its current revision.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_DELETE = new Operation(
             "pipeline-draft.delete", Scope.WRITE, true, null,
-            "Discard one Pipeline draft using its current revision.", REST_ONLY);
+            "Discard one Pipeline draft using its current revision.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_PREVIEW = new Operation(
             "pipeline-draft.preview", Scope.READ, false, null,
-            "Compile one Pipeline draft without publishing or changing the applied artifact.", REST_ONLY);
+            "Compile one Pipeline draft without publishing or changing the applied artifact.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_PUBLISH = new Operation(
             "pipeline-draft.publish", Scope.WRITE, true, null,
-            "Compile and atomically publish one Pipeline draft after its revision and artifact checks.", REST_ONLY);
+            "Compile and atomically publish one Pipeline draft after its revision and artifact checks.", CLI_AND_REST);
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
@@ -238,10 +243,11 @@ public final class ControlOperations {
             "pipeline.resume", Scope.WRITE, true,
             "Carry a paused Pipeline on from the position it was holding, reading nothing again.");
 
-    // pipeline observation reads: the four read faces. status/metrics/snapshot are store-backed over the
+    // pipeline observation reads: status/metrics/snapshot are store-backed over the
     // per-pipeline observation doc (status = lifecycle state, metrics = open stat map, snapshot = per-table
-    // load progress); logs tails the node-local process log output for the pipeline. Each reads and mutates
-    // nothing, so all four are read-scoped and unaudited.
+    // load progress); history projects bounded retained samples, explain applies the shared diagnostic
+    // checklist to one current observation, and logs tails the node-local process log output for the
+    // pipeline. Each reads and mutates nothing, so all are read-scoped and unaudited.
     public static final Operation PIPELINE_STATUS = mcp(
             "pipeline.status", Scope.READ, false,
             "Read a Pipeline's current lifecycle status.");
@@ -254,6 +260,15 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LOGS = mcp(
             "pipeline.logs", Scope.READ, false,
             "Read the bounded, secret-redacted log tail for a Pipeline.");
+    public static final Operation PIPELINE_METRICS_HISTORY = mcp(
+            "pipeline.metrics.history", Scope.READ, false,
+            "Read a bounded, reset-aware page of target-acknowledged output rates and selected table lag "
+                    + "over a retained time range. The result is eventually consistent; follow nextCursor "
+                    + "with every other argument unchanged.");
+    public static final Operation PIPELINE_EXPLAIN = mcp(
+            "pipeline.explain", Scope.READ, false,
+            "Read the shared evidence-backed explanation of one Pipeline's latest observation. A no-match "
+                    + "answer is not a health verdict and names what the observation cannot establish.");
 
     // Where a pipeline resumes from, read and written back. The read mutates nothing; the write moves
     // durable state that outlives every run on the chain -- shared with any other pipeline reading it --
@@ -337,6 +352,8 @@ public final class ControlOperations {
             PIPELINE_METRICS,
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
+            PIPELINE_METRICS_HISTORY,
+            PIPELINE_EXPLAIN,
             PIPELINE_POSITION,
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,

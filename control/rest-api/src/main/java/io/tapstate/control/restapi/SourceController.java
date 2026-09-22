@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.net.URI;
@@ -48,8 +49,10 @@ class SourceController {
 
     @Verb("source.list")
     @GetMapping("/sources")
-    SourceList list() {
-        return new SourceList(sources.list());
+    SourceList list(
+            @RequestParam(name = "limit", required = false) Integer limit,
+            @RequestParam(name = "offset", required = false) Integer offset) {
+        return new SourceList(ListWindow.page(sources.list(), limit, offset));
     }
 
     @Verb("source.get")

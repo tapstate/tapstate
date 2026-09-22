@@ -89,7 +89,8 @@ public final class MongoDesiredStore implements DesiredStore {
         if (targetState == null || revision == null) {
             // A stored desired doc missing a field this version requires is store corruption, surfaced
             // as a coded io diagnostic rather than a bare null-argument crash while reconstructing.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", targetState == null ? "targetState" : "revision"), null);
         }
         // Absent reads as false, and that is the one direction it may default in: a document written
         // before this field existed was written by a stop that could not have asked for anything to be
@@ -112,7 +113,8 @@ public final class MongoDesiredStore implements DesiredStore {
         try {
             return PipelineState.valueOf(targetState);
         } catch (IllegalArgumentException e) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), e);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "targetState"), e);
         }
     }
 }

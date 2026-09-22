@@ -1,0 +1,10 @@
+# Invalid: a view materializes into a sink keyed by primary_key, and that key carries the unique
+# index a reader pages on. Left out, the view was accepted here and refused only once something
+# tried to build it - a failure the author saw at run time instead of at validate time.
+version: tapstate/v1
+kind: pipeline
+id: to_view
+source: src_orders
+view:
+  id: v_orders
+  from: orders

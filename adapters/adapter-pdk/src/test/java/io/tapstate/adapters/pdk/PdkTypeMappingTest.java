@@ -5,6 +5,8 @@ import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.schema.type.TapRaw;
 import io.tapstate.core.common.TapstateType;
 
+import io.tapdata.entity.schema.type.TapType;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -322,6 +324,40 @@ class PdkTypeMappingTest {
                 .isEqualTo(expected);
     }
 
+    @Test
+    void targetConversionUsesTheInferredTypeRatherThanASourceDatabaseToken() {
+        ConnectorRef ref = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)),
+                "synthetic.Discoverable", "2.0.8", null, BIGINT_SPEC);
+        try (PdkConnector connector = PdkConnector.open("demo", ref, Map.of())) {
+            TapTable table = TargetTapTable.build(new io.tapstate.spi.sink.TargetTable("orders", List.of(
+                    new io.tapstate.spi.sink.TargetField("id", "NUMBER(19)", true, TapstateType.INT64))));
+            connector.resolveTargetTypes(table);
+            TapField id = table.getNameFieldMap().get("id");
+            assertThat(id.getDataType()).isEqualTo("bigint");
+            assertThat(id.getTapType()).isInstanceOf(io.tapdata.entity.schema.type.TapNumber.class);
+            assertThat(table.primaryKeys()).containsExactly("id");
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"decimal", "recommended_numeric"})
+    void theTargetConnectorsRecommendationIsUsedWithoutRepairingItsPrecision(String targetToken) {
+        String targetSpec = DECIMAL_SPEC.replace("decimal", targetToken);
+        ConnectorRef ref = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)),
+                "synthetic.Discoverable", "2.0.8", null, targetSpec);
+        try (PdkConnector connector = PdkConnector.open("demo", ref, Map.of())) {
+            TapTable table = TargetTapTable.build(new io.tapstate.spi.sink.TargetTable("orders", List.of(
+                    new io.tapstate.spi.sink.TargetField("amount", "source_numeric(20,4)", false,
+                            TapstateType.DECIMAL, PdkTypeMapping.numericType(
+                                    filled(DECIMAL_SPEC, "amount", "decimal(18,4)").getTapType())))));
+
+            connector.resolveTargetTypes(table);
+            TapField amount = table.getNameFieldMap().get("amount");
+            assertThat(amount.getDataType()).isEqualTo(targetToken + "(18,4)");
+            assertThat(amount.getTapType()).isInstanceOf(io.tapdata.entity.schema.type.TapNumber.class);
+        }
+    }
+
     /** Discovers one column of the given database type through a connector declaring {@code spec}. */
     private TapField filled(String spec, String column, String dataType) {
         ConnectorRef ref = new ConnectorRef(
@@ -332,5 +368,56 @@ class PdkTypeMappingTest {
             connector.fillFieldTypes(table);
             return table.getNameFieldMap().get(column);
         }
+    }
+
+    @Test
+    void eachWayAColumnArrivesWithoutATypeIsAttributedToThatWay() {
+        // The four reach here by different routes and want different things done about them: a
+        // connector that declared no mapping at all, a shape this mapping has no member for, a scaled
+        // column the connector did not mark, and a number it named and said nothing else about. As one
+        // text they read as "the type did not resolve", which is the reading nobody acts on.
+        //
+        // Compared as a set rather than one at a time: any two of them collapsing into one text is the
+        // failure this exists to catch, and four separate assertions would not see it.
+        List<String> reasons = Stream.of(
+                        PdkTypeMapping.resolve(null),
+                        PdkTypeMapping.resolve(filled(BIGINT_SPEC, "amount", "decimal(18,4)").getTapType()),
+                        PdkTypeMapping.resolve(filled(UNMARKED_SCALED_SPEC, "amount", "FLOAT").getTapType()),
+                        PdkTypeMapping.resolve(filled(BARE_SPEC, "rate", "double").getTapType()))
+                .map(PdkTypeMapping.Resolved::unknownBecause)
+                .toList();
+
+        assertThat(reasons).doesNotContainNull();
+        assertThat(Set.copyOf(reasons)).as("four routes, four attributions").hasSize(4);
+        assertThat(reasons.get(1))
+                .as("which shape arrived is what says this mapping is short a case rather than the "
+                        + "connector being at fault, and it is not recoverable once the connector is shut")
+                .contains("TapRaw");
+    }
+
+    @Test
+    void aTypeThatResolvedIsAttributedToNothing() {
+        assertThat(PdkTypeMapping.resolve(filled(BIGINT_SPEC, "id", "bigint").getTapType()).unknownBecause())
+                .isNull();
+    }
+
+    @Test
+    void theTypeOnlyReadingIsTheSameSwitchAsTheAttributedOne() {
+        // of() reads resolve() rather than repeating the mapping, so the two cannot answer differently.
+        // Written as a case because the repetition is what a later simplification would put back.
+        List<TapType> types = List.of(
+                filled(BIGINT_SPEC, "id", "bigint").getTapType(),
+                filled(BIGINT_SPEC, "amount", "decimal(18,4)").getTapType(),
+                filled(UNMARKED_SCALED_SPEC, "amount", "FLOAT").getTapType(),
+                filled(BARE_SPEC, "rate", "double").getTapType(),
+                filled(VARCHAR_SPEC, "customer", "varchar(64)").getTapType());
+
+        for (TapType type : types) {
+            assertThat(PdkTypeMapping.of(type)).isEqualTo(PdkTypeMapping.resolve(type).type());
+            assertThat(PdkTypeMapping.of(type) == TapstateType.UNKNOWN)
+                    .as("an unknown is attributed and a resolved type is not, with nothing in between")
+                    .isEqualTo(PdkTypeMapping.resolve(type).unknownBecause() != null);
+        }
+        assertThat(PdkTypeMapping.of(null)).isEqualTo(PdkTypeMapping.resolve(null).type());
     }
 }

@@ -8,6 +8,7 @@ import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.DiscoveredTable;
 import io.tapstate.core.dsl.RowExpressionTypeRules;
+import io.tapstate.core.dsl.TargetConnectorRules;
 import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.dsl.Workspace;
 import io.tapstate.core.dsl.WriteKeyRules;
@@ -84,6 +85,7 @@ public final class ApplyService {
     private final AuditGate auditGate;
     private final SchemaStore schemas;
     private final PlanAdvisories advisories;
+    private final SchemaDerivation derivation;
 
     /**
      * The reading of which pipelines are up, or null when the caller supplied none -- see the same field
@@ -96,13 +98,13 @@ public final class ApplyService {
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
-            PlanAdvisories advisories) {
-        this(catalog, store, auditGate, schemas, advisories, null);
+            PlanAdvisories advisories, SchemaDerivation derivation) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, null);
     }
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
-            PlanAdvisories advisories, LivePipelines live) {
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live) {
         this.live = live;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
@@ -112,6 +114,10 @@ public final class ApplyService {
         // would be indistinguishable from one whose rules all passed, so an assembly with no rules yet
         // states that by handing over PlanAdvisories.none().
         this.advisories = Objects.requireNonNull(advisories, "advisories");
+        // Named for the same reason the advisories are: an apply that quietly re-derived nothing reads
+        // exactly like one whose pipelines were all up to date, and the case this exists for is the one
+        // where nothing was written either.
+        this.derivation = Objects.requireNonNull(derivation, "derivation");
     }
 
     /**
@@ -157,7 +163,7 @@ public final class ApplyService {
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
-        List<Resource> storedResources = store.list();
+        List<Resource> storedResources = ReadableArtifactInventory.list(store);
         List<Resource> candidate = new ArrayList<>();
         for (Resource stored : storedResources) {
             if (!submittedIds.contains(stored.id())) {
@@ -180,6 +186,12 @@ public final class ApplyService {
         Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources);
         RowExpressionTypeRules.validate(validationResources, discovered);
         WriteKeyRules.validate(validationResources, discovered);
+        // Judged over the submitted resources and resolved against the whole candidate workspace.
+        // The two differ on both sides here: the typed path's validation set is a reference closure
+        // that reaches stored referrers, which must not be refused for an edit they were pulled into,
+        // and a write target is a connection document normally filed by an earlier batch, which has
+        // to be resolvable or every sync whose target was not resubmitted would pass unjudged.
+        TargetConnectorRules.validate(submitted, candidate);
         List<Resource> validated = List.copyOf(workspace.resources());
         Map<String, String> workspacePreconditions = new LinkedHashMap<>();
         for (Resource resource : validated) {
@@ -201,7 +213,7 @@ public final class ApplyService {
             Resource recorded = resource instanceof PipelineResource pipeline
                     ? withOwnSrsSwitches(pipeline, batchSources) : resource;
             String canonicalForm = writer.write(recorded);
-            prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(canonicalForm)));
+            prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(recorded)));
         }
         return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
     }
@@ -339,10 +351,12 @@ public final class ApplyService {
         ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
         if (live != null) {
-            List<Resource> stored = store.list();
+            ReadableArtifactInventory.Snapshot inventory = ReadableArtifactInventory.scan(store);
+            List<Resource> stored = inventory.resources();
             if (prepared.resource() instanceof SourceResource replacement) {
                 live.refuseBufferingChangeWhileLive(
-                        storedSource(stored, replacement.id()), replacement, stored);
+                        storedSource(stored, replacement.id()), replacement, stored,
+                        inventory.unreadablePipelineIds());
             }
             if (prepared.resource() instanceof PipelineResource replacement) {
                 live.refuseBufferingChangeWhileLive(
@@ -402,13 +416,18 @@ public final class ApplyService {
         List<AuditContext> audited = new ArrayList<>();
         Map<String, String> enforced = new LinkedHashMap<>();
         // Read once for the refusal below, and only when there is a reading to judge against.
-        List<Resource> stored = live == null ? List.of() : store.list();
+        ReadableArtifactInventory.Snapshot inventory = live == null
+                ? null : ReadableArtifactInventory.scan(store);
+        List<Resource> stored = inventory == null ? List.of() : inventory.resources();
+        List<String> unreadablePipelineIds = inventory == null
+                ? List.of() : inventory.unreadablePipelineIds();
         for (PreparedArtifact prepared : plan.artifacts()) {
             ArtifactOutcome outcome = outcome(prepared);
             if (outcome.change() != ArtifactOutcome.Change.UNCHANGED) {
                 if (live != null && prepared.resource() instanceof SourceResource replacement) {
                     live.refuseBufferingChangeWhileLive(
-                            storedSource(stored, replacement.id()), replacement, stored);
+                            storedSource(stored, replacement.id()), replacement, stored,
+                            unreadablePipelineIds);
                 }
                 if (live != null && prepared.resource() instanceof PipelineResource replacement) {
                     live.refuseBufferingChangeWhileLive(
@@ -423,13 +442,41 @@ public final class ApplyService {
             }
             outcomes.add(outcome);
         }
-        return auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
+        // The changed set is audited per artifact, then written as one atomic batch: all of it lands or,
+        // on a write failure, none does.
+        //
+        // The declared versions are handed to the write rather than only to plan(). plan()'s comparison
+        // happens before a whole workspace validation and a schema-store read, so a second author
+        // editing the same id inside that window passes the same comparison and both writes land — the
+        // first author's edit is gone, and nothing anywhere reports it. Passing them here makes the
+        // comparison and the write one store operation, which is the only form of the check that
+        // survives a concurrent writer.
+        ApplyResult result = auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
             String conflicted = store.saveAll(toWrite, enforced).orElse(null);
             if (conflicted != null) {
                 throw new TapstateException(ArtifactError.VERSION_CONFLICT, Map.of("id", conflicted), null);
             }
             return new ApplyResult(outcomes, plan.warnings());
         });
+        // Every pipeline in the batch, whether or not this apply wrote it. An unchanged pipeline is
+        // precisely the case that needs re-deriving: its content hash covers the pipeline document and
+        // nothing else, so a source that moved under it leaves the hash byte-identical and the write
+        // skipped. Keying this on the write would leave it silent in the one case it is here for.
+        List<ValidationDiagnostic> warnings = new ArrayList<>(result.warnings());
+        for (PreparedArtifact prepared : plan.artifacts()) {
+            if (prepared.resource() instanceof PipelineResource) {
+                try {
+                    derivation.derive(prepared.id());
+                } catch (TapstateException failure) {
+                    // The artifact transaction has committed. A skipped or partial model refresh must
+                    // not report that write as refused, or prevent later pipelines from refreshing.
+                    warnings.add(new ValidationDiagnostic(ControlError.SCHEMA_DERIVATION_INCOMPLETE.code(),
+                            Map.of("pipeline", prepared.id(), "causeCode", failure.code().code(),
+                                    "causeParams", failure.args())));
+                }
+            }
+        }
+        return new ApplyResult(result.outcomes(), warnings);
     }
 
     private static PipelineResource storedPipeline(List<Resource> stored, String id) {
@@ -493,8 +540,9 @@ public final class ApplyService {
         return new ArtifactOutcome(prepared.id(), prepared.kind(), change, prepared.contentHash());
     }
 
+    /** The content hash of a stored artifact, recomputed over its canonical structure. */
     private String storedHash(Resource stored) {
-        return CanonicalHash.of(writer.write(stored));
+        return CanonicalHash.of(stored);
     }
 
     private void requireCurrentVersion(ArtifactDraft draft, Resource parsed) {

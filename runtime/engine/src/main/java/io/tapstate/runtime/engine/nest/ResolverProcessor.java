@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine.nest;
 
+import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
@@ -8,6 +9,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.ReplayFloor;
@@ -47,7 +50,12 @@ import java.util.Set;
  * batch is done: an entry evicted mid-drain is still the clean one already on disk, and the events that
  * would have changed it have not been acknowledged, so a crash replays them.
  */
-public final class ResolverProcessor extends AbstractProcessor {
+public final class ResolverProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.NEST;
+    }
 
     /**
      * The shortest gap between two passes over the tombstones that may stop being kept.
@@ -248,6 +256,7 @@ public final class ResolverProcessor extends AbstractProcessor {
     @Override
     protected void init(Processor.Context context) {
         this.failures = NestFailureRecording.of(context);
+        this.timer = StageTimer.of(stage(), context);
     }
 
     @Override
@@ -343,12 +352,20 @@ public final class ResolverProcessor extends AbstractProcessor {
         return false;
     }
 
+    // Times each drain of arrivals, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.NEST);
+
     @Override
     public void process(int ordinal, Inbox inbox) {
-        failures.recording(() -> {
-            processRecording(ordinal, inbox);
-            return null;
-        });
+        long started = timer.begin();
+        try {
+            failures.recording(() -> {
+                processRecording(ordinal, inbox);
+                return null;
+            });
+        } finally {
+            timer.end(started);
+        }
     }
 
     private void processRecording(int ordinal, Inbox inbox) {
@@ -814,16 +831,22 @@ public final class ResolverProcessor extends AbstractProcessor {
      * this one hangs from - the same climb this level's own rows make, which is what lets a level nested
      * anywhere point at a row without a path of its own.
      *
-     * <p><b>Word for a row whose parent is not known yet is dropped, and that loses nothing.</b> Nothing of
-     * this level is in a document until its parent turns up, and whatever puts it there draws the document
-     * then - reading the edited row as it now stands, because it was filed before this word was ever sent.
-     * Holding the word instead would mean queueing a wake-up for a document that does not exist, on a key
-     * that may never resolve.
+     * <p><b>Word for a later edit whose parent is not known yet is dropped, and that loses nothing.</b>
+     * Nothing of this level is in a document until its parent turns up, and whatever puts it there draws the
+     * document then - reading the edited row as it now stands, because it was filed before this word was ever
+     * sent. Holding the word instead would mean queueing a wake-up for a document that does not exist, on a
+     * key that may never resolve. A first filing still sends its position on: the filed row is durable, and
+     * nothing else will carry its chain to the sink when there is no parent to address the wake to.
      */
     private void passOn(NestTouch word, Map<Object, ResolverState> touched) {
         ResolverState state = stateFor(word.key(), touched);
         if (state.parentKey() != null) {
             emit(word.routedBy(state.parentKey()));
+        } else if (word.firstFiling()) {
+            // This row is durable in its lookup, and a referrer that has not reached its parent yet will
+            // read it when it eventually does. No document needs redrawing here, but the row's own chain
+            // still needs a position at the sink or its frontier stops at this first filing for good.
+            emit(new SettledPositions(word.positions()));
         }
     }
 

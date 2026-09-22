@@ -98,6 +98,10 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     private static final String GRANDCHILD_CONNECTOR_NAMESPACE =
             connectorNamespace(PIPELINE, GRANDCHILD_SOURCE);
     private static final String SINK_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "sync_1");
+    private static final String SINK_PREPARATION_NAMESPACE =
+            io.tapstate.spi.sink.SinkPreparationNamespace.of(new PipelineNode(PIPELINE, "sync_1"));
+    private static final String VIEW_PREPARATION_NAMESPACE =
+            io.tapstate.spi.sink.SinkPreparationNamespace.of(new PipelineNode(PIPELINE, "orders_view"));
     private static final String VIEW_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "orders_view");
     private static final String OTHER_PIPELINE_CONNECTOR_NAMESPACE = connectorNamespace("other_pipe", PARENT_SOURCE);
     private static final String UNOPENED_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "removed_node");
@@ -144,7 +148,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         // under a name no run afterwards looks at.
         assertThat(namespaces).containsExactlyInAnyOrder(ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE,
                 ROOT_NAMESPACE + ".parking", ITEMS_NAMESPACE + ".parking", SOURCE_CONNECTOR_NAMESPACE,
-                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE);
+                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE, SINK_PREPARATION_NAMESPACE);
     }
 
     @Test
@@ -173,7 +177,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.artifacts().save(pipelineWithoutNest());
 
         assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
-                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE);
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE, SINK_PREPARATION_NAMESPACE);
     }
 
     @Test
@@ -182,7 +186,17 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.artifacts().save(pipelineWithView());
 
         assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
-                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE);
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE, VIEW_PREPARATION_NAMESPACE);
+    }
+
+    @Test
+    void rerunDropsPreparationReceiptsButAnOrdinaryStopKeepsThem() {
+        InMemoryStorePort store = seedStore();
+        store.keyedState().save(SINK_PREPARATION_NAMESPACE, "orders", new byte[] {1});
+        actuator(store).stop(PIPELINE, false);
+        assertThat(store.keyedState().load(SINK_PREPARATION_NAMESPACE, "orders")).isPresent();
+        actuator(store).stop(PIPELINE, true);
+        assertThat(store.keyedState().load(SINK_PREPARATION_NAMESPACE, "orders")).isEmpty();
     }
 
     @Test
@@ -349,6 +363,75 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
+    void aPurgeDropsStateAndDeadLettersFromTheDatabaseTheNestSelected() {
+        InMemoryStorePort store = seedStore();
+        String database = "orders_operator_state";
+        var routed = store.operatorStateStores().inDatabase(database);
+        routed.state().save(ROOT_NAMESPACE, "k", "held".getBytes(StandardCharsets.UTF_8));
+        routed.deadLetters().record(new NestDeadLetterRecord(
+                ROOT_NAMESPACE, "e1", "orders", "1:1", 0L, 0L, Map.of("id", 1)));
+        store.keyedState().save(OTHER_PIPELINE_NAMESPACE, "k", "other".getBytes(StandardCharsets.UTF_8));
+        member.getMap(ROOT_NAMESPACE).put("k", "held");
+
+        NestStateTeardown teardown = new NestStateTeardown(member, store.operatorStateStores());
+        Set<OperatorStateLocation> locations = Set.of(
+                new OperatorStateLocation(database, ROOT_NAMESPACE));
+        teardown.willKeepStateAt(PIPELINE, locations);
+        teardown.noteLocations(PIPELINE, Set.of());
+        teardown.finishPending(PIPELINE);
+
+        assertThat(routed.state().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(routed.deadLetters().read(ROOT_NAMESPACE, 10)).isEmpty();
+        assertThat(member.getMap(ROOT_NAMESPACE).size()).isZero();
+        assertThat(store.keyedState().load(OTHER_PIPELINE_NAMESPACE, "k")).isPresent();
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept")).isEmpty();
+    }
+
+    @Test
+    void aPurgeAfterRelocationLeavesTheOldDatabaseAsARollbackCopy() {
+        InMemoryStorePort store = seedStore();
+        String oldDatabase = "orders_state_old";
+        String newDatabase = "orders_state_new";
+        var oldStores = store.operatorStateStores().inDatabase(oldDatabase);
+        var newStores = store.operatorStateStores().inDatabase(newDatabase);
+        oldStores.state().save(ROOT_NAMESPACE, "k", "old".getBytes(StandardCharsets.UTF_8));
+        newStores.state().save(ROOT_NAMESPACE, "k", "new".getBytes(StandardCharsets.UTF_8));
+        oldStores.deadLetters().record(new NestDeadLetterRecord(
+                ROOT_NAMESPACE, "old-e", "orders", "1:1", 0L, 0L, Map.of("id", 1)));
+        newStores.deadLetters().record(new NestDeadLetterRecord(
+                ROOT_NAMESPACE, "new-e", "orders", "1:1", 0L, 0L, Map.of("id", 1)));
+
+        NestStateTeardown teardown = new NestStateTeardown(member, store.operatorStateStores());
+        teardown.willKeepStateAt(PIPELINE, Set.of(
+                new OperatorStateLocation(oldDatabase, ROOT_NAMESPACE)));
+        teardown.willKeepStateAt(PIPELINE, Set.of(
+                new OperatorStateLocation(newDatabase, ROOT_NAMESPACE)));
+        teardown.noteLocations(PIPELINE, Set.of(
+                new OperatorStateLocation(newDatabase, ROOT_NAMESPACE)));
+        teardown.finishPending(PIPELINE);
+
+        assertThat(newStores.state().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(newStores.deadLetters().read(ROOT_NAMESPACE, 10)).isEmpty();
+        assertThat(oldStores.state().load(ROOT_NAMESPACE, "k"))
+                .describedAs("the pre-migration copy remains available for rollback")
+                .isPresent();
+        assertThat(oldStores.deadLetters().read(ROOT_NAMESPACE, 10)).hasSize(1);
+    }
+
+    @Test
+    void aLegacyNamespaceOnlyTeardownRecordStillMeansTheDeploymentDefaultDatabase() {
+        InMemoryStorePort store = seedStore();
+        seedState(store, ROOT_NAMESPACE);
+        store.keyedState().save(TEARDOWN_NAMESPACE, "namespaces",
+                ROOT_NAMESPACE.getBytes(StandardCharsets.UTF_8));
+
+        new NestStateTeardown(member, store.operatorStateStores()).finishPending(PIPELINE);
+
+        assertThat(store.keyedState().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "namespaces")).isEmpty();
+    }
+
+    @Test
     @DisplayName("a pipeline that nests nothing records connector state and drops its record after purge")
     void aPipelineWithoutNestsRecordsConnectorState() {
         InMemoryStorePort store = seedStore();
@@ -359,7 +442,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))
                 .hasValueSatisfying(bytes -> assertThat(new String(bytes, StandardCharsets.UTF_8))
-                        .contains(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE));
+                        .startsWith("v2:")
+                        .doesNotContain(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE));
         actuator.stop(PIPELINE, true);
 
         assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "kept"))
@@ -573,7 +657,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         artifacts.save(source(PARENT_SOURCE, PARENT_TABLE));
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
         artifacts.save(source(GRANDCHILD_SOURCE, GRANDCHILD_TABLE));
-        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
+        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
         artifacts.save(pipeline());
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
@@ -607,9 +691,9 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         aliases.put("i", FromRef.literal(CHILD_TABLE));
         aliases.put("p", FromRef.literal(GRANDCHILD_TABLE));
         return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true), SourceRef.spec(GRANDCHILD_SOURCE, true)),
-                List.of(Step.inline(STEP, FromClause.aliases(aliases), body, null, null)), null,
+                List.of(Step.inline(STEP, FromClause.aliases(aliases), body, null)), null,
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
     }
 
@@ -617,19 +701,19 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     private static PipelineResource pipelineWithoutNest() {
         return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true)), List.of(), null,
                 new ServeBlock.Inline(null, FromRef.literal(PARENT_SOURCE),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
     }
 
     private static PipelineResource pipelineWithView() {
         return new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true)), List.of(),
-                new ViewBlock.Inline("orders_view", FromRef.literal(PARENT_SOURCE), "id", null, null), null,
+                new ViewBlock.Inline("orders_view", FromRef.literal(PARENT_SOURCE), "id", null), null,
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
     }
 
     private static SourceResource source(String id, String table) {
         return new SourceResource(id, null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static DiscoveredSourceModel discovered(String connectionId, SourceTable table) {

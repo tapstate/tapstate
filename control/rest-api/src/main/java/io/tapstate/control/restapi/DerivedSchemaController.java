@@ -13,9 +13,10 @@ import java.util.List;
  *
  * <p>The read is what a person looks at when a start was refused because a join no longer produces the
  * columns it was recorded producing: what was recorded, what it produces now, and what the table it
- * writes into actually holds. The write is how they say to carry on, and it is a verb of its own rather
- * than a flag on the start - a flag is typed once and then lives in a script, and the whole value of
- * this check is the one moment somebody looks.
+ * writes into actually holds. The write is how they say to carry on - it re-reads the sources into the
+ * pipeline's own copy of them and works every step below that out again - and it is a verb of its own
+ * rather than a flag on the start: a flag is typed once and then lives in a script, and the whole value
+ * of this check is the one moment somebody looks.
  *
  * <p>Both are thin pass-throughs; the comparison, the audit and the record all live behind the port.
  */

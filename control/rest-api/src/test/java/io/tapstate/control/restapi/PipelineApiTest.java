@@ -4,6 +4,7 @@ import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.PlanAdvisories;
+import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.BootstrapService;
@@ -698,6 +699,7 @@ class PipelineApiTest {
                         "pipeline.update",
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
+                        "pipeline.metrics.history", "pipeline.explain",
                         "pipeline.position", "pipeline.set-position",
                         "pipeline.derived-schema", "pipeline.accept-derived-schema");
 
@@ -719,7 +721,7 @@ class PipelineApiTest {
 
     /** The revision of a pipeline is the content hash of its canonical form — the value apply stamps. */
     private static String revisionOf(String dsl) {
-        return CanonicalHash.of(new CanonicalWriter().write(parse(dsl)));
+        return CanonicalHash.of(parse(dsl));
     }
 
     /** What an artifact's run is assembled from: the same canonical text, with whitelisted fields erased. */
@@ -777,18 +779,21 @@ class PipelineApiTest {
                   ddl: apply
             """;
 
+    // Read by the pipelines below, so it has to say how it is read. The write target under it
+    // deliberately does not: only a source a pipeline reads is asked for a mode.
     private static final String SOURCE_X = """
             version: tapstate/v1
             kind: source
             id: src_x
             connector: mysql
+            mode: cdc
             """;
 
     private static final String SOURCE_TARGET = """
             version: tapstate/v1
             kind: source
             id: tgt_x
-            connector: mysql
+            connector: mongodb
             """;
 
     /**
@@ -801,7 +806,7 @@ class PipelineApiTest {
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             PipelinePositionTestConfiguration.class,
-            DerivedSchemaTestConfiguration.class})
+            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class})
     static class TestApp {
 
         @Bean
@@ -945,7 +950,7 @@ class PipelineApiTest {
         @Bean
         ApplyService applyService(ArtifactStore store, AuditGate auditGate) {
             return new ApplyService(TapstateCatalog::load, store, auditGate, new EmptySchemaStore(),
-                    PlanAdvisories.none());
+                    PlanAdvisories.none(), SchemaDerivation.none());
         }
 
         @Bean
@@ -1191,7 +1196,7 @@ class PipelineApiTest {
             for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
                 Resource current = byId.get(expected.getKey());
                 if (current == null
-                        || !CanonicalHash.of(new CanonicalWriter().write(current)).equals(expected.getValue())) {
+                        || !CanonicalHash.of(current).equals(expected.getValue())) {
                     return Optional.of(expected.getKey());
                 }
             }
@@ -1215,7 +1220,7 @@ class PipelineApiTest {
             if (current == null) {
                 return io.tapstate.spi.store.ArtifactMutation.NOT_FOUND;
             }
-            if (!CanonicalHash.of(new CanonicalWriter().write(current)).equals(expectedContentHash)) {
+            if (!CanonicalHash.of(current).equals(expectedContentHash)) {
                 return io.tapstate.spi.store.ArtifactMutation.VERSION_CONFLICT;
             }
             byId.put(id, replacement);

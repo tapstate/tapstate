@@ -23,15 +23,17 @@ import java.util.Set;
 final class YamlMap {
 
     private final String path;                                  // "" at the document root
+    private final Node self;                                    // the mapping this view reads
     private final Map<String, Node> values = new LinkedHashMap<>();
     private final Map<String, Node> keyNodes = new LinkedHashMap<>();
 
-    private YamlMap(String path) {
+    private YamlMap(String path, Node self) {
         this.path = path;
+        this.self = self;
     }
 
     static YamlMap of(MappingNode node, String path) {
-        YamlMap m = new YamlMap(path);
+        YamlMap m = new YamlMap(path, node);
         for (NodeTuple tuple : node.getValue()) {
             String key = ((ScalarNode) tuple.getKeyNode()).getValue();
             m.values.put(key, tuple.getValueNode());
@@ -47,6 +49,27 @@ final class YamlMap {
                 throw error(DslError.UNKNOWN_FIELD, childPath(key), keyNodes.get(key),
                         Map.of("field", key));
             }
+        }
+    }
+
+    /**
+     * Rejects a mapping missing any of {@code required} with code {@link DslError#MISSING_FIELD}.
+     * Reported at the mapping's own position: an absent key has no node to point at, and a diagnostic
+     * naming a field with no place to put it is most of the answer missing in a directory of files.
+     *
+     * <p>Reports the alphabetically first of several, so the same document always names the same
+     * field. Iteration order over the caller's set is not specified, and a diagnostic that varies
+     * between runs is one no test can pin and no user can compare against a colleague's.
+     */
+    void requirePresent(Set<String> required) {
+        String missing = null;
+        for (String key : required) {
+            if (!values.containsKey(key) && (missing == null || key.compareTo(missing) < 0)) {
+                missing = key;
+            }
+        }
+        if (missing != null) {
+            throw error(DslError.MISSING_FIELD, childPath(missing), self, Map.of("field", missing));
         }
     }
 
@@ -72,15 +95,54 @@ final class YamlMap {
         return sc.getValue();
     }
 
+    /**
+     * As {@link #string}, for a key the schema requires: an absent one is refused rather than
+     * handed on as a null.
+     */
+    String requireString(String key) {
+        return require(key, string(key));
+    }
+
+    /**
+     * Returns {@code value} as read from {@code key}, or refuses when the key the schema requires
+     * was left out. Leaving one out is a property of the document, so it comes back located like
+     * every other malformed artifact -- passing the null on reaches a model record that null-checks
+     * it, and the author is handed a NullPointerException naming an internal component instead.
+     *
+     * <p>Reports what {@link #requirePresent} reports, since the two differ only in whether the
+     * requirement is stated per field or per record. The field travels as its own parameter rather
+     * than inside a sentence, which is what lets it be matched on and rendered per locale.
+     */
+    <T> T require(String key, T value) {
+        if (value == null) {
+            throw error(DslError.MISSING_FIELD, childPath(key), self, Map.of("field", key));
+        }
+        return value;
+    }
+
     /** Free-form typed value (scalar / list / map) per the Tapstate dialect; null if absent. */
     Object value(String key) {
         Node n = values.get(key);
         return n == null ? null : nodeValue(n);
     }
 
+    /**
+     * Free-form mapping value, or null if absent. A value that is present but is not a mapping is
+     * refused here rather than cast: the cast succeeds unchecked and the failure surfaces later as a
+     * class-cast crash carrying no field, no position and no document — an authoring mistake reported
+     * as a fault in the reader.
+     */
     @SuppressWarnings("unchecked")
     Map<String, Object> freeMap(String key) {
-        return (Map<String, Object>) value(key);
+        Object value = value(key);
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Map<?, ?>)) {
+            throw errorAt(key, DslError.ILLEGAL_VALUE,
+                    Map.of("value", nodeTypeName(values.get(key)), "expected", "a mapping"));
+        }
+        return (Map<String, Object>) value;
     }
 
     /** Sub-mapping as a located view, carrying the extended path; null if absent; error if not a mapping. */
@@ -136,7 +198,7 @@ final class YamlMap {
                 return Boolean.valueOf(v);
             }
             if (Tag.INT.equals(tag)) {
-                return parseInt(v);
+                return parseInt(v, sc);
             }
             if (Tag.FLOAT.equals(tag)) {
                 return Double.valueOf(v);
@@ -160,7 +222,15 @@ final class YamlMap {
         return null;
     }
 
-    private static Object parseInt(String raw) {
+    /**
+     * A whole number as the narrowest of int / long that holds it.
+     *
+     * <p>One wider than a long is refused here, coded and located. No store this value can reach holds
+     * an integer wider than 64 bits, so admitting it only moves the refusal to a layer that has no field
+     * name and no line to report it against -- which is where it used to land, as an unchecked crash out
+     * of the writer that turns the model into text.
+     */
+    private static Object parseInt(String raw, ScalarNode node) {
         boolean negative = raw.startsWith("-");
         String s = (raw.startsWith("+") || raw.startsWith("-")) ? raw.substring(1) : raw;
         int radix = 10;
@@ -176,8 +246,13 @@ final class YamlMap {
         }
         try {
             return Integer.valueOf(s, radix);
-        } catch (NumberFormatException overflow) {
-            return Long.valueOf(s, radix);
+        } catch (NumberFormatException widerThanAnInt) {
+            try {
+                return Long.valueOf(s, radix);
+            } catch (NumberFormatException widerThanAnyStore) {
+                throw error(DslError.ILLEGAL_VALUE, "", node,
+                        Map.of("value", raw, "expected", "a whole number that fits in 64 bits"));
+            }
         }
     }
 

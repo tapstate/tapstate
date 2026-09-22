@@ -58,7 +58,9 @@
                 "enum": [
                   "mongo",
                   "mysql",
-                  "postgres"
+                  "oracle",
+                  "postgres",
+                  "sqlserver"
                 ]
               }
             }
@@ -422,7 +424,7 @@
                 "required": [
                   "where"
                 ],
-                "description": "One document, located and read at the endpoint itself. Carry expect or size - a doc that expects nothing checks nothing.",
+                "description": "One document, located and read at the endpoint itself. Carry expect, size or absent - a doc that expects nothing checks nothing.",
                 "properties": {
                   "where": {
                     "type": "object",
@@ -455,6 +457,15 @@
                       "description": "How many elements the list at this path holds.",
                       "minimum": 0
                     }
+                  },
+                  "absent": {
+                    "type": "array",
+                    "description": "Paths that must not be there at all - the only thing here a wider document fails, since every value and length is satisfied by a document carrying extra fields beside them.",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "description": "A path that must not be present."
+                    }
                   }
                 },
                 "anyOf": [
@@ -466,6 +477,11 @@
                   {
                     "required": [
                       "size"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "absent"
                     ]
                   }
                 ]
@@ -512,6 +528,20 @@
               "type": "string",
               "description": "The canonical code of the failure the pipeline this specification names is expected to publish, written '<domain>.<symbol>'.",
               "pattern": "^[a-z0-9]+\\.[a-z0-9-]+$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "records_out"
+          ],
+          "properties": {
+            "records_out": {
+              "type": "integer",
+              "description": "How many rows this pipeline is expected to have had confirmed by its targets, added up over its tables and the operations its sources performed. Nought asserted here is only an assertion beside a sibling asserting a real total: the face publishes no entry until something settles, so nought is also what a pipeline publishing nothing at all would read.",
+              "minimum": 0
             }
           }
         },

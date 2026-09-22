@@ -5,8 +5,8 @@ import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * The authoritative registry of first-party error-code domains (ADR-0024 D2). The {@code <domain>}
- * segment of every canonical code must be one of these — the build-time format gate (ADR-0024 D5-2)
+ * The authoritative registry of first-party error-code domains. The {@code <domain>}
+ * segment of every canonical code must be one of these — the build-time format gate
  * rejects any code whose domain is unregistered. This closes the legacy class of bug where a typo
  * (e.g. {@code dls.} for {@code dsl.}) silently minted a brand-new namespace.
  *
@@ -18,6 +18,10 @@ public enum Domain {
     CLI,
     CORE,
     CATALOG,
+    // the naming and shape of the data a batch would move: what a source's discovered columns become
+    // once a sink has stored them. Distinct from DSL, which judges the document the author wrote --
+    // nothing here says the batch is wrong, only what one of its column names will mean on the other
+    // side (core)
     SCHEMA,
     // core ring: pipeline lifecycle state machine (illegal transitions)
     LIFECYCLE,
@@ -29,6 +33,12 @@ public enum Domain {
     ACTUATION,
     // storage connectivity: reaching the backing store and its replica-set requirement (adapters)
     STORE,
+    // system-data schema versioning: the startup gate that compares the version the store holds
+    // against the versions this build knows, and the migrator that moves it forward. Distinct from
+    // STORE, which reports that the store could not be reached at all, and from IO, which reports a
+    // failure operating on it once it is up: these say the store was reached and is at a version this
+    // process must not run against (adapters)
+    MIGRATION,
     // pdk bridge: loading, level-gating, driving and projecting a connector (adapters)
     CONNECTOR,
     // stateless row transforms: evaluating an author's CEL expression or js script against an event

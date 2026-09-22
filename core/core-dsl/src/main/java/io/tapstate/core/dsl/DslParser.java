@@ -1,5 +1,6 @@
 package io.tapstate.core.dsl;
 
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
@@ -11,6 +12,7 @@ import io.tapstate.core.model.JoinEngine;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestOrder;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.NestStateStorage;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.PushFormat;
@@ -31,12 +33,12 @@ import io.tapstate.core.model.SrsSchemaEvolution;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewResource;
-import io.tapstate.core.model.ViewSchema;
 import io.tapstate.core.model.WriteMode;
 import org.yaml.snakeyaml.DumperOptions;
 import org.yaml.snakeyaml.LoaderOptions;
@@ -46,6 +48,7 @@ import org.yaml.snakeyaml.error.MarkedYAMLException;
 import org.yaml.snakeyaml.error.YAMLException;
 import org.yaml.snakeyaml.nodes.MappingNode;
 import org.yaml.snakeyaml.nodes.Node;
+import org.yaml.snakeyaml.nodes.NodeTuple;
 import org.yaml.snakeyaml.nodes.ScalarNode;
 import org.yaml.snakeyaml.nodes.SequenceNode;
 import org.yaml.snakeyaml.representer.Representer;
@@ -59,7 +62,9 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
@@ -75,97 +80,277 @@ import java.util.function.Function;
  */
 public final class DslParser {
 
-    private static final Set<String> SOURCE_KEYS = Set.of(
-            "version", "kind", "id", "metadata", "connector", "config", "mode",
-            "tables", "options", "srs", "experimental");
-    private static final Set<String> PIPELINE_KEYS = Set.of(
-            "version", "kind", "id", "metadata", "source", "transforms", "view", "serve",
-            "settings", "experimental");
-    private static final Set<String> METADATA_KEYS = Set.of("labels", "description");
-    private static final Set<String> SRS_KEYS = Set.of("key", "retention", "schema_evolution", "queryable", "enabled");
-    // snapshot_mode / start_from moved from source options to pipeline settings (read_mode / start_from).
-    // options is otherwise a free connector map, so these two names are rejected explicitly instead of
-    // being silently passed through to the connector as no-ops when a stale artifact still carries them.
-    private static final List<String> RELOCATED_SOURCE_OPTIONS = List.of("snapshot_mode", "start_from");
-    private static final Set<String> TABLE_SPEC_KEYS = Set.of("name", "filter", "pk", "options");
-    private static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", "options", "experimental");
-    private static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", "options");
+    private static final String VERSION_FIELD = "version";
+    private static final String METADATA_FIELD = "metadata";
+    private static final String EXPERIMENTAL_FIELD = "experimental";
+    private static final String CONNECTOR_FIELD = "connector";
+    private static final String OPTIONS_FIELD = "options";
+    private static final String SOURCE_TOKEN = "source";
+    private static final String TRANSFORMS_FIELD = "transforms";
+    private static final String SERVE_TOKEN = "serve";
+    private static final String PRIMARY_KEY_FIELD = "primary_key";
+    private static final String STORAGE_FIELD = "storage";
+    private static final String FILTER_TOKEN = "filter";
+    private static final String FORMAT_FIELD = "format";
+
+    static final Set<String> SOURCE_KEYS = Set.of(
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, CONNECTOR_FIELD, "config", "mode",
+            "tables", OPTIONS_FIELD, "srs", EXPERIMENTAL_FIELD);
+    static final Set<String> PIPELINE_KEYS = Set.of(
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, SOURCE_TOKEN, TRANSFORMS_FIELD, "view", SERVE_TOKEN,
+            "settings", EXPERIMENTAL_FIELD);
+    static final Set<String> METADATA_KEYS = Set.of("labels", "description");
+    static final Set<String> SRS_KEYS = Set.of("key", "retention", "schema_evolution", "queryable", "enabled");
+    /**
+     * The engine options a source accepts. Options are the engine's own configuration, so the key
+     * set is a closed vocabulary the product owns - unlike config, whose keys belong to the
+     * connector and stay free. Every key that used to be accepted here had no reader anywhere in
+     * the product, so the vocabulary is empty and each of them is now rejected by name. Adding an
+     * engine option means adding a typed component to the owning record and naming it here.
+     */
+    private static final Set<String> NO_ENGINE_OPTIONS = Set.of();
+    static final Set<String> TABLE_SPEC_KEYS = Set.of("name", FILTER_TOKEN, "pk", OPTIONS_FIELD);
+    static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
+    static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", OPTIONS_FIELD);
     private static final Set<String> NEST_ROOT_KEYS =
             Set.of("from", "key", "mode", "trackKeyChanges", "embed");
+    static final Set<String> NEST_STATE_KEYS = Set.of("database");
+    static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
             "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
-    private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", "primary_key", "storage", "schema");
+    private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD);
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> STORAGE_KEYS = Set.of("hot", "warm", "cold");
     private static final Set<String> HOT_KEYS = Set.of("ttl");
     private static final Set<String> WARM_KEYS = Set.of("collection", "indexes");
     private static final Set<String> COLD_KEYS = Set.of("partition_by");
-    private static final Set<String> VIEW_SCHEMA_KEYS = Set.of("enforce", "evolution");
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
-    private static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
-    private static final Set<String> SYNC_KEYS = Set.of("id", "source", "write_mode", "rename", "ddl", "options");
+    static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
+    static final Set<String> SYNC_KEYS = Set.of("id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD);
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
-    private static final Set<String> PUSH_KEYS = Set.of("id", "source", "topic", "format", "options");
+    static final Set<String> PUSH_KEYS = Set.of("id", SOURCE_TOKEN, "topic", FORMAT_FIELD, OPTIONS_FIELD);
     private static final Set<String> SETTINGS_KEYS = Set.of(
             "error_policy", "batch_size", "parallelism", "schedule", "read_mode", "start_from");
-    private static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
-            "version", "kind", "id", "metadata", "type", "options", "experimental");
+    static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, "type", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> VIEW_DEF_KEYS = Set.of(
-            "version", "kind", "id", "metadata", "primary_key", "storage", "schema", "experimental");
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> SERVE_DEF_KEYS = Set.of(
-            "version", "kind", "id", "metadata", "sync", "query", "push", "experimental");
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, "sync", "query", "push", EXPERIMENTAL_FIELD);
+
+    /*
+     * What each position must carry, checked against the map right after its keys are closed.
+     *
+     * These are the model's required components minus the ones the parser supplies itself - a
+     * generated id, a from: taken from natural order - so they are a subset of the record's non-null
+     * contract rather than a reading of it. StructuralKeyDerivationTest re-derives each from its
+     * record and names the parser-supplied exceptions, so a component that becomes required without
+     * reaching this list turns red there instead of becoming a NullPointerException at the boundary.
+     */
+    static final Set<String> REQUIRED_SOURCE_KEYS = Set.of("id", CONNECTOR_FIELD);
+    static final Set<String> REQUIRED_PIPELINE_KEYS = Set.of("id", SOURCE_TOKEN);
+    /** Every definition body: the rest of what they require is supplied or checked by shape. */
+    static final Set<String> REQUIRED_DEFINITION_KEYS = Set.of("id");
+    // A view carries a key of its own; the other two definition bodies do not, so they cannot share
+    // one set. The key is what the sink indexes uniquely, so a view without it cannot be built.
+    static final Set<String> REQUIRED_VIEW_DEF_KEYS = Set.of("id", PRIMARY_KEY_FIELD);
+    // Only the key: an inline view's id is generated when omitted and its from comes from natural
+    // order, so neither is required of the document even though the model requires both.
+    static final Set<String> REQUIRED_VIEW_INLINE_KEYS = Set.of(PRIMARY_KEY_FIELD);
+    static final Set<String> REQUIRED_TABLE_SPEC_KEYS = Set.of("name");
+    static final Set<String> REQUIRED_SYNC_KEYS = Set.of(SOURCE_TOKEN);
+    static final Set<String> REQUIRED_PUSH_KEYS = Set.of(SOURCE_TOKEN);
+    static final Set<String> REQUIRED_QUERY_KEYS = Set.of("type");
+    static final Set<String> REQUIRED_HOT_KEYS = Set.of("ttl");
+    static final Set<String> REQUIRED_WARM_KEYS = Set.of("collection");
+    static final Set<String> REQUIRED_NEST_ROOT_KEYS = Set.of("from");
+    static final Set<String> REQUIRED_EMBED_KEYS = Set.of("from", "on", "as", "path");
 
     /** Parses one YAML document into its {@link Resource} model. */
     public Resource parse(String yaml) {
+        return bind(rootMapping(yaml));
+    }
+
+    /**
+     * Parses text an earlier release wrote, dropping the keys this build has retired since.
+     *
+     * <p>A release that stops accepting a field it used to emit leaves behind stored text this build's
+     * grammar refuses. The only thing that reads that text is the upgrade, so refusing it there strands
+     * the store with no forward path at all: the server does not start, and the one component that
+     * would repair the document is the one throwing. Dropping the retired key is the whole of what
+     * carrying it forward could mean -- this build has nowhere to put the value.
+     *
+     * <p>The keys are named by the caller and kept nowhere here, because what a given upgrade retired
+     * is a fact about that upgrade rather than about the grammar. This is not a leniency switch for
+     * ordinary parsing: nothing on the authoring path may call it, and a document reaching a user is
+     * still read by {@link #parse}.
+     *
+     * <p>It drops only what it is given. A field this build newly *requires* is the opposite fact with
+     * a different answer -- nothing here can invent the value -- so such a document is still refused,
+     * and the refusal names the field.
+     */
+    public Resource parseDropping(String yaml, Set<String> retiredKeys) {
+        return parseDropping(yaml, retiredKeys, Map.of());
+    }
+
+    /**
+     * As {@link #parseDropping(String, Set)}, also dropping exact paths retired from particular
+     * artifact kinds. Qualifying a path by kind keeps a spelling that belongs elsewhere -- for
+     * example a connector-owned {@code config.schema} -- in the document that is bound.
+     */
+    public Resource parseDropping(String yaml, Set<String> retiredKeys,
+            Map<String, Set<List<String>>> retiredPathsByKind) {
+        Objects.requireNonNull(retiredKeys, "retiredKeys");
+        Objects.requireNonNull(retiredPathsByKind, "retiredPathsByKind");
+        MappingNode mapping = rootMapping(yaml);
+        String kind = scalarValue(mapping, "kind");
+        drop(mapping, Set.copyOf(retiredKeys));
+        Set<List<String>> retiredPaths = kind == null
+                ? Set.of() : retiredPathsByKind.getOrDefault(kind, Set.of());
+        for (List<String> retiredPath : retiredPaths) {
+            if (retiredPath.isEmpty()) {
+                throw new IllegalArgumentException("a retired field path must not be empty");
+            }
+            drop(mapping, List.copyOf(retiredPath), 0);
+        }
+        return bind(mapping);
+    }
+
+    /** Reads a discriminator without validating it before the ordinary binding order reaches it. */
+    private static String scalarValue(MappingNode mapping, String wanted) {
+        for (NodeTuple tuple : mapping.getValue()) {
+            if (tuple.getKeyNode() instanceof ScalarNode key && key.getValue().equals(wanted)
+                    && tuple.getValueNode() instanceof ScalarNode value) {
+                return value.getValue();
+            }
+        }
+        return null;
+    }
+
+    private static MappingNode rootMapping(String yaml) {
         Node root = compose(yaml);
         if (!(root instanceof MappingNode mapping)) {
             throw YamlMap.error(DslError.ILLEGAL_VALUE, "", root,
                     Map.of("value", YamlMap.nodeTypeName(root), "expected", "a mapping"));
         }
+        return mapping;
+    }
+
+    /** Removes the named keys wherever they sit in a composed document, at any depth. */
+    private static void drop(Node node, Set<String> keys) {
+        if (node instanceof MappingNode mapping) {
+            List<NodeTuple> kept = new ArrayList<>(mapping.getValue().size());
+            for (NodeTuple tuple : mapping.getValue()) {
+                if (tuple.getKeyNode() instanceof ScalarNode key && keys.contains(key.getValue())) {
+                    continue;
+                }
+                drop(tuple.getValueNode(), keys);
+                kept.add(tuple);
+            }
+            mapping.setValue(kept);
+        } else if (node instanceof SequenceNode sequence) {
+            sequence.getValue().forEach(item -> drop(item, keys));
+        }
+    }
+
+    /** Removes one exact mapping path, leaving the same key at every other position untouched. */
+    private static void drop(Node node, List<String> path, int depth) {
+        if (!(node instanceof MappingNode mapping)) {
+            return;
+        }
+        List<NodeTuple> kept = new ArrayList<>(mapping.getValue().size());
+        for (NodeTuple tuple : mapping.getValue()) {
+            if (tuple.getKeyNode() instanceof ScalarNode key && key.getValue().equals(path.get(depth))) {
+                if (depth == path.size() - 1) {
+                    continue;
+                }
+                drop(tuple.getValueNode(), path, depth + 1);
+            }
+            kept.add(tuple);
+        }
+        mapping.setValue(kept);
+    }
+
+    /**
+     * Reads a document that is already structured -- plain maps, lists and scalars, the shape a
+     * document store returns -- into its {@link Resource} model, parsing no text on the way.
+     *
+     * <p>It is the same binding as {@link #parse}, entered one step later: the declared grammar version
+     * is settled first and every structural rule applies unchanged, because a stored document has to
+     * satisfy the grammar it claims exactly as a written one does. What it does not have is a position:
+     * diagnostics name the field and report no line, which is all a stored document can be pointed at.
+     */
+    public Resource fromTree(Map<String, Object> document) {
+        Objects.requireNonNull(document, "document");
+        return bind(TreeNodes.mapping(document, ""));
+    }
+
+    private Resource bind(MappingNode mapping) {
         YamlMap doc = YamlMap.of(mapping, "");
+        requireSupportedVersion(doc, mapping);
         String kind = doc.string("kind");
         return switch (kind) {
-            case "source" -> source(doc);
+            case SOURCE_TOKEN -> source(doc);
             case "pipeline" -> pipeline(doc);
             case "transform" -> transformDefinition(doc);
             case "view" -> viewDefinition(doc);
-            case "serve" -> serveDefinition(doc);
+            case SERVE_TOKEN -> serveDefinition(doc);
             case null, default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "kind", mapping,
                     Map.of("value", kind == null ? "(absent)" : kind,
                             "expected", "one of: source, pipeline, transform, view, serve"));
         };
     }
 
+    /**
+     * Settles the declared grammar version before anything else is read. It decides which grammar
+     * reads the rest, so nothing downstream means anything until it holds -- including what counts as
+     * a kind. A document that declares nothing is refused under the same code as one declaring a
+     * version this build cannot read: to whoever wrote it those are one situation, and the argument
+     * says which happened.
+     *
+     * <p>One version exists today. When a successor ships, this becomes the set of versions still
+     * readable -- a version stays readable for two further minor releases after its successor.
+     */
+    private static void requireSupportedVersion(YamlMap doc, MappingNode at) {
+        String declared = doc.string(VERSION_FIELD);
+        // Absent is checked on its own: an immutable list refuses to be asked whether it contains null,
+        // so folding the two together turns a document that declares no version -- the commonest way to
+        // get this wrong -- from a diagnostic into a bare crash.
+        if (declared == null || !Resource.SUPPORTED_VERSIONS.contains(declared)) {
+            throw YamlMap.error(DslError.UNSUPPORTED_VERSION, VERSION_FIELD, at,
+                    Map.of("got", declared == null ? "(absent)" : declared,
+                            "supported", String.join(", ", Resource.SUPPORTED_VERSIONS)));
+        }
+    }
+
     // ---- source -------------------------------------------------------------------
 
     private SourceResource source(YamlMap m) {
         m.requireOnly(SOURCE_KEYS);
-        Map<String, Object> options = m.freeMap("options");
-        rejectRelocatedReadOptions(m, options);
+        m.requirePresent(REQUIRED_SOURCE_KEYS);
+        requireKnownOptions(m, NO_ENGINE_OPTIONS);
         return new SourceResource(
-                idOf(m),
+                m.require("id", idOf(m)),
                 metadata(m),
-                m.string("connector"),
+                m.requireString(CONNECTOR_FIELD),
                 m.freeMap("config"),
                 mode(m, "mode"),
                 tables(m.seq("tables")),
-                options,
                 srs(m.mapping("srs")),
-                m.freeMap("experimental"));
+                m.freeMap(EXPERIMENTAL_FIELD));
     }
 
-    /** Rejects read options that have moved to pipeline settings (read_mode / start_from). */
-    private static void rejectRelocatedReadOptions(YamlMap m, Map<String, Object> options) {
-        if (options == null) {
-            return;
-        }
-        Node optionsNode = m.node("options");
-        for (String key : RELOCATED_SOURCE_OPTIONS) {
-            if (options.containsKey(key)) {
-                throw YamlMap.error(DslError.UNKNOWN_FIELD, "options." + key, optionsNode, Map.of("field", key));
-            }
+    /**
+     * Rejects every option key outside the owner's engine-option vocabulary, the same way
+     * {@code requireOnly} closes the structural keys one level up. An option nothing reads is
+     * worse accepted than rejected: it looks configured and does nothing, and no run reports it.
+     */
+    private static void requireKnownOptions(YamlMap owner, Set<String> allowed) {
+        YamlMap options = owner.mapping(OPTIONS_FIELD);
+        if (options != null) {
+            options.requireOnly(allowed);
         }
     }
 
@@ -179,14 +364,16 @@ public final class DslParser {
                 String t = sc.getValue();
                 refs.add(isRegex(t) ? TableRef.regex(unslash(t)) : TableRef.literal(t));
             } else {
-                YamlMap ts = YamlMap.requireMapping(n, "tables");
+                YamlMap ts = YamlMap.requireMapping(n, "tables[" + refs.size() + "]");
                 ts.requireOnly(TABLE_SPEC_KEYS);
+                ts.requirePresent(REQUIRED_TABLE_SPEC_KEYS);
+                requireKnownOptions(ts, NO_ENGINE_OPTIONS);
                 // tables[].filter is a source-row CEL predicate bound to source columns (§12),
                 // not the event envelope. Its type environment is the source schema, unknown
                 // offline — so its compile / type-check is deferred to the engine, unlike the
                 // envelope-rooted expressions (filter node / map / push) checked at parse time.
-                refs.add(TableRef.spec(ts.string("name"), ts.string("filter"),
-                        scalarList(ts.seq("pk"), "tables.pk"), ts.freeMap("options")));
+                refs.add(TableRef.spec(ts.requireString("name"), ts.string(FILTER_TOKEN),
+                        scalarList(ts.seq("pk"), "tables.pk")));
             }
         }
         return refs;
@@ -207,18 +394,19 @@ public final class DslParser {
 
     private PipelineResource pipeline(YamlMap m) {
         m.requireOnly(PIPELINE_KEYS);
-        List<Step> transforms = transforms(m.seq("transforms"));
+        m.requirePresent(REQUIRED_PIPELINE_KEYS);
+        List<Step> transforms = transforms(m.seq(TRANSFORMS_FIELD));
         String lastTransform = lastId(transforms);
         ViewBlock view = view(m, lastTransform);
         String beforeServe = view != null ? viewId(view) : lastTransform;
         ServeBlock serve = serve(m, beforeServe);
         return new PipelineResource(
-                idOf(m), metadata(m), sources(m), transforms, view, serve, settings(m),
-                m.freeMap("experimental"));
+                m.require("id", idOf(m)), metadata(m), sources(m), transforms, view, serve, settings(m),
+                m.freeMap(EXPERIMENTAL_FIELD));
     }
 
     private static List<SourceRef> sources(YamlMap m) {
-        Node n = m.node("source");
+        Node n = m.node(SOURCE_TOKEN);
         if (n instanceof ScalarNode sc) {
             return List.of(SourceRef.bare(sc.getValue()));
         }
@@ -235,13 +423,15 @@ public final class DslParser {
         if (item instanceof ScalarNode sc) {
             return SourceRef.bare(sc.getValue());
         }
-        YamlMap ref = YamlMap.requireMapping(item, "source");
+        YamlMap ref = YamlMap.requireMapping(item, SOURCE_TOKEN);
         ref.requireOnly(SOURCE_REF_KEYS);
         Boolean srs = boolValue(ref, "srs");
         // An object written without the switch says exactly what a bare id says, so it normalizes
         // to one: keeping both spellings of one state would let the same pipeline canonicalize two
         // ways, and the materialization rule reads "has a switch" off this distinction.
-        return srs == null ? SourceRef.bare(ref.string("id")) : SourceRef.spec(ref.string("id"), srs);
+        return srs == null
+                ? SourceRef.bare(ref.requireString("id"))
+                : SourceRef.spec(ref.requireString("id"), srs);
     }
 
     // ---- transforms ---------------------------------------------------------------
@@ -257,12 +447,13 @@ public final class DslParser {
             index++;
             Step step;
             if (n instanceof ScalarNode sc) {
-                step = Step.use(null, sc.getValue(), naturalFrom(prevId, n), null);
+                step = Step.use(null, sc.getValue(), naturalFrom(prevId, n));
             } else {
                 YamlMap s = YamlMap.requireMapping(n, "transforms[" + (index - 1) + "]");
                 if (s.has("use")) {
                     s.requireOnly(STEP_USE_KEYS);
-                    step = Step.use(idOf(s), s.string("use"), fromFlow(s, prevId, n), s.freeMap("options"));
+                    requireKnownOptions(s, NO_ENGINE_OPTIONS);
+                    step = Step.use(idOf(s), s.string("use"), fromFlow(s, prevId, n));
                 } else {
                     step = inlineStep(s, index, prevId, n);
                 }
@@ -282,23 +473,45 @@ public final class DslParser {
         Set<String> allowed = new HashSet<>(STEP_BASE_KEYS);
         allowed.addAll(payloadKeys(type));
         s.requireOnly(allowed);
+        s.requirePresent(requiredPayloadKeys(type));
         String id = idOf(s);
         if (id == null) {
             id = type + "_" + index;
         }
         boolean aliased = type.equals("nest") || type.equals("join");
         FromClause from = aliased ? fromAliases(s, at) : fromFlow(s, prevId, at);
-        return Step.inline(id, from, body(type, s), s.freeMap("options"), s.freeMap("experimental"));
+        requireKnownOptions(s, NO_ENGINE_OPTIONS);
+        return Step.inline(id, from, body(type, s), s.freeMap(EXPERIMENTAL_FIELD));
     }
 
     private static Set<String> payloadKeys(String type) {
         return switch (type) {
             case "js" -> Set.of("script");
             case "map" -> Set.of("fields");
-            case "filter" -> Set.of("expr");
+            case FILTER_TOKEN -> Set.of("expr");
+            case "unwind" -> Set.of("path", "include_array_index",
+                    "preserve_null_and_empty_arrays", "element_key", "element_type");
             case "union" -> Set.of();
             case "nest" -> Set.of(
-                    "primary_key", "order", "entries_in_memory", "max_elements_per_document", "root");
+                    PRIMARY_KEY_FIELD, "order", "entries_in_memory", "max_elements_per_document",
+                    "state", "root");
+            case "join" -> Set.of("engine", "sql");
+            default -> Set.of();
+        };
+    }
+
+    /**
+     * The payload keys a body of this type must carry, a subset of {@link #payloadKeys}. A union has
+     * none — it is wiring alone — and an unknown type gets none because {@link #body} refuses it by
+     * name a moment later, which is the diagnostic its author needs.
+     */
+    static Set<String> requiredPayloadKeys(String type) {
+        return switch (type) {
+            case "js" -> Set.of("script");
+            case "map" -> Set.of("fields");
+            case FILTER_TOKEN -> Set.of("expr");
+            case "unwind" -> Set.of("path");
+            case "nest" -> Set.of("root");
             case "join" -> Set.of("engine", "sql");
             default -> Set.of();
         };
@@ -306,28 +519,37 @@ public final class DslParser {
 
     private TransformBody body(String type, YamlMap s) {
         return switch (type) {
-            case "js" -> new TransformBody.Js(s.string("script"));
-            case "map" -> new TransformBody.MapProjection(fieldRules(s.mapping("fields")));
-            case "filter" -> {
-                String expr = s.string("expr");
+            case "js" -> new TransformBody.Js(s.requireString("script"));
+            case "map" -> new TransformBody.MapProjection(
+                    fieldRules(s.require("fields", s.mapping("fields"))));
+            case FILTER_TOKEN -> {
+                String expr = s.requireString("expr");
                 checkPredicate(s, "expr", expr);
                 yield new TransformBody.Filter(expr);
             }
+            case "unwind" -> new TransformBody.Unwind(
+                    s.requireString("path"),
+                    s.string("include_array_index"),
+                    boolValue(s, "preserve_null_and_empty_arrays"),
+                    s.string("element_key"),
+                    elementType(s));
             case "union" -> new TransformBody.Union();
             case "nest" -> new TransformBody.Nest(
-                    s.string("primary_key"),
+                    s.string(PRIMARY_KEY_FIELD),
                     enumByYaml(NestOrder.values(), NestOrder::yaml, s, "order"),
                     positiveIntValue(s, "entries_in_memory"),
                     positiveIntValue(s, "max_elements_per_document"),
-                    nestRoot(s.mapping("root")));
+                    nestStateStorage(s.mapping("state")),
+                    nestRoot(s.require("root", s.mapping("root"))));
             case "join" -> {
-                JoinEngine engine = enumByYaml(JoinEngine.values(), JoinEngine::yaml, s, "engine");
-                String sql = s.string("sql");
+                JoinEngine engine =
+                        s.require("engine", enumByYaml(JoinEngine.values(), JoinEngine::yaml, s, "engine"));
+                String sql = s.requireString("sql");
                 checkJoinSql(s, sql);
                 yield new TransformBody.Join(engine, sql);
             }
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
-                    Map.of("value", type, "expected", "a known transform type (js, map, filter, union, nest, join)"));
+                    Map.of("value", type, "expected", "a known transform type (js, map, filter, unwind, union, nest, join)"));
         };
     }
 
@@ -360,12 +582,22 @@ public final class DslParser {
 
     private NestRoot nestRoot(YamlMap r) {
         r.requireOnly(NEST_ROOT_KEYS);
+        r.requirePresent(REQUIRED_NEST_ROOT_KEYS);
         return new NestRoot(
-                r.string("from"),
+                r.requireString("from"),
                 scalarList(r.seq("key"), "key"),
                 r.string("mode"),
                 boolValue(r, "trackKeyChanges"),
                 embeds(r.seq("embed")));
+    }
+
+    private NestStateStorage nestStateStorage(YamlMap state) {
+        if (state == null) {
+            return null;
+        }
+        state.requireOnly(NEST_STATE_KEYS);
+        state.requirePresent(REQUIRED_NEST_STATE_KEYS);
+        return new NestStateStorage(state.requireString("database"));
     }
 
     private List<Embed> embeds(List<Node> items) {
@@ -374,13 +606,14 @@ public final class DslParser {
         }
         List<Embed> out = new ArrayList<>();
         for (Node n : items) {
-            YamlMap e = YamlMap.requireMapping(n, "embed");
+            YamlMap e = YamlMap.requireMapping(n, "embed[" + out.size() + "]");
             e.requireOnly(EMBED_KEYS);
+            e.requirePresent(REQUIRED_EMBED_KEYS);
             out.add(new Embed(
-                    e.string("from"),
-                    stringMap(e, "on"),
-                    enumByYaml(EmbedAs.values(), EmbedAs::yaml, e, "as"),
-                    e.string("path"),
+                    e.requireString("from"),
+                    e.require("on", stringMap(e, "on")),
+                    e.require("as", enumByYaml(EmbedAs.values(), EmbedAs::yaml, e, "as")),
+                    e.requireString("path"),
                     scalarList(e.seq("key"), "key"),
                     scalarList(e.seq("arrayKey"), "arrayKey"),
                     boolValue(e, "ignoreUpdates"),
@@ -406,13 +639,13 @@ public final class DslParser {
             return new ViewBlock.Use(idOf(v), v.string("use"), blockFrom(v, prevId, n));
         }
         v.requireOnly(VIEW_INLINE_KEYS);
+        v.requirePresent(REQUIRED_VIEW_INLINE_KEYS);
         String id = idOf(v);
         return new ViewBlock.Inline(
                 id != null ? id : "view",
                 blockFrom(v, prevId, n),
-                v.string("primary_key"),
-                storage(v.mapping("storage")),
-                viewSchema(v.mapping("schema")));
+                v.string(PRIMARY_KEY_FIELD),
+                storage(v.mapping(STORAGE_FIELD)));
     }
 
     private Storage storage(YamlMap st) {
@@ -424,13 +657,13 @@ public final class DslParser {
         if (st.has("hot")) {
             YamlMap h = st.mapping("hot");
             h.requireOnly(HOT_KEYS);
-            hot = new Storage.Hot(h.string("ttl"));
+            hot = new Storage.Hot(h.requireString("ttl"));
         }
         Storage.Warm warm = null;
         if (st.has("warm")) {
             YamlMap w = st.mapping("warm");
             w.requireOnly(WARM_KEYS);
-            warm = new Storage.Warm(w.string("collection"), scalarList(w.seq("indexes"), "indexes"));
+            warm = new Storage.Warm(w.requireString("collection"), scalarList(w.seq("indexes"), "indexes"));
         }
         Storage.Cold cold = null;
         if (st.has("cold")) {
@@ -441,23 +674,15 @@ public final class DslParser {
         return new Storage(hot, warm, cold);
     }
 
-    private ViewSchema viewSchema(YamlMap sc) {
-        if (sc == null) {
-            return null;
-        }
-        sc.requireOnly(VIEW_SCHEMA_KEYS);
-        return new ViewSchema(boolValue(sc, "enforce"), sc.string("evolution"));
-    }
-
     private ServeBlock serve(YamlMap m, String prevId) {
-        Node n = m.node("serve");
+        Node n = m.node(SERVE_TOKEN);
         if (n == null) {
             return null;
         }
         if (n instanceof ScalarNode sc) {
             return new ServeBlock.Use(null, sc.getValue(), naturalFrom(prevId, n));
         }
-        YamlMap s = m.mapping("serve");
+        YamlMap s = m.mapping(SERVE_TOKEN);
         if (s.has("use")) {
             s.requireOnly(SERVE_USE_KEYS);
             return new ServeBlock.Use(idOf(s), s.string("use"), serveFrom(s, prevId, n));
@@ -465,7 +690,7 @@ public final class DslParser {
         s.requireOnly(SERVE_INLINE_KEYS);
         String id = idOf(s);
         return new ServeBlock.Inline(
-                id != null ? id : "serve",     // anonymous serve block -> 'serve' (2026-06-15)
+                id != null ? id : SERVE_TOKEN,     // anonymous serve block -> 'serve' (2026-06-15)
                 serveFrom(s, prevId, n),
                 syncList(s.seq("sync"), "serve."),
                 queryList(s.seq("query"), "serve."),
@@ -480,14 +705,16 @@ public final class DslParser {
         for (int i = 0; i < items.size(); i++) {
             YamlMap s = YamlMap.requireMapping(items.get(i), pathPrefix + "sync[" + i + "]");
             s.requireOnly(SYNC_KEYS);
+            s.requirePresent(REQUIRED_SYNC_KEYS);
+            requireKnownOptions(s, NO_ENGINE_OPTIONS);
             String id = s.string("id");
             out.add(new SyncElement(
                     id != null ? id : "sync_" + (i + 1),     // anonymous sync element -> sync_<N> (2026-06-15)
-                    s.string("source"),
+                    s.requireString(SOURCE_TOKEN),
                     enumByYaml(WriteMode.values(), WriteMode::yaml, s, "write_mode"),
                     rename(s.mapping("rename")),
                     enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl"),
-                    s.freeMap("options")));
+                    enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, s, "on_full_load")));
         }
         return out;
     }
@@ -513,7 +740,10 @@ public final class DslParser {
         for (Node n : items) {
             YamlMap q = YamlMap.requireMapping(n, pathPrefix + "query[" + i++ + "]");
             q.requireOnly(QUERY_KEYS);
-            out.add(new QueryElement(enumByYaml(QueryType.values(), QueryType::yaml, q, "type"), q.string("backend")));
+            q.requirePresent(REQUIRED_QUERY_KEYS);
+            out.add(new QueryElement(
+                    q.require("type", enumByYaml(QueryType.values(), QueryType::yaml, q, "type")),
+                    q.string("backend")));
         }
         return out;
     }
@@ -526,27 +756,29 @@ public final class DslParser {
         for (int i = 0; i < items.size(); i++) {
             YamlMap p = YamlMap.requireMapping(items.get(i), pathPrefix + "push[" + i + "]");
             p.requireOnly(PUSH_KEYS);
+            p.requirePresent(REQUIRED_PUSH_KEYS);
+            requireKnownOptions(p, NO_ENGINE_OPTIONS);
             String id = p.string("id");
             out.add(new PushElement(
                     id != null ? id : "push_" + (i + 1),     // anonymous push element -> push_<N> (2026-06-15)
-                    p.string("source"), p.string("topic"),
-                    pushFormat(p), p.freeMap("options")));
+                    p.requireString(SOURCE_TOKEN), p.string("topic"),
+                    pushFormat(p)));
         }
         return out;
     }
 
     private PushFormat pushFormat(YamlMap owner) {
-        Node n = owner.node("format");
+        Node n = owner.node(FORMAT_FIELD);
         if (n == null) {
             return null;
         }
         if (n instanceof ScalarNode sc) {
             String v = sc.getValue();
             String expr = v.startsWith("=") ? v.substring(1) : v;   // optional '=' marker (X11)
-            checkValue(owner, "format", expr);
+            checkValue(owner, FORMAT_FIELD, expr);
             return PushFormat.cel(expr);
         }
-        return PushFormat.fields(fieldRules(YamlMap.requireMapping(n, owner.childPath("format"))));
+        return PushFormat.fields(fieldRules(YamlMap.requireMapping(n, owner.childPath(FORMAT_FIELD))));
     }
 
     private Settings settings(YamlMap m) {
@@ -565,7 +797,7 @@ public final class DslParser {
     }
 
     private Metadata metadata(YamlMap m) {
-        YamlMap md = m.mapping("metadata");
+        YamlMap md = m.mapping(METADATA_FIELD);
         if (md == null) {
             return null;
         }
@@ -575,7 +807,7 @@ public final class DslParser {
 
     // ---- definition bodies (kind: transform / view / serve) -----------------------
 
-    /** A reusable transform body (ADR-0016 §5, X19): same payload grammar as an inline step, no wiring. */
+    /** A reusable transform body (§5, X19): same payload grammar as an inline step, no wiring. */
     private TransformResource transformDefinition(YamlMap m) {
         forbidFrom(m);
         String type = m.string("type");
@@ -586,27 +818,32 @@ public final class DslParser {
         Set<String> allowed = new HashSet<>(TRANSFORM_DEF_KEYS);
         allowed.addAll(payloadKeys(type));
         m.requireOnly(allowed);
+        m.requirePresent(REQUIRED_DEFINITION_KEYS);
+        m.requirePresent(requiredPayloadKeys(type));
+        requireKnownOptions(m, NO_ENGINE_OPTIONS);
         return new TransformResource(
-                idOf(m), metadata(m), body(type, m), m.freeMap("options"), m.freeMap("experimental"));
+                m.require("id", idOf(m)), metadata(m), body(type, m), m.freeMap(EXPERIMENTAL_FIELD));
     }
 
-    /** A reusable MDM sink definition (ADR-0016 §7, X19): where/how to materialize, no wiring. */
+    /** A reusable MDM sink definition (§7, X19): where/how to materialize, no wiring. */
     private ViewResource viewDefinition(YamlMap m) {
         forbidFrom(m);
         m.requireOnly(VIEW_DEF_KEYS);
+        m.requirePresent(REQUIRED_VIEW_DEF_KEYS);
         return new ViewResource(
-                idOf(m), metadata(m), m.string("primary_key"),
-                storage(m.mapping("storage")), viewSchema(m.mapping("schema")), m.freeMap("experimental"));
+                m.require("id", idOf(m)), metadata(m), m.string(PRIMARY_KEY_FIELD),
+                storage(m.mapping(STORAGE_FIELD)), m.freeMap(EXPERIMENTAL_FIELD));
     }
 
-    /** A reusable publish-surface definition (ADR-0016 §8, X19): sync / query / push, no wiring. */
+    /** A reusable publish-surface definition (§8, X19): sync / query / push, no wiring. */
     private ServeResource serveDefinition(YamlMap m) {
         forbidFrom(m);
         m.requireOnly(SERVE_DEF_KEYS);
+        m.requirePresent(REQUIRED_DEFINITION_KEYS);
         return new ServeResource(
-                idOf(m), metadata(m),
+                m.require("id", idOf(m)), metadata(m),
                 syncList(m.seq("sync"), ""), queryList(m.seq("query"), ""), pushList(m.seq("push"), ""),
-                m.freeMap("experimental"));
+                m.freeMap(EXPERIMENTAL_FIELD));
     }
 
     /** X19: a definition body is pure logic; {@code from:} wiring belongs to the referencing step. */
@@ -667,7 +904,7 @@ public final class DslParser {
 
     private static FromClause naturalFrom(String prevId, Node at) {
         if (prevId == null) {
-            throw YamlMap.error(DslError.COMPOSITION, "transforms", at,
+            throw YamlMap.error(DslError.COMPOSITION, TRANSFORMS_FIELD, at,
                     Map.of("detail", "the first transforms step must declare from: (no predecessor to wire from)"));
         }
         return FromClause.list(FromRef.literal(prevId));
@@ -767,6 +1004,22 @@ public final class DslParser {
                     Map.of("value", value, "expected", "a count above zero"));
         }
         return value;
+    }
+
+    /**
+     * The declared type of an unwind's expanded column, held against the shared type vocabulary.
+     *
+     * <p>Leaving it out is a real answer here - it hands the choice to the target, the same way any
+     * column nobody resolved a type for does - which is exactly why a name outside the vocabulary
+     * cannot be folded into that answer. Resolved leniently it would read as "unresolved", making a
+     * misspelling indistinguishable from an omission the author never wrote, and the column would
+     * silently become whatever the target guessed. Kept as the string the model carries: what
+     * travels downstream is the token, not the enum.
+     */
+    private static String elementType(YamlMap s) {
+        TapstateType declared = enumByYaml(
+                TapstateType.values(), t -> t.name().toLowerCase(Locale.ROOT), s, "element_type");
+        return declared == null ? null : declared.name().toLowerCase(Locale.ROOT);
     }
 
     private static Boolean boolValue(YamlMap m, String key) {

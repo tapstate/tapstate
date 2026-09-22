@@ -100,7 +100,8 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
                 MongoConnection connection = new MongoConnection(
                         new MongoConnectionSettings(storeUri, null, Duration.ofSeconds(5)))) {
             connection.verify();
-            KeyedStateStore state = new MongoStorePort(connection).keyedState();
+            KeyedStateStore state =
+                    new MongoStorePort(connection, SharedMongo.OPERATOR_STATE_DATABASE).keyedState();
 
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");

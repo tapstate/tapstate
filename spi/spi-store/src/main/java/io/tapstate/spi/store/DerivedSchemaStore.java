@@ -54,6 +54,31 @@ public interface DerivedSchemaStore {
             String derivedFrom, String derivedBy);
 
     /**
+     * Notes which version of a step's history a run is holding on to. Written by the assembly a run is
+     * built from, once per step, and overwritten by the next assembly of the same pipeline.
+     *
+     * <p><b>Why a run holds a version at all.</b> The history is append-only, so somebody recording a
+     * new shape does not disturb the one an assembled run was built from — but nothing was left saying
+     * which that was, so every reader answering "what does this pipeline produce" answered with the
+     * newest record rather than with the one the running job is actually producing. Those two are the
+     * same answer right up to the moment they are not, and the moment they are not is exactly when
+     * somebody is looking.
+     *
+     * <p>Not cleared when a run ends: a reader asks for the pin only while a run exists, and the next
+     * assembly overwrites it. Clearing it would be a second write on the stop path with nothing reading
+     * what it cleared.
+     */
+    void pin(String pipelineId, String stepId, long version);
+
+    /**
+     * The recorded derivation a run was pinned to, or empty where nothing has pinned this step or the
+     * pinned version is no longer held. Never falls back to the latest: a caller asking for the pin is
+     * asking what the run holds, and answering with the newest record instead is the confusion the pin
+     * exists to end.
+     */
+    Optional<DerivedSchema> pinned(String pipelineId, String stepId);
+
+    /**
      * Removes every recorded derivation for a pipeline, whichever steps carry one. Idempotent: a
      * pipeline with nothing recorded is not an error. Called when a pipeline is removed — a record
      * left behind would be read as the derivation history of whatever is applied under that id next,

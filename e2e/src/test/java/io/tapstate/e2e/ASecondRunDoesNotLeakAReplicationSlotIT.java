@@ -122,7 +122,7 @@ class ASecondRunDoesNotLeakAReplicationSlotIT {
                             + "the count below would be met by a second run that never streamed")
                     .hasSize(1);
 
-            control.lifecycle(PIPELINE_ID, LifecycleVerb.STOP);
+            control.stop(PIPELINE_ID, false);
             awaitState(control, PipelineState.STOPPED);
 
             // ---- the second run ----------------------------------------------------------------

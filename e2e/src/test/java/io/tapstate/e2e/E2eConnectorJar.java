@@ -67,7 +67,13 @@ final class E2eConnectorJar {
      * vocabulary the mapping reads.
      */
     private static final String SPEC_TEMPLATE =
-            "{\"properties\":{\"id\":\"%s\"},\"dataTypes\":{\"string\":{\"to\":\"TapString\",\"byte\":65535}}}";
+            "{\"properties\":{\"id\":\"%s\"},"
+                    + "\"configOptions\":{\"connection\":{\"type\":\"object\","
+                    + "\"properties\":{\"password\":{\"type\":\"string\","
+                    + "\"title\":\"Password\",\"x-component\":\"Password\"}}},"
+                    + "\"node\":{\"type\":\"object\",\"properties\":{\"fail_cdc\":{"
+                    + "\"type\":\"boolean\",\"title\":\"Fail CDC\",\"x-component\":\"Switch\"}}}},"
+                    + "\"dataTypes\":{\"string\":{\"to\":\"TapString\",\"byte\":65535}}}";
 
     /**
      * The API version the product's level table registers. An unregistered version does not refuse the

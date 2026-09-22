@@ -3,7 +3,6 @@ package io.tapstate.e2e;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.testsupport.DockerGate;
 
-import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -38,10 +37,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * not the product. It is the first time a real connector carries data end to end here - every earlier
  * "real chain" test faked the connector on both ends.
  *
- * <p>Snapshot only on purpose: this is the smallest real crossing, batch-read to sink with no change
- * stream, so it needs no binlog and no replication grant and rests on nothing but the connector reading
- * a table and the sink writing one. The change-stream half is the declarative example
- * a-real-change-stream-carries-rows-written-after-start.
+ * <p>This witnesses the snapshot rows of a snapshot-and-CDC pipeline. The source needs replication
+ * privileges to sample the binlog position before reading the table and to open the change stream;
+ * the transform passes only snapshot events to the target. Delivery of later changes is witnessed by
+ * the declarative example a-real-change-stream-carries-rows-written-after-start.
  *
  * <p>The crossing itself is also witnessed declaratively, by the example
  * real-mysql-rows-cross-to-a-real-mongo-target. What keeps this class is the timestamp claim below: a
@@ -87,6 +86,7 @@ class RealMysqlToMongoSnapshotIT {
     void realMysqlSnapshotRowsReachRealMongo(Tiers tier) throws Exception {
         try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))) {
             mysql.start();
+            SharedMySql.grantReplication(mysql);
             seedMysqlOrders(mysql, SEEDED_ROWS);
 
             // One store and one target per tier: sharing them would let a later tier read the rows an

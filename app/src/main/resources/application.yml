@@ -3,3 +3,16 @@
 # means moving those together. SERVER_PORT overrides it for a host where 8080 is already taken.
 server:
   port: ${SERVER_PORT:8080}
+
+# Metrics export is opt-in. With neither key set, nothing is started and every read face is unchanged.
+# The names exported are the same the metrics face reads, and they are still unstable (see the docs).
+#   tapstate.metrics.export.prometheus.port: 9464       # serve a Prometheus scrape endpoint on this port
+#   tapstate.metrics.export.prometheus.host: 127.0.0.1  # the interface it listens on; the default.
+#                                                       # What it serves is an inventory of pipeline,
+#                                                       # table and namespace ids, with no authentication
+#                                                       # in front of it, so widening this puts that
+#                                                       # inventory on whatever network it is widened to.
+#                                                       # A scraper in another container needs 0.0.0.0.
+#   tapstate.metrics.export.otlp.endpoint: http://collector:4318/v1/metrics   # push over OTLP
+#   tapstate.metrics.export.otlp.protocol: http-protobuf                      # or grpc (then host:port)
+#   tapstate.metrics.export.otlp.interval: 60s

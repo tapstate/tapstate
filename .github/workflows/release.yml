@@ -132,10 +132,18 @@ jobs:
         if: inputs.bump == 'patch'
         run: .github/scripts/changeset-parity.sh "${{ steps.next.outputs.base }}" HEAD
 
-      # The pages for this release have to be written and merged before it starts. That is the same
-      # gate the release itself runs, asked here because here it is cheap to act on -- nothing has
-      # been created yet, so finishing the pages and dispatching again costs nothing. Asked later it
-      # is a release sitting at its first gate with three branches already cut.
+      # Asked here because here it is cheap to act on: nothing has been created yet, so answering it
+      # and dispatching again costs nothing, where the same refusal later is a release sitting at its
+      # first gate with three branches already cut.
+      #
+      # What it refuses is narrower than the name. A pull request that never answered its
+      # documentation impact stops any release -- that is our own paperwork, and no other person's
+      # morning is in it. A page follow-up still open in the documentation repository stops a major
+      # and nothing below it: a release is not held for an issue somebody else has to close. The ones
+      # it lets past are written to the file the next step carries into the request this release is
+      # already making of the documentation site, so they reach the person who owes them instead of
+      # stopping the train. That file is this step's real output, and the step after it is the only
+      # reader.
       #
       # This is about the pages for what is shipping. Publishing the site is a separate thing, asked
       # for below in an issue, and it deliberately does not gate anything.
@@ -146,7 +154,8 @@ jobs:
           .github/scripts/docs-gate.sh \
             --base "${{ steps.next.outputs.base }}" \
             --sha "${{ steps.sha.outputs.sha }}" \
-            --bump "${{ inputs.bump }}"
+            --bump "${{ inputs.bump }}" \
+            --list-open "$RUNNER_TEMP/docs-open.tsv"
 
       - name: the satellite token reaches every satellite
         env:
@@ -190,11 +199,15 @@ jobs:
       # into `main`, so it is asked for in an issue. It gates nothing -- see the script for what
       # happens when it is not done by the time the release publishes, and for what happens to the
       # request when the attempt is abandoned instead.
+      #
+      # It also carries what the gate above let past: the page follow-ups this release is not waiting
+      # for are listed in this issue, which is the one already in front of the person who owes them.
       - name: ask for the documentation site to be published
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
         run: |
           bash .github/scripts/docs-release.sh open "${{ steps.next.outputs.version }}" \
+            --followups "$RUNNER_TEMP/docs-open.tsv" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: say what this run is about to make
@@ -494,7 +507,7 @@ jobs:
               exit 1
             fi
             echo "waiting for the real-connector lane..."
-            sleep 60
+            sleep 20
           done
 
       # 8. And so is the join performance lane, for the same reason and read the same way. It is the
@@ -516,7 +529,7 @@ jobs:
               exit 1
             fi
             echo "waiting for the join performance lane..."
-            sleep 60
+            sleep 20
           done
 
       # 4. Every pull request in this release's range answered its documentation impact, and the ones
@@ -851,12 +864,32 @@ jobs:
       # one branch into another, which was asked for when the release started; this either finds that
       # done and creates the tag, or asks again in a new issue. It exits 0 either way -- a release
       # that stopped here would be hostage to one person's morning.
+      #
+      # The same scan the release opened with, run again and reaching no verdict. Hours separate the
+      # two, and they are exactly the hours the documentation owner may have spent closing the things
+      # the first scan listed -- so replaying what the pin job found would hand somebody a list of
+      # work they have already done. --report-only cannot refuse; `continue-on-error` is for
+      # everything else, because this step must never be the reason the step below it does not run,
+      # on a release that has already gone out.
+      - name: what documentation this release still owes
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_REPO_TOKEN || github.token }}
+        run: |
+          .github/scripts/docs-gate.sh \
+            --base "${{ needs.version.outputs.base }}" \
+            --sha "${{ needs.version.outputs.sha }}" \
+            --report-only \
+            --list-open "$RUNNER_TEMP/docs-open.tsv" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: settle the documentation site
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
         run: |
           .github/scripts/docs-release.sh settle "${{ needs.version.outputs.version }}" \
             --notes-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}" \
+            --followups "$RUNNER_TEMP/docs-open.tsv" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
 

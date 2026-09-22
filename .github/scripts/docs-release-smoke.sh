@@ -51,6 +51,14 @@ contains() {
     esac
 }
 
+lacks() {
+    local name="$1" needle="$2" haystack="$3"
+    case "$haystack" in
+        *"$needle"*) fail "$name" "'$needle' is in: $haystack" ;;
+        *) pass "$name" ;;
+    esac
+}
+
 # --- refusals -------------------------------------------------------------------------------
 
 refuses "no verb is refused"            bash "$script"
@@ -482,6 +490,105 @@ else
     fail "a lookup that names no single issue says so where the release reports" "stdout was: $out"
 fi
 rm -rf "$stub_dir"
+
+# --- the page follow-ups a release does not wait for -------------------------------------------
+#
+# The release-time gate refuses a major over one of these and lets a minor or a patch past. What is
+# tested here is the other half of "lets past": the person who is owed the pages has to be told which
+# ones, in the issue this script is already putting in front of them, or "not blocking" is just
+# "nobody said". Each case reads the bullet with its issue AND its pull request in it, because the
+# bullets are built by a different line from the count above them -- a count stays right while every
+# bullet comes out empty.
+
+fu_dir="$(mktemp -d)"
+printf '23\t7\thttps://github.com/tapstate/tapstate/pull/23\n'  > "$fu_dir/open.tsv"
+printf '24\t9\thttps://github.com/tapstate/tapstate/pull/24\n' >> "$fu_dir/open.tsv"
+: > "$fu_dir/empty.tsv"
+
+out="$(plan open 0.4.0 --followups "$fu_dir/open.tsv")"
+contains "the request names an unfinished follow-up and its pull request" \
+    "- #7 -- https://github.com/tapstate/tapstate/pull/23" "$out"
+contains "and the second one as well" \
+    "- #9 -- https://github.com/tapstate/tapstate/pull/24" "$out"
+contains "and says how many there are"    "2 follow-up issue(s)" "$out"
+contains "and names the release they are missing from" "v0.4.0" "$out"
+
+out="$(plan settle 0.4.0 --notes-url "$url" --assume-state open --followups "$fu_dir/open.tsv")"
+contains "the second issue carries them too" "- #7 -- https://github.com/tapstate/tapstate/pull/23" "$out"
+
+# The end of a release where the site WAS published: no second issue is opened, so this is the only
+# moment the list can still reach anybody, and it goes on the issue that is being closed out.
+out="$(plan settle 0.4.0 --notes-url "$url" --assume-state closed --followups "$fu_dir/open.tsv")"
+contains "a settled request is still told what shipped without pages" \
+    "- #7 -- https://github.com/tapstate/tapstate/pull/23" "$out"
+
+# Nothing outstanding and nobody looked must not render as the same paragraph.
+lacks "an empty list writes no section" "Pages" "$(plan open 0.4.0 --followups "$fu_dir/empty.tsv")"
+lacks "a file that is not there writes none either" "Pages" "$(plan open 0.4.0 --followups "$fu_dir/gone.tsv")"
+# And says nothing about it anywhere. Checked as "stderr is empty" rather than against a message,
+# because the message would be awk's and awk does not word it the same on a developer's Mac as on the
+# runner -- an assertion that passes here and fails there, over a path this is not even about.
+gone_err="$(bash "$script" open 0.4.0 --plan --followups "$fu_dir/gone.tsv" 2>&1 >/dev/null)"
+if [ -z "$gone_err" ]; then
+    pass "and complains about it nowhere"
+else
+    fail "and complains about it nowhere" "stderr was: $gone_err"
+fi
+lacks "and neither does not being given one" "Pages" "$(plan open 0.4.0)"
+rm -rf "$fu_dir"
+
+# --- and what the issue actually sent --------------------------------------------------------
+#
+# Everything above reads --plan, which builds no body. Measured by deleting the section from each of
+# the three bodies that include it: every case above stayed green all three times. --plan proves the
+# section can be built; only a real run proves it is in what was sent. So these drive the script
+# against a stubbed gh and read the body out of the call.
+
+body_dir="$(mktemp -d)"
+cat > "$body_dir/gh" <<'STUB'
+#!/bin/sh
+echo "$*" >> "$GH_STUB_LOG"
+case "$*" in
+  "issue list"*)
+    printf '[{"title":"%s","state":"%s","number":29}]\n' "$GH_STUB_TITLE" "${GH_STUB_STATE:-OPEN}"
+    exit 0 ;;
+  "api repos/"*) echo 0000000000000000000000000000000000000000; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$body_dir/gh"
+printf '23\t7\thttps://github.com/tapstate/tapstate/pull/23\n' > "$body_dir/open.tsv"
+
+live() {   # log, verb, issue state
+    GH_STUB_LOG="$1" \
+    GH_STUB_TITLE="Release 0.4.2: publish the documentation site" \
+    GH_STUB_STATE="${3:-OPEN}" \
+    PATH="$body_dir:$PATH" \
+    bash "$script" "$2" 0.4.2 --notes-url "$url" --followups "$body_dir/open.tsv" >/dev/null 2>&1 || true
+}
+
+# The stub having run is asserted first. A PATH that does not shadow gh reaches the real one, which
+# in a sandbox answers nothing and leaves an empty log -- and an empty log is also what a body with
+# no section looks like to a grep.
+carries() {   # name, log
+    if ! grep -q 'issue create\|issue comment' "$2"; then
+        fail "$1" "no gh call was recorded; the stub did not run"
+    elif grep -qF -- '- #7 -- https://github.com/tapstate/tapstate/pull/23' "$2"; then
+        pass "$1"
+    else
+        fail "$1" "the body carried no follow-up section. calls: $(cat "$2")"
+    fi
+}
+
+log="$body_dir/log-open"; : > "$log"; live "$log" open
+carries "the request that is sent carries the section" "$log"
+
+log="$body_dir/log-settle-open"; : > "$log"; live "$log" settle OPEN
+carries "the second issue that is sent carries it too" "$log"
+
+log="$body_dir/log-settle-closed"; : > "$log"; live "$log" settle CLOSED
+carries "and a request already finished is told at the end" "$log"
+rm -rf "$body_dir"
 
 echo
 if [ "$failures" -eq 0 ]; then

@@ -27,6 +27,24 @@ final class Synthetic {
      */
     private static String source(
             String simpleName, String ctorBody, String registerBody, String members) {
+        return source(simpleName, ctorBody, registerBody, members,
+                "TapTable table = new TapTable(\"t1\");"
+                        + "table.add(new TapField(\"id\", \"int\"));"
+                        + "List<TapTable> tables = new ArrayList<>();"
+                        + "tables.add(table);"
+                        + "s.accept(tables);");
+    }
+
+    /** The shared source scaffold with a caller-supplied discovery body. */
+    private static String source(
+            String simpleName, String ctorBody, String registerBody, String members, String discoveryBody) {
+        return source(simpleName, ctorBody, registerBody, members, discoveryBody, "");
+    }
+
+    /** The shared source scaffold with caller-supplied discovery and stop bodies. */
+    private static String source(
+            String simpleName, String ctorBody, String registerBody, String members,
+            String discoveryBody, String stopBody) {
         return ""
                 + "package synthetic;"
                 + "import io.tapdata.pdk.apis.TapConnector;"
@@ -53,13 +71,9 @@ final class Synthetic {
                 + registerBody
                 + "  }"
                 + "  public void init(TapConnectionContext c) {}"
-                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {" + stopBody + "}"
                 + "  public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> s) {"
-                + "    TapTable table = new TapTable(\"t1\");"
-                + "    table.add(new TapField(\"id\", \"int\"));"
-                + "    List<TapTable> tables = new ArrayList<>();"
-                + "    tables.add(table);"
-                + "    s.accept(tables);"
+                + discoveryBody
                 + "  }"
                 + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> s) {"
                 + "    s.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY));"
@@ -68,6 +82,31 @@ final class Synthetic {
                 + "  public int tableCount(TapConnectionContext c) { return 1; }"
                 + members
                 + "}";
+    }
+
+    /** A stream source whose schema discovery does not return until the host stops the connector. */
+    static Path blockingDiscoverySource(Path dir) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  throw new IllegalStateException(\"stream read must not start\");"
+                + "});";
+        String members = "private volatile boolean stopped;";
+        String discovery = "while (!stopped) { java.util.concurrent.locks.LockSupport.parkNanos(1000000L); }";
+        return SyntheticJar.compileToJar(dir, "synthetic.BlockingDiscoverySource",
+                source("BlockingDiscoverySource", "", register, members, discovery, "stopped = true;"));
+    }
+
+    /** A stream source whose discovered table and column names are supplied by the caller. */
+    static Path namedStreamSource(Path dir, String table, String column) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  throw new IllegalStateException(\"stream read must not start\");"
+                + "});";
+        String discovery = "TapTable table = new TapTable(\"" + table + "\");"
+                + "table.add(new TapField(\"" + column + "\", \"int\"));"
+                + "List<TapTable> tables = new ArrayList<>();"
+                + "tables.add(table);"
+                + "s.accept(tables);";
+        return SyntheticJar.compileToJar(dir, "synthetic.NamedStreamSource",
+                source("NamedStreamSource", "", register, "", discovery));
     }
 
     /**
@@ -103,14 +142,22 @@ final class Synthetic {
                 + "import java.util.Map;"
                 + "import java.util.function.Consumer;"
                 + "public class PositionedSource implements TapConnector {"
+                + "  private boolean readStarted;"
                 + "  public static class Offset implements java.io.Serializable {"
                 + "    public String mark;"
                 + "    public Offset() {}"
                 + "    public Offset(String mark) { this.mark = mark; }"
                 + "  }"
                 + "  public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {"
-                + "    functions.supportTimestampToStreamOffset((context, timestamp) -> new Offset(\"seam-1\"));"
+                + "    functions.supportTimestampToStreamOffset((context, timestamp) -> {"
+                + "      if (readStarted) throw new IllegalStateException(\"seam sampled after snapshot started\");"
+                + "      TapTable discovered = context.getTableMap().get(\"t1\");"
+                + "      if (!discovered.getNameFieldMap().containsKey(\"id\"))"
+                + "        throw new IllegalStateException(\"seam needs discovered table metadata\");"
+                + "      return new Offset(\"seam-1\");"
+                + "    });"
                 + "    functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "      readStarted = true;"
                 + "      List<TapEvent> evs = new ArrayList<>();"
                 + row("r1", 1)
                 + "      evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(r1));"
@@ -573,6 +620,23 @@ final class Synthetic {
                 + "  consumer.accept(evs, null);"
                 + "});";
         return SyntheticJar.compileToJar(dir, "synthetic.BadRow", source("BadRow", "", register));
+    }
+
+    /** Records target preparation independently of record delivery. */
+    static Path preparationSink(Path dir, Path trace, boolean exists) {
+        String register = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\"); });"
+                + "functions.supportCreateTableV2((c, e) -> { mark(\"create:\" + e.getTableId());"
+                + "return io.tapdata.pdk.apis.functions.connector.target.CreateTableOptions.create().tableExists("
+                + exists + "); });"
+                + "functions.supportClearTable((c, e) -> mark(\"clear:\" + e.getTableId()));"
+                + "functions.supportCountByPartitionFilterFunction((c, t, f) -> { mark(\"count:\" + t.getId()); return 1L; });";
+        String members = "private void mark(String value) throws Exception {"
+                + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
+                + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
+        String code = source("PreparationSink", "", register, members)
+                .replace("public void stop(TapConnectionContext c) {}",
+                        "public void stop(TapConnectionContext c) throws Throwable { mark(\"stop\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.PreparationSink", code);
     }
 
     /** A sink connector whose writeRecord counts events and reports them all inserted. */

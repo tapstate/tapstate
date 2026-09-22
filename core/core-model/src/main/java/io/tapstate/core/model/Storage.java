@@ -4,7 +4,7 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Tiered storage of a view (ADR-0016 §7): hot = Hz, warm = Mongo, cold = Paimon
+ * Tiered storage of a view (§7): hot = Hz, warm = Mongo, cold = Paimon
  * (runtime GA; grammar reserved).
  */
 @Doc("Tiered storage configuration for a view: hot in-memory, warm database, and cold data-lake layers.")

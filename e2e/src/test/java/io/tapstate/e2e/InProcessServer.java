@@ -4,6 +4,8 @@ import io.tapstate.app.Bootstrap;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.scheduling.config.ScheduledTask;
+import org.springframework.scheduling.config.ScheduledTaskHolder;
 
 import java.net.URI;
 
@@ -17,6 +19,12 @@ import java.net.URI;
  */
 final class InProcessServer implements ServerHandle {
 
+    /**
+     * The scheduled pass that republishes every pipeline's observation, as the scheduler renders it:
+     * a scheduled method's string form is its declaring class and method name.
+     */
+    private static final String PUBLISHING_PASS = "io.tapstate.app.ConvergenceDriver.reconcile";
+
     private final ConfigurableApplicationContext context;
     private final URI baseUrl;
 
@@ -27,10 +35,16 @@ final class InProcessServer implements ServerHandle {
 
     /** Boots the assembly against the given store and returns once its surface is listening. */
     static InProcessServer start(String storeUri) {
+        return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
+    }
+
+    /** Boots the assembly with an explicit operator-state database. */
+    static InProcessServer start(String storeUri, String operatorStateDatabase) {
         ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
                 .properties(
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
+                        ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                         // The container speaks plaintext; store TLS is opt-in, so no flag is needed.
                         "tapstate.store.mongo.server-selection-timeout=5s",
                         // This tier's working directory is the harness's own module, and the setting's
@@ -59,6 +73,45 @@ final class InProcessServer implements ServerHandle {
     @Override
     public URI baseUrl() {
         return baseUrl;
+    }
+
+    /**
+     * Stops this server publishing observations, while leaving everything that answers a read alone.
+     *
+     * <p>The situation a reader has to be able to tell apart from a healthy run is one where the thing
+     * that keeps observations current has stopped and the surface serving them has not. Nothing in the
+     * product separates those two: there is one supported role and it runs both, and the store backs
+     * both, so making the store unreachable takes the read face down with the publisher and leaves
+     * nothing to read. Cancelling the scheduled task is the only way to produce the situation without
+     * inventing a switch in the product for a test to flip.
+     *
+     * <p>In this tier only, and deliberately so -- it reaches inside the running application, which is
+     * exactly what the tier boundary exists to keep out of {@link ServerHandle}. A case that needs this
+     * is a case about the server's internals, and it names this tier rather than pretending to be
+     * portable.
+     *
+     * <p>The pass is matched by name because it is not visible from here, and the count returned is what
+     * makes that safe: rename or move it and this cancels nothing, so a caller that insists on exactly one
+     * gets a red rather than a case that keeps passing while measuring a publisher which never stopped.
+     * Without that insistence the two are the same green -- measured, not imagined: the first version of
+     * this matched on the runnable's type, the scheduler wraps it, and the cancel found nothing.
+     *
+     * @return how many scheduled tasks were cancelled; a caller must refuse anything but what it expects
+     */
+    int stopPublishingObservations() {
+        int cancelled = 0;
+        for (ScheduledTaskHolder holder : context.getBeansOfType(ScheduledTaskHolder.class).values()) {
+            for (ScheduledTask task : holder.getScheduledTasks()) {
+                // The runnable itself is wrapped by the scheduler, so it is matched by how it renders
+                // rather than by its type: the wrapper delegates toString to the scheduled method, which
+                // renders as its declaring class and method name.
+                if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable()))) {
+                    task.cancel();
+                    cancelled++;
+                }
+            }
+        }
+        return cancelled;
     }
 
     @Override

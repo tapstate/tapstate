@@ -123,7 +123,8 @@ class PublishedExamplesIT {
     }
 
     static Stream<Arguments> everyPublishedExampleOnEveryTier() {
-        return Examples.specifications().stream()
+        return PublishedExampleSelection.select(Examples.specifications(),
+                        System.getProperty(PublishedExampleSelection.PROPERTY)).stream()
                 .flatMap(specification -> Stream.of(Tiers.values())
                         .map(tier -> Arguments.of(specification, tier)));
     }
@@ -131,6 +132,7 @@ class PublishedExamplesIT {
     @ParameterizedTest(name = "{0} on {1}")
     @MethodSource("everyPublishedExampleOnEveryTier")
     void thePublishedExampleRuns(Path specification, Tiers tier) {
+        PublishedExampleSelection.reportIdentity(specification, tier);
         Path workspace = specification.getParent();
         Envelope envelope = EnvelopeParser.parse(Examples.read(specification));
 
@@ -143,9 +145,9 @@ class PublishedExamplesIT {
         stageConnectorJars(envelope.setup().connectors());
 
         String run = store(workspace, tier);
-        // Nest state is held under a fixed database name, so it is the one thing a run cannot isolate by
-        // taking a name of its own. Two tiers of one example share every id in it; without this the second
-        // serves documents the first assembled from rows this one never had.
+        // Every run in this harness uses the deployment's default operator-state database. Two tiers of
+        // one example share every id in it; without this reset the second serves documents the first
+        // assembled from rows this one never had.
         SharedMongo.discardNestState();
         // The stores the example asked for come up before anything else: a resource cannot be applied
         // before the endpoint whose address it interpolates exists.
@@ -167,11 +169,17 @@ class PublishedExamplesIT {
             } catch (RuntimeException | AssertionError failed) {
                 // Before the containers go away. Everything that would explain this failure is inside
                 // them, and a second run to add a print statement costs two database engines again.
-                FailureScene.write(
-                        FAILURE_SCENES.resolve(specification + "-" + tier.name().toLowerCase(Locale.ROOT) + ".txt"),
-                        envelope,
-                        binding,
-                        new FilePipelineLoader(workspace).resolvePipelineId(envelope.pipeline()));
+                try {
+                    FailureScene.write(
+                            FAILURE_SCENES.resolve(specification + "-" + tier.name().toLowerCase(Locale.ROOT) + ".txt"),
+                            envelope,
+                            binding,
+                            new FilePipelineLoader(workspace).resolvePipelineId(envelope.pipeline()));
+                } catch (RuntimeException | AssertionError sceneFailure) {
+                    // Setup can fail before a pipeline exists. Preserve that cause when collecting
+                    // its status fails too, rather than replacing it with an unknown-pipeline error.
+                    failed.addSuppressed(sceneFailure);
+                }
                 throw failed;
             }
 
@@ -180,7 +188,7 @@ class PublishedExamplesIT {
         // Last line on purpose: the ledger vouches only for a run that held every assertion above,
         // including the independent read. The release gate reads absence from it, so nothing may be
         // recorded on a path that can be reached without the assertions.
-        WitnessLedger.record(workspace.getFileName().toString(), tier);
+        WitnessLedger.record(specification, tier);
     }
 
     /**
@@ -211,7 +219,7 @@ class PublishedExamplesIT {
                             + "it handed out: the resource is not pointing where the run put its endpoint",
                             specification, seed.table(), address.settings())
                     .isTrue();
-            holder.ifPresent(seeded::add);
+            recordSeededStore(seeded, seed, holder);
         }
         settled.forEach((alias, rows) -> {
             Optional<String> holder = stores.storeHolding(binding.addressOf(alias));
@@ -244,6 +252,11 @@ class PublishedExamplesIT {
             ProvisionedStores stores,
             Endpoints files) {
         if (envelope.setup().databases().isEmpty()) {
+            // Read once, at one instant. A file target is replaced whole - the new content is staged
+            // beside it and moved into place - so a reader is never shown a table mid-write, and a count
+            // that disagrees here is the product's answer rather than the run's timing. Polling it
+            // instead samples around the write rather than reading the table, and accepts a target that
+            // holds the rows only some of the time.
             settled.forEach((alias, rows) -> assertThat(
                             files.count(EndpointAddress.uri(targetDirectory.toString()), alias.table()))
                     .as("%s settles on %s rows in %s, read there by the address it named; this reads the "
@@ -285,6 +298,13 @@ class PublishedExamplesIT {
             }
         }
         return Map.of();
+    }
+
+    /** Empty seeds create table structure, but cannot account for any delivered target row. */
+    static void recordSeededStore(Set<String> seeded, Seed seed, Optional<String> holder) {
+        if (!seed.rows().isEmpty()) {
+            holder.ifPresent(seeded::add);
+        }
     }
 
     /**

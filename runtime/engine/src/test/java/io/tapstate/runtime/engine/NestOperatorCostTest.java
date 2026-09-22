@@ -701,14 +701,14 @@ class NestOperatorCostTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("order", FromRef.literal("orders"));
         others.forEach((alias, table) -> aliases.put(alias, FromRef.literal(table.name())));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
 
         List<SourceRef> sourceNames = new ArrayList<>();
         sourceNames.add(SourceRef.bare("orders"));
         others.values().forEach(table -> sourceNames.add(SourceRef.bare(table.name())));
         PipelineResource resource = new PipelineResource(pipeline, null, sourceNames, List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal(STEP),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();

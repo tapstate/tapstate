@@ -18,7 +18,7 @@ import java.util.Optional;
 import java.util.concurrent.Callable;
 
 /**
- * {@code explain} — the grammar field manual, kubectl-explain style. Backed by the same-source
+ * {@code explain} without a server target — the grammar field manual, kubectl-explain style. Backed by the same-source
  * {@code tapstate/v1} JSON Schema through {@link SchemaNavigator}: with no path it lists the resource
  * kinds; a dotted path resolves to a field and shows its type, description, allowed enum values and
  * child fields. {@code text} is the human surface (colour-aware); {@code json} / {@code yaml} write a
@@ -26,7 +26,7 @@ import java.util.concurrent.Callable;
  * affordance — a plain stderr message and exit 2, not a coded domain diagnostic, in every format.
  */
 @Command(name = "explain", mixinStandardHelpOptions = true,
-        description = "Explain a grammar field path (backed by the bundled tapstate/v1 schema).")
+        description = "Explain a grammar field path offline; with a server target, explain one pipeline.")
 final class ExplainCmd implements Callable<Integer> {
 
     /** Exit code when the requested field path does not exist in the grammar. */

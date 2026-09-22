@@ -6,6 +6,7 @@ import io.tapdata.entity.event.dml.TapDeleteRecordEvent;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
+import io.tapdata.entity.logger.TapLogger;
 import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.utils.cache.KVMap;
@@ -26,6 +27,8 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -45,6 +48,9 @@ import java.util.stream.Stream;
  * one. Everything the product does around the connector - registering the artifact, resolving the
  * class, deriving the target model, running the DAG, keying the upsert - is the real thing; only the
  * store at each end is a directory instead of a database.
+ *
+ * <p>A table is published by staging its complete contents beside it and atomically replacing the
+ * table's file. Writers must never overwrite a visible table in place because readers open it whole.
  *
  * <h2>Two rules this class must not break</h2>
  *
@@ -85,15 +91,43 @@ public class CsvConnector implements TapConnector {
     private static final String FAIL_WRITES = "fail_writes";
 
     /**
-     * A test affordance on the read side, the mirror of {@link #FAIL_WRITES}: when set truthy on a source
-     * connection, the cdc tail starts and then throws. It exists so a specification can drive a source whose
-     * change stream dies and assert the product surfaces it as an observable error - a dead cdc tail becoming
-     * a FAILED state and an error count - even though the tail runs on its own thread and the job reading the
-     * ring it fills keeps running over a ring gone quiet. A tail that never fails cannot witness that path.
+     * A test affordance on the read side, the mirror of {@link #FAIL_WRITES}: when set truthy for one source
+     * use, the cdc tail starts and then throws. The connector declares it on its node form and reads it only
+     * from the node config, so the published failure case also witnesses that node parameters cross the host
+     * boundary. It then asserts the product surfaces the failure as a FAILED state and an error count, even
+     * though the tail runs on its own thread and the job reading the ring it fills keeps running over a ring
+     * gone quiet. A tail that never fails cannot witness that path.
      */
     private static final String FAIL_CDC = "fail_cdc";
 
+    /** A test affordance for a saved-source witness: discovery fails when persistence loses this secret. */
+    private static final String REQUIRE_PASSWORD = "require_password";
+
+    /** What this connector says when it is driven without the password its settings declare it needs. */
+    private static final String CANNOT_AUTHENTICATE = "password authentication failed: no password was given";
+
+    /**
+     * The same refusal said on the contract's shared static channel, deliberately in different words: a
+     * reader of the tail cannot tell which channel carried a sentence, so two sentences that read alike
+     * would let either channel alone satisfy a witness meant to hold both.
+     */
+    private static final String CANNOT_AUTHENTICATE_ALOUD =
+            "the connection was refused before any row was read";
+
+    /** What it says on the context log when its change stream dies, written on the tail's own thread. */
+    private static final String CDC_STREAM_DIED = "the change stream stopped and will not resume";
+
+    /** The same, on the shared static channel; different words for the reason the pair above gives. */
+    private static final String CDC_STREAM_DIED_ALOUD = "no further changes will be read from this source";
+
     private static final String SUFFIX = ".csv";
+
+    /**
+     * What a table's content is staged under while the table is being replaced. The format's suffix is
+     * absent from it on purpose: a staging file that outlived a crash is then not a table by the same
+     * reading that lists the tables, and no lookup resolves to it.
+     */
+    private static final String STAGING_SUFFIX = ".staging";
 
     /**
      * The one command the read face dispatches. It is pinned on both sides on purpose: the caller sends
@@ -169,6 +203,19 @@ public class CsvConnector implements TapConnector {
 
     @Override
     public void init(TapConnectionContext context) {
+        if (passwordRequired(context) && !passwordPresent(context)) {
+            // A connector knows why it cannot open a connection, and nothing outside it does: to the host
+            // this is one more read that failed. It says so on both of the channels the contract gives it
+            // -- the log on the context it was driven with, and the shared static one -- because the real
+            // connectors use both, and a witness that carried only one would leave the other's users with
+            // the silence this exists to remove.
+            context.getLog().error(CANNOT_AUTHENTICATE + " for the directory {}", directory(context));
+            TapLogger.error("CsvConnector", CANNOT_AUTHENTICATE_ALOUD);
+            // The failure it throws says less than the two lines above on purpose. What the host can see
+            // from outside is only that a read failed; a thrown message repeating what the connector just
+            // logged would let a witness of "the connector's words arrived" pass on the host's own line.
+            throw new IllegalStateException("cannot open a connection");
+        }
         stopped = false;
     }
 
@@ -185,6 +232,9 @@ public class CsvConnector implements TapConnector {
     @Override
     public void discoverSchema(
             TapConnectionContext context, List<String> tables, int tableSize, Consumer<List<TapTable>> consumer) {
+        if (passwordRequired(context) && !passwordPresent(context)) {
+            throw new IllegalArgumentException("this connector requires the 'password' setting");
+        }
         List<TapTable> discovered = new ArrayList<>();
         for (String name : tables.isEmpty() ? tableNames(context) : tables) {
             List<String> header = header(file(context, name));
@@ -241,6 +291,11 @@ public class CsvConnector implements TapConnector {
         if (cdcRejected(context)) {
             // The stream started, then dies - the read-side mirror of a rejected write. The product wraps
             // whatever the tail throws and surfaces it as an observable failure; the type here is immaterial.
+            // It says why first, on both channels: this runs on the tail's own thread, which is the host's
+            // but not the one reconciling, so a line written here is the case for carrying the attribution
+            // onto the thread a drive actually runs on rather than onto the caller that started it.
+            context.getLog().error(CDC_STREAM_DIED + " for {}", tables);
+            TapLogger.error("CsvConnector", CDC_STREAM_DIED_ALOUD);
             throw new IllegalStateException(
                     "the '" + FAIL_CDC + "' setting makes this source's cdc stream fail");
         }
@@ -572,6 +627,20 @@ public class CsvConnector implements TapConnector {
         return columns;
     }
 
+    /**
+     * Replaces the table's file with the given rows in one step.
+     *
+     * <p>The content is staged beside the file it replaces and moved into place, rather than written over
+     * it. A file opened for writing is emptied before the text lands, so an in-place rewrite is a table
+     * that observably holds nothing for the length of the write while every row it holds is still there -
+     * and that reading is the one a count taken by anyone else cannot tell apart from a run that wrote
+     * nothing at all. A move is the one step a reader cannot land inside.
+     *
+     * <p>The staged name deliberately does not end in the format's suffix, and is not where a table is
+     * looked for: a directory listing made mid-write sees exactly the tables that have been written,
+     * never a half-written one being called a table. A staging file left behind by a crash is therefore
+     * not a table either, and the next write of that table does not collide with it.
+     */
     private static void write(Path file, List<String> header, List<Map<String, Object>> rows) {
         StringBuilder text = new StringBuilder(String.join(",", header)).append('\n');
         for (Map<String, Object> row : rows) {
@@ -584,10 +653,37 @@ public class CsvConnector implements TapConnector {
         }
         try {
             Files.createDirectories(file.getParent());
-            Files.writeString(file, text.toString());
+            Path staged = Files.createTempFile(file.getParent(), "table-", STAGING_SUFFIX);
+            try {
+                Files.writeString(staged, text.toString());
+                publish(staged, file);
+            } finally {
+                // Nothing reads a staging file, so one a failed write leaves behind is one nothing ever
+                // collects. After the move it is already gone, and this call does nothing.
+                Files.deleteIfExists(staged);
+            }
         } catch (IOException e) {
             throw new UncheckedIOException("cannot write the table at " + file, e);
         }
+    }
+
+    /**
+     * Puts the staged content where the table is, in one step, with the mode a reader other than this
+     * process needs.
+     *
+     * <p>A temp file is created readable by its owner alone, and a move carries that mode onto the table.
+     * The write this replaces left the mode the process's umask gives instead - readable by anyone. These
+     * directories are read across users: a build running in a container and a harness running out here
+     * share one, each reading what the other wrote. So the staged file is given that mode back before it
+     * is moved into place, or a table this process wrote is one the other user cannot open.
+     */
+    private static void publish(Path staged, Path file) throws IOException {
+        try {
+            Files.setPosixFilePermissions(staged, PosixFilePermissions.fromString("rw-r--r--"));
+        } catch (UnsupportedOperationException noPosixPermissions) {
+            // A filesystem that carries no POSIX permissions has nothing to widen.
+        }
+        Files.move(staged, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     private static List<String> read(Path file) {
@@ -632,12 +728,26 @@ public class CsvConnector implements TapConnector {
         return flag != null && Boolean.parseBoolean(String.valueOf(flag));
     }
 
-    /** Whether this connection is configured to fail its cdc stream. Off unless a source opts in. */
+    /** Whether this source use is configured to fail its cdc stream. Off unless its node opts in. */
     private static boolean cdcRejected(TapConnectionContext context) {
+        Object flag = context.getNodeConfig() == null
+                ? null
+                : context.getNodeConfig().getObject(FAIL_CDC);
+        return flag != null && Boolean.parseBoolean(String.valueOf(flag));
+    }
+
+    private static boolean passwordRequired(TapConnectionContext context) {
         Object flag = context.getConnectionConfig() == null
                 ? null
-                : context.getConnectionConfig().getObject(FAIL_CDC);
+                : context.getConnectionConfig().getObject(REQUIRE_PASSWORD);
         return flag != null && Boolean.parseBoolean(String.valueOf(flag));
+    }
+
+    private static boolean passwordPresent(TapConnectionContext context) {
+        Object password = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject("password");
+        return password != null && !String.valueOf(password).isBlank();
     }
 
     private static Path directory(TapConnectionContext context) {

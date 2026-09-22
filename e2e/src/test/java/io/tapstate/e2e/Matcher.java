@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -57,21 +58,36 @@ public sealed interface Matcher {
     record DeadLettered(long expected) implements Matcher {}
 
     /**
+     * How many rows the pipeline this specification names has had confirmed by its targets, added up over
+     * its tables and the operations its sources performed, read from its metrics face. Written as one
+     * number for the reason {@link DeadLettered} is: the breakdown is keyed by names derived from the
+     * pipeline, and a specification naming one would be copying an internal name by hand.
+     */
+    record RecordsOut(long expected) implements Matcher {}
+
+    /**
      * One document at an endpoint: located by the equality settings in {@code where}, held to scalar
-     * values by path in {@code expect} and to list lengths by path in {@code size}. Paths read
-     * {@code a.b} for a field of a field and {@code items[0].sku} for a field of a list element.
-     * Identity is spelled {@code id} whatever the store calls it; the driver owns that spelling.
+     * values by path in {@code expect}, to list lengths by path in {@code size}, and to paths that
+     * must not be there at all in {@code absent}. Paths read {@code a.b} for a field of a field and
+     * {@code items[0].sku} for a field of a list element. Identity is spelled {@code id} whatever the
+     * store calls it; the driver owns that spelling.
+     *
+     * <p><b>{@code absent} is the only one of the three that a wider document can fail.</b> Every
+     * value and length an author writes down is satisfied by a document that carries extra fields
+     * beside them, so a target built one column too wide passes every other expectation there is.
      */
     record Doc(
             TableAlias table,
             Map<String, Object> where,
             Map<String, Object> expect,
-            Map<String, Long> size)
+            Map<String, Long> size,
+            List<String> absent)
             implements Matcher {
         public Doc {
             where = Collections.unmodifiableMap(new LinkedHashMap<>(where));
             expect = Collections.unmodifiableMap(new LinkedHashMap<>(expect));
             size = Collections.unmodifiableMap(new LinkedHashMap<>(size));
+            absent = List.copyOf(absent);
         }
     }
 
@@ -93,5 +109,9 @@ public sealed interface Matcher {
 
     static Matcher deadLettered(long expected) {
         return new DeadLettered(expected);
+    }
+
+    static Matcher recordsOut(long expected) {
+        return new RecordsOut(expected);
     }
 }

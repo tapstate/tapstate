@@ -111,8 +111,7 @@ public final class PipelineDraftService {
             return new PublishResult(PipelineDraftMutation.REVISION_CONFLICT, null, null);
         }
         PipelineResource artifact = compile(pipelineId, draft);
-        String canonical = writer.write(artifact);
-        String artifactHash = CanonicalHash.of(canonical);
+        String artifactHash = CanonicalHash.of(artifact);
         String baseHash = expectedArtifactHash == null ? draft.baseArtifactHash() : expectedArtifactHash;
         PipelineDraft.Publication publication = new PipelineDraft.Publication(
                 pipelineId, expectedDraftRevision, baseHash, artifact, artifactHash,

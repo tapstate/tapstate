@@ -50,7 +50,7 @@ class SourceProjectionServiceTest {
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
     private final SourceProjectionService sources = new SourceProjectionService(
             new ApplyService(() -> catalog, store, new AuditGate(record -> { }, Clock.systemUTC()),
-                    schemas, PlanAdvisories.none()),
+                    schemas, PlanAdvisories.none(), SchemaDerivation.none()),
             new ArtifactQueryService(store),
             new ArtifactMutationService(store, new EmptyDesiredStore(), new EmptyStateStore(),
                     new EmptyObservationStore(), new EmptySrsMetaStore(),
@@ -146,7 +146,7 @@ class SourceProjectionServiceTest {
                 """));
         schemas.save(new DiscoveredSourceModel(
                 "mysql_feynman", "mysql", 0L, new SourceModel(List.of(new SourceTable(
-                        "BB_0727", List.of(new SourceField("value", "varchar", null)),
+                        "BB_0727", List.of(new SourceField("value", "varchar")),
                         List.of(), List.of())))));
 
         SourceView created = sources.create("alice", input("test_1", "new source"));
@@ -179,7 +179,7 @@ class SourceProjectionServiceTest {
                 """));
         schemas.save(new DiscoveredSourceModel(
                 "mysql_feynman", "mysql", 0L, new SourceModel(List.of(new SourceTable(
-                        "orders", List.of(new SourceField("value", "varchar", null)),
+                        "orders", List.of(new SourceField("value", "varchar")),
                         List.of(), List.of())))));
 
         Throwable failure = catchThrowable(() -> sources.replace(
@@ -219,7 +219,7 @@ class SourceProjectionServiceTest {
     }
 
     private static String hash(Resource resource) {
-        return CanonicalHash.of(new CanonicalWriter().write(resource));
+        return CanonicalHash.of(resource);
     }
 
     private static final class RecordingArtifactStore implements ArtifactStore {
@@ -283,7 +283,7 @@ class SourceProjectionServiceTest {
         }
 
         private static String hash(Resource resource) {
-            return CanonicalHash.of(new CanonicalWriter().write(resource));
+            return CanonicalHash.of(resource);
         }
     }
 
@@ -333,7 +333,8 @@ class SourceProjectionServiceTest {
         @Override public void advanceConsumerReadSeq(
                 String miningChainId, String pipelineId, String table, long lastReadSeq) { }
         @Override public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) { }
-        @Override public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) { }
+        @Override public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) { }
         @Override public long openEpoch(String miningChainId) { return 0; }
         @Override public void appendSchemaVersion(String miningChainId, SchemaVersion version) { }
         @Override public void markSnapshotComplete(String miningChainId, String pipelineId, String table) { }

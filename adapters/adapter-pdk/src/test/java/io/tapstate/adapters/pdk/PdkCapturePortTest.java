@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -351,6 +352,138 @@ class PdkCapturePortTest {
         assertThat(got).extracting(Envelope::op).containsExactly(Op.INSERT, Op.UPDATE, Op.DELETE);
     }
 
+    @Test
+    void oracleLogMinerRejectsAnUnsupportedSchemaIdentifierBeforeCdcStarts(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.emittingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+        String shortSchema = "S".repeat(30);
+        String longSchema = "S".repeat(63);
+
+        CountDownLatch shortNameDelivered = new CountDownLatch(1);
+        CaptureConfig shortLogMiner = new CaptureConfig(
+                "oracle", Map.of("schema", shortSchema, "autoLog", false), List.of("t1"));
+        try (Subscription ignored = port.cdc(shortLogMiner, CaptureStart.present(),
+                (events, position) -> shortNameDelivered.countDown())) {
+            assertThat(shortNameDelivered.await(5, TimeUnit.SECONDS))
+                    .as("the supported LogMiner identifier still delivers changes")
+                    .isTrue();
+        }
+
+        CountDownLatch otherModeDelivered = new CountDownLatch(1);
+        CaptureConfig longLogParser = new CaptureConfig("oracle",
+                Map.of("schema", longSchema, "autoLog", false, "logPluginName", "oracle-log-parser"),
+                List.of("t1"));
+        try (Subscription ignored = port.cdc(longLogParser, CaptureStart.present(),
+                (events, position) -> otherModeDelivered.countDown())) {
+            assertThat(otherModeDelivered.await(5, TimeUnit.SECONDS))
+                    .as("the LogMiner limit is not imposed on another Oracle capture mode")
+                    .isTrue();
+        }
+
+        CaptureConfig unsupportedLogMiner = new CaptureConfig(
+                "oracle", Map.of("schema", longSchema, "autoLog", false), List.of("t1"));
+        assertThat(port.testConnection(unsupportedLogMiner).sample())
+                .as("snapshot probing still succeeds for the unsupported LogMiner schema")
+                .isNotEmpty();
+
+        assertThatThrownBy(() -> {
+            try (Subscription ignored = port.cdc(
+                    unsupportedLogMiner, CaptureStart.present(), (events, position) -> { })) {
+                // A successful return is the defect: the source can now look healthy while LogMiner drops changes.
+            }
+        }).isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    TapstateException refusal = (TapstateException) error;
+                    assertThat(refusal.code().code()).isEqualTo("connector.logminer-identifier-too-long");
+                    assertThat(refusal.args())
+                            .containsEntry("connector", "oracle")
+                            .containsEntry("kind", "schema")
+                            .containsEntry("identifier", longSchema)
+                            .containsEntry("limit", 30);
+                });
+    }
+
+    @Test
+    void oracleLogMinerRejectsAnUnsupportedDiscoveredTableBeforeCdcStarts(@TempDir Path dir) {
+        String longTable = "T".repeat(31);
+        Path jar = Synthetic.namedStreamSource(dir, longTable, "id");
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.NamedStreamSource", null));
+        CaptureConfig config = new CaptureConfig(
+                "oracle", Map.of("schema", "SUPPORTED", "autoLog", false), List.of());
+
+        assertThatThrownBy(() -> port.cdc(config, CaptureStart.present(), (events, position) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    TapstateException refusal = (TapstateException) error;
+                    assertThat(refusal.code()).isEqualTo(ConnectorError.LOGMINER_IDENTIFIER_TOO_LONG);
+                    assertThat(refusal.args())
+                            .containsEntry("kind", "table")
+                            .containsEntry("identifier", longTable)
+                            .containsEntry("limit", 30);
+                });
+    }
+
+    @Test
+    void oracleLogMinerRejectsAnUnsupportedDiscoveredColumnBeforeCdcStarts(@TempDir Path dir) {
+        String longColumn = "C".repeat(31);
+        Path jar = Synthetic.namedStreamSource(dir, "orders", longColumn);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.NamedStreamSource", null));
+        CaptureConfig config = new CaptureConfig(
+                "oracle", Map.of("schema", "SUPPORTED", "autoLog", false), List.of());
+
+        assertThatThrownBy(() -> port.cdc(config, CaptureStart.present(), (events, position) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    TapstateException refusal = (TapstateException) error;
+                    assertThat(refusal.code()).isEqualTo(ConnectorError.LOGMINER_IDENTIFIER_TOO_LONG);
+                    assertThat(refusal.args())
+                            .containsEntry("kind", "column")
+                            .containsEntry("identifier", longColumn)
+                            .containsEntry("limit", 30);
+                });
+    }
+
+    @Test
+    void aBlockedLogMinerPreflightTimesOutAndDoesNotStarveTheNextPipeline(@TempDir Path dir) throws Exception {
+        Path blocked = Synthetic.blockingDiscoverySource(dir.resolve("blocked"));
+        Path healthy = Synthetic.emittingSource(dir.resolve("healthy"));
+        ConnectorRef blockedRef = new ConnectorRef(
+                List.of(blocked), "synthetic.BlockingDiscoverySource", "2.0.8", null);
+        ConnectorRef healthyRef = new ConnectorRef(
+                List.of(healthy), "synthetic.EmittingSource", "2.0.8", null);
+        ConnectorProvisioner provisioner = connectorId -> "oracle".equals(connectorId) ? blockedRef : healthyRef;
+        Duration timeout = Duration.ofMillis(100);
+        PdkCapturePort port = new PdkCapturePort(provisioner, null, timeout);
+        CaptureConfig blockedConfig = new CaptureConfig(
+                "oracle", Map.of("schema", "SUPPORTED", "autoLog", false), List.of());
+
+        long started = System.nanoTime();
+        assertThatThrownBy(() -> port.cdc(blockedConfig, CaptureStart.present(), (events, position) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    TapstateException timeoutFailure = (TapstateException) error;
+                    assertThat(timeoutFailure.code()).isEqualTo(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT);
+                    assertThat(timeoutFailure.args())
+                            .containsEntry("connector", "oracle")
+                            .containsEntry("timeout", "100ms");
+                });
+        assertThat(Duration.ofNanos(System.nanoTime() - started))
+                .as("the blocked preflight releases the reconciliation caller")
+                .isLessThan(Duration.ofSeconds(3));
+        assertThat(Thread.getAllStackTraces().keySet())
+                .as("the stopped connector's preflight worker was joined")
+                .noneMatch(thread -> thread.isAlive() && "tapstate-cdc-oracle".equals(thread.getName()));
+
+        CountDownLatch delivered = new CountDownLatch(1);
+        try (Subscription ignored = port.cdc(
+                new CaptureConfig("demo", Map.of(), List.of("t1")), CaptureStart.present(),
+                (events, position) -> delivered.countDown())) {
+            assertThat(delivered.await(5, TimeUnit.SECONDS))
+                    .as("the next pipeline reconciles after the first preflight times out")
+                    .isTrue();
+        }
+    }
+
     /**
      * The table map the cdc drive hands the connector answers walking, not only lookup by name.
      *
@@ -534,7 +667,7 @@ class PdkCapturePortTest {
     }
 
     @Test
-    void reportsTheSeamSampledBeforeTheSnapshotRead(@TempDir Path dir) throws Exception {
+    void reportsTheSeamAfterDiscoveryAndBeforeTheSnapshotRead(@TempDir Path dir) throws Exception {
         // Sampled before the first row, so a change made while the snapshot runs falls after the seam and
         // is re-delivered by the tail. Sampled after, it would fall before and never be delivered at all.
         Path jar = Synthetic.positionedSource(dir);

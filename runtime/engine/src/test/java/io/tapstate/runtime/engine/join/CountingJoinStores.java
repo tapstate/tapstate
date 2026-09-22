@@ -27,6 +27,9 @@ final class CountingJoinStores implements JoinStores {
     /** How many times a single fact key was asked for on its own. */
     int singleReads;
 
+    /** How many times an index bucket's page count was asked for. */
+    int pageCountReads;
+
     /**
      * How many calls changed something - either mirror, either direction, and the index with them.
      *
@@ -65,6 +68,7 @@ final class CountingJoinStores implements JoinStores {
         batchReads = 0;
         keysRead = 0;
         singleReads = 0;
+        pageCountReads = 0;
         writes = 0;
     }
 
@@ -99,9 +103,10 @@ final class CountingJoinStores implements JoinStores {
     }
 
     @Override
-    public void putDimensionRow(String source, String dimensionKey, Map<String, Object> row) {
+    public Map<String, Object> putDimensionRow(String source, String dimensionKey,
+            Map<String, Object> row) {
         writes++;
-        held.putDimensionRow(source, dimensionKey, row);
+        return held.putDimensionRow(source, dimensionKey, row);
     }
 
     @Override
@@ -112,6 +117,7 @@ final class CountingJoinStores implements JoinStores {
 
     @Override
     public int indexPageCount(String source, String dimensionKey) {
+        pageCountReads++;
         return held.indexPageCount(source, dimensionKey);
     }
 

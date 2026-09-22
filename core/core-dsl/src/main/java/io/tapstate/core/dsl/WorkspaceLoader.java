@@ -17,7 +17,7 @@ import java.util.stream.Stream;
  * attributing any per-file parse error to its source filename ({@link DslException#source()}) —
  * then builds and validates the batch via {@link Workspace#of} (duplicate-id + reference closure)
  * and the connector capability matrix via {@link CapabilityRules} (plan C3). The closure is the
- * directory itself: the offline projection of the artifact store (ADR-0021 §3).
+ * directory itself: the offline projection of the artifact store.
  */
 public final class WorkspaceLoader {
 
@@ -37,7 +37,7 @@ public final class WorkspaceLoader {
     /**
      * Loads {@code dir} as one workspace batch; throws {@link DslException} on the first violation.
      * The capability-matrix tier (mode × connector, config type / enum) is judged against
-     * {@code catalog} — the offline bundled ∪ cache projection (ADR-0019 §3.3).
+     * {@code catalog} — the offline bundled ∪ cache projection.
      */
     public static Workspace load(Path dir, TapstateCatalog catalog) {
         DslParser parser = new DslParser();

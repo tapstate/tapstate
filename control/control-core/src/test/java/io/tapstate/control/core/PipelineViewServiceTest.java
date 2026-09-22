@@ -15,8 +15,10 @@ import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -127,6 +129,18 @@ class PipelineViewServiceTest {
     }
 
     @Test
+    void listKeepsReadablePipelinesAvailableWhenAStoredArtifactIsUnreadable() {
+        ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
+        store.seed(source("orders", "Orders", "mysql"));
+        store.seed(pipeline("daily", List.of("orders")));
+        store.seedUnreadable("corrupt", "pipeline", "not: [valid");
+        PipelineViewService pipelines = new PipelineViewService(
+                new ArtifactQueryService(store), new PipelineRepresentation());
+
+        assertThat(pipelines.list()).extracting(PipelineView::id).containsExactly("daily");
+    }
+
+    @Test
     void savesEditorLayoutWithoutChangingThePipelineArtifactOrAcceptingAnUnknownPipeline() {
         ReadOnlyArtifactStore artifacts = new ReadOnlyArtifactStore();
         artifacts.seed(source("orders", "Orders", "mysql"));
@@ -165,7 +179,6 @@ class PipelineViewServiceTest {
                 null,
                 null,
                 null,
-                null,
                 null);
     }
 
@@ -178,9 +191,14 @@ class PipelineViewServiceTest {
     private static final class ReadOnlyArtifactStore implements ArtifactStore {
 
         private final Map<String, Resource> resources = new LinkedHashMap<>();
+        private final List<StoredArtifactRecord> unreadable = new ArrayList<>();
 
         void seed(Resource resource) {
             resources.put(resource.id(), resource);
+        }
+
+        void seedUnreadable(String id, String kind, String canonicalForm) {
+            unreadable.add(new StoredArtifactRecord(id, kind, canonicalForm, null, false));
         }
 
         @Override
@@ -215,7 +233,17 @@ class PipelineViewServiceTest {
 
         @Override
         public List<Resource> list() {
+            unreadable.forEach(row -> new io.tapstate.core.dsl.DslParser().parse(row.canonicalForm()));
             return List.copyOf(resources.values());
+        }
+
+        @Override
+        public List<StoredArtifactRecord> listStored() {
+            List<StoredArtifactRecord> rows = resources.values().stream()
+                    .map(StoredArtifactRecord::of)
+                    .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+            rows.addAll(unreadable);
+            return List.copyOf(rows);
         }
     }
 

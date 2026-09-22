@@ -6,7 +6,7 @@ import io.tapstate.core.common.Severity;
 import java.util.Set;
 
 /**
- * The {@code cli} domain's error codes (ADR-0024 D1) — surface-layer diagnosables that are not DSL
+ * The {@code cli} domain's error codes — surface-layer diagnosables that are not DSL
  * semantics: the scaffolding wizard's refusals and bad-input conditions. Thrown as a base
  * {@link io.tapstate.core.common.TapstateException} (no DSL source position) and rendered through the
  * message catalog like any other coded diagnostic.
@@ -36,6 +36,22 @@ enum CliError implements TapstateErrorCode {
     WORKSPACE_NOT_WRITABLE("cli.workspace-not-writable", Set.of("path", Names.REASON)),
 
     /**
+     * A workspace {@code up} was asked to bring up could not be read; {@code path} is the workspace and
+     * {@code reason} is what the filesystem said - typically the directory or file under it that refused.
+     * Its own code rather than the write one above: the two ask for opposite fixes (grant reading,
+     * grant writing), and a reader who is told "could not write" about a command that writes nothing
+     * goes looking in the wrong place.
+     */
+    WORKSPACE_UNREADABLE("cli.workspace-unreadable", Set.of("path", Names.REASON)),
+
+    /**
+     * A workspace {@code up} was asked to bring up holds no pipeline, so there is nothing to start;
+     * {@code path} is the workspace. A refusal rather than a quiet no-op: an empty or half-written
+     * workspace is the state a first run most often gets stuck in, and the way out is a scaffold.
+     */
+    WORKSPACE_HAS_NO_PIPELINE("cli.workspace-has-no-pipeline", Set.of("path")),
+
+    /**
      * The optional {@code tap} shortcut cannot be managed because that name belongs to something else;
      * {@code path} is where it sits. Refused rather than replaced or deleted: the name is a working
      * command on that machine, and a convenience shortcut does not get to remove one.
@@ -56,6 +72,38 @@ enum CliError implements TapstateErrorCode {
      */
     ALIAS_LINK_FAILED("cli.alias-link-failed", Set.of("path", Names.REASON)),
 
+    /**
+     * The local development stack the guided first run starts in Docker could not be started, or was
+     * started and never answered; {@code reason} says which - no {@code docker} on the PATH, no Compose
+     * plugin, what {@code docker compose} said, or where the stack is and how to stop it when it came
+     * up and stayed silent. One code for the whole route rather than one per step: what a reader does
+     * about any of them is the same - fix Docker, or point the workspace at a server they already run.
+     */
+    DOCKER_UNAVAILABLE("cli.docker-unavailable", Set.of(Names.REASON)),
+
+    /**
+     * {@code up} was asked to bring up a workspace that names no server, with nobody to ask which one;
+     * {@code server} is the default it declined to assume. Refused rather than defaulted: adopting the
+     * loopback address would bind a script to whatever happens to be listening on that machine, which
+     * is a different server on every machine the script runs on.
+     */
+    SERVER_NOT_NAMED("cli.server-not-named", Set.of("server")),
+
+    /**
+     * Signing in to {@code server} needs a password that was neither asked for nor supplied;
+     * {@code variable} names the environment variable a script puts it in. Its own code rather than a
+     * login refusal: nothing was sent, so the credential was never wrong - it was never given.
+     */
+    PASSWORD_REQUIRED("cli.password-required", Set.of("server", "variable")),
+
+    /**
+     * Signing in to {@code server} while binding a workspace returned nothing that can be kept: the
+     * server could not be reached for the login, or answered without a persistent session this release
+     * can use. Names the server rather than a context, because a binding that fails here has settled a
+     * context name without writing it - naming it would point at an entry no later command can find.
+     */
+    SIGN_IN_UNUSABLE("cli.sign-in-unusable", Set.of("server")),
+
     /** A connector id supplied to the wizard that is not in the bundled catalog. */
     UNKNOWN_CONNECTOR("cli.unknown-connector", Set.of("connector")),
 
@@ -67,6 +115,9 @@ enum CliError implements TapstateErrorCode {
      * instead of leaving it to be guessed.
      */
     CONNECTOR_NOT_OFFICIAL("cli.connector-not-official", Set.of("connector", "official")),
+
+    /** A published connector id could not be fetched as a complete jar before registration. */
+    CONNECTOR_DOWNLOAD_FAILED("cli.connector-download-failed", Set.of("connector", Names.REASON)),
 
     /** A workspace artifact sits in a directory whose name does not match its declared kind. */
     KIND_DIR_MISMATCH("cli.kind-dir-mismatch", Set.of("path", "kind", "dir")),

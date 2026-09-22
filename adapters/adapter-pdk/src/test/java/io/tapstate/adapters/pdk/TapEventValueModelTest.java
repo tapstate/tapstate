@@ -4,6 +4,7 @@ import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapdata.entity.codec.TapCodecsRegistry;
+import io.tapdata.entity.codec.ToTapValueCodec;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
 import io.tapdata.entity.schema.value.ByteData;
@@ -28,6 +29,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import java.lang.reflect.InvocationTargetException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.file.Path;
@@ -39,6 +41,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Pins what a decoded row actually holds, as opposed to which field lands where (that is the golden's
@@ -381,10 +384,13 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void aCarriedValueInsideADocumentTheSchemaDoesNotNameReachesTheTargetAsItsPortableValue() {
+    void aFieldInsideADocumentIsNeverRebuiltAsWhateverTheDocumentItselfIsDeclaredToBe() {
         // The column is named, its interior is not - which is what discovery reports for a document
-        // nobody sampled to that depth. Lending the interior the column's own declared name would
-        // rebuild it as whatever the column is, so the absence is honoured rather than filled in.
+        // nobody sampled to that depth - and the column is declared the very type its interior holds,
+        // so the document's own declared name is the only name in the row. Lending it down would
+        // rebuild every field of the document as whatever the document is declared to be and report
+        // success, which is worse than the portable value. Nothing else here names this driver type,
+        // so the interior has no answer of its own and stays portable.
         Envelope decoded = insert(row("doc", new LinkedHashMap<>(Map.of("ref", new DriverKey("64f0c0de")))),
                 CODECS, Map.of("doc", KEY_COLUMN));
 
@@ -394,16 +400,392 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void aCarriedValueInsideAnArrayReachesTheTargetAsItsPortableValue() {
-        // An array is named as an array and its elements are not named at all, so an element has no
-        // path of its own to look up. Pinned rather than left to be found: the way in converts these
-        // as readily as it converts a document's fields, and only the way out stops short.
+    void aFieldTheSchemaNeverDescribedIsRestoredLikeAnArrayElementBesideIt() {
+        // One document, one driver type, three places: a column the schema names, a field inside a
+        // document it names nothing beneath, and an array element it has no way to name. Read beneath
+        // arrays only, this row decodes two ways - the element restored, the field beside it holding
+        // that very value arriving as the text it travelled as, with the better-described place
+        // getting the worse answer. A field map naming `meta` and nothing under it is the fields
+        // discovery met in the documents it sampled, not a statement that `meta.ref` has no type, so
+        // that absence is read the same way the element's is.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("_id", key, "meta", new LinkedHashMap<>(Map.of("ref", key)), "refs", List.of(key)),
+                CODECS,
+                Map.of("_id", KEY_COLUMN, "meta", "DOCUMENT", "refs", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("meta"))
+                .as("the field whose place the schema never described")
+                .isEqualTo(Map.of("ref", key));
+        assertThat(encoded.getAfter().get("refs"))
+                .as("the element beside it, which gets the same answer")
+                .isEqualTo(List.of(key));
+    }
+
+    @Test
+    void aColumnTheSchemaNeverDescribedIsRestoredTheSameWay() {
+        // The same absence one level up. A field that first appeared after discovery sampled the
+        // collection has no row in the field map either, and a schemaless source produces those
+        // routinely; the declared name that does reach this driver type is read for it too, so the
+        // column lands as the driver's own type rather than as its text.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(row("_id", key, "parent", key), CODECS, Map.of("_id", KEY_COLUMN));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("parent")).isEqualTo(key);
+    }
+
+    @Test
+    void anArrayElementIsNeverRebuiltAsWhateverTheArrayItselfIsDeclaredToBe() {
+        // The array column is declared the very type its element is, and the row holds that type
+        // nowhere else - so the array's own declared name is the only name on offer. Lending it to the
+        // element would rebuild every element as whatever the array is declared to be and report
+        // success, which is a worse answer than the portable value, so the element stays portable.
         Envelope decoded = insert(row("refs", List.of(new DriverKey("64f0c0de"))),
                 CODECS, Map.of("refs", KEY_COLUMN));
 
         TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
 
         assertThat(encoded.getAfter().get("refs")).isEqualTo(List.of("64f0c0de"));
+    }
+
+    @Test
+    void aCarriedValueInsideAnArrayIsRestoredLikeTheSameValueInsideADocument() {
+        // The measured document, both halves in one row and one run: the same driver value inside a
+        // document and inside an array, under the schema a real source reports for it - a dotted path
+        // for the field inside the document, the array named as an array, and nothing named beneath it.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("meta", new LinkedHashMap<>(Map.of("ref", key)), "arr", List.of(key)),
+                CODECS,
+                Map.of("meta.ref", KEY_COLUMN, "meta", "DOCUMENT", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("meta"))
+                .as("the half the schema names, which the way back already restores")
+                .isEqualTo(Map.of("ref", key));
+        // The array half is what a target of the same kind stored wrongly before this reading existed:
+        // the element arrived as the text it travelled as, the row landed, and the write reported
+        // success. The array's own declared name cannot close that - it is declared an array here, and
+        // rebuilding an element as whatever the array is declared to be would be a different defect
+        // that also reported success. What restores it is the name this same schema gives that driver
+        // type at the one place it does name one: the dotted path asserted above.
+        assertThat(encoded.getAfter().get("arr"))
+                .as("the same value inside an array, restored from what the schema calls that type")
+                .isEqualTo(List.of(key));
+    }
+
+    @Test
+    void anArrayElementIsRestoredWhicheverOrderTheConnectorReportedTheRowIn() {
+        // The same row with the array reported first. What the schema calls this driver type is read
+        // off the whole row before any value is converted, so the answer cannot depend on field order -
+        // read as the walk went, this row would restore nothing and the one above would restore, and a
+        // document would decode two ways for no reason a reader could see.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("arr", List.of(key), "meta", new LinkedHashMap<>(Map.of("ref", key))),
+                CODECS,
+                Map.of("meta.ref", KEY_COLUMN, "meta", "DOCUMENT", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("arr")).isEqualTo(List.of(key));
+    }
+
+    @Test
+    void aCarriedValueInsideADocumentInsideAnArrayIsRestoredTheSameWay() {
+        // Below an element there is no place the schema could name either, so the same reading answers
+        // all the way down rather than stopping at the element itself.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("meta", new LinkedHashMap<>(Map.of("ref", key)),
+                        "arr", List.of(new LinkedHashMap<>(Map.of("ref", key)))),
+                CODECS,
+                Map.of("meta.ref", KEY_COLUMN, "meta", "DOCUMENT", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("arr")).isEqualTo(List.of(Map.of("ref", key)));
+    }
+
+    @Test
+    void bothImagesOfOneUpdateRestoreItsArrayTheSameWay() {
+        // A before image the connector reported without the column that names this driver type, beside
+        // an after image that has it - which a connector is free to do, and several do. Read per image,
+        // the half that carries the name would restore and the half that does not would not, so one
+        // change would say an array changed when nothing in it did.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = TapEventCodec.decodeChange(
+                TapUpdateRecordEvent.create().table("orders").referenceTime(1000L)
+                        .before(row("arr", List.of(key)))
+                        .after(row("_id", key, "arr", List.of(key))),
+                CODECS,
+                Map.of("_id", KEY_COLUMN, "arr", "ARRAY"));
+
+        TapUpdateRecordEvent encoded = (TapUpdateRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getBefore().get("arr"))
+                .as("the array on the side the naming column is missing from")
+                .isEqualTo(encoded.getAfter().get("arr"))
+                .isEqualTo(List.of(key));
+    }
+
+    @Test
+    void aDriverTypeTheSchemaSpellsTwoWaysLeavesItsArrayElementsAlone() {
+        // Two named columns of one driver type, declared differently - which a schema is free to do -
+        // and this change holds a value under each, which is what makes the disagreement visible here.
+        // There is then no single answer to what this source calls that type, and picking either
+        // spelling would rebuild every element as one of them and report success. The case below is
+        // the same schema with only one of the two columns in the change, which is not this case.
+        DriverKey key = new DriverKey("64f0c0de");
+        Envelope decoded = insert(
+                row("id", key, "ref", key, "arr", List.of(key)),
+                CODECS,
+                Map.of("id", KEY_COLUMN, "ref", "OTHER_KEY", "arr", "ARRAY"));
+
+        TapInsertRecordEvent encoded = (TapInsertRecordEvent) TapEventCodec.encode(decoded, CODECS);
+
+        assertThat(encoded.getAfter().get("arr"))
+                .as("the element, which has no name of its own and now no unambiguous type either")
+                .isEqualTo(List.of("64f0c0de"));
+        // The named halves are untouched by the ambiguity: each is looked up by its own place.
+        assertThat(encoded.getAfter().get("id")).isEqualTo(key);
+        assertThat(encoded.getAfter().get("ref")).isEqualTo("64f0c0de");
+    }
+
+    @Test
+    void anAmbiguousSchemaOnlyRefusesTheChangesThatActuallyShowTheAmbiguity() {
+        // The same two-way schema as above, and a change that carries only one of the two columns -
+        // which is the ordinary shape of a sparse field, so it is the common case rather than the
+        // corner one. The reading is taken off the change: a column that is not in it, or is null in
+        // it, attaches its name to no class and so contradicts nothing, and the element is restored
+        // from the one spelling on offer. Pinned because the refusal reads as an absolute and is not
+        // one - nothing in a field map says which declared name belongs to which driver class until a
+        // value arrives holding the two together, so no reading of the schema alone could do better.
+        DriverKey key = new DriverKey("64f0c0de");
+
+        Envelope missing = insert(
+                row("id", key, "arr", List.of(key)),
+                CODECS,
+                Map.of("id", KEY_COLUMN, "ref", "OTHER_KEY", "arr", "ARRAY"));
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(missing, CODECS)).getAfter().get("arr"))
+                .as("the second spelling's column is not in this change, so it contradicts nothing")
+                .isEqualTo(List.of(key));
+
+        Map<String, Object> withNull = row("id", key, "arr", List.of(key));
+        withNull.put("ref", null);
+        Envelope nulled = insert(withNull, CODECS,
+                Map.of("id", KEY_COLUMN, "ref", "OTHER_KEY", "arr", "ARRAY"));
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(nulled, CODECS)).getAfter().get("arr"))
+                .as("present but null names no class either, which is the same answer")
+                .isEqualTo(List.of(key));
+    }
+
+    @Test
+    void oneCollectionLandsBothWaysWhereTheColumnThatNamesTheTypeIsNullable() {
+        // One schema, one collection, two documents that differ only in whether the nullable column
+        // naming this driver type is populated. The reading is taken off the document's own values, so
+        // the one that carries the name restores its array and the one that does not leaves its
+        // elements portable: the same collection landing both ways, in the same run and the same
+        // pipeline. That is the ordinary case rather than a corner of it - a nullable column of a
+        // driver type is ordinary - so it is pinned here rather than left to be discovered in a target.
+        //
+        // Pinned rather than closed, because no reading of the schema alone can do better. A field map
+        // says what a column is called and never which driver class that name belongs to; the registry
+        // is keyed by class and carries no name. Only a value ties the two together, so the tie cannot
+        // be worked out per table before the values arrive.
+        //
+        // Carrying the tie across documents instead - learning it from one and keeping it for the rest
+        // of the table - would trade this for something worse. A document would then decode by what the
+        // stream happened to deliver before it: the same document restored on one run and left portable
+        // on the next after a resume from a different position, a snapshot and its change stream
+        // disagreeing, and values already written to the target unable to be taken back when a second
+        // spelling turned up later and withdrew the name. None of that is visible in the target. Taken
+        // per document, the answer is a function of that document alone - whatever it is, it is the
+        // same every time that document is read, which is the property a reader can act on.
+        DriverKey key = new DriverKey("64f0c0de");
+        Map<String, String> schema = Map.of("cover", KEY_COLUMN, "thumbs", "ARRAY");
+
+        Envelope carried = insert(row("cover", key, "thumbs", List.of(key)), CODECS, schema);
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(carried, CODECS)).getAfter().get("thumbs"))
+                .as("the document that carries the naming column restores its elements")
+                .isEqualTo(List.of(key));
+
+        Map<String, Object> withoutCover = row("thumbs", List.of(key));
+        withoutCover.put("cover", null);
+        Envelope nulled = insert(withoutCover, CODECS, schema);
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(nulled, CODECS)).getAfter().get("thumbs"))
+                .as("the same array in the same collection, portable where that column is null")
+                .isEqualTo(List.of("64f0c0de"));
+    }
+
+    @Test
+    void aLaterUpdateOfOneRowRewritesTheArrayItsSnapshotRestored() {
+        // The same row twice: the snapshot, which carries every column, and a later change that touches
+        // only the array. A change stream reports the key plus what changed, so neither image of that
+        // change holds the column naming this driver type - and the reading is taken off the change, so
+        // there is nothing to take. The elements travel as text, and a write into a keyed target sets
+        // the fields it is given, so that text lands over the values the snapshot already restored. The
+        // write reports success and the target shows the text: the same field is the driver's type
+        // after the snapshot and text after the update, in one table and one run.
+        //
+        // Pinned rather than closed, because the only readings that could answer here are the two the
+        // per-document case above already weighs and rejects. Keeping the tie from an earlier change
+        // makes a row decode by whatever the stream happened to deliver before it, so a resume from
+        // another position silently changes the answer and nothing in the target shows it. Refusing to
+        // write an element the reading cannot name turns a value the target can hold into a dropped
+        // field or a failed row. A visibly wrong type in the target is the better of the three.
+        DriverKey key = new DriverKey("64f0c0de");
+        DriverKey added = new DriverKey("64f0c0df");
+        Map<String, String> schema = Map.of("_id", "STRING", "cover", KEY_COLUMN, "thumbs", "ARRAY");
+
+        Envelope snapshot = TapEventCodec.decodeSnapshotRow(
+                TapInsertRecordEvent.create().table("albums").referenceTime(1000L)
+                        .after(row("_id", "album-1", "cover", key, "thumbs", List.of(key))),
+                CODECS, schema);
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(snapshot, CODECS)).getAfter().get("thumbs"))
+                .as("the snapshot carries the naming column, so the target stores the driver's type")
+                .isEqualTo(List.of(key));
+
+        Envelope update = TapEventCodec.decodeChange(
+                TapUpdateRecordEvent.create().table("albums").referenceTime(2000L)
+                        .before(row("_id", "album-1", "thumbs", List.of(key)))
+                        .after(row("_id", "album-1", "thumbs", List.of(key, added))),
+                CODECS, schema);
+
+        TapUpdateRecordEvent encoded = (TapUpdateRecordEvent) TapEventCodec.encode(update, CODECS);
+
+        assertThat(encoded.getAfter().get("thumbs"))
+                .as("neither image names that type, so the same array is written back as text")
+                .isEqualTo(List.of("64f0c0de", "64f0c0df"));
+        assertThat(encoded.getBefore().get("thumbs"))
+                .as("both halves of the change agree, which is what the one reading over two images buys")
+                .isEqualTo(List.of("64f0c0de"));
+    }
+
+    @Test
+    void aRowTheSchemaNamesThroughoutIsNotWalkedASecondTime() {
+        // What this source calls a driver type is only ever asked for where the schema names no place,
+        // so a row it names throughout has no use for the answer - and that is most rows on the hottest
+        // path this adapter has, walked once per change and twice per update. Measured by counting the
+        // conversion lookups one driver type takes: one, the walk's own. Taken up front instead, the
+        // reading would walk this row a second time and look that same type up again, for an answer
+        // nothing here ever asks for.
+        CountingCodecs codecs = countingCodecs();
+
+        Envelope decoded = insert(row("stamp", new DriverStamp(7), "qty", 5), codecs,
+                Map.of("stamp", "STAMP", "qty", "INT64"));
+
+        assertThat(decoded.after().get("qty")).as("the row decodes as it always did").isEqualTo(5L);
+        assertThat(codecs.lookupsOf(DriverStamp.class))
+                .as("the walk's own lookup, with no reading taken on top of it")
+                .isEqualTo(1);
+    }
+
+    @Test
+    void theReadingIsTakenOnceHoweverManyValuesTheSchemaNamesNoPlaceFor() {
+        // Three array elements, none of which the schema names a place for, so each of them asks. The
+        // answer is taken off the whole change either way, so it is taken on the first ask and kept:
+        // the named column's own type is looked up once more, not once per element.
+        DriverKey key = new DriverKey("64f0c0de");
+        CountingCodecs codecs = countingCodecs();
+
+        Envelope decoded = insert(
+                row("id", key, "stamp", new DriverStamp(7), "arr", List.of(key, key, key)),
+                codecs,
+                Map.of("id", KEY_COLUMN, "stamp", "STAMP", "arr", "ARRAY"));
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(decoded, codecs)).getAfter().get("arr"))
+                .as("the reading ran and answered, which is what makes the count below mean anything")
+                .isEqualTo(List.of(key, key, key));
+        assertThat(codecs.lookupsOf(DriverStamp.class))
+                .as("the walk's own lookup plus one reading, whatever the number of elements asking")
+                .isEqualTo(2);
+    }
+
+    @Test
+    void anArrayOfValuesNoConversionIsRegisteredForTakesNoReadingAtAll() {
+        // Only a class the connector registered a conversion for can ever be in the reading, so an
+        // element of any other kind is answered without taking one. This is the ordinary array - plain
+        // text, numbers - and it asks on every element, the schema naming no place that reaches one.
+        // Answering those off the reading instead would walk the whole change a second time to be told
+        // nothing, on the hottest path this adapter has.
+        CountingCodecs codecs = countingCodecs();
+
+        Envelope decoded = insert(
+                row("stamp", new DriverStamp(7), "tags", List.of("red", "blue"), "sizes", List.of(1, 2)),
+                codecs,
+                Map.of("stamp", "STAMP", "tags", "ARRAY", "sizes", "ARRAY"));
+
+        assertThat(((TapInsertRecordEvent) TapEventCodec.encode(decoded, codecs)).getAfter())
+                .as("the arrays decode as they always did, which is what makes the count below mean anything")
+                .containsEntry("tags", List.of("red", "blue"))
+                .containsEntry("sizes", List.of(1L, 2L));
+        assertThat(codecs.lookupsOf(DriverStamp.class))
+                .as("the walk's own lookup, with no reading taken on top of it")
+                .isEqualTo(1);
+    }
+
+    @Test
+    void aValueIsLookedUpOnceHoweverManyQuestionsItsOwnClassAnswers() {
+        // One reading of the registry settles both things a value's own class settles here: whether the
+        // connector converts it at all, and - where the schema names no place - whether the type
+        // reading has anything to say about it. Asked as two, every element of an ordinary array paid
+        // for a second lookup only to be told what the first already knew, on the one path this whole
+        // guard exists to keep cheap.
+        CountingCodecs codecs = countingCodecs();
+
+        Envelope decoded = insert(
+                row("tags", List.of("red", "blue", "green")), codecs, Map.of("tags", "ARRAY"));
+
+        assertThat(decoded.after().get("tags"))
+                .as("the array decodes as it always did, which is what makes the count below mean anything")
+                .isEqualTo(List.of("red", "blue", "green"));
+        assertThat(codecs.lookupsOf(String.class))
+                .as("one lookup per element, not one per element per question")
+                .isEqualTo(3);
+    }
+
+    /**
+     * The same registrations the cases above run against, counting what the decode asks it - which is
+     * the one thing that says how many times a row was walked, since a walk cannot reach a value
+     * without asking whether the connector converts its type.
+     */
+    private static final class CountingCodecs extends TapCodecsRegistry {
+
+        private final Map<Class<?>, Integer> lookups = new LinkedHashMap<>();
+
+        @Override
+        public ToTapValueCodec<?> getCustomToTapValueCodec(Class<?> clazz) {
+            lookups.merge(clazz, 1, Integer::sum);
+            return super.getCustomToTapValueCodec(clazz);
+        }
+
+        int lookupsOf(Class<?> type) {
+            return lookups.getOrDefault(type, 0);
+        }
+    }
+
+    private static CountingCodecs countingCodecs() {
+        CountingCodecs codecs = new CountingCodecs();
+        codecs.registerToTapValue(DriverKey.class, (value, tapType) ->
+                new TapStringValue(((DriverKey) value).hex()));
+        codecs.registerToTapValue(DriverStamp.class, (value, tapType) ->
+                new TapStringValue(Long.toString(((DriverStamp) value).seconds())));
+        codecs.registerFromTapValue(TapStringValue.class, tapValue ->
+                KEY_COLUMN.equals(tapValue.getOriginType())
+                        ? new DriverKey(tapValue.getValue())
+                        : tapValue.getValue());
+        return codecs;
     }
 
     @Test
@@ -587,40 +969,130 @@ class TapEventValueModelTest {
     }
 
     @Test
-    void anExactDecimalLosesDigitsBecauseTheConnectorsConversionGoesThroughADouble() {
+    void aDecimal128ColumnKeepsEverySignificantDigit() {
         Decimal128 exact = Decimal128.parse("1234567890.123456789012345678901234");
 
+        Object withoutTheRegisteredConversion =
+                insert(row("v", exact), mongoCodecs(Set.of(Decimal128.class))).after().get("v");
         Object decoded = decodedByMongo(exact);
 
-        // Applying the connector's conversion is the decision, and this is what it costs on this
-        // column: 34 significant digits through a double. Left alone the value is exact, so the loss
-        // is this project's to own even though the conversion is not. Pinned rather than tolerated -
-        // the day the upstream conversion is fixed, this case goes red and says so.
-        assertThat(decoded).isInstanceOf(ConvertedValue.class);
-        Object value = ((ConvertedValue) decoded).value();
-        assertThat(value).isInstanceOf(Double.class);
-        assertThat(new java.math.BigDecimal(value.toString())).isNotEqualByComparingTo(exact.bigDecimalValue());
-        // What is missing is a way back: the one the write side runs is keyed on the portable form, and
-        // this connector registers none from a number, so a target of the same kind is handed the double
-        // anyway. The exact value is not on the row to fall back on either - nothing driver-owned
-        // travels, because a second connector could not read it.
-        assertThat(((ConvertedValue) decoded).originType()).isNull();
+        assertThat(withoutTheRegisteredConversion)
+                .as("the same driver value when no Decimal128 conversion is registered")
+                .isSameAs(exact);
+        // Assert the value rather than a chosen repair representation. The read path may keep the
+        // driver's exact number or carry another exact numeric form, but it must not make a distinct
+        // database value indistinguishable by first narrowing it to a binary floating point number.
+        Object value = decoded instanceof ConvertedValue converted ? converted.value() : decoded;
+        BigDecimal carried = switch (value) {
+            case Decimal128 decimal -> decimal.bigDecimalValue();
+            case BigDecimal decimal -> decimal;
+            case Number number -> new BigDecimal(number.toString());
+            default -> throw new AssertionError("the decimal column arrived as " + value.getClass().getName());
+        };
+        assertThat(carried).isEqualTo(exact.bigDecimalValue());
     }
 
     @Test
-    void aTimestampReadsAsTheWrongInstantBecauseTheConnectorsConversionTakesSecondsForMillis() {
+    void aDecimal128ConversionThatDoesNotUseADoubleWinsUnchanged() {
+        Decimal128 exact = Decimal128.parse("1234567890.123456789012345678901234");
+        TapCodecsRegistry corrected = new TapCodecsRegistry()
+                .registerToTapValue(Decimal128.class,
+                        (value, tapType) -> new TapStringValue(((Decimal128) value).toString()));
+
+        Object decoded = insert(row("v", exact), corrected).after().get("v");
+
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value()).isEqualTo(exact.toString());
+    }
+
+    @Test
+    void aDecimal128SpecialValueKeepsTheConnectorsPortableValue() {
+        Object decoded = decodedByMongo(Decimal128.NaN);
+
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value())
+                .isInstanceOf(Double.class)
+                .matches(value -> ((Double) value).isNaN());
+    }
+
+    @Test
+    void aDecimal128NegativeZeroKeepsTheConnectorsPortableValue() {
+        Object decoded = decodedByMongo(Decimal128.NEGATIVE_ZERO);
+
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value())
+                .isInstanceOf(Double.class)
+                .isEqualTo(-0.0d);
+    }
+
+    @Test
+    void aDecimal128TypeWithoutTheRequiredAccessorsCrashesAsAProgrammerError() throws Exception {
+        var decimal = TapEventCodec.class.getDeclaredMethod("decimal128Value", Object.class);
+        decimal.setAccessible(true);
+
+        assertThatThrownBy(() -> decimal.invoke(null, new Object()))
+                .isInstanceOf(InvocationTargetException.class)
+                .cause()
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("mongodb decimal128 has no exact-value accessor")
+                .hasCauseInstanceOf(NoSuchMethodException.class);
+    }
+
+    @Test
+    void aTimestampReadsFromEpochSecondsDespiteTheConnectorsMillisecondsConversion() {
         // 2026-01-01T00:00:00Z, as a mongodb timestamp: seconds in the high half, a counter in the low.
         BsonTimestamp stamp = new BsonTimestamp(1_767_225_600, 7);
 
         Object decoded = decodedByMongo(stamp);
 
-        // The same decision as the decimal above, with a worse shape: not a loss of precision but a
-        // wrong value, off by a factor of a thousand, and the counter dropped entirely. Left alone the
-        // value is right. Pinned for the same reason - a fix upstream reddens this and nothing else.
+        // A timestamp's time half is seconds since the epoch. Treating it as milliseconds moves this
+        // 2026 value into January 1970 and silently leaves a plausible but wrong instant on the row.
         assertThat(decoded).isInstanceOf(ConvertedValue.class);
         Object instant = ((ConvertedValue) decoded).value();
         assertThat(instant).isInstanceOf(DateTime.class);
-        assertThat(((DateTime) instant).toInstant()).isEqualTo(Instant.ofEpochMilli(1_767_225_600L));
+        assertThat(((DateTime) instant).toInstant()).isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
+    }
+
+    @Test
+    void anAlreadyCorrectTimestampConversionIsNotAdjustedAgain() {
+        TapCodecsRegistry corrected = new TapCodecsRegistry();
+        corrected.registerToTapValue(BsonTimestamp.class, (value, tapType) -> {
+            long seconds = Integer.toUnsignedLong(((BsonTimestamp) value).getTime());
+            return new TapDateTimeValue(new DateTime(Instant.ofEpochSecond(seconds)));
+        });
+
+        Object decoded = insert(row("v", new BsonTimestamp(1_767_225_600, 7)), corrected).after().get("v");
+
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value())
+                .isInstanceOf(DateTime.class)
+                .extracting(value -> ((DateTime) value).toInstant())
+                .isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
+    }
+
+    @Test
+    void aTimestampConversionToAnotherPortableTypeIsLeftAlone() {
+        TapCodecsRegistry textual = new TapCodecsRegistry();
+        textual.registerToTapValue(BsonTimestamp.class,
+                (value, tapType) -> new TapStringValue("timestamp:" + ((BsonTimestamp) value).getValue()));
+
+        Object decoded = insert(row("v", new BsonTimestamp(1_767_225_600, 7)), textual).after().get("v");
+
+        assertThat(decoded).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) decoded).value()).isEqualTo("timestamp:7590176156653977607");
+    }
+
+    @Test
+    void aTimestampTypeWithoutTheRequiredAccessorCrashesAsAProgrammerError() throws Exception {
+        var seconds = TapEventCodec.class.getDeclaredMethod("bsonTimestampSeconds", Object.class);
+        seconds.setAccessible(true);
+
+        assertThatThrownBy(() -> seconds.invoke(null, new Object()))
+                .isInstanceOf(InvocationTargetException.class)
+                .cause()
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("mongodb timestamp has no time accessor")
+                .hasCauseInstanceOf(NoSuchMethodException.class);
     }
 
     @Test

@@ -8,6 +8,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -40,26 +41,131 @@ final class RealProcessServer implements ServerHandle {
 
     /** Launches the deliverable and returns once its health probe answers. */
     static RealProcessServer start(String storeUri) {
-        Path jar = bootJar();
+        return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
+    }
+
+    /** Launches this build with additional command-line settings owned by one focused witness. */
+    static RealProcessServer start(String storeUri, List<String> additionalArguments) {
+        return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), additionalArguments);
+    }
+
+    /** Launches the deliverable with an explicit operator-state database. */
+    static RealProcessServer start(String storeUri, String operatorStateDatabase) {
+        return start(storeUri, operatorStateDatabase, bootJar());
+    }
+
+    /**
+     * The same, for a build of the product that is not the one this reactor made.
+     *
+     * <p>Only one witness needs this, and it needs it structurally: the reactor builds this build and
+     * nothing else, so a case whose subject is what an <em>older</em> binary does when handed a store
+     * this build has migrated cannot get its subject from here. The jar is built beside the run and
+     * named to it.
+     */
+    static RealProcessServer start(String storeUri, Path jar) {
+        return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);
+    }
+
+    private static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar) {
+        return start(storeUri, operatorStateDatabase, jar, List.of());
+    }
+
+    private static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
+            List<String> additionalArguments) {
+        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, additionalArguments);
+        try {
+            awaitHealthy(server.process, server.baseUrl, server.output);
+        } catch (RuntimeException | AssertionError e) {
+            server.process.destroyForcibly();
+            throw e;
+        }
+        return server;
+    }
+
+    /**
+     * Launches the deliverable and returns straight away, without waiting for it to serve.
+     *
+     * <p>For a witness whose subject is something the server does on the way up. Waiting for health
+     * would mean waiting for the very thing such a witness means to interrupt, and the interruption
+     * would then always land after the work rather than inside it.
+     */
+    static RealProcessServer launching(String storeUri) {
+        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar());
+    }
+
+    /** The same, launching the jar named rather than the one this reactor built. See {@link #start(String, Path)}. */
+    static RealProcessServer launching(String storeUri, Path jar) {
+        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);
+    }
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar) {
+        return launching(storeUri, operatorStateDatabase, jar, List.of());
+    }
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            List<String> additionalArguments) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
         URI baseUrl = URI.create("http://127.0.0.1:" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
-        Process process = launch(jar, port, storeUri, workingDirectory, output);
-        try {
-            awaitHealthy(process, baseUrl, output);
-        } catch (RuntimeException | AssertionError e) {
-            process.destroyForcibly();
-            throw e;
-        }
+        Process process = launch(jar, port, storeUri, operatorStateDatabase, workingDirectory, output,
+                additionalArguments);
         return new RealProcessServer(process, baseUrl, output);
+    }
+
+    /**
+     * Ends the process the way losing power ends it: no signal it can handle, nothing of its own run
+     * on the way out.
+     *
+     * <p>{@link #close()} asks the process to stop and gives it time to, which is what a witness of
+     * ordinary shutdown wants. A witness of a crash wants the opposite, and the difference is not
+     * cosmetic: a process shut down politely gets to finish what it was doing, which is precisely the
+     * state a crash witness needs it never to reach.
+     */
+    void kill() {
+        process.destroyForcibly();
+        try {
+            process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting for the killed server to go away", e);
+        }
     }
 
     @Override
     public URI baseUrl() {
         return baseUrl;
+    }
+
+    /**
+     * Where this launch wrote what it said. Some claims are only about a member's own start - which of
+     * two members did a piece of one-time work, and how often - and the store records how far that work
+     * got rather than who did it, so the account the server gave of itself is the only place to look.
+     */
+    Path output() {
+        return output;
+    }
+
+    /** Whether it is still running, so a witness waiting on it can tell waiting from waiting forever. */
+    boolean isAlive() {
+        return process.isAlive();
+    }
+
+    /**
+     * What it exited with, for a witness whose subject is the server declining to start.
+     *
+     * <p>"Stopped" and "failed" are not the same outcome to anything supervising the process, so a
+     * witness of a refusal has to be able to tell them apart.
+     */
+    int exitValue() {
+        return process.exitValue();
+    }
+
+    /** The end of what it said, for a failure message that carries the server's own words. */
+    String tail() {
+        return tail(output);
     }
 
     @Override
@@ -76,8 +182,10 @@ final class RealProcessServer implements ServerHandle {
         }
     }
 
-    private static Process launch(Path jar, int port, String storeUri, Path workingDirectory, Path output) {
-        List<String> command = List.of(
+    private static Process launch(
+            Path jar, int port, String storeUri, String operatorStateDatabase, Path workingDirectory,
+            Path output, List<String> additionalArguments) {
+        List<String> command = new ArrayList<>(List.of(
                 javaBinary(),
                 "-jar",
                 jar.toString(),
@@ -91,11 +199,13 @@ final class RealProcessServer implements ServerHandle {
                 "--server.port=" + port,
                 "--tapstate.store.mongo.enabled=true",
                 "--tapstate.store.mongo.uri=" + storeUri,
+                "--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                 "--tapstate.store.mongo.server-selection-timeout=5s",
                 // A staging directory of this launch's own, for the same reason the other tier gets one:
                 // the cache is content-addressed and reused, so a shared one serves a stale connector.
                 "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + ServerHandle.privateStagingDirectory(),
-                "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID);
+                "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
+        command.addAll(additionalArguments);
         try {
             return new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())

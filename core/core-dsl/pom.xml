@@ -12,11 +12,11 @@
 
   <artifactId>core-dsl</artifactId>
   <name>Tapstate :: Core :: DSL</name>
-  <description>YAML parse / validate / CEL checking for .tap.yml artifacts; carries the ADR-0016 §14 corpus</description>
+  <description>YAML parse / validate / CEL checking for .tap.yml artifacts; carries the grammar-scenario corpus</description>
 
   <dependencies>
     <!-- compile scope: the error-code contract (TapstateException / TapstateErrorCode) — DslError
-         is the dsl domain's first consumer (ADR-0024) -->
+         is the dsl domain's first consumer -->
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>core-common</artifactId>

@@ -30,8 +30,21 @@ final class ContextManager {
     }
 
     synchronized ContextDefinition create(String name, List<URI> seeds, boolean verifyTls) {
+        return register(name, define(name, seeds, verifyTls));
+    }
+
+    /**
+     * The definition a context would carry, settled without writing anything: its identity and its
+     * auth reference are fixed here, so a caller can sign in through it and {@link #register} it only
+     * once that succeeded. Until that call the store is untouched and the name is still free.
+     */
+    synchronized ContextDefinition define(String name, List<URI> seeds, boolean verifyTls) {
         validateName(name);
-        ContextDefinition definition = definition(name, ids.get(), seeds, verifyTls, ids.get());
+        return definition(name, ids.get(), seeds, verifyTls, ids.get());
+    }
+
+    /** Writes a definition from {@link #define} into the store, under a name nothing else has taken. */
+    synchronized ContextDefinition register(String name, ContextDefinition definition) {
         return store.update(current -> {
             if (current.contexts().containsKey(name)) {
                 throw new TapstateException(CliError.CONTEXT_ALREADY_EXISTS, Map.of("name", name), null);
@@ -98,6 +111,18 @@ final class ContextManager {
     synchronized Optional<String> contextBoundExactlyTo(Path workspaceRoot) {
         ContextConfig current = store.load();
         return Optional.ofNullable(current.workspaceBindings().get(canonical(workspaceRoot).toString()));
+    }
+
+    /**
+     * The server of the context bound exactly to {@code workspaceRoot} - its first seed - or empty
+     * when the directory is not bound. Read here, from the same store the binding was written to, so
+     * what a command tells the user it will connect to is what its connection would actually use.
+     */
+    synchronized Optional<URI> serverBoundTo(Path workspaceRoot) {
+        ContextConfig current = store.load();
+        String name = current.workspaceBindings().get(canonical(workspaceRoot).toString());
+        ContextDefinition definition = name == null ? null : current.contexts().get(name);
+        return definition == null ? Optional.empty() : Optional.of(definition.seeds().get(0));
     }
 
     synchronized DeletionImpact previewDelete(String name) {

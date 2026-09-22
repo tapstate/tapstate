@@ -4,7 +4,7 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * The {@code serve:} block of a pipeline (ADR-0016 §8): inline publish surface or a
+ * The {@code serve:} block of a pipeline (§8): inline publish surface or a
  * {@code use:} reference to a {@code kind: serve} definition body. The serve block is a
  * terminal container — nothing in the grammar references it, so it stays anonymous
  * (canonical-form.md §5 coverage ruling).

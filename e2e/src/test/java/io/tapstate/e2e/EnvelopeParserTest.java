@@ -586,7 +586,26 @@ class EnvelopeParserTest {
     void aDocMatcherWithoutExpectationsIsRefused() {
         assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
                 "steps:\n  - assert: { doc: { a.t: { where: { id: 1 } } } }\n")))
-                .hasMessageContaining("carry expect or size");
+                .hasMessageContaining("carry expect, size or absent");
+    }
+
+    /** Paths that must not be there are an expectation of their own: a doc may carry only those. */
+    @Test
+    void aDocMatcherCarryingOnlyAbsentPathsIsAccepted() {
+        Matcher.Doc doc = (Matcher.Doc) ((Step.Assertion) EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, absent: [secret, \"items[0].sku\"] } } }\n"))
+                .steps().get(0)).matcher();
+
+        assertThat(doc.absent()).containsExactly("secret", "items[0].sku");
+        assertThat(doc.expect()).isEmpty();
+    }
+
+    /** An absent path is a path, held to the same shape as one an author expects a value at. */
+    @Test
+    void anAbsentPathThatIsNotAPathIsRefusedWhereItIsWritten() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, absent: [\"items[0\"] } } }\n")))
+                .hasMessageContaining("doc.a.t.absent");
     }
 
     /**
