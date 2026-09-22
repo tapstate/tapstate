@@ -171,11 +171,20 @@ class ThreeMemberNetworkPartitionFailsClosedIT {
                 // was taken while the handover was still owed. The product was doing what it promises --
                 // a budget, not an instant. On the kill lane there is no such stretch, because a killed
                 // process carries nothing across, which is why only this case needed the order fixed.
+                // What is waited for is the execution generation moving, not the state reading RUNNING.
+                // The state is what the pipeline was last recorded as, and right after a cut that is
+                // still RUNNING -- the run is dead and nobody has written it down yet -- so waiting on it
+                // returns at once and witnesses nothing. Only a generation nobody can lower says a new
+                // run was taken under this claim.
                 Await.until("the pair to take the pipeline over, which waits out the lease the stranded "
                                 + "holder never released", TAKEOVER,
-                        () -> survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> survivor.executionGenerationOf(PIPELINE)
+                                .filter(taken -> taken == generationBefore + 1).isPresent()
+                                && survivor.state(PIPELINE)
+                                .filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> "the majority reports " + survivor.state(PIPELINE) + " at execution "
-                                + survivor.executionGenerationOf(PIPELINE) + ", captures owned by "
+                                + survivor.executionGenerationOf(PIPELINE) + " (was " + generationBefore
+                                + " before the cut), captures owned by "
                                 + survivor.captureOwnersOf(PIPELINE).values());
 
                 long rowsAtTheTakeover = files.count(targetAddress, TABLE);
