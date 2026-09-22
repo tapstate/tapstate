@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -60,6 +61,13 @@ final class PartitionableCluster implements AutoCloseable {
     private final String storeUri;
     private final Map<String, IntFunction<List<String>>> launchArguments;
 
+    /**
+     * Where every member process this cluster launched wrote what it said, including the incarnations a
+     * restart replaced - a member's account of why it left is in the log of the process that left, and
+     * the one that came back in its place says nothing about it.
+     */
+    private final Map<String, Path> logs = new LinkedHashMap<>();
+
     private PartitionableCluster(List<String> nodeIds, Map<String, RealProcessServer> servers,
             Map<String, CuttableLink> links, String clusterId, String storeUri,
             Map<String, IntFunction<List<String>>> launchArguments) {
@@ -72,6 +80,16 @@ final class PartitionableCluster implements AutoCloseable {
         Map<String, ControlPlane> built = new LinkedHashMap<>();
         servers.forEach((nodeId, server) -> built.put(nodeId, new ControlPlane(server.baseUrl())));
         this.planes = built;
+        servers.forEach(this::remember);
+    }
+
+    /** Files one launch's log under its node id, or under a numbered one when that id launched before. */
+    private void remember(String nodeId, RealProcessServer server) {
+        String name = nodeId;
+        for (int launch = 2; logs.containsKey(name); launch++) {
+            name = nodeId + "-launch-" + launch;
+        }
+        logs.put(name, server.output());
     }
 
     /**
@@ -221,6 +239,7 @@ final class PartitionableCluster implements AutoCloseable {
         RealProcessServer replacement =
                 RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(known));
         servers.put(known, replacement);
+        remember(known, replacement);
         ControlPlane plane = new ControlPlane(replacement.baseUrl());
         plane.login(ADMIN, PASSWORD);
         planes.put(known, plane);
@@ -246,6 +265,8 @@ final class PartitionableCluster implements AutoCloseable {
             }
         }
         links.values().forEach(CuttableLink::close);
+        // After the processes are down, so what a member said on its way out is in what is kept.
+        FailureScene.writeMemberLogs(clusterId, logs);
         if (!failures.isEmpty()) {
             throw failures.getFirst();
         }

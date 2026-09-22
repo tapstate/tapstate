@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -206,9 +207,15 @@ final class TwoMemberCluster implements AutoCloseable {
     @Override
     public void close() {
         try {
-            second.close();
+            try {
+                second.close();
+            } finally {
+                first.close();
+            }
         } finally {
-            first.close();
+            // After both are down, so what a member said on its way out is in what is kept.
+            FailureScene.writeMemberLogs(
+                    clusterId, Map.of(NODE_A, first.output(), NODE_B, second.output()));
         }
     }
 
