@@ -233,6 +233,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.ContextPicker picker ->
                     Math.max(5, Math.min(10, picker.contexts().size()) + 4);
             case WorkbenchOverlayState.ContextCreate ignored -> 8;
+            case WorkbenchOverlayState.RegisterConnector ignored -> 6;
             case WorkbenchOverlayState.SourceCreate source -> source.stage() == WorkbenchOverlayState.SourceCreate.Stage.PREVIEW
                     ? 12 : 9;
             case WorkbenchOverlayState.SourceYamlEditor ignored -> 8;
@@ -269,6 +270,8 @@ final class WorkbenchRenderer {
                     renderContexts(frame, area, box, picker, theme);
             case WorkbenchOverlayState.ContextCreate create ->
                     renderContextCreate(frame, area, box, create, theme);
+            case WorkbenchOverlayState.RegisterConnector register ->
+                    renderRegisterConnector(frame, area, box, register, theme);
             case WorkbenchOverlayState.SourceCreate source -> renderSourceCreate(frame, area, box, source, theme);
             case WorkbenchOverlayState.SourceYamlEditor editor -> renderSourceYamlEditor(
                     frame, area, box, editor, theme);
@@ -288,6 +291,7 @@ final class WorkbenchRenderer {
             case WorkbenchOverlayState.More ignored -> "More";
             case WorkbenchOverlayState.ContextPicker ignored -> "Choose Context";
             case WorkbenchOverlayState.ContextCreate ignored -> "New Context";
+            case WorkbenchOverlayState.RegisterConnector ignored -> "Register Connector";
             case WorkbenchOverlayState.SourceCreate ignored -> "New Source";
             case WorkbenchOverlayState.SourceYamlEditor ignored -> "Edit YAML";
             case WorkbenchOverlayState.PipelineCreate ignored -> "New Pipeline";
@@ -952,6 +956,21 @@ final class WorkbenchRenderer {
         actions.message().ifPresent(message -> write(frame, box.x() + 2, box.bottom() - 2,
                 clip(message, Math.max(0, box.width() - 4)), theme.warning(), area));
         return List.copyOf(hits);
+    }
+
+    private static List<OverlayHit> renderRegisterConnector(
+            Frame frame, Rect area, Rect box, WorkbenchOverlayState.RegisterConnector register,
+            WorkbenchTheme theme) {
+        renderFormField(frame, area, box.x() + 2, box.y() + 1, "Path", register.path(),
+                !register.pending(), theme);
+        write(frame, box.x() + 2, box.y() + 3,
+                "A .jar file or a directory of connector jars.", theme.muted(), area);
+        String hint = register.pending() ? "Registering..." : "Enter register  Esc back";
+        write(frame, box.x() + 2, box.y() + 4, hint, theme.muted(), area);
+        register.message().ifPresent(message -> write(
+                frame, box.x() + 2, box.y() + 5, clip(message, Math.max(0, box.width() - 4)),
+                message.startsWith("Registered") ? theme.info() : theme.warning(), area));
+        return List.of();
     }
 
     private static void renderLoginField(
@@ -2005,6 +2024,9 @@ final class WorkbenchRenderer {
                     new FooterHint("↑↓", "fields", Optional.empty()),
                     new FooterHint("Enter", create.pending() ? "wait" : "next", Optional.empty()),
                     new FooterHint("Esc", "cancel", Optional.empty()));
+            case WorkbenchOverlayState.RegisterConnector register -> List.of(
+                    new FooterHint("Enter", register.pending() ? "wait" : "register", Optional.empty()),
+                    new FooterHint("Esc", "back", Optional.empty()));
             case WorkbenchOverlayState.SourceCreate source -> sourceCreateFooter(source);
             case WorkbenchOverlayState.SourceYamlEditor editor -> List.of(
                     new FooterHint("↑↓←→", "navigate", Optional.empty()),

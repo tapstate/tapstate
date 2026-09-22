@@ -35,6 +35,10 @@ interface WorkbenchActionGateway {
         return new SourceCatalogResult.Unavailable();
     }
 
+    default ConnectorRegisterResult registerConnector(Path path) {
+        return new ConnectorRegisterResult.Unavailable();
+    }
+
     default SourcePreviewResult previewSource(SourceDraft draft) {
         return new SourcePreviewResult.Unavailable();
     }
@@ -302,6 +306,29 @@ interface WorkbenchActionGateway {
         }
 
         record Unavailable() implements SourceCatalogResult {
+        }
+    }
+
+    sealed interface ConnectorRegisterResult {
+        record Registered(int registered, int alreadyRegistered, List<String> failures) implements ConnectorRegisterResult {
+            public Registered {
+                if (registered < 0 || alreadyRegistered < 0) {
+                    throw new IllegalArgumentException("Connector counts must not be negative");
+                }
+                failures = List.copyOf(failures);
+            }
+        }
+
+        record Rejected(String message) implements ConnectorRegisterResult {
+            public Rejected {
+                Objects.requireNonNull(message, "message");
+            }
+        }
+
+        record Unreachable() implements ConnectorRegisterResult {
+        }
+
+        record Unavailable() implements ConnectorRegisterResult {
         }
     }
 

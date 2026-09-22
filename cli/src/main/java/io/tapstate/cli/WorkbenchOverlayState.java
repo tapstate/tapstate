@@ -17,6 +17,7 @@ sealed interface WorkbenchOverlayState
                 WorkbenchOverlayState.Confirm,
                 WorkbenchOverlayState.Login,
                 WorkbenchOverlayState.Actions,
+                WorkbenchOverlayState.RegisterConnector,
                 WorkbenchOverlayState.LogLevel,
                 WorkbenchOverlayState.Help {
 
@@ -370,6 +371,7 @@ sealed interface WorkbenchOverlayState
         enum Action {
             CONTEXT("🧭  Context", "Choose or create a context"),
             AUTHENTICATION("🔐  Authentication", "Sign in to the selected server"),
+            REGISTER_CONNECTOR("🧩  Register Connector", "Upload a connector jar or directory"),
             NEW_SOURCE("✨  New Source", "Create a local source artifact"),
             NEW_PIPELINE("⚡  New Pipeline", "Create a local pipeline artifact"),
             APPLY_SELECTED_PIPELINE("☁️  Apply Selected Pipeline", "Synchronize the selected local pipeline"),
@@ -397,6 +399,13 @@ sealed interface WorkbenchOverlayState
             String description() {
                 return description;
             }
+        }
+    }
+
+    record RegisterConnector(String path, boolean pending, Optional<String> message) implements WorkbenchOverlayState {
+        public RegisterConnector {
+            Objects.requireNonNull(path, "path");
+            Objects.requireNonNull(message, "message");
         }
     }
 

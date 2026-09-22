@@ -357,6 +357,71 @@ final class Repl {
         this.connectorFetcher = fetcher;
     }
 
+    /** Registers one connector jar or the direct jar children of a connector directory for the workbench. */
+    private synchronized WorkbenchActionGateway.ConnectorRegisterResult registerConnectorFromWorkbench(Path input) {
+        if (!session.isConnected() || !session.isAuthenticated()) {
+            return new WorkbenchActionGateway.ConnectorRegisterResult.Unavailable();
+        }
+        Path artifactPath = (input.isAbsolute() ? input : workdir.resolve(input)).normalize();
+        if (!Files.exists(artifactPath)) {
+            return new WorkbenchActionGateway.ConnectorRegisterResult.Rejected(
+                    "Connector path does not exist: " + input);
+        }
+        List<Path> artifacts;
+        if (Files.isDirectory(artifactPath)) {
+            try (Stream<Path> entries = Files.list(artifactPath)) {
+                artifacts = entries.filter(Files::isRegularFile)
+                        .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
+                        .sorted()
+                        .toList();
+            } catch (IOException unavailable) {
+                return new WorkbenchActionGateway.ConnectorRegisterResult.Rejected(
+                        "Cannot read connector directory: " + unavailable.getMessage());
+            }
+            if (artifacts.isEmpty()) {
+                return new WorkbenchActionGateway.ConnectorRegisterResult.Rejected(
+                        "No connector jars found in " + input);
+            }
+        } else {
+            artifacts = List.of(artifactPath);
+        }
+
+        int registered = 0;
+        int alreadyRegistered = 0;
+        List<String> failures = new ArrayList<>();
+        for (Path artifactPathEntry : artifacts) {
+            byte[] artifact;
+            try {
+                artifact = Files.readAllBytes(artifactPathEntry);
+            } catch (IOException unreadable) {
+                failures.add(artifactPathEntry.getFileName() + ": " + unreadable.getMessage());
+                continue;
+            }
+            byte[] upload = artifact;
+            ConnectorRegisterOutcome outcome = withFailover(
+                    () -> controlPlane.register(session.landingNode(), session.credential(), upload),
+                    candidate -> candidate instanceof ConnectorRegisterOutcome.Unreachable);
+            switch (outcome) {
+                case ConnectorRegisterOutcome.Registered result -> {
+                    if (result.connector().newlyRegistered()) {
+                        registered++;
+                    } else {
+                        alreadyRegistered++;
+                    }
+                }
+                case ConnectorRegisterOutcome.Rejected result ->
+                        failures.add(artifactPathEntry.getFileName() + ": " + result.message());
+                case ConnectorRegisterOutcome.TimedOut ignored ->
+                        failures.add(artifactPathEntry.getFileName() + ": request timed out");
+                case ConnectorRegisterOutcome.Unreachable ignored -> {
+                    return new WorkbenchActionGateway.ConnectorRegisterResult.Unreachable();
+                }
+            }
+        }
+        return new WorkbenchActionGateway.ConnectorRegisterResult.Registered(
+                registered, alreadyRegistered, failures);
+    }
+
     /** The current session workspace. */
     Path workdir() {
         return workdir;
@@ -428,6 +493,11 @@ final class Repl {
                 } catch (RuntimeException unavailable) {
                     return new SourceCatalogResult.Unavailable();
                 }
+            }
+
+            @Override
+            public ConnectorRegisterResult registerConnector(Path path) {
+                return registerConnectorFromWorkbench(path);
             }
 
             @Override

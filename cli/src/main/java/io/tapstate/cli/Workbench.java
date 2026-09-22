@@ -664,6 +664,7 @@ final class Workbench {
                         case WorkbenchOverlayState.ContextPicker picker -> runtime.updateState(state ->
                             state.withOverlay(picker.select(index)));
                         case WorkbenchOverlayState.ContextCreate ignored -> true;
+                        case WorkbenchOverlayState.RegisterConnector ignored -> true;
                         case WorkbenchOverlayState.SourceCreate ignored -> true;
                         case WorkbenchOverlayState.SourceYamlEditor ignored -> true;
                         case WorkbenchOverlayState.PipelineCreate ignored -> true;
@@ -695,6 +696,7 @@ final class Workbench {
                 case WorkbenchOverlayState.More more -> handleMoreKey(more, key);
                 case WorkbenchOverlayState.ContextPicker picker -> handleContextKey(picker, key);
                 case WorkbenchOverlayState.ContextCreate create -> handleContextCreateKey(create, key);
+                case WorkbenchOverlayState.RegisterConnector register -> handleRegisterConnectorKey(register, key);
                 case WorkbenchOverlayState.SourceCreate source -> handleSourceCreateKey(source, key);
                 case WorkbenchOverlayState.SourceYamlEditor editor -> handleSourceYamlEditorKey(editor, key);
                 case WorkbenchOverlayState.PipelineCreate pipeline -> handlePipelineCreateKey(pipeline, key);
@@ -743,6 +745,64 @@ final class Workbench {
                     availableActions(state), 0)));
         }
 
+        private boolean openRegisterConnector() {
+            if (actionCoordinator == null || actionGateway == null) {
+                return false;
+            }
+            return runtime.updateState(state -> state.withOverlay(
+                    new WorkbenchOverlayState.RegisterConnector("", false, Optional.empty())));
+        }
+
+        private boolean handleRegisterConnectorKey(
+                WorkbenchOverlayState.RegisterConnector register, KeyEvent key) {
+            if (register.pending()) {
+                return true;
+            }
+            if (key.isDeleteBackward()) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.RegisterConnector(
+                        deleteLastCodePoint(register.path()), false, Optional.empty())));
+            }
+            if (key.isSelect() || key.isConfirm()) {
+                if (register.path().isBlank()) {
+                    return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.RegisterConnector(
+                            register.path(), false, Optional.of("Connector jar or directory is required"))));
+                }
+                runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.RegisterConnector(
+                        register.path(), true, Optional.of("Registering connector..."))));
+                actionCoordinator.submit(
+                        () -> actionGateway.registerConnector(Path.of(register.path())),
+                        failure -> new WorkbenchActionGateway.ConnectorRegisterResult.Unavailable(),
+                        this::completeConnectorRegister);
+                return true;
+            }
+            if (key.code() == dev.tamboui.tui.event.KeyCode.CHAR) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.RegisterConnector(
+                        register.path() + printableText(key.string()), false, Optional.empty())));
+            }
+            return true;
+        }
+
+        private void completeConnectorRegister(WorkbenchActionGateway.ConnectorRegisterResult result) {
+            String message = switch (result) {
+                case WorkbenchActionGateway.ConnectorRegisterResult.Registered registered ->
+                        "Registered " + registered.registered() + ", already registered "
+                                + registered.alreadyRegistered()
+                                + (registered.failures().isEmpty()
+                                ? ""
+                                : ", failed " + registered.failures().size());
+                case WorkbenchActionGateway.ConnectorRegisterResult.Rejected rejected -> rejected.message();
+                case WorkbenchActionGateway.ConnectorRegisterResult.Unreachable ignored ->
+                        "Server could not be reached";
+                case WorkbenchActionGateway.ConnectorRegisterResult.Unavailable ignored ->
+                        "Connector registration requires an authenticated server";
+            };
+            runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.RegisterConnector(
+                    state.overlay().filter(WorkbenchOverlayState.RegisterConnector.class::isInstance)
+                            .map(WorkbenchOverlayState.RegisterConnector.class::cast)
+                            .map(WorkbenchOverlayState.RegisterConnector::path)
+                            .orElse(""), false, Optional.of(message))));
+        }
+
         private boolean handleActionsKey(WorkbenchOverlayState.Actions actions, KeyEvent key) {
             if (key.isUp() || key.isDown()) {
                 return runtime.updateState(state -> state.withOverlay(actions.select(
@@ -755,6 +815,7 @@ final class Workbench {
             return switch (action) {
                 case CONTEXT -> openContextEntry();
                 case AUTHENTICATION -> openAuthEntry();
+                case REGISTER_CONNECTOR -> openRegisterConnector();
                 case NEW_SOURCE -> openSourceCreate();
                 case NEW_PIPELINE -> openPipelineCreate();
                 case APPLY_SELECTED_SOURCE -> confirmSourceApply(selectedSourceRequest().orElseThrow());
@@ -1529,6 +1590,7 @@ final class Workbench {
             List<WorkbenchOverlayState.Actions.Action> actions = new ArrayList<>(List.of(
                     WorkbenchOverlayState.Actions.Action.CONTEXT,
                     WorkbenchOverlayState.Actions.Action.AUTHENTICATION,
+                    WorkbenchOverlayState.Actions.Action.REGISTER_CONNECTOR,
                     WorkbenchOverlayState.Actions.Action.NEW_SOURCE,
                     WorkbenchOverlayState.Actions.Action.NEW_PIPELINE));
             if (selectedSourceRequest().isPresent()) {
@@ -1988,6 +2050,10 @@ final class Workbench {
                     && create.stage() != WorkbenchOverlayState.ContextCreate.Stage.VERIFY_TLS) {
                 return appendContextCreateText(create, text);
             }
+            if (overlay instanceof WorkbenchOverlayState.RegisterConnector register && !register.pending()) {
+                return runtime.updateState(state -> state.withOverlay(new WorkbenchOverlayState.RegisterConnector(
+                        register.path() + printableText(text), false, Optional.empty())));
+            }
             if (overlay instanceof WorkbenchOverlayState.SourceCreate source && !source.pending()) {
                 return appendSourceCreateText(source, text);
             }
@@ -2291,6 +2357,7 @@ final class Workbench {
             return switch (overlay) {
                 case WorkbenchOverlayState.ContextPicker picker -> picker.previous();
                 case WorkbenchOverlayState.ContextCreate create -> create.previous();
+                case WorkbenchOverlayState.RegisterConnector ignored -> Optional.empty();
                 case WorkbenchOverlayState.SourceCreate ignored -> Optional.empty();
                 case WorkbenchOverlayState.SourceYamlEditor ignored -> Optional.empty();
                 case WorkbenchOverlayState.PipelineCreate ignored -> Optional.empty();
