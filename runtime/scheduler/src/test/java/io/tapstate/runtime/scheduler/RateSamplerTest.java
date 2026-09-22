@@ -39,8 +39,23 @@ class RateSamplerTest {
         }
 
         @Override
-        public List<RateSample> readBetween(String pipelineId, Instant from, Instant to) {
-            return appended.stream().filter(sample -> sample.pipelineId().equals(pipelineId)).toList();
+        public Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit) {
+            return new Page(List.of(), false);
+        }
+
+        @Override
+        public java.util.Optional<Entry> predecessor(String pipelineId, Instant at) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public java.util.Optional<Entry> read(String pipelineId, Key key) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public java.util.Optional<Entry> successor(String pipelineId, Instant at) {
+            return java.util.Optional.empty();
         }
 
         @Override

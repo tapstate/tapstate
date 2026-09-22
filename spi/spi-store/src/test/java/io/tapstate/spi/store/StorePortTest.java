@@ -1264,12 +1264,23 @@ class StorePortTest {
                 }
 
                 @Override
-                public List<RateSample> readBetween(String pipelineId, Instant from, Instant to) {
-                    return samples.stream()
-                            .filter(sample -> sample.pipelineId().equals(pipelineId))
-                            .filter(sample -> !sample.observedAt().isBefore(from) && !sample.observedAt().isAfter(to))
-                            .sorted(Comparator.comparing(RateSample::observedAt))
-                            .toList();
+                public Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit) {
+                    return new Page(List.of(), false);
+                }
+
+                @Override
+                public Optional<Entry> predecessor(String pipelineId, Instant at) {
+                    return Optional.empty();
+                }
+
+                @Override
+                public Optional<Entry> read(String pipelineId, Key key) {
+                    return Optional.empty();
+                }
+
+                @Override
+                public Optional<Entry> successor(String pipelineId, Instant at) {
+                    return Optional.empty();
                 }
 
                 @Override

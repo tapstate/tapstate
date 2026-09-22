@@ -163,7 +163,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "token", "derived-schema");
+            "connectors", "token", "derived-schema", "explain");
 
     private final CommandLine commandLine;
 
@@ -647,6 +647,13 @@ final class Repl {
             lastExitCode = help ? commandLine.execute(words.toArray(new String[0])) : up(words);
             return true;
         }
+        // `explain` is deliberately dual-use. With a server target it is pipeline.explain; without one
+        // it remains the offline grammar field manual that predates that operation. A bare invocation or
+        // help is unambiguously the field manual even inside a connected session.
+        if (explainRunsOffline(words)) {
+            lastExitCode = commandLine.execute(withWorkspace(words));
+            return true;
+        }
         if (!session.isConnected() && ONLINE_VERBS.contains(words.get(0)) && contextResolver != null) {
             int resolved = resolveTarget(words);
             if (resolved != Cli.EXIT_OK) {
@@ -661,6 +668,24 @@ final class Repl {
         // the offline path already had a status -- picocli returns one -- and it was being discarded
         lastExitCode = commandLine.execute(withWorkspace(words));
         return true;
+    }
+
+    private boolean explainRunsOffline(List<String> words) {
+        if (!words.get(0).equals("explain")) {
+            return false;
+        }
+        if (words.size() == 1 || words.stream().anyMatch(
+                word -> word.equals("-h") || word.equals("--help")
+                        || word.equals("-V") || word.equals("--version"))) {
+            return true;
+        }
+        if (session.isConnected()) {
+            return false;
+        }
+        // A workspace binding must not silently change the long-standing offline field manual into a
+        // network call. In one-shot mode the caller chooses the remote meaning explicitly with -c or
+        // --context; an interactive session chooses it by already being connected.
+        return explicitContext == null;
     }
 
     private static boolean isMachineTokenLocalAuth(List<String> words) {
@@ -830,6 +855,11 @@ final class Repl {
         if (words.get(0).equals("status")) {
             return statusOnline(words);
         }
+        // Current metrics is positional, while the history form carries a bounded range and selectors.
+        // Parse both here so the generic connected-verb guard does not reject the history options.
+        if (words.get(0).equals("metrics")) {
+            return metricsOnline(words);
+        }
         // The other connected verbs take positional operands only; a dash-option (e.g. `-o json`) is not yet
         // supported and must not be silently misread as an id / kind / path.
         for (int i = 1; i < words.size(); i++) {
@@ -846,6 +876,7 @@ final class Repl {
             case "start", "pause", "resume" -> lifecycleOnline(words);
             case "status" -> statusOnline(words);
             case "metrics" -> metricsOnline(words);
+            case "explain" -> explainOnline(words);
             case "snapshot" -> snapshotOnline(words);
             case "logs" -> logsOnline(words);
             case "position" -> positionOnline(words);
@@ -3247,8 +3278,8 @@ final class Repl {
      * not working, what is wrong. A missing id is a benign usage line; a pipeline that has published no
      * observation is a coded refusal ({@code monitor.no-observation}) rendering its code and message.
      *
-     * <p>The answer is a fixed checklist walked over readings that already existed on four separate faces.
-     * Correlating them by hand is what this replaces; no new measurement is taken and no new face is added.
+     * <p>The answer comes from {@code pipeline.explain}, the server-owned projection over one observation.
+     * This command renders its conclusion and typed evidence; it does not carry or re-run the five rules.
      * The state line above it is unchanged and still the first thing printed, so anything reading it keeps
      * working.
      */
@@ -3258,23 +3289,18 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         boolean waitForRate = words.contains("--rate");
-        StatusOutcome outcome = readStatus(id);
+        ExplainOutcome outcome = readExplanation(id);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
-            case StatusOutcome.Found found -> {
+            case ExplainOutcome.Found found -> {
                 out.println(found.pipelineId() + "  " + found.state().toLowerCase(Locale.ROOT));
-                if (found.failureCode() != null) {
-                    // A failed state that cannot say what failed sends the user hunting through logs. This
-                    // read succeeded -- it is not a refusal -- so it renders to stdout, not alongside a
-                    // coded refusal on stderr.
-                    renderStatusFailure(found.failureCode(), found.failureMessage());
-                }
-                renderDiagnosis(out, id, found, waitForRate);
+                renderExplanation(out, found);
+                renderMovement(out, id, found, waitForRate);
                 out.flush();
                 yield Cli.EXIT_OK;
             }
-            case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
-            case StatusOutcome.Unreachable ignored -> reportRequestFailed();
+            case ExplainOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ExplainOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
 
@@ -3292,9 +3318,15 @@ final class Repl {
      * — the two are one blank line apart on screen and a different problem apart in the world.
      */
     private int metricsOnline(List<String> words) {
-        String id = readTargetId(words);
-        if (id == null) {
+        if (words.size() < 2 || words.get(1).isBlank()) {
+            PrintWriter err = commandLine.getErr();
+            err.println("metrics: missing operand (usage: metrics <pipeline-id> [HISTORY OPTIONS])");
+            err.flush();
             return Cli.EXIT_USAGE;
+        }
+        String id = words.get(1);
+        if (words.size() > 2) {
+            return historyOnline(id, words.subList(2, words.size()));
         }
         MetricsOutcome outcome = withFailover(() ->
                 controlPlane.metrics(session.landingNode(), session.credential(), id),
@@ -3327,6 +3359,153 @@ final class Repl {
             }
             case MetricsOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case MetricsOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    private int historyOnline(String id, List<String> options) {
+        HistoryRequest request;
+        try {
+            request = historyRequest(options);
+        } catch (IllegalArgumentException invalid) {
+            return renderMalformedRequest(invalid.getMessage());
+        }
+        HistoryOutcome outcome = withFailover(() ->
+                controlPlane.history(session.landingNode(), session.credential(), id, request),
+                answer -> answer instanceof HistoryOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case HistoryOutcome.Found found -> {
+                renderHistory(out, found);
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case HistoryOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case HistoryOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    private static HistoryRequest historyRequest(List<String> options) {
+        String from = null;
+        String to = null;
+        String resolution = null;
+        Integer limit = null;
+        String cursor = null;
+        List<String> tables = new ArrayList<>();
+        for (int i = 0; i < options.size(); i++) {
+            String option = options.get(i);
+            if (!List.of("--from", "--to", "--resolution", "--limit", "--cursor", "--table")
+                    .contains(option)) {
+                throw new IllegalArgumentException("unknown history option " + option);
+            }
+            if (i + 1 >= options.size()) {
+                throw new IllegalArgumentException(option + " requires a value");
+            }
+            String value = options.get(++i);
+            switch (option) {
+                case "--from" -> from = once(from, value, option);
+                case "--to" -> to = once(to, value, option);
+                case "--resolution" -> resolution = once(resolution, resolution(value), option);
+                case "--limit" -> {
+                    if (limit != null) {
+                        throw new IllegalArgumentException(option + " may be supplied once");
+                    }
+                    try {
+                        limit = Integer.valueOf(value);
+                    } catch (NumberFormatException invalid) {
+                        throw new IllegalArgumentException("--limit must be an integer", invalid);
+                    }
+                }
+                case "--cursor" -> cursor = once(cursor, value, option);
+                case "--table" -> tables.add(value);
+                default -> throw new IllegalStateException("unhandled history option " + option);
+            }
+        }
+        if (from == null || to == null) {
+            throw new IllegalArgumentException("history requires both --from and --to");
+        }
+        return new HistoryRequest(from, to, resolution, limit, tables, cursor);
+    }
+
+    private static String once(String current, String value, String option) {
+        if (current != null) {
+            throw new IllegalArgumentException(option + " may be supplied once");
+        }
+        if (value.isBlank()) {
+            throw new IllegalArgumentException(option + " requires a non-blank value");
+        }
+        return value;
+    }
+
+    private static String resolution(String value) {
+        return switch (value) {
+            case "auto", "raw" -> value;
+            case "5m" -> "PT5M";
+            case "30m" -> "PT30M";
+            case "1h" -> "PT1H";
+            case "3h" -> "PT3H";
+            case "6h" -> "PT6H";
+            default -> throw new IllegalArgumentException(
+                    "--resolution must be auto, raw, 5m, 30m, 1h, 3h, or 6h");
+        };
+    }
+
+    private int renderMalformedRequest(String reason) {
+        Map<String, Object> args = Map.of("reason", reason);
+        String message = MessageCatalog.bundled().render("control.malformed-request", args).message();
+        return renderRejection("control.malformed-request", message, args);
+    }
+
+    private static void renderHistory(PrintWriter out, HistoryOutcome.Found history) {
+        out.println(history.pipelineId() + "  " + history.status().toLowerCase(Locale.ROOT)
+                + "  " + history.effectiveResolution() + "  "
+                + history.effectiveFrom() + " .. " + history.effectiveTo());
+        for (HistoryOutcome.Segment segment : history.segments()) {
+            out.println("segment    " + segment.startReason().toLowerCase(Locale.ROOT)
+                    + "  " + segment.intervalStart() + " .. " + segment.intervalEnd());
+            for (HistoryOutcome.Point point : segment.points()) {
+                StringBuilder line = new StringBuilder("  ").append(point.intervalEnd());
+                if (point.recordsOut() != null) {
+                    line.append("  records.out=").append(point.recordsOut().averageRate()).append("/s")
+                            .append(" delta=").append(point.recordsOut().delta())
+                            .append(" max=").append(point.recordsOut().maxRate()).append("/s");
+                }
+                if (point.bytesOut() != null) {
+                    line.append("  bytes.out=").append(point.bytesOut().averageRate()).append("/s")
+                            .append(" delta=").append(point.bytesOut().delta())
+                            .append(" max=").append(point.bytesOut().maxRate()).append("/s");
+                }
+                for (HistoryOutcome.Lag lag : point.lag()) {
+                    line.append("  lag.").append(lag.table()).append('=').append(lag.last()).append('s')
+                            .append(" max=").append(lag.max()).append('s');
+                }
+                out.println(line);
+            }
+        }
+        history.gaps().forEach(gap -> out.println(
+                "gap        " + gap.intervalStart() + " .. " + gap.intervalEnd()));
+        history.unavailable().forEach(missing -> out.println("unavailable " + missing.metric()
+                + (missing.table() == null ? "" : "." + missing.table())));
+        out.println("cutoff     " + history.retentionCutoff());
+        out.println("consistency " + history.consistency().toLowerCase(Locale.ROOT));
+        out.println("nextCursor " + (history.nextCursor() == null ? "none" : history.nextCursor()));
+    }
+
+    private int explainOnline(List<String> words) {
+        String id = readTargetId(words);
+        if (id == null) {
+            return Cli.EXIT_USAGE;
+        }
+        ExplainOutcome outcome = readExplanation(id);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case ExplainOutcome.Found found -> {
+                out.println(found.pipelineId() + "  " + found.state().toLowerCase(Locale.ROOT));
+                renderExplanation(out, found);
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case ExplainOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ExplainOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
 
@@ -4490,6 +4669,13 @@ final class Repl {
                 o -> o instanceof StatusOutcome.Unreachable);
     }
 
+    /** Reads the server-owned explanation; the CLI never re-applies its rules locally. */
+    private ExplainOutcome readExplanation(String pipelineId) {
+        return withFailover(() -> controlPlane.explain(
+                        session.landingNode(), session.credential(), pipelineId),
+                o -> o instanceof ExplainOutcome.Unreachable);
+    }
+
     /**
      * Renders a coded refusal raised on this side of the wire, located at the file and line it was found
      * on. Distinct from {@link #renderRejection} only in where the message comes from: a server refusal
@@ -4608,39 +4794,24 @@ final class Repl {
         return open >= 0 && rendered.indexOf('}', open + 1) > open;
     }
 
-    /**
-     * The one answer, printed under the state: what the checklist concluded, the face and value it read to
-     * conclude it, and where to look next.
-     *
-     * <p>Printed on every status, not only a failing one. A checklist that came up empty prints its
-     * readings and what it could not decide, because "nothing matched" and "everything is fine" are
-     * different claims and only the first one is true.
-     *
-     * <p>The other two faces are read only when the status face has not already answered. A run whose
-     * publisher has gone silent is the clearest case of that: every other face would be re-reading the same
-     * old observation, so asking them costs two round trips to learn nothing.
-     */
-    private void renderDiagnosis(PrintWriter out, String id, StatusOutcome.Found found, boolean waitForRate) {
-        Optional<StatusDiagnosis.Answer> early = StatusDiagnosis
-                .fromStatusAlone(id, found.state(), found.failureCode(), found.observedAgeMillis());
-        MetricsOutcome first = null;
-        StatusDiagnosis.Answer answer;
-        if (early.isPresent()) {
-            answer = early.get();
-        } else {
-            // Read once and kept: the same reading is the first of the two a rate is made of below.
-            first = readMetrics(id);
-            answer = StatusDiagnosis.of(id, found.state(), found.failureCode(),
-                    found.failureMessage(), found.observedAgeMillis(),
-                    metricsFactsOf(first), snapshotRowsLoaded(id));
-        }
-        out.println(Ansi.AUTO.string("@|bold why:|@") + " " + answer.conclusion());
-        answer.readings().forEach(reading -> out.println("  read       " + reading));
+    /** Renders the explanation exactly as the server projected it, without evaluating its evidence. */
+    private static void renderExplanation(PrintWriter out, ExplainOutcome.Found answer) {
+        out.println(Ansi.AUTO.string("@|bold why:|@") + " " + answer.message());
+        out.println("  kind       " + answer.kind());
+        out.println("  freshness  " + answer.freshness().toLowerCase(Locale.ROOT));
+        answer.evidence().forEach(reading -> out.println("  read       "
+                + reading.source() + "." + reading.field() + " = " + evidenceValue(reading.value())));
         if (answer.next() != null) {
-            out.println("  next       " + answer.next());
+            out.println("  next       " + answer.next().message() + " [" + answer.next().action() + "]");
+        }
+        if (answer.pending() != null) {
+            out.println("  pending    " + answer.pending().reason());
         }
         answer.cannotSay().forEach(unanswerable -> out.println("  cannot say " + unanswerable));
-        renderMovement(out, id, found, early.isPresent(), first, waitForRate);
+    }
+
+    private static String evidenceValue(Object value) {
+        return value == null ? "null" : String.valueOf(value);
     }
 
     /**
@@ -4654,9 +4825,9 @@ final class Repl {
      * rather than nought: a pipeline that has not been observed twice and a pipeline that moved nothing
      * call for different next steps, and only a number that is honestly absent keeps them apart.
      *
-     * <p>When the status face answered on its own -- the reading is stale, or the run failed -- no other
-     * face is read, for the reason the answer gives, and the movement says so rather than measuring
-     * across an observation the answer has already called old.
+     * <p>When explain reports a stale observation or a coded failure, no movement reading is attempted;
+     * the movement line says why instead of measuring across an observation the server has already called
+     * old or a run it has already reported failed.
      *
      * <p><strong>The second reading is waited for at a terminal, or when {@code --rate} asks for it.</strong>
      * A person who ran this and is looking at it will spend a second on a rate; a script will not, and this
@@ -4666,16 +4837,18 @@ final class Repl {
      * number says so -- which is also what the line prints when it has to answer without one, since a flag
      * nobody is told about is a flag nobody passes.
      */
-    private void renderMovement(PrintWriter out, String id, StatusOutcome.Found found, boolean statusAnswered,
-            MetricsOutcome first, boolean waitForRate) {
+    private void renderMovement(PrintWriter out, String id, ExplainOutcome.Found found, boolean waitForRate) {
         String moving = "moving     ";
         String lag = "lag        ";
-        if (statusAnswered) {
-            out.println(moving + "not known -- " + (found.failureCode() != null
+        boolean explanationStopsMeasurement = "OBSERVATION_STALE".equals(found.kind())
+                || "CODED_FAILURE".equals(found.kind());
+        if (explanationStopsMeasurement) {
+            out.println(moving + "not known -- " + ("CODED_FAILURE".equals(found.kind())
                     ? "the run failed"
                     : "this reading is old, and a rate across an old reading would be a rate of nothing current"));
             return;
         }
+        MetricsOutcome first = readMetrics(id);
         MovementReading earlier = movementOf(first);
         if (earlier == null) {
             out.println(moving + "not known -- no records counter is published (no live job)");
@@ -4732,35 +4905,6 @@ final class Repl {
     /** The movement a metrics read carried, or null when the face did not answer or carried none. */
     private static MovementReading movementOf(MetricsOutcome outcome) {
         return outcome instanceof MetricsOutcome.Found found ? MetricsFacts.movementOf(found.facts()) : null;
-    }
-
-    /**
-     * The metrics face's readings for the diagnosis, or null when that face did not answer.
-     *
-     * <p>No failover here, deliberately: the status read just picked the node, and a supplementary read
-     * that cannot be answered becomes "could not be read" in the answer rather than a second round of node
-     * hunting. Null is carried all the way into the answer, because a face nobody could read and a face
-     * with nothing wrong in it are the two readings this command exists to keep apart.
-     */
-    private static MetricsFacts metricsFactsOf(MetricsOutcome outcome) {
-        return outcome instanceof MetricsOutcome.Found found ? MetricsFacts.of(found.metrics(), found.facts()) : null;
-    }
-
-    /**
-     * How many rows the snapshot face reports loaded across every table it carries, or null when that face
-     * did not answer.
-     *
-     * <p>Rows, not tables. That face holds one entry per selected table from the moment a run starts and
-     * keeps it for the life of the run, so its size answers how many tables were selected -- the same
-     * number for a run that has loaded nothing and for one whose load finished hours ago. It reports no
-     * total for a table either, so it cannot be asked whether a load is still in flight; what it can be
-     * asked is how much has been loaded, which is the reading the checklist actually wants.
-     */
-    private Long snapshotRowsLoaded(String id) {
-        return controlPlane.snapshot(session.landingNode(), session.credential(), id)
-                        instanceof SnapshotOutcome.Found found
-                ? found.tables().values().stream().mapToLong(RemoteTableSnapshot::rowsDone).sum()
-                : null;
     }
 
     /**

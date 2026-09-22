@@ -44,7 +44,12 @@ public final class MessageCatalog {
 
     /** Loads the bundled {@code en} catalog (the mandatory locale). */
     public static MessageCatalog bundled() {
-        return new MessageCatalog(parse(read("/messages/en.yml")));
+        return fromResource("/messages/en.yml");
+    }
+
+    /** Loads another bundled catalog with the same strict two-level shape. */
+    static MessageCatalog fromResource(String resource) {
+        return new MessageCatalog(parse(read(resource)));
     }
 
     /** Renders the code's message and solution, substituting named placeholders from the args. */

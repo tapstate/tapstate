@@ -225,6 +225,17 @@ interface ControlPlaneClient extends AutoCloseable {
      */
     MetricsOutcome metrics(URI baseUrl, String credential, String pipelineId);
 
+    /** Reads one bounded, reset-aware page from {@code pipeline.metrics.history}. */
+    default HistoryOutcome history(
+            URI baseUrl, String credential, String pipelineId, HistoryRequest request) {
+        return new HistoryOutcome.Unreachable();
+    }
+
+    /** Reads the server-owned explanation projected from one current observation. */
+    default ExplainOutcome explain(URI baseUrl, String credential, String pipelineId) {
+        return new ExplainOutcome.Unreachable();
+    }
+
     /**
      * Reads where a pipeline resumes from via {@code GET {baseUrl}/api/pipelines/{pipelineId}/position},
      * authenticated by the bearer {@code credential}: the document on success, a coded rejection when the
