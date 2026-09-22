@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.MapLoader;
 import com.hazelcast.map.MapStoreFactory;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.OperatorStateStores;
 
 import java.util.Objects;
 import java.util.Properties;
@@ -46,9 +47,14 @@ public final class NestStateMapStoreFactory implements MapStoreFactory<Object, O
      * store is resolved as a map starts, not as the configuration is written, so binding afterwards is
      * too late for a map that has already begun.
      */
-    public static void bindTo(HazelcastInstance member, KeyedStateStore store) {
+    public static void bindTo(HazelcastInstance member, OperatorStateStores stores) {
         Objects.requireNonNull(member, "member").getUserContext()
-                .put(USER_CONTEXT_KEY, Objects.requireNonNull(store, "store"));
+                .put(USER_CONTEXT_KEY, Objects.requireNonNull(stores, "stores"));
+    }
+
+    /** Compatibility binding for tests and backends with one physical target. */
+    public static void bindTo(HazelcastInstance member, KeyedStateStore store) {
+        bindTo(member, OperatorStateStores.stateOnly("default", store));
     }
 
     /**
@@ -56,17 +62,17 @@ public final class NestStateMapStoreFactory implements MapStoreFactory<Object, O
      * that is not there cannot degrade to keeping nothing: what it holds would be gone at the first
      * eviction, and the configuration read back would still say a store was behind it.
      */
-    static KeyedStateStore boundTo(HazelcastInstance member) {
+    static OperatorStateStores boundTo(HazelcastInstance member) {
         Object store = member.getUserContext().get(USER_CONTEXT_KEY);
         if (store == null) {
             throw new IllegalStateException("no nest state store is bound to this member, and a nest "
                     + "state map on it is configured to read through to one");
         }
-        return (KeyedStateStore) store;
+        return (OperatorStateStores) store;
     }
 
     @Override
     public MapLoader<Object, Object> newMapStore(String mapName, Properties properties) {
-        return new NestStateMapStore(mapName);
+        return new NestStateMapStore(mapName, properties.getProperty(NestMaps.STATE_DATABASE_PROPERTY));
     }
 }

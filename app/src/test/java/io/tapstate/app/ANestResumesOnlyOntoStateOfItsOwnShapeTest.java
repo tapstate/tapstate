@@ -10,6 +10,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.NestStateStorage;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -25,6 +26,7 @@ import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -85,6 +87,75 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
                 .isPresent();
     }
 
+    @Test
+    void theShapeLedgerAndMapPlacementFollowTheNestDatabase() {
+        InMemoryStorePort store = seedStore("items");
+        String database = "orders_operator_state";
+        store.artifacts().save(pipeline("items", database));
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+
+        source.dagFor(PIPELINE);
+
+        assertThat(store.operatorStateStores().inDatabase(database).state()
+                .load("nest.shape." + PIPELINE, STEP)).isPresent();
+        assertThat(store.keyedState().load("nest.shape." + PIPELINE, STEP)).isEmpty();
+        assertThat(source.capacityOf(PIPELINE).mapDatabases().values())
+                .isNotEmpty()
+                .containsOnly(database);
+        assertThat(source.stateLocations(
+                PIPELINE, store.operatorStateStores().defaultDatabase()))
+                .filteredOn(location -> location.namespace().startsWith("nest."))
+                .isNotEmpty()
+                .allMatch(location -> location.database().equals(database));
+    }
+
+    @Test
+    void removingTheOverrideSelectsTheDeploymentDefaultWithoutMovingExistingState() {
+        InMemoryStorePort store = seedStore("items");
+        String database = "orders_operator_state";
+        store.artifacts().save(pipeline("items", database));
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+        String namespace = source.capacityOf(PIPELINE).mapDatabases().keySet().iterator().next();
+        var custom = store.operatorStateStores().inDatabase(database).state();
+        custom.save(namespace, "held", "custom".getBytes(StandardCharsets.UTF_8));
+
+        store.artifacts().save(pipeline("items"));
+        DagSource.NestCapacity inherited = source.capacityOf(PIPELINE);
+
+        assertThat(inherited.mapDatabases().values())
+                .isNotEmpty()
+                .containsOnly(store.operatorStateStores().defaultDatabase());
+        assertThat(custom.load(namespace, "held"))
+                .as("removing the override does not move or delete the old location")
+                .isPresent();
+        assertThat(store.keyedState().load(namespace, "held"))
+                .as("the inherited target starts without an implicit copy")
+                .isEmpty();
+    }
+
+    @Test
+    void oneStartPreparationKeepsOneArtifactRevisionAcrossEveryDerivedAnswer() {
+        InMemoryStorePort store = seedStore("items");
+        String firstDatabase = "orders_state_first";
+        String laterDatabase = "orders_state_later";
+        store.artifacts().save(pipeline("items", firstDatabase));
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+
+        DagSource.StartPreparation prepared = source.prepareStart(
+                PIPELINE, store.operatorStateStores().defaultDatabase());
+        store.artifacts().save(pipeline("items", laterDatabase));
+        DagSource.StartPlan plan = prepared.build();
+
+        assertThat(plan.capacity().mapDatabases().values()).containsOnly(firstDatabase);
+        assertThat(plan.stateLocations())
+                .filteredOn(location -> location.namespace().startsWith("nest."))
+                .allMatch(location -> location.database().equals(firstDatabase));
+        assertThat(store.operatorStateStores().inDatabase(firstDatabase).state()
+                .load("nest.shape." + PIPELINE, STEP)).isPresent();
+        assertThat(store.operatorStateStores().inDatabase(laterDatabase).state()
+                .load("nest.shape." + PIPELINE, STEP)).isEmpty();
+    }
+
     // ---- fixtures ---------------------------------------------------------------------
 
     /** The two sources, the sink connection, a discovered model each, and the nest pipeline. */
@@ -110,9 +181,14 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
     }
 
     private static PipelineResource pipeline(String embedPath) {
+        return pipeline(embedPath, null);
+    }
+
+    private static PipelineResource pipeline(String embedPath, String stateDatabase) {
         Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, embedPath, List.of("id"),
                 null, null, null);
-        TransformBody.Nest body = new TransformBody.Nest(null, null,
+        TransformBody.Nest body = new TransformBody.Nest(null, null, null, null,
+                stateDatabase == null ? null : new NestStateStorage(stateDatabase),
                 new NestRoot("o", List.of("id"), null, null, List.of(item)));
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("o", FromRef.literal(PARENT_TABLE));

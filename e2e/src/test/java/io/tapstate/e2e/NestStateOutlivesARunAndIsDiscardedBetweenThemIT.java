@@ -2,8 +2,12 @@ package io.tapstate.e2e;
 
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
+import io.tapstate.adapters.mongostore.MongoNestDeadLetterStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.NestDeadLetterRecord;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
@@ -66,6 +70,12 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     private static final String CONFIGURED_VIEW = "configured_order_state";
     private static final String CONFIGURED_STATE_A = "issue431_e2e_state_a";
     private static final String CONFIGURED_STATE_B = "issue431_e2e_state_b";
+    private static final String MIGRATION_CONTROL = "issue456_migration_control";
+    private static final String MIGRATION_DEFAULT = "issue456_migration_default";
+    private static final String MIGRATION_OLD = "issue456_migration_old";
+    private static final String MIGRATION_NEW = "issue456_migration_new";
+    private static final String MIGRATION_PIPELINE = "assembled_orders_migration";
+    private static final String MIGRATION_VIEW = "migrated_order_state";
 
     private static final String SEEDED = "seeded-customer";
     /** Written only by the first run, so reading it in the second says where it came from. */
@@ -176,6 +186,98 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
         assertThat(operatorStateDocuments(SharedMongo.OPERATOR_STATE_DATABASE)).isZero();
     }
 
+    @Test
+    void aStoppedNestsStateCanBeCopiedAndResumedFromItsNewDatabase() throws Exception {
+        dropDatabases(MIGRATION_CONTROL, MIGRATION_DEFAULT, MIGRATION_OLD, MIGRATION_NEW);
+        Map<String, Object> source = SharedMySql.settings("nest_migration_source");
+        seedChildWaitingForParent(source);
+        String warehouse = SharedMongo.replicaSetUrl("nest_migration_warehouse");
+        String controlUri = SharedMongo.replicaSetUrl(MIGRATION_CONTROL);
+
+        try (ServerHandle server = Tiers.IN_PROCESS.launch(controlUri, MIGRATION_DEFAULT)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            applyMigrationResources(control, source, warehouse, MIGRATION_OLD);
+            control.discoverSchema("src_parents", "mysql", source);
+            control.discoverSchema("src_children", "mysql", source);
+            control.lifecycle(MIGRATION_PIPELINE, LifecycleVerb.START);
+
+            Await.until("the child waiting for its parent is durable in the old state database",
+                    () -> mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc") > 0,
+                    () -> Long.toString(mapStateDocuments(
+                            MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc")));
+            control.stop(MIGRATION_PIPELINE, false);
+            Await.until("the pipeline is stopped without clearing its continuation",
+                    () -> control.state(MIGRATION_PIPELINE).orElse(null) == PipelineState.STOPPED,
+                    () -> control.state(MIGRATION_PIPELINE).map(Enum::name).orElse("no observation"));
+        }
+
+        seedMigrationDeadLetter(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
+        long sourceStateCount = mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
+        long sourceShapeCount = shapeRecordDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
+        long sourceDeadLetterCount = deadLetterDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
+        copyNestState(MIGRATION_OLD, MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc");
+        assertThat(mapStateDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"))
+                .as("the migration copied the in-flight child state")
+                .isEqualTo(sourceStateCount);
+        assertThat(shapeRecordDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"))
+                .as("the migration copied the shape record beside the map state")
+                .isEqualTo(sourceShapeCount)
+                .isPositive();
+        assertThat(deadLetterDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"))
+                .as("the migration copied the Nest's dead letters")
+                .isEqualTo(sourceDeadLetterCount)
+                .isPositive();
+
+        try (ServerHandle server = Tiers.IN_PROCESS.launch(controlUri, MIGRATION_DEFAULT);
+                MongoEndpoints mongo = new MongoEndpoints()) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.login("e2e", "e2e-password");
+            applyMigrationResources(control, source, warehouse, MIGRATION_NEW);
+            control.lifecycle(MIGRATION_PIPELINE, LifecycleVerb.START);
+            Await.until("the migrated pipeline is running before the parent arrives",
+                    () -> control.state(MIGRATION_PIPELINE).orElse(null) == PipelineState.RUNNING,
+                    () -> control.state(MIGRATION_PIPELINE).map(Enum::name).orElse("no observation"));
+
+            insertParent(source, "arrived-after-migration");
+            EndpointAddress target = EndpointAddress.uri(warehouse);
+            Await.until("the migrated child joins the parent that arrived after restart",
+                    () -> migratedDocumentHasChild(mongo, target),
+                    () -> mongo.documents(target, MIGRATION_VIEW).toString());
+
+            Document migrated = only(mongo.documents(target, MIGRATION_VIEW));
+            assertThat(migrated.getString("customer")).isEqualTo("arrived-after-migration");
+            assertThat(migrated.getList("items", Document.class))
+                    .extracting(item -> item.getString("sku"))
+                    .containsExactly("waiting-sku");
+
+            control.stop(MIGRATION_PIPELINE, true);
+            Await.until("the migrated pipeline is purged from its new database",
+                    () -> control.state(MIGRATION_PIPELINE).orElse(null) == PipelineState.STOPPED
+                            && mapStateDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc") == 0
+                            && shapeRecordDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc") == 0
+                            && deadLetterDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc") == 0,
+                    () -> "state=" + mapStateDocuments(
+                            MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc")
+                            + ", shape=" + shapeRecordDocuments(
+                                    MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc")
+                            + ", deadLetters=" + deadLetterDocuments(
+                                    MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"));
+        }
+
+        assertThat(mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
+                .as("copying, switching, and later purging never delete the rollback source")
+                .isEqualTo(sourceStateCount);
+        assertThat(shapeRecordDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
+                .as("the rollback source keeps its shape record too")
+                .isEqualTo(sourceShapeCount);
+        assertThat(deadLetterDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
+                .as("the rollback source keeps its dead letters too")
+                .isEqualTo(sourceDeadLetterCount);
+    }
+
     /**
      * The same two runs, with the second one's pipeline and view named differently - and nothing leaks.
      *
@@ -242,6 +344,17 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
         control.lifecycle(pipelineId, LifecycleVerb.START);
     }
 
+    private static void applyMigrationResources(ControlPlane control, Map<String, Object> source,
+            String warehouseUri, String stateDatabase) {
+        Map<String, String> resources = new LinkedHashMap<>();
+        resources.put("src_parents.tap.yml", sourceYaml("src_parents", source, PARENTS));
+        resources.put("src_children.tap.yml", sourceYaml("src_children", source, CHILDREN));
+        resources.put("views.tap.yml", viewsYaml(warehouseUri));
+        resources.put("pipeline.tap.yml",
+                pipelineYaml(MIGRATION_PIPELINE, MIGRATION_VIEW, stateDatabase));
+        control.apply(resources);
+    }
+
     /** One parent with two children, identical in both runs so only the changed value tells them apart. */
     private static void seed(Map<String, Object> settings) throws Exception {
         try (Connection connection = SharedMySql.connect(settings);
@@ -254,6 +367,26 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
             statement.execute("INSERT INTO " + PARENTS + " (id, customer) VALUES (1, '" + SEEDED + "')");
             statement.execute("INSERT INTO " + CHILDREN
                     + " (id, order_id, sku) VALUES (1, 1, 'sku-1'), (2, 1, 'sku-2')");
+        }
+    }
+
+    private static void seedChildWaitingForParent(Map<String, Object> settings) throws Exception {
+        try (Connection connection = SharedMySql.connect(settings);
+                Statement statement = connection.createStatement()) {
+            statement.execute("DROP TABLE IF EXISTS " + CHILDREN);
+            statement.execute("DROP TABLE IF EXISTS " + PARENTS);
+            statement.execute("CREATE TABLE " + PARENTS + " (id INT PRIMARY KEY, customer VARCHAR(64))");
+            statement.execute("CREATE TABLE " + CHILDREN
+                    + " (id INT PRIMARY KEY, order_id INT, sku VARCHAR(64))");
+            statement.execute("INSERT INTO " + CHILDREN
+                    + " (id, order_id, sku) VALUES (1, 1, 'waiting-sku')");
+        }
+    }
+
+    private static void insertParent(Map<String, Object> settings, String customer) throws Exception {
+        try (Connection connection = SharedMySql.connect(settings);
+                Statement statement = connection.createStatement()) {
+            statement.execute("INSERT INTO " + PARENTS + " (id, customer) VALUES (1, '" + customer + "')");
         }
     }
 
@@ -302,6 +435,79 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
         }
     }
 
+    private static long mapStateDocuments(String database, String pipelineId, String stepId) {
+        String prefix = "^nest\\." + pipelineId + "\\." + stepId + "\\.";
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
+            return client.getDatabase(database)
+                    .getCollection(MongoStorePort.OPERATOR_STATE)
+                    .countDocuments(new Document("_id.ns", new Document("$regex", prefix)));
+        }
+    }
+
+    private static long shapeRecordDocuments(String database, String pipelineId, String stepId) {
+        Document shape = new Document("_id.ns", "nest.shape." + pipelineId).append("_id.k", stepId);
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
+            return client.getDatabase(database)
+                    .getCollection(MongoStorePort.OPERATOR_STATE)
+                    .countDocuments(shape);
+        }
+    }
+
+    private static long deadLetterDocuments(String database, String pipelineId, String stepId) {
+        String prefix = "^nest\\." + pipelineId + "\\." + stepId + "\\.";
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
+            return client.getDatabase(database)
+                    .getCollection(MongoStorePort.NEST_DEAD_LETTERS)
+                    .countDocuments(new Document("_id.ns", new Document("$regex", prefix)));
+        }
+    }
+
+    private static void seedMigrationDeadLetter(String database, String pipelineId, String stepId) {
+        String namespace = "nest." + pipelineId + "." + stepId + ".$root";
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
+            new MongoNestDeadLetterStore(client.getDatabase(database)
+                    .getCollection(MongoStorePort.NEST_DEAD_LETTERS))
+                    .record(new NestDeadLetterRecord(
+                            namespace, "waiting-child", "src_children", "1:1", 0L, 9_000L,
+                            Map.of("sku", "waiting-sku")));
+        }
+    }
+
+    private static void copyNestState(
+            String from, String to, String pipelineId, String stepId) {
+        String prefix = "^nest\\." + pipelineId + "\\." + stepId + "\\.";
+        Document mapNamespaces = new Document("_id.ns", new Document("$regex", prefix));
+        Document shape = new Document("_id.ns", "nest.shape." + pipelineId).append("_id.k", stepId);
+        Document stateFilter = new Document("$or", List.of(mapNamespaces, shape));
+        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(from))) {
+            merge(client.getDatabase(from).getCollection(MongoStorePort.OPERATOR_STATE),
+                    to, MongoStorePort.OPERATOR_STATE, stateFilter);
+            merge(client.getDatabase(from).getCollection(MongoStorePort.NEST_DEAD_LETTERS),
+                    to, MongoStorePort.NEST_DEAD_LETTERS, mapNamespaces);
+        }
+    }
+
+    private static void merge(
+            MongoCollection<Document> source, String targetDatabase, String targetCollection, Document filter) {
+        source.aggregate(List.of(
+                        new Document("$match", filter),
+                        new Document("$merge", new Document("into", new Document("db", targetDatabase)
+                                        .append("coll", targetCollection))
+                                .append("on", "_id")
+                                .append("whenMatched", "replace")
+                                .append("whenNotMatched", "insert"))))
+                .toCollection();
+    }
+
+    private static boolean migratedDocumentHasChild(MongoEndpoints mongo, EndpointAddress target) {
+        List<Document> documents = mongo.documents(target, MIGRATION_VIEW);
+        if (documents.size() != 1) {
+            return false;
+        }
+        List<Document> items = documents.getFirst().getList("items", Document.class);
+        return items != null && items.size() == 1 && "waiting-sku".equals(items.getFirst().getString("sku"));
+    }
+
     private static String sourceYaml(String id, Map<String, Object> config, String table) {
         return """
                 version: tapstate/v1
@@ -328,6 +534,13 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     }
 
     private static String pipelineYaml(String pipelineId, String view) {
+        return pipelineYaml(pipelineId, view, null);
+    }
+
+    private static String pipelineYaml(String pipelineId, String view, String stateDatabase) {
+        String state = stateDatabase == null
+                ? ""
+                : "    state: { database: " + stateDatabase + " }\n";
         return """
                 version: tapstate/v1
                 kind: pipeline
@@ -337,6 +550,7 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                 transforms:
                   - id: order_doc
                     type: nest
+                %s
                     from: { o: orders, i: order_items }
                     root:
                       from: o
@@ -347,6 +561,6 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                   id: %s
                   from: order_doc
                   primary_key: id
-                """.formatted(pipelineId, view);
+                """.formatted(pipelineId, state, view);
     }
 }

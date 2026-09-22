@@ -10,7 +10,10 @@ import com.hazelcast.jet.core.DAG;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.spi.store.OperatorStateStore;
+import io.tapstate.spi.store.OperatorStateStores;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.AfterEach;
@@ -94,6 +97,34 @@ class ANewStatefulComponentNeedsNoEditToBePurgedTest {
         // unmentioned in the one a cautious user reads.
         assertThat(PipelineStateInventory.describe(false, new NewComponentDagSource().stateHeldBy(PIPELINE)))
                 .contains(ITS_LABEL);
+    }
+
+    @Test
+    void aDefaultLocationResolvesThroughTheDeploymentsActualDefaultDatabase() {
+        var state = new InMemoryKeyedStateStore();
+        var deadLetters = new InMemoryNestDeadLetterStore();
+        List<String> routedDatabases = new ArrayList<>();
+        OperatorStateStores stores = new OperatorStateStores() {
+            @Override
+            public String defaultDatabase() {
+                return "operator_state_default";
+            }
+
+            @Override
+            public OperatorStateStore inDatabase(String database) {
+                routedDatabases.add(database);
+                return new OperatorStateStore(state, deadLetters);
+            }
+        };
+        NestStateTeardown teardown = new NestStateTeardown(member, stores);
+        routedDatabases.clear();
+
+        teardown.willKeepStateAt(PIPELINE,
+                new NewComponentDagSource().stateLocations(PIPELINE, stores.defaultDatabase()));
+        teardown.noteLocations(PIPELINE, Set.of());
+        teardown.finishPending(PIPELINE);
+
+        assertThat(routedDatabases).containsOnly("operator_state_default");
     }
 
     private EngineLifecycleActuator actuator(InMemoryStorePort store) {

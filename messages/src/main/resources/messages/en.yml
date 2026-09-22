@@ -684,6 +684,9 @@ nest.memory-budget-below-partition-count:
 nest.memory-budget-changed-while-running:
   message: "Nest state {namespace} is already configured to hold {configured} entries in memory on this process, and this pipeline asks for {requested}."
   solution: "Restart the process to pick up the new budget: what a state map holds is settled the first time that map is configured and cannot be changed while the process runs, so restarting the pipeline alone would leave it on the earlier number."
+nest.state-database-changed-while-running:
+  message: "Nest state {namespace} is already routed to database {configured} on this process, and this pipeline asks for {requested}."
+  solution: "Stop every writer and restart the server before changing this nest's state database. Migrate operator state and dead letters first, or purge the pipeline state and run a full replay."
 nest.state-paths-changed:
   message: "Nest {stepId} stored its state under {recorded}, and now compiles to {compiled}."
   solution: "Stop the pipeline and start it again rather than resuming: renaming an embed path or inserting a level leaves the stored state where nothing reads it, and the new paths start empty beside documents that are not."

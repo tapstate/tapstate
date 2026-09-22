@@ -20,8 +20,10 @@ import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
 import io.tapstate.runtime.engine.nest.NestMemoryBudget;
 import io.tapstate.runtime.engine.nest.NestSettings;
+import io.tapstate.runtime.engine.nest.NestStatePlacement;
 import io.tapstate.runtime.engine.nest.NestStateMetricNames;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.OperatorStateStores;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -58,16 +60,21 @@ public final class Engine {
      * The layer behind the nest state maps, asked how much a namespace holds altogether. Absent on a run
      * that keeps its state in memory alone, where what is in memory is all there is.
      */
-    private final KeyedStateStore nestState;
+    private final OperatorStateStores operatorStateStores;
 
     public Engine(HazelcastInstance member) {
-        this(member, null);
+        this(member, (OperatorStateStores) null);
     }
 
     /** An engine that can also say how much of a nest's state is on the layer behind its memory. */
     public Engine(HazelcastInstance member, KeyedStateStore nestState) {
+        this(member, nestState == null ? null : OperatorStateStores.stateOnly("default", nestState));
+    }
+
+    /** An engine resolving each nest namespace through the deployment's operator-state stores. */
+    public Engine(HazelcastInstance member, OperatorStateStores operatorStateStores) {
         this.member = Objects.requireNonNull(member, "member");
-        this.nestState = nestState;
+        this.operatorStateStores = operatorStateStores;
     }
 
     /**
@@ -103,6 +110,22 @@ public final class Engine {
                 .setName(pipelineId)
                 .setProcessingGuarantee(ProcessingGuarantee.NONE);
         member.getJet().newJobIfAbsent(dag, config);
+    }
+
+    /** Submits after pinning every nest namespace to the database the compiled artifact resolved. */
+    public void submit(String pipelineId, DAG dag, Map<String, String> stateDatabases,
+            NestSettings settings) {
+        configureNestState(stateDatabases, settings);
+        JobFailureRegistry.of(member).clear(pipelineId);
+        JobConfig config = new JobConfig()
+                .setName(pipelineId)
+                .setProcessingGuarantee(ProcessingGuarantee.NONE);
+        member.getJet().newJobIfAbsent(dag, config);
+    }
+
+    /** Validates and pins placement before capture or graph construction performs a side effect. */
+    public void configureNestState(Map<String, String> stateDatabases, NestSettings settings) {
+        NestStatePlacement.applyTo(member, stateDatabases, settings);
     }
 
     /** Pauses the pipeline's running job. The job is kept so it can be resumed. */
@@ -673,7 +696,12 @@ public final class Engine {
      * write. Here it is paid once per namespace by whoever is reporting.
      */
     private OptionalLong stored(String namespace) {
-        return nestState == null ? OptionalLong.empty() : OptionalLong.of(nestState.count(namespace));
+        if (operatorStateStores == null) {
+            return OptionalLong.empty();
+        }
+        String database = NestStatePlacement.databaseOf(
+                member, namespace, operatorStateStores.defaultDatabase());
+        return OptionalLong.of(operatorStateStores.inDatabase(database).state().count(namespace));
     }
 
     /**
