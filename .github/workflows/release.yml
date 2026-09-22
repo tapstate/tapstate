@@ -344,6 +344,38 @@ jobs:
           ref: ${{ needs.version.outputs.sha }}
       - name: write the release version into every file that pins one
         run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      # The satellite branch was created during the freeze before this build begins. Checking out its
+      # explicit branch makes the Web revision a release input rather than whatever reaches main while
+      # this workflow is running. The token is the existing satellite credential and never appears in
+      # output or in the packaged provenance.
+      - uses: actions/checkout@v4
+        with:
+          repository: tapstate/tapstate-web
+          ref: ws/release-${{ needs.version.outputs.version }}
+          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+          path: tapstate-web
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: tapstate-web/pnpm-lock.yaml
+      - name: build the pinned Web production bundle
+        working-directory: tapstate-web
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm lint
+          pnpm --filter web i18n:check
+          pnpm --filter web test
+          pnpm build
+      - name: stage the pinned Web bundle for the Boot JAR
+        run: |
+          web_revision="$(git -C tapstate-web rev-parse HEAD)"
+          bash scripts/prepare-web-assets.sh \
+            --web-root tapstate-web \
+            --web-revision "$web_revision" \
+            --output app/target/generated-resources/tapstate-web
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
