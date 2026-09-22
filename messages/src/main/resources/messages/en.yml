@@ -8,6 +8,9 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+cluster.membership-unreadable:
+  message: "This member cannot read who is in the cluster right now."
+  solution: "Its engine member is not active, which is what a member looks like while it is starting, while it is stopping, and while the cluster is putting itself back together after a partition healed. Ask another member, or read again in a moment."
 actuation.pipeline-not-found:
   message: "No pipeline artifact `{pipeline}` is stored to run."
   solution: "Apply the pipeline before starting it, and check the id for typos."

@@ -7,8 +7,10 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.IntFunction;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -276,12 +278,27 @@ final class PartitionableCluster implements AutoCloseable {
             java.util.function.Predicate<List<String>> settled) {
         ControlPlane plane = member(asSeenBy);
         AtomicReference<List<String>> seen = new AtomicReference<>(List.of());
+        AtomicInteger refused = new AtomicInteger();
         Await.until(asSeenBy + " " + what, budget,
                 () -> {
-                    seen.set(plane.clusterMemberNodeIds());
+                    Optional<List<String>> answered = plane.clusterMemberNodeIdsIfAnswered();
+                    // A member that says it cannot read the cluster has not answered this question, so
+                    // the wait goes on. Ending it here would end it on a window the cluster passes
+                    // through on its way to the very state being waited for -- and a poll that dies on
+                    // its first transient is not a poll. How many times it happened is carried into the
+                    // timeout message, because a member that refused every single poll and one that
+                    // never refused at all fail this in the same words otherwise.
+                    if (answered.isEmpty()) {
+                        refused.incrementAndGet();
+                        return false;
+                    }
+                    seen.set(answered.get());
                     return settled.test(seen.get());
                 },
-                () -> "the membership it reported was still " + seen.get());
+                () -> "the membership it reported was still " + seen.get()
+                        + (refused.get() == 0 ? ""
+                                : ", and on " + refused.get() + " of the polls it answered that it "
+                                        + "could not read the cluster at all"));
         return seen.get();
     }
 

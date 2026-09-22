@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.tapstate.control.core.ClusterError;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -186,6 +187,21 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
                     Await.until("the store to answer these members again", RECOVERY,
                             () -> control.state(PIPELINE).isPresent(),
                             () -> "the read face says " + stateOn(control));
+
+                    // With the store answering and nothing rejoined yet, this read reaches the engine
+                    // half for the only stretch in this case where it can: the durable half of the
+                    // answer is readable again, and the member that would supply the live half shut its
+                    // own engine down when its session lapsed and does not restart it. What it must not
+                    // answer here is a page carrying no code, which a caller cannot tell from the
+                    // product having fallen over -- nor the reading that is worse still, a plain 200
+                    // saying this member is in a cluster of nobody.
+                    for (String nodeId : nodes) {
+                        assertThat(cluster.member(nodeId).clusterReadRefusal())
+                                .describedAs("%s says in a code that it cannot read the cluster, rather "
+                                        + "than answering an empty one and rather than refusing without "
+                                        + "saying why", nodeId)
+                                .contains(ClusterError.MEMBERSHIP_UNREADABLE.code());
+                    }
 
                     // Nothing comes back on its own, so the way back is a restart -- and what has to
                     // hold on the way back is that the run resumes under exactly one owner. Keeping a

@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
@@ -272,9 +273,81 @@ final class ControlPlane {
     List<String> clusterMemberNodeIds() {
         HttpResponse<String> response = send(authedGet("/api/cluster/members"));
         expect(response, 200, "read who is in the cluster");
-        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> topology)
+        return nodeIdsIn(response.body());
+    }
+
+    /**
+     * The same read, with the one refusal a healthy cluster produces told apart from an answer.
+     *
+     * <p>A member cannot always answer this. It shuts its own engine member down while it cannot renew
+     * its node session, the library restarts that member on the smaller side once a split brain heals,
+     * and this HTTP face -- which is neither -- goes on being asked throughout both. It says so with a
+     * code, and a wait that read that as a failure would end on the first one rather than waiting the
+     * cluster out, which is not a poll: the window is on the way to the state being waited for.
+     *
+     * <p>Every other non-200 still fails here and now. Tolerating those would make this wait patient
+     * about exactly the answer a partition case exists to catch.
+     */
+    Optional<List<String>> clusterMemberNodeIdsIfAnswered() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        return interpretClusterMembers(response.statusCode(), response.body());
+    }
+
+    /**
+     * Nothing when this member answered who is in its cluster; the code it refused with when it could
+     * not.
+     *
+     * <p>A refusal carrying no code at all fails here rather than being reported as one of them. An
+     * uncoded page is precisely what a caller cannot tell from the product having fallen over, so a
+     * case that folded it in with the coded refusals would be asserting the thing it means to rule out.
+     */
+    Optional<String> clusterReadRefusal() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        return interpretClusterRefusal(response.statusCode(), response.body());
+    }
+
+    /**
+     * What a membership answer is allowed to mean, read the way a status answer is: one code of the
+     * product's own reads as "not now, ask again", and every other refusal stays loud.
+     *
+     * <p>Pinned as a decision over a status and a body rather than only through a live cluster, because
+     * a running product is least willing to produce these two answers on demand -- and confusing them
+     * is what a wait over this face has to be incapable of.
+     */
+    static Optional<List<String>> interpretClusterMembers(int status, String body) {
+        if (status != 200 && ClusterError.MEMBERSHIP_UNREADABLE.code().equals(codeOf(body))) {
+            return Optional.empty();
+        }
+        if (status != 200) {
+            throw new AssertionError("could not read who is in the cluster: expected HTTP 200, got "
+                    + status + " - " + body);
+        }
+        return Optional.of(nodeIdsIn(body));
+    }
+
+    /**
+     * Nothing when this member answered who is in its cluster; the code it refused with when it could
+     * not; loud when it refused without one.
+     *
+     * <p>An uncoded page is precisely what a caller cannot tell from the product having fallen over, so
+     * a case that folded one in with the coded refusals would pass over the thing it means to rule out.
+     */
+    static Optional<String> interpretClusterRefusal(int status, String body) {
+        if (status == 200) {
+            return Optional.empty();
+        }
+        String code = codeOf(body);
+        if (code == null) {
+            throw new AssertionError("this member would not say who is in the cluster, and would not "
+                    + "say why either: HTTP " + status + " - " + body);
+        }
+        return Optional.of(code);
+    }
+
+    private static List<String> nodeIdsIn(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> topology)
                 || !(topology.get("members") instanceof List<?> members)) {
-            throw new AssertionError("the topology carried no members at all: " + response.body());
+            throw new AssertionError("the topology carried no members at all: " + body);
         }
         List<String> nodeIds = new ArrayList<>();
         for (Object member : members) {

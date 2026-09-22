@@ -108,6 +108,7 @@ cli.watch-needs-a-terminal
 cli.workspace-has-no-pipeline
 cli.workspace-not-writable
 cli.workspace-unreadable
+cluster.membership-unreadable
 connector.ambiguous-connector-class
 connector.ambiguous-registration
 connector.api-level-incompatible

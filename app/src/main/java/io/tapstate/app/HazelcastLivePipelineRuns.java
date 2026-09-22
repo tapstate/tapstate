@@ -1,14 +1,17 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricTags;
+import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.LivePipelineProcessor;
 import io.tapstate.control.core.LivePipelineRun;
 import io.tapstate.control.core.LivePipelineRuns;
 import io.tapstate.control.core.LivePipelineVertex;
+import io.tapstate.core.common.TapstateException;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -57,13 +60,20 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
     @Override
     public List<LivePipelineRun> runs() {
         List<LivePipelineRun> live = new ArrayList<>();
-        for (Job job : member.getJet().getJobs()) {
-            // A terminal job is kept under its name; reporting one would say a stopped pipeline is
-            // running on the members that last ran it.
-            if (job.getName() == null || job.getStatus().isTerminal()) {
-                continue;
+        try {
+            for (Job job : member.getJet().getJobs()) {
+                // A terminal job is kept under its name; reporting one would say a stopped pipeline is
+                // running on the members that last ran it.
+                if (job.getName() == null || job.getStatus().isTerminal()) {
+                    continue;
+                }
+                live.add(runOf(job));
             }
-            live.add(runOf(job));
+        } catch (HazelcastInstanceNotActiveException notActive) {
+            // The same window the member half refuses in, and the same code: one cause does not become
+            // two answers because the read has two halves. An empty list would be worse than either --
+            // it reads as this member having looked and found the cluster running nothing.
+            throw new TapstateException(ClusterError.MEMBERSHIP_UNREADABLE, Map.of(), notActive);
         }
         return List.copyOf(live);
     }
