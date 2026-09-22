@@ -163,7 +163,7 @@ public final class ApplyService {
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
-        List<Resource> storedResources = store.list();
+        List<Resource> storedResources = ReadableArtifactInventory.list(store);
         List<Resource> candidate = new ArrayList<>();
         for (Resource stored : storedResources) {
             if (!submittedIds.contains(stored.id())) {
@@ -351,7 +351,7 @@ public final class ApplyService {
         ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
         if (live != null) {
-            List<Resource> stored = store.list();
+            List<Resource> stored = ReadableArtifactInventory.list(store);
             if (prepared.resource() instanceof SourceResource replacement) {
                 live.refuseBufferingChangeWhileLive(
                         storedSource(stored, replacement.id()), replacement, stored);
@@ -414,7 +414,7 @@ public final class ApplyService {
         List<AuditContext> audited = new ArrayList<>();
         Map<String, String> enforced = new LinkedHashMap<>();
         // Read once for the refusal below, and only when there is a reading to judge against.
-        List<Resource> stored = live == null ? List.of() : store.list();
+        List<Resource> stored = live == null ? List.of() : ReadableArtifactInventory.list(store);
         for (PreparedArtifact prepared : plan.artifacts()) {
             ArtifactOutcome outcome = outcome(prepared);
             if (outcome.change() != ArtifactOutcome.Change.UNCHANGED) {
