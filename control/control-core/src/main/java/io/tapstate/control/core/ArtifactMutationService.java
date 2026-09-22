@@ -248,6 +248,9 @@ public final class ArtifactMutationService {
         Resource target = store.get(id)
                 .orElseThrow(() -> error(ArtifactError.NOT_FOUND, Map.of("id", id)));
 
+        // A read-only inventory may omit a row this build cannot reconstruct. A destructive check may
+        // not: without the resource, its references are unknown rather than absent, so the strict list
+        // fails closed before any audit record or deletion is written.
         refuseWhenReferenced(id, store.list());
         if (target instanceof PipelineResource) {
             refuseWhenNotStopped(id);
