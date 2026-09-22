@@ -163,7 +163,7 @@ public final class ApplyService {
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
-        List<Resource> storedResources = store.list();
+        List<Resource> storedResources = ReadableArtifactInventory.list(store);
         List<Resource> candidate = new ArrayList<>();
         for (Resource stored : storedResources) {
             if (!submittedIds.contains(stored.id())) {
@@ -351,10 +351,12 @@ public final class ApplyService {
         ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
         if (live != null) {
-            List<Resource> stored = store.list();
+            ReadableArtifactInventory.Snapshot inventory = ReadableArtifactInventory.scan(store);
+            List<Resource> stored = inventory.resources();
             if (prepared.resource() instanceof SourceResource replacement) {
                 live.refuseBufferingChangeWhileLive(
-                        storedSource(stored, replacement.id()), replacement, stored);
+                        storedSource(stored, replacement.id()), replacement, stored,
+                        inventory.unreadablePipelineIds());
             }
             if (prepared.resource() instanceof PipelineResource replacement) {
                 live.refuseBufferingChangeWhileLive(
@@ -414,13 +416,18 @@ public final class ApplyService {
         List<AuditContext> audited = new ArrayList<>();
         Map<String, String> enforced = new LinkedHashMap<>();
         // Read once for the refusal below, and only when there is a reading to judge against.
-        List<Resource> stored = live == null ? List.of() : store.list();
+        ReadableArtifactInventory.Snapshot inventory = live == null
+                ? null : ReadableArtifactInventory.scan(store);
+        List<Resource> stored = inventory == null ? List.of() : inventory.resources();
+        List<String> unreadablePipelineIds = inventory == null
+                ? List.of() : inventory.unreadablePipelineIds();
         for (PreparedArtifact prepared : plan.artifacts()) {
             ArtifactOutcome outcome = outcome(prepared);
             if (outcome.change() != ArtifactOutcome.Change.UNCHANGED) {
                 if (live != null && prepared.resource() instanceof SourceResource replacement) {
                     live.refuseBufferingChangeWhileLive(
-                            storedSource(stored, replacement.id()), replacement, stored);
+                            storedSource(stored, replacement.id()), replacement, stored,
+                            unreadablePipelineIds);
                 }
                 if (live != null && prepared.resource() instanceof PipelineResource replacement) {
                     live.refuseBufferingChangeWhileLive(

@@ -713,7 +713,7 @@ class DataBrowserApiTest {
 
         @Override
         public Optional<Resource> get(String id) {
-            return source.id().equals(id) ? Optional.of(source) : Optional.empty();
+            return declared.stream().filter(resource -> resource.id().equals(id)).findFirst();
         }
 
         @Override

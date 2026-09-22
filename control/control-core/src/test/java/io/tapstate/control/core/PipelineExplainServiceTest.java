@@ -128,8 +128,8 @@ class PipelineExplainServiceTest {
     void stalledChainsAreEvidenceInDictionaryOrder() {
         Map<String, Long> metrics = new LinkedHashMap<>();
         metrics.put("recordCount", 128L);
-        metrics.put("frontierStalledMillis.zeta", 1_000L);
-        metrics.put("frontierStalledMillis.alpha", 2_000L);
+        metrics.put("frontierStalledMillis.zeta", 96_000L);
+        metrics.put("frontierStalledMillis.alpha", 60_000L);
         Observation observation = observation(PipelineState.RUNNING, metrics, 1, NOW.minusSeconds(2));
 
         PipelineExplanation answer = service(observation).explain(ID);
@@ -138,6 +138,25 @@ class PipelineExplainServiceTest {
         assertThat(answer.evidence()).extracting(Evidence::field)
                 .containsExactly("frontierStalledMillis.alpha", "frontierStalledMillis.zeta");
         assertThat(answer.next().action()).isEqualTo(NextAction.CHECK_TARGET);
+    }
+
+    @Test
+    void subThresholdPausesRemainTypedEvidenceWithoutAStoppedChainDiagnosis() {
+        Observation observation = observation(PipelineState.RUNNING, Map.of(
+                "reconcileFailuresInARow", 0L,
+                "recordCount", 11L,
+                "frontierStalledMillis.shipments", 9L,
+                "frontierStalledMillis.orders", 196L), 11, NOW.minusSeconds(2));
+
+        PipelineExplanation answer = service(observation).explain(ID);
+
+        assertThat(answer.kind()).isEqualTo(Kind.NO_MATCH);
+        assertThat(answer.evidence())
+                .filteredOn(evidence -> evidence.field().equals("frontierStalledMillis"))
+                .containsExactly(new Evidence(Source.METRICS, "frontierStalledMillis", Map.of(
+                        "orders", 196L,
+                        "shipments", 9L)));
+        assertThat(answer.next()).isNull();
     }
 
     @Test

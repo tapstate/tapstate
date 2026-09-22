@@ -18,6 +18,8 @@ import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
@@ -131,6 +133,40 @@ class ApplyServiceTest {
                 "author", replacement, CanonicalHash.of(store.get("orders_src").orElseThrow())))
                 .isInstanceOfSatisfying(TapstateException.class, refused ->
                         assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    @Test
+    void typedReplaceFailsClosedWhenALivePipelineIsUnreadable() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        String sourceBefore = stored("orders_src");
+        store.makeUnreadable("p1");
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+        Resource replacement = new DslParser().parse(UNBUFFERED_SRC);
+
+        assertThatThrownBy(() -> guarded.replace(
+                "author", replacement, CanonicalHash.of(store.get("orders_src").orElseThrow())))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                    assertThat(refused.args()).containsExactlyInAnyOrderEntriesOf(
+                            Map.of("id", "p1", "field", "body"));
+                });
+        assertThat(stored("orders_src")).isEqualTo(sourceBefore);
+    }
+
+    @Test
+    void batchApplyFailsClosedWhenALivePipelineIsUnreadable() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        String sourceBefore = stored("orders_src");
+        store.makeUnreadable("p1");
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+
+        assertThatThrownBy(() -> guarded.apply("author", List.of(draft(UNBUFFERED_SRC))))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                    assertThat(refused.args()).containsExactlyInAnyOrderEntriesOf(
+                            Map.of("id", "p1", "field", "body"));
+                });
+        assertThat(stored("orders_src")).isEqualTo(sourceBefore);
     }
 
     /** A cdc source whose changes are buffered through the shared replay store. */
@@ -1202,6 +1238,7 @@ class ApplyServiceTest {
         private final CanonicalWriter writer = new CanonicalWriter();
         private final DslParser parser = new DslParser();
         private final Map<String, String> byId = new LinkedHashMap<>();
+        private final List<String> unreadable = new ArrayList<>();
         private final List<List<String>> saveAllBatches = new ArrayList<>();
         private int saveCount = 0;
         private String failOnId = null;
@@ -1242,6 +1279,7 @@ class ApplyServiceTest {
                 }
             }
             byId.put(write.resource().id(), writer.write(write.resource()));
+            unreadable.remove(write.resource().id());
             saveCount++;
             saveAllBatches.add(List.of(write.resource().id()));
             return ArtifactBatchWrite.applied();
@@ -1275,6 +1313,7 @@ class ApplyServiceTest {
                 staged.put(artifact.id(), writer.write(artifact));
             }
             byId.putAll(staged);
+            unreadable.removeAll(staged.keySet());
             saveCount += artifacts.size();
             saveAllBatches.add(artifacts.stream().map(Resource::id).toList());
             return Optional.empty();
@@ -1292,21 +1331,53 @@ class ApplyServiceTest {
         /** Commits {@code canonical} for {@code id} directly, as another author's apply would. */
         void landDirectly(Resource artifact) {
             byId.put(artifact.id(), writer.write(artifact));
+            unreadable.remove(artifact.id());
         }
 
         @Override
         public Optional<Resource> get(String id) {
+            if (unreadable.contains(id)) {
+                throw unreadable(id);
+            }
             String canonical = byId.get(id);
             return canonical == null ? Optional.empty() : Optional.of(parser.parse(canonical));
         }
 
         @Override
         public List<Resource> list() {
+            if (!unreadable.isEmpty()) {
+                throw unreadable(unreadable.getFirst());
+            }
             List<Resource> resources = new ArrayList<>();
             for (String canonical : byId.values()) {
                 resources.add(parser.parse(canonical));
             }
             return resources;
+        }
+
+        @Override
+        public List<StoredArtifactRecord> listStored() {
+            List<StoredArtifactRecord> rows = new ArrayList<>();
+            for (Map.Entry<String, String> entry : byId.entrySet()) {
+                Resource resource = parser.parse(entry.getValue());
+                rows.add(unreadable.contains(entry.getKey())
+                        ? new StoredArtifactRecord(
+                                resource.id(), resource.kind(), null, CanonicalHash.of(resource), false)
+                        : StoredArtifactRecord.of(resource));
+            }
+            return List.copyOf(rows);
+        }
+
+        void makeUnreadable(String id) {
+            if (!byId.containsKey(id)) {
+                throw new IllegalArgumentException("no stored artifact " + id);
+            }
+            unreadable.add(id);
+        }
+
+        private static TapstateException unreadable(String id) {
+            return new TapstateException(
+                    IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", "settings"), null);
         }
     }
 }
