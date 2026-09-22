@@ -9,26 +9,33 @@ import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * A stored artifact this build cannot read does not hide an unrelated readable pipeline from the
- * control plane's list.
+ * A stored artifact this build cannot read is isolated from tolerant read-only listings but still makes
+ * a destructive reference check fail closed.
  *
  * <p>The unreadable row is made in the real Mongo store after both pipelines are accepted over HTTP.
- * The list is then read over HTTP as well, so a strict whole-store reconstruction fails this case before
- * it can return the readable pipeline. One tier is enough: the behavior under test sits between the HTTP
- * controller and the same real store used by both launchers, not at the process boundary.
+ * The list and deletion are then driven over HTTP, so these cases cover both inventory policies against
+ * the real stored shape. One tier is enough: the behavior under test sits between the HTTP controller and
+ * the same real store used by both launchers, not at the process boundary.
  */
 class UnreadableArtifactIsolationIT {
 
     private static final String READABLE_ID = "readable_pipeline";
     private static final String UNREADABLE_ID = "unreadable_pipeline";
+    private static final String SOURCE_ID = "referenced_source";
+    private static final String REFERRER_ID = "unreadable_referrer";
 
     @BeforeAll
     static void requireDocker() {
@@ -52,6 +59,30 @@ class UnreadableArtifactIsolationIT {
         }
     }
 
+    @Test
+    void anUnreadableReferencingPipelineCannotLetItsSourceBeDeleted(@TempDir Path directory)
+            throws Exception {
+        String storeUri = SharedMongo.replicaSetUrl("unreadable_artifact_reference");
+        try (ServerHandle server = InProcessServer.start(storeUri);
+                MongoClient store = MongoClients.create(storeUri)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
+            control.registerConnector(
+                    E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            control.apply(referencingWorkspace());
+            ControlPlane.StoredArtifact source = control.artifact(SOURCE_ID).orElseThrow();
+
+            makeFieldUnreadable(store, storeUri, REFERRER_ID, "body.settings");
+
+            assertThatThrownBy(() -> control.deleteArtifact(SOURCE_ID, source.contentHash()))
+                    .isInstanceOf(AssertionError.class)
+                    .hasMessageContaining("got 500")
+                    .hasMessageContaining("io.document-unreadable");
+            assertThat(control.artifact(SOURCE_ID)).contains(source);
+        }
+    }
+
     private static String pipeline(String id) {
         return """
                 version: tapstate/v1
@@ -61,7 +92,39 @@ class UnreadableArtifactIsolationIT {
                 """.formatted(id);
     }
 
+    private static Map<String, String> referencingWorkspace() {
+        Map<String, String> resources = new LinkedHashMap<>();
+        resources.put("source.tap.yml", """
+                version: tapstate/v1
+                kind: source
+                id: %s
+                connector: %s
+                config: { uri: "/tmp/%s" }
+                mode: cdc
+                tables: [ orders ]
+                """.formatted(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, SOURCE_ID));
+        resources.put("pipeline.tap.yml", """
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: %s
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - { type: filter, from: [orders], expr: "op != 'd'" }
+                serve:
+                  from: orders
+                  sync:
+                    - source: %s
+                """.formatted(REFERRER_ID, SOURCE_ID, SOURCE_ID));
+        return resources;
+    }
+
     private static void makeBodyUnreadable(MongoClient store, String storeUri, String id) {
+        makeFieldUnreadable(store, storeUri, id, "body");
+    }
+
+    private static void makeFieldUnreadable(
+            MongoClient store, String storeUri, String id, String field) {
         String database = new ConnectionString(storeUri).getDatabase();
         if (database == null) {
             throw new AssertionError("the store URI names no database");
@@ -70,7 +133,7 @@ class UnreadableArtifactIsolationIT {
                 .getCollection(MongoStorePort.ARTIFACTS)
                 .updateOne(
                         new Document("_id", id),
-                        new Document("$set", new Document("body", "unreadable")))
+                        new Document("$set", new Document(field, "unreadable")))
                 .getMatchedCount();
         assertThat(matched).as("the stored artifact selected for corruption").isEqualTo(1L);
     }
