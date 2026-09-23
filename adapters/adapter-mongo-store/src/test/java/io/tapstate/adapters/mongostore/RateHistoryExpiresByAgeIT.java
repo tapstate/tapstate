@@ -58,14 +58,17 @@ class RateHistoryExpiresByAgeIT {
 
             Instant deadline = Instant.now().plusSeconds(60);
             while (Instant.now().isBefore(deadline)
-                    && !history.readBetween("stopped", now.minusSeconds(3600), now.plusSeconds(60)).isEmpty()) {
+                    && !history.readPage("stopped", now.minusSeconds(3600), now.plusSeconds(60), null, 10)
+                            .entries().isEmpty()) {
                 Thread.sleep(500);
             }
 
-            List<RateSample> running = history.readBetween("running", now.minusSeconds(3600), now.plusSeconds(60));
+            List<RateSample> running = history
+                    .readPage("running", now.minusSeconds(3600), now.plusSeconds(60), null, 10)
+                    .entries().stream().map(io.tapstate.spi.store.RateHistoryStore.Entry::sample).toList();
             assertThat(running).as("the old sample of the running pipeline has gone, the young one stays")
                     .extracting(RateSample::observedAt).containsExactly(now.minusSeconds(0).truncatedTo(java.time.temporal.ChronoUnit.MILLIS));
-            assertThat(history.readBetween("stopped", now.minusSeconds(3600), now.plusSeconds(60)))
+            assertThat(history.readPage("stopped", now.minusSeconds(3600), now.plusSeconds(60), null, 10).entries())
                     .as("the pipeline that stopped writing had its old sample taken away all the same")
                     .isEmpty();
         }

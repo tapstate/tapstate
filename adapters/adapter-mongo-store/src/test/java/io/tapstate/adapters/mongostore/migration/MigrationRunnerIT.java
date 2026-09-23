@@ -90,6 +90,18 @@ class MigrationRunnerIT {
     }
 
     @Test
+    void bringsAStoreAtTheConsumerCursorVersionForwardToTheHistoryKeysetIndex() {
+        MongoDatabase database = freshDatabase("runner_history_keyset_after_consumer_cursors");
+        seedSchemaDocument(database, 10, null);
+
+        MigrationRunner.migrate(database);
+
+        assertThat(installedVersion(database)).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
+        assertThat(indexNames(database, SystemCollections.PIPELINE_RATE_HISTORY))
+                .contains("pipelineId_observedAt__id_idx");
+    }
+
+    @Test
     void runningItAgainstTheSameStoreAgainChangesNothing() {
         MongoDatabase database = freshDatabase("runner_twice");
 
@@ -293,7 +305,7 @@ class MigrationRunnerIT {
                 .containsExactly("V1BaselineIndexes", "V2StructuredArtifacts", "V3RecordedSrsSwitches",
                         "V4DiscardInventedPositions", "V5SplitSourceSchemas", "V6SplitDerivedSchemas",
                         "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
-                        "V10SrsConsumerOffsetIndexes");
+                        "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex");
 
         MigrationRunner.migrate(database);
 

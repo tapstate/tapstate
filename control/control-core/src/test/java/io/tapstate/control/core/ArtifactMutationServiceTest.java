@@ -28,6 +28,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.PipelineLayoutStore;
@@ -35,6 +36,7 @@ import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -201,6 +203,24 @@ class ArtifactMutationServiceTest {
         assertThat(store.get("orders")).isPresent();
         assertThat(store.get("alpha")).isPresent();
         assertThat(store.get("zeta")).isPresent();
+    }
+
+    @Test
+    void anUnreadableReferencingPipelineFailsClosedAndLeavesItsSourceStored() {
+        SourceResource orders = source("orders");
+        PipelineResource reader = pipelineReading("reader", "orders");
+        store.saveAll(List.of(orders, reader));
+
+        // The raw row still contains the source edge, but another part of its body can no longer be
+        // reconstructed by this build. A destructive check cannot turn that unknown edge into no edge.
+        store.makeUnreadable("reader");
+
+        assertThatThrownBy(() -> service.delete(PRINCIPAL, "orders", hash(orders)))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                    assertThat(failure.args()).containsEntry("id", "reader");
+                });
+        assertThat(store.get("orders")).contains(orders);
     }
 
     @Test
@@ -770,6 +790,7 @@ class ArtifactMutationServiceTest {
     private static final class InMemoryArtifactStore implements ArtifactStore {
 
         private final Map<String, Resource> artifacts = new LinkedHashMap<>();
+        private final List<String> unreadable = new ArrayList<>();
         /** Another caller acting in the window between the removal and the reclaim that follows it. */
         private Runnable afterDelete = null;
 
@@ -793,17 +814,48 @@ class ArtifactMutationServiceTest {
 
         @Override
         public synchronized void saveAll(List<Resource> resources) {
-            resources.forEach(resource -> artifacts.put(resource.id(), resource));
+            resources.forEach(resource -> {
+                artifacts.put(resource.id(), resource);
+                unreadable.remove(resource.id());
+            });
         }
 
         @Override
         public synchronized Optional<Resource> get(String id) {
+            if (unreadable.contains(id)) {
+                throw unreadable(id);
+            }
             return Optional.ofNullable(artifacts.get(id));
         }
 
         @Override
         public synchronized List<Resource> list() {
+            if (!unreadable.isEmpty()) {
+                throw unreadable(unreadable.getFirst());
+            }
             return new ArrayList<>(artifacts.values());
+        }
+
+        @Override
+        public synchronized List<StoredArtifactRecord> listStored() {
+            return artifacts.values().stream()
+                    .map(resource -> unreadable.contains(resource.id())
+                            ? new StoredArtifactRecord(
+                                    resource.id(), resource.kind(), null, hash(resource), false)
+                            : StoredArtifactRecord.of(resource))
+                    .toList();
+        }
+
+        synchronized void makeUnreadable(String id) {
+            if (!artifacts.containsKey(id)) {
+                throw new IllegalArgumentException("no stored artifact " + id);
+            }
+            unreadable.add(id);
+        }
+
+        private static TapstateException unreadable(String id) {
+            return new TapstateException(
+                    IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", "settings"), null);
         }
     }
 
@@ -830,9 +882,24 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
-        public List<io.tapstate.core.lifecycle.RateSample> readBetween(
-                String pipelineId, java.time.Instant from, java.time.Instant to) {
-            return List.of();
+        public Page readPage(String pipelineId, java.time.Instant from, java.time.Instant to,
+                Key after, int limit) {
+            return new Page(List.of(), false);
+        }
+
+        @Override
+        public java.util.Optional<Entry> predecessor(String pipelineId, java.time.Instant at) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public java.util.Optional<Entry> read(String pipelineId, Key key) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public java.util.Optional<Entry> successor(String pipelineId, java.time.Instant at) {
+            return java.util.Optional.empty();
         }
 
         @Override

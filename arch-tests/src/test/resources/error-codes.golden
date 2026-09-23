@@ -190,7 +190,10 @@ mcp.server-rejected
 migration.changeset-failed
 migration.data-newer-than-binary
 migration.lock-timeout
+monitor.cursor-expired
+monitor.invalid-cursor
 monitor.no-observation
+monitor.query-budget-exceeded
 nest.append-mode-conflicts-with-key-tracking
 nest.array-key-unresolvable
 nest.capacity-estimate-incomplete

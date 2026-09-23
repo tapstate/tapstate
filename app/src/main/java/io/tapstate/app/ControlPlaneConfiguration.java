@@ -37,6 +37,9 @@ import io.tapstate.control.core.PipelineLifecycleService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineChains;
+import io.tapstate.control.core.HistoryCursorCodec;
+import io.tapstate.control.core.PipelineExplainService;
+import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineProjectionService;
@@ -78,6 +81,7 @@ import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.DataBrowser;
 import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.messages.ExplanationCatalog;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
@@ -188,8 +192,18 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    TokenSigner tokenSigner(ControlAuthProperties properties, Clock clock) {
-        return new HmacTokenSigner(resolveSigningSecret(properties), HmacTokenSigner.DEFAULT_TTL, clock);
+    SigningSecret signingSecret(ControlAuthProperties properties) {
+        return new SigningSecret(resolveSigningSecret(properties));
+    }
+
+    @Bean
+    TokenSigner tokenSigner(SigningSecret secret, Clock clock) {
+        return new HmacTokenSigner(secret.bytes(), HmacTokenSigner.DEFAULT_TTL, clock);
+    }
+
+    @Bean
+    HistoryCursorCodec historyCursorCodec(SigningSecret secret, Clock clock) {
+        return new HistoryCursorCodec(secret.bytes(), clock);
     }
 
     // ---- the control-core services (stateless, composed over the ports above) ----
@@ -522,6 +536,25 @@ class ControlPlaneConfiguration {
         return new PipelineObservationQueryService(artifactQueryService, storePort.observations());
     }
 
+    @Bean
+    PipelineHistoryQueryService pipelineHistoryQueryService(
+            ArtifactQueryService artifactQueryService,
+            StorePort storePort,
+            MetricsHistoryProperties history,
+            Clock clock,
+            HistoryCursorCodec cursors) {
+        return new PipelineHistoryQueryService(
+                artifactQueryService, storePort.rateHistory(), history.getSampleInterval(), clock, cursors);
+    }
+
+    @Bean
+    PipelineExplainService pipelineExplainService(
+            ArtifactQueryService artifactQueryService, StorePort storePort, Clock clock) {
+        ExplanationCatalog messages = ExplanationCatalog.bundled();
+        return new PipelineExplainService(
+                artifactQueryService, storePort.observations(), clock, messages::render);
+    }
+
     /**
      * Which chains a pipeline reads — the one part of the resume-point face that has to be resolved
      * here, because a chain's identity comes from the connector config, the selected tables and the srs
@@ -633,5 +666,18 @@ class ControlPlaneConfiguration {
                 + "secret. Tokens will not survive a restart or work across nodes -- set a secret for a "
                 + "restart-stable or multi-node deployment.");
         return ephemeral;
+    }
+
+    /** One startup key shared by session tokens and independently domain-separated history cursors. */
+    static final class SigningSecret {
+        private final byte[] bytes;
+
+        SigningSecret(byte[] bytes) {
+            this.bytes = bytes.clone();
+        }
+
+        byte[] bytes() {
+            return bytes.clone();
+        }
     }
 }
