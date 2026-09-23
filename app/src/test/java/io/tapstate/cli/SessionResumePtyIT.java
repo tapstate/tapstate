@@ -71,6 +71,7 @@ class SessionResumePtyIT {
             output = bytearray()
             sent = False
             status = None
+            answered_modes = set()
             deadline = time.time() + 30
 
             def no_echo():
@@ -89,6 +90,13 @@ class SessionResumePtyIT {
                     if not chunk:
                         break
                     output.extend(chunk)
+                # Report unsupported DEC private modes instead of leaving JLine's capability
+                # probes waiting for a terminal response that this PTY driver cannot provide.
+                for mode in (2026, 2027, 2048):
+                    query = f"\\x1b[?{mode}$p".encode()
+                    if mode not in answered_modes and query in output:
+                        os.write(fd, f"\\x1b[?{mode};0$y".encode())
+                        answered_modes.add(mode)
                 # JLine may emit terminal-capability probes before it has installed the reader.
                 # For ordinary prompts, wait until line editing is enabled rather than treating those
                 # probes as a ready signal. Password input still waits for echo to be disabled.
