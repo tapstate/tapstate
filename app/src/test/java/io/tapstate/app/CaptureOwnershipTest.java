@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -10,11 +12,16 @@ import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
+import io.tapstate.runtime.srs.CaptureError;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureRun;
+import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
+import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -26,18 +33,28 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CaptureOwnershipTest {
 
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Duration RENEW = Duration.ofHours(1);
+
+    private static final SourceResource SOURCE = new SourceResource(
+            "orders-source", null, "mysql", Map.of("host", "db.internal"), SourceMode.CDC,
+            List.of(TableRef.literal("orders")), null, null);
+
+    /** The chain every pipeline here reads, whichever member drives it. */
+    private static final String CHAIN = SourceCaptureResolution.of(SOURCE).chainId().value();
 
     @Test
     void twoMemberBaselineReadsTwiceWithoutAClaimAndOnceWithCaptureOwnership() {
@@ -65,6 +82,7 @@ class CaptureOwnershipTest {
         CaptureAttacher claimed = (spec, passthrough, startTail) -> {
             if (startTail) {
                 claimedTails.incrementAndGet();
+                opensTheRing(store);
             }
             return run(() -> { });
         };
@@ -157,6 +175,173 @@ class CaptureOwnershipTest {
                 .isEmpty();
     }
 
+    /**
+     * A pipeline driven by a member that does not hold its capture still attaches, for its own load.
+     *
+     * <p>How a pipeline reads is its own settings' and its own record's to say, wherever it is driven. The
+     * capture claim decides who tails the source and nothing else; a pipeline owed its initial load is owed
+     * it on any member. A driver that left the pipeline unattached because the claim was held elsewhere
+     * ran it with no load at all: every row the source held before it started missing from its target,
+     * the run healthy, and nothing reported.
+     */
+    @Test
+    void aPipelineDrivenWhereTheCaptureIsNotHeldAttachesForItsOwnLoadAndOpensNoTail() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q"));
+        MemoryClaims claims = new MemoryClaims();
+        List<String> starts = new ArrayList<>();
+        Member a = new Member("node-a", store, claims, TTL, starts);
+        Member b = new Member("node-b", store, claims, TTL, starts);
+
+        a.captures.startCapture("p");
+        b.captures.startCapture("q");
+
+        assertThat(starts)
+                .as("one tail, on the member holding the capture, and the pipeline driven by the other "
+                        + "member attached there rather than left with nothing")
+                .containsExactly("node-a p opened the tail", "node-b q attached");
+    }
+
+    /**
+     * Clearing the state of the last pipeline one member runs leaves the chain to a pipeline on another.
+     *
+     * <p>A member's own release answers for the pipelines it runs and for no others. A pipeline another
+     * member drives over the same chain keeps its load and its cursor on that chain's record, and a drop
+     * made because this member had nobody left would take them from it: its next start would read its
+     * whole source again, and nothing would say why.
+     */
+    @Test
+    void clearingTheLastPipelineOnTheHoldingMemberLeavesTheChainToAPipelineOnAnother() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q"));
+        MemoryClaims claims = new MemoryClaims();
+        List<String> starts = new ArrayList<>();
+        Member a = new Member("node-a", store, claims, TTL, starts);
+        Member b = new Member("node-b", store, claims, TTL, starts);
+        a.captures.startCapture("p");
+        b.captures.startCapture("q");
+        // What q's own run leaves on the record as it reads: its cursor, and its place on the chain with it.
+        store.meta().upsertConsumerOffset(CHAIN, new ConsumerOffset("q", Map.of(), null));
+
+        a.captures.stopCapture("p", true);
+
+        assertThat(store.meta().read(CHAIN))
+                .as("the chain is still there for the pipeline reading it on the other member")
+                .isPresent();
+        assertThat(consumersOn(store)).containsExactly("q");
+
+        b.captures.stopCapture("q", true);
+
+        assertThat(store.meta().read(CHAIN))
+                .as("and it goes with the last pipeline on it, whichever member ran that one")
+                .isEmpty();
+    }
+
+    /**
+     * A member that takes a capture over runs its tail for the pipelines of its own that were reading
+     * that capture already, not only for the one whose start took the claim.
+     */
+    @Test
+    void aMemberThatTakesACaptureOverKeepsItsTailForThePipelinesThatHadJoinedIt() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q", "r"));
+        MemoryClaims claims = new MemoryClaims();
+        List<String> starts = new ArrayList<>();
+        Member a = new Member("node-a", store, claims, TTL, starts);
+        Member b = new Member("node-b", store, claims, TTL, starts);
+        a.captures.startCapture("p");
+        b.captures.startCapture("q");
+        a.captures.stopCapture("p", false);
+
+        b.captures.startCapture("r");
+        assertThat(starts).last().isEqualTo("node-b r opened the tail");
+
+        b.captures.stopCapture("r", false);
+        assertThat(b.tailsClosed)
+                .as("q still reads what this tail writes, so it outlasts the pipeline that took the claim")
+                .hasValue(0);
+        b.captures.stopCapture("q", false);
+        assertThat(b.tailsClosed).as("and closes with the last pipeline reading it").hasValue(1);
+    }
+
+    /**
+     * A holder that took a capture's claim and never opened its ring leaves the capture to the member
+     * waiting on it, once its lease runs out.
+     */
+    @Test
+    void aPipelineWaitingOnAHolderThatNeverOpenedItsRingTakesTheCaptureOnceTheLeaseRunsOut() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("q"));
+        MemoryClaims claims = new MemoryClaims();
+        // A member that took the claim and died before opening anything: nothing renews it.
+        claims.acquire(captureKey(store, "q"), Member.owner("node-a"), 7, Duration.ofMillis(300));
+        List<String> starts = new ArrayList<>();
+        Member b = new Member("node-b", store, claims, Duration.ofSeconds(10), starts);
+
+        b.captures.startCapture("q");
+
+        assertThat(starts).containsExactly("node-b q opened the tail");
+        assertThat(claims.current.owner()).isEqualTo(Member.owner("node-b"));
+    }
+
+    /**
+     * A pipeline started while the member holding its capture is still opening the ring attaches as soon
+     * as the ring is there.
+     */
+    @Test
+    void aPipelineStartedWhileTheHolderIsStillOpeningItsRingAttachesOnceItIsOpen() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("q"));
+        MemoryClaims claims = new MemoryClaims();
+        claims.acquire(captureKey(store, "q"), Member.owner("node-a"), 7, Duration.ofMinutes(5));
+        List<String> starts = new ArrayList<>();
+        Member b = new Member("node-b", store, claims, Duration.ofSeconds(10), starts);
+        Thread holderOpening = new Thread(() -> {
+            try {
+                Thread.sleep(400);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            opensTheRing(store);
+        });
+        holderOpening.start();
+
+        b.captures.startCapture("q");
+        holderOpening.join();
+
+        assertThat(starts).containsExactly("node-b q attached");
+    }
+
+    /**
+     * A pipeline with no ring to read and no way to take its capture over is refused, with a code, once
+     * the wait that would have let the claim move is over -- not left running over nothing.
+     */
+    @Test
+    void aPipelineWithNoRingToReadAndNoWayToTakeTheCaptureOverIsRefusedWithACode() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("q"));
+        MemoryClaims claims = new MemoryClaims();
+        claims.acquire(captureKey(store, "q"), Member.owner("node-a"), 7, Duration.ofMinutes(5));
+        List<String> starts = new ArrayList<>();
+        Member b = new Member("node-b", store, claims, Duration.ofMillis(600), starts);
+
+        assertThatThrownBy(() -> b.captures.startCapture("q"))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(CaptureError.NO_RING_TO_ATTACH));
+        assertThat(starts).isEmpty();
+    }
+
+    /** A read with no tail has no ring to wait for, so it attaches at once. */
+    @Test
+    void aSnapshotOnlyReadWaitsForNoRing() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "q"));
+        MemoryClaims claims = new MemoryClaims();
+        claims.acquire(captureKey(store, "q"), Member.owner("node-a"), 7, Duration.ofMinutes(5));
+        List<String> starts = new ArrayList<>();
+        Member b = new Member("node-b", store, claims, Duration.ofSeconds(30), starts);
+
+        long started = System.nanoTime();
+        b.captures.startCapture("q");
+
+        assertThat(starts).containsExactly("node-b q attached");
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(10));
+    }
+
     private static StoreBackedPipelineCaptureCoordinator managed(
             InMemoryStorePort store,
             CaptureAttacher attacher,
@@ -179,19 +364,87 @@ class CaptureOwnershipTest {
     }
 
     private static InMemoryArtifactStore artifactsWith(String... pipelineIds) {
+        return artifactsWith(ReadMode.CDC_ONLY, pipelineIds);
+    }
+
+    private static InMemoryArtifactStore artifactsWith(ReadMode readMode, String... pipelineIds) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
-        artifacts.save(new SourceResource(
-                "orders-source", null, "mysql", Map.of("host", "db.internal"), SourceMode.CDC,
-                List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(SOURCE);
         for (String pipelineId : pipelineIds) {
             artifacts.save(new PipelineResource(
                     pipelineId, null, List.of(SourceRef.spec("orders-source", true)), null, null,
                     new ServeBlock.Inline(
                             null, FromRef.literal("orders-source"),
                             List.of(new SyncElement("sync", "target", null, null, null)), null, null),
-                    new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+                    new Settings(null, null, null, null, readMode, "earliest"), null));
         }
         return artifacts;
+    }
+
+    /** What the member starting a tail does to the store before anybody can read its ring. */
+    private static void opensTheRing(InMemoryStorePort store) {
+        if (store.meta().read(CHAIN).isEmpty()) {
+            store.meta().create(CHAIN, null);
+        }
+        store.meta().openEpoch(CHAIN);
+    }
+
+    private static List<String> consumersOn(InMemoryStorePort store) {
+        return store.meta().read(CHAIN).orElseThrow().consumerOffsets().stream()
+                .map(ConsumerOffset::pipelineId)
+                .toList();
+    }
+
+    private static WorkloadClaimKey captureKey(InMemoryStorePort store, String pipelineId) {
+        return new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE,
+                new StoreBackedPipelineCaptures(store).captureIds(pipelineId).getFirst());
+    }
+
+    /**
+     * One member of a cluster over the shared store: a chain coordinator and a capture coordinator of its
+     * own, and a run unit standing in for the real one by doing to the chain coordinator what the real one
+     * does -- open the chain and its generation for a tail, join it for an attachment, attach the consumer
+     * -- and nothing else.
+     */
+    private static final class Member {
+        private final String node;
+        private final List<String> starts;
+        private final SrsCoordinator chains;
+        private final StoreBackedPipelineCaptureCoordinator captures;
+        private final AtomicInteger tailsClosed = new AtomicInteger();
+
+        Member(String node, InMemoryStorePort store, MemoryClaims claims, Duration ttl, List<String> starts) {
+            this.node = node;
+            this.starts = starts;
+            this.chains = new SrsCoordinator(store.meta());
+            ClusterMembershipGate gate = eligibleGate();
+            CaptureOwnership ownership = new CaptureOwnership(
+                    "cluster-a", owner(node), gate, new ClusterWorkloadClaims(claims, gate), ttl);
+            this.captures = new StoreBackedPipelineCaptureCoordinator(
+                    store, this::start, chains, new SnapshotBuffer(), ownership, RENEW);
+        }
+
+        static WorkloadOwner owner(String node) {
+            return new WorkloadOwner(node, "boot-" + node);
+        }
+
+        private CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> passthrough, boolean startTail) {
+            starts.add(node + " " + spec.pipelineId() + (startTail ? " opened the tail" : " attached"));
+            Subscription subscription = startTail ? tailsClosed::incrementAndGet : () -> { };
+            if (spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
+                return new CaptureRun(Optional.empty(), false, 0, Optional.empty(), Optional.of(subscription),
+                        new CaptureHealth());
+            }
+            MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
+            if (startTail) {
+                chains.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention());
+            } else {
+                chains.joinSource(spec.sourceId(), chain, spec.config().streams());
+            }
+            chains.attachConsumer(chain, spec.pipelineId());
+            return new CaptureRun(Optional.of(chain), !startTail, 0, Optional.empty(), Optional.of(subscription),
+                    new CaptureHealth());
+        }
     }
 
     private static CaptureRun run(Runnable close) {

@@ -141,6 +141,9 @@ capture.event-table-not-selected:
 capture.claim-lost:
   message: "Capture `{captureId}` lost its cluster ownership claim."
   solution: "Let the current owner continue from the durable position; do not restart the fenced process."
+capture.no-ring-to-attach:
+  message: "Capture `{captureId}` had no change ring open after {seconds}s and this member could not take it over, so the pipeline had nothing to attach to."
+  solution: "Check that the member holding the capture is running and that every member can reach the coordination store, then start the pipeline again."
 capture.cluster-refused-the-read:
   message: "The cluster refused reads of change ring `{ring}` for {seconds}s, so the source stopped."
   solution: "Check that every member can reach the coordination store and see the others; start the pipeline again once the cluster reports its full membership."

@@ -24,6 +24,15 @@ public enum CaptureError implements TapstateErrorCode {
     CLAIM_LOST("capture.claim-lost", Set.of("captureId")),
 
     /**
+     * A pipeline driven by a member that does not hold its capture found no change ring open to read for
+     * the whole stretch that takes a capture's claim to move, and could not take the capture over itself.
+     * The member holding a capture opens the ring just after it takes the claim, so a pipeline attaching in
+     * between waits; this is the wait that never ended. {@code captureId} names the capture, {@code seconds}
+     * how long it waited.
+     */
+    NO_RING_TO_ATTACH("capture.no-ring-to-attach", Set.of("captureId", "seconds")),
+
+    /**
      * The cluster refused this member's writes into a change ring for the whole stretch the capture waits
      * such a refusal out. A refusal while members' verdicts converge is transient and is waited out rather
      * than coded; this is the one that never cleared, which says this member is not in a cluster that

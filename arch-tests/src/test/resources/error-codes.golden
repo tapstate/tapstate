@@ -53,6 +53,7 @@ capture.claim-lost
 capture.cluster-refused-the-read
 capture.cluster-refused-writes
 capture.event-table-not-selected
+capture.no-ring-to-attach
 capture.snapshot-reports-no-seam
 capture.start-from-outside-window
 capture.start-from-unparsable

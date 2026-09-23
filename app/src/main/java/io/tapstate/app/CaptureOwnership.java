@@ -93,4 +93,12 @@ final class CaptureOwnership {
             claims.release(expected);
         }
     }
+
+    /**
+     * How long a claim outlives the member holding it: the lease a holder that stops renewing leaves
+     * behind, and so how long it can take a claim to become free to anybody else.
+     */
+    Duration ttl() {
+        return ttl;
+    }
 }

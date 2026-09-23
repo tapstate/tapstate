@@ -109,6 +109,12 @@ public final class CaptureRunUnit {
 
     /**
      * Starts one pipeline attachment and starts the shared tail only when this member owns its capture claim.
+     *
+     * <p>An attachment that starts no tail is the same attachment wherever it is made: the pipeline's own
+     * load, as its own record says it is owed, and its membership of the chain whose ring it reads. What
+     * differs is only who writes that ring. On the member holding the capture it is this member's own tail;
+     * anywhere else it is another member's, so the chain is joined under the generation that tail writes
+     * under rather than opened -- see {@link SrsCoordinator#joinSource}.
      */
     public CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> passthrough, boolean startTail) {
         Objects.requireNonNull(spec, "spec");
@@ -131,8 +137,12 @@ public final class CaptureRunUnit {
             // is what the next run reads to know where to start -- a question the flag has no bearing on.
             if (plan.tail()) {
                 chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
-                ProvisionOutcome provisioned = coordinator
-                        .provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+                // Only the member that runs the tail opens a generation; an attachment reads the one that tail
+                // writes under.
+                ProvisionOutcome provisioned = startTail
+                        ? coordinator.provisionSource(
+                                spec.sourceId(), chainId, spec.config().streams(), spec.retention())
+                        : coordinator.joinSource(spec.sourceId(), chainId, spec.config().streams());
                 merged = provisioned.merged();
                 epoch = provisioned.epoch();
                 chainCreated = !merged;

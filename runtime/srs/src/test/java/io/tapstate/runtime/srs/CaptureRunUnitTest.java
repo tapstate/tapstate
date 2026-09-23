@@ -708,6 +708,46 @@ class CaptureRunUnitTest {
         assertThat(attached.chainId()).isEqualTo(owner.chainId());
     }
 
+    /**
+     * A pipeline attaching on a member that does not hold the capture reads under the generation the
+     * member holding it opened.
+     *
+     * <p>The member holding a capture opens the chain's ring generation as it starts the tail, and every
+     * change that tail writes is ordered under it. A pipeline driven by another member attaches to the same
+     * ring with no tail of its own, and the rows of its own load are ordered by the generation stamped on
+     * them: beneath every change of that generation, above every change of an older one. An attaching
+     * member that opened a generation of its own would put its load above the changes the holder goes on
+     * writing, so a row the source changed after the load read it would keep the value the load saw; and
+     * every run assembled afterwards would read a generation no tail writes under.
+     */
+    @Test
+    void aPipelineAttachingOnAMemberThatDidNotOpenTheChainReadsUnderTheGenerationAlreadyRunning() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = MiningChainId.resolve(config(), "chain-held-elsewhere").value();
+        CaptureRun held = new CaptureRunUnit(
+                new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-held-elsewhere"), e -> { }, true);
+        long running = meta.read(chain).orElseThrow().epoch();
+
+        // Another member: a coordinator of its own, over the same durable record and the same ring.
+        List<Envelope> loaded = new ArrayList<>();
+        CaptureRun attached = new CaptureRunUnit(
+                new FakeSource(List.of(row(1), row(2)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-held-elsewhere"), loaded::add, false);
+
+        assertThat(meta.read(chain).orElseThrow().epoch())
+                .as("attaching opened no generation of its own")
+                .isEqualTo(running);
+        assertThat(loaded)
+                .as("it ran a load of its own")
+                .hasSize(2);
+        assertThat(loaded).extracting(e -> e.position().order())
+                .as("and that load is ordered beneath every change of the generation the holder writes under")
+                .containsOnly(SourceOrder.snapshotRow(running));
+        assertThat(attached.cdcSubscription()).as("it opened no tail").isEmpty();
+        assertThat(held.cdcSubscription()).as("the holder's tail is the one tail").isPresent();
+    }
+
     @Test
     void routesAMultiTableSharedRingRunToOneSubscriptionAndTwoRings() throws Exception {
         InMemoryMeta meta = new InMemoryMeta();
