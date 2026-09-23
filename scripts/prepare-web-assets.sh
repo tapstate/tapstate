@@ -10,7 +10,8 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/prepare-web-assets.sh --web-root <path> --web-revision <sha> --output <path>
+Usage: scripts/prepare-web-assets.sh --web-root <path> --web-revision <sha> \
+       --tapstate-revision <sha> --release-version <version> --output <path>
 
 The web checkout must be clean, checked out at --web-revision, and contain apps/web/dist/index.html.
 The output directory must not exist; it receives static/ and META-INF/tapstate-web.properties.
@@ -24,12 +25,16 @@ die() {
 
 web_root=""
 web_revision=""
+tapstate_revision=""
+release_version=""
 output=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --web-root) web_root="${2:-}"; shift 2 ;;
         --web-revision) web_revision="${2:-}"; shift 2 ;;
+        --tapstate-revision) tapstate_revision="${2:-}"; shift 2 ;;
+        --release-version) release_version="${2:-}"; shift 2 ;;
         --output) output="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown argument '$1'" ;;
@@ -38,7 +43,15 @@ done
 
 [ -n "$web_root" ] || die "--web-root is required"
 [ -n "$web_revision" ] || die "--web-revision is required"
+[ -n "$tapstate_revision" ] || die "--tapstate-revision is required"
+[ -n "$release_version" ] || die "--release-version is required"
 [ -n "$output" ] || die "--output is required"
+[[ "$tapstate_revision" =~ ^[0-9a-f]{40}$ ]] \
+    || die "Tapstate revision must be a full lowercase SHA-1 commit id"
+[[ "$web_revision" =~ ^[0-9a-f]{40}$ ]] \
+    || die "Web revision must be a full lowercase SHA-1 commit id"
+[[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
+    || die "release version must be a numeric x.y.z version with an optional prerelease suffix"
 [ -d "$web_root" ] || die "web checkout '$web_root' does not exist"
 [ ! -e "$output" ] || die "output '$output' already exists; clean the Maven target directory before staging assets"
 
@@ -53,6 +66,8 @@ actual="$(git -C "$web_root" rev-parse HEAD)"
 [ "$actual" = "$expected" ] || die "web checkout is at $actual, expected $expected"
 git -C "$web_root" diff --quiet || die "web checkout has unstaged changes"
 git -C "$web_root" diff --cached --quiet || die "web checkout has staged changes"
+[ -z "$(git -C "$web_root" status --porcelain --untracked-files=all)" ] \
+    || die "web checkout has untracked files"
 
 [ -f "$web_root/package.json" ] || die "web checkout has no package.json"
 [ -f "$web_root/pnpm-lock.yaml" ] || die "web checkout has no pnpm-lock.yaml"
@@ -76,6 +91,8 @@ cat >"$output/META-INF/tapstate-web.properties" <<EOF
 repository=tapstate/tapstate-web
 revision=$actual
 files.sha256=$files_digest
+tapstate.revision=$tapstate_revision
+release.version=$release_version
 EOF
 
 test -s "$output/static/index.html" || die "staged index.html is empty"

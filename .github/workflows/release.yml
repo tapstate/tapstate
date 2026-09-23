@@ -338,6 +338,9 @@ jobs:
     # what makes building arm64 under emulation cheap.
     needs: version
     runs-on: ubuntu-latest
+    outputs:
+      web-revision: ${{ steps.web-provenance.outputs.revision }}
+      web-files-sha256: ${{ steps.web-provenance.outputs.files-sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -375,6 +378,8 @@ jobs:
           bash scripts/prepare-web-assets.sh \
             --web-root tapstate-web \
             --web-revision "$web_revision" \
+            --tapstate-revision "${{ needs.version.outputs.sha }}" \
+            --release-version "${{ needs.version.outputs.version }}" \
             --output app/target/generated-resources/tapstate-web
       - uses: actions/setup-java@v4
         with:
@@ -383,6 +388,17 @@ jobs:
           cache: maven
       - name: build the boot jar the image ships
         run: mvn -B -pl app -am -DskipTests package
+      - name: read the staged Web provenance
+        id: web-provenance
+        shell: bash
+        run: |
+          properties=app/target/classes/META-INF/tapstate-web.properties
+          revision="$(sed -n 's/^revision=//p' "$properties")"
+          files_sha256="$(sed -n 's/^files.sha256=//p' "$properties")"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$files_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "files-sha256=$files_sha256" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       # Into a local archive, not a registry. The completeness check reads both architectures out of
@@ -395,6 +411,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: false
           tags: ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}
+          build-args: |
+            TAPSTATE_RELEASE_VERSION=${{ needs.version.outputs.version }}
+            TAPSTATE_REVISION=${{ needs.version.outputs.sha }}
+            TAPSTATE_WEB_REVISION=${{ steps.web-provenance.outputs.revision }}
+            TAPSTATE_WEB_FILES_SHA256=${{ steps.web-provenance.outputs.files-sha256 }}
           outputs: type=oci,dest=${{ runner.temp }}/server-image.tar
       - uses: actions/upload-artifact@v4
         with:
@@ -713,6 +734,15 @@ jobs:
         run: |
           mkdir -p image/layout
           tar -xf image/server-image.tar -C image/layout
+          provenance="staging/tapstate-${{ needs.version.outputs.version }}-provenance.json"
+          python3 .github/scripts/web-provenance.py create \
+            --oci-layout image/layout \
+            --output "$provenance" \
+            --version '${{ needs.version.outputs.version }}' \
+            --tapstate-revision '${{ needs.version.outputs.sha }}' \
+            --web-revision '${{ needs.server-image.outputs.web-revision }}'
+          python3 .github/scripts/web-provenance.py verify \
+            --oci-layout image/layout --provenance "$provenance"
           .github/scripts/release-manifest.sh "${{ needs.version.outputs.version }}" staging image/layout
       - name: assemble the draft release
         id: create
@@ -739,6 +769,7 @@ jobs:
             staging/tapstate-*.tar.gz.sha256
             staging/checksums.txt
             staging/platform-minimums.txt
+            staging/tapstate-${{ needs.version.outputs.version }}-provenance.json
       - name: where to look before approving
         run: |
           {
@@ -833,6 +864,18 @@ jobs:
           docker buildx imagetools create \
             --tag "ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}" \
             "oci-layout://$(pwd)/image/layout@${digest}"
+      - name: confirm the published registry digest matches the checked archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(jq -r '.manifests[0].digest' image/layout/index.json)"
+          image="ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}"
+          actual="sha256:$(docker buildx imagetools inspect --raw "$image" | sha256sum | awk '{print $1}')"
+          if [ "$actual" != "$expected" ]; then
+            echo "published image digest $actual differs from checked OCI archive $expected" >&2
+            exit 1
+          fi
+          echo "published image digest matches checked archive: $actual"
       # Publishing is what creates the tag, at the commit the draft named. `--notes` is deliberately not
       # passed: whoever reviewed the draft may have edited the body, and re-sending the assembled body
       # would silently put their edit back the way it was.
