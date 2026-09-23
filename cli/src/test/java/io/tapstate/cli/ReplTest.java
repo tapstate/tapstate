@@ -4855,6 +4855,30 @@ class ReplTest {
     }
 
     @Test
+    void positionWriteBackKeepsSerializedTokenOnTheWireButNotInConfirmation(@TempDir Path dir)
+            throws IOException {
+        String serializedPosition = "rO0ABXNyADdpby50YXBkYXRhLmNvbm5lY3Rvci5wb3N0Z3Jlcy5jZGMub2Zmc2V0"
+                + "LlBvc3RncmVzT2Zmc2V0KScGvwPaw5wCAANMAAtvZmZzZXRWYWx1ZXQAEExqYXZhL2xhbmcvTG9uZztM"
+                + "AApzb3J0U3RyaW5ndAASTGphdmEvbGFuZy9TdHJpbmc7TAAMc291cmNlT2Zmc2V0cQB+AAJ4cHBwcA==";
+        String document = "{\"chains\":[{\"chainId\":\"shop@postgres-1\",\"resumeFrom\":{\"token\":\""
+                + serializedPosition + "\"}}]}";
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.positionOutcome = new PositionOutcome.Found("{}",
+                List.of(new PositionOutcome.Chain("shop@postgres-1", serializedPosition, List.of())));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        Path edited = dir.resolve("position.json");
+        Files.writeString(edited, document);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1 -f " + edited)).isTrue();
+
+        assertThat(client.positionBodies).containsExactly(document);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("opaque position recorded (source coordinate unavailable)")
+                .doesNotContain(serializedPosition);
+    }
+
+    @Test
     void positionRefusesAFileItCannotRead() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         Harness h = onlineSession(Path.of("tap-work"), client);
@@ -5004,6 +5028,27 @@ class ReplTest {
         h.repl().dispatch("metrics pl1");
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("recordCount").contains("targetAckedPosition.orders").contains("w7");
+    }
+
+    @Test
+    void metricsTextDoesNotPrintSerializedPostgresOffsetsForEachTable() {
+        // An observed Postgres CDC position: Java serialization of PostgresOffset with null fields.
+        String serializedPosition = "rO0ABXNyADdpby50YXBkYXRhLmNvbm5lY3Rvci5wb3N0Z3Jlcy5jZGMub2Zmc2V0"
+                + "LlBvc3RncmVzT2Zmc2V0KScGvwPaw5wCAANMAAtvZmZzZXRWYWx1ZXQAEExqYXZhL2xhbmcvTG9uZztM"
+                + "AApzb3J0U3RyaW5ndAASTGphdmEvbGFuZy9TdHJpbmc7TAAMc291cmNlT2Zmc2V0cQB+AAJ4cHBwcA==";
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
+                Map.of("orders", serializedPosition, "accounts", serializedPosition),
+                List.of("sourceHeadPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("metrics pl1")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("recordCount  6", "sourceHeadPosition  not collected");
+        assertThat(out).as("text metrics must not expose an opaque serialized connector object")
+                .doesNotContain(serializedPosition);
     }
 
     @Test
