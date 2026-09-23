@@ -253,7 +253,7 @@ class SrsSourceProcessorTest {
 
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source", SrsSourceProcessor.snapshotOnlyMetaSupplier(
-                PIPELINE, ringName, "orders", 7L, null));
+                PIPELINE, ringName, "orders", 7L, null, SourcePlacement.anyMember()));
         Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
                 .localParallelism(1);
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP("out-snapshot-only"))
@@ -290,7 +290,7 @@ class SrsSourceProcessorTest {
 
         Job job = hz.getJet().newJob(new DAG().vertex(new Vertex("source",
                 SrsSourceProcessor.metaSupplier(PIPELINE, "srs.chain.nogen", "orders", StartFrom.earliest(), 0L,
-                        SrsReadCursorPublisherFactory.NONE))));
+                        SrsReadCursorPublisherFactory.NONE, SourcePlacement.anyMember()))));
 
         assertThatThrownBy(() -> job.join())
                 .hasMessageContaining("srs.chain.nogen")
@@ -385,7 +385,7 @@ class SrsSourceProcessorTest {
         // a no-op to the rest, so resolving over several members yields more than one distinct supplier.
         ProcessorMetaSupplier meta = SrsSourceProcessor.metaSupplier(
                 PIPELINE, "srs.chain.pins", "orders", StartFrom.earliest(), 1L,
-                SrsReadCursorPublisherFactory.NONE);
+                SrsReadCursorPublisherFactory.NONE, SourcePlacement.anyMember());
         List<Address> addresses = List.of(
                 Address.createUnresolvedAddress("10.0.0.1", 5701),
                 Address.createUnresolvedAddress("10.0.0.2", 5702),
@@ -394,6 +394,47 @@ class SrsSourceProcessorTest {
         Function<? super Address, ? extends ProcessorSupplier> assignment = meta.get(addresses);
 
         assertThat(addresses.stream().map(assignment).distinct().count()).isGreaterThan(1);
+    }
+
+    /**
+     * The one instance runs on the member its placement names, and on no other, for both shapes of source.
+     *
+     * <p>A source drains a hand-off the capture fills on the member that started it, so an instance anywhere
+     * else finds nothing to drain and reads nothing, with its job running and nothing thrown. Left to the
+     * engine the member is picked at random on every resolution, so each member is named in turn and the
+     * assignment resolved many times over: a random pick lands on the named member a third of the time,
+     * and on it every time essentially never.
+     */
+    @Test
+    void runs_the_one_instance_on_the_member_its_placement_names() {
+        List<Address> addresses = List.of(
+                Address.createUnresolvedAddress("10.0.0.1", 5701),
+                Address.createUnresolvedAddress("10.0.0.2", 5702),
+                Address.createUnresolvedAddress("10.0.0.3", 5703));
+        for (Address named : addresses) {
+            SourcePlacement placement = SourcePlacement.on(named);
+            List<ProcessorMetaSupplier> shapes = List.of(
+                    SrsSourceProcessor.metaSupplier(PIPELINE, "srs.chain.placed", "orders", StartFrom.earliest(),
+                            1L, SrsReadCursorPublisherFactory.NONE, placement),
+                    SrsSourceProcessor.snapshotOnlyMetaSupplier(
+                            PIPELINE, "srs.chain.placed", "orders", 1L, null, placement));
+            for (ProcessorMetaSupplier meta : shapes) {
+                for (int resolution = 0; resolution < 20; resolution++) {
+                    Function<? super Address, ? extends ProcessorSupplier> assignment = meta.get(addresses);
+                    for (Address member : addresses) {
+                        if (member.equals(named)) {
+                            assertThat(assignment.apply(member))
+                                    .describedAs("the named member %s runs the source", named)
+                                    .isNotInstanceOf(ProcessorMetaSupplier.ExpectNothingProcessorSupplier.class);
+                        } else {
+                            assertThat(assignment.apply(member))
+                                    .describedAs("%s is not the named member %s and runs nothing", member, named)
+                                    .isInstanceOf(ProcessorMetaSupplier.ExpectNothingProcessorSupplier.class);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -471,7 +512,8 @@ class SrsSourceProcessorTest {
         Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
                 PIPELINE, ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
                 order -> new Watermark(
-                        order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7)));
+                        order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7),
+                SourcePlacement.anyMember()));
         Vertex record = dag.newVertex("record", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of(RecordingBounds::new)));
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(sinkName)).localParallelism(1);
@@ -535,7 +577,8 @@ class SrsSourceProcessorTest {
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source",
                 SrsSourceProcessor.metaSupplier(
-                        PIPELINE, ringName, src, StartFrom.earliest(), epoch, publisherFactory));
+                        PIPELINE, ringName, src, StartFrom.earliest(), epoch, publisherFactory,
+                        SourcePlacement.anyMember()));
         Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
                 .localParallelism(1);
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(sinkName)).localParallelism(1);

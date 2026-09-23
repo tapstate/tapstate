@@ -145,7 +145,8 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
     private static DAG sourceToList() {
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
-                PIPELINE, RING, "orders", StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE));
+                PIPELINE, RING, "orders", StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
+                SourcePlacement.anyMember()));
         Vertex render = dag.newVertex("render",
                 Processors.mapP((FunctionEx<Envelope, String>) envelope -> String.valueOf(envelope.after())));
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(SINK)).localParallelism(1);

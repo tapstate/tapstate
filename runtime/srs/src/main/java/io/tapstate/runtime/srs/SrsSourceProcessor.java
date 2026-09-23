@@ -326,7 +326,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * A meta-supplier for pipeline {@code pipelineId}'s source vertex tailing {@code ringName} from
      * {@code start}, tagging every change with the logical stream name {@code src} and the generation
      * {@code epoch} the ring was opened under, and reporting its read cursor through {@code publisherFactory}.
-     * The vertex is pinned to total parallelism one: one reader per ring keeps the change stream in order.
+     * The vertex is pinned to total parallelism one: one reader per ring keeps the change stream in order. That
+     * one reader runs where {@code placement} says, which has to be the member whose capture fills the hand-off
+     * it drains -- see {@link SourcePlacement}.
      *
      * <p>The generation is resolved when the job is assembled, not read per change: the ring is opened
      * before the job is submitted and does not change generation while it runs, so carrying it here keeps
@@ -334,8 +336,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * capture was started, and a change found under it is rejected rather than ordered.
      */
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
-            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory) {
-        return metaSupplier(pipelineId, ringName, src, start, epoch, publisherFactory, null);
+            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory,
+            SourcePlacement placement) {
+        return metaSupplier(pipelineId, ringName, src, start, epoch, publisherFactory, null, placement);
     }
 
     /**
@@ -344,37 +347,42 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * is the frontier standing still rather than running ahead.
      */
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
-            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp) {
+            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp,
+            SourcePlacement placement) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
         Objects.requireNonNull(start, "start");
         Objects.requireNonNull(publisherFactory, "publisherFactory");
+        Objects.requireNonNull(placement, "placement");
         if (epoch < 0) {
             throw new IllegalArgumentException("a ring generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(
                 pipelineId, ringName, src, epoch, stamp, new RingTail(start, publisherFactory));
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+        return placement.place(ProcessorSupplier.of(supplier));
     }
 
     /**
      * A source for a bounded snapshot with no incremental tail. It drains only this pipeline's member-local
      * hand-off, stamps its rows with {@code epoch}, and stays live so the downstream frontier remains sound.
      * It deliberately accepts neither a start point nor a cursor publisher: {@code ringName} is only the
-     * buffer key, and another pipeline may be filling the shared ring behind that name.
+     * buffer key, and another pipeline may be filling the shared ring behind that name. Everything it emits
+     * comes from that hand-off, so where {@code placement} puts it decides whether it reads anything at all.
      */
     public static ProcessorMetaSupplier snapshotOnlyMetaSupplier(
-            String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp) {
+            String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
+            SourcePlacement placement) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
+        Objects.requireNonNull(placement, "placement");
         if (epoch < 0) {
             throw new IllegalArgumentException("a snapshot generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier =
                 () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null);
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+        return placement.place(ProcessorSupplier.of(supplier));
     }
 
     /** Present only on the source shape that follows a shared ring and publishes its read cursor. */

@@ -9,6 +9,7 @@ import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
+import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.store.ConnectionTester;
@@ -50,10 +51,17 @@ class DataPlaneActuationConfiguration {
      */
     private static final Duration STORE_PROBE_TIMEOUT = Duration.ofSeconds(10);
 
+    /**
+     * The topology builder, with every source vertex it builds held to this member. A start runs its capture
+     * here before it builds, so this member's hand-off is the one the sources have to drain; left to the
+     * engine, a source lands on another member as often as not on a cluster and reads nothing, healthily.
+     */
     @Bean
-    DagSource dagSource(StorePort storePort, NestSettings nestSettings, ConnectionTester connectionTester) {
+    DagSource dagSource(StorePort storePort, NestSettings nestSettings, ConnectionTester connectionTester,
+            HazelcastInstance hazelcastMember) {
         return new StoreBackedDagSource(storePort, nestSettings,
-                StoreReachability.probing(connectionTester, STORE_PROBE_TIMEOUT));
+                StoreReachability.probing(connectionTester, STORE_PROBE_TIMEOUT),
+                SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()));
     }
 
     @Bean

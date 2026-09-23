@@ -38,6 +38,7 @@ import io.tapstate.runtime.engine.nest.NestClock;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.srs.SrsSourceProcessor;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.sink.DdlPolicy;
@@ -99,6 +100,7 @@ final class StoreBackedDagSource implements DagSource {
     private final JoinSchemaDrift joinSchemaDrift;
     private final SourceSchemaCopy sourceSchemaCopy;
     private final StepSchemaRecord stepSchemaRecord;
+    private final SourcePlacement sourcePlacement;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -114,10 +116,16 @@ final class StoreBackedDagSource implements DagSource {
         this(storePort, assembledSinkWriterBinder(), NestSettings.defaults(), storeReachability);
     }
 
-    /** The assembled source: nests held to {@code nestSettings}, the store probed before a view is built. */
+    /**
+     * The assembled source: nests held to {@code nestSettings}, the store probed before a view is built, and
+     * every source vertex run where {@code sourcePlacement} says. The member a start runs on starts the
+     * capture before it builds the topology, so that member is where the capture's hand-off fills and where
+     * the vertex that drains it has to be.
+     */
     StoreBackedDagSource(
-            StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability) {
-        this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability);
+            StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability,
+            SourcePlacement sourcePlacement) {
+        this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement);
     }
 
     /**
@@ -141,7 +149,7 @@ final class StoreBackedDagSource implements DagSource {
     public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
         ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
         StoreBackedDagSource captured = new StoreBackedDagSource(
-                storePort, sinkWriterBinder, nestSettings, storeReachability, snapshot);
+                storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
@@ -190,13 +198,21 @@ final class StoreBackedDagSource implements DagSource {
     StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability) {
-        this(storePort, sinkWriterBinder, nestSettings, storeReachability,
+        // Every construction that builds a topology for a cluster names where its sources run; the ones that
+        // reach here build for a single member, or inspect a topology rather than submit it.
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability, SourcePlacement.anyMember());
+    }
+
+    StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, SourcePlacement sourcePlacement) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
                 Objects.requireNonNull(storePort, "storePort").artifacts());
     }
 
     private StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
-            StoreReachability storeReachability, ArtifactStore artifactStore) {
+            StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
@@ -206,6 +222,7 @@ final class StoreBackedDagSource implements DagSource {
         this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
         this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
         this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
+        this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
     }
 
     @Override
@@ -2193,14 +2210,14 @@ final class StoreBackedDagSource implements DagSource {
         if (snapshotOnly) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(
                     vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), snapshotEpoch,
-                    order -> new Watermark(FrontierOrders.pack(chain, order), axis));
+                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
         }
         return SrsSourceProcessor.metaSupplier(
                 vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
                 ringGeneration(vertex.resolution()),
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),
-                order -> new Watermark(FrontierOrders.pack(chain, order), axis));
+                order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
     }
 
     /**
