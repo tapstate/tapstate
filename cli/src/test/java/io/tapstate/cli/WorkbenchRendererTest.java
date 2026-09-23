@@ -569,8 +569,10 @@ class WorkbenchRendererTest {
 
         Rendered rendered = render(100, 24, state);
 
-        assertThat(rendered.text()).contains("More", "Context", "Authentication", "Help");
-        assertThat(rendered.layout().overlayHits()).hasSize(3).isUnmodifiable();
+        assertThat(rendered.text()).contains("More", "Context", "Authentication", "Logs", "Inspect", "Help");
+        assertThat(rendered.layout().overlayHits())
+                .hasSize(WorkbenchOverlayState.More.ENTRIES.size())
+                .isUnmodifiable();
         for (WorkbenchRenderer.OverlayHit hit : rendered.layout().overlayHits()) {
             assertThat(rendered.layout().overlayIndexAt(hit.area().x(), hit.area().y()))
                     .hasValue(hit.index());

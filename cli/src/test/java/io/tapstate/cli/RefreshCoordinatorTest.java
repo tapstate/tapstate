@@ -300,14 +300,23 @@ class RefreshCoordinatorTest {
         }, "test-close-during-sink");
         closeThread.start();
 
-        assertThatIllegalStateException()
-                .isThrownBy(() -> coordinator.refresh(
-                        (generation, sequence, token) -> RefreshResult.empty()))
-                .withMessage("Refresh coordinator is closed");
-        assertThat(closeReturned).as("close remains a barrier while the sink is running")
-                .matches(latch -> latch.getCount() == 1);
-
-        releaseSink.countDown();
+        long closeDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (closeThread.getState() != Thread.State.WAITING && System.nanoTime() < closeDeadline) {
+            Thread.yield();
+        }
+        assertThat(closeThread.getState())
+                .as("close has marked the coordinator closed and is waiting for the in-flight sink")
+                .isEqualTo(Thread.State.WAITING);
+        try {
+            assertThatIllegalStateException()
+                    .isThrownBy(() -> coordinator.refresh(
+                            (generation, sequence, token) -> RefreshResult.empty()))
+                    .withMessage("Refresh coordinator is closed");
+            assertThat(closeReturned).as("close remains a barrier while the sink is running")
+                    .matches(latch -> latch.getCount() == 1);
+        } finally {
+            releaseSink.countDown();
+        }
         await(closeReturned);
         closeThread.join(TimeUnit.SECONDS.toMillis(2));
         assertThat(closeThread.isAlive()).isFalse();
