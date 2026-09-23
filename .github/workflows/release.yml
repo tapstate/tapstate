@@ -339,8 +339,8 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     outputs:
-      web-revision: ${{ steps.web-provenance.outputs.revision }}
-      web-files-sha256: ${{ steps.web-provenance.outputs.files-sha256 }}
+      web_revision: ${{ steps.web-provenance.outputs.revision }}
+      web_files_sha256: ${{ steps.web-provenance.outputs.files-sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -740,7 +740,7 @@ jobs:
             --output "$provenance" \
             --version '${{ needs.version.outputs.version }}' \
             --tapstate-revision '${{ needs.version.outputs.sha }}' \
-            --web-revision '${{ needs.server-image.outputs.web-revision }}'
+            --web-revision '${{ needs.server-image.outputs.web_revision }}'
           python3 .github/scripts/web-provenance.py verify \
             --oci-layout image/layout --provenance "$provenance"
           .github/scripts/release-manifest.sh "${{ needs.version.outputs.version }}" staging image/layout
