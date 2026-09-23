@@ -63,9 +63,9 @@ class SessionResumePtyIT {
             wait_no_echo = os.environ.pop("TAPSTATE_PTY_WAIT_NO_ECHO", "0") == "1"
             pid, fd = pty.fork()
             if pid == 0:
-                # Exercise the basic terminal profile used by CI.  It does not answer JLine's
-                # optional capability probes, so a one-shot prompt must not depend on them.
-                os.environ["TERM"] = "linux"
+                # Keep masked-prompt coverage independent of terminal capability probes; the PTY
+                # driver is not a full terminal emulator.
+                os.environ["TERM"] = "dumb" if wait_no_echo else "linux"
                 os.execvp(sys.argv[1], sys.argv[1:])
 
             output = bytearray()
