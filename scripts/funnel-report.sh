@@ -3,8 +3,10 @@
 # The weekly funnel report, computed entirely from the stored series -- no manual scraping, which is
 # the point: a number nobody can reproduce is a number nobody can act on.
 #
-# The report has one denominator and it is stated as such. Canonical L1 is "an install completed",
-# counted by unique installation_id, and it is the only figure anything may be divided by. Everything
+# The report has one denominator and it is stated as such. Canonical L1 is "a community install
+# completed", counted by unique installation_id, and it is the only figure anything may be divided by.
+# Our own test harnesses install constantly, so the events carry which side they are on and the ones
+# that are ours are printed apart from the denominator rather than inside it. Everything
 # under distribution signals is listed item by item and never added up: one person contributes clones
 # and downloads at once, and CI contributes far more than any person. Measured on this repo over
 # 2026-08-18..08-31: 6525 clones from 316 unique cloners against 750 views from 34 unique visitors.
@@ -92,33 +94,78 @@ def read_events():
 print("tapstate funnel -- week of %s (%s..%s)" % (start, start, end))
 print()
 
+def machine_shaped(events):
+    """Bursts that no person produces: three or more os/arch combinations inside three minutes.
+
+    The channel field is what separates our traffic from everyone else's, but it only works while the
+    lane that installs remembers to set it -- and the failure it replaced was exactly a lane that
+    forgot. So the report keeps a second, independent read that owes nothing to what the sender
+    claimed: nobody installs on macOS Intel, macOS ARM, Linux x64 and Linux ARM inside the same
+    minute. Returns the start timestamps of the offending bursts."""
+    rows = sorted((e for e in events if e.get("timestamp")), key=lambda e: e["timestamp"])
+    bursts, current = [], []
+    for row in rows:
+        try:
+            at = datetime.datetime.strptime(row["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+        if current and (at - current[-1][0]).total_seconds() > 180:
+            bursts.append(current)
+            current = []
+        current.append((at, row))
+    if current:
+        bursts.append(current)
+    out = []
+    for burst in bursts:
+        platforms = {"%s/%s" % (r.get("os"), r.get("arch")) for _, r in burst}
+        if len(platforms) >= 3:
+            out.append((burst[0][1]["timestamp"], len(burst), sorted(platforms)))
+    return out
+
 # --- canonical L1 -----------------------------------------------------------------------------
 # Unique installation_id, not event count: a reinstall in the same place is one installation, and
 # counting rows would inflate the one figure everything else is divided by.
+#
+# Counted over the community channel alone. Our own harnesses are printed below it and never added
+# in -- a denominator that includes the machines testing the product measures the tests.
 all_events = read_events()
-print("CANONICAL L1 -- installs completed (unique installation_id)")
+print("CANONICAL L1 -- community installs completed (unique installation_id)")
 l1 = None
+community = []
 if all_events is None:
     print("  no event store yet -- the install endpoint is not receiving. L1 is unavailable,")
     print("  which is different from L1 being zero.")
 else:
     events = [e for e in all_events if e.get("timestamp", "")[:10] in days]
-    ids = {e.get("installation_id") for e in events if e.get("installation_id")}
+    # An event with no channel key at all predates the field. It is neither ours nor demonstrably
+    # somebody else's, and calling it community would put whatever it was into the denominator.
+    by_channel = {}
+    for e in events:
+        by_channel.setdefault(e.get("channel", "unknown"), []).append(e)
+    community = by_channel.get("community", [])
+    ids = {e.get("installation_id") for e in community if e.get("installation_id")}
     l1 = len(ids)
     print("  installs completed: %d" % l1)
     by_version = {}
-    for e in events:
+    for e in community:
         by_version.setdefault(e.get("version", "unknown"), set()).add(e.get("installation_id"))
     if by_version:
         print("  by version:")
         for v in sorted(by_version, reverse=True):
             print("    %-10s %d" % (v, len(by_version[v])))
     by_entry = {}
-    for e in events:
+    for e in community:
         by_entry.setdefault(e.get("entrypoint", "unknown"), set()).add(e.get("installation_id"))
     if by_entry:
         print("  by entry point: " + ", ".join(
             "%s %d" % (k, len(v)) for k, v in sorted(by_entry.items())))
+    print()
+    print("  NOT the denominator, and never added to it:")
+    for label, why in (("internal", "our own test harnesses -- installs nobody performed"),
+                       ("unknown", "no channel was reported: an installer older than the field")):
+        rows = by_channel.get(label, [])
+        n = len({e.get("installation_id") for e in rows if e.get("installation_id")})
+        print("    %-9s %-6d (%s)" % (label, n, why))
 print()
 
 # --- distribution signals ---------------------------------------------------------------------
@@ -224,6 +271,18 @@ if not missing_any:
 # through completely separate paths -- a pull from GitHub's API versus a push from the installer -- so
 # traffic with no installs at all is either a real collapse or, far more often, the callback failing
 # quietly. Neither is visible in any single figure above.
+# The channel says what the sender claimed. This says what the traffic looks like, and the two are
+# independent on purpose: the one failure this field cannot catch by itself is a lane that installs
+# without setting it, whose events arrive claiming to be community and look exactly like a person's.
+bursts = machine_shaped(community)
+if bursts:
+    print()
+    print("  WARNING: %d burst(s) counted as community have a shape no person produces." % len(bursts))
+    for at, n, platforms in bursts[:5]:
+        print("    %s  %d events across %s" % (at, n, ", ".join(platforms)))
+    print("  Three or more platforms inside three minutes is a test matrix. Find the lane that")
+    print("  installed without declaring itself, and read this week's L1 as an upper bound.")
+
 if distribution_seen > 0 and (l1 is None or l1 == 0):
     print()
     print("  WARNING: distribution signals are non-zero for this week while L1 is %s."

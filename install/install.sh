@@ -20,6 +20,10 @@
 #                          written. Checked before either happens, never after.
 #   TAPSTATE_TELEMETRY_URL where the install event goes; default https://install.tapstate.dev/e.
 #   TAPSTATE_ENTRYPOINT    which entry point ran this: "cli" (default) or "quickstart".
+#   TAPSTATE_TELEMETRY_CHANNEL
+#                          "internal" marks the event as one of ours -- a test harness, not a person.
+#                          Anything else, unset included, is "community". The one figure the funnel
+#                          divides by counts the community channel alone.
 #
 # POSIX sh, no bashisms. All work is inside main(); the final line calls it, so a truncated download can
 # never execute a partial script.
@@ -366,8 +370,8 @@ telemetry_enabled() {
 # dropped, so a disclosure on stdout would be invisible on the path most first-time users take.
 telemetry_disclose() {
     telemetry_enabled || return 0
-    printf 'tapstate reports one anonymous install event (version, OS/arch, entry point, and a random\n' >&2
-    printf 'installation id kept in %s). No IP address is stored.\n' "$install_dir" >&2
+    printf 'tapstate reports one anonymous install event (version, OS/arch, entry point, channel, and\n' >&2
+    printf 'a random installation id kept in %s). No IP address is stored.\n' "$install_dir" >&2
     printf 'Turn it off with TAPSTATE_TELEMETRY=off; deleting %s forgets this installation.\n\n' "$install_dir/$ID_FILE" >&2
 }
 
@@ -396,9 +400,18 @@ send_install_event() {
 
     event_os="${platform%%-*}"
     event_arch="${platform#*-}"
-    payload="$(printf '{"installation_id":"%s","version":"%s","os":"%s","arch":"%s","entrypoint":"%s","timestamp":"%s"}' \
+    # Which side of the denominator this install falls on. Only an exact "internal" marks it as ours;
+    # everything else, an unset variable included, is a community install -- because unset is the path
+    # a person's machine takes, and a normalisation that guessed "they probably meant internal" would
+    # make a typo in one of our own lanes invisible, which is the failure this field exists to end.
+    # A lane that sets it wrong is caught by a gate that reads the lane, not by a fallback here.
+    case "${TAPSTATE_TELEMETRY_CHANNEL:-}" in
+        internal) event_channel="internal" ;;
+        *) event_channel="community" ;;
+    esac
+    payload="$(printf '{"installation_id":"%s","version":"%s","os":"%s","arch":"%s","entrypoint":"%s","channel":"%s","timestamp":"%s"}' \
         "$installation_id" "$version" "$event_os" "$event_arch" \
-        "${TAPSTATE_ENTRYPOINT:-cli}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+        "${TAPSTATE_ENTRYPOINT:-cli}" "$event_channel" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
     endpoint="${TAPSTATE_TELEMETRY_URL:-https://install.tapstate.dev/e}"
 
     if command -v curl >/dev/null 2>&1; then

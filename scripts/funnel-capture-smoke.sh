@@ -11,6 +11,9 @@
 #     treats every counter as a daily observation reports 130 and looks entirely plausible.
 #   - a gap is reported, never zero-filled. A series with three missing days must say so: zero-filling
 #     produces a good-looking and wrong number, which is worse than an obvious hole.
+#   - the denominator counts community installs and nothing else. Our own harnesses install on four
+#     platforms every night; counted in, they are most of the figure everything is divided by, and
+#     an event that never said which side it is on must not be read as a person either.
 #
 # Fixtures are canned API payloads, so this runs with no network and no credentials.
 set -eu
@@ -88,11 +91,13 @@ printf '[{"assets":[{"name":"cli","download_count":130}]}]\n' > "$fx/releases.js
 sh "$capture" --store "$store" --fixture-dir "$fx" --observed-at 2026-08-20T00:00:00Z >/dev/null
 
 # Four events, three installations: one id repeats, which is what a reinstall in place looks like.
+# All four are community installs -- the denominator counts that channel, so a fixture without one
+# would be asserting the channel split rather than the unique-id rule this case is about.
 cat > "$store/events/installs.jsonl" <<'JSON'
-{"installation_id":"aaa","version":"0.3.0","os":"darwin","arch":"arm64","entrypoint":"cli","timestamp":"2026-08-18T01:00:00Z"}
-{"installation_id":"aaa","version":"0.3.0","os":"darwin","arch":"arm64","entrypoint":"cli","timestamp":"2026-08-19T01:00:00Z"}
-{"installation_id":"bbb","version":"0.3.0","os":"linux","arch":"x64","entrypoint":"quickstart","timestamp":"2026-08-19T02:00:00Z"}
-{"installation_id":"ccc","version":"0.2.9","os":"linux","arch":"x64","entrypoint":"cli","timestamp":"2026-08-20T02:00:00Z"}
+{"installation_id":"aaa","version":"0.3.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T01:00:00Z"}
+{"installation_id":"aaa","version":"0.3.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-19T01:00:00Z"}
+{"installation_id":"bbb","version":"0.3.0","os":"linux","arch":"x64","entrypoint":"quickstart","channel":"community","timestamp":"2026-08-19T02:00:00Z"}
+{"installation_id":"ccc","version":"0.2.9","os":"linux","arch":"x64","entrypoint":"cli","channel":"community","timestamp":"2026-08-20T02:00:00Z"}
 JSON
 out="$(sh "$report" --store "$store" --week 2026-08-18)"
 
@@ -190,10 +195,10 @@ pass "case 10: the series reaches the origin"
 store="$work/store7"; fx="$work/fx7"; mkdir -p "$fx" "$store/events"
 : > "$fx/clones.json"; : > "$fx/releases.json"
 cat > "$store/events/2026-08-18T01-00-00Z-aaaa1111.json" <<'JSON'
-{"installation_id":"e1","version":"0.4.1","os":"darwin","arch":"arm64","entrypoint":"cli","country":"SG","timestamp":"2026-08-18T01:00:00Z"}
+{"installation_id":"e1","version":"0.4.1","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","country":"SG","timestamp":"2026-08-18T01:00:00Z"}
 JSON
 cat > "$store/events/2026-08-19T02-00-00Z-bbbb2222.json" <<'JSON'
-{"installation_id":"e2","version":"0.4.1","os":"linux","arch":"x64","entrypoint":"quickstart","country":"ZZ","timestamp":"2026-08-19T02:00:00Z"}
+{"installation_id":"e2","version":"0.4.1","os":"linux","arch":"x64","entrypoint":"quickstart","channel":"community","country":"ZZ","timestamp":"2026-08-19T02:00:00Z"}
 JSON
 sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
 [ -f "$store/events/installs.jsonl" ] \
@@ -207,7 +212,7 @@ pass "case 11: the receiver's per-event files are folded into the series the rep
 # Idempotent, because the job runs forever and a re-run must not double the denominator. Re-adding an
 # already-folded event must change nothing: the key is (installation_id, timestamp), not the filename.
 cat > "$store/events/2026-08-18T01-00-00Z-cccc3333.json" <<'JSON'
-{"installation_id":"e1","version":"0.4.1","os":"darwin","arch":"arm64","entrypoint":"cli","country":"SG","timestamp":"2026-08-18T01:00:00Z"}
+{"installation_id":"e1","version":"0.4.1","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","country":"SG","timestamp":"2026-08-18T01:00:00Z"}
 JSON
 sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
 folded2="$(wc -l < "$store/events/installs.jsonl" | tr -d ' ')"
@@ -225,7 +230,7 @@ pass "case 13: a file that does not parse as an event is kept, not silently drop
 # an absent event store must still say "unavailable" rather than zero -- they are opposite findings.
 store="$work/store8"; mkdir -p "$store/events" "$store/daily"
 cat > "$store/events/2026-08-18T03-00-00Z-dddd4444.json" <<'JSON'
-{"installation_id":"e9","version":"0.4.1","os":"linux","arch":"x64","entrypoint":"cli","country":"ZZ","timestamp":"2026-08-18T03:00:00Z"}
+{"installation_id":"e9","version":"0.4.1","os":"linux","arch":"x64","entrypoint":"cli","channel":"community","country":"ZZ","timestamp":"2026-08-18T03:00:00Z"}
 JSON
 out3="$(sh "$report" --store "$store" --week 2026-08-18)"
 echo "$out3" | grep -qE 'installs completed: *1' \
@@ -327,5 +332,75 @@ out10="$(sh "$report" --store "$store" --week 2026-08-18)"
 echo "$out10" | grep -qi 'WARNING: distribution signals are non-zero' \
   || fail "case 22: traffic with no installs at all raised no warning: $out10"
 pass "case 22: traffic with no installs raises a warning rather than reading as a real ratio"
+
+# --- the channel: which installs reach the denominator ----------------------------------------------
+# Numbered after the cases above because the numbers follow the order they were added in, and moving
+# an existing one would renumber assertions that other output already refers to.
+#
+# Measured before this field existed, over 2026-09-06..09-20 on the real store: 366 events, 186
+# installations, and all but a handful arrived in nightly bursts across four platforms. The figure the
+# funnel divides by was almost entirely the machines testing the product, and nothing in a stored
+# event could separate them afterwards -- which is the whole reason there is a channel to assert.
+
+store="$work/store-channel"; mkdir -p "$store/events"
+cat > "$store/events/installs.jsonl" <<'JSON'
+{"installation_id":"p1","version":"0.5.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T09:00:00Z"}
+{"installation_id":"p2","version":"0.5.0","os":"linux","arch":"x64","entrypoint":"quickstart","channel":"community","timestamp":"2026-08-19T14:30:00Z"}
+{"installation_id":"m1","version":"0.5.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"internal","timestamp":"2026-08-20T20:49:28Z"}
+{"installation_id":"m2","version":"0.5.0","os":"darwin","arch":"x64","entrypoint":"cli","channel":"internal","timestamp":"2026-08-20T20:49:31Z"}
+{"installation_id":"m3","version":"0.5.0","os":"linux","arch":"arm64","entrypoint":"cli","channel":"internal","timestamp":"2026-08-20T20:49:34Z"}
+JSON
+out="$(sh "$report" --store "$store" --week 2026-08-18)"
+
+echo "$out" | grep -qE 'installs completed: *2' \
+  || fail "case 23: expected L1 = 2 community installations, report said: $(echo "$out" | grep -i 'installs completed')"
+echo "$out" | grep -qE 'internal +3' \
+  || fail "case 23: the three internal installations are not shown apart from the denominator"
+echo "$out" | grep -qi 'NOT the denominator' \
+  || fail "case 23: nothing on the page says the internal figure is not a denominator"
+pass "case 23: the denominator counts community installs and lists ours apart from it"
+
+# An installer older than the field cannot say which side it is on. Reading that as "community" is
+# the one substitution that puts our own lanes -- which is most of what an old installer is -- back
+# inside the denominator, invisibly.
+store="$work/store-nochannel"; mkdir -p "$store/events"
+cat > "$store/events/installs.jsonl" <<'JSON'
+{"installation_id":"o1","version":"0.4.5","os":"darwin","arch":"arm64","entrypoint":"cli","timestamp":"2026-08-18T09:00:00Z"}
+{"installation_id":"o2","version":"0.4.5","os":"linux","arch":"x64","entrypoint":"cli","timestamp":"2026-08-19T09:00:00Z"}
+JSON
+out="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out" | grep -qE 'installs completed: *0' \
+  || fail "case 24: an event carrying no channel was counted into the denominator"
+echo "$out" | grep -qE 'unknown +2' \
+  || fail "case 24: the two unattributable installations are not reported as unknown"
+pass "case 24: an install that never said which side it is on is unknown, not community"
+
+# The channel says what the sender claimed; this says what the traffic looks like. The failure the
+# field cannot catch by itself is a lane that installs without setting it -- its events arrive
+# claiming to be community and are indistinguishable from a person's, one at a time.
+store="$work/store-shape"; mkdir -p "$store/events"
+cat > "$store/events/installs.jsonl" <<'JSON'
+{"installation_id":"b1","version":"0.5.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T20:49:28Z"}
+{"installation_id":"b2","version":"0.5.0","os":"darwin","arch":"x64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T20:49:31Z"}
+{"installation_id":"b3","version":"0.5.0","os":"linux","arch":"x64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T20:49:34Z"}
+{"installation_id":"b4","version":"0.5.0","os":"linux","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T20:49:37Z"}
+JSON
+out="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out" | grep -qi 'shape no person produces' \
+  || fail "case 25: a four-platform burst inside ten seconds did not raise the shape warning"
+
+# And the control, without which the case above is satisfied by a warning that always fires: the same
+# number of community installs, one platform, spread across the week.
+store="$work/store-shape-ok"; mkdir -p "$store/events"
+cat > "$store/events/installs.jsonl" <<'JSON'
+{"installation_id":"h1","version":"0.5.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T09:00:00Z"}
+{"installation_id":"h2","version":"0.5.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-19T11:20:00Z"}
+{"installation_id":"h3","version":"0.5.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-20T16:05:00Z"}
+{"installation_id":"h4","version":"0.5.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-21T08:40:00Z"}
+JSON
+out="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out" | grep -qi 'shape no person produces' \
+  && fail "case 25: the shape warning fired on four ordinary installs across four days"
+pass "case 25: a machine-shaped burst claiming to be community is named, an ordinary week is not"
 
 printf 'funnel-capture-smoke: all cases passed\n'
