@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.WriteMode;
@@ -108,6 +109,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         for (Node node : all) {
             node.referenced(referenced(node, tables));
         }
+        checkFlatFieldConflicts(root.from(), List.of(), top, tables);
         List<String> rootIdentity = identityOf(ROOT_NAMESPACE, rootKey, claimants(top));
         for (Node node : all) {
             if (!node.children().isEmpty()) {
@@ -325,7 +327,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             }
             List<String> beneath = new ArrayList<>();
             for (Node child : node.children()) {
-                beneath.add(child.embed().path());
+                beneath.add(render(child.pathId()));
             }
             NestTable table = tables.apply(node.embed().from());
             throw new TapstateException(NestError.REFERENCED_LEVEL_CARRIES_EMBEDS,
@@ -534,8 +536,28 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
      * paths from the root would render the same - which is also what keeps a rendered path unique.
      */
     private static void checkPaths(List<Node> children) {
+        Map<String, Node> stateSegments = new LinkedHashMap<>();
+        for (Node child : children) {
+            Node sameState = stateSegments.putIfAbsent(child.embed().treeSegment(), child);
+            if (sameState != null) {
+                if (sameState.embed().as() == EmbedAs.FLAT && child.embed().as() == EmbedAs.FLAT
+                        && sameState.embed().from().equals(child.embed().from())) {
+                    throw new TapstateException(NestError.FLAT_EMBED_ALIAS_CONFLICT,
+                            Map.of("parentPath", render(child.parentPathId()),
+                                    "alias", child.embed().from()), null);
+                }
+                throw new TapstateException(NestError.EMBED_PATH_CONFLICT,
+                        Map.of("path", child.embed().treeSegment(),
+                                "embedPathA", render(sameState.pathId()),
+                                "embedPathB", render(child.pathId())), null);
+            }
+        }
         for (int i = 0; i < children.size(); i++) {
             for (int j = i + 1; j < children.size(); j++) {
+                if (children.get(i).embed().as() == EmbedAs.FLAT
+                        || children.get(j).embed().as() == EmbedAs.FLAT) {
+                    continue;
+                }
                 List<String> a = segments(children.get(i).embed().path());
                 List<String> b = segments(children.get(j).embed().path());
                 int common = Math.min(a.size(), b.size());
@@ -547,6 +569,92 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                 }
             }
         }
+    }
+
+    /**
+     * Refuses every flat field collision the discovered models can already prove. A missing model is
+     * deliberately not an empty model: its field set contributes no preflight finding, and the renderer
+     * performs the same check against the actual row when it arrives.
+     */
+    private static void checkFlatFieldConflicts(String parentAlias, List<String> parentPathId,
+            List<Node> children, Function<String, NestTable> tables) {
+        Map<String, String> occupied = new LinkedHashMap<>();
+        NestTable parent = tables.apply(parentAlias);
+        if (parent != null) {
+            for (String field : new TreeSet<>(parent.fields())) {
+                occupied.putIfAbsent(field, render(parentPathId) + " row");
+            }
+        }
+        for (Node child : children) {
+            if (child.embed().as() != EmbedAs.FLAT) {
+                occupied.putIfAbsent(child.embed().path(), render(child.pathId()));
+            }
+        }
+        for (Node child : children) {
+            if (child.embed().as() != EmbedAs.FLAT) {
+                continue;
+            }
+            Map<String, String> contributed = knownFlatOutput(child, tables);
+            Map<String, String> conflicts = conflicts(contributed.keySet(), occupied);
+            if (!conflicts.isEmpty()) {
+                throw flatFieldConflict(child, conflicts);
+            }
+            contributed.keySet().forEach(field -> occupied.put(field, render(child.pathId())));
+        }
+        for (Node child : children) {
+            checkFlatFieldConflicts(child.embed().from(), child.pathId(), child.children(), tables);
+        }
+    }
+
+    /** Known output fields of one flat row, including the paths and flat fields nested inside it. */
+    private static Map<String, String> knownFlatOutput(Node node, Function<String, NestTable> tables) {
+        Map<String, String> output = new LinkedHashMap<>();
+        NestTable table = tables.apply(node.embed().from());
+        if (table != null) {
+            for (String field : new TreeSet<>(table.fields())) {
+                output.putIfAbsent(field, render(node.pathId()) + " row");
+            }
+        }
+        for (Node child : node.children()) {
+            Map<String, String> contributed = child.embed().as() == EmbedAs.FLAT
+                    ? knownFlatOutput(child, tables)
+                    : Map.of(child.embed().path(), render(child.pathId()));
+            Map<String, String> collisions = conflicts(contributed.keySet(), output);
+            if (!collisions.isEmpty()) {
+                throw flatFieldConflict(child.embed().as() == EmbedAs.FLAT ? child : node, collisions);
+            }
+            contributed.forEach(output::put);
+        }
+        return output;
+    }
+
+    /** Every candidate field that overlaps an occupied field, mapped to the existing owner. */
+    private static Map<String, String> conflicts(Set<String> candidates, Map<String, String> occupied) {
+        Map<String, String> found = new LinkedHashMap<>();
+        for (String candidate : new TreeSet<>(candidates)) {
+            for (String existing : new TreeSet<>(occupied.keySet())) {
+                if (pathsOverlap(candidate, existing)) {
+                    found.put(candidate, occupied.get(existing));
+                    break;
+                }
+            }
+        }
+        return found;
+    }
+
+    private static TapstateException flatFieldConflict(Node flat, Map<String, String> conflicts) {
+        return new TapstateException(NestError.FLAT_FIELD_CONFLICT,
+                Map.of("embedPath", render(flat.pathId()),
+                        "fields", String.join(", ", conflicts.keySet()),
+                        "occupiedBy", String.join(", ", new TreeSet<>(conflicts.values()))), null);
+    }
+
+    /** Whether two dotted field paths claim the same place or one lies beneath the other. */
+    static boolean pathsOverlap(String left, String right) {
+        List<String> a = segments(left);
+        List<String> b = segments(right);
+        int common = Math.min(a.size(), b.size());
+        return a.subList(0, common).equals(b.subList(0, common));
     }
 
     /**
@@ -678,10 +786,12 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         for (Node node : nodes) {
             Embed embed = node.embed();
             slots.add(node.referenced()
-                    ? new EmbedSlot(embed.path(), embed.as(), referenceFields(embed),
+                    ? new EmbedSlot(embed.treeSegment(), embed.path(), render(node.pathId()), embed.as(),
+                            referenceFields(embed),
                             mapName(pipelineId, nodeId, node.pathId()),
                             slotsOf(pipelineId, nodeId, node.children()))
-                    : new EmbedSlot(embed.path(), embed.as(), slotsOf(pipelineId, nodeId, node.children())));
+                    : new EmbedSlot(embed.treeSegment(), embed.path(), render(node.pathId()), embed.as(),
+                            null, null, slotsOf(pipelineId, nodeId, node.children())));
         }
         return slots;
     }
@@ -723,7 +833,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
     private static Node node(Embed embed, List<String> parentPathId, String parentAlias,
             List<String> parentKey) {
         List<String> pathId = new ArrayList<>(parentPathId);
-        pathId.add(embed.path());
+        pathId.add(embed.treeSegment());
         List<Node> children = new ArrayList<>();
         for (Embed child : childrenOf(embed.embed())) {
             children.add(node(child, pathId, embed.from(), embed.key()));
