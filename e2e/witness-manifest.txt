@@ -108,3 +108,5 @@ an-unwind-index-cannot-overwrite-a-parent-column on IN_PROCESS
 an-unwind-index-cannot-overwrite-a-parent-column on REAL_PROCESS
 an-unwind-element-key-cannot-overwrite-a-parent-column on IN_PROCESS
 an-unwind-element-key-cannot-overwrite-a-parent-column on REAL_PROCESS
+many-parents-share-flat-children on IN_PROCESS
+many-parents-share-flat-children on REAL_PROCESS

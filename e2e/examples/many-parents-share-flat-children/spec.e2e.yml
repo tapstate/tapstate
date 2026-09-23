@@ -1,0 +1,46 @@
+# Two lookup tables contribute fields directly to each customer document. The two customer rows in the
+# west share one region row, which distinguishes many-to-one flat lookup from one-to-one assembly. The
+# region and tier fields are asserted together so a runtime that keeps only one flat sibling cannot pass.
+#
+# The mapped child rows intentionally remove their original id and name fields. Flat embeds never choose
+# a winner for a duplicate field; keeping those generic names would correctly stop the pipeline instead
+# of exercising the successful shape this case specifies.
+#
+# Each lookup key remains on the mapped child until Nest has used it, then the final map removes it from
+# the public document. This witnesses that authoring can keep structural fields without leaking them into
+# the result.
+#
+# Read mode is snapshot_only so the result cannot be repaired by CDC after an incomplete snapshot.
+# Mutation evidence is recorded in the pull request that introduces this case.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
+# example, naming a directory whose jars do not resolve fails it.
+name: many-parents-share-flat-children
+setup:
+  databases:
+    src: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [ mysql, mongodb ]
+  apply: [ src_catalog.tap.yml, views.tap.yml, pipeline.tap.yml ]
+  discover: [ src_catalog ]
+pipeline: pipeline.tap.yml
+seed:
+  src_catalog.customers:
+    values:
+      - { id: 1, customer_name: ada, region_id: 10, tier_id: 100 }
+      - { id: 2, customer_name: grace, region_id: 10, tier_id: 200 }
+      - { id: 3, customer_name: linus, region_id: 20, tier_id: 100 }
+  src_catalog.regions:
+    values:
+      - { id: 10, name: west }
+      - { id: 20, name: east }
+  src_catalog.tiers:
+    values:
+      - { id: 100, name: gold }
+      - { id: 200, name: silver }
+steps:
+  - start
+  - await: { count: { views.customer_state: 3 } }
+  - await: { doc: { views.customer_state: { where: { id: 1 }, expect: { customer_name: ada, region_name: west, tier_name: gold } } } }
+  - await: { doc: { views.customer_state: { where: { id: 2 }, expect: { customer_name: grace, region_name: west, tier_name: silver } } } }
+  - await: { doc: { views.customer_state: { where: { id: 3 }, expect: { customer_name: linus, region_name: east, tier_name: gold } } } }

@@ -663,6 +663,15 @@ nest.embed-target-not-parent-key:
 nest.embed-path-conflict:
   message: "Embeds {embedPathA} and {embedPathB} both target the path {path}."
   solution: "Give each embed a path of its own, or one silently overwrites the other in the document."
+nest.flat-embed-alias-conflict:
+  message: "Flat embeds under {parentPath} reuse alias {alias}, so their pathless state identity is the same."
+  solution: "Give each flat embed a distinct alias in the nest from map, even when two aliases read the same upstream stream."
+nest.flat-field-conflict:
+  message: "Flat embed {embedPath} contributes fields {fields}, already occupied by {occupiedBy}."
+  solution: "Rename or drop the conflicting child fields before the nest, or use an object or array embed with its own path. Flat fields never overwrite a parent or sibling field by declaration order."
+nest.flat-cardinality-violation:
+  message: "Flat embed {embedPath} matched {rows} live rows for one parent document."
+  solution: "Make the child-to-parent join one-to-one, reverse a many-to-one relationship so the parent points at one shared row, or use an array embed for a one-to-many relationship. Flat never chooses an arbitrary matching row."
 nest.root-key-required:
   message: "The nest rooted at {rootAlias} has no key: it declares none, and its stream offers neither a primary key nor a single unique index to take one from."
   solution: "Declare root.key: it is the identity children are grouped under, and the assembled document has none without it. A root over a table that already declares one need not repeat it."

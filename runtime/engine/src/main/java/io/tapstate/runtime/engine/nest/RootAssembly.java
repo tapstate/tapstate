@@ -1,7 +1,9 @@
 package io.tapstate.runtime.engine.nest;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.EmbedAs;
 import io.tapstate.runtime.engine.ReplayFloor;
 
 import java.io.Serializable;
@@ -16,6 +18,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * One nested document under assembly: the root row, the tree of elements attached beneath it, and the
@@ -63,9 +66,8 @@ import java.util.Set;
  * emitting it is the caller's business.
  *
  * <p>An array embed with no live element renders an empty array; an object embed with none omits its
- * field rather than rendering null, so two correct implementations cannot differ in the shape they
- * produce for the same input. An object embed that ends up holding several rows — a one-to-one the
- * source contradicted — shows the one with the highest order.
+ * field rather than rendering null. A flat embed merges one row into its parent and refuses a second
+ * live row rather than choosing one. Object's historical latest-row behavior remains unchanged.
  *
  * <p>An element's identity is taken when it first appears. A row whose identity value changes later is
  * a structural key change, which this state does not track: its existing children stay where they are.
@@ -96,6 +98,17 @@ public final class RootAssembly implements Serializable {
     private Map<String, Object> rootFields;
     private SourceOrder rootOrder;
     private boolean rootPresent;
+
+    /**
+     * Top-level fields each flat embed has contributed in any emitted version of this document. A sink
+     * applies rows by setting present fields, so a later delete or narrower row must name the old fields
+     * explicitly. Persisted because the removal may arrive after a restart, and path-scoped because two
+     * flat embeds with disjoint models may independently gain and lose fields.
+     *
+     * <p>Null is the safe value when state written before this field is read: those builds had no flat
+     * shape, so they could not have emitted a field that this set now owes a removal for.
+     */
+    private Map<String, Set<String>> flatFields = new LinkedHashMap<>();
 
     /** The embeds directly under the root: field name, then element key. */
     private final Map<String, Map<List<Object>, ElementNode>> children = new LinkedHashMap<>();
@@ -622,7 +635,7 @@ public final class RootAssembly implements Serializable {
             return Optional.empty();
         }
         Map<String, Object> document = new LinkedHashMap<>(rootFields);
-        renderInto(document, children, slots, resolved);
+        renderInto(document, children, slots, resolved, true);
         return Optional.of(document);
     }
 
@@ -646,12 +659,18 @@ public final class RootAssembly implements Serializable {
      * not have drops nothing. Telling "gone" from "never here" would need a memory of what was last sent,
      * which is a second copy of every document to save nothing.
      */
-    public static Set<String> embedsNotRendered(List<EmbedSlot> slots, Map<String, Object> rendered) {
+    public Set<String> embedsNotRendered(List<EmbedSlot> slots, Map<String, Object> rendered) {
         Objects.requireNonNull(slots, "slots");
         Objects.requireNonNull(rendered, "rendered");
         Set<String> absent = new LinkedHashSet<>();
         for (EmbedSlot slot : slots) {
-            if (!rendered.containsKey(slot.path())) {
+            if (slot.as() == EmbedAs.FLAT) {
+                for (String field : flatFields().getOrDefault(slot.diagnosticPath(), Set.of())) {
+                    if (!rendered.containsKey(field)) {
+                        absent.add(field);
+                    }
+                }
+            } else if (!rendered.containsKey(slot.path())) {
                 absent.add(slot.path());
             }
         }
@@ -720,7 +739,7 @@ public final class RootAssembly implements Serializable {
                 }
                 continue;
             }
-            Map<List<Object>, ElementNode> elements = held.get(slot.path());
+            Map<List<Object>, ElementNode> elements = held.get(slot.stateField());
             if (elements == null) {
                 continue;
             }
@@ -1028,10 +1047,18 @@ public final class RootAssembly implements Serializable {
         return parent == null ? null : parent.children();
     }
 
-    private static void renderInto(Map<String, Object> document,
+    private void renderInto(Map<String, Object> document,
             Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots,
-            Map<String, Map<Object, Map<String, Object>>> resolved) {
+            Map<String, Map<Object, Map<String, Object>>> resolved, boolean rememberTopLevelFlatFields) {
+        Map<String, String> occupied = new LinkedHashMap<>();
+        for (String field : document.keySet()) {
+            occupied.put(field, "the parent row");
+        }
         for (EmbedSlot slot : slots) {
+            if (slot.as() == EmbedAs.FLAT) {
+                continue;
+            }
+            occupied.putIfAbsent(slot.path(), slot.diagnosticPath());
             if (slot.isReference()) {
                 // Read off the row this level already carries. The columns holding the reference are ones
                 // the row has anyway, so pointing at something costs the document no bytes of its own.
@@ -1059,26 +1086,50 @@ public final class RootAssembly implements Serializable {
                             document.put(slot.path(), new LinkedHashMap<>(row));
                         }
                     }
+                    case FLAT -> throw new IllegalStateException("flat slots are rendered in the flat pass");
                 }
                 continue;
             }
-            Map<List<Object>, ElementNode> elements = held.get(slot.path());
+            Map<List<Object>, ElementNode> elements = held.get(slot.stateField());
             switch (slot.as()) {
                 case ARRAY -> document.put(slot.path(), liveOf(elements, slot, resolved));
                 case OBJECT -> latestOf(elements)
                         .ifPresent(element -> document.put(slot.path(), renderOne(element, slot, resolved)));
+                case FLAT -> throw new IllegalStateException("flat slots are rendered in the flat pass");
+            }
+        }
+        for (EmbedSlot slot : slots) {
+            if (slot.as() != EmbedAs.FLAT) {
+                continue;
+            }
+            Map<String, Object> flat = null;
+            if (slot.isReference()) {
+                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields());
+                Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
+                if (row != null && !row.isEmpty()) {
+                    flat = new LinkedHashMap<>(row);
+                }
+            } else {
+                Map<List<Object>, ElementNode> elements = held.get(slot.stateField());
+                Optional<ElementNode> only = onlyLiveFlat(elements, slot);
+                if (only.isPresent()) {
+                    flat = renderOne(only.get(), slot, resolved);
+                }
+            }
+            if (flat != null) {
+                mergeFlat(document, flat, slot, occupied, rememberTopLevelFlatFields);
             }
         }
     }
 
-    private static Map<String, Object> renderOne(ElementNode element, EmbedSlot slot,
+    private Map<String, Object> renderOne(ElementNode element, EmbedSlot slot,
             Map<String, Map<Object, Map<String, Object>>> resolved) {
         Map<String, Object> rendered = new LinkedHashMap<>(element.fields());
-        renderInto(rendered, element.children(), slot.children(), resolved);
+        renderInto(rendered, element.children(), slot.children(), resolved, false);
         return rendered;
     }
 
-    private static List<Map<String, Object>> liveOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot,
+    private List<Map<String, Object>> liveOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot,
             Map<String, Map<Object, Map<String, Object>>> resolved) {
         List<Map<String, Object>> live = new ArrayList<>();
         if (elements != null) {
@@ -1089,6 +1140,59 @@ public final class RootAssembly implements Serializable {
             }
         }
         return live;
+    }
+
+    /** The one live row of a flat embed, refusing a one-to-many relationship at runtime. */
+    private static Optional<ElementNode> onlyLiveFlat(
+            Map<List<Object>, ElementNode> elements, EmbedSlot slot) {
+        ElementNode found = null;
+        int live = 0;
+        if (elements != null) {
+            for (ElementNode element : elements.values()) {
+                if (!element.deleted()) {
+                    found = element;
+                    live++;
+                }
+            }
+        }
+        if (live > 1) {
+            throw new TapstateException(NestError.FLAT_CARDINALITY_VIOLATION,
+                    Map.of("embedPath", slot.diagnosticPath(), "rows", live), null);
+        }
+        return Optional.ofNullable(found);
+    }
+
+    /** Merges one flat row after proving that none of its fields claims an occupied parent path. */
+    private void mergeFlat(Map<String, Object> document, Map<String, Object> flat, EmbedSlot slot,
+            Map<String, String> occupied, boolean rememberTopLevelFlatFields) {
+        Map<String, String> conflicts = new LinkedHashMap<>();
+        for (String field : new TreeSet<>(flat.keySet())) {
+            for (String existing : new TreeSet<>(occupied.keySet())) {
+                if (NestTopology.pathsOverlap(field, existing)) {
+                    conflicts.put(field, occupied.get(existing));
+                    break;
+                }
+            }
+        }
+        if (!conflicts.isEmpty()) {
+            throw new TapstateException(NestError.FLAT_FIELD_CONFLICT,
+                    Map.of("embedPath", slot.diagnosticPath(),
+                            "fields", String.join(", ", conflicts.keySet()),
+                            "occupiedBy", String.join(", ", new TreeSet<>(conflicts.values()))), null);
+        }
+        document.putAll(flat);
+        flat.keySet().forEach(field -> occupied.put(field, slot.diagnosticPath()));
+        if (rememberTopLevelFlatFields) {
+            flatFields().computeIfAbsent(slot.diagnosticPath(), ignored -> new LinkedHashSet<>())
+                    .addAll(flat.keySet());
+        }
+    }
+
+    private Map<String, Set<String>> flatFields() {
+        if (flatFields == null) {
+            flatFields = new LinkedHashMap<>();
+        }
+        return flatFields;
     }
 
     private static Optional<ElementNode> latestOf(Map<List<Object>, ElementNode> elements) {
