@@ -23,7 +23,7 @@
     },
     "Embed": {
       "type": "object",
-      "description": "One embedded child of a nest tree, joined onto its parent and placed at a target path.",
+      "description": "One child of a nest tree, joined onto its parent and either placed at a path or merged into it.",
       "properties": {
         "from": {
           "description": "Alias of the nest step's from map that supplies this child's rows.",
@@ -37,11 +37,11 @@
           }
         },
         "as": {
-          "description": "How the matched child rows are shaped under the parent: a single object or an array.",
+          "description": "How matched child rows contribute under the parent: an array, an object, or flat fields.",
           "$ref": "#/$defs/EmbedAs"
         },
         "path": {
-          "description": "Target field path under the parent where the embedded child is placed.",
+          "description": "Target field path for array and object embeds. Flat embeds must omit it.",
           "type": "string"
         },
         "key": {
@@ -77,14 +77,50 @@
       "required": [
         "from",
         "on",
-        "as",
-        "path"
+        "as"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "as": {
+                "const": "flat"
+              }
+            },
+            "required": [
+              "as"
+            ]
+          },
+          "then": {
+            "allOf": [
+              {
+                "not": {
+                  "required": [
+                    "path"
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "required": [
+                    "arrayKey"
+                  ]
+                }
+              }
+            ]
+          },
+          "else": {
+            "required": [
+              "path"
+            ]
+          }
+        }
       ],
       "additionalProperties": false
     },
     "EmbedAs": {
       "type": "string",
-      "description": "How a nested child is embedded into its parent: as a one-to-many array or a one-to-one object.",
+      "description": "How a nested child contributes to its parent: as an array, an object, or fields merged in place.",
       "oneOf": [
         {
           "const": "array",
@@ -93,6 +129,10 @@
         {
           "const": "object",
           "description": "One-to-one relationship: a single matching child row is embedded as an object."
+        },
+        {
+          "const": "flat",
+          "description": "One-to-one or many-to-one relationship: the matched row's fields are merged into the parent."
         }
       ]
     },
