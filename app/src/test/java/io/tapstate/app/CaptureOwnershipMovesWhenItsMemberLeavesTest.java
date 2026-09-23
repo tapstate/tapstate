@@ -156,13 +156,14 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
                 new ChainPosition(new SourceOrder(opened.epoch(), Long.MAX_VALUE / 2), "src-far"));
 
         leaving.feed(change(2));
-        await("the capture to record how far it has read",
-                () -> meta.read(chain).map(SrsMeta::sourceReadOffset).isPresent());
+        // Waited for rather than read at the first position that appears. The source hands its changes over
+        // on a thread of its own, so the first change can be taken after the confirmation above and record
+        // its own position first; reading then is a race with the tail rather than a finding about where
+        // it got to. Measured: with the source slowed down, the first reading was the first change every time.
+        await("the durable record to hold the position this member read up to, which is the last change "
+                        + "it took rather than where the chain was opened",
+                () -> "src-2".equals(meta.read(chain).map(SrsMeta::sourceReadOffset).orElse(null)));
         String reached = meta.read(chain).orElseThrow().sourceReadOffset();
-        assertThat(reached)
-                .describedAs("the durable record holds the position this member read up to, which is "
-                        + "the last change it took rather than where the chain was opened")
-                .isEqualTo("src-2");
 
         // The member goes away: no stop, no release, nothing of its own run on the way out. Its lease is
         // then the only thing holding the capture, and it is no longer renewing it.
