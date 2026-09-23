@@ -179,7 +179,8 @@ class SessionResumePtyIT {
         ProcessResult login = runInPty(home, workspace, true, PASSWORD + "\n",
                 "auth", "login", USERNAME, "--context", "dev");
 
-        assertThat(login.exitCode()).as("masked login exits successfully").isZero();
+        assertThat(login.exitCode()).as("masked login exits successfully; PTY transcript:\n" + login.stdout())
+                .isZero();
         assertThat(login.stdout().contains("signed in as " + USERNAME))
                 .as("login reports the authenticated user").isTrue();
         assertThat(login.stdout().contains("session saved"))
