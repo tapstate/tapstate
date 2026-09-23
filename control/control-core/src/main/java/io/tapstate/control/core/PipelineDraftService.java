@@ -22,27 +22,38 @@ public final class PipelineDraftService {
     private final CanonicalWriter writer;
     private final Clock clock;
     private final AuditGate auditGate;
+    private final ApplyService validation;
 
     public PipelineDraftService(PipelineDraftStore store) {
-        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), null);
+        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), null, null);
     }
 
     PipelineDraftService(PipelineDraftStore store, PipelineDraftCompiler compiler,
             CanonicalWriter writer, Clock clock) {
-        this(store, compiler, writer, clock, null);
+        this(store, compiler, writer, clock, null, null);
     }
 
     public PipelineDraftService(PipelineDraftStore store, AuditGate auditGate) {
-        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), auditGate);
+        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), auditGate, null);
+    }
+
+    public PipelineDraftService(PipelineDraftStore store, AuditGate auditGate, ApplyService validation) {
+        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), auditGate, validation);
     }
 
     PipelineDraftService(PipelineDraftStore store, PipelineDraftCompiler compiler,
             CanonicalWriter writer, Clock clock, AuditGate auditGate) {
+        this(store, compiler, writer, clock, auditGate, null);
+    }
+
+    PipelineDraftService(PipelineDraftStore store, PipelineDraftCompiler compiler,
+            CanonicalWriter writer, Clock clock, AuditGate auditGate, ApplyService validation) {
         this.store = Objects.requireNonNull(store, "store");
         this.compiler = Objects.requireNonNull(compiler, "compiler");
         this.writer = Objects.requireNonNull(writer, "writer");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.auditGate = auditGate;
+        this.validation = validation;
     }
 
     public Optional<PipelineDraft> find(String pipelineId) {
@@ -54,23 +65,45 @@ public final class PipelineDraftService {
     }
 
     public PipelineDraftMutation create(PipelineDraft draft) {
-        return store.create(Objects.requireNonNull(draft, "draft"));
+        Objects.requireNonNull(draft, "draft");
+        Instant now = Instant.now(clock);
+        return store.create(new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), 1, draft.mode(),
+                draft.name(), draft.description(), draft.graph(), draft.wizard(), null, null, null,
+                now, now, draft.updatedBy()));
     }
 
     public PipelineDraftMutation create(String principal, PipelineDraft draft) {
         return audited(ControlOperations.PIPELINE_DRAFT_CREATE, principal, draft.pipelineId(),
-                () -> create(draft));
+                () -> create(withActor(draft, principal)));
     }
 
     public PipelineDraftMutation save(String pipelineId, long expectedRevision, PipelineDraft replacement) {
-        return store.replace(Objects.requireNonNull(pipelineId, "pipelineId"), expectedRevision,
-                Objects.requireNonNull(replacement, "replacement"));
+        return saveOwned(pipelineId, expectedRevision, replacement, replacement.updatedBy());
     }
 
     public PipelineDraftMutation save(String principal, String pipelineId, long expectedRevision,
             PipelineDraft replacement) {
         return audited(ControlOperations.PIPELINE_DRAFT_REPLACE, principal, pipelineId,
-                () -> save(pipelineId, expectedRevision, replacement));
+                () -> saveOwned(pipelineId, expectedRevision, replacement, principal));
+    }
+
+    private PipelineDraftMutation saveOwned(String pipelineId, long expectedRevision,
+            PipelineDraft replacement, String principal) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(replacement, "replacement");
+        PipelineDraft current = store.get(pipelineId).orElse(null);
+        if (current == null) {
+            return PipelineDraftMutation.NOT_FOUND;
+        }
+        if (current.mode() != replacement.mode()) {
+            return PipelineDraftMutation.MODE_CONFLICT;
+        }
+        PipelineDraft serverOwned = new PipelineDraft(pipelineId, replacement.schemaVersion(),
+                expectedRevision + 1, current.mode(), replacement.name(), replacement.description(),
+                replacement.graph(), replacement.wizard(), current.baseArtifactHash(),
+                current.publishedDraftRevision(), current.publishedArtifactHash(), current.createdAt(),
+                Instant.now(clock), requirePrincipal(principal));
+        return store.replace(pipelineId, expectedRevision, serverOwned);
     }
 
     public PipelineDraftMutation discard(String principal, String pipelineId, long expectedRevision) {
@@ -87,7 +120,8 @@ public final class PipelineDraftService {
             throw new TapstateException(
                     PipelineDraftError.REVISION_CONFLICT, java.util.Map.of("id", pipelineId), null);
         }
-        return compile(pipelineId, draft);
+        PipelineResource candidate = compile(pipelineId, draft);
+        return validateAndPrepare(pipelineId, candidate);
     }
 
     /**
@@ -110,11 +144,13 @@ public final class PipelineDraftService {
         if (draft.revision() != expectedDraftRevision) {
             return new PublishResult(PipelineDraftMutation.REVISION_CONFLICT, null, null);
         }
-        PipelineResource artifact = compile(pipelineId, draft);
+        if (expectedArtifactHash != null && !Objects.equals(expectedArtifactHash, draft.baseArtifactHash())) {
+            return new PublishResult(PipelineDraftMutation.ARTIFACT_CONFLICT, null, null);
+        }
+        PipelineResource artifact = validateAndPrepare(pipelineId, compile(pipelineId, draft));
         String artifactHash = CanonicalHash.of(artifact);
-        String baseHash = expectedArtifactHash == null ? draft.baseArtifactHash() : expectedArtifactHash;
         PipelineDraft.Publication publication = new PipelineDraft.Publication(
-                pipelineId, expectedDraftRevision, baseHash, artifact, artifactHash,
+                pipelineId, expectedDraftRevision, draft.baseArtifactHash(), artifact, artifactHash,
                 Instant.now(clock), updatedBy);
         PipelineDraftMutation outcome = store.publish(publication);
         return new PublishResult(outcome, outcome == PipelineDraftMutation.PUBLISHED ? artifact : null,
@@ -130,6 +166,50 @@ public final class PipelineDraftService {
                             "reason", error.getMessage() == null ? "draft cannot be compiled" : error.getMessage()),
                     error);
         }
+    }
+
+    private PipelineResource validateAndPrepare(String pipelineId, PipelineResource candidate) {
+        if (validation == null) {
+            return candidate;
+        }
+        try {
+            return (PipelineResource) validation.prepareTyped(candidate);
+        } catch (TapstateException error) {
+            String reason = validationReason(new ValidationDiagnostic(error.code().code(), error.args()));
+            throw new TapstateException(PipelineDraftError.INVALID,
+                    java.util.Map.of("id", pipelineId, "reason", reason), error);
+        }
+    }
+
+    static String validationReason(ValidationDiagnostic diagnostic) {
+        Object detail = diagnostic.params().get("detail");
+        if (detail instanceof String message && !message.isBlank()) {
+            return diagnostic.code() + ": " + message;
+        }
+        StringBuilder reason = new StringBuilder(diagnostic.code());
+        Object path = diagnostic.params().get("path");
+        if (path instanceof String value && !value.isBlank()) {
+            reason.append(" at ").append(value);
+        }
+        Object ref = diagnostic.params().get("ref");
+        if (ref instanceof String value && !value.isBlank()) {
+            reason.append(" (ref: ").append(value).append(')');
+        }
+        return reason.toString();
+    }
+
+    private static PipelineDraft withActor(PipelineDraft draft, String principal) {
+        return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), draft.revision(), draft.mode(),
+                draft.name(), draft.description(), draft.graph(), draft.wizard(), draft.baseArtifactHash(),
+                draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(),
+                draft.updatedAt(), requirePrincipal(principal));
+    }
+
+    private static String requirePrincipal(String principal) {
+        if (principal == null || principal.isBlank()) {
+            throw new IllegalArgumentException("authenticated principal must not be blank");
+        }
+        return principal;
     }
 
     private <T> T audited(Operation operation, String principal, String pipelineId,

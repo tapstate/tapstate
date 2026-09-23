@@ -7,6 +7,7 @@ import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.ServeBlock;
@@ -40,6 +41,8 @@ public final class PipelineDraftCompiler {
     private PipelineResource compileWizard(PipelineDraft draft) {
         PipelineDraft.Wizard wizard = Objects.requireNonNull(draft.wizard(), "wizard payload");
         PipelineDraft.Root root = Objects.requireNonNull(wizard.root(), "wizard root");
+        requiredText(root.sourceId(), "wizard root source");
+        requiredText(root.table(), "wizard root table");
         validateWizardIds(root, wizard.related());
 
         LinkedHashSet<String> sourceIds = new LinkedHashSet<>();
@@ -49,38 +52,46 @@ public final class PipelineDraftCompiler {
         LinkedHashMap<String, FromRef> aliases = new LinkedHashMap<>();
         List<Step> steps = new ArrayList<>();
         Map<String, String> outputAliases = new LinkedHashMap<>();
-        aliases.put(root.id(), FromRef.literal(root.sourceId() + "." + root.table()));
-        outputAliases.put(root.id(), compileBranch(root.id(), root.preTransforms(), aliases, steps));
+        outputAliases.put(root.id(), compileBranch(root.id(), root.sourceId() + "." + root.table(),
+                root.preTransforms(), aliases, steps));
 
         Map<String, List<PipelineDraft.Related>> children = new LinkedHashMap<>();
         for (PipelineDraft.Related related : wizard.related()) {
+            requiredText(related.sourceId(), "related source");
+            requiredText(related.table(), "related table");
             if (!related.parentId().equals(root.id()) && !containsRelated(wizard.related(), related.parentId())) {
                 throw new IllegalArgumentException("related table parent does not exist: " + related.parentId());
             }
             children.computeIfAbsent(related.parentId(), ignored -> new ArrayList<>()).add(related);
-            aliases.put(related.id(), FromRef.literal(related.sourceId() + "." + related.table()));
-            outputAliases.put(related.id(), compileBranch(related.id(), related.preTransforms(), aliases, steps));
+            outputAliases.put(related.id(), compileBranch(related.id(),
+                    related.sourceId() + "." + related.table(), related.preTransforms(), aliases, steps));
         }
 
-        List<Embed> embeds = embedsFor(root.id(), children, outputAliases);
-        String nestId = draft.pipelineId() + "__nest";
-        TransformBody.Nest nest = new TransformBody.Nest(null, null,
-                new NestRoot(root.id(), root.key(), null, null, embeds));
-        steps.add(new Step.Inline(nestId, FromClause.aliases(aliases), nest, Map.of()));
-
-        String previous = nestId;
+        String previous;
+        if (wizard.related().isEmpty()) {
+            previous = outputAliases.get(root.id());
+        } else {
+            if (root.key().isEmpty()) {
+                throw new IllegalArgumentException("wizard root requires a document key when relations exist");
+            }
+            List<Embed> embeds = embedsFor(root.id(), children);
+            String nestId = draft.pipelineId() + "__nest";
+            TransformBody.Nest nest = new TransformBody.Nest(null, null,
+                    new NestRoot(root.id(), root.key(), null, null, embeds));
+            steps.add(new Step.Inline(nestId, FromClause.aliases(aliases), nest, Map.of()));
+            previous = nestId;
+        }
         for (PipelineDraft.Transform transform : wizard.transforms()) {
             Step step = compileTransform(transform, previous);
             steps.add(step);
             previous = step.id();
         }
-        ServeBlock serve = compileWizardOutput(wizard.output(), previous, sourceIds);
+        ServeBlock serve = compileWizardOutput(wizard.output(), previous, root.sourceId() + "." + root.table());
         return new PipelineResource(draft.pipelineId(), metadata(draft),
                 sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(), steps, null, serve, null, Map.of());
     }
 
-    private static ServeBlock compileWizardOutput(PipelineDraft.Output output, String from,
-            Set<String> sourceIds) {
+    private static ServeBlock compileWizardOutput(PipelineDraft.Output output, String from, String inputTable) {
         if (output == null) {
             throw new IllegalArgumentException("wizard output is required for publication");
         }
@@ -92,14 +103,15 @@ public final class PipelineDraftCompiler {
         if (destinationId == null || destinationTable == null) {
             throw new IllegalArgumentException("wizard atlas output requires sourceId and table");
         }
-        sourceIds.add(destinationId);
         String syncId = firstText(output.config(), "syncId");
         if (syncId == null) {
             syncId = destinationId + "_" + destinationTable;
         }
+        RenameSpec rename = inputTable != null && !inputTable.equals(destinationTable)
+                ? new RenameSpec(Map.of(inputTable, destinationTable), null, null, null) : null;
         return new ServeBlock.Inline("atlas", FromClause.list(FromRef.literal(from)),
                 List.of(new SyncElement(syncId, destinationId,
-                        outputWriteMode(output.config()), null, null, null)), null, null);
+                        outputWriteMode(output.config()), rename, null, null)), null, null);
     }
 
     private static String firstText(Map<String, Object> values, String... names) {
@@ -158,34 +170,53 @@ public final class PipelineDraftCompiler {
         }
     }
 
-    private static String compileBranch(String owner, List<PipelineDraft.Transform> transforms,
+    private static String compileBranch(String owner, String source, List<PipelineDraft.Transform> transforms,
             Map<String, FromRef> aliases, List<Step> steps) {
-        String previous = owner;
+        String previous = source;
         int index = 0;
         for (PipelineDraft.Transform transform : transforms) {
             String stepId = index++ == 0 ? owner + "__pre" : owner + "__pre__" + index + "__" + transform.id();
             Step step = compileTransform(new PipelineDraft.Transform(stepId, transform.type(), transform.fields()), previous);
             steps.add(step);
-            aliases.put(stepId, FromRef.literal(stepId));
             previous = stepId;
         }
+        aliases.put(owner, FromRef.literal(previous));
         return previous;
     }
 
-    private static List<Embed> embedsFor(String parentId, Map<String, List<PipelineDraft.Related>> children,
-            Map<String, String> outputAliases) {
+    private static List<Embed> embedsFor(String parentId, Map<String, List<PipelineDraft.Related>> children) {
         List<Embed> result = new ArrayList<>();
         for (PipelineDraft.Related related : children.getOrDefault(parentId, List.of())) {
             PipelineDraft.Relation relation = related.relation();
-            if (relation.shape() == PipelineDraft.Shape.FLAT) {
-                throw new IllegalArgumentException("flat wizard publication is not supported yet");
+            if (relation.shape() == PipelineDraft.Shape.ARRAY && relation.arrayKey().isEmpty()) {
+                throw new IllegalArgumentException("array relation requires an array key");
+            }
+            if (relation.shape() == PipelineDraft.Shape.FLAT && relation.path() != null) {
+                throw new IllegalArgumentException("flat relation must not have a target path");
+            }
+            if (relation.shape() != PipelineDraft.Shape.FLAT && (relation.path() == null || relation.path().isBlank())) {
+                throw new IllegalArgumentException("object and array relations require a target path");
+            }
+            if (relation.on().isEmpty()) {
+                throw new IllegalArgumentException("relation requires at least one association condition");
+            }
+            for (PipelineDraft.FieldPair pair : relation.on()) {
+                requiredText(pair.childField(), "related child field");
+                requiredText(pair.parentField(), "related parent field");
             }
             Map<String, String> on = new LinkedHashMap<>();
             relation.on().forEach(pair -> on.put(pair.childField(), pair.parentField()));
+            List<String> key = relation.key().isEmpty() ? null : relation.key();
             List<String> arrayKey = relation.shape() == PipelineDraft.Shape.ARRAY ? relation.arrayKey() : null;
-            result.add(new Embed(outputAliases.get(related.id()), on,
-                    relation.shape() == PipelineDraft.Shape.ARRAY ? EmbedAs.ARRAY : EmbedAs.OBJECT,
-                    relation.path(), arrayKey, null, null, embedsFor(related.id(), children, outputAliases)));
+            EmbedAs shape = switch (relation.shape()) {
+                case FLAT -> EmbedAs.FLAT;
+                case OBJECT -> EmbedAs.OBJECT;
+                case ARRAY -> EmbedAs.ARRAY;
+            };
+            result.add(new Embed(related.id(), on,
+                    shape,
+                    relation.path(), key, arrayKey, null, null,
+                    embedsFor(related.id(), children)));
         }
         return result;
     }
@@ -222,6 +253,13 @@ public final class PipelineDraftCompiler {
         return string;
     }
 
+    private static String requiredText(String value, String name) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("wizard field must be non-blank: " + name);
+        }
+        return value;
+    }
+
     private PipelineResource compileGraph(PipelineDraft draft) {
         PipelineDraft.Graph graph = Objects.requireNonNull(draft.graph(), "graph payload");
         LinkedHashSet<String> sourceIds = new LinkedHashSet<>();
@@ -230,7 +268,7 @@ public final class PipelineDraftCompiler {
             if (nodes.put(node.id(), node) != null) {
                 throw new IllegalArgumentException("duplicate graph node: " + node.id());
             }
-            if (node.sourceId() != null && !node.sourceId().isBlank()) {
+            if ("source".equals(node.type()) && node.sourceId() != null && !node.sourceId().isBlank()) {
                 sourceIds.add(node.sourceId());
             }
         }

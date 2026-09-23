@@ -106,8 +106,6 @@ public record PipelineDraft(
             List<Transform> preTransforms) {
         public Root {
             requireText(id, "root id");
-            requireText(sourceId, "root source id");
-            requireText(table, "root table");
             key = key == null ? List.of() : List.copyOf(key);
             preTransforms = preTransforms == null ? List.of() : List.copyOf(preTransforms);
         }
@@ -118,37 +116,35 @@ public record PipelineDraft(
         public Related {
             requireText(id, "related id");
             requireText(parentId, "related parent id");
-            requireText(sourceId, "related source id");
-            requireText(table, "related table");
             Objects.requireNonNull(relation, "relation");
             preTransforms = preTransforms == null ? List.of() : List.copyOf(preTransforms);
         }
     }
 
-    public record Relation(List<FieldPair> on, Shape shape, String path, List<String> arrayKey) {
+    public record Relation(List<FieldPair> on, Shape shape, String path, List<String> key,
+            List<String> arrayKey) {
+        public Relation(List<FieldPair> on, Shape shape, String path, List<String> arrayKey) {
+            this(on, shape, path, List.of(), arrayKey);
+        }
+
         public Relation {
             on = List.copyOf(on);
             Objects.requireNonNull(shape, "shape");
-            if (shape == Shape.ARRAY && (arrayKey == null || arrayKey.isEmpty())) {
-                throw new IllegalArgumentException("array relations require arrayKey");
-            }
             if (shape != Shape.ARRAY && arrayKey != null && !arrayKey.isEmpty()) {
                 throw new IllegalArgumentException("arrayKey is only valid for array relations");
-            }
-            if (shape != Shape.FLAT && (path == null || path.isBlank())) {
-                throw new IllegalArgumentException("object and array relations require path");
             }
             if (shape == Shape.FLAT && path != null && !path.isBlank()) {
                 throw new IllegalArgumentException("flat relations do not have a path");
             }
+            key = key == null ? List.of() : List.copyOf(key);
             arrayKey = arrayKey == null ? List.of() : List.copyOf(arrayKey);
         }
     }
 
     public record FieldPair(String childField, String parentField) {
         public FieldPair {
-            requireText(childField, "child field");
-            requireText(parentField, "parent field");
+            Objects.requireNonNull(childField, "child field");
+            Objects.requireNonNull(parentField, "parent field");
         }
     }
 

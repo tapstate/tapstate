@@ -5,6 +5,7 @@ import io.tapstate.control.core.PipelineDraftError;
 import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
 import org.springframework.beans.factory.ObjectProvider;
@@ -91,7 +92,8 @@ class PipelineDraftController {
             @RequestBody(required = false) Map<String, Object> body) {
         long expected = body == null ? currentRevision(id) : number(body.get("revision"), "revision");
         PipelineResource artifact = service().preview(id, expected);
-        return Map.of("pipelineId", id, "revision", expected, "artifact", artifact);
+        return Map.of("pipelineId", id, "revision", expected, "artifact", artifact,
+                "dsl", new CanonicalWriter().write(artifact));
     }
 
     @Verb("pipeline-draft.publish")

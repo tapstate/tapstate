@@ -28,7 +28,7 @@ final class PipelineDraftJson {
         PipelineDraft.Graph graphModel = graph == null ? null
                 : json.convertValue(normalize(graph, "graph"), PipelineDraft.Graph.class);
         PipelineDraft.Wizard wizardModel = wizard == null ? null
-                : json.convertValue(normalize(wizard, "wizard"), PipelineDraft.Wizard.class);
+                : json.convertValue(normalizeWizardForModel(wizard), PipelineDraft.Wizard.class);
         return new PipelineDraft(
                 id,
                 schemaVersion,
@@ -38,11 +38,11 @@ final class PipelineDraftJson {
                 textOrNull(body.get("description")),
                 graphModel,
                 wizardModel,
-                textOrNull(body.get("baseArtifactHash")),
-                numberOrNull(body.get("publishedDraftRevision")),
-                textOrNull(body.get("publishedArtifactHash")),
-                instant(json, body.get("createdAt")),
-                instant(json, body.get("updatedAt")),
+                null,
+                null,
+                null,
+                java.time.Instant.EPOCH,
+                java.time.Instant.EPOCH,
                 requireActor(updatedBy));
     }
 
@@ -63,6 +63,35 @@ final class PipelineDraftJson {
         result.put("updatedAt", draft.updatedAt());
         result.put("updatedBy", draft.updatedBy());
         return result;
+    }
+
+    /** The Wizard API uses lower-case shape names while the storage model uses enum constants. */
+    private static Map<String, Object> normalizeWizardForModel(Map<String, Object> wizard) {
+        Map<String, Object> normalized = new LinkedHashMap<>(wizard);
+        Object relatedValue = normalized.get("related");
+        if (!(relatedValue instanceof List<?> related)) {
+            return normalized;
+        }
+
+        normalized.put("related", related.stream().map(item -> {
+            if (!(item instanceof Map<?, ?> relationEntry)) {
+                return item;
+            }
+            Map<String, Object> nextEntry = new LinkedHashMap<>();
+            relationEntry.forEach((key, value) -> nextEntry.put(String.valueOf(key), value));
+            Object relationValue = nextEntry.get("relation");
+            if (relationValue instanceof Map<?, ?> relation) {
+                Map<String, Object> nextRelation = new LinkedHashMap<>();
+                relation.forEach((key, value) -> nextRelation.put(String.valueOf(key), value));
+                Object shape = nextRelation.get("shape");
+                if (shape instanceof String value) {
+                    nextRelation.put("shape", value.toUpperCase(java.util.Locale.ROOT));
+                }
+                nextEntry.put("relation", nextRelation);
+            }
+            return nextEntry;
+        }).toList());
+        return normalized;
     }
 
     private static Object normalize(Object value, String field) {
@@ -115,14 +144,6 @@ final class PipelineDraftJson {
             throw new IllegalArgumentException(field + " must be numeric");
         }
         return number;
-    }
-
-    private static Long numberOrNull(Object value) {
-        return value == null ? null : number(value, "publishedDraftRevision").longValue();
-    }
-
-    private static java.time.Instant instant(ObjectMapper json, Object value) {
-        return value == null ? java.time.Instant.now() : json.convertValue(value, java.time.Instant.class);
     }
 
     @SuppressWarnings("unchecked")

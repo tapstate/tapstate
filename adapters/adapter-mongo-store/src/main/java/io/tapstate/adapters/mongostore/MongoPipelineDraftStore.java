@@ -242,7 +242,8 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         return new Document("id", related.id()).append("parentId", related.parentId())
                 .append("sourceId", related.sourceId()).append("table", related.table())
                 .append("relation", new Document("on", pairs).append("shape", relation.shape().name().toLowerCase())
-                        .append("path", relation.path()).append("arrayKey", relation.arrayKey()))
+                        .append("path", relation.path()).append("key", relation.key())
+                        .append("arrayKey", relation.arrayKey()))
                 .append("preTransforms", related.preTransforms().stream().map(MongoPipelineDraftStore::transformDocument).toList());
     }
 
@@ -277,7 +278,8 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         return new PipelineDraft.Related(document.getString("id"), document.getString("parentId"),
                 document.getString("sourceId"), document.getString("table"), new PipelineDraft.Relation(on,
                         PipelineDraft.Shape.valueOf(relation.getString("shape").toUpperCase()),
-                        relation.getString("path"), strings(relation.get("arrayKey"))),
+                        relation.getString("path"), strings(relation.get("key")),
+                        strings(relation.get("arrayKey"))),
                 transforms(document.get("preTransforms")));
     }
 

@@ -394,6 +394,27 @@ public final class ApplyService {
         return new ArtifactValidationResult(true, outcomes, List.of(), planned.warnings());
     }
 
+    /** Validates one typed resource against the stored workspace without writing or auditing it. */
+    public ArtifactValidationResult validateTyped(Resource resource) {
+        Objects.requireNonNull(resource, "resource");
+        final ApplyPlan planned;
+        try {
+            planned = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        } catch (TapstateException diagnostic) {
+            return new ArtifactValidationResult(false, List.of(),
+                    List.of(new ValidationDiagnostic(diagnostic.code().code(), diagnostic.args())), List.of());
+        }
+        List<ArtifactOutcome> outcomes = planned.artifacts().stream().map(this::outcome).toList();
+        return new ArtifactValidationResult(true, outcomes, List.of(), planned.warnings());
+    }
+
+    /** Validates and materializes one typed resource against the stored workspace without writing it. */
+    public Resource prepareTyped(Resource resource) {
+        Objects.requireNonNull(resource, "resource");
+        return planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE)
+                .artifacts().getFirst().resource();
+    }
+
     /**
      * Validates the batch (via {@link #plan}), then writes the changed set — created and updated
      * artifacts — into the store as one atomic batch, returning one outcome per artifact in submission

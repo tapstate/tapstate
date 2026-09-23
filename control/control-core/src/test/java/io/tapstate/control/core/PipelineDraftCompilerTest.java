@@ -1,8 +1,12 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
@@ -37,18 +41,21 @@ class PipelineDraftCompilerTest {
 
         assertThat(nest.id()).isEqualTo("customer-orders__nest");
         assertThat(body.root().from()).isEqualTo("orders");
-        assertThat(body.root().embed()).extracting(Embed::from).containsExactly("policy__pre");
+        assertThat(body.root().embed()).extracting(Embed::from).containsExactly("policy");
         Embed policy = body.root().embed().getFirst();
         assertThat(policy.as()).isEqualTo(EmbedAs.OBJECT);
         assertThat(policy.path()).isEqualTo("policy");
         assertThat(policy.embed()).extracting(Embed::from).containsExactly("claim");
         assertThat(policy.embed().getFirst().as()).isEqualTo(EmbedAs.ARRAY);
         assertThat(policy.embed().getFirst().path()).isEqualTo("claims");
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("policy", FromRef.literal("policy__pre"))
+                .containsEntry("claim", FromRef.literal("crm.claims"));
         assertThat(compiled.serve()).isEqualTo(new ServeBlock.Inline(
                 "atlas", io.tapstate.core.model.FromRef.literal("only-active"),
                 List.of(new io.tapstate.core.model.SyncElement(
                         "atlas_customer_orders", "atlas", io.tapstate.core.model.WriteMode.UPSERT,
-                        null, null)), null, null));
+                        new RenameSpec(Map.of("crm.orders", "customer_orders"), null, null, null), null)), null, null));
     }
 
     @Test
@@ -61,6 +68,68 @@ class PipelineDraftCompilerTest {
 
         assertThat(first).isEqualTo(second);
         assertThat(CanonicalHash.ofText(first)).hasSize(64).isEqualTo(CanonicalHash.ofText(second));
+    }
+
+    @Test
+    void compilesFlatRelationsAsPathlessNestEmbedsAndRoundTripsDsl() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related flatProfile = new PipelineDraft.Related(
+                "profile", "orders", "crm", "profiles",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("customer_id", "customer_id")),
+                        PipelineDraft.Shape.FLAT, null, List.of("id"), List.of()),
+                List.of(new PipelineDraft.Transform("normalize-profile", "map", Map.of("name", "$full_name"))));
+        PipelineDraft flatDraft = new PipelineDraft(
+                template.pipelineId(), template.schemaVersion(), template.revision(), template.mode(),
+                template.name(), template.description(), template.graph(),
+                new PipelineDraft.Wizard(wizard.root(), List.of(flatProfile), List.of(), wizard.output()),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(flatDraft);
+        Step.Inline nest = compiled.transforms().stream()
+                .filter(Step.Inline.class::isInstance)
+                .map(Step.Inline.class::cast)
+                .filter(step -> step.body() instanceof TransformBody.Nest)
+                .findFirst()
+                .orElseThrow();
+        Embed embed = ((TransformBody.Nest) nest.body()).root().embed().getFirst();
+        String canonical = new CanonicalWriter().write(compiled);
+
+        assertThat(embed.as()).isEqualTo(EmbedAs.FLAT);
+        assertThat(embed.path()).isNull();
+        assertThat(embed.arrayKey()).isNull();
+        assertThat(embed.key()).containsExactly("id");
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("profile", FromRef.literal("profile__pre"));
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void compilesSourceTransformsWithoutInventingAnEmptyNest() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft sourceOnly = new PipelineDraft(
+                template.pipelineId(), template.schemaVersion(), template.revision(), template.mode(),
+                template.name(), template.description(), template.graph(),
+                new PipelineDraft.Wizard(wizard.root(), List.of(),
+                        List.of(new PipelineDraft.Transform("active-orders", "filter", Map.of("expr", "active == true"))),
+                        new PipelineDraft.Output("atlas", Map.of("sourceId", "atlas", "table", "orders_archive"))),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(sourceOnly);
+
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly("active-orders");
+        assertThat(compiled.sourceIds()).containsExactly("crm");
+        Step.Inline filter = (Step.Inline) compiled.transforms().getFirst();
+        assertThat(((io.tapstate.core.model.FromClause.Flow) filter.from()).refs())
+                .containsExactly(io.tapstate.core.model.FromRef.literal("crm.orders"));
+        assertThat(compiled.serve()).isInstanceOf(ServeBlock.Inline.class);
+        assertThat(((io.tapstate.core.model.FromClause.Flow) ((ServeBlock.Inline) compiled.serve()).from()).refs())
+                .containsExactly(io.tapstate.core.model.FromRef.literal("active-orders"));
+        assertThat(((ServeBlock.Inline) compiled.serve()).sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("crm.orders", "orders_archive"), null, null, null));
     }
 
     @Test
@@ -117,7 +186,7 @@ class PipelineDraftCompilerTest {
 
         PipelineResource compiled = compiler.compile(draft);
 
-        assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm", "warehouse");
+        assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm");
         assertThat(compiled.transforms()).extracting(Step::id).containsExactly("active-orders");
         assertThat(compiled.view()).isEqualTo(new ViewBlock.Inline(
                 "orders_view", io.tapstate.core.model.FromRef.literal("active-orders"), null, null));

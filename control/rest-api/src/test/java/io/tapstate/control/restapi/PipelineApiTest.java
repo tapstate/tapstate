@@ -265,6 +265,45 @@ class PipelineApiTest {
     }
 
     @Test
+    void wizardDraftRoundTripsLowerCaseRelationShapes() {
+        String token = machineToken(Scope.WRITE);
+        String draft = """
+                {"pipelineId":"wizard-shape-p1","mode":"wizard","name":"Orders",
+                 "wizard":{"root":{"id":"root","sourceId":"orders-source","table":"orders",
+                   "key":["_id"],"preTransforms":[]},
+                   "related":[{"id":"items","parentId":"root","sourceId":"orders-source",
+                     "table":"items","relation":{"on":[{"childField":"order_id",
+                       "parentField":"_id"}],"shape":"array","path":"items","key":["_id"],
+                       "arrayKey":["_id"]},"preTransforms":[]}],
+                   "transforms":[],"output":{"kind":"atlas","config":{"sourceId":"target",
+                     "table":"orders_output"}}}}
+                """;
+
+        ResponseEntity<Map> created = client().post().uri("/api/pipelines/wizard-shape-p1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toEntity(Map.class);
+
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(shapeOf(created.getBody())).isEqualTo("array");
+
+        ResponseEntity<Map> replaced = client().put().uri("/api/pipelines/wizard-shape-p1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header(HttpHeaders.IF_MATCH, "\"1\"")
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toEntity(Map.class);
+
+        assertThat(replaced.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(replaced.getBody()).containsEntry("revision", 2);
+        assertThat(shapeOf(replaced.getBody())).isEqualTo("array");
+    }
+
+    private static String shapeOf(Map<?, ?> draft) {
+        Map<?, ?> wizard = (Map<?, ?>) draft.get("wizard");
+        Map<?, ?> related = (Map<?, ?>) ((List<?>) wizard.get("related")).getFirst();
+        Map<?, ?> relation = (Map<?, ?>) related.get("relation");
+        return (String) relation.get("shape");
+    }
+
+    @Test
     void draftPreviewReturnsAStableClientErrorForAnUncompilableDraft() {
         String token = machineToken(Scope.WRITE);
         String draft = """
