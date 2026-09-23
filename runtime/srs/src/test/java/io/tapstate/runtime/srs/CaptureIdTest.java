@@ -61,4 +61,31 @@ class CaptureIdTest {
         assertThat(CaptureId.of(snapshot)).isNotEqualTo(CaptureId.of(cdc));
         assertThat(CaptureId.of(cdc)).isEqualTo(CaptureId.of(snapshotAndCdc));
     }
+
+    /**
+     * Two pipelines reading one source directly are two captures, however alike their reads.
+     *
+     * <p>A tail with the shared ring switched off streams to the one pipeline that opened it and writes no
+     * ring anybody else could read. Filed under one identity, the second pipeline over the same source was
+     * held to the first one's claim, attached to a tail it could not read from, and ran on its initial
+     * load alone -- every change after it missing, with the pipeline running.
+     */
+    @Test
+    void twoPipelinesReadingOneSourceDirectlyAreTwoCaptures() {
+        CaptureConfig config = new CaptureConfig("mysql", Map.of("host", "db.internal"), List.of("orders"));
+        CaptureRunSpec first = new CaptureRunSpec(
+                config, ReadMode.SNAPSHOT_AND_CDC, null, false, "source", "pipeline-a",
+                StartFrom.latest(), null, 0);
+        CaptureRunSpec second = new CaptureRunSpec(
+                config, ReadMode.SNAPSHOT_AND_CDC, null, false, "source", "pipeline-b",
+                StartFrom.latest(), null, 0);
+        CaptureRunSpec firstAgain = new CaptureRunSpec(
+                config, ReadMode.CDC_ONLY, null, false, "source", "pipeline-a",
+                StartFrom.latest(), null, 0);
+
+        assertThat(CaptureId.of(first)).isNotEqualTo(CaptureId.of(second));
+        assertThat(CaptureId.of(first))
+                .as("while one pipeline's direct read stays one capture, run after run")
+                .isEqualTo(CaptureId.of(firstAgain));
+    }
 }
