@@ -77,13 +77,25 @@ The defaults are deliberately two separate clocks:
 | `tapstate.hz.heartbeat-interval` | `5s` | How often a member sends a liveness heartbeat. |
 | `tapstate.hz.maximum-no-heartbeat` | `30s` | How long membership waits before declaring a member lost. |
 | `tapstate.cluster.node-session-renew-interval` | `10s` | How often a stable node renews its reservation. |
-| `tapstate.cluster.node-session-ttl` | `30s` | How long the reservation remains valid without renewal. |
+| `tapstate.cluster.node-session-ttl` | `30s` | How long the reservation remains valid without renewal. A member whose renewals go unanswered this long leaves the cluster, even if the store never answers. |
 | `tapstate.cluster.workload-claim-renew-interval` | `10s` | How often a business owner renews its claim. |
 | `tapstate.cluster.workload-claim-ttl` | `30s` | How long a business claim remains valid without renewal. |
 
 The maximum no-heartbeat duration must be longer than the heartbeat interval. Recovery waits for
 both topology loss detection and the relevant workload lease boundary; it is not an instantaneous
 failover promise.
+
+## Where a source is read
+
+One member tails each source: whichever member first starts a pipeline over it holds the claim, and
+changes are read from the source once however many pipelines use them. Every pipeline reading that
+source reads it the same way on whichever member runs it -- its own initial load where one is owed,
+then the changes that one tail writes into the cluster's shared buffer. A pipeline's initial load runs
+on the member driving that pipeline, so every member needs to reach the source databases, as it
+already does to take a tail over.
+
+When the member tailing a source stops the last of its own pipelines on it, or leaves the cluster, a
+member whose pipelines still read that source takes the tail over, from the position already recorded.
 
 ## Discovery
 
