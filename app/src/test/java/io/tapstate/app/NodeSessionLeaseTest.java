@@ -28,7 +28,7 @@ class NodeSessionLeaseTest {
     void aLiveNodeSessionIsRenewedAndReleasedBeforeTheMemberIsDestroyed() throws Exception {
         RecordingStore store = new RecordingStore(true);
         NodeSessionLease lease = new NodeSessionLease(
-                store, CLAIM, Duration.ofSeconds(1), Duration.ofMillis(10), () -> { });
+                store, CLAIM, System.nanoTime(), Duration.ofSeconds(1), Duration.ofMillis(10), () -> { });
 
         assertThat(store.renewed.await(1, TimeUnit.SECONDS)).isTrue();
         lease.close();
@@ -41,12 +41,105 @@ class NodeSessionLeaseTest {
         RecordingStore store = new RecordingStore(false);
         CountDownLatch memberStopped = new CountDownLatch(1);
         NodeSessionLease lease = new NodeSessionLease(
-                store, CLAIM, Duration.ofSeconds(1), Duration.ofMillis(10), memberStopped::countDown);
+                store, CLAIM, System.nanoTime(), Duration.ofSeconds(1), Duration.ofMillis(10),
+                memberStopped::countDown);
 
         assertThat(memberStopped.await(1, TimeUnit.SECONDS)).isTrue();
         lease.close();
 
         assertThat(store.released.get()).isFalse();
+    }
+
+    /**
+     * A renewal the store never answers loses the session once the lease the last accepted renewal bought
+     * has run out -- not before, and not only when the store finally answers.
+     *
+     * <p>Measured as a store frozen under three members: the renewal hung for the whole outage, every
+     * member stayed in the cluster throughout, and once the store answered again each of them answered for
+     * the cluster for a moment before its renewal came back refused.
+     */
+    @Test
+    void aRenewalTheStoreNeverAnswersLosesTheSessionOnceTheLeaseItLastBoughtRunsOut() throws Exception {
+        SilentStore store = new SilentStore();
+        CountDownLatch memberStopped = new CountDownLatch(1);
+        Duration lease = Duration.ofMillis(500);
+        long askedAt = System.nanoTime();
+        NodeSessionLease session = new NodeSessionLease(
+                store, CLAIM, askedAt, lease, Duration.ofMillis(20), memberStopped::countDown);
+        try {
+            assertThat(store.asked.await(1, TimeUnit.SECONDS))
+                    .as("a renewal was asked for, and the store is not answering it")
+                    .isTrue();
+            assertThat(memberStopped.await(5, TimeUnit.SECONDS))
+                    .as("the member leaves once the lease it last proved has run out")
+                    .isTrue();
+            assertThat(Duration.ofNanos(System.nanoTime() - askedAt))
+                    .as("and not before it has")
+                    .isGreaterThanOrEqualTo(lease);
+        } finally {
+            session.close();
+            store.answer();
+        }
+    }
+
+    /** A session the store keeps renewing is never lost to the clock, however long it runs. */
+    @Test
+    void aSessionTheStoreKeepsRenewingIsNotLostToTheClock() throws Exception {
+        RecordingStore store = new RecordingStore(true);
+        CountDownLatch memberStopped = new CountDownLatch(1);
+        NodeSessionLease session = new NodeSessionLease(
+                store, CLAIM, System.nanoTime(), Duration.ofMillis(200), Duration.ofMillis(20),
+                memberStopped::countDown);
+        try {
+            assertThat(memberStopped.await(1, TimeUnit.SECONDS))
+                    .as("five leases' worth of renewals, every one of them accepted")
+                    .isFalse();
+        } finally {
+            session.close();
+        }
+    }
+
+    /** A store whose renewals hang until {@link #answer} lets them go, as a frozen store's do. */
+    private static final class SilentStore implements WorkloadClaimStore {
+
+        private final CountDownLatch asked = new CountDownLatch(1);
+        private final CountDownLatch answered = new CountDownLatch(1);
+
+        void answer() {
+            answered.countDown();
+        }
+
+        @Override
+        public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
+            asked.countDown();
+            try {
+                answered.await();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return Optional.empty();
+        }
+
+        @Override
+        public WorkloadClaimAttempt acquire(
+                WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean release(WorkloadClaim expected) {
+            return true;
+        }
+
+        @Override
+        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
+            throw new UnsupportedOperationException();
+        }
     }
 
     private static final class RecordingStore implements WorkloadClaimStore {

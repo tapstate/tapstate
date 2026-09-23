@@ -70,6 +70,12 @@ import java.util.regex.Pattern;
 class HazelcastConfiguration {
 
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
+
+    /**
+     * When, on the monotonic clock, this member's node session was asked for: no later than the moment
+     * its lease began, and so where a lease this member cannot renew is timed from.
+     */
+    static final String NODE_SESSION_ASKED_AT_CONTEXT_KEY = "tapstate.cluster.node-session.asked-at";
     private static final Logger LOG = LoggerFactory.getLogger(HazelcastConfiguration.class);
 
     /** A single port, or an inclusive range, in the form the library itself accepts. */
@@ -96,6 +102,7 @@ class HazelcastConfiguration {
                 ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
         warnAboutClusterProfile(clusterProperties);
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
+        long sessionAskedAt = System.nanoTime();
         if (identity != null) {
             identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
                     clusterIdentities.getIfAvailable(), claimStore, UUID.randomUUID().toString());
@@ -125,6 +132,7 @@ class HazelcastConfiguration {
             member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
             member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
             member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
+            member.getUserContext().put(NODE_SESSION_ASKED_AT_CONTEXT_KEY, sessionAskedAt);
             member.getUserContext().put(
                     io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
                     ClusterMembershipGate.PROTECTION_NAME);
@@ -218,7 +226,10 @@ class HazelcastConfiguration {
         if (store == null) {
             throw new IllegalStateException("cluster member started without its workload-claim store");
         }
-        return new NodeSessionLease(store, claim, clusterProperties.getNodeSessionTtl(),
+        if (!(member.getUserContext().get(NODE_SESSION_ASKED_AT_CONTEXT_KEY) instanceof Long askedAt)) {
+            throw new IllegalStateException("cluster member started without the time its node session was asked for");
+        }
+        return new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
                 clusterProperties.getNodeSessionRenewInterval(), member::shutdown);
     }
 
