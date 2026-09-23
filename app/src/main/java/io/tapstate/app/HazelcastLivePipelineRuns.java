@@ -74,6 +74,21 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
     private final HazelcastInstance member;
     private final Duration listingBound;
 
+    /**
+     * Where listings run, so that giving up on one is real: the engine waits on its calls interruptibly, and
+     * a listing cancelled on its own thread stops rather than staying parked for the rest of its minute.
+     *
+     * <p>Kept for the life of this reader rather than made per read, because a per-read pool is a resource
+     * each read would have to close, and closing one waits for what it is running -- which is the one wait
+     * this exists to bound. Its threads are daemons and let go of when idle, so nothing here outlives the
+     * process or holds a thread no read is using.
+     */
+    private final ExecutorService listings = Executors.newCachedThreadPool(runnable -> {
+        Thread thread = new Thread(runnable, "cluster-topology-runs");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     HazelcastLivePipelineRuns(HazelcastInstance member) {
         this(member, LISTING_BOUND);
     }
@@ -83,44 +98,30 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
         this.listingBound = Objects.requireNonNull(listingBound, "listingBound");
     }
 
-    /**
-     * The runs, or the same refusal the member half gives when the engine could not list them in time.
-     *
-     * <p>The listing runs on a thread of its own so that giving up on it is real: the engine waits on its
-     * calls interruptibly, so cancelling stops it rather than leaving it parked for the rest of its minute.
-     */
+    /** The runs, or the same refusal the member half gives when the engine could not list them in time. */
     @Override
     public List<LivePipelineRun> runs() {
-        ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "cluster-topology-runs");
-            thread.setDaemon(true);
-            return thread;
-        });
+        Future<List<LivePipelineRun>> answer = listings.submit(this::listed);
         try {
-            Future<List<LivePipelineRun>> answer = worker.submit(this::listed);
-            try {
-                return answer.get(listingBound.toMillis(), TimeUnit.MILLISECONDS);
-            } catch (TimeoutException unanswered) {
-                answer.cancel(true);
-                // The same code as the engine not being active, for the same reason: the cluster is
-                // changing under this read, and "ask again in a moment" is the whole of the answer.
-                throw new TapstateException(ClusterError.MEMBERSHIP_UNREADABLE, Map.of(), unanswered);
-            } catch (InterruptedException interrupted) {
-                answer.cancel(true);
-                Thread.currentThread().interrupt();
-                // The caller was interrupted, not the cluster: nothing was learned about it to report.
-                throw new IllegalStateException("interrupted while listing the engine's jobs", interrupted);
-            } catch (ExecutionException failed) {
-                if (failed.getCause() instanceof RuntimeException runtime) {
-                    throw runtime;
-                }
-                if (failed.getCause() instanceof Error error) {
-                    throw error;
-                }
-                throw new IllegalStateException("listing the engine's jobs failed", failed.getCause());
+            return answer.get(listingBound.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException unanswered) {
+            answer.cancel(true);
+            // The same code as the engine not being active, for the same reason: the cluster is changing
+            // under this read, and "ask again in a moment" is the whole of the answer.
+            throw new TapstateException(ClusterError.MEMBERSHIP_UNREADABLE, Map.of(), unanswered);
+        } catch (InterruptedException interrupted) {
+            answer.cancel(true);
+            Thread.currentThread().interrupt();
+            // The caller was interrupted, not the cluster: nothing was learned about it to report.
+            throw new IllegalStateException("interrupted while listing the engine's jobs", interrupted);
+        } catch (ExecutionException failed) {
+            if (failed.getCause() instanceof RuntimeException runtime) {
+                throw runtime;
             }
-        } finally {
-            worker.shutdownNow();
+            if (failed.getCause() instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException("listing the engine's jobs failed", failed.getCause());
         }
     }
 
