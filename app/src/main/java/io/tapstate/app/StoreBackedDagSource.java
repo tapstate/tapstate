@@ -284,8 +284,12 @@ final class StoreBackedDagSource implements DagSource {
         }
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
         FrontierBinding frontier = frontierBinding(sourceVertices);
+        PipelineResource builtPipeline = new PipelineResource(
+                pipeline.id(), pipeline.metadata(),
+                pipeline.sources().stream().filter(ref -> sourceKeysById.containsKey(ref.id())).toList(),
+                pipeline.transforms(), pipeline.view(), pipeline.serve(), pipeline.settings(), pipeline.experimental());
         return PipelineDagBuilder.build(
-                pipeline,
+                builtPipeline,
                 bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins),
                 sinkAckFactory(pipeline, pipelineId), frontier);
@@ -441,7 +445,7 @@ final class StoreBackedDagSource implements DagSource {
             if (discovered == null) {
                 continue;
             }
-            for (String table : SourceTableSelection.resolve(source, discovered)) {
+            for (String table : PipelineTableSelection.resolve(pipeline, source, discovered)) {
                 if (sourceSchemaCopy.copy(pipelineId, sourceId, table, discoveredTable(discovered, table))) {
                     copied.add(SourceSchemaCopy.nodeId(sourceId, table));
                 }
@@ -514,7 +518,12 @@ final class StoreBackedDagSource implements DagSource {
             if (skipUndiscovered && discovered == null) {
                 continue;
             }
-            SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discovered);
+            Optional<SourceCaptureResolution> selected =
+                    SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+            if (selected.isEmpty()) {
+                continue;
+            }
+            SourceCaptureResolution resolution = selected.orElseThrow();
             for (String table : resolution.tables()) {
                 String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
                 vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution));
@@ -1224,10 +1233,9 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> chainIdByTable = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-            SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
-            for (String table : resolution.tables()) {
-                chainIdByTable.put(table, resolution.chainId().value());
-            }
+            SourceCaptureResolution.forPipeline(pipeline, source, SourceDiscovery.model(storePort, source))
+                    .ifPresent(resolution -> resolution.tables().forEach(table ->
+                            chainIdByTable.put(table, resolution.chainId().value())));
         }
         return chainIdByTable;
     }
