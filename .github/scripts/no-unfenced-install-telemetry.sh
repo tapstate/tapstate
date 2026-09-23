@@ -29,8 +29,14 @@ set -euo pipefail
 # either script run straight out of the checkout. At the top because the liveness control runs these
 # exact expressions -- a control with its own copy proves the copy works and says nothing about the
 # ones that decide.
+#
+# Both scripts are executable, so `./install/install.sh` runs one without naming an interpreter; a
+# pattern that demanded `sh` or `bash` in front would report a workflow that installs on every run as
+# carrying no installer at all. The path has to arrive with a leading `/` or `./` to count as being
+# run -- that is what separates executing it from naming it, as a `paths:` trigger or an argument does.
 PIPED='install\.tapstate\.dev[^|]*\|'
-DIRECT='(^|[^[:alnum:]_.-])(sh|bash)[[:space:]]+[^|;&]*(install/install\.sh|deploy/quickstart/quickstart\.sh)'
+SCRIPTS='(install/install\.sh|deploy/quickstart/quickstart\.sh)'
+DIRECT="(^|[^[:alnum:]_.-])((sh|bash)[[:space:]]+[^|;&]*${SCRIPTS}|\.?/${SCRIPTS})"
 
 REQUIRE_URL='TAPSTATE_TELEMETRY_URL:'
 REQUIRE_CHANNEL='TAPSTATE_TELEMETRY_CHANNEL:[[:space:]]*internal'
@@ -52,8 +58,19 @@ installs() { # <file>
   grep -qE "$PIPED|$DIRECT" <(grep -vE '^[[:space:]]*#|shellcheck' "$1")
 }
 
+# Comments are stripped here for the same reason they are stripped above, in the other direction: a
+# workflow that merely writes the two names in a comment -- this file's own header does exactly that
+# -- would otherwise read as fenced while its install step inherits neither.
+#
+# What this deliberately does NOT do is resolve scope. It asks whether the workflow sets both, not
+# whether the job holding the install step does, so a workflow whose only `env:` block sits on an
+# unrelated job passes. Deciding that needs the job/step tree, and a YAML parser is not something this
+# repository's gates can assume on a runner. The bound is stated rather than papered over: this
+# catches forgetting, which is the failure that happened, and not a fence deliberately put in the
+# wrong place. Both lanes it guards today set the variables at workflow level, where every job has them.
 fenced() { # <file>
-  grep -qE "$REQUIRE_URL" "$1" && grep -qE "$REQUIRE_CHANNEL" "$1"
+  local body; body="$(grep -vE '^[[:space:]]*#' "$1")"
+  grep -qE "$REQUIRE_URL" <<<"$body" && grep -qE "$REQUIRE_CHANNEL" <<<"$body"
 }
 
 # A repository where no workflow installs reports nothing and exits 0 -- which is also exactly what
@@ -74,6 +91,19 @@ detector_alive() {
   printf '%s\n' '  SITE_DOMAIN: install.tapstate.dev' > "$d/mentions.yml"
   printf '%s\n' '        # curl -sSL https://install.tapstate.dev/cli | sh' > "$d/commented.yml"
   printf '%s\n' '          shellcheck -s sh install/install.sh' > "$d/linted.yml"
+  # Executable, so no interpreter is named. A pattern demanding one calls this workflow clean.
+  printf '%s\n' '          ./install/install.sh --print-platform' > "$d/direct.yml"
+  # Names a script without running it: a path filter, and an argument to a tool that reads it.
+  printf '%s\n' "  paths: ['install/install.sh']" > "$d/named.yml"
+  # Installs, with the fence commented out -- the shape someone leaves behind while debugging. Both
+  # lines have to be spelled the way the checks below spell them, or the control proves nothing about
+  # them: an earlier draft wrote the names without their colons and passed against either version.
+  {
+    printf '%s\n' '# env:'
+    printf '%s\n' '#   TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e'
+    printf '%s\n' '#   TAPSTATE_TELEMETRY_CHANNEL: internal'
+    printf '%s\n' 'run: curl -sSL https://install.tapstate.dev/cli | sh'
+  } > "$d/commented-fence.yml"
 
   installs "$d/unfenced.yml" || die_detector "the scan did not recognise a published one-liner piped into a shell."
   fenced "$d/unfenced.yml"   && die_detector "the scan called an unfenced control fenced."
@@ -82,6 +112,9 @@ detector_alive() {
   installs "$d/mentions.yml" && die_detector "the scan treated a mention of the install domain as an install."
   installs "$d/commented.yml" && die_detector "the scan treated a commented-out one-liner as an install."
   installs "$d/linted.yml"    && die_detector "the scan treated a lint invocation as an install."
+  installs "$d/direct.yml"    || die_detector "the scan did not recognise an executable installer run by path."
+  installs "$d/named.yml"     && die_detector "the scan treated a path filter naming the script as an install."
+  fenced "$d/commented-fence.yml" && die_detector "the scan accepted a fence that exists only in a comment."
   rm -rf "$d"
 }
 

@@ -403,4 +403,19 @@ echo "$out" | grep -qi 'shape no person produces' \
   && fail "case 25: the shape warning fired on four ordinary installs across four days"
 pass "case 25: a machine-shaped burst claiming to be community is named, an ordinary week is not"
 
+# The window is measured from its own first event, never from the previous one. Grouping by the gap
+# between neighbours chains: each of these is 170s after the one before it, so a neighbour rule joins
+# all three into a 340s "burst" on three platforms and reports an ordinary week as a test matrix.
+# A false alarm here is the same defect this field exists to remove, pointing the other way.
+store="$work/store-shape-chain"; mkdir -p "$store/events"
+cat > "$store/events/installs.jsonl" <<'JSON'
+{"installation_id":"c1","version":"0.5.0","os":"darwin","arch":"arm64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T09:00:00Z"}
+{"installation_id":"c2","version":"0.5.0","os":"darwin","arch":"x64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T09:02:50Z"}
+{"installation_id":"c3","version":"0.5.0","os":"linux","arch":"x64","entrypoint":"cli","channel":"community","timestamp":"2026-08-18T09:05:40Z"}
+JSON
+out="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out" | grep -qi 'shape no person produces' \
+  && fail "case 26: three installs chained 170s apart, spanning 340s, were reported as one burst"
+pass "case 26: the three-minute window is measured from its own first event, not from the previous one"
+
 printf 'funnel-capture-smoke: all cases passed\n'

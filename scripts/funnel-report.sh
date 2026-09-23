@@ -94,32 +94,42 @@ def read_events():
 print("tapstate funnel -- week of %s (%s..%s)" % (start, start, end))
 print()
 
+WINDOW_SECONDS = 180
+
 def machine_shaped(events):
-    """Bursts that no person produces: three or more os/arch combinations inside three minutes.
+    """Bursts that no person produces: three or more os/arch combinations inside one three-minute window.
 
     The channel field is what separates our traffic from everyone else's, but it only works while the
     lane that installs remembers to set it -- and the failure it replaced was exactly a lane that
     forgot. So the report keeps a second, independent read that owes nothing to what the sender
     claimed: nobody installs on macOS Intel, macOS ARM, Linux x64 and Linux ARM inside the same
-    minute. Returns the start timestamps of the offending bursts."""
-    rows = sorted((e for e in events if e.get("timestamp")), key=lambda e: e["timestamp"])
-    bursts, current = [], []
-    for row in rows:
+    minute.
+
+    The window is measured from its own first event, never from the previous one. Grouping by the gap
+    between neighbours chains: three installs at 00:00, 02:50 and 05:40 are each under three minutes
+    apart and span nearly six, so an ordinary week on three platforms would be reported as a test
+    matrix. A false alarm here is the same defect this whole field exists to remove -- a figure that
+    looks right and is not -- only pointing the other way.
+
+    Returns (timestamp, events in the window, platforms) for each flagged window, skipping past one
+    once it is reported so a single burst is named once rather than once per event in it."""
+    rows = []
+    for row in sorted((e for e in events if e.get("timestamp")), key=lambda e: e["timestamp"]):
         try:
-            at = datetime.datetime.strptime(row["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
+            rows.append((datetime.datetime.strptime(row["timestamp"], "%Y-%m-%dT%H:%M:%SZ"), row))
         except ValueError:
             continue
-        if current and (at - current[-1][0]).total_seconds() > 180:
-            bursts.append(current)
-            current = []
-        current.append((at, row))
-    if current:
-        bursts.append(current)
-    out = []
-    for burst in bursts:
-        platforms = {"%s/%s" % (r.get("os"), r.get("arch")) for _, r in burst}
+    out, i, n = [], 0, len(rows)
+    while i < n:
+        j = i
+        while j + 1 < n and (rows[j + 1][0] - rows[i][0]).total_seconds() <= WINDOW_SECONDS:
+            j += 1
+        platforms = {"%s/%s" % (r.get("os"), r.get("arch")) for _, r in rows[i:j + 1]}
         if len(platforms) >= 3:
-            out.append((burst[0][1]["timestamp"], len(burst), sorted(platforms)))
+            out.append((rows[i][1]["timestamp"], j - i + 1, sorted(platforms)))
+            i = j + 1
+        else:
+            i += 1
     return out
 
 # --- canonical L1 -----------------------------------------------------------------------------
