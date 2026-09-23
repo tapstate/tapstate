@@ -67,7 +67,12 @@ class ARestartedServerKeepsCarryingIT {
         long carriedBeforeTheRestart;
         try (ServerHandle first = tier.launch(storeUri)) {
             running = RunningPipeline.started(first, directory);
-            long seeded = awaitAtLeast(running, 1, "the seeded rows to reach the target");
+            // Every seeded row, not the first: the count read here is what the half after the restart is
+            // held to exactly, and one read while the load was still arriving undercounts it. The row that
+            // was still on its way then satisfies the wait for the change below, and the restarted target,
+            // holding everything, can never again equal the number taken down -- measured once in CI as a
+            // minute spent waiting for fewer rows than a fully restored target held.
+            long seeded = awaitAtLeast(running, RunningPipeline.SEEDED_ROWS, "every seeded row to reach the target");
             // Live before the restart, so the wait after it is measuring the restart and nothing else.
             running.insertAtSource(1);
             carriedBeforeTheRestart = awaitAtLeast(running, seeded + 1, "a change made before the restart");
