@@ -34,12 +34,19 @@ set -euo pipefail
 # pattern that demanded `sh` or `bash` in front would report a workflow that installs on every run as
 # carrying no installer at all. The path has to arrive with a leading `/` or `./` to count as being
 # run -- that is what separates executing it from naming it, as a `paths:` trigger or an argument does.
+#
+# The pipeline is looked for on a LOGICAL line, after backslash-continuations are joined: a `run: |`
+# block may write the URL on one line and `| sh` on the next, and bash runs that as one command.
 PIPED='install\.tapstate\.dev[^|]*\|'
 SCRIPTS='(install/install\.sh|deploy/quickstart/quickstart\.sh)'
 DIRECT="(^|[^[:alnum:]_.-])((sh|bash)[[:space:]]+[^|;&]*${SCRIPTS}|\.?/${SCRIPTS})"
 
 REQUIRE_URL='TAPSTATE_TELEMETRY_URL:'
-REQUIRE_CHANNEL='TAPSTATE_TELEMETRY_CHANNEL:[[:space:]]*internal'
+# Anchored at the end of the value, not merely at its start. The installer marks an install as ours
+# only on the exact word, so `internal-test` is a community install -- and a fence pattern that
+# accepted it would report a lane as declared while its events went into the denominator, which is
+# the one thing this gate exists to make impossible.
+REQUIRE_CHANNEL='TAPSTATE_TELEMETRY_CHANNEL:[[:space:]]*internal([[:space:]]|$)'
 
 SELF='.github/scripts/no-unfenced-install-telemetry.sh'
 
@@ -49,13 +56,28 @@ die_detector() {
   exit 1
 }
 
-# A workflow that installs, ignoring two kinds of line that only look like one. A commented-out
-# one-liner runs nothing, and a gate that counted it would be refusing prose. A lint invocation
-# names the script as an argument -- `shellcheck -s sh install/install.sh` reads it and executes
-# nothing -- and demanding a channel from the lane that lints would teach it to claim an install
-# it never performs.
+# What the patterns above are matched against: the workflow as a shell would read it, not as a file
+# viewer shows it. Three passes, in this order and for three different reasons.
+#
+#   1. Join backslash-continuations. A `run: |` block may end a line with `\` and put `| sh` on the
+#      next; bash runs that as one command, and a per-line scan sees an installer that is never piped
+#      anywhere and a pipe that installs nothing.
+#   2. Drop whole-line comments. A commented-out one-liner runs nothing, and refusing it would be
+#      refusing prose.
+#   3. Remove lint invocations -- `shellcheck -s sh install/install.sh` reads the script and executes
+#      nothing, so demanding a channel from the lane that lints would teach it to claim an install it
+#      never performs. **Only the lint command, never the rest of the line.** Dropping the whole line
+#      was the first attempt and it opened the hole it was meant to close: in
+#      `shellcheck install/install.sh && ./install/install.sh` the install runs, and a line-wise
+#      exclusion made the gate report that workflow as carrying no installer at all.
+prepared() { # <file>
+  sed -e :a -e '/\\$/N; s/\\\n//; ta' "$1" \
+    | grep -vE '^[[:space:]]*#' \
+    | sed -E 's/(^[[:space:]]*|[;&|][[:space:]]*)shellcheck[^;&|]*/\1/g'
+}
+
 installs() { # <file>
-  grep -qE "$PIPED|$DIRECT" <(grep -vE '^[[:space:]]*#|shellcheck' "$1")
+  grep -qE "$PIPED|$DIRECT" <(prepared "$1")
 }
 
 # Comments are stripped here for the same reason they are stripped above, in the other direction: a
@@ -69,7 +91,7 @@ installs() { # <file>
 # catches forgetting, which is the failure that happened, and not a fence deliberately put in the
 # wrong place. Both lanes it guards today set the variables at workflow level, where every job has them.
 fenced() { # <file>
-  local body; body="$(grep -vE '^[[:space:]]*#' "$1")"
+  local body; body="$(prepared "$1")"
   grep -qE "$REQUIRE_URL" <<<"$body" && grep -qE "$REQUIRE_CHANNEL" <<<"$body"
 }
 
@@ -91,6 +113,20 @@ detector_alive() {
   printf '%s\n' '  SITE_DOMAIN: install.tapstate.dev' > "$d/mentions.yml"
   printf '%s\n' '        # curl -sSL https://install.tapstate.dev/cli | sh' > "$d/commented.yml"
   printf '%s\n' '          shellcheck -s sh install/install.sh' > "$d/linted.yml"
+  # The pipe is on the next line. Bash reads one command; a per-line scan reads two harmless halves.
+  {
+    printf '          curl -sSL https://install.tapstate.dev/cli \\\n'
+    printf '%s\n' '            | sh'
+  } > "$d/continued.yml"
+  # Lints, then installs. Excluding the line rather than the command hides the half that runs.
+  printf '%s\n' '          shellcheck install/install.sh && ./install/install.sh' > "$d/chained-lint.yml"
+  # Installs, and declares a channel the installer does not treat as ours.
+  {
+    printf '%s\n' 'env:'
+    printf '%s\n' '  TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e'
+    printf '%s\n' '  TAPSTATE_TELEMETRY_CHANNEL: internal-test'
+    printf '%s\n' 'run: curl -sSL https://install.tapstate.dev/cli | sh'
+  } > "$d/suffix-fence.yml"
   # Executable, so no interpreter is named. A pattern demanding one calls this workflow clean.
   printf '%s\n' '          ./install/install.sh --print-platform' > "$d/direct.yml"
   # Names a script without running it: a path filter, and an argument to a tool that reads it.
@@ -112,6 +148,9 @@ detector_alive() {
   installs "$d/mentions.yml" && die_detector "the scan treated a mention of the install domain as an install."
   installs "$d/commented.yml" && die_detector "the scan treated a commented-out one-liner as an install."
   installs "$d/linted.yml"    && die_detector "the scan treated a lint invocation as an install."
+  installs "$d/continued.yml" || die_detector "the scan did not join a backslash-continued installer pipeline."
+  installs "$d/chained-lint.yml" || die_detector "the scan lost an install chained after a lint command."
+  fenced "$d/suffix-fence.yml" && die_detector "the scan accepted a channel value the installer does not treat as ours."
   installs "$d/direct.yml"    || die_detector "the scan did not recognise an executable installer run by path."
   installs "$d/named.yml"     && die_detector "the scan treated a path filter naming the script as an install."
   fenced "$d/commented-fence.yml" && die_detector "the scan accepted a fence that exists only in a comment."

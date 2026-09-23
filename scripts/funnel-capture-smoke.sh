@@ -418,4 +418,24 @@ echo "$out" | grep -qi 'shape no person produces' \
   && fail "case 26: three installs chained 170s apart, spanning 340s, were reported as one burst"
 pass "case 26: the three-minute window is measured from its own first event, not from the previous one"
 
+# The receiver-health cross-check (case 22) reads whether events ARRIVED, not whether any of them
+# counted toward the denominator. Keyed on the community figure it fired on every week collected
+# before the channel existed: the events had arrived, been stored and been counted, and the page
+# still said the callback might not be reaching us. A cross-check that cries wolf on the archive is
+# one nobody believes on the day it is right.
+store="$work/store-arrivals"; fx="$work/fx-arrivals"; mkdir -p "$fx" "$store/events"
+window > "$fx/clones.json"
+: > "$fx/releases.json"
+sh "$capture" --store "$store" --fixture-dir "$fx" >/dev/null
+cat > "$store/events/installs.jsonl" <<'JSON'
+{"installation_id":"u1","version":"0.4.5","os":"darwin","arch":"arm64","entrypoint":"cli","timestamp":"2026-08-18T09:00:00Z"}
+{"installation_id":"i1","version":"0.5.0","os":"linux","arch":"x64","entrypoint":"cli","channel":"internal","timestamp":"2026-08-19T09:00:00Z"}
+JSON
+out="$(sh "$report" --store "$store" --week 2026-08-18)"
+echo "$out" | grep -qE 'installs completed: *0' \
+  || fail "case 27: the fixture is meant to have no community installs, so the case proves nothing"
+echo "$out" | grep -qi 'WARNING: distribution signals are non-zero' \
+  && fail "case 27: the receiver warning fired although two install events arrived that week"
+pass "case 27: the receiver cross-check reads arrivals, not the denominator"
+
 printf 'funnel-capture-smoke: all cases passed\n'

@@ -142,11 +142,17 @@ all_events = read_events()
 print("CANONICAL L1 -- community installs completed (unique installation_id)")
 l1 = None
 community = []
+# Events that arrived this week, whatever channel they claimed. Kept apart from the denominator on
+# purpose: the cross-check at the bottom asks whether the receiver is alive, and the denominator
+# cannot answer that any more. A week of nothing but our own harnesses, or of installers too old to
+# say, has a community L1 of zero while every event arrived exactly as it should.
+arrivals = None
 if all_events is None:
     print("  no event store yet -- the install endpoint is not receiving. L1 is unavailable,")
     print("  which is different from L1 being zero.")
 else:
     events = [e for e in all_events if e.get("timestamp", "")[:10] in days]
+    arrivals = len(events)
     # An event with no channel key at all predates the field. It is neither ours nor demonstrably
     # somebody else's, and calling it community would put whatever it was into the denominator.
     by_channel = {}
@@ -293,10 +299,14 @@ if bursts:
     print("  Three or more platforms inside three minutes is a test matrix. Find the lane that")
     print("  installed without declaring itself, and read this week's L1 as an upper bound.")
 
-if distribution_seen > 0 and (l1 is None or l1 == 0):
+# Read off arrivals, not off the denominator. Keyed on community L1 this fired for every week
+# collected before the channel existed -- events had arrived, been stored and been counted, and the
+# page still said the callback might not be reaching us. A cross-check that cries wolf on the
+# archive is one nobody believes on the day it is right.
+if distribution_seen > 0 and (arrivals is None or arrivals == 0):
     print()
-    print("  WARNING: distribution signals are non-zero for this week while L1 is %s."
-          % ("unavailable" if l1 is None else "zero"))
+    print("  WARNING: distribution signals are non-zero for this week while %s."
+          % ("no event store exists" if arrivals is None else "not one install event arrived"))
     print("  Either nobody who fetched the software ran the installer, or the install callback is")
     print("  not arriving. Check the receiver before reading any ratio off this page.")
 print("  This covers the community funnel only. Offline and restricted-network deployments never")
