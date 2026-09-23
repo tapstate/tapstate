@@ -371,7 +371,7 @@ sealed interface WorkbenchOverlayState
         enum Action {
             CONTEXT("🧭  Context", "Choose or create a context"),
             AUTHENTICATION("🔐  Authentication", "Sign in to the selected server"),
-            REGISTER_CONNECTOR("🧩  Register Connector", "Upload a connector jar or directory"),
+            REGISTER_CONNECTOR("🔌  Register Connector", "Upload a connector jar or directory"),
             NEW_SOURCE("✨  New Source", "Create a local source artifact"),
             NEW_PIPELINE("⚡  New Pipeline", "Create a local pipeline artifact"),
             APPLY_SELECTED_PIPELINE("☁️  Apply Selected Pipeline", "Synchronize the selected local pipeline"),
