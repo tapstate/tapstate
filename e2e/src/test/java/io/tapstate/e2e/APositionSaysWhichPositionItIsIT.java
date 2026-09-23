@@ -11,9 +11,14 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -79,7 +84,7 @@ class APositionSaysWhichPositionItIsIT {
     }
 
     @Test
-    void theRecordedPositionNamesItselfAndTheUnrecordedOnesAreNamedToo() {
+    void theRecordedPositionNamesItselfAndTheUnrecordedOnesAreNamedToo() throws Exception {
         String database = PIPELINE_ID + "_src";
         String sourceUri = SharedMongo.replicaSetUrl(database);
         String targetUri = SharedMongo.replicaSetUrl(PIPELINE_ID + "_tgt");
@@ -116,8 +121,10 @@ class APositionSaysWhichPositionItIsIT {
                     .as("the session must have run; stdout was:%n%s%nstderr was:%n%s", run.stdout(), run.stderr())
                     .isZero();
             assertThat(run.stdout())
-                    .as("the position on screen is the one the run acked, and it says which position that is")
-                    .contains("targetAckedPosition." + COLLECTION + "  " + acked);
+                    .as("the acked table is named without displaying its connector-private token")
+                    .doesNotContain(acked);
+            String firstFingerprint = printedFingerprint(run.stdout());
+            assertThat(firstFingerprint).isEqualTo(fingerprintOf(acked));
             assertThat(run.stdout())
                     .as("a position nobody records is printed by name, not left out to be guessed at")
                     .contains("sourceHeadPosition  not collected")
@@ -125,7 +132,41 @@ class APositionSaysWhichPositionItIsIT {
             assertThat(run.stdout())
                     .as("the name that said where but never which is gone, not kept beside the new one")
                     .doesNotContain("perTableOffset");
+
+            rename(source, database, 1, "v2");
+            Await.until("a second change the tail carried to the target", TIMEOUT,
+                    () -> mongo.documents(target, COLLECTION).stream()
+                            .anyMatch(document -> "v2".equals(document.getString("name"))),
+                    () -> mongo.documents(target, COLLECTION).toString());
+            Await.until("the target-acked source position to advance", TIMEOUT,
+                    () -> control.durablePosition(PIPELINE_ID, COLLECTION)
+                            .filter(position -> !position.equals(acked)).isPresent(),
+                    () -> String.valueOf(control.durablePosition(PIPELINE_ID, COLLECTION)));
+            String nextAcked = control.durablePosition(PIPELINE_ID, COLLECTION).orElseThrow();
+            CliOnce.Run next = CliOnce.runSession(PASSWORD, "metrics " + PIPELINE_ID + "\nexit\n",
+                    "-c", server.baseUrl().toString(), "-u", USER);
+            assertThat(next.exitCode())
+                    .as("the session must have run; stdout was:%n%s%nstderr was:%n%s", next.stdout(), next.stderr())
+                    .isZero();
+            assertThat(next.stdout()).doesNotContain(acked, nextAcked);
+            assertThat(printedFingerprint(next.stdout()))
+                    .isEqualTo(fingerprintOf(nextAcked))
+                    .isNotEqualTo(firstFingerprint);
         }
+    }
+
+    private static String printedFingerprint(String output) {
+        Matcher line = Pattern.compile("(?m)^targetAckedPosition\\." + COLLECTION
+                + "  opaque position fingerprint ([0-9a-f]{16}) \\(source coordinate unavailable\\)$")
+                .matcher(output);
+        assertThat(line.find()).as("the acked table has an opaque position fingerprint").isTrue();
+        return line.group(1);
+    }
+
+    private static String fingerprintOf(String position) throws Exception {
+        byte[] digest = MessageDigest.getInstance("SHA-256")
+                .digest(position.getBytes(StandardCharsets.UTF_8));
+        return HexFormat.of().formatHex(digest, 0, 8);
     }
 
     /** Everything up to and including the start. */

@@ -26,11 +26,15 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -3310,8 +3314,8 @@ final class Repl {
     /**
      * {@code metrics <pipeline-id>} — reads the pipeline's open map of run statistics and the one source
      * position it records, and prints one {@code <name>  <value>} line each in name order. Readable
-     * positions appear under {@code targetAckedPosition.<table>}; Java-serialized positions are summarized
-     * because their connector-private bytes cannot be presented as source coordinates. A benign
+     * positions appear under {@code targetAckedPosition.<table>}; Java-serialized positions get a stable
+     * fingerprint because their connector-private bytes cannot be presented as source coordinates. A benign
      * {@code no metrics} line appears when nothing is wired yet (unavailable, never faked). A coded
      * refusal renders its code and message.
      *
@@ -3345,6 +3349,9 @@ final class Repl {
                 found.targetAckedPosition().forEach((table, position) -> {
                     if (isSerializedJavaPosition(position)) {
                         serializedPositions.add(position);
+                        lines.put(TARGET_ACKED_POSITION + "." + table,
+                                "opaque position fingerprint " + opaquePositionFingerprint(position)
+                                        + " (source coordinate unavailable)");
                     } else {
                         lines.put(TARGET_ACKED_POSITION + "." + table, position);
                     }
@@ -3385,6 +3392,16 @@ final class Repl {
         // AC ED 00 05 is the Java serialization header (rO0AB in base64). The CLI has no connector
         // class or safe source-coordinate decoder for these opaque tokens.
         return position != null && position.startsWith("rO0AB");
+    }
+
+    private static String opaquePositionFingerprint(String position) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(position.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest, 0, 8);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
     }
 
     private static String positionForText(String position) {

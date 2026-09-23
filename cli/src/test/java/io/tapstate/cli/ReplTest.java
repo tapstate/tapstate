@@ -5047,8 +5047,34 @@ class ReplTest {
 
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("recordCount  6", "sourceHeadPosition  not collected");
+        assertThat(out).containsPattern("targetAckedPosition.orders  opaque position fingerprint [0-9a-f]{16}")
+                .containsPattern("targetAckedPosition.accounts  opaque position fingerprint [0-9a-f]{16}");
         assertThat(out).as("text metrics must not expose an opaque serialized connector object")
                 .doesNotContain(serializedPosition);
+    }
+
+    @Test
+    void metricsShowsWhenOneOpaquePositionAdvances() {
+        String firstPosition = "rO0ABXQAA29uZQ==";
+        String nextPosition = "rO0ABXQAA3R3bw==";
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", firstPosition));
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("metrics pl1")).isTrue();
+        String first = h.sink().toString().substring(mark);
+
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", nextPosition));
+        mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("metrics pl1")).isTrue();
+        String next = h.sink().toString().substring(mark);
+
+        assertThat(first).containsPattern("targetAckedPosition.orders  opaque position fingerprint [0-9a-f]{16}")
+                .doesNotContain(firstPosition, nextPosition);
+        assertThat(next).containsPattern("targetAckedPosition.orders  opaque position fingerprint [0-9a-f]{16}")
+                .doesNotContain(firstPosition, nextPosition);
+        assertThat(next).isNotEqualTo(first);
     }
 
     @Test
