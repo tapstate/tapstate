@@ -40,6 +40,8 @@ a-postgres-change-stream-carries-rows-written-after-start on IN_PROCESS
 a-postgres-change-stream-carries-rows-written-after-start on REAL_PROCESS
 a-real-change-stream-carries-rows-written-after-start on IN_PROCESS
 a-real-change-stream-carries-rows-written-after-start on REAL_PROCESS
+a-real-mongo-collection-syncs-to-a-real-mongo-target on IN_PROCESS
+a-real-mongo-collection-syncs-to-a-real-mongo-target on REAL_PROCESS
 a-row-keeps-its-sequence-across-the-crossing on IN_PROCESS
 a-row-keeps-its-sequence-across-the-crossing on REAL_PROCESS
 a-select-that-renames-and-computes-lands-exactly-that on IN_PROCESS
