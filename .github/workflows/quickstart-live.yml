@@ -50,6 +50,9 @@ concurrency:
 # user with no network takes.
 env:
   TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e
+  # The independent second half: the line above stops the send, this one makes an install that gets
+  # sent anyway arrive marked as ours rather than counted as a person's.
+  TAPSTATE_TELEMETRY_CHANNEL: internal
 
 jobs:
   quickstart-live:
