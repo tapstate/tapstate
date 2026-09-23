@@ -13,6 +13,7 @@ import io.tapstate.control.core.LivePipelineRuns;
 import io.tapstate.control.core.LivePipelineVertex;
 import io.tapstate.core.common.TapstateException;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -21,6 +22,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Where each pipeline's work is running, read off the engine's own readings of its running jobs.
@@ -51,14 +58,73 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
      */
     private static final Set<String> PLACEHOLDER_TYPES = Set.of("ExpectNothingP", "NoopP");
 
+    /**
+     * How long this member waits for the engine to list its jobs before saying it cannot answer.
+     *
+     * <p>The listing is a call to every member and to the one coordinating the cluster, and it waits for all
+     * of them. When a member dies the coordinating role moves, and a listing caught in that move can be
+     * dropped outright -- measured on a two-member cluster, the survivor's engine logged the call as a
+     * duplicate it would not run and nothing answered it again. Unbounded, the read then waits out the
+     * engine's own call timeout, a minute, and so does whoever asked: at the moment a member has just been
+     * lost, which is the moment someone most wants to know who is left. A listing that is answered at all
+     * takes milliseconds, so this is a bound on how long a stuck one is waited for, not on a slow one.
+     */
+    private static final Duration LISTING_BOUND = Duration.ofSeconds(5);
+
     private final HazelcastInstance member;
+    private final Duration listingBound;
 
     HazelcastLivePipelineRuns(HazelcastInstance member) {
-        this.member = Objects.requireNonNull(member, "member");
+        this(member, LISTING_BOUND);
     }
 
+    HazelcastLivePipelineRuns(HazelcastInstance member, Duration listingBound) {
+        this.member = Objects.requireNonNull(member, "member");
+        this.listingBound = Objects.requireNonNull(listingBound, "listingBound");
+    }
+
+    /**
+     * The runs, or the same refusal the member half gives when the engine could not list them in time.
+     *
+     * <p>The listing runs on a thread of its own so that giving up on it is real: the engine waits on its
+     * calls interruptibly, so cancelling stops it rather than leaving it parked for the rest of its minute.
+     */
     @Override
     public List<LivePipelineRun> runs() {
+        ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "cluster-topology-runs");
+            thread.setDaemon(true);
+            return thread;
+        });
+        try {
+            Future<List<LivePipelineRun>> answer = worker.submit(this::listed);
+            try {
+                return answer.get(listingBound.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (TimeoutException unanswered) {
+                answer.cancel(true);
+                // The same code as the engine not being active, for the same reason: the cluster is
+                // changing under this read, and "ask again in a moment" is the whole of the answer.
+                throw new TapstateException(ClusterError.MEMBERSHIP_UNREADABLE, Map.of(), unanswered);
+            } catch (InterruptedException interrupted) {
+                answer.cancel(true);
+                Thread.currentThread().interrupt();
+                // The caller was interrupted, not the cluster: nothing was learned about it to report.
+                throw new IllegalStateException("interrupted while listing the engine's jobs", interrupted);
+            } catch (ExecutionException failed) {
+                if (failed.getCause() instanceof RuntimeException runtime) {
+                    throw runtime;
+                }
+                if (failed.getCause() instanceof Error error) {
+                    throw error;
+                }
+                throw new IllegalStateException("listing the engine's jobs failed", failed.getCause());
+            }
+        } finally {
+            worker.shutdownNow();
+        }
+    }
+
+    private List<LivePipelineRun> listed() {
         List<LivePipelineRun> live = new ArrayList<>();
         try {
             for (Job job : member.getJet().getJobs()) {

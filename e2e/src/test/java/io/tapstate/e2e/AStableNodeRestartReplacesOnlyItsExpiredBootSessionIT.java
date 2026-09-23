@@ -106,9 +106,16 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
             // being tested is the id of a node that did not get to say goodbye.
             cluster.processCarrying(TwoMemberCluster.NODE_A).kill();
 
+            // Read patiently: while the survivor settles after losing the other member it can refuse to say
+            // who is left, with its code, and that refusal is on the way to the departure this waits for.
+            // Any other answer that is not a membership still fails here.
             Await.until("the killed member to leave the cluster the other one reports", DEPARTURE_BUDGET,
-                    () -> !survivor.clusterMemberNodeIds().contains(TwoMemberCluster.NODE_A),
-                    () -> "the membership was still " + survivor.clusterMemberNodeIds());
+                    () -> survivor.clusterMemberNodeIdsIfAnswered()
+                            .filter(nodeIds -> !nodeIds.contains(TwoMemberCluster.NODE_A))
+                            .isPresent(),
+                    () -> "the membership was still " + survivor.clusterMemberNodeIdsIfAnswered()
+                            .map(String::valueOf)
+                            .orElse("unanswered, with the code that says to ask again"));
 
             List<RealProcessServer> restarts = new ArrayList<>();
             try {
