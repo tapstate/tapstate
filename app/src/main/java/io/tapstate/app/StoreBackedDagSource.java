@@ -2373,7 +2373,8 @@ final class StoreBackedDagSource implements DagSource {
             SourceVertex vertex = entry.getValue();
             if (pattern.matcher(vertex.table()).matches()
                     || pattern.matcher(entry.getKey()).matches()
-                    || pattern.matcher(vertex.sourceId()).matches()) {
+                    || pattern.matcher(vertex.sourceId()).matches()
+                    || pattern.matcher(vertex.sourceId() + "." + vertex.table()).matches()) {
                 matches.add(entry.getKey());
             }
         }

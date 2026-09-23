@@ -806,6 +806,23 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void qualified_from_regex_reaches_a_single_selected_table() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
+        store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource(
+                "selected", null, List.of(SourceRef.spec("src", true)), null, null,
+                serve(FromRef.regex("src\\.orders"), sync("sync_1", "dest")), null, null));
+        discovered(store, "src", "orders", "customers");
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("selected");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("src", "serve.sync_1");
+        assertThat(edges(dag)).containsExactly(edge("src", "serve.sync_1"));
+    }
+
+    @Test
     void aSourceWithNoReferencedTableOpensNoVertex() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(cdcSource("src_a", "orders"));
