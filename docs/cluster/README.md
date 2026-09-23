@@ -59,6 +59,15 @@ Before the production threshold is reached, members may discover each other but 
 renew business-workload claims. A node-session claim is different: it reserves a stable node ID
 before join and does not authorize pipeline side effects.
 
+The committed set grows when a member joins and does not shrink when one stops answering. A member
+that has died and a member on the other side of a network cut look the same from here, and writing
+the smaller set down on that evidence is how one half of an even split would make itself a majority.
+So losing members is survivable while a majority of the committed set is still running -- three of
+four, say -- and a cluster that permanently loses a majority stays refused. To bring it back, start
+replacement members with the node IDs that are still committed: each is admitted once the session
+its predecessor left behind has expired. There is not yet a way to remove a member from the
+committed set.
+
 ## Failure-detection budget
 
 The defaults are deliberately two separate clocks:
