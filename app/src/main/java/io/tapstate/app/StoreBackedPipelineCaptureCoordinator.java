@@ -31,6 +31,8 @@ import java.time.Duration;
 import java.time.Instant;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -39,8 +41,14 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The store-backed capture coordinator: it resolves a pipeline and the sources it reads from the store,
@@ -60,6 +68,8 @@ import java.util.stream.Collectors;
  */
 final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoordinator {
 
+    private static final Logger LOG = LoggerFactory.getLogger(StoreBackedPipelineCaptureCoordinator.class);
+
     /** The schema version stamped on ring items at L1 (schema evolution is a later increment). */
     private static final long MOCK_SCHEMA_VER = 0L;
 
@@ -78,12 +88,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private final Map<CaptureId, OwnedCapture> ownedCaptures = new LinkedHashMap<>();
 
     /**
-     * The pipelines here reading a capture another member holds, by capture. Kept so that a member which
-     * later takes such a capture over counts them among the pipelines its tail runs for: they read what
-     * that tail writes from then on, and it has to outlast the last of them rather than the pipeline that
-     * happened to take the claim.
+     * The pipelines here reading a capture another member holds, by capture. Kept for the moment this
+     * member takes such a capture over, by a start of its own or because nobody tails it any more: its
+     * tail then runs for these pipelines as well, and has to outlast the last of them rather than the
+     * pipeline that happened to take the claim.
      */
-    private final Map<CaptureId, Set<String>> joinedCaptures = new LinkedHashMap<>();
+    private final Map<CaptureId, JoinedCapture> joinedCaptures = new LinkedHashMap<>();
+
+    /** Looks for captures pipelines here read and nobody tails; started with the first capture joined. */
+    private ScheduledExecutorService takeovers;
 
     /** What each running pipeline's load read, keyed by pipeline; dropped when it stops. */
     private final Map<String, SnapshotReading> snapshotsByPipeline = new ConcurrentHashMap<>();
@@ -194,27 +207,24 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                                 ownership.release(permit.claim());
                                 throw failure;
                             }
-                            OwnedCapture owned = new OwnedCapture(run, permit, pipelineId);
                             // Pipelines here that joined this capture while another member held it read the
                             // tail this member now runs, so it runs for as long as any of them does.
-                            Set<String> joined = joinedCaptures.remove(captureId);
+                            Set<String> pipelines = new LinkedHashSet<>(List.of(pipelineId));
+                            JoinedCapture joined = joinedCaptures.remove(captureId);
                             if (joined != null) {
-                                owned.pipelines.addAll(joined);
+                                pipelines.addAll(joined.pipelines);
                             }
-                            ownedCaptures.put(captureId, owned);
-                            owned.lease = permit.claim() == null
-                                    ? CaptureClaimLease.unfenced()
-                                    : new CaptureClaimLease(
-                                            ownership, permit.claim(), claimRenewInterval,
-                                            () -> captureClaimLost(captureId, owned));
+                            own(captureId, run, permit, pipelines);
                         } else {
                             // Another member tails this source. The pipeline reads it no differently for
                             // that: its own load where its record says one is owed, then the changes the
                             // other member's tail writes into the shared ring.
-                            run = captureAttacher.start(
-                                    spec, snapshotPassthrough(pipelineId, resolution, observedSnapshotCounts), false);
-                            joinedCaptures.computeIfAbsent(captureId, ignored -> new LinkedHashSet<>())
-                                    .add(pipelineId);
+                            Consumer<Envelope> passthrough =
+                                    snapshotPassthrough(pipelineId, resolution, observedSnapshotCounts);
+                            run = captureAttacher.start(spec, passthrough, false);
+                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec, passthrough))
+                                    .pipelines.add(pipelineId);
+                            lookForCapturesNobodyTails();
                         }
                     }
                     runs.add(PipelineRun.managed(captureId, run));
@@ -254,10 +264,109 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         private final Set<String> pipelines = new LinkedHashSet<>();
         private CaptureClaimLease lease;
 
-        private OwnedCapture(CaptureRun run, CaptureOwnership.Permit permit, String pipelineId) {
+        private OwnedCapture(CaptureRun run, CaptureOwnership.Permit permit, Collection<String> pipelines) {
             this.run = run;
             this.permit = permit;
-            this.pipelines.add(pipelineId);
+            this.pipelines.addAll(pipelines);
+        }
+    }
+
+    /**
+     * A capture pipelines here read while another member tails it: those pipelines, and what this member
+     * would open the tail with should nobody else be tailing it. That tail reads no load -- each of the
+     * pipelines ran its own when it attached -- so it is opened as a change-only read of the same source,
+     * which is the same capture.
+     */
+    private static final class JoinedCapture {
+        private final boolean tails;
+        private final CaptureRunSpec tailSpec;
+        private final Consumer<Envelope> tailPassthrough;
+        private final Set<String> pipelines = new LinkedHashSet<>();
+
+        private JoinedCapture(CaptureRunSpec joinedWith, Consumer<Envelope> passthrough) {
+            // A snapshot-only read has no tail for anybody to take over.
+            this.tails = joinedWith.readMode() != ReadMode.SNAPSHOT_ONLY;
+            this.tailSpec = new CaptureRunSpec(
+                    joinedWith.config(), ReadMode.CDC_ONLY, joinedWith.srsKey(), joinedWith.srsEnabled(),
+                    joinedWith.sourceId(), joinedWith.pipelineId(), joinedWith.startFrom(),
+                    joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch());
+            this.tailPassthrough = passthrough;
+        }
+    }
+
+    private void own(CaptureId captureId, CaptureRun run, CaptureOwnership.Permit permit, Set<String> pipelines) {
+        OwnedCapture owned = new OwnedCapture(run, permit, pipelines);
+        ownedCaptures.put(captureId, owned);
+        owned.lease = permit.claim() == null
+                ? CaptureClaimLease.unfenced()
+                : new CaptureClaimLease(
+                        ownership, permit.claim(), claimRenewInterval,
+                        () -> captureClaimLost(captureId, owned));
+    }
+
+    /**
+     * Opens, here, the tail of every capture pipelines here read that nobody tails any more.
+     *
+     * <p>A member lets a capture's claim go with the last of its own pipelines on it, and a pipeline on
+     * another member reading the same capture goes on running over a ring nobody writes: healthy, and
+     * receiving nothing because a different pipeline somewhere else was stopped. So each member that reads
+     * a capture it does not hold keeps asking for its claim, and the first to get it opens the tail, from
+     * where the durable record says the last one had got to. A holder that died leaves the claim to be
+     * taken the same way once its lease has run out.
+     */
+    synchronized void tailWhatNobodyTails() {
+        Iterator<Map.Entry<CaptureId, JoinedCapture>> joined = joinedCaptures.entrySet().iterator();
+        while (joined.hasNext()) {
+            Map.Entry<CaptureId, JoinedCapture> entry = joined.next();
+            JoinedCapture capture = entry.getValue();
+            if (!capture.tails) {
+                continue;
+            }
+            CaptureOwnership.Permit permit = ownership.acquire(entry.getKey());
+            if (!permit.acquired()) {
+                continue;
+            }
+            CaptureRun tail;
+            try {
+                tail = captureAttacher.start(
+                        capture.tailSpec.withCaptureFence(permit.fence()), capture.tailPassthrough, true);
+            } catch (RuntimeException failure) {
+                ownership.release(permit.claim());
+                LOG.warn("Could not open the tail of capture {} for pipelines {} here; asking again later",
+                        entry.getKey().value(), capture.pipelines, failure);
+                continue;
+            }
+            joined.remove();
+            own(entry.getKey(), tail, permit, capture.pipelines);
+            LOG.info("Took over the tail of capture {} for pipelines {} here", entry.getKey().value(),
+                    capture.pipelines);
+        }
+    }
+
+    private void lookForCapturesNobodyTails() {
+        if (takeovers != null || claimRenewInterval.isZero()) {
+            return;
+        }
+        takeovers = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "tapstate-capture-takeover");
+            thread.setDaemon(true);
+            return thread;
+        });
+        long every = claimRenewInterval.toMillis();
+        takeovers.scheduleWithFixedDelay(() -> {
+            try {
+                tailWhatNobodyTails();
+            } catch (RuntimeException failure) {
+                LOG.warn("Looking for captures nobody tails failed; asking again later", failure);
+            }
+        }, every, every, TimeUnit.MILLISECONDS);
+    }
+
+    /** Stops looking for captures to take over. What this member already tails is its stops' to close. */
+    public synchronized void close() {
+        if (takeovers != null) {
+            takeovers.shutdownNow();
+            takeovers = null;
         }
     }
 
@@ -721,12 +830,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     private void forgetJoined(CaptureId captureId, String pipelineId) {
-        Set<String> joined = joinedCaptures.get(captureId);
+        JoinedCapture joined = joinedCaptures.get(captureId);
         if (joined == null) {
             return;
         }
-        joined.remove(pipelineId);
-        if (joined.isEmpty()) {
+        joined.pipelines.remove(pipelineId);
+        if (joined.pipelines.isEmpty()) {
             joinedCaptures.remove(captureId);
         }
     }

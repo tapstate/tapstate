@@ -34,6 +34,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -342,6 +343,58 @@ class CaptureOwnershipTest {
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(10));
     }
 
+    /**
+     * When the member holding a capture stops the last of its own pipelines on it, a member whose
+     * pipelines still read that capture takes the tail over, so they go on receiving changes.
+     *
+     * <p>Nothing else would: the holder lets the claim go with its last pipeline, and the pipelines on the
+     * other member are running, healthy, and reading a ring nobody writes any more -- a pipeline whose
+     * changes stopped because a different pipeline somewhere else was stopped.
+     */
+    @Test
+    void aMemberWhosePipelinesStillReadACaptureTakesItsTailOverWhenTheHolderLetsItGo() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q"));
+        MemoryClaims claims = new MemoryClaims();
+        List<String> starts = Collections.synchronizedList(new ArrayList<>());
+        Duration look = Duration.ofMillis(100);
+        Member a = new Member("node-a", store, claims, TTL, look, starts);
+        Member b = new Member("node-b", store, claims, TTL, look, starts);
+        a.captures.startCapture("p");
+        b.captures.startCapture("q");
+
+        a.captures.stopCapture("p", false);
+
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (!starts.contains("node-b q opened the tail") && System.nanoTime() - deadline < 0) {
+            Thread.sleep(20);
+        }
+        assertThat(List.copyOf(starts))
+                .as("the member still reading the capture opened the tail its pipeline reads")
+                .containsExactly("node-a p opened the tail", "node-b q attached", "node-b q opened the tail");
+        assertThat(claims.current.owner()).isEqualTo(Member.owner("node-b"));
+
+        b.captures.stopCapture("q", false);
+        assertThat(b.tailsClosed).as("and that tail closes with the last pipeline reading it").hasValue(1);
+    }
+
+    /** A member holding nothing it has joined does not take anything over while the holder still tails. */
+    @Test
+    void aMemberTakesNothingOverWhileTheHolderStillTails() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q"));
+        MemoryClaims claims = new MemoryClaims();
+        List<String> starts = Collections.synchronizedList(new ArrayList<>());
+        Duration look = Duration.ofMillis(100);
+        Member a = new Member("node-a", store, claims, TTL, look, starts);
+        Member b = new Member("node-b", store, claims, TTL, look, starts);
+        a.captures.startCapture("p");
+        b.captures.startCapture("q");
+
+        Thread.sleep(look.multipliedBy(5).toMillis());
+
+        assertThat(List.copyOf(starts)).containsExactly("node-a p opened the tail", "node-b q attached");
+        assertThat(claims.current.owner()).isEqualTo(Member.owner("node-a"));
+    }
+
     private static StoreBackedPipelineCaptureCoordinator managed(
             InMemoryStorePort store,
             CaptureAttacher attacher,
@@ -414,6 +467,11 @@ class CaptureOwnershipTest {
         private final AtomicInteger tailsClosed = new AtomicInteger();
 
         Member(String node, InMemoryStorePort store, MemoryClaims claims, Duration ttl, List<String> starts) {
+            this(node, store, claims, ttl, RENEW, starts);
+        }
+
+        Member(String node, InMemoryStorePort store, MemoryClaims claims, Duration ttl, Duration renew,
+                List<String> starts) {
             this.node = node;
             this.starts = starts;
             this.chains = new SrsCoordinator(store.meta());
@@ -421,7 +479,7 @@ class CaptureOwnershipTest {
             CaptureOwnership ownership = new CaptureOwnership(
                     "cluster-a", owner(node), gate, new ClusterWorkloadClaims(claims, gate), ttl);
             this.captures = new StoreBackedPipelineCaptureCoordinator(
-                    store, this::start, chains, new SnapshotBuffer(), ownership, RENEW);
+                    store, this::start, chains, new SnapshotBuffer(), ownership, renew);
         }
 
         static WorkloadOwner owner(String node) {
