@@ -445,7 +445,7 @@ final class StoreBackedDagSource implements DagSource {
             if (discovered == null) {
                 continue;
             }
-            for (String table : PipelineTableSelection.resolve(pipeline, source, discovered)) {
+            for (String table : SourceTableSelection.resolve(source, discovered)) {
                 if (sourceSchemaCopy.copy(pipelineId, sourceId, table, discoveredTable(discovered, table))) {
                     copied.add(SourceSchemaCopy.nodeId(sourceId, table));
                 }
