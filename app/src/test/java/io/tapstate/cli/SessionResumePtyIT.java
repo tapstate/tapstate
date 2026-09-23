@@ -70,6 +70,7 @@ class SessionResumePtyIT {
             output = bytearray()
             sent = False
             status = None
+            answered_queries = set()
             deadline = time.time() + 30
 
             while time.time() < deadline:
@@ -82,6 +83,18 @@ class SessionResumePtyIT {
                     if not chunk:
                         break
                     output.extend(chunk)
+                # Answer JLine's terminal probes as an ordinary Linux console would: unsupported
+                # private modes, no Kitty keyboard mode, and a basic VT100 device-attributes reply.
+                for query, response in (
+                    (b"\\x1b[?2026$p", b"\\x1b[?2026;0$y"),
+                    (b"\\x1b[?2027$p", b"\\x1b[?2027;0$y"),
+                    (b"\\x1b[?2048$p", b"\\x1b[?2048;0$y"),
+                    (b"\\x1b[?u", b"\\x1b[?0u"),
+                    (b"\\x1b[c", b"\\x1b[?1;0c"),
+                ):
+                    if query in output and query not in answered_queries:
+                        os.write(fd, response)
+                        answered_queries.add(query)
                 # JLine may emit terminal-capability probes before it has installed the reader.
                 # A password is sent only after its prompt is visible; the transcript assertion below
                 # verifies that masked input never exposes the secret.
