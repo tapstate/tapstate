@@ -8,6 +8,7 @@ import io.tapstate.core.model.TableRename;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetIndex;
 import io.tapstate.spi.sink.TargetTable;
+import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
@@ -30,24 +31,30 @@ import java.util.Optional;
  * the source the sink reads and mapping the discovered {@link SourceTable} onto a {@link TargetTable}.
  *
  * <p>A source may select several tables. When a table's schema has never been discovered, it is absent from
- * the resolved map. View materialization tolerates that absence; a sync start refuses it before binding.
+ * the resolved map. A start that materializes either a view or a sync refuses that absence before binding.
  */
 final class TargetModelResolver {
 
     private final StorePort storePort;
+    private final ArtifactStore artifacts;
 
     TargetModelResolver(StorePort storePort) {
+        this(storePort, Objects.requireNonNull(storePort, "storePort").artifacts());
+    }
+
+    TargetModelResolver(StorePort storePort, ArtifactStore artifacts) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
+        this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
     }
 
     /**
-     * Requires every source model that reaches a sync to have been discovered. Literal table selectors can
-     * still resolve without discovery for legacy view/nest paths, but a sync target needs the discovered
-     * fields and primary key before capture or a sink can safely start.
+     * Requires every source model that reaches a materialized output to have been discovered. Literal table
+     * selectors can still resolve without discovery while a pipeline is authored, but a write target needs
+     * the discovered fields and primary key before capture or a sink can safely start.
      */
     void requireAllDiscovered(Iterable<String> sourceIds) {
         for (String sourceId : sourceIds) {
-            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+            SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
             SourceModel discovered = SourceDiscovery.model(storePort, source);
             if (discovered == null) {
                 throw new TapstateException(
@@ -68,7 +75,7 @@ final class TargetModelResolver {
     Map<String, TargetTable> resolveAll(PipelineResource pipeline) {
         Map<String, TargetTable> targets = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
-            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+            SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
             resolveAll(source, SourceDiscovery.model(storePort, source)).forEach(targets::putIfAbsent);
         }
         return Collections.unmodifiableMap(new LinkedHashMap<>(targets));
@@ -76,13 +83,13 @@ final class TargetModelResolver {
 
     /** Resolves one target model per selected table of the source that feeds a sink. */
     Map<String, TargetTable> resolveAll(String sourceId) {
-        SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+        SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
         return resolveAll(source, SourceDiscovery.model(storePort, source));
     }
 
     /** Resolves the first selected table for callers that still require a single target. */
     ResolvedTarget resolve(String sourceId) {
-        SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+        SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
         SourceModel discovered = SourceDiscovery.model(storePort, source);
         String table = SourceCaptureResolution.of(source, discovered).table();
         return new ResolvedTarget(table, resolveAll(source, discovered).get(table));

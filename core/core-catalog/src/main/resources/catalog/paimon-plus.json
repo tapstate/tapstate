@@ -269,7 +269,7 @@
   ],
   "provenance": {
     "specPath": "connectors/paimon-plus-connector/src/main/resources/spec.json",
-    "specContentHash": "8b90d87de9ef1436",
+    "specContentHash": "d6290830afb309b6",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

@@ -6,6 +6,7 @@ import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.control.restapi.SystemDataVersion;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
+import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
@@ -46,10 +47,19 @@ class StoreConfiguration {
      */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    StorePort storePort(MongoConnection storeConnection, MetricsHistoryProperties history) {
+    StorePort storePort(
+            MongoConnection storeConnection, MongoProperties mongo, MetricsHistoryProperties history) {
         // The one configured bound among the stores: how long a movement sample is kept. Written onto
         // the history's expiring index as the port comes up, so a changed retention is a changed index.
-        return new MongoStorePort(storeConnection, history.getRetention());
+        return new MongoStorePort(
+                storeConnection, mongo.getOperatorStateDatabase(), history.getRetention());
+    }
+
+    /** The deployment's default and per-Nest operator-state databases over the verified store client. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    OperatorStateStores operatorStateStores(StorePort storePort) {
+        return storePort.operatorStateStores();
     }
 
     /**
@@ -99,8 +109,8 @@ class StoreConfiguration {
      */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    KeyedStateStore nestStateStore(StorePort storePort) {
-        return storePort.keyedState();
+    KeyedStateStore nestStateStore(OperatorStateStores stores) {
+        return stores.inDatabase(stores.defaultDatabase()).state();
     }
 
     /**
@@ -110,7 +120,7 @@ class StoreConfiguration {
      */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    NestDeadLetterStore nestDeadLetterStore(StorePort storePort) {
-        return storePort.nestDeadLetters();
+    NestDeadLetterStore nestDeadLetterStore(OperatorStateStores stores) {
+        return stores.inDatabase(stores.defaultDatabase()).deadLetters();
     }
 }

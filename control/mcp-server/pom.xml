@@ -51,6 +51,17 @@
   </dependencies>
 
   <build>
+    <testResources>
+      <testResource>
+        <directory>src/test/resources</directory>
+      </testResource>
+      <testResource>
+        <directory>${project.basedir}/../rest-api/src/test/resources</directory>
+        <includes>
+          <include>golden/observability/**</include>
+        </includes>
+      </testResource>
+    </testResources>
     <plugins>
       <!-- The version this sidecar announces in the MCP handshake is a configured property, not a
            compiled constant, so a release can leave it behind with nothing to notice. Handing the real

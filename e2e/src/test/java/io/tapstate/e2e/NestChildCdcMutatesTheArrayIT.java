@@ -75,11 +75,11 @@ class NestChildCdcMutatesTheArrayIT {
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state.
      *
-     * <p>A nest keeps its state in a database of a fixed name, addressed by a namespace built from the
-     * pipeline and step ids - so two installs on one Mongo running a pipeline of the same id share one
-     * state, knowingly and by design. The tiers are two such installs. Giving each its own store and its
-     * own target, as this witness already did, leaves that third thing shared: the second tier starts on
-     * the state the first one finished with, and its snapshot is merged into an array that already holds
+     * <p>A nest keeps its state in the deployment's configured database, addressed by a namespace built
+     * from the pipeline and step ids. Both tiers in this witness use the same configured database.
+     * Giving each its own control store and target therefore leaves operator state shared, so the second
+     * tier starts on the state the first one finished with, and its snapshot is merged into an array that
+     * already holds
      * the first tier's changes. Idempotent witnesses cannot see this; this one ends somewhere its own
      * snapshot never reaches, so it can.
      *

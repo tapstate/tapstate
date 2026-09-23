@@ -63,6 +63,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Pattern;
@@ -90,6 +91,7 @@ import java.util.regex.PatternSyntaxException;
 final class StoreBackedDagSource implements DagSource {
 
     private final StorePort storePort;
+    private final ArtifactStore artifactStore;
     private final SinkWriterBinder sinkWriterBinder;
     private final TargetModelResolver targetModelResolver;
     private final NestSettings nestSettings;
@@ -136,18 +138,43 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     @Override
+    public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
+        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
+        StoreBackedDagSource captured = new StoreBackedDagSource(
+                storePort, sinkWriterBinder, nestSettings, storeReachability, snapshot);
+        captured.validateStart(pipelineId);
+        NestCapacity capacity = captured.capacityOf(pipelineId);
+        Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
+        return new StartPreparation(
+                capacity, locations, Optional.of(snapshot), () -> captured.dagFor(pipelineId));
+    }
+
+    @Override
     public void validateStart(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        boolean writesView = pipeline.view() instanceof ViewBlock.Inline;
+        boolean writesSync = pipeline.serve() instanceof ServeBlock.Inline serve
+                && serve.sync() != null && !serve.sync().isEmpty();
+        if (!writesView && !writesSync) {
+            return;
+        }
+        Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> stepIds = stepIds(pipeline);
+        Set<String> sourceIds = new LinkedHashSet<>();
         if (pipeline.serve() instanceof ServeBlock.Inline serve
                 && serve.sync() != null && !serve.sync().isEmpty()) {
-            Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
-            Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
-            Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
-            targetModelResolver.requireAllDiscovered(sourceIdsReaching(
-                    pipeline, serve.from(), sourceKeyByTable, sourceKeysById, sourceVertices,
-                    stepIds(pipeline)));
+            sourceIds.addAll(sourceIdsReaching(
+                    pipeline, serve.from(), sourceKeyByTable, sourceKeysById, sourceVertices, stepIds));
         }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            sourceIds.addAll(sourceIdsReaching(
+                    pipeline, FromClause.list(view.from()), sourceKeyByTable, sourceKeysById,
+                    sourceVertices, stepIds));
+        }
+        targetModelResolver.requireAllDiscovered(sourceIds);
     }
 
     StoreBackedDagSource(StorePort storePort, SinkWriterBinder sinkWriterBinder) {
@@ -162,9 +189,17 @@ final class StoreBackedDagSource implements DagSource {
     StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability,
+                Objects.requireNonNull(storePort, "storePort").artifacts());
+    }
+
+    private StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, ArtifactStore artifactStore) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
+        this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
-        this.targetModelResolver = new TargetModelResolver(this.storePort);
+        this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore);
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
         this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
@@ -293,6 +328,45 @@ final class StoreBackedDagSource implements DagSource {
         }
         holdings.add(PipelineStateInventory.CONNECTOR_STATE.in(driveNamespaces));
         return List.copyOf(holdings);
+    }
+
+    @Override
+    public Set<OperatorStateLocation> stateLocations(String pipelineId, String defaultDatabase) {
+        Objects.requireNonNull(defaultDatabase, "defaultDatabase");
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        var stores = storePort.operatorStateStores();
+        Set<OperatorStateLocation> locations = new LinkedHashSet<>();
+
+        Set<String> routedNestNamespaces = new LinkedHashSet<>();
+        if (PipelineDagBuilder.hasNest(pipeline)) {
+            Map<String, NestTable> byAlias = nestTablesByAlias(
+                    pipeline, sourceIdByTable(sourceVertices(pipeline)));
+            Map<String, String> mapDatabases = PipelineDagBuilder.nestStateDatabases(
+                    pipeline, byAlias::get, defaultDatabase);
+            mapDatabases.forEach((namespace, database) -> {
+                stores.inDatabase(database);
+                routedNestNamespaces.add(namespace);
+                locations.add(new OperatorStateLocation(database, namespace));
+            });
+            PipelineDagBuilder.nestStateDatabasesByStep(pipeline, defaultDatabase).values().stream()
+                    .distinct()
+                    .forEach(database -> {
+                        stores.inDatabase(database);
+                        locations.add(new OperatorStateLocation(
+                                database, StoreBackedNestStateLedger.namespaceOf(pipelineId)));
+                    });
+        }
+
+        for (PipelineStateHolding holding : stateHeldBy(pipelineId)) {
+            for (String namespace : holding.namespaces()) {
+                if (!routedNestNamespaces.contains(namespace)
+                        && !namespace.equals(StoreBackedNestStateLedger.namespaceOf(pipelineId))) {
+                    locations.add(new OperatorStateLocation(defaultDatabase, namespace));
+                }
+            }
+        }
+        return Set.copyOf(locations);
     }
 
     /**
@@ -1812,7 +1886,12 @@ final class StoreBackedDagSource implements DagSource {
             return NestCapacity.none();
         }
         Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices(pipeline)));
-        return new NestCapacity(PipelineDagBuilder.nestStateNamespaces(pipeline, byAlias::get),
+        var stores = storePort.operatorStateStores();
+        String defaultDatabase = stores.defaultDatabase();
+        Map<String, String> databases = PipelineDagBuilder.nestStateDatabases(
+                pipeline, byAlias::get, defaultDatabase);
+        databases.values().stream().distinct().forEach(stores::inDatabase);
+        return new NestCapacity(databases,
                 PipelineDagBuilder.nestSettings(pipeline, byAlias::get, nestSettings));
     }
 
@@ -1989,10 +2068,13 @@ final class StoreBackedDagSource implements DagSource {
 
     private NestBinding nestBinding(PipelineResource pipeline, Map<String, String> sourceIdByTable) {
         Map<String, NestTable> byAlias = nestTablesByAlias(pipeline, sourceIdByTable);
+        var operatorStateStores = storePort.operatorStateStores();
         return new NestBinding(byAlias::get, NestBinding.onMap(),
                 new LoggingNestDeadLetter(new DurableNestDeadLetter()),
                 new StoreBackedReplayFloorFactory(chainIdByTable(pipeline), pipeline.id()),
-                new StoreBackedNestStateLedger(storePort.keyedState()),
+                new StoreBackedNestStateLedger(operatorStateStores,
+                        PipelineDagBuilder.nestStateDatabasesByStep(
+                                pipeline, operatorStateStores.defaultDatabase())),
                 // What the deployment was started with, with what this pipeline's author wrote over it.
                 // Laid on here rather than held as one value for the process because the shape each
                 // number bounds is the pipeline's, not the process's: one tree is deep and narrow and
@@ -2319,7 +2401,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private ArtifactStore artifacts() {
-        return storePort.artifacts();
+        return artifactStore;
     }
 
     /**

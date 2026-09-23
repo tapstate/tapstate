@@ -351,6 +351,9 @@ store.unreachable:
 store.not-replica-set:
   message: "The store at {target} is not a replica-set."
   solution: "Start MongoDB as a single-node replica-set; the checkpoint transaction requires one."
+store.invalid-operator-state-database:
+  message: "The operator-state database name is not valid for this deployment."
+  solution: "Set tapstate.store.mongo.operator-state-database to a non-blank name of at most 63 UTF-8 bytes, without a null character, slash, backslash, space, double quote, dot, or dollar sign. Do not use local, config, or the control database named by tapstate.store.mongo.uri."
 store.invalid-uri:
   message: "The store connection string is not a valid MongoDB URI."
   solution: "Check the store URI setting; it must start with mongodb:// or mongodb+srv://."
@@ -405,6 +408,12 @@ connector.class-not-found:
 connector.config-type-mismatch:
   message: "Connection setting '{field}' of connector '{connector}' must be a {expected}, but its value is '{value}'."
   solution: "Give '{field}' a {expected} the connector can read, or remove it if the connection does not need it."
+connector.logminer-identifier-too-long:
+  message: "Oracle LogMiner connector '{connector}' cannot capture {kind} identifier '{identifier}' because it is longer than {limit} characters."
+  solution: "Use an Oracle schema, table and column name no longer than {limit} characters, or select another supported Oracle capture mode."
+connector.logminer-preflight-timeout:
+  message: "Oracle LogMiner connector '{connector}' did not finish initialization and schema discovery within {timeout} and was stopped."
+  solution: "Check that the Oracle source is reachable and responsive, or increase the LogMiner preflight timeout if discovery is expected to take longer."
 connector.no-connector-class:
   message: "No connector class found in artifact '{artifact}'."
   solution: "Check the jar is a PDK connector: it must contain a class annotated with @TapConnectorClass."
@@ -564,6 +573,15 @@ position.nothing-to-write:
 monitor.no-observation:
   message: "No observation is available for pipeline {pipeline}."
   solution: "Check the pipeline id for typos; a freshly started pipeline may take a moment to publish its first observation."
+monitor.invalid-cursor:
+  message: "The cursor for {operation} is invalid ({reason})."
+  solution: "Start a new history query, then repeat every query parameter unchanged when following its next cursor."
+monitor.cursor-expired:
+  message: "The cursor for {operation} has expired."
+  solution: "Start a new history query; cursors are intentionally short-lived and do not hold a server-side session."
+monitor.query-budget-exceeded:
+  message: "The {operation} query exceeded the {budget} budget of {limit}."
+  solution: "Narrow the time range or select fewer table series, then start a new query."
 artifact.in-use:
   message: "Artifact `{id}` is still referenced by: {referrers}."
   solution: "Delete or rewrite those resources first, then delete `{id}`."
@@ -624,6 +642,9 @@ transform.expression-failed:
 transform.script-compile-failed:
   message: "The js transform script could not be compiled: {detail}."
   solution: "Fix the script so it parses as valid JavaScript."
+transform.script-decimal-out-of-range:
+  message: "The js transform cannot expose exact decimal {value} as a JavaScript number without changing it to zero or infinity."
+  solution: "Use a value whose conversion to a JavaScript number stays finite and does not underflow to zero, or keep this value outside the js transform."
 transform.script-failed:
   message: "The js transform script raised an error while processing a row: {detail}."
   solution: "Fix the script so it does not throw for this input, or guard the failing operation."
@@ -678,6 +699,9 @@ nest.memory-budget-below-partition-count:
 nest.memory-budget-changed-while-running:
   message: "Nest state {namespace} is already configured to hold {configured} entries in memory on this process, and this pipeline asks for {requested}."
   solution: "Restart the process to pick up the new budget: what a state map holds is settled the first time that map is configured and cannot be changed while the process runs, so restarting the pipeline alone would leave it on the earlier number."
+nest.state-database-changed-while-running:
+  message: "Nest state {namespace} is already routed to database {configured} on this process, and this pipeline asks for {requested}."
+  solution: "Stop every writer and restart the server before changing this nest's state database. Migrate operator state and dead letters first, or purge the pipeline state and run a full replay."
 nest.state-paths-changed:
   message: "Nest {stepId} stored its state under {recorded}, and now compiles to {compiled}."
   solution: "Stop the pipeline and start it again rather than resuming: renaming an embed path or inserting a level leaves the stored state where nothing reads it, and the new paths start empty beside documents that are not."

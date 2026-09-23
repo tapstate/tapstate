@@ -18,7 +18,7 @@ final class SharedMongo {
     private static final DockerImageName IMAGE = DockerImageName.parse("mongo:7.0");
 
     /** Kept as its own constant rather than reached for across modules: this module depends on neither. */
-    private static final String NEST_STATE_DATABASE = "tapstate_nest";
+    static final String OPERATOR_STATE_DATABASE = "tapstate_nest";
 
     private static MongoDBContainer container;
 
@@ -26,9 +26,9 @@ final class SharedMongo {
     }
 
     /**
-     * The one database on this replica set a run cannot keep to itself: nest state is held under a fixed
-     * name, chosen so that a deployment configures nothing to get durable assembly. Everything else here
-     * is isolated by taking a database of one's own, and that is precisely what a fixed name cannot do.
+     * The operator-state database configured for this test deployment. Every server here uses the
+     * compatible default, while its control database takes a per-run name. The helper therefore has to
+     * reset operator state explicitly between independent runs.
      *
      * <p>Two runs of one pipeline therefore meet in it. That is right in a deployment - a pipeline that
      * restarts is meant to resume what it had assembled - and wrong here, where two runs of one
@@ -44,19 +44,18 @@ final class SharedMongo {
             return;
         }
         try (MongoClient client = MongoClients.create(container.getReplicaSetUrl())) {
-            client.getDatabase(NEST_STATE_DATABASE).drop();
+            client.getDatabase(OPERATOR_STATE_DATABASE).drop();
         }
     }
     /**
      * The URL of the one database above, for a case whose subject is what lives in it.
      *
-     * <p>Named here rather than spelled out at the call site, because the point of the constant it reads
-     * is that this name is fixed by the deployment and not by whoever is looking -- a case that wrote the
-     * name out again would keep working after the deployment changed it, and would be asserting about a
-     * database nothing uses.
+     * <p>Named here rather than spelled out at the call site because this is the value configured for the
+     * test deployment. A case that wrote the default again would keep working after the harness changed
+     * its configuration and would be asserting about a database nothing uses.
      */
     static synchronized String assemblyStateUrl() {
-        return replicaSetUrl(NEST_STATE_DATABASE);
+        return replicaSetUrl(OPERATOR_STATE_DATABASE);
     }
 
 

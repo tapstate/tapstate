@@ -1,0 +1,22 @@
+version: tapstate/v1
+kind: pipeline
+id: nullable_join_expression
+source: shop_db
+settings: { read_mode: snapshot_only }
+transforms:
+  - id: widen
+    type: join
+    from: { o: orders, c: customers }
+    engine: builtin
+    sql: |
+      SELECT o.id AS order_id, c.name AS customer_name
+      FROM o LEFT JOIN c ON o.customer_id = c.id
+  - id: tag
+    from: widen
+    type: map
+    fields:
+      customer_tag: "=after.customer_name + '!'"
+view:
+  id: order_state
+  from: tag
+  primary_key: order_id

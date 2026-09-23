@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.spi.store.ArtifactStore;
 
 import java.util.Optional;
 
@@ -15,6 +16,14 @@ interface PipelineCaptureCoordinator {
 
     /** Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop. */
     void startCapture(String pipelineId);
+
+    /**
+     * Starts from the same immutable artifact snapshot used to build the pipeline's DAG and state plan.
+     * Lightweight coordinators that do not read artifacts keep their existing implementation.
+     */
+    default void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
+        startCapture(pipelineId);
+    }
 
     /**
      * Stops the cdc capture started for the pipeline, tearing down each source run and giving back its hold

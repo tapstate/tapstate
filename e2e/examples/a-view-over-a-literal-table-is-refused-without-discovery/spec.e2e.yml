@@ -1,0 +1,18 @@
+# A view over a literally named table needs the source schema before it starts, just as a sync does.
+# The setup deliberately omits discovery: a literal selector can name the capture stream without it,
+# but the view target cannot know the row's columns or identity from that name alone.
+#
+# Both the lifecycle state and the error code are asserted so an unrelated failure cannot satisfy the
+# case. The target count also proves the refusal happened before a partial or key-only row was written.
+name: a-view-over-a-literal-table-is-refused-without-discovery
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, views.tap.yml, pipeline.tap.yml]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders: { rows: 3 }
+steps:
+  - start
+  - await: { state: FAILED }
+  - assert: { failure_code: actuation.source-schema-not-discovered }
+  - assert: { count: { views.order_state: 0 } }

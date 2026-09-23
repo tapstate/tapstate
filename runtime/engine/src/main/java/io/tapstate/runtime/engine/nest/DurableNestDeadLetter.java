@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.nest;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.spi.store.NestDeadLetterRecord;
 import io.tapstate.spi.store.NestDeadLetterStore;
+import io.tapstate.spi.store.OperatorStateStores;
 
 import java.util.Map;
 import java.util.Objects;
@@ -69,6 +70,12 @@ public final class DurableNestDeadLetter implements NestDeadLetter {
                 .put(USER_CONTEXT_KEY, Objects.requireNonNull(store, "store"));
     }
 
+    /** Binds the database-routed state stores used by production Nest vertices. */
+    public static void bindTo(HazelcastInstance member, OperatorStateStores stores) {
+        Objects.requireNonNull(member, "member").getUserContext()
+                .put(USER_CONTEXT_KEY, Objects.requireNonNull(stores, "stores"));
+    }
+
     /**
      * The channel for this member, or this unbound form where the member was told of none.
      *
@@ -81,7 +88,14 @@ public final class DurableNestDeadLetter implements NestDeadLetter {
      */
     @Override
     public NestDeadLetter bind(HazelcastInstance member) {
-        return boundTo(Objects.requireNonNull(member, "member").getUserContext());
+        HazelcastInstance current = Objects.requireNonNull(member, "member");
+        Object store = current.getUserContext().get(USER_CONTEXT_KEY);
+        if (store instanceof OperatorStateStores routed) {
+            return bindTo(routed, current, new JetNestDeadLetterGauge());
+        }
+        return store == null
+                ? this
+                : new Bound((NestDeadLetterStore) store, clock, new JetNestDeadLetterGauge());
     }
 
     /** The channel for a member holding {@code userContext}, taken apart from the member so it is testable. */
@@ -105,6 +119,14 @@ public final class DurableNestDeadLetter implements NestDeadLetter {
     /** The channel with {@code store} behind it, leaving its counts with {@code gauge}. */
     NestDeadLetter bindTo(NestDeadLetterStore store, NestDeadLetterGauge gauge) {
         return new Bound(Objects.requireNonNull(store, "store"), clock,
+                Objects.requireNonNull(gauge, "gauge"));
+    }
+
+    /** Database-routed binding with an explicit gauge, separated for focused tests outside a Jet thread. */
+    NestDeadLetter bindTo(
+            OperatorStateStores stores, HazelcastInstance member, NestDeadLetterGauge gauge) {
+        return new Routed(Objects.requireNonNull(stores, "stores"),
+                Objects.requireNonNull(member, "member"), clock,
                 Objects.requireNonNull(gauge, "gauge"));
     }
 
@@ -156,6 +178,50 @@ public final class DurableNestDeadLetter implements NestDeadLetter {
                     child.fields()));
             gauge.handedOver(namespace,
                     counts.computeIfAbsent(namespace, ignored -> new AtomicLong()).incrementAndGet());
+        }
+    }
+
+    /** A member-bound channel resolving the database from the exact map configuration of each namespace. */
+    private static final class Routed implements NestDeadLetter {
+
+        private static final long serialVersionUID = 1L;
+
+        private final OperatorStateStores stores;
+        private final HazelcastInstance member;
+        private final NestClock clock;
+        private final NestDeadLetterGauge gauge;
+        private final Map<String, AtomicLong> counts = new ConcurrentHashMap<>();
+        private final Map<String, NestDeadLetterStore> byNamespace = new ConcurrentHashMap<>();
+
+        private Routed(OperatorStateStores stores, HazelcastInstance member, NestClock clock,
+                NestDeadLetterGauge gauge) {
+            this.stores = stores;
+            this.member = member;
+            this.clock = clock;
+            this.gauge = gauge;
+        }
+
+        @Override
+        public void unassemblable(NestVertex from, ReleasedChild released) {
+            String namespace = from.mapName();
+            NestElement child = released.child();
+            deadLetters(namespace).record(new NestDeadLetterRecord(
+                    namespace,
+                    elementOf(child),
+                    chainOf(child),
+                    orderOf(child),
+                    released.heldFor().toMillis(),
+                    clock.millis(),
+                    child.fields()));
+            gauge.handedOver(namespace,
+                    counts.computeIfAbsent(namespace, ignored -> new AtomicLong()).incrementAndGet());
+        }
+
+        private NestDeadLetterStore deadLetters(String namespace) {
+            return byNamespace.computeIfAbsent(namespace, ignored -> {
+                String database = NestMaps.stateDatabase(member.getConfig().findMapConfig(namespace));
+                return stores.inDatabase(database == null ? stores.defaultDatabase() : database).deadLetters();
+            });
         }
     }
 

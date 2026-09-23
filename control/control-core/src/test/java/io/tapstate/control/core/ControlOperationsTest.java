@@ -54,6 +54,8 @@ class ControlOperationsTest {
                         "pipeline.snapshot",
                         "pipeline.logs",
                         "pipeline.log-level",
+                        "pipeline.metrics.history",
+                        "pipeline.explain",
                         "pipeline.position",
                         "pipeline.set-position",
                         "pipeline.derived-schema",
@@ -117,7 +119,7 @@ class ControlOperationsTest {
         // read faces; read-scoped, unaudited.
         for (String id : List.of(
                 "pipeline.list", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
-                "pipeline.snapshot", "pipeline.logs")) {
+                "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
         }
         assertThat(registry.resolve("pipeline.log-level").scope()).isEqualTo(Scope.WRITE);
@@ -178,7 +180,9 @@ class ControlOperationsTest {
                 "pipeline.status",
                 "pipeline.metrics",
                 "pipeline.snapshot",
-                "pipeline.logs")) {
+                "pipeline.logs",
+                "pipeline.metrics.history",
+                "pipeline.explain")) {
             assertThat(registry.resolve(id).audited()).as(id).isFalse();
         }
     }
@@ -188,7 +192,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(50);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(52);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }
@@ -220,6 +224,7 @@ class ControlOperationsTest {
                         "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status",
                         "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
+                        "pipeline.metrics.history", "pipeline.explain",
                         // Neither half of the resume-point pair is here: where to resume from turns on
                         // the source's retention window, which nothing on this face can see.
                         "data-browser.collections", "data-browser.find", "data-browser.stats");

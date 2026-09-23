@@ -35,10 +35,16 @@ final class InProcessServer implements ServerHandle {
 
     /** Boots the assembly against the given store and returns once its surface is listening. */
     static InProcessServer start(String storeUri) {
+        return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
+    }
+
+    /** Boots the assembly with an explicit operator-state database. */
+    static InProcessServer start(String storeUri, String operatorStateDatabase) {
         ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
                 .properties(
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
+                        ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                         // The container speaks plaintext; store TLS is opt-in, so no flag is needed.
                         "tapstate.store.mongo.server-selection-timeout=5s",
                         // This tier's working directory is the harness's own module, and the setting's

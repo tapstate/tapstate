@@ -117,7 +117,7 @@ give up is failover awareness, which local development does not need.
 | Program arguments | `--role=all` |
 | VM options | `--add-opens java.base/java.lang=ALL-UNNAMED` |
 | Working directory | an empty directory of your own, for example `~/tapstate-run` |
-| Environment variables | `TAPSTATE_STORE_MONGO_URI=mongodb://localhost:27117/tapstate?directConnection=true` |
+| Environment variables | `TAPSTATE_STORE_MONGO_URI=mongodb://localhost:27117/tapstate?directConnection=true;TAPSTATE_STORE_MONGO_OPERATOR_STATE_DATABASE=tapstate_nest` |
 
 ### The VM option is not optional, and leaving it out fails somewhere else entirely
 

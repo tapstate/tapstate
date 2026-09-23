@@ -124,6 +124,17 @@
   </dependencies>
 
   <build>
+    <testResources>
+      <testResource>
+        <directory>src/test/resources</directory>
+      </testResource>
+      <testResource>
+        <directory>${project.basedir}/../control/rest-api/src/test/resources</directory>
+        <includes>
+          <include>golden/observability/**</include>
+        </includes>
+      </testResource>
+    </testResources>
     <plugins>
       <!-- picocli's annotation processor emits the native-image reflection config for the command
            tree at compile time, so the native binary needs no hand-written reflect config. It runs

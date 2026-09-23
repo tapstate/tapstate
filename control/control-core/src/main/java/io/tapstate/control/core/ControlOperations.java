@@ -216,10 +216,11 @@ public final class ControlOperations {
             "pipeline.resume", Scope.WRITE, true,
             "Carry a paused Pipeline on from the position it was holding, reading nothing again.");
 
-    // pipeline observation reads: the four read faces. status/metrics/snapshot are store-backed over the
+    // pipeline observation reads: status/metrics/snapshot are store-backed over the
     // per-pipeline observation doc (status = lifecycle state, metrics = open stat map, snapshot = per-table
-    // load progress); logs tails the node-local process log output for the pipeline. Each reads and mutates
-    // nothing, so all four are read-scoped and unaudited.
+    // load progress); history projects bounded retained samples, explain applies the shared diagnostic
+    // checklist to one current observation, and logs tails the node-local process log output for the
+    // pipeline. Each reads and mutates nothing, so all are read-scoped and unaudited.
     public static final Operation PIPELINE_STATUS = mcp(
             "pipeline.status", Scope.READ, false,
             "Read a Pipeline's current lifecycle status.");
@@ -235,6 +236,15 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LOG_LEVEL = new Operation(
             "pipeline.log-level", Scope.WRITE, true, null,
             "Set the minimum severity retained for one Pipeline's future node-local log lines.", CLI_ONLY);
+    public static final Operation PIPELINE_METRICS_HISTORY = mcp(
+            "pipeline.metrics.history", Scope.READ, false,
+            "Read a bounded, reset-aware page of target-acknowledged output rates and selected table lag "
+                    + "over a retained time range. The result is eventually consistent; follow nextCursor "
+                    + "with every other argument unchanged.");
+    public static final Operation PIPELINE_EXPLAIN = mcp(
+            "pipeline.explain", Scope.READ, false,
+            "Read the shared evidence-backed explanation of one Pipeline's latest observation. A no-match "
+                    + "answer is not a health verdict and names what the observation cannot establish.");
 
     // Where a pipeline resumes from, read and written back. The read mutates nothing; the write moves
     // durable state that outlives every run on the chain -- shared with any other pipeline reading it --
@@ -312,6 +322,8 @@ public final class ControlOperations {
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
             PIPELINE_LOG_LEVEL,
+            PIPELINE_METRICS_HISTORY,
+            PIPELINE_EXPLAIN,
             PIPELINE_POSITION,
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,

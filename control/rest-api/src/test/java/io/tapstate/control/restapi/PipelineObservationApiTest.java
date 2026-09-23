@@ -5,12 +5,15 @@ import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.Frontend;
 import io.tapstate.control.core.GeneratedSecret;
+import io.tapstate.control.core.HistoryCursorCodec;
 import io.tapstate.control.core.Operation;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PipelineMetrics;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.PipelineChains;
+import io.tapstate.control.core.PipelineExplainService;
+import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineSnapshot;
@@ -32,12 +35,14 @@ import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -48,6 +53,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
+import io.tapstate.messages.ExplanationCatalog;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -62,11 +68,13 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -169,6 +177,12 @@ class PipelineObservationApiTest {
         observations.save(PL_POS);
         observations.save(PL_DEAD);
         observations.save(PL_FACTS);
+        FakeRateHistoryStore history = context.getBean(FakeRateHistoryStore.class);
+        history.clear();
+        history.append(new RateSample("pl1", NOW.minusSeconds(120),
+                Map.of("records.out", 100L, "bytes.out", 1_000L), Map.of("orders", 5L), COUNTING_SINCE));
+        history.append(new RateSample("pl1", NOW.minusSeconds(60),
+                Map.of("records.out", 700L, "bytes.out", 13_000L), Map.of("orders", 2L), COUNTING_SINCE));
         context.getBean(FakeChainStore.class).reset();
         context.getBean(FakeStoppedPipelines.class).reset();
     }
@@ -345,6 +359,137 @@ class PipelineObservationApiTest {
         assertThat(body.snapshot()).containsEntry("orders", new TableSnapshot(10, 100L, 10));
     }
 
+    @Test
+    void explainReturnsTheSharedTypedShapeWithoutCachingIt() {
+        ResponseEntity<Map<String, Object>> response = client().get().uri("/api/pipelines/pl1/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+        Map<String, Object> body = response.getBody();
+        assertThat(body).containsEntry("pipelineId", "pl1")
+                .containsEntry("state", "RUNNING")
+                .containsEntry("kind", "NO_MATCH")
+                .containsEntry("freshness", "UNKNOWN")
+                .containsKey("next")
+                .doesNotContainKeys("observedAt", "observedAgeMillis", "pending");
+        assertThat(body.get("next")).isNull();
+        List<Map<String, Object>> evidence = (List<Map<String, Object>>) body.get("evidence");
+        assertThat(evidence).anySatisfy(reading -> {
+            assertThat(reading).containsEntry("source", "status")
+                    .containsEntry("field", "observedAgeMillis")
+                    .containsKey("value");
+            assertThat(reading.get("value")).isNull();
+        });
+        assertThat((List<String>) body.get("cannotSay")).isNotEmpty();
+    }
+
+    @Test
+    void historyReturnsResetAwareTypedPointsWithoutCachingThem() {
+        ResponseEntity<Map<String, Object>> response = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/metrics/history")
+                        .queryParam("from", "2026-07-12T11:58:00Z")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .queryParam("resolution", "raw")
+                        .queryParam("table", "orders")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+        Map<String, Object> body = response.getBody();
+        assertThat(body).containsEntry("pipelineId", "pl1")
+                .containsEntry("effectiveResolution", "PT1M")
+                .containsEntry("status", "OK")
+                .containsEntry("consistency", "EVENTUAL")
+                .containsKey("nextCursor");
+        assertThat(body.get("nextCursor")).isNull();
+        List<Map<String, Object>> segments = (List<Map<String, Object>>) body.get("segments");
+        List<Map<String, Object>> points = (List<Map<String, Object>>) segments.getFirst().get("points");
+        assertThat(points).hasSize(2);
+        assertThat(points.getFirst()).doesNotContainKeys("recordsOut", "bytesOut");
+        assertThat((Map<String, Object>) points.getLast().get("recordsOut"))
+                .containsEntry("delta", 600).containsEntry("averageRate", 10);
+        assertThat((List<Map<String, Object>>) points.getLast().get("lag"))
+                .singleElement().satisfies(lag -> assertThat(lag)
+                        .containsEntry("table", "orders").containsEntry("last", 2));
+
+        String wire = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/metrics/history")
+                        .queryParam("from", "2026-07-12T11:58:00Z")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .queryParam("resolution", "raw")
+                        .queryParam("table", "orders")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(String.class);
+        assertThat(wire).contains("\"recordsOut\":{\"delta\":600,\"averageRate\":10,\"maxRate\":10}");
+    }
+
+    @Test
+    void aMalformedHistoryRangeIsACodedBadRequest() {
+        ApiError body = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/metrics/history")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.params()).containsEntry("reason", "from is required");
+    }
+
+    @Test
+    void historyDoesNotRequireALatestObservation() {
+        context.getBean(FakeObservationStore.class).clear();
+
+        Map<String, Object> body = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/metrics/history")
+                        .queryParam("from", "2026-07-12T11:58:00Z")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        assertThat(body).containsEntry("status", "OK");
+    }
+
+    @Test
+    void explainWithoutALatestObservationUsesTheSameCodedPendingWindow() {
+        context.getBean(FakeObservationStore.class).clear();
+
+        ApiError body = client().get().uri("/api/pipelines/pl1/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("monitor.no-observation");
+        assertThat(body.params()).containsEntry("pipeline", "pl1");
+    }
+
+    @Test
+    void historyOfAnUnknownPipelineIsNotAnEmptyWindow() {
+        ApiError body = client().get().uri(uri -> uri
+                        .path("/api/pipelines/ghost/metrics/history")
+                        .queryParam("from", "2026-07-12T11:58:00Z")
+                        .queryParam("to", "2026-07-12T12:00:00Z")
+                        .build())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+    }
+
     // ---- a read of a pipeline with no published observation is a 404 coded body, never a bare 500 ----
 
     @Test
@@ -384,6 +529,7 @@ class PipelineObservationApiTest {
         ApiError body = client().get().uri("/api/pipelines/pl1/status")
                 .exchange((request, response) -> {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
                     return response.bodyTo(ApiError.class);
                 });
 
@@ -415,6 +561,7 @@ class PipelineObservationApiTest {
         assertThat(projectedReadFaces)
                 .as("every pipeline face imported here projects onto the authenticated /api surface")
                 .containsExactlyInAnyOrder("pipeline.status", "pipeline.metrics", "pipeline.snapshot",
+                        "pipeline.metrics.history", "pipeline.explain",
                         "pipeline.position", "pipeline.set-position");
     }
 
@@ -427,7 +574,8 @@ class PipelineObservationApiTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class,
-            PipelineObservationController.class, PipelinePositionController.class,
+            PipelineObservationController.class, PipelineObservabilityController.class,
+            PipelinePositionController.class,
             ApiExceptionHandler.class})
     static class TestApp {
 
@@ -452,6 +600,25 @@ class PipelineObservationApiTest {
         @Bean
         PipelineObservationQueryService pipelineObservationQueryService(ObservationStore observations) {
             return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations);
+        }
+
+        @Bean
+        FakeRateHistoryStore rateHistoryStore() {
+            return new FakeRateHistoryStore();
+        }
+
+        @Bean
+        PipelineHistoryQueryService pipelineHistoryQueryService(
+                FakeRateHistoryStore history, Clock clock) {
+            return new PipelineHistoryQueryService(new ArtifactQueryService(appliedPipelines()), history,
+                    Duration.ofMinutes(1), clock, new HistoryCursorCodec("test-history-secret".getBytes(), clock));
+        }
+
+        @Bean
+        PipelineExplainService pipelineExplainService(ObservationStore observations, Clock clock) {
+            ExplanationCatalog messages = ExplanationCatalog.bundled();
+            return new PipelineExplainService(new ArtifactQueryService(appliedPipelines()), observations,
+                    clock, messages::render);
         }
 
         @Bean
@@ -524,6 +691,74 @@ class PipelineObservationApiTest {
         @Override
         public Optional<Observation> read(String pipelineId) {
             return Optional.ofNullable(byId.get(pipelineId));
+        }
+    }
+
+    static final class FakeRateHistoryStore implements RateHistoryStore {
+        private final List<Entry> entries = new ArrayList<>();
+        private int sequence;
+
+        void clear() {
+            entries.clear();
+            sequence = 0;
+        }
+
+        @Override
+        public void append(RateSample sample) {
+            sequence++;
+            entries.add(new Entry(new Key(sample.observedAt(), String.format("%08d", sequence)), sample));
+            entries.sort(FakeRateHistoryStore::compare);
+        }
+
+        @Override
+        public Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit) {
+            List<Entry> matches = entries.stream()
+                    .filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> !entry.sample().observedAt().isBefore(from)
+                            && entry.sample().observedAt().isBefore(to))
+                    .filter(entry -> after == null || compare(entry.key(), after) > 0)
+                    .toList();
+            boolean hasMore = matches.size() > limit;
+            return new Page(matches.subList(0, Math.min(limit, matches.size())), hasMore);
+        }
+
+        @Override
+        public Optional<Entry> read(String pipelineId, Key key) {
+            return entries.stream().filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> entry.key().equals(key)).findFirst();
+        }
+
+        @Override
+        public Optional<Entry> predecessor(String pipelineId, Instant at) {
+            return entries.stream().filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> entry.sample().observedAt().isBefore(at))
+                    .max(FakeRateHistoryStore::compare);
+        }
+
+        @Override
+        public Optional<Entry> successor(String pipelineId, Instant at) {
+            return entries.stream().filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> !entry.sample().observedAt().isBefore(at))
+                    .min(FakeRateHistoryStore::compare);
+        }
+
+        @Override
+        public void deleteAll(String pipelineId) {
+            entries.removeIf(entry -> entry.sample().pipelineId().equals(pipelineId));
+        }
+
+        @Override
+        public Duration retention() {
+            return Duration.ofDays(15);
+        }
+
+        private static int compare(Entry left, Entry right) {
+            return compare(left.key(), right.key());
+        }
+
+        private static int compare(Key left, Key right) {
+            int time = left.observedAt().compareTo(right.observedAt());
+            return time != 0 ? time : left.internalKey().compareTo(right.internalKey());
         }
     }
 

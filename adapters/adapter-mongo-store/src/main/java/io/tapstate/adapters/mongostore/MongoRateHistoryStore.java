@@ -9,6 +9,8 @@ import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.RateHistoryStore;
 import org.bson.Document;
+import org.bson.conversions.Bson;
+import org.bson.types.ObjectId;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -18,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The MongoDB history of movement samples: one document per sample, appended and never overwritten,
@@ -46,6 +49,7 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
     public static final String PIPELINE_ID = "pipelineId";
     /** The field a sample is dated by, and the one the expiring index is over. */
     public static final String OBSERVED_AT = "observedAt";
+    static final String INTERNAL_ID = "_id";
     static final String COUNTERS = "counters";
     static final String LAG = "lag";
     static final String COUNTING_SINCE = "countingSince";
@@ -66,7 +70,7 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
             IndexEnsure.ensure(database, collection, new SystemCollections.IndexSpec(
                     List.of(OBSERVED_AT), false, retention.toSeconds()));
             IndexEnsure.ensure(database, collection, new SystemCollections.IndexSpec(
-                    List.of(PIPELINE_ID, OBSERVED_AT), false));
+                    List.of(PIPELINE_ID, OBSERVED_AT, INTERNAL_ID), false));
         });
     }
 
@@ -77,18 +81,78 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
     }
 
     @Override
-    public List<RateSample> readBetween(String pipelineId, Instant from, Instant to) {
+    public Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(from, "from");
         Objects.requireNonNull(to, "to");
-        List<RateSample> out = new ArrayList<>();
-        StoreIo.run(() -> collection.find(Filters.and(
+        requireRange(from, to);
+        requireLimit(limit);
+        if (after != null && !after.observedAt().isBefore(to)) {
+            throw new IllegalArgumentException("a rate-history continuation key precedes the requested upper bound");
+        }
+
+        List<Bson> filters = new ArrayList<>();
+        filters.add(Filters.eq(PIPELINE_ID, pipelineId));
+        filters.add(Filters.gte(OBSERVED_AT, Date.from(from)));
+        filters.add(Filters.lt(OBSERVED_AT, Date.from(to)));
+        if (after != null) {
+            Date afterAt = Date.from(after.observedAt());
+            ObjectId afterId = internalId(after);
+            filters.add(Filters.or(
+                    Filters.gt(OBSERVED_AT, afterAt),
+                    Filters.and(Filters.eq(OBSERVED_AT, afterAt), Filters.gt(INTERNAL_ID, afterId))));
+        }
+
+        List<Entry> candidates = StoreIo.call(() -> {
+            List<Entry> found = new ArrayList<>();
+            collection.find(Filters.and(filters))
+                    .sort(Sorts.orderBy(Sorts.ascending(OBSERVED_AT), Sorts.ascending(INTERNAL_ID)))
+                    .limit(limit + 1)
+                    .forEach(document -> found.add(toEntry(document)));
+            return found;
+        });
+        boolean hasMore = candidates.size() > limit;
+        List<Entry> entries = hasMore ? candidates.subList(0, limit) : candidates;
+        return new Page(entries, hasMore);
+    }
+
+    @Override
+    public Optional<Entry> predecessor(String pipelineId, Instant at) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(at, "at");
+        Document found = StoreIo.call(() -> collection.find(Filters.and(
                         Filters.eq(PIPELINE_ID, pipelineId),
-                        Filters.gte(OBSERVED_AT, Date.from(from)),
-                        Filters.lte(OBSERVED_AT, Date.from(to))))
-                .sort(Sorts.ascending(OBSERVED_AT))
-                .forEach(document -> out.add(toSample(document))));
-        return out;
+                        Filters.lt(OBSERVED_AT, Date.from(at))))
+                .sort(Sorts.orderBy(Sorts.descending(OBSERVED_AT), Sorts.descending(INTERNAL_ID)))
+                .limit(1)
+                .first());
+        return Optional.ofNullable(found).map(MongoRateHistoryStore::toEntry);
+    }
+
+    @Override
+    public Optional<Entry> read(String pipelineId, Key key) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(key, "key");
+        Document found = StoreIo.call(() -> collection.find(Filters.and(
+                        Filters.eq(PIPELINE_ID, pipelineId),
+                        Filters.eq(OBSERVED_AT, Date.from(key.observedAt())),
+                        Filters.eq(INTERNAL_ID, internalId(key))))
+                .limit(1)
+                .first());
+        return Optional.ofNullable(found).map(MongoRateHistoryStore::toEntry);
+    }
+
+    @Override
+    public Optional<Entry> successor(String pipelineId, Instant at) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(at, "at");
+        Document found = StoreIo.call(() -> collection.find(Filters.and(
+                        Filters.eq(PIPELINE_ID, pipelineId),
+                        Filters.gte(OBSERVED_AT, Date.from(at))))
+                .sort(Sorts.orderBy(Sorts.ascending(OBSERVED_AT), Sorts.ascending(INTERNAL_ID)))
+                .limit(1)
+                .first());
+        return Optional.ofNullable(found).map(MongoRateHistoryStore::toEntry);
     }
 
     @Override
@@ -139,6 +203,36 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
                 longs(document.get(COUNTERS), pipelineId, COUNTERS),
                 longs(document.get(LAG), pipelineId, LAG),
                 rawSince == null ? null : ((Date) rawSince).toInstant());
+    }
+
+    private static Entry toEntry(Document document) {
+        Object rawId = document.get(INTERNAL_ID);
+        if (!(rawId instanceof ObjectId id)) {
+            Object pipelineId = document.get(PIPELINE_ID);
+            throw corrupt(String.valueOf(pipelineId), INTERNAL_ID);
+        }
+        RateSample sample = toSample(document);
+        return new Entry(new Key(sample.observedAt(), id.toHexString()), sample);
+    }
+
+    private static ObjectId internalId(Key key) {
+        try {
+            return new ObjectId(key.internalKey());
+        } catch (IllegalArgumentException malformed) {
+            throw new IllegalArgumentException("a Mongo rate-history key is not an ObjectId", malformed);
+        }
+    }
+
+    private static void requireRange(Instant from, Instant to) {
+        if (!from.isBefore(to)) {
+            throw new IllegalArgumentException("a rate-history range is half-open and non-empty");
+        }
+    }
+
+    private static void requireLimit(int limit) {
+        if (limit < 1 || limit > MAX_PAGE_SIZE) {
+            throw new IllegalArgumentException("a rate-history page limit is between 1 and " + MAX_PAGE_SIZE);
+        }
     }
 
     private static Map<String, Long> longs(Object raw, String pipelineId, String field) {

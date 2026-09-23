@@ -2,6 +2,7 @@ package io.tapstate.adapters.transform;
 
 import io.tapstate.core.common.TapstateException;
 
+import java.math.BigDecimal;
 import java.util.Map;
 
 /**
@@ -23,6 +24,12 @@ final class TransformErrors {
     /** A js script that would not compile; carries the script-engine diagnostic. */
     static TapstateException scriptCompileFailed(Throwable cause) {
         return new TapstateException(TransformError.SCRIPT_COMPILE_FAILED, Map.of("detail", detail(cause)), cause);
+    }
+
+    /** An exact decimal that JavaScript would see as zero or infinity rather than its finite value. */
+    static TapstateException scriptDecimalOutOfRange(BigDecimal value) {
+        return new TapstateException(TransformError.SCRIPT_DECIMAL_OUT_OF_RANGE,
+                Map.of("value", value.toString()), null);
     }
 
     /** A js script with no {@code process(record, ctx)} entry point. */

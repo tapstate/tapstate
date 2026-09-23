@@ -158,9 +158,24 @@ public final class ArtifactMutationService {
             }
 
             @Override
-            public java.util.List<io.tapstate.core.lifecycle.RateSample> readBetween(
-                    String pipelineId, java.time.Instant from, java.time.Instant to) {
-                return java.util.List.of();
+            public Page readPage(String pipelineId, java.time.Instant from, java.time.Instant to,
+                    Key after, int limit) {
+                return new Page(java.util.List.of(), false);
+            }
+
+            @Override
+            public java.util.Optional<Entry> predecessor(String pipelineId, java.time.Instant at) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public java.util.Optional<Entry> read(String pipelineId, Key key) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public java.util.Optional<Entry> successor(String pipelineId, java.time.Instant at) {
+                return java.util.Optional.empty();
             }
 
             @Override
@@ -233,6 +248,9 @@ public final class ArtifactMutationService {
         Resource target = store.get(id)
                 .orElseThrow(() -> error(ArtifactError.NOT_FOUND, Map.of("id", id)));
 
+        // A read-only inventory may omit a row this build cannot reconstruct. A destructive check may
+        // not: without the resource, its references are unknown rather than absent, so the strict list
+        // fails closed before any audit record or deletion is written.
         refuseWhenReferenced(id, store.list());
         if (target instanceof PipelineResource) {
             refuseWhenNotStopped(id);
