@@ -63,9 +63,8 @@ class SessionResumePtyIT {
             wait_for_password_prompt = os.environ.pop("TAPSTATE_PTY_WAIT_PASSWORD_PROMPT", "0") == "1"
             pid, fd = pty.fork()
             if pid == 0:
-                # Keep masked-prompt coverage independent of terminal capability probes; the PTY
-                # driver is not a full terminal emulator.
-                os.environ["TERM"] = "dumb" if wait_for_password_prompt else "linux"
+                # Exercise the supported basic terminal profile consistently in CI.
+                os.environ["TERM"] = "linux"
                 os.execvp(sys.argv[1], sys.argv[1:])
 
             output = bytearray()
