@@ -39,8 +39,15 @@ concurrency:
 # listens on, the send is refused instantly and the installer swallows it, which is what a user
 # offline already sees. Deliberately not TAPSTATE_TELEMETRY=off: that also skips the identifier file,
 # and the installer smoke run below asserts on both halves.
+#
+# The channel is the second, independent half, and it is set even though the line above means nothing
+# is sent. Pointing somewhere unreachable leaves no trace when it is forgotten -- which is how this
+# lane fed the denominator for weeks -- so the channel is what makes a dropped override, a new step,
+# or a container that did not inherit the environment arrive marked instead of joining the one figure
+# the funnel divides by. Both have to be forgotten for an install of ours to look like a person's.
 env:
   TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e
+  TAPSTATE_TELEMETRY_CHANNEL: internal
 
 jobs:
   install:

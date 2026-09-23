@@ -14,6 +14,10 @@ set -uo pipefail
 # nothing listens on: the send is refused instantly and the installer swallows it, exactly as it does
 # for a user who is offline. A case that wants to observe an event still sets its own URL.
 export TAPSTATE_TELEMETRY_URL="${TAPSTATE_TELEMETRY_URL:-http://127.0.0.1:1/e}"
+# Cleared rather than defaulted. One case below is about what an install reports when nothing set a
+# channel at all, and a value inherited from whatever started this suite would make that case an
+# assertion about the caller instead of about the installer.
+unset TAPSTATE_TELEMETRY_CHANNEL
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_SH="$HERE/install.sh"
@@ -643,6 +647,26 @@ PYEOF
   if [ -n "$other_id" ] && [ "$other_id" != "$first_id" ]; then ok "a second installation root gets its own id"
   else bad "second installation root reused the first id ('$other_id')"; fi
 
+  # the channel: which side of the denominator this install falls on. The default has to be the
+  # community one, because unset is the path every real machine takes.
+  d_ch="$(mktemp -d)/bin"
+  beacon_reset; ev_run "$d_ch" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if [ "$(beacon_field channel)" = community ]; then ok "install event defaults channel=community"
+  else bad "install event channel: expected community by default, got '$(beacon_field channel)'"; fi
+
+  d_ch2="$(mktemp -d)/bin"
+  beacon_reset; EV_ENV="TAPSTATE_TELEMETRY_CHANNEL=internal" ev_run "$d_ch2" "$OTHER_VERSION" "$ev_err" "$ev_out"; EV_ENV=""
+  if [ "$(beacon_field channel)" = internal ]; then ok "TAPSTATE_TELEMETRY_CHANNEL=internal marks the event as ours"
+  else bad "TAPSTATE_TELEMETRY_CHANNEL=internal produced channel='$(beacon_field channel)'"; fi
+
+  # A near miss is a community install, deliberately. Normalising it to "internal" would make a typo
+  # in one of our own lanes invisible -- and an invisible typo in exactly this variable is the failure
+  # the field exists to end. The lane is held to the exact word by a gate that reads the lane.
+  d_ch3="$(mktemp -d)/bin"
+  beacon_reset; EV_ENV="TAPSTATE_TELEMETRY_CHANNEL=interal" ev_run "$d_ch3" "$OTHER_VERSION" "$ev_err" "$ev_out"; EV_ENV=""
+  if [ "$(beacon_field channel)" = community ]; then ok "a misspelt channel is community, not quietly internal"
+  else bad "a misspelt channel produced channel='$(beacon_field channel)'"; fi
+
   # opt-out: nothing sent AND nothing written. Skipping only the request still leaves an identifier on
   # the user's disk, and no network assertion would ever notice.
   d3="$(mktemp -d)/bin"
@@ -674,6 +698,8 @@ PYEOF
     bad "disclosure not on stderr; a quickstart user would never see it"
   elif ! grep -qi 'TAPSTATE_TELEMETRY=off' "$ev_err"; then
     bad "disclosure on stderr does not say how to turn it off"
+  elif ! grep -qi 'channel' "$ev_err"; then
+    bad "the disclosure does not name the channel, which is a field the event carries"
   elif grep -qiE 'anonymous install event|TAPSTATE_TELEMETRY=off' "$ev_out"; then
     bad "part of the disclosure went to stdout, which the quickstart drops"
   else ok "the whole disclosure is on stderr, none of it on stdout"; fi
