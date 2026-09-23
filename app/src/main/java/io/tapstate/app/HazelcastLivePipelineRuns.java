@@ -6,6 +6,7 @@ import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricTags;
+import com.hazelcast.spi.exception.RetryableException;
 import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.LivePipelineProcessor;
 import io.tapstate.control.core.LivePipelineRun;
@@ -136,13 +137,38 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
                 }
                 live.add(runOf(job));
             }
-        } catch (HazelcastInstanceNotActiveException notActive) {
+        } catch (RuntimeException failed) {
+            if (!theClusterIsChanging(failed)) {
+                throw failed;
+            }
             // The same window the member half refuses in, and the same code: one cause does not become
             // two answers because the read has two halves. An empty list would be worse than either --
             // it reads as this member having looked and found the cluster running nothing.
-            throw new TapstateException(ClusterError.MEMBERSHIP_UNREADABLE, Map.of(), notActive);
+            throw new TapstateException(ClusterError.MEMBERSHIP_UNREADABLE, Map.of(), failed);
         }
         return List.copyOf(live);
+    }
+
+    /**
+     * Whether {@code failed} is the engine saying the cluster is changing under this read rather than that
+     * anything is wrong: its instance not active, or a failure it marks as worth retrying -- a call aimed at
+     * an address that is no longer a member, or at a member that left while it was being asked. A listing
+     * goes to the member coordinating the cluster, and while a partition heals that role is still moving:
+     * measured on a three-member cluster, the listing went to an address that had stopped being a member
+     * thirty milliseconds before the merged membership was installed, and came back as an uncoded page.
+     *
+     * <p>The causes are walked because the engine hands some of these on wrapped. Anything else is thrown
+     * as it came: a failure filed under a code that says the cluster is merely busy is one nobody goes
+     * looking for.
+     */
+    private static boolean theClusterIsChanging(Throwable failed) {
+        Throwable cause = failed;
+        for (int depth = 0; cause != null && depth < 16; depth++, cause = cause.getCause()) {
+            if (cause instanceof HazelcastInstanceNotActiveException || cause instanceof RetryableException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static LivePipelineRun runOf(Job job) {

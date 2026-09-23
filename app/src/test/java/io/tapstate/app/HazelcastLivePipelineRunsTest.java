@@ -1,8 +1,11 @@
 package io.tapstate.app;
 
+import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
+import com.hazelcast.core.MemberLeftException;
 import com.hazelcast.jet.JetService;
+import com.hazelcast.spi.exception.TargetNotMemberException;
 import io.tapstate.control.core.ClusterError;
 import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
@@ -88,6 +91,48 @@ class HazelcastLivePipelineRunsTest {
                 .describedAs("the refusal made on the listing's own thread reaches the caller as it was made")
                 .isInstanceOfSatisfying(TapstateException.class, refused ->
                         assertThat(refused.code()).isEqualTo(ClusterError.MEMBERSHIP_UNREADABLE));
+    }
+
+    /**
+     * A listing aimed at an address that stopped being a member is the cluster changing, not a fault.
+     *
+     * <p>Measured on a three-member cluster as a partition healed: the listing went to the member that had
+     * been coordinating, which was no longer one, and the read answered an uncoded page.
+     */
+    @Test
+    void aListingSentToAnAddressThatIsNoLongerAMemberIsRefusedWithTheSameCode() {
+        HazelcastLivePipelineRuns runs = new HazelcastLivePipelineRuns(memberListing(() -> {
+            throw new TargetNotMemberException("Not Member! target: [127.0.0.1]:33301, partitionId: -1");
+        }), BOUND);
+
+        assertThatThrownBy(runs::runs)
+                .describedAs("the engine marks this as worth asking again, and so does the answer")
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(ClusterError.MEMBERSHIP_UNREADABLE));
+    }
+
+    @Test
+    void aMemberThatLeftMidListingIsRefusedWithTheSameCodeEvenWhenHandedOnWrapped() {
+        HazelcastLivePipelineRuns runs = new HazelcastLivePipelineRuns(memberListing(() -> {
+            throw new HazelcastException("listing failed", new MemberLeftException("the member left"));
+        }), BOUND);
+
+        assertThatThrownBy(runs::runs)
+                .describedAs("a departure the engine wrapped is still a departure")
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(ClusterError.MEMBERSHIP_UNREADABLE));
+    }
+
+    @Test
+    void anyOtherFailureComesOutAsItWent() {
+        IllegalStateException defect = new IllegalStateException("a defect, not the cluster being busy");
+        HazelcastLivePipelineRuns runs = new HazelcastLivePipelineRuns(memberListing(() -> {
+            throw defect;
+        }), BOUND);
+
+        assertThatThrownBy(runs::runs)
+                .describedAs("a failure filed under a code that says the cluster is busy is one nobody looks for")
+                .isSameAs(defect);
     }
 
     /** A member whose engine answers a listing of its jobs by calling {@code listing}, and nothing else. */
