@@ -57,27 +57,21 @@ class SessionResumePtyIT {
             "  (cli " + Cli.VERSION_NUMBER + ", server " + Cli.VERSION_NUMBER + ")",
             "");
     private static final String PTY_DRIVER = """
-            import os, pty, select, signal, sys, termios, time
+            import os, pty, select, signal, sys, time
 
             data = os.environ.pop("TAPSTATE_PTY_INPUT").encode()
-            wait_no_echo = os.environ.pop("TAPSTATE_PTY_WAIT_NO_ECHO", "0") == "1"
+            wait_for_password_prompt = os.environ.pop("TAPSTATE_PTY_WAIT_PASSWORD_PROMPT", "0") == "1"
             pid, fd = pty.fork()
             if pid == 0:
                 # Keep masked-prompt coverage independent of terminal capability probes; the PTY
                 # driver is not a full terminal emulator.
-                os.environ["TERM"] = "dumb" if wait_no_echo else "linux"
+                os.environ["TERM"] = "dumb" if wait_for_password_prompt else "linux"
                 os.execvp(sys.argv[1], sys.argv[1:])
 
             output = bytearray()
             sent = False
             status = None
             deadline = time.time() + 30
-
-            def no_echo():
-                try:
-                    return not (termios.tcgetattr(fd)[3] & termios.ECHO)
-                except (OSError, termios.error):
-                    return False
 
             while time.time() < deadline:
                 readable, _, _ = select.select([fd], [], [], 0.25)
@@ -90,11 +84,11 @@ class SessionResumePtyIT {
                         break
                     output.extend(chunk)
                 # JLine may emit terminal-capability probes before it has installed the reader.
-                # ECHO can be disabled temporarily during those probes, so a password prompt is ready
-                # only after its text is visible and the terminal remains in no-echo mode.
+                # A password is sent only after its prompt is visible; the transcript assertion below
+                # verifies that masked input never exposes the secret.
                 ready = (
-                    b"Password: " in output and no_echo()
-                    if wait_no_echo
+                    b"Password: " in output
+                    if wait_for_password_prompt
                     else b"\\x1b[?2004h>" in output
                 )
                 if not sent and ready:
@@ -258,7 +252,7 @@ class SessionResumePtyIT {
     }
 
     private static ProcessResult runInPty(
-            Path home, Path workspace, boolean waitForNoEcho, String input, String... arguments)
+            Path home, Path workspace, boolean waitForPasswordPrompt, String input, String... arguments)
             throws Exception {
         List<String> cli = cliCommand(home, arguments);
         List<String> command = new ArrayList<>(List.of("python3", "-c", PTY_DRIVER));
@@ -266,7 +260,7 @@ class SessionResumePtyIT {
         Path transcriptFile = Files.createTempFile(home, "tapstate-pty-", ".log");
         ProcessBuilder builder = process(command, workspace).redirectErrorStream(true);
         builder.environment().put("TAPSTATE_PTY_INPUT", input);
-        builder.environment().put("TAPSTATE_PTY_WAIT_NO_ECHO", waitForNoEcho ? "1" : "0");
+        builder.environment().put("TAPSTATE_PTY_WAIT_PASSWORD_PROMPT", waitForPasswordPrompt ? "1" : "0");
         builder.redirectOutput(transcriptFile.toFile());
         Process process = null;
         try {
