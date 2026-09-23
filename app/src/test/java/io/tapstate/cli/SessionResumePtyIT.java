@@ -100,7 +100,7 @@ class SessionResumePtyIT {
             else:
                 os.kill(pid, signal.SIGKILL)
                 _, status = os.waitpid(pid, 0)
-                reason = b" waiting for terminal no-echo mode" if wait_no_echo and not sent else b""
+                reason = b" waiting for password prompt" if wait_for_password_prompt and not sent else b""
                 output.extend(b"\\nPTY timeout" + reason + b"\\n")
 
             try:
