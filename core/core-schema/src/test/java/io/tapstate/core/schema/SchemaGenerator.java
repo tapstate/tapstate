@@ -1,6 +1,7 @@
 package io.tapstate.core.schema;
 
 import io.tapstate.core.model.Doc;
+import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.YamlFlatten;
 import io.tapstate.core.model.YamlForm;
@@ -190,6 +191,9 @@ final class SchemaGenerator {
         if (!required.isEmpty()) {
             entries.add(new Json.Entry("required", new Json.Arr(required)));
         }
+        if (record == Embed.class) {
+            entries.add(new Json.Entry("allOf", new Json.Arr(List.of(flatEmbedShape()))));
+        }
         if (flattened != null) {
             // The discriminated union's variant fields merge into this object: allOf brings them
             // in, and unevaluatedProperties (not additionalProperties) closes the merged whole —
@@ -204,6 +208,30 @@ final class SchemaGenerator {
             entries.add(new Json.Entry("additionalProperties", new Json.Bool(false)));
         }
         return new Json.Obj(entries);
+    }
+
+    /**
+     * A flat embed merges into its parent and therefore has no target path or array identity. The other
+     * two shapes still require a path. This conditional belongs beside the generated record rather than
+     * in the checked-in artifact, so the schema remains reproducible from the model contract.
+     */
+    private static Json flatEmbedShape() {
+        Json flat = new Json.Obj(List.of(
+                new Json.Entry("properties", new Json.Obj(List.of(
+                        new Json.Entry("as", new Json.Obj(List.of(
+                                new Json.Entry("const", new Json.Str("flat")))))))),
+                new Json.Entry("required", new Json.Arr(List.of(new Json.Str("as"))))));
+        Json noPath = new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
+                new Json.Entry("required", new Json.Arr(List.of(new Json.Str("path")))))))));
+        Json noArrayKey = new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
+                new Json.Entry("required", new Json.Arr(List.of(new Json.Str("arrayKey")))))))));
+        Json thenShape = new Json.Obj(List.of(new Json.Entry("allOf", new Json.Arr(List.of(noPath, noArrayKey)))));
+        Json elseShape = new Json.Obj(List.of(new Json.Entry("required",
+                new Json.Arr(List.of(new Json.Str("path"))))));
+        return new Json.Obj(List.of(
+                new Json.Entry("if", flat),
+                new Json.Entry("then", thenShape),
+                new Json.Entry("else", elseShape)));
     }
 
     private static RecordComponent flattenedComponent(Class<?> record) {

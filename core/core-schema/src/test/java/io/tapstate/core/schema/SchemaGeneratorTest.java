@@ -227,6 +227,27 @@ class SchemaGeneratorTest {
     }
 
     @Test
+    void flatEmbedOmitsPathAndArrayKeyWhileOtherShapesStillRequirePath() {
+        Json.Obj defs = (Json.Obj) generator.generateTree().get("$defs");
+        Json.Obj embed = (Json.Obj) defs.get("Embed");
+
+        assertThat(((Json.Arr) embed.get("required")).items())
+                .containsExactlyInAnyOrder(new Json.Str("from"), new Json.Str("on"), new Json.Str("as"));
+        Json.Obj conditional = (Json.Obj) ((Json.Arr) embed.get("allOf")).items().getFirst();
+        Json.Obj when = (Json.Obj) conditional.get("if");
+        Json.Obj whenProperties = (Json.Obj) when.get("properties");
+        assertThat(((Json.Obj) whenProperties.get("as")).get("const")).isEqualTo(new Json.Str("flat"));
+        Json.Obj otherwise = (Json.Obj) conditional.get("else");
+        assertThat(((Json.Arr) otherwise.get("required")).items()).containsExactly(new Json.Str("path"));
+        Json.Arr flatRules = (Json.Arr) ((Json.Obj) conditional.get("then")).get("allOf");
+        assertThat(flatRules.items()).containsExactly(
+                new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
+                        new Json.Entry("required", new Json.Arr(List.of(new Json.Str("path"))))))))),
+                new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
+                        new Json.Entry("required", new Json.Arr(List.of(new Json.Str("arrayKey"))))))))));
+    }
+
+    @Test
     void everyGrammarElementIsDocumented() {
         assertThat(generator.undocumented())
                 .as("every grammar type, field and enum constant needs an @Doc — an undocumented "

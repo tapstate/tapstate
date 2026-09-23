@@ -146,7 +146,7 @@ final class TransformBodyPrompter {
         String from = prompter.ask("Embed child alias", null);
         Map<String, String> on = askOn();
         EmbedAs as = askEmbedAs();
-        String path = prompter.ask("Embed path (field under parent)", null);
+        String path = as == EmbedAs.FLAT ? null : prompter.ask("Embed path (field under parent)", null);
         List<String> arrayKey = as == EmbedAs.ARRAY
                 ? askKeyList("Array key (comma-separated, blank for none)")
                 : null;
@@ -168,7 +168,7 @@ final class TransformBodyPrompter {
 
     /** Array is the canonical default, listed last so an empty reply selects it. */
     private EmbedAs askEmbedAs() {
-        String chosen = prompter.choose("Embed as?", List.of("object", "array"));
+        String chosen = prompter.choose("Embed as?", List.of("object", "flat", "array"));
         for (EmbedAs a : EmbedAs.values()) {
             if (a.yaml().equals(chosen)) {
                 return a;

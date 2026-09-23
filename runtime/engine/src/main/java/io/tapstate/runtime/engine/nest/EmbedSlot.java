@@ -7,15 +7,21 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Where one embed sits in the assembled document and what shape it takes there: the field it occupies
- * under its parent, whether that field holds an array of elements or a single object, and the embeds
- * nested beneath it.
+ * Where one embed is held and what it contributes to the assembled document. {@code stateField} is the
+ * key used inside a parent's state; {@code path} is the output field for array and object shapes and is
+ * absent for flat. Keeping the two separate is what lets a pathless flat embed retain durable identity.
  *
  * <p>The shape is a property of the declared tree, not of the data, which is why it is handed to a
  * render rather than remembered per document: an array embed that has never received a row still
  * renders an empty array, and only the declaration says so.
  */
-public record EmbedSlot(String path, EmbedAs as, List<String> referenceFields, String lookupMap,
+public record EmbedSlot(
+        String stateField,
+        String path,
+        String diagnosticPath,
+        EmbedAs as,
+        List<String> referenceFields,
+        String lookupMap,
         List<EmbedSlot> children) implements Serializable {
 
     /**
@@ -24,12 +30,25 @@ public record EmbedSlot(String path, EmbedAs as, List<String> referenceFields, S
      * from.
      */
     public EmbedSlot(String path, EmbedAs as, List<EmbedSlot> children) {
-        this(path, as, null, null, children);
+        this(path, path, path, as, null, null, children);
+    }
+
+    /** A referenced object or array embed using its output path as its state identity. */
+    public EmbedSlot(String path, EmbedAs as, List<String> referenceFields, String lookupMap,
+            List<EmbedSlot> children) {
+        this(path, path, path, as, referenceFields, lookupMap, children);
     }
 
     public EmbedSlot {
-        Objects.requireNonNull(path, "path");
+        Objects.requireNonNull(stateField, "stateField");
+        Objects.requireNonNull(diagnosticPath, "diagnosticPath");
         Objects.requireNonNull(as, "as");
+        if (as == EmbedAs.FLAT && path != null) {
+            throw new IllegalArgumentException("a flat slot has no output path");
+        }
+        if (as != EmbedAs.FLAT && path == null) {
+            throw new IllegalArgumentException("an " + as.yaml() + " slot needs an output path");
+        }
         referenceFields = referenceFields == null ? null : List.copyOf(referenceFields);
         children = List.copyOf(children);
         if (referenceFields == null ^ lookupMap == null) {

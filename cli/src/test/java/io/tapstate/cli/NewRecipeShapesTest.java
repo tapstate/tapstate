@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The three recipes that shape what they mirror: {@code reshaped-table} (a map and a filter step),
@@ -296,6 +297,18 @@ class NewRecipeShapesTest {
         args.addAll(MYSQL_DB);
         args.addAll(List.of("--root", "orders", "--child", "shipments:order_id=id", "-w", ws.toString()));
         return run(home, new ScriptedPrompter(), with(args, extra));
+    }
+
+    @Test
+    void nestedJsonAcceptsAPathlessFlatChildAndRefusesAFlatPath() {
+        NestedJsonRecipe.Child flat = NestedJsonRecipe.parseChild("profiles:customer_id=id:flat", null);
+
+        assertThat(flat.as()).isEqualTo(io.tapstate.core.model.EmbedAs.FLAT);
+        assertThat(flat.path()).isNull();
+        assertThatThrownBy(() -> NestedJsonRecipe.parseChild("profiles:customer_id=id:flat:profile", null))
+                .isInstanceOf(RecipeRun.Usage.class)
+                .hasMessageContaining("flat")
+                .hasMessageContaining("no path");
     }
 
     @Test
