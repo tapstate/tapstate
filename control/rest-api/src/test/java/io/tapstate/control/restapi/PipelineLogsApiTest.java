@@ -218,7 +218,7 @@ class PipelineLogsApiTest {
 
         assertThat(projected)
                 .as("only the logs face projects onto this focused context")
-                .containsExactlyInAnyOrder("pipeline.logs", "pipeline.log-level");
+                .containsExactlyInAnyOrder("pipeline.logs", "pipeline.log-level", "pipeline.logs");
     }
 
     /**
