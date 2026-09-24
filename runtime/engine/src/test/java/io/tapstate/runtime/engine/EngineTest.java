@@ -270,6 +270,9 @@ class EngineTest {
                     });
             assertThat(engine.hasLiveJob("orders-pipe")).isFalse();
             assertThat(engine.recordCount("orders-pipe")).isEmpty();
+            assertThat(engine.isLost())
+                    .describedAs("lost already, while a job on the member may still be ending")
+                    .isTrue();
             refusedForWantOfMemory(() -> engine.refuseIfLost("orders-pipe"));
             assertThat(escaping.stillHandling())
                     .describedAs("every answer above was given while the shutdown was still held open")
@@ -310,6 +313,7 @@ class EngineTest {
 
         member.shutdown();
 
+        assertThat(engine.isLost()).isFalse();
         assertThatCode(() -> engine.refuseIfLost("orders-pipe")).doesNotThrowAnyException();
         assertThatThrownBy(() -> engine.failureOf("orders-pipe"))
                 .isInstanceOf(HazelcastInstanceNotActiveException.class);

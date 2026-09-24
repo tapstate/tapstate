@@ -143,6 +143,15 @@ public final class Engine {
         });
     }
 
+    /**
+     * Whether this engine's member has been shut down for want of memory, from the moment its out-of-memory
+     * handling starts taking it down. Nothing on the member can be reached from then on, and for as long as that
+     * shutdown lasts a job on it can still be ending where no lookup sees it any more.
+     */
+    public boolean isLost() {
+        return MemberOutOfMemory.of(member).isPresent();
+    }
+
     /** Pauses the pipeline's running job. The job is kept so it can be resumed. */
     public void suspend(String pipelineId) {
         requireJob(pipelineId).suspend();
