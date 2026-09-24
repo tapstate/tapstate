@@ -145,6 +145,14 @@ def inherit(env, node):
     return {}
 
 
+def fenced(env):
+    # The installer reads an empty or null endpoint as unset and sends to its production default, so
+    # an override that is blank, or that names production itself, stops nothing.
+    target = env.get(url)
+    return (isinstance(target, str) and target.strip() != '' and 'tapstate.dev' not in target
+            and env.get(channel) == value)
+
+
 def written(text):
     global count
     count += 1
@@ -163,13 +171,15 @@ for path in sys.argv[5:]:
     top = inherit({}, workflow)
     places = [(top, 'outside its jobs', {k: v for k, v in workflow.items() if k != 'jobs'})]
     for job_id, job in (workflow.get('jobs') or {}).items():
-        env = inherit(top, job)
+        # A job that calls a reusable workflow hands its inputs to a run whose env is the called
+        # workflow's alone; the caller's env reaches none of it.
+        env = {} if 'uses' in job else inherit(top, job)
         places.append((env, f'job {job_id}, outside its steps', {k: v for k, v in job.items() if k != 'steps'}))
         for number, step in enumerate(job.get('steps') or [], 1):
             name = ' '.join(str(step.get('name') or '').split())
             places.append((inherit(env, step), f'job {job_id}, step {number}' + (f' ({name})' if name else ''), step))
     unfenced = [(where, '\n'.join(strings(node)) + '\n#\n') for env, where, node in places
-                if not (url in env and env.get(channel) == value)]
+                if not fenced(env)]
     if unfenced:
         together = written(''.join(text for _, text in unfenced))
         for where, text in unfenced:
@@ -312,6 +322,29 @@ detector_alive() {
     printf '%s\n' '        env:'
     printf '%s\n' '          TAPSTATE_TELEMETRY_CHANNEL: community'
   } > "$d/overridden.yml"
+  # The endpoint named with no value. The installer reads a blank override as unset and sends to
+  # production, so the name alone is no override.
+  {
+    printf '%s\n' 'env:'
+    printf '%s\n' '  TAPSTATE_TELEMETRY_URL:'
+    printf '%s\n' '  TAPSTATE_TELEMETRY_CHANNEL: internal'
+    printf '%s\n' 'jobs:'
+    printf '%s\n' '  install:'
+    printf '%s\n' '    steps:'
+    printf '%s\n' '      - run: curl -sSL https://install.tapstate.dev/cli | sh'
+  } > "$d/blank-url.yml"
+  # Fenced for the whole workflow, and the install handed as an input to a reusable workflow. The
+  # called workflow runs with its own env only; the caller's reaches none of it.
+  {
+    printf '%s\n' 'env:'
+    printf '%s\n' '  TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e'
+    printf '%s\n' '  TAPSTATE_TELEMETRY_CHANNEL: internal'
+    printf '%s\n' 'jobs:'
+    printf '%s\n' '  install:'
+    printf '%s\n' '    uses: ./.github/workflows/run.yml'
+    printf '%s\n' '    with:'
+    printf '%s\n' "      how: 'curl -sSL https://install.tapstate.dev/cli | sh'"
+  } > "$d/reusable.yml"
   # A step whose value ends in a backslash, then a step that installs. They are separate commands; a
   # continuation joined across them glues the install onto `echo x`, where the pattern cannot see it.
   {
@@ -346,7 +379,7 @@ detector_alive() {
 
   report="$(unfenced_installs "$d/unfenced.yml" "$d/fenced.yml" "$d/suffix-fence.yml" "$d/channel-only.yml" \
     "$d/commented-fence.yml" "$d/wrong-job.yml" "$d/job-fence.yml" "$d/step-fence.yml" "$d/overridden.yml" \
-    "$d/dangling.yml" "$d/matrix.yml")" \
+    "$d/blank-url.yml" "$d/reusable.yml" "$d/dangling.yml" "$d/matrix.yml")" \
     || die_detector "the scan could not read its own controls as workflows; it needs python3 with PyYAML."
   names "$report" "$d/unfenced.yml"        || die_detector "the scan called an unfenced control fenced."
   names "$report" "$d/fenced.yml"          && die_detector "the scan did not accept a control carrying both variables."
@@ -357,6 +390,8 @@ detector_alive() {
   names "$report" "$d/job-fence.yml"       && die_detector "the scan did not accept a fence on the job that installs."
   names "$report" "$d/step-fence.yml"      && die_detector "the scan did not accept a fence on the install step itself."
   names "$report" "$d/overridden.yml"      || die_detector "the scan accepted a fence the install step overrides."
+  names "$report" "$d/blank-url.yml"       || die_detector "the scan accepted an endpoint override with no value."
+  names "$report" "$d/reusable.yml"        || die_detector "the scan let a caller's env fence a reusable workflow it calls."
   names "$report" "$d/dangling.yml"        || die_detector "the scan joined one step's trailing continuation onto the next step's install."
   names "$report" "$d/matrix.yml"          || die_detector "the scan lost an install carried by a matrix value rather than a run: line."
   rm -rf "$d"

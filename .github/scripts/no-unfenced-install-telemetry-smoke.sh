@@ -73,5 +73,26 @@ jobs:
 EOF
 expect "a fence on a job that installs nothing does not cover the job that does" 1 ".github/workflows/two-jobs.yml"
 
+# --- the same workflow with the fence moved onto the job that installs: clean, and exit 0. Without
+# --- this, a gate that refused every repository would pass the case above.
+fresh_repo
+workflow .github/workflows/two-jobs.yml <<'EOF'
+name: two-jobs
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "nothing is installed in this job"
+  install:
+    runs-on: ubuntu-latest
+    env:
+      TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e
+      TAPSTATE_TELEMETRY_CHANNEL: internal
+    steps:
+      - run: curl -sSL https://install.tapstate.dev/cli | sh
+EOF
+expect "a fence on the job that installs is accepted" 0 "clean:"
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
