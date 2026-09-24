@@ -40,6 +40,20 @@ else
     fail "a clean checkout at the explicit revision is staged with provenance"
 fi
 
+ln -s assets/app.js "$web/apps/web/dist/bundle.js"
+git -C "$web" add apps/web/dist/bundle.js
+git -C "$web" commit -qm 'add symlink to fixture bundle'
+sha="$(git -C "$web" rev-parse HEAD)"
+if output="$("$script" --web-root "$web" --web-revision "$sha" \
+   --tapstate-revision 0123456789abcdef0123456789abcdef01234567 \
+   --release-version 0.5.0 --output "$work/symlink" 2>&1)"; then
+    fail "a bundle containing symlinks is refused"
+elif grep -Fq 'production bundle contains symlinks' <<<"$output"; then
+    pass "a bundle containing symlinks is refused before staging"
+else
+    fail "a bundle containing symlinks is refused for the expected reason"
+fi
+
 if "$script" --web-root "$web" --web-revision short \
    --tapstate-revision 0123456789abcdef0123456789abcdef01234567 \
    --release-version 0.5.0 --output "$work/short-revision" >/dev/null 2>&1; then

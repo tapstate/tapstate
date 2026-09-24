@@ -71,6 +71,8 @@ git -C "$web_root" diff --cached --quiet || die "web checkout has staged changes
 
 [ -f "$web_root/package.json" ] || die "web checkout has no package.json"
 [ -f "$web_root/pnpm-lock.yaml" ] || die "web checkout has no pnpm-lock.yaml"
+[ -z "$(find "$web_root/apps/web/dist" -type l -print -quit)" ] \
+    || die "production bundle contains symlinks"
 [ -f "$web_root/apps/web/dist/index.html" ] || die "production bundle has no apps/web/dist/index.html"
 [ -n "$(find "$web_root/apps/web/dist" -type f -print -quit)" ] \
     || die "production bundle contains no files"

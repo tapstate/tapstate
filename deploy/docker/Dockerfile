@@ -35,19 +35,10 @@ RUN set -eu; \
 
 FROM eclipse-temurin:21-jre
 
-ARG TAPSTATE_RELEASE_VERSION=development
-ARG TAPSTATE_REVISION=unknown
-ARG TAPSTATE_WEB_REVISION=unknown
-ARG TAPSTATE_WEB_FILES_SHA256=unknown
-
 # Image self-description (OCI). The source label connects this package to its repository, so the
 # registry renders the repository README on the package page; the description states the preview
 # posture up front so the image is not mistaken for a production default.
 LABEL org.opencontainers.image.title="Tapstate server" \
-      org.opencontainers.image.version="$TAPSTATE_RELEASE_VERSION" \
-      org.opencontainers.image.revision="$TAPSTATE_REVISION" \
-      io.tapstate.web.revision="$TAPSTATE_WEB_REVISION" \
-      io.tapstate.web.files.sha256="$TAPSTATE_WEB_FILES_SHA256" \
       org.opencontainers.image.description="Preview runtime: single-node, in-memory; a restart replays from the source rather than resuming a persisted offset. Not for production." \
       org.opencontainers.image.source="https://github.com/tapstate/tapstate" \
       org.opencontainers.image.url="https://tapstate.com" \
@@ -74,6 +65,16 @@ RUN mkdir -p /var/lib/tapstate/plugins /var/lib/tapstate/logs /var/lib/tapstate/
 
 # Already resolved to exactly one file by the stage above, so this names it outright.
 COPY --from=boot-jar --chown=tapstate:tapstate /jars/tapstate.jar /opt/tapstate/tapstate.jar
+
+# Keep per-build metadata out of the earlier installation layers so source changes can reuse them.
+ARG TAPSTATE_RELEASE_VERSION=development
+ARG TAPSTATE_REVISION=unknown
+ARG TAPSTATE_WEB_REVISION=unknown
+ARG TAPSTATE_WEB_FILES_SHA256=unknown
+LABEL org.opencontainers.image.version="$TAPSTATE_RELEASE_VERSION" \
+      org.opencontainers.image.revision="$TAPSTATE_REVISION" \
+      io.tapstate.web.revision="$TAPSTATE_WEB_REVISION" \
+      io.tapstate.web.files.sha256="$TAPSTATE_WEB_FILES_SHA256"
 
 USER tapstate
 

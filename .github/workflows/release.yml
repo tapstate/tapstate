@@ -246,6 +246,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
       # Before anything is built. The version enters the tree once, here, and the build downstream of
       # it cannot disagree with the release it is part of.
       - name: write the release version into every file that pins one
@@ -345,6 +346,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
       - name: write the release version into every file that pins one
         run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
       # The satellite branch was created during the freeze before this build begins. Checking out its
@@ -357,6 +359,7 @@ jobs:
           ref: ws/release-${{ needs.version.outputs.version }}
           token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
           path: tapstate-web
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
