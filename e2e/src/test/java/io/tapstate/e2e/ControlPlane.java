@@ -1557,6 +1557,29 @@ final class ControlPlane {
     }
 
     /**
+     * Where in its source's change buffer the last change this pipeline's target confirmed sat, as the
+     * position face reports it for the pipeline's first chain -- empty until a change has been confirmed.
+     *
+     * <p>What a case needs before it kills a member and counts what the replacing run writes: a target
+     * showing a row says the row was written, not that the write was confirmed back, and a run is owed
+     * again whatever was written but not yet confirmed. Waiting for this to stop moving is waiting for the
+     * two to agree.
+     */
+    Optional<Long> ackedChangeSeq(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
+        expect(response, 200, "read the acknowledged position of " + pipelineId);
+        if (JsonReader.parse(response.body()) instanceof Map<?, ?> document
+                && document.get("chains") instanceof List<?> chains && !chains.isEmpty()
+                && chains.getFirst() instanceof Map<?, ?> chain
+                && chain.get("targetAcked") instanceof Map<?, ?> acked
+                && acked.get("seq") instanceof Number seq
+                && seq.longValue() >= 0) {
+            return Optional.of(seq.longValue());
+        }
+        return Optional.empty();
+    }
+
+    /**
      * Puts a chain back at a token, and answers what the product says the pipeline now stands at.
      *
      * <p>Only the two settable parts are sent. A body carrying anything the face reports as a reading is

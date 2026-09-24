@@ -748,6 +748,78 @@ class CaptureRunUnitTest {
         assertThat(held.cdcSubscription()).as("the holder's tail is the one tail").isPresent();
     }
 
+    /**
+     * Where a pipeline arriving on a chain starts reading the ring is marked as it arrives, before its own
+     * load reads anything: just past what the ring already holds. Everything under the mark is history from
+     * before the pipeline existed, or a change its own load covers; left unmarked, the pipeline's run reads
+     * the ring from its head and hands its target every change the ring has ever kept.
+     */
+    @Test
+    void aPipelineArrivingOnARingThatAlreadyHoldsChangesStartsPastThem() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = MiningChainId.resolve(config(), "chain-arrival").value();
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-arrival"), e -> { }, true);
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
+        ring.append(buffered(1));
+        long heldAtArrival = ring.append(buffered(2));
+
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-arrival"), e -> { }, false);
+
+        assertThat(meta.ringDoneThrough(chain, "pipe-b"))
+                .as("the pipeline starts just past the two changes the ring held when it arrived")
+                .containsExactly(Map.entry("orders", heldAtArrival));
+    }
+
+    @Test
+    void aPipelineComingBackKeepsThePlaceItHadInTheRingRatherThanTheOneTheRingHasReached() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = MiningChainId.resolve(config(), "chain-return").value();
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-return"), e -> { }, true);
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
+        long hadReached = ring.append(buffered(1));
+        meta.startRingAfter(chain, "pipe-b", "orders", hadReached);
+        ring.append(buffered(2));
+        ring.append(buffered(3));
+
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-return"), e -> { }, false);
+
+        assertThat(meta.ringDoneThrough(chain, "pipe-b"))
+                .as("the two changes written while it was away are still owed to it")
+                .containsExactly(Map.entry("orders", hadReached));
+    }
+
+    @Test
+    void aCdcOnlyReadFromThePresentIsMarkedAndOneFromTheEarliestChangeIsLeftToItsStart() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = MiningChainId.resolve(config(), "chain-cdc-start").value();
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-cdc-start"), e -> { }, true);
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
+        long held = ring.append(buffered(1));
+
+        new CaptureRunUnit(new FakeSource(List.of(), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-cdc-start", true, "src-1",
+                        "pipe-present", StartFrom.latest(), null, 0L), e -> { }, false);
+        new CaptureRunUnit(new FakeSource(List.of(), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-cdc-start", true, "src-1",
+                        "pipe-earliest", StartFrom.earliest(), null, 0L), e -> { }, false);
+
+        assertThat(meta.ringDoneThrough(chain, "pipe-present"))
+                .as("a read from the present owes nothing the ring held before it arrived")
+                .containsExactly(Map.entry("orders", held));
+        assertThat(meta.ringDoneThrough(chain, "pipe-earliest"))
+                .as("a read from the earliest change is owed everything the ring holds, so nothing is marked")
+                .isEmpty();
+    }
+
+    private static SrsItem buffered(int id) {
+        return new SrsItem(new SourcePosition("b" + id), Op.INSERT, 1L, null, Map.of("id", id), 0L);
+    }
+
     @Test
     void routesAMultiTableSharedRingRunToOneSubscriptionAndTwoRings() throws Exception {
         InMemoryMeta meta = new InMemoryMeta();
@@ -1032,6 +1104,20 @@ class CaptureRunUnitTest {
      * wiring without a store backend.
      */
     private static final class InMemoryMeta implements SrsMetaStore {
+        /** Per chain and pipeline, how far each table's ring is done with -- kept once, never raised here. */
+        final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
+
+        @Override
+        public void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
+            ringDone.computeIfAbsent(miningChainId + "/" + pipelineId, key -> new LinkedHashMap<>())
+                    .putIfAbsent(table, seq);
+        }
+
+        @Override
+        public Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
+            return Map.copyOf(ringDone.getOrDefault(miningChainId + "/" + pipelineId, Map.of()));
+        }
+
         @Override
         public java.util.List<String> miningChainIdsWithConsumer(String pipelineId) {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");

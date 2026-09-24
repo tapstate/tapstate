@@ -1285,8 +1285,9 @@ final class StoreBackedDagSource implements DagSource {
                 : 0L;
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
+        StartFrom freshStart = freshRingStart(pipeline);
         return new DagBindings(
-                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch),
+                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
                         sinkWriter(pipeline, element, targets, serveStreams), fence),
@@ -2198,7 +2199,7 @@ final class StoreBackedDagSource implements DagSource {
      * writer fills.
      */
     private ProcessorMetaSupplier sourceVertex(
-            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch) {
+            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -2212,9 +2213,17 @@ final class StoreBackedDagSource implements DagSource {
                     vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), snapshotEpoch,
                     order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
         }
+        // Where in the ring this run starts. Not the head as such: a ring outlives the runs that read it, so
+        // after one run dies the head can sit far below what this pipeline already landed, and starting there
+        // hands its target every change the ring still holds again. The record says how far the pipeline is
+        // done in this table's ring -- confirmed by its sink, or marked when it arrived -- and the run carries
+        // on just past that. With nothing recorded, the pipeline's own start decides.
+        Long doneThrough = storePort.meta()
+                .ringDoneThrough(vertex.resolution().chainId().value(), vertex.pipelineId())
+                .get(vertex.table());
         return SrsSourceProcessor.metaSupplier(
-                vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
-                ringGeneration(vertex.resolution()),
+                vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), freshStart,
+                doneThrough, ringGeneration(vertex.resolution()),
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
@@ -2230,6 +2239,20 @@ final class StoreBackedDagSource implements DagSource {
      */
     private long ringGeneration(SourceCaptureResolution resolution) {
         return storePort.meta().read(resolution.chainId().value()).map(SrsMeta::epoch).orElse(0L);
+    }
+
+    /**
+     * Where a run with nothing recorded in a ring starts reading it: a cdc-only read where its own start says
+     * -- the present unless it names an earlier point, which is also what its capture is told -- and any read
+     * that loads first at the head, beneath which its own load is ordered.
+     */
+    private static StartFrom freshRingStart(PipelineResource pipeline) {
+        if (readModeOf(pipeline) != ReadMode.CDC_ONLY) {
+            return StartFrom.earliest();
+        }
+        String raw = pipeline.settings() != null && pipeline.settings().startFrom() != null
+                ? pipeline.settings().startFrom() : "latest";
+        return StartFrom.parse(raw);
     }
 
     private static ReadMode readModeOf(PipelineResource pipeline) {

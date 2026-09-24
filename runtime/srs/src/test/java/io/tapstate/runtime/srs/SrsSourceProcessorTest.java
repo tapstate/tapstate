@@ -135,6 +135,30 @@ class SrsSourceProcessorTest {
     }
 
     @Test
+    void aRunCarryingOnPastAConfirmedChangeStreamsOnlyWhatCameAfterIt() throws InterruptedException {
+        fill("srs.chain.resume", 4);
+
+        // The ring outlived the run that confirmed changes 0 and 1. The run replacing it carries on past them;
+        // one started at the head would stream all four and hand the target the first two again.
+        DAG dag = new DAG();
+        Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
+                PIPELINE, "srs.chain.resume", "orders", StartFrom.earliest(), 1L, 1L,
+                SrsReadCursorPublisherFactory.NONE, null, SourcePlacement.anyMember()));
+        Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
+                .localParallelism(1);
+        Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP("out-resume")).localParallelism(1);
+        dag.edge(between(source, project)).edge(between(project, sink));
+        Job job = hz.getJet().newJob(dag);
+        IList<String> out = hz.getList("out-resume");
+        try {
+            awaitSize(out, 2);
+            assertThat(out).containsExactly("orders|w2|2|1:2", "orders|w3|3|1:3");
+        } finally {
+            job.cancel();
+        }
+    }
+
+    @Test
     void publishes_the_read_cursor_member_side_as_it_drains() throws InterruptedException {
         PUBLISHED.clear();
         fill("srs.chain.cursor", 5);

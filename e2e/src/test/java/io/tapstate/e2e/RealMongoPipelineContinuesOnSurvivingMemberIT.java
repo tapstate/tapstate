@@ -8,6 +8,7 @@ import io.tapstate.testsupport.DockerGate;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -33,12 +34,23 @@ import org.junit.jupiter.api.Test;
  *
  * <p>Nothing is asked of the product between the kill and the assertions, for the reason the harness
  * connector's version of this case gives: recovering when told to is a different promise.
+ *
+ * <p><b>And the run that replaces the dead one carries on from where the target got to.</b> The source's
+ * change buffer outlives the run that read it, so after the kill it still holds every change made before
+ * it -- all of them already written and confirmed. A replacement reading that buffer from its start writes
+ * them all again; one carrying on from what its target confirmed writes the change made after the kill and
+ * nothing else. The count is taken once the target has confirmed everything written before the kill, so
+ * nothing the dead run left unconfirmed is owed again and the only honest answer is one.
  */
 class RealMongoPipelineContinuesOnSurvivingMemberIT {
 
     private static final String CONNECTOR = "mongodb";
     private static final String TABLE = "orders";
     private static final long SEEDED_ROWS = 5;
+    private static final int CHANGES_BEFORE_THE_KILL = 3;
+
+    /** How long a published reading has to hold still to be read: metrics and positions lag the work. */
+    private static final Duration SETTLED = Duration.ofSeconds(8);
 
     private static final String SOURCE_ID = "real_failover_src";
     private static final String TARGET_ID = "real_failover_tgt";
@@ -80,10 +92,12 @@ class RealMongoPipelineContinuesOnSurvivingMemberIT {
                 Await.until("the seeded documents to cross on two members",
                         () -> mongo.count(target, TABLE) >= SEEDED_ROWS,
                         () -> reading(mongo, target, control));
-                mongo.cdc(source, TABLE, CdcOp.INSERT, 1);
-                Await.until("a change made while both members are up to cross",
-                        () -> mongo.count(target, TABLE) >= SEEDED_ROWS + 1,
+                mongo.cdc(source, TABLE, CdcOp.INSERT, CHANGES_BEFORE_THE_KILL);
+                Await.until("the changes made while both members are up to cross",
+                        () -> mongo.count(target, TABLE) >= SEEDED_ROWS + CHANGES_BEFORE_THE_KILL,
                         () -> reading(mongo, target, control));
+                awaitSettled("the target to confirm every change it was written", Duration.ofMinutes(1),
+                        () -> control.ackedChangeSeq(PIPELINE).orElse(-1L));
 
                 String driver = Await.answered("the cluster to name the member driving the pipeline",
                         () -> control.pipelineControllerOf(PIPELINE));
@@ -116,8 +130,31 @@ class RealMongoPipelineContinuesOnSurvivingMemberIT {
                 assertThat(survivor.executionGenerationOf(PIPELINE))
                         .describedAs("what replaced the dead run is exactly one new execution")
                         .contains(generationBefore + 1);
+                long writtenByTheReplacement = awaitSettled("the replacing run's count of confirmed rows to settle",
+                        Duration.ofMinutes(1), () -> survivor.recordsOut(PIPELINE).orElse(-1L));
+                assertThat(writtenByTheReplacement)
+                        .describedAs("the run that replaced the dead one wrote the change made after the kill and "
+                                + "none of the %d before it: they were confirmed, and the buffer that still held "
+                                + "them is not where a replacement starts", CHANGES_BEFORE_THE_KILL)
+                        .isEqualTo(1L);
             }
         }
+    }
+
+    /** Waits until {@code reading} holds still for {@link #SETTLED} at zero or above, and answers it. */
+    private static long awaitSettled(String what, Duration bound, LongSupplier reading) {
+        long[] last = {Long.MIN_VALUE};
+        long[] since = {System.nanoTime()};
+        Await.until(what, bound, () -> {
+            long now = reading.getAsLong();
+            if (now != last[0]) {
+                last[0] = now;
+                since[0] = System.nanoTime();
+                return false;
+            }
+            return now >= 0 && System.nanoTime() - since[0] >= SETTLED.toNanos();
+        }, () -> "last reading " + last[0]);
+        return last[0];
     }
 
     private static String reading(MongoEndpoints mongo, EndpointAddress target, ControlPlane control) {

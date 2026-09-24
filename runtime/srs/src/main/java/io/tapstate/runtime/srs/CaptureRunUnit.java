@@ -148,6 +148,17 @@ public final class CaptureRunUnit {
                 chainCreated = !merged;
             }
 
+            // Where this pipeline starts in each ring, marked now: after it is on the chain, and before its
+            // own load reads a row or any tail this run opens mines a change -- so everything it is owed lands
+            // above the mark. Only where changes come to it through the ring, and only for a read that starts
+            // from the ring as it stands: a load does, since its rows cover what came before, and so does a
+            // cdc-only read from the present. A cdc-only read from the earliest change or from an instant is
+            // placed by that start instead, when its reader opens. A pipeline coming back keeps the place it
+            // had -- see SrsMetaStore#startRingAfter.
+            if (plan.sharedRing() && (plan.snapshot() || spec.startFrom() instanceof StartFrom.Latest)) {
+                markWhereThisPipelineArrives(chainId.value(), spec.pipelineId(), tables);
+            }
+
             // Opened before the load, not with the tail: the load's rows are this run's too, and an
             // account opened after them would report a run that had read nothing until its first change.
             CaptureHealth health = new CaptureHealth();
@@ -494,6 +505,19 @@ public final class CaptureRunUnit {
      * sink-ack. It closes over only the chain, pipeline and table coordinates — never the store — so it
      * stays serializable; a member with no store bound resolves to a no-op sink.
      */
+    /**
+     * Marks, for each of the pipeline's tables, where it starts in that table's ring: just past what the ring
+     * already holds. Read from the ring itself, which numbers on across rebuilds, so the mark names the same
+     * place for every member that reads it. A refusal while the cluster is still forming surfaces as an
+     * uncoded failure of this start, which the next pass tries again.
+     */
+    private void markWhereThisPipelineArrives(String chainId, String pipelineId, List<String> tables) {
+        for (String table : tables) {
+            SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, table)));
+            meta.startRingAfter(chainId, pipelineId, table, ring.tailSequence());
+        }
+    }
+
     public static SrsReadCursorPublisherFactory readCursorPublisher(
             String miningChainId, String pipelineId, String table) {
         return member -> {

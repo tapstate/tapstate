@@ -198,7 +198,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             return true;
         }
         try {
-            reader = SrsRingReader.from(ring, ringTail.start(), cursor);
+            reader = ringTail.resumeAfter() != null
+                    ? SrsRingReader.resumingAfter(ring, ringTail.resumeAfter(), cursor)
+                    : SrsRingReader.from(ring, ringTail.start(), cursor);
             refused = false;
             return true;
         } catch (RingWriteRefusedException refusal) {
@@ -349,6 +351,18 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
             StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp,
             SourcePlacement placement) {
+        return metaSupplier(pipelineId, ringName, src, start, null, epoch, publisherFactory, stamp, placement);
+    }
+
+    /**
+     * The same source vertex, carrying on just past {@code resumeAfter} when it is given: the ring sequence
+     * of the last change this pipeline's sink confirmed from this ring. A run that replaces one that died
+     * starts there rather than at {@code start}, because the ring outlived the run and still holds what the
+     * run had already landed; with nothing confirmed, {@code start} decides as it always has.
+     */
+    public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
+            StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
+            SourceBoundStamp stamp, SourcePlacement placement) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
@@ -359,7 +373,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a ring generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(
-                pipelineId, ringName, src, epoch, stamp, new RingTail(start, publisherFactory));
+                pipelineId, ringName, src, epoch, stamp, new RingTail(start, resumeAfter, publisherFactory));
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
@@ -386,6 +400,6 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     }
 
     /** Present only on the source shape that follows a shared ring and publishes its read cursor. */
-    private record RingTail(StartFrom start, SrsReadCursorPublisherFactory publisherFactory) {
+    private record RingTail(StartFrom start, Long resumeAfter, SrsReadCursorPublisherFactory publisherFactory) {
     }
 }
