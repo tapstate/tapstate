@@ -1,0 +1,36 @@
+# A join's SQL names a column the discovered orders table does not have. Validation cannot see this -
+# it knows the SQL but not the columns, which only discovery supplies - so the first place it can be
+# caught is the start.
+#
+# The start used to throw the SQL front end's own column-resolution error, which carries no code. The
+# converger records only a coded refusal as a failed pipeline, so it retried the start on every pass:
+# the pipeline stayed NEW with a climbing error count, indefinitely, and the reason lived in the server
+# log alone.
+#
+# What the assertions have to discriminate:
+#
+# - FAILED says the start was refused once and recorded, rather than retried for ever. The old
+#   behaviour never leaves NEW, so it cannot satisfy this wait.
+# - failure_code says the join's SQL is what was diagnosed, and names it as the author's to fix.
+# - The view stays empty: nothing ran.
+name: a-join-naming-a-column-its-table-lacks-fails-with-a-code
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+  shop_db.orders:
+    values:
+      - { id: 10, customer_id: 1 }
+steps:
+  - start
+  - await: { state: FAILED }
+  - assert: { failure_code: actuation.join-sql-invalid }
+  - assert: { count: { views.order_state: 0 } }

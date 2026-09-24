@@ -1,0 +1,17 @@
+version: tapstate/v1
+kind: pipeline
+id: missing_join_column
+source: shop_db
+settings: { read_mode: snapshot_only }
+transforms:
+  - id: widen
+    type: join
+    from: { o: orders, c: customers }
+    engine: builtin
+    sql: |
+      SELECT o.id AS order_id, o.no_such_column AS missing, c.name AS customer_name
+      FROM o LEFT JOIN c ON o.customer_id = c.id
+view:
+  id: order_state
+  from: widen
+  primary_key: order_id
