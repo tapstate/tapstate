@@ -163,6 +163,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override
+    public Optional<Throwable> lost(String pipelineId) {
+        // The engine alone: a member shut down for want of memory took every job it held with it. The capture is
+        // not asked. It keeps running behind a paused pipeline, and whether it has died is failure()'s to say.
+        return engine.lost(pipelineId).map(Throwable.class::cast);
+    }
+
+    @Override
     public boolean isCarryingAJob(String pipelineId) {
         // The job side alone. A capture that died while the job runs is a failure, reported above; what
         // is asked here is whether anything is running this pipeline at all, and a process that has just

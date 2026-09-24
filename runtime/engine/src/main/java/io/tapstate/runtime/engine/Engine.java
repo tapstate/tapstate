@@ -778,7 +778,7 @@ public final class Engine {
     }
 
     /** Why this engine can no longer run {@code pipelineId}, as the coded failure; empty while its member runs. */
-    private Optional<TapstateException> lost(String pipelineId) {
+    public Optional<TapstateException> lost(String pipelineId) {
         return MemberOutOfMemory.of(member).map(error ->
                 new TapstateException(EngineError.OUT_OF_MEMORY, Map.of("pipeline", pipelineId), error));
     }

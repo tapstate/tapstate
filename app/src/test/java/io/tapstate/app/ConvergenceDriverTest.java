@@ -377,6 +377,11 @@ class ConvergenceDriverTest {
             return Optional.ofNullable(failure);
         }
 
+        @Override
+        public Optional<Throwable> lost(String pipelineId) {
+            return Optional.empty();
+        }
+
         /** Always carrying: these cases are about what the driver does with a converge result. */
         @Override
         public boolean isCarryingAJob(String pipelineId) {
