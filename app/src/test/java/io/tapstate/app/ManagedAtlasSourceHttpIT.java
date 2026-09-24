@@ -28,6 +28,7 @@ import org.testcontainers.utility.DockerImageName;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -128,6 +129,25 @@ class ManagedAtlasSourceHttpIT {
                                 .retrieve().body(SchemaReport.class);
                         assertThat(saved).isNotNull();
                         assertThat(saved.tables()).extracting(SchemaReport.Table::name).contains("probe");
+
+                        if (standard) {
+                            Map<String, Object> badSettings = new LinkedHashMap<>(savedSource.config());
+                            badSettings.put("password", "invalid-plan-test-password");
+                            ConnectionTestReport denied = client.post().uri("/api/connections:test")
+                                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .body(Map.of("id", id, "connectorId", "mongodb-atlas",
+                                            "settings", badSettings))
+                                    .retrieve().body(ConnectionTestReport.class);
+                            assertThat(denied).isNotNull();
+                            assertThat(denied.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
+                            assertThat(denied.checks()).anyMatch(check ->
+                                    check.status() == ConnectionTestReport.Check.Status.FAILED
+                                            && check.message() != null && !check.message().isBlank());
+                            assertThat(String.valueOf(denied).contains("invalid-plan-test-password")).isFalse();
+                            assertThat(String.valueOf(denied).contains(settings.get("password").toString()))
+                                    .isFalse();
+                        }
 
                         ResponseEntity<Void> replaced = client.put().uri("/api/sources/" + id)
                                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
