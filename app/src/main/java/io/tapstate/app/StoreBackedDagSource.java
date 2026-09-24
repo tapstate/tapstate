@@ -2063,16 +2063,36 @@ final class StoreBackedDagSource implements DagSource {
         }
         int end = message.indexOf('\n');
         String line = (end < 0 ? message : message.substring(0, end)).trim();
-        String stripped;
-        while (!(stripped = EXCEPTION_CLASS_PREFIX.matcher(line).replaceFirst("")).equals(line)) {
-            line = stripped;
+        while (true) {
+            int colon = line.indexOf(": ");
+            if (colon <= 0 || !isQualifiedThrowableName(line.substring(0, colon))) {
+                return line;
+            }
+            line = line.substring(colon + 2).trim();
         }
-        return line;
     }
 
-    /** A leading {@code some.package.SomeException: } that a wrapping exception put before a message. */
-    private static final Pattern EXCEPTION_CLASS_PREFIX =
-            Pattern.compile("^(?:[A-Za-z_$][\\w$]*\\.)+[A-Za-z_$][\\w$]*(?:Exception|Error):\\s*");
+    /**
+     * Whether {@code name} reads as a fully qualified exception or error class, such as
+     * {@code org.apache.calcite.runtime.CalciteContextException}: dotted, every segment a Java
+     * identifier, the last one ending in {@code Exception} or {@code Error}.
+     */
+    private static boolean isQualifiedThrowableName(String name) {
+        if (name.indexOf('.') < 0 || !(name.endsWith("Exception") || name.endsWith("Error"))) {
+            return false;
+        }
+        for (String segment : name.split("\\.", -1)) {
+            if (segment.isEmpty() || !Character.isJavaIdentifierStart(segment.charAt(0))) {
+                return false;
+            }
+            for (int i = 1; i < segment.length(); i++) {
+                if (!Character.isJavaIdentifierPart(segment.charAt(i))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
 
     /** The columns of one table, in the shared type vocabulary the plan is derived against. */
     private List<io.tapstate.core.sql.SourceColumn> columnsOf(String table,
