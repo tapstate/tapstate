@@ -65,6 +65,24 @@ enum ActuationError implements TapstateErrorCode {
     JOIN_SOURCE_NOT_DECLARED("actuation.join-source-not-declared", Set.of("step", "name")),
 
     /**
+     * A join's {@code from:} map names another step of the pipeline rather than a source table;
+     * {@code step} is the join, {@code alias} the alias and {@code ref} the step it names. Validation
+     * refuses this shape, so only a pipeline stored before it did reaches here. A step's output has no
+     * discovered columns and no key, so the SQL resolves none of its columns and the start could only
+     * fail the same way on every attempt.
+     */
+    JOIN_INPUT_NOT_A_TABLE("actuation.join-input-not-a-table", Set.of("step", "alias", "ref")),
+
+    /**
+     * A join's SQL cannot be compiled against the discovered columns of the tables it reads; {@code step}
+     * is the join and {@code detail} the front end's diagnosis, which names what it could not resolve or
+     * run. Validation only parses the SQL, because the columns are known only once the sources are
+     * discovered, so a statement naming a column no source has - or one a source has since dropped - is
+     * first caught at start, and fails the same way at every start until one of the two changes.
+     */
+    JOIN_SQL_INVALID("actuation.join-sql-invalid", Set.of("step", "detail")),
+
+    /**
      * A join's SELECT does not publish the driving table's key, so nothing identifies a result row;
      * {@code step} is the join step, {@code table} the driving table and {@code column} the key column
      * missing from the projection. A target keyed on anything less collapses rows the SQL says are
