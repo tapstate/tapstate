@@ -264,6 +264,18 @@
   </dependencies>
 
   <build>
+    <!-- Release packaging stages the pinned Web bundle here before Maven processes resources. Keeping it
+         under target prevents a generated browser asset from becoming a source-tree artifact. A normal
+         developer build without this directory remains a server-only build; the release entry point
+         refuses to package when staging did not happen. -->
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+      </resource>
+      <resource>
+        <directory>${project.build.directory}/generated-resources/tapstate-web</directory>
+      </resource>
+    </resources>
     <plugins>
       <!-- Stamp Add-Opens into the jar manifest so the shipped boot jar opens java.base/java.lang to
            unnamed modules under a bare `java -jar` (the spring-boot repackage below preserves the jar
