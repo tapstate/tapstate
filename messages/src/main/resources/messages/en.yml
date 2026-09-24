@@ -23,6 +23,12 @@ actuation.join-source-key-missing:
 actuation.join-source-not-declared:
   message: "Join `{step}` names source `{name}`, which is not one of the aliases the step declares."
   solution: "Write the alias the step's `from:` map declares for that table, or declare an alias under the name the SQL uses. Only a declared alias is wired to an upstream, so a table name that is not also an alias has nothing feeding it."
+actuation.join-input-not-a-table:
+  message: "Join `{step}` reads step `{ref}` through alias `{alias}`, but a join can only read source tables."
+  solution: "Point `{alias}` at the source table the step reads, and do the step's work after the join instead. A join resolves its SQL against the discovered columns of each input and keys its rows on the driving table's primary key; a step's output has neither."
+actuation.join-sql-invalid:
+  message: "The SQL of join `{step}` cannot be compiled against the tables it reads: {detail}."
+  solution: "Correct the SQL, or the table it names, then start the pipeline again. Columns are checked against each table's discovered schema, so run schema discovery again if a table changed. The pipeline stays failed until one of the two is corrected."
 actuation.join-output-key-not-published:
   message: "Join `{step}` does not publish column `{column}` of its driving table `{table}`, so nothing identifies a row of its result."
   solution: "Add `{column}` to the SELECT as a plain column, for example `SELECT t.{column} AS {column}, ...`. It has to be the column itself and not an expression over it: a computed value need not be unique where the column is, so rows the query says are distinct would be written over one another."
@@ -312,6 +318,12 @@ dsl.join-sql-not-parsable:
 dsl.join-sql-unsupported:
   message: "The join SQL at {path} uses {shape} at line {line}, column {column}, which this release does not run."
   solution: "A join is one SELECT over tables combined with equality conditions, publishing one row per match; it cannot filter, sort, cut, de-duplicate, aggregate or nest queries. Rewrite the SQL within that subset, or do the rest in a later step."
+dsl.join-input-not-a-table:
+  message: "Join `{step}` at {path} reads step `{ref}` through alias `{alias}`, but a join can only read source tables."
+  solution: "Point `{alias}` at the source table the step reads, and do the step's work after the join instead. A join resolves its SQL against the discovered columns of each input and keys its rows on the driving table's primary key; a step's output has neither."
+dsl.join-input-is-a-pattern:
+  message: "Join `{step}` at {path} binds alias `{alias}` to the pattern `/{pattern}/`, but a join input must name one source table."
+  solution: "Write the table's name instead of a pattern, for example `{alias}: orders`. A join reads one table per alias: its SQL names that table's columns and its rows are keyed on that table's primary key. A pattern names a set that can change, so it is refused even where it matches a single table today."
 dsl.malformed-yaml:
   message: "Malformed YAML: {detail}."
   solution: "Fix the YAML syntax; the line and column point at the problem."
