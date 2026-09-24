@@ -75,6 +75,27 @@ STUB
   printf '%s' "$shim"
 }
 
+# Pretend this host needs the pinned x86_64 protoc but cannot execute it. The
+# Atlas-only reactor has no protobuf module, so it should not probe curl at all.
+make_arm_no_protoc_shim() {
+  local shim
+  shim="$(make_shim)"
+  cat > "$shim/uname" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  -s) echo Darwin ;;
+  -m) echo arm64 ;;
+esac
+STUB
+  cat > "$shim/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SMOKE_CURL_SEEN"
+exit 1
+STUB
+  chmod +x "$shim/uname" "$shim/curl"
+  printf '%s' "$shim"
+}
+
 # A checkout with the three default modules plus one extra, so a case can ask for something outside
 # the default list and be seen to get it.
 fresh_checkout() {
@@ -212,6 +233,46 @@ fresh_checkout
 expect "a named list is built instead of the default" 0 "Connector jars staged" \
   --modules "redis=connectors/redis-connector" --checkout "$scratch/checkout" "$scratch/dest"
 expect_modules "only what was named" "connectors/redis-connector"
+
+# A build-wide protoc preflight used to demand Rosetta even for Atlas, whose
+# selected Maven reactor contains no protobuf compiler module. Keep the default
+# witness lane as the control: it still includes PostgreSQL and must probe.
+fresh_checkout
+mkdir -p "$scratch/checkout/connectors/mongodb-atlas-connector"
+shim="$(make_arm_no_protoc_shim)"
+: > "$scratch/curl-seen"
+out="$(env PATH="$shim:$PATH" SMOKE_MODULES_SEEN="$scratch/modules-seen" \
+    SMOKE_JAVA_HOME_SEEN="$scratch/java-home-seen" SMOKE_CURL_SEEN="$scratch/curl-seen" \
+    bash "$builder" --modules "mongodb-atlas=connectors/mongodb-atlas-connector" \
+    --checkout "$scratch/checkout" "$scratch/dest" 2>&1)"; code=$?
+if [ "$code" = 0 ] && [ ! -s "$scratch/curl-seen" ] \
+    && [ -f "$scratch/dest/mongodb-atlas-connector-v1.0.0.jar" ]; then
+  printf '  ok    %s\n' "Atlas-only build needs no protoc or Rosetta"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s: exit %s, curl calls %s\n' \
+      "Atlas-only build needs no protoc or Rosetta" "$code" "$(wc -l < "$scratch/curl-seen" | tr -d ' ')"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  failed=$((failed + 1))
+fi
+
+fresh_checkout
+shim="$(make_arm_no_protoc_shim)"
+: > "$scratch/curl-seen"
+out="$(env PATH="$shim:$PATH" SMOKE_MODULES_SEEN="$scratch/modules-seen" \
+    SMOKE_JAVA_HOME_SEEN="$scratch/java-home-seen" SMOKE_CURL_SEEN="$scratch/curl-seen" \
+    bash "$builder" --checkout "$scratch/checkout" --checkout "$scratch/enterprise" \
+    "$scratch/dest" 2>&1)"; code=$?
+if [ "$code" != 0 ] && [ -s "$scratch/curl-seen" ] \
+    && printf '%s' "$out" | grep -q 'protoc .* publishes no arm64 build'; then
+  printf '  ok    %s\n' "default PostgreSQL witness still probes protoc"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s: exit %s, curl calls %s\n' \
+      "default PostgreSQL witness still probes protoc" "$code" "$(wc -l < "$scratch/curl-seen" | tr -d ' ')"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  failed=$((failed + 1))
+fi
 
 fresh_checkout
 expect "an existing checkout is not cloned over" 0 "Building from the existing checkout" \

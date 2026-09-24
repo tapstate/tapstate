@@ -208,7 +208,16 @@ done
 # reached when there really is no native build - a version that has one is left to the plugin, so this
 # stops applying by itself once the connectors move past 3.17.
 protoc_flags=()
-if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+# The Atlas-only reactor is connectors-common, connector-core, sql-core,
+# read-partition, connectors, mongodb and mongodb-atlas. None compiles a proto;
+# demanding Rosetta here prevents an otherwise successful native build. Keep the
+# fallback for the default witness set, which includes PostgreSQL's proto.
+atlas_only=false
+if [ "${#CONNECTOR_MODULES[@]}" -eq 1 ] \
+    && [ "${CONNECTOR_MODULES[0]}" = "connectors/mongodb-atlas-connector" ]; then
+    atlas_only=true
+fi
+if [ "$atlas_only" = false ] && [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
     bom="$checkout/connectors-common/debezium-bucket/debezium-bom/pom.xml"
     protoc_version="$(sed -n 's|.*<version\.com\.google\.protobuf>\(.*\)</version\.com\.google\.protobuf>.*|\1|p' \
         "$bom" | head -1)"
