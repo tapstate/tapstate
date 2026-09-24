@@ -15,7 +15,8 @@ Every cluster member needs:
 - one stable, unique `tapstate.cluster.node-id`;
 - an absolute, routable `tapstate.control.advertise-url`;
 - one shared `tapstate.control.auth.jwt-secret`;
-- an explicit member discovery mode and a routable `tapstate.hz.bind-address`;
+- an explicit member discovery mode and a `tapstate.hz.bind-address` that is a routable IP address
+  of the member's host (a host name is refused at startup);
 - at least 4 GiB of JVM heap; and
 - a MongoDB replica set available to the members as the majority coordination store.
 

@@ -97,7 +97,7 @@ boot.coordination-store-required:
   message: "Cluster discovery requires the Mongo-backed coordination store."
   solution: "Enable the Mongo store and configure it as a replica set before starting a cluster member."
 boot.control-advertise-url-invalid:
-  message: "Cluster discovery requires an absolute HTTP(S) control advertise URL."
+  message: "Cluster discovery requires an absolute HTTP(S) control advertise URL naming a host other machines can reach."
   solution: "Set tapstate.control.advertise-url to the URL other members and clients can reach."
 boot.discovery-config-invalid:
   message: "The cluster discovery configuration is invalid: {detail}."
@@ -110,7 +110,7 @@ boot.heartbeat-config-invalid:
   solution: "Use whole-second positive durations and set maximum-no-heartbeat longer than heartbeat-interval."
 boot.member-bind-address-invalid:
   message: "The Hazelcast member bind address is not valid for the selected discovery mode."
-  solution: "Keep loopback with discovery mode none, or choose an explicit routable interface for cluster mode."
+  solution: "Keep 127.0.0.1 with discovery mode none, or set a routable IP address of this host for cluster mode; a host name is not accepted."
 boot.node-id-required:
   message: "Cluster discovery requires an explicit stable node id."
   solution: "Set tapstate.cluster.node-id to a value that remains stable across restarts and is unique in the cluster."

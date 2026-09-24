@@ -10,11 +10,21 @@ import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.util.Map;
+import java.util.Optional;
+import java.util.regex.Pattern;
 
 /** Validates the stable identity a network-discoverable member must prove before it is created. */
 final class ClusterMemberPreflight {
+
+    /** The address a single node's member binds: the one loopback address a member can start on. */
+    private static final String SINGLE_NODE_BIND_ADDRESS = "127.0.0.1";
+
+    private static final Pattern IPV4_LITERAL = Pattern.compile(
+            "((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)");
 
     private ClusterMemberPreflight() {
     }
@@ -23,8 +33,12 @@ final class ClusterMemberPreflight {
             HazelcastProperties hazelcast, ClusterProperties cluster, ControlEndpointProperties control) {
         validateHeartbeat(hazelcast);
         String bindAddress = hazelcast.getBindAddress();
+        // The member matches its bind address against the addresses this host's interfaces carry, so it has
+        // to be one of them as written. A host name, or a loopback address the loopback interface does not
+        // carry, passed a looser check here and then failed the member's start with an error that does not
+        // name this setting.
         if (hazelcast.getDiscovery().getMode() == HazelcastProperties.DiscoveryMode.NONE) {
-            if (!loopback(bindAddress)) {
+            if (!SINGLE_NODE_BIND_ADDRESS.equals(bindAddress)) {
                 throw new TapstateException(BootError.MEMBER_BIND_ADDRESS_INVALID, Map.of(), null);
             }
             if (cluster.getProfile() != ClusterProperties.Profile.SINGLE) {
@@ -32,7 +46,8 @@ final class ClusterMemberPreflight {
             }
             return null;
         }
-        if (loopback(bindAddress) || unspecified(bindAddress)) {
+        Optional<InetAddress> bound = literal(bindAddress);
+        if (bound.isEmpty() || bound.get().isLoopbackAddress() || bound.get().isAnyLocalAddress()) {
             throw new TapstateException(BootError.MEMBER_BIND_ADDRESS_INVALID, Map.of(), null);
         }
         if (cluster.getProfile() == null
@@ -59,7 +74,7 @@ final class ClusterMemberPreflight {
         }
         if (!controlUrl.isAbsolute()
                 || controlUrl.getHost() == null
-                || loopback(controlUrl.getHost())
+                || !reachableFromElsewhere(controlUrl.getHost())
                 || !("http".equalsIgnoreCase(controlUrl.getScheme())
                         || "https".equalsIgnoreCase(controlUrl.getScheme()))) {
             throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), null);
@@ -134,15 +149,48 @@ final class ClusterMemberPreflight {
         return value.trim();
     }
 
-    private static boolean loopback(String host) {
-        return host == null
-                || "localhost".equalsIgnoreCase(host)
-                || "::1".equals(host)
-                || host.startsWith("127.");
+    /**
+     * Whether a URL's {@code host} names a machine another one can reach: neither loopback, by name or by
+     * address, nor an unspecified address, which names no machine at all. A URL keeps an IPv6 literal in
+     * its brackets, so those come off before the address is read. Any other host name is taken at its
+     * word: finding out what it resolves to would ask DNS, from a check that has to answer the same
+     * wherever it runs.
+     */
+    private static boolean reachableFromElsewhere(String host) {
+        if ("localhost".equalsIgnoreCase(host)) {
+            return false;
+        }
+        return literal(host)
+                .map(address -> !address.isLoopbackAddress() && !address.isAnyLocalAddress())
+                .orElse(true);
     }
 
-    private static boolean unspecified(String host) {
-        return "0.0.0.0".equals(host) || "::".equals(host);
+    /**
+     * {@code host} read as the IP address it is written as, or empty when it is not written as one --
+     * without ever looking a name up, which {@link InetAddress#getByName} does for anything it cannot read
+     * as a literal. So only what is plainly a literal reaches it: four decimal octets, or anything with a
+     * colon, which is handed over in brackets so that a malformed one is refused rather than resolved.
+     */
+    private static Optional<InetAddress> literal(String host) {
+        if (host == null) {
+            return Optional.empty();
+        }
+        String bare = host.length() > 2 && host.startsWith("[") && host.endsWith("]")
+                ? host.substring(1, host.length() - 1)
+                : host;
+        String written;
+        if (IPV4_LITERAL.matcher(bare).matches()) {
+            written = bare;
+        } else if (bare.indexOf(':') >= 0) {
+            written = "[" + bare + "]";
+        } else {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(InetAddress.getByName(written));
+        } catch (UnknownHostException notAnAddress) {
+            return Optional.empty();
+        }
     }
 
     record Identity(String clusterId, String nodeId, URI controlUrl, WorkloadClaim nodeSession) {

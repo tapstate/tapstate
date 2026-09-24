@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -65,6 +66,64 @@ class ClusterMemberPreflightTest {
 
         assertThat(invalid).isInstanceOfSatisfying(TapstateException.class,
                 coded -> assertThat(coded.code()).isEqualTo(BootError.CONTROL_ADVERTISE_URL_INVALID));
+    }
+
+    /**
+     * The advertised control URL is what every other member and every client is handed to reach this one,
+     * so it has to name an address another machine can reach. A URL hands an IPv6 literal over in brackets,
+     * which a loopback check on the bare form never matched, and the unspecified addresses name no machine
+     * at all: all of them passed and were published to every peer.
+     */
+    @Test
+    void anAdvertisedControlUrlMustNameAnAddressAnotherMachineCanReach() {
+        assertThat(List.of(
+                "http://[::1]:8080",
+                "http://[0:0:0:0:0:0:0:1]:8080",
+                "http://0.0.0.0:8080",
+                "http://[::]:8080",
+                "http://localhost:8080"))
+                .allSatisfy(url -> assertThat(catchThrowable(() -> ClusterMemberPreflight.validate(
+                        clusteredHazelcast(), cluster("cluster-a", "node-a"), control(url))))
+                        .as(url)
+                        .isInstanceOfSatisfying(TapstateException.class, coded ->
+                                assertThat(coded.code()).isEqualTo(BootError.CONTROL_ADVERTISE_URL_INVALID)));
+        assertThat(ClusterMemberPreflight.validate(
+                clusteredHazelcast(), cluster("cluster-a", "node-a"), control("http://[2001:db8::11]:8080")))
+                .as("a routable IPv6 literal is advertisable")
+                .isNotNull();
+    }
+
+    /**
+     * A single node binds its member to loopback, and the one loopback address a member can start on is
+     * {@code 127.0.0.1}: the member matches its bind address against the addresses this host's interfaces
+     * carry, which a host name or another loopback address does not match. Every other spelling passed this
+     * check and then failed at member start, with an error that does not name the setting.
+     */
+    @Test
+    void aSingleNodeBindsTheOneLoopbackAddressItsMemberCanStartOn() {
+        assertThat(List.of("localhost", "::1", "127.0.0.2"))
+                .allSatisfy(bind -> assertThat(catchThrowable(() -> ClusterMemberPreflight.validate(
+                        singleNodeHazelcast(bind), new ClusterProperties(), control(null))))
+                        .as(bind)
+                        .isInstanceOfSatisfying(TapstateException.class, coded ->
+                                assertThat(coded.code()).isEqualTo(BootError.MEMBER_BIND_ADDRESS_INVALID)));
+        assertThat(ClusterMemberPreflight.validate(
+                singleNodeHazelcast("127.0.0.1"), new ClusterProperties(), control(null)))
+                .as("a single node proves no identity")
+                .isNull();
+    }
+
+    /** A clustered member binds an address of this host rather than a name for one, for the same reason. */
+    @Test
+    void aClusteredMemberBindsAnAddressRatherThanAName() {
+        HazelcastProperties hazelcast = clusteredHazelcast();
+        hazelcast.setBindAddress("node-a.internal");
+
+        Throwable invalid = catchThrowable(() -> ClusterMemberPreflight.validate(
+                hazelcast, cluster("cluster-a", "node-a"), control("https://node-a.internal:8080")));
+
+        assertThat(invalid).isInstanceOfSatisfying(TapstateException.class,
+                coded -> assertThat(coded.code()).isEqualTo(BootError.MEMBER_BIND_ADDRESS_INVALID));
     }
 
     @Test
@@ -127,6 +186,12 @@ class ClusterMemberPreflightTest {
         properties.getDiscovery().setMode(HazelcastProperties.DiscoveryMode.TCP_IP);
         properties.getDiscovery().getTcpIp().setSeeds(java.util.List.of("10.20.0.11:5701"));
         properties.setBindAddress("10.20.0.11");
+        return properties;
+    }
+
+    private static HazelcastProperties singleNodeHazelcast(String bindAddress) {
+        HazelcastProperties properties = new HazelcastProperties();
+        properties.setBindAddress(bindAddress);
         return properties;
     }
 
