@@ -456,6 +456,11 @@ public final class JoinDriver {
                 continue;
             }
             int pages = stores.indexPageCount(bucket.getKey().source(), bucket.getKey().dimensionKey());
+            // With the walk before it this asks about every page of the bucket: the widest read
+            // confirming a row makes, and one a restart makes whether or not a dimension row under the
+            // bucket ever changes. So the length just read is reported, as a rebuild's walk reports it,
+            // or a bucket read whole only here never shows in the widest bucket.
+            gauge.bucketWalked(bucket.getKey().source(), bucket.getKey().dimensionKey(), pages);
             // One set for every page of the bucket, so that a question can carry it once.
             Set<String> left = Set.copyOf(search.left);
             for (int page = 0; page < pages; page++) {

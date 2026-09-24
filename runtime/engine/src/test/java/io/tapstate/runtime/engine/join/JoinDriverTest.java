@@ -904,6 +904,40 @@ class JoinDriverTest {
         assertThat(reported).as("five keys in pages of two, then one key").containsExactly(3, 1);
     }
 
+    /**
+     * A row no page names - the one a member died part way through - is not taken to be missing until
+     * every page of its bucket has been asked about: the widest read confirming a row makes, and one a
+     * restart makes whether or not any dimension row under that bucket ever changes. It reads how long
+     * the bucket is on the way, so it reports that as a rebuild's walk does; otherwise a bucket read
+     * whole on a restart is one the widest bucket never shows. Held both for a row read ahead with its
+     * batch and for a row arriving on its own, which is looked up by itself.
+     */
+    @Test
+    @DisplayName("a bucket asked about whole for a row no page names is reported, as a rebuild's is")
+    void aBucketAskedAboutWholeForARowNoPageNamesIsReported() {
+        List<List<Object>> reported = new ArrayList<>();
+        MapJoinStores kept = new MapJoinStores(2);
+        Fixture restarted = new Fixture(JoinKind.LEFT, kept,
+                (source, dimensionKey, pages) -> reported.add(List.of(source, dimensionKey, pages)));
+        String bucket = restarted.dimensionKeyOf(1L);
+        // Ten pages of two under customer 1, and rows 120 and 121 in the mirror with no page naming them.
+        leaveUnfinished(kept, restarted, 20);
+        kept.putFact(restarted.factKeyOf(120L), unfinished(Map.of("id", 120L, "cust_id", 1L)));
+        kept.putFact(restarted.factKeyOf(121L), unfinished(Map.of("id", 121L, "cust_id", 1L)));
+
+        restarted.applyBatch(readAgain(100, 120));
+        restarted.applyBatch(readAgain(121));
+
+        // Neither lost row is on page 0 or page 1, so each lookup reads how long the bucket is and asks
+        // about the rest of it: ten pages, then eleven once row 120 has been added.
+        assertThat(reported).as("the length each lookup read, for the bucket it asked about whole")
+                .containsExactly(List.of("c", bucket, 10), List.of("c", bucket, 11));
+        assertThat(restarted.stores.pageCountReads).as("and no read of that length of its own")
+                .isEqualTo(2);
+        assertThat(namedIn(kept, restarted)).as("both lost rows added, and every row named once")
+                .hasSize(22).doesNotHaveDuplicates();
+    }
+
     @Test
     @DisplayName("a null in a join key matches nothing, on either side")
     void aNullJoinKeyMatchesNothing() {
@@ -1329,6 +1363,14 @@ class JoinDriverTest {
         Fixture(JoinKind kind, int pageSize, JoinGauge gauge) {
             this.withNote = true;
             this.stores = new CountingJoinStores(pageSize);
+            this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores,
+                    JoinDriver.DEFAULT_KEYS_PER_READ, gauge);
+        }
+
+        /** Over the state handed in, watching what the join reports about the buckets it reads. */
+        Fixture(JoinKind kind, JoinStores held, JoinGauge gauge) {
+            this.withNote = true;
+            this.stores = new CountingJoinStores(held);
             this.driver = new JoinDriver(planOf(kind), List.of("id"), STREAM, stores,
                     JoinDriver.DEFAULT_KEYS_PER_READ, gauge);
         }
