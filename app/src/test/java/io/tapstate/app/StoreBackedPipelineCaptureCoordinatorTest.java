@@ -7,6 +7,9 @@ import static org.assertj.core.api.Assertions.entry;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.Step;
+import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -16,6 +19,7 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.core.lifecycle.CaptureReading;
@@ -598,6 +602,32 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
+    void aPipelineCapturesOnlyTheTableItsGraphReads() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("crm", null, "postgres", Map.of("host", "postgres"),
+                SourceMode.CDC, List.of(TableRef.literal("account"), TableRef.literal("contact"),
+                        TableRef.literal("pricebook2")), null, null));
+        artifacts.save(new PipelineResource("pricebook_state", null, List.of(SourceRef.spec("crm", true)),
+                List.of(Step.inline("t_pricebook2", FromClause.list(FromRef.literal("pricebook2")),
+                        new TransformBody.Js("function process(record, ctx) { return record; }"), null)),
+                new ViewBlock.Inline("pricebook", FromRef.literal("t_pricebook2"), "id", null), null,
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
+        AtomicReference<CaptureRunSpec> startedSpec = new AtomicReference<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            startedSpec.set(spec);
+            return new CaptureRun(Optional.empty(), false, 2L, Optional.empty(), Optional.empty(),
+                    new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()),
+                new SnapshotBuffer());
+
+        coordinator.startCapture("pricebook_state");
+
+        assertThat(startedSpec.get().config().streams()).containsExactly("pricebook2");
+    }
+
+    @Test
     void multiTableSnapshotProgressAndBufferRoutingStayPerTable() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         SourceResource source = new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
@@ -841,7 +871,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         artifacts.save(cdcSource("src_a", "orders", null));
         artifacts.save(cdcSource("src_b", "orders", null));
         artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true)), null, null,
-                new ServeBlock.Inline(null, FromRef.literal("src_a"),
+                new ServeBlock.Inline(null, FromClause.list(FromRef.literal("src_a"), FromRef.literal("src_b")),
                         List.of(new SyncElement("sync_1", "src_a", null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
         java.util.Map<String, Long> countsBySource = Map.of("src_a", 100L, "src_b", 200L);
@@ -1005,7 +1035,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         artifacts.save(new SourceResource("src_c", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, null, null, null));
         artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true), SourceRef.spec("src_c", true)), null, null,
-                new ServeBlock.Inline(null, FromRef.literal("src_a"),
+                new ServeBlock.Inline(null, FromClause.list(FromRef.literal("src_a"), FromRef.literal("src_b")),
                         List.of(new SyncElement("sync_1", "src_a", null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
         SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
@@ -1193,7 +1223,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
     private static PipelineResource twoSourcePipeline(String id, String sourceA, String sourceB) {
         return new PipelineResource(id, null, List.of(SourceRef.spec(sourceA, true), SourceRef.spec(sourceB, true)), null, null,
-                new ServeBlock.Inline(null, FromRef.literal(sourceA),
+                new ServeBlock.Inline(null, FromClause.list(FromRef.literal(sourceA), FromRef.literal(sourceB)),
                         List.of(new SyncElement("sync_1", sourceA, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);
     }

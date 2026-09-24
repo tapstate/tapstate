@@ -358,6 +358,9 @@ jobs:
           shellcheck deploy/docker/image-smoke.sh
           shellcheck deploy/docker/dockerfile-smoke.sh
           shellcheck deploy/docker/dockerfile-smoke-test.sh
+          shellcheck scripts/prepare-web-assets.sh
+          shellcheck scripts/prepare-web-assets-smoke.sh
+          python3 -m py_compile .github/scripts/web-provenance.py .github/scripts/web-provenance-smoke.py
           shellcheck -s sh deploy/install-site/assemble.sh
           shellcheck -s sh deploy/install-site/verify-published.sh
           shellcheck deploy/install-site/verify-smoke.sh
@@ -373,6 +376,10 @@ jobs:
         run: bash deploy/quickstart/quickstart-smoke.sh
       - name: Dockerfile smoke verdict tests
         run: bash deploy/docker/dockerfile-smoke-test.sh
+      - name: Web asset packaging cases
+        run: bash scripts/prepare-web-assets-smoke.sh
+      - name: Web release provenance cases
+        run: python3 .github/scripts/web-provenance-smoke.py
       - name: install-site verifier smoke
         run: bash deploy/install-site/verify-smoke.sh
 
