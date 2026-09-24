@@ -360,12 +360,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: enable the pinned package manager
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
           cache: pnpm
           cache-dependency-path: tapstate-web/pnpm-lock.yaml
       - name: build the pinned Web production bundle
         working-directory: tapstate-web
         run: |
-          corepack enable
           pnpm install --frozen-lockfile
           pnpm typecheck
           pnpm lint

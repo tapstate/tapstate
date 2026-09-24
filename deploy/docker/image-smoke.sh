@@ -146,9 +146,18 @@ done
 green "  store ready (primary elected)"
 
 bold "1. container boots against the store, HEALTHCHECK reaches healthy, runs as the unprivileged uid"
+host_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}' || true)"
+if [[ -z "$host_ip" ]] && command -v ipconfig >/dev/null 2>&1; then
+  host_interface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  host_ip="$(ipconfig getifaddr "${host_interface:-en0}" 2>/dev/null || true)"
+fi
+if [[ -z "$host_ip" ]]; then
+  red "  FAIL: could not determine a host IP address for the published-port check"
+  FAIL=$((FAIL + 1))
+fi
 if docker run -d --name "$SERVER" --network "$NET" \
      -e TAPSTATE_STORE_MONGO_URI="mongodb://$MONGO:27017/tapstate?directConnection=true" \
-     -p 127.0.0.1::8080 \
+     -p 0.0.0.0::8080 \
      "$IMAGE" --role=all >/dev/null; then
   # Poll the container's own health -- the signal a dependent's service_healthy waits on. Break early
   # if the container exits before turning healthy: the embedded member + engine are the keep-alive
@@ -163,16 +172,16 @@ if docker run -d --name "$SERVER" --network "$NET" \
   check "container reaches healthy (built-in HEALTHCHECK → /healthz)" test "$status" = "healthy"
   check "runs as uid 10001, not root" test "$(docker exec "$SERVER" id -u 2>/dev/null || echo NA)" = "10001"
   host_port="$(docker port "$SERVER" 8080/tcp | sed 's/.*://')"
-  base_url="http://127.0.0.1:$host_port"
+  base_url="http://$host_ip:$host_port"
   http_ready=0
   for _ in $(seq 1 15); do
     if curl -fsS "$base_url/healthz" >/dev/null 2>&1; then http_ready=1; break; fi
     sleep 1
   done
   if [ "$http_ready" = 1 ]; then
-    check "root serves the packaged Web entry point" curl -fsS "$base_url/" -o "$WORK/root.html"
-    check "deep client route serves the Web entry point" curl -fsS "$base_url/pipelines/smoke/edit/api" -o "$WORK/deep.html"
-    check "referenced static asset is served" curl -fsS "$base_url/assets/app.js" -o "$WORK/app.js"
+    check "host IP and published port serve the packaged Web entry point" curl -fsS "$base_url/" -o "$WORK/root.html"
+    check "host IP and published port serve a deep client route" curl -fsS "$base_url/pipelines/smoke/edit/api" -o "$WORK/deep.html"
+    check "host IP and published port serve a referenced static asset" curl -fsS "$base_url/assets/app.js" -o "$WORK/app.js"
     check "root HTML is the packaged fixture" grep -qF "Tapstate smoke" "$WORK/root.html"
     check "deep route returns the same SPA entry" cmp -s "$WORK/root.html" "$WORK/deep.html"
     check "static asset is the packaged fixture" grep -qF "__tapstateWebSmoke" "$WORK/app.js"
