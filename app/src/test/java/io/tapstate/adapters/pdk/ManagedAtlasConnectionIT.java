@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import com.mongodb.ConnectionString;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
@@ -51,6 +52,42 @@ class ManagedAtlasConnectionIT {
                 .map(item -> item.name() + ":" + item.status())
                 .toList();
         assertThat(result.outcome()).as("Atlas PDK check statuses: %s", checkStatuses)
+                .isEqualTo(ConnectionTestResult.Outcome.PASSED);
+        assertThat(result.items()).anyMatch(item -> item.status() == ConnectionTestItem.Status.PASSED);
+    }
+
+    @Test
+    void atlasResolvedHostsCanConnectThroughStandardFields() {
+        String artifact = System.getProperty("tapstate.pdk.it.atlasJar");
+        String standardUri = System.getenv("TAPSTATE_ATLAS_STANDARD_URI");
+        assumeTrue(artifact != null && !artifact.isBlank()
+                        && standardUri != null && !standardUri.isBlank(),
+                "real Atlas jar and resolved-host URI are required for this live witness");
+
+        ConnectionString connectionString = new ConnectionString(standardUri);
+        assertThat(connectionString.getCredential()).isNotNull();
+        assertThat(connectionString.getCredential().getPassword()).isNotNull();
+        int optionStart = standardUri.indexOf('?');
+        String options = optionStart < 0 ? "" : standardUri.substring(optionStart + 1);
+        Map<String, Object> settings = Map.of(
+                "isUri", false,
+                "host", String.join(",", connectionString.getHosts()),
+                "database", connectionString.getDatabase(),
+                "user", connectionString.getCredential().getUserName(),
+                "password", new String(connectionString.getCredential().getPassword()),
+                "additionalString", options);
+        Path jar = Path.of(artifact);
+        IntrospectedConnector introspected = new ConnectorIntrospector().introspect(List.of(jar));
+        ConnectorRef ref = new ConnectorRef(
+                List.of(jar), introspected.className(), introspected.pdkApiVersion(), null,
+                introspected.spec());
+
+        ConnectionTestResult result = new PdkConnectionTester(id -> ref, Clock.systemUTC()).test(
+                new ConnectionConfig("atlas-standard-live", "mongodb-atlas", settings));
+        List<String> checkStatuses = result.items().stream()
+                .map(item -> item.name() + ":" + item.status())
+                .toList();
+        assertThat(result.outcome()).as("Atlas standard-field PDK check statuses: %s", checkStatuses)
                 .isEqualTo(ConnectionTestResult.Outcome.PASSED);
         assertThat(result.items()).anyMatch(item -> item.status() == ConnectionTestItem.Status.PASSED);
     }
