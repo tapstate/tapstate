@@ -460,7 +460,8 @@ final class ControlPlane {
      * reports it -- empty when no run of it is being measured.
      *
      * <p>What a case that kills a member needs before it can say it killed one the run was on: the
-     * engine places a run's pieces for itself, so which members carry them is read, never assumed.
+     * engine places a run's pieces for itself, so which members carry them is read, never assumed. It is
+     * assembled from the members that have reported so far; {@link #membersMeasuring} says which.
      */
     Set<String> membersCarryingPartOf(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/cluster/members"));
@@ -484,6 +485,33 @@ final class ControlPlane {
             }
         }
         return carrying;
+    }
+
+    /**
+     * The members this pipeline's current run has been measured from, by engine identity -- empty when no
+     * run of it is being measured.
+     *
+     * <p>What makes {@link #membersCarryingPartOf} an answer rather than part of one. The cluster's
+     * readings of a run arrive from each member on that member's own schedule, seconds apart, and a piece
+     * running on a member that has not reported yet is missing from the placement rather than shown as
+     * unknown: until then a run split across two members reads as carried by one. A case that judges where
+     * a run is placed waits for this to name every member first.
+     */
+    Set<String> membersMeasuring(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read which members " + pipelineId + "'s run is measured from");
+        Set<String> measuring = new TreeSet<>();
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("measuredFrom") instanceof List<?> members) {
+                for (Object member : members) {
+                    if (member instanceof String memberUuid) {
+                        measuring.add(memberUuid);
+                    }
+                }
+            }
+        }
+        return measuring;
     }
 
     private static List<?> pipelinesOf(String body) {

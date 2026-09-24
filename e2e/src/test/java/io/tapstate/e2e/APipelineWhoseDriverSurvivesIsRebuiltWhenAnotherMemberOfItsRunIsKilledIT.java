@@ -9,7 +9,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,11 +30,17 @@ import org.junit.jupiter.api.io.TempDir;
  * A driver that judged the death only by what was committed recorded it as the pipeline's own and left
  * the pipeline failed for a person, which is what a run on two real machines found.
  *
- * <p><b>Which member to kill is read off the cluster.</b> The engine places each piece of a run for
- * itself, and where it puts one is not up to anybody, so the case starts a few pipelines and looks for
- * one whose run has a piece on a member other than its driver; when none has, it stops and starts them so
- * their pieces are placed again. The member killed is that other member, and only once a run is known to
- * be on it -- killing a member that carries nothing of the run would pass against any product.
+ * <p><b>Which member to kill is read off the cluster.</b> Where each piece of a run goes is not up to this
+ * case, and for as long as the membership holds it is the same every time: stopping a pipeline and
+ * starting it again puts every piece back where it was, so a restart is no second chance of a split. The
+ * case therefore starts pipelines one at a time, each with pieces of its own, and stops at the first
+ * whose run has a piece on a member other than its driver. The member killed is that other member, and
+ * only once a run is known to be on it -- killing a member that carries nothing of the run would pass
+ * against any product.
+ *
+ * <p>A placement is judged only once the cluster's readings of the run have arrived from every member.
+ * Each member reports on its own schedule, seconds apart, and a piece on a member that has not reported
+ * yet is missing from the answer: read before then, a split run looks carried entirely by its driver.
  *
  * <p><b>Nothing is asked of the product between the kill and the assertions.</b>
  *
@@ -48,11 +53,11 @@ class APipelineWhoseDriverSurvivesIsRebuiltWhenAnotherMemberOfItsRunIsKilledIT {
     private static final String TABLE = "orders";
     private static final long SEEDED_ROWS = 3;
 
-    /** Enough pipelines that a split placement is the ordinary outcome of one start, not a lucky one. */
-    private static final int PIPELINES = 3;
-
-    /** How many times the pipelines are placed before the case says it never saw a run split. */
-    private static final int PLACEMENTS = 6;
+    /**
+     * How many pipelines are started, one at a time, before the case says none of their runs was split.
+     * Each brings pieces of its own to be placed, so each is a fresh chance of a split.
+     */
+    private static final int MOST_PIPELINES = 10;
 
     /** Bound on the replacement: the cluster has to notice the member is gone, then the run is rebuilt. */
     private static final Duration TAKEOVER = Duration.ofMinutes(3);
@@ -68,46 +73,36 @@ class APipelineWhoseDriverSurvivesIsRebuiltWhenAnotherMemberOfItsRunIsKilledIT {
         byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
 
         try (FileEndpoints files = new FileEndpoints()) {
-            List<Lane> lanes = new ArrayList<>();
-            Map<String, String> resources = new LinkedHashMap<>();
-            for (int i = 1; i <= PIPELINES; i++) {
-                Lane lane = new Lane("kept_driver_pipe_" + i, "kept_driver_src_" + i, "kept_driver_tgt_" + i,
-                        Files.createDirectories(directory.resolve("src" + i)),
-                        Files.createDirectories(directory.resolve("tgt" + i)));
-                files.seed(lane.sourceAddress(), TABLE, SeedRows.generated(SEEDED_ROWS));
-                resources.put(lane.sourceId() + ".tap.yml", Workspaces.cdcSourceYaml(lane.sourceId(), lane.source()));
-                resources.put(lane.targetId() + ".tap.yml", Workspaces.targetYaml(lane.targetId(), lane.target()));
-                resources.put(lane.pipeline() + ".tap.yml",
-                        Workspaces.pipelineYaml(lane.pipeline(), lane.sourceId(), lane.targetId(), TABLE));
-                lanes.add(lane);
-            }
-
             String store = SharedMongo.replicaSetUrl("e2e_kept_driver_cluster");
             try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-kept-driver")) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
-                for (Lane lane : lanes) {
+
+                // Applied as a whole each time a pipeline is added, the way a workspace is applied.
+                Map<String, String> resources = new LinkedHashMap<>();
+                Split split = null;
+                for (int i = 1; i <= MOST_PIPELINES && split == null; i++) {
+                    Lane lane = new Lane("kept_driver_pipe_" + i, "kept_driver_src_" + i, "kept_driver_tgt_" + i,
+                            Files.createDirectories(directory.resolve("src" + i)),
+                            Files.createDirectories(directory.resolve("tgt" + i)));
+                    files.seed(lane.sourceAddress(), TABLE, SeedRows.generated(SEEDED_ROWS));
                     control.discoverSchema(lane.sourceId(), E2eConnectorJar.CONNECTOR_ID,
                             Map.of("uri", lane.source().toString()));
-                }
-                control.apply(resources);
-                lanes.forEach(lane -> control.lifecycle(lane.pipeline(), LifecycleVerb.START));
-
-                Split split = null;
-                for (int placement = 1; placement <= PLACEMENTS && split == null; placement++) {
-                    if (placement > 1) {
-                        placeAgain(control, lanes);
-                    }
-                    for (Lane lane : lanes) {
-                        awaitRunningAndPlaced(control, files, lane);
-                    }
-                    split = aSplitRun(control, lanes);
+                    resources.put(lane.sourceId() + ".tap.yml",
+                            Workspaces.cdcSourceYaml(lane.sourceId(), lane.source()));
+                    resources.put(lane.targetId() + ".tap.yml", Workspaces.targetYaml(lane.targetId(), lane.target()));
+                    resources.put(lane.pipeline() + ".tap.yml",
+                            Workspaces.pipelineYaml(lane.pipeline(), lane.sourceId(), lane.targetId(), TABLE));
+                    control.apply(resources);
+                    control.lifecycle(lane.pipeline(), LifecycleVerb.START);
+                    awaitRunningAndMeasuredEverywhere(control, files, lane);
+                    split = aSplitRun(control, lane);
                 }
                 assertThat(split)
-                        .describedAs("after %d placements no pipeline had a piece of its run on a member other "
-                                + "than its driver, so there was no member this case could kill that the "
-                                + "run was on", PLACEMENTS)
+                        .describedAs("none of the %d pipelines started had a piece of its run on a member other "
+                                + "than its driver, so there was no member this case could kill that a run was "
+                                + "on", MOST_PIPELINES)
                         .isNotNull();
 
                 Split chosen = split;
@@ -142,45 +137,32 @@ class APipelineWhoseDriverSurvivesIsRebuiltWhenAnotherMemberOfItsRunIsKilledIT {
         }
     }
 
-    /** Stops every pipeline and starts it again, which places the pieces of each run afresh. */
-    private static void placeAgain(ControlPlane control, List<Lane> lanes) {
-        for (Lane lane : lanes) {
-            control.stop(lane.pipeline(), false);
-        }
-        for (Lane lane : lanes) {
-            Await.until(lane.pipeline() + " to stop", Duration.ofMinutes(1),
-                    () -> control.state(lane.pipeline()).filter(PipelineState.STOPPED::equals).isPresent(),
-                    () -> String.valueOf(control.state(lane.pipeline())));
-        }
-        lanes.forEach(lane -> control.lifecycle(lane.pipeline(), LifecycleVerb.START));
-    }
-
-    private static void awaitRunningAndPlaced(ControlPlane control, FileEndpoints files, Lane lane) {
+    private static void awaitRunningAndMeasuredEverywhere(ControlPlane control, FileEndpoints files, Lane lane) {
         Await.until(lane.pipeline() + " to reach " + PipelineState.RUNNING, Duration.ofMinutes(1),
                 () -> control.state(lane.pipeline()).filter(PipelineState.RUNNING::equals).isPresent(),
                 () -> String.valueOf(control.state(lane.pipeline())));
         Await.until("the seeded rows of " + lane.pipeline() + " to cross", Duration.ofMinutes(1),
                 () -> files.count(lane.targetAddress(), TABLE) >= SEEDED_ROWS,
                 () -> "rows at target = " + files.count(lane.targetAddress(), TABLE));
+        List<String> everyMember = control.clusterMembers().stream().map(ClusterMemberFacts::memberUuid).toList();
+        Await.until("the cluster's readings of " + lane.pipeline() + "'s run to arrive from every member",
+                Duration.ofMinutes(1),
+                () -> control.membersMeasuring(lane.pipeline()).containsAll(everyMember),
+                () -> "measured from " + control.membersMeasuring(lane.pipeline()) + " of " + everyMember);
         Await.until("the cluster to say where " + lane.pipeline() + "'s run is placed", Duration.ofMinutes(1),
                 () -> !control.membersCarryingPartOf(lane.pipeline()).isEmpty(),
                 () -> "carried by " + control.membersCarryingPartOf(lane.pipeline()));
     }
 
-    /** A pipeline whose run has a piece on a member other than the one driving it, or null when none has. */
-    private static Split aSplitRun(ControlPlane control, List<Lane> lanes) {
-        for (Lane lane : lanes) {
-            String driver = control.pipelineControllerOf(lane.pipeline()).orElse(null);
-            if (driver == null) {
-                continue;
-            }
-            Set<String> others = new TreeSet<>(control.membersCarryingPartOf(lane.pipeline()));
-            others.remove(driver);
-            if (!others.isEmpty()) {
-                return new Split(lane, driver, others.iterator().next());
-            }
+    /** This pipeline, when its run has a piece on a member other than the one driving it; null otherwise. */
+    private static Split aSplitRun(ControlPlane control, Lane lane) {
+        String driver = control.pipelineControllerOf(lane.pipeline()).orElse(null);
+        if (driver == null) {
+            return null;
         }
-        return null;
+        Set<String> others = new TreeSet<>(control.membersCarryingPartOf(lane.pipeline()));
+        others.remove(driver);
+        return others.isEmpty() ? null : new Split(lane, driver, others.iterator().next());
     }
 
     private record Lane(String pipeline, String sourceId, String targetId, Path source, Path target) {
