@@ -198,6 +198,15 @@ def read(node, matrix):
     return '\n'.join(own + taken) + '\n#\n'
 
 
+def shaped(node, kind, path, where):
+    # A part of the wrong shape runs nothing -- GitHub refuses the whole workflow -- and nothing here
+    # can read it either. Reading on anyway would stop at a traceback that names neither the workflow
+    # nor the place.
+    if not isinstance(node, kind):
+        sys.exit(f'{path}: {where} must be a {"mapping" if kind is dict else "list"}')
+    return node
+
+
 def written(text):
     global count
     count += 1
@@ -213,9 +222,10 @@ for path in sys.argv[5:]:
             workflow = yaml.load(f, Loader=Loader) or {}
     except yaml.YAMLError as e:
         sys.exit(f'{path} is not readable as YAML: {e}')
-    top = inherit({}, workflow)
+    top = inherit({}, shaped(workflow, dict, path, 'the top level'))
     places = [(top, 'outside its jobs', {k: v for k, v in workflow.items() if k != 'jobs'}, {})]
-    for job_id, job in (workflow.get('jobs') or {}).items():
+    for job_id, job in shaped(workflow.get('jobs') or {}, dict, path, 'jobs').items():
+        shaped(job, dict, path, f'job {job_id}')
         # A job that calls a reusable workflow hands its inputs to a run whose env is the called
         # workflow's alone; the caller's env reaches none of it.
         env = {} if 'uses' in job else inherit(top, job)
@@ -223,7 +233,9 @@ for path in sys.argv[5:]:
         # The strategy runs nothing of its own: its matrix values are read where they are named.
         places.append((env, f'job {job_id}, outside its steps',
                        {k: v for k, v in job.items() if k not in ('steps', 'strategy')}, matrix))
-        for number, step in enumerate(job.get('steps') or [], 1):
+        steps = shaped(job.get('steps') or [], list, path, f'the steps of job {job_id}')
+        for number, step in enumerate(steps, 1):
+            shaped(step, dict, path, f'job {job_id}, step {number}')
             name = ' '.join(str(step.get('name') or '').split())
             places.append((inherit(env, step), f'job {job_id}, step {number}' + (f' ({name})' if name else ''),
                            step, matrix))
@@ -506,7 +518,7 @@ done < <(git ls-files '.github/workflows/*.yml' '.github/workflows/*.yaml')
 unfenced=""
 if [ "${#workflows[@]}" -gt 0 ]; then
   unfenced="$(unfenced_installs "${workflows[@]}")" || {
-    echo "::error::the workflows could not be read as YAML, so where they install from is unknown."
+    echo "::error::the workflows could not be read, so where they install from is unknown."
     exit 1
   }
 fi

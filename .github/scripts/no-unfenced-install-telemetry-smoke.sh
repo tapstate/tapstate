@@ -94,5 +94,35 @@ jobs:
 EOF
 expect "a fence on the job that installs is accepted" 0 "clean:"
 
+# --- a job with nothing under its name. GitHub refuses the whole workflow, so nothing in it runs, and
+# --- the gate cannot read it either: it fails naming the workflow and the job, not with a traceback
+# --- that names neither.
+fresh_repo
+workflow .github/workflows/malformed.yml <<'EOF'
+name: malformed
+on: workflow_dispatch
+jobs:
+  build:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -sSL https://install.tapstate.dev/cli | sh
+EOF
+expect "a job that is not a mapping is named" 1 ".github/workflows/malformed.yml: job build must be a mapping"
+
+# --- the same for a step written as a bare command, which GitHub refuses as well.
+fresh_repo
+workflow .github/workflows/malformed.yml <<'EOF'
+name: malformed
+on: workflow_dispatch
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "a step GitHub reads"
+      - curl -sSL https://install.tapstate.dev/cli | sh
+EOF
+expect "a step that is not a mapping is named" 1 ".github/workflows/malformed.yml: job install, step 2 must be a mapping"
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
