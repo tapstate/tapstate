@@ -40,6 +40,9 @@ class McpOperationExecutorTest {
                          "config":[],
                          "spec":{"contentHash":"abc123","text":"{}","unavailable":null}}
                         """);
+            } else if (exchange.getRequestURI().toString().equals("/api/sources?limit=50&offset=0")
+                    || exchange.getRequestURI().toString().equals("/api/pipelines?limit=50&offset=0")) {
+                answer(exchange, 200, "{\"items\":[]}");
             } else {
                 answer(exchange, 200, "{}");
             }
@@ -50,13 +53,25 @@ class McpOperationExecutorTest {
             Map<String, Object> connection = Map.of(
                     "id", "orders", "connectorId", "mysql", "settings", Map.of());
             Map<String, Object> pipeline = Map.of("id", "orders");
+            // A stop reaches the server only with the answer; without it this executor refuses at its
+            // own end and no request is made, which is what the routing assertion below counts.
+            Map<String, Object> stop = Map.of("id", "orders", "purgeState", true);
             Map<String, Object> logs = new LinkedHashMap<>(pipeline);
             logs.put("limit", 999);
+            Map<String, Object> history = Map.of(
+                    "id", "orders",
+                    "from", "2026-09-20T10:00:00Z",
+                    "to", "2026-09-20T11:00:00Z",
+                    "resolution", "raw",
+                    "limit", 10,
+                    "table", List.of("public.orders"),
+                    "cursor", "next page");
 
             List<Map.Entry<io.tapstate.control.core.Operation, Map<String, Object>>> calls = List.of(
                     Map.entry(ControlOperations.SYSTEM_VERSION, Map.of()),
                     Map.entry(ControlOperations.CONNECTOR_LIST, Map.of()),
                     Map.entry(ControlOperations.CONNECTOR_GET, Map.of("id", "mysql")),
+                    Map.entry(ControlOperations.SOURCE_LIST, Map.of()),
                     Map.entry(ControlOperations.SOURCE_DRAFT, Map.of(
                             "id", "orders", "connector", "mysql", "config", Map.of("host", "db"))),
                     Map.entry(ControlOperations.CONNECTION_TEST, connection),
@@ -68,12 +83,17 @@ class McpOperationExecutorTest {
                     Map.entry(ControlOperations.ARTIFACT_GET, Map.of("id", "orders")),
                     Map.entry(ControlOperations.ARTIFACT_DELETE,
                             Map.of("id", "orders", "expectedContentHash", "a".repeat(64))),
+                    Map.entry(ControlOperations.PIPELINE_LIST, Map.of()),
                     Map.entry(ControlOperations.PIPELINE_START, pipeline),
-                    Map.entry(ControlOperations.PIPELINE_STOP, pipeline),
+                    Map.entry(ControlOperations.PIPELINE_STOP, stop),
+                    Map.entry(ControlOperations.PIPELINE_PAUSE, pipeline),
+                    Map.entry(ControlOperations.PIPELINE_RESUME, pipeline),
                     Map.entry(ControlOperations.PIPELINE_STATUS, pipeline),
                     Map.entry(ControlOperations.PIPELINE_METRICS, pipeline),
                     Map.entry(ControlOperations.PIPELINE_SNAPSHOT, pipeline),
                     Map.entry(ControlOperations.PIPELINE_LOGS, logs),
+                    Map.entry(ControlOperations.PIPELINE_METRICS_HISTORY, history),
+                    Map.entry(ControlOperations.PIPELINE_EXPLAIN, pipeline),
                     Map.entry(ControlOperations.DATA_BROWSER_COLLECTIONS, Map.of("sourceId", "views")),
                     Map.entry(ControlOperations.DATA_BROWSER_STATS,
                             Map.of("sourceId", "views", "collection", "order_state")),
@@ -97,17 +117,214 @@ class McpOperationExecutorTest {
                     // At the root, not under /api: the version answer is the anonymous endpoint the
                     // CLI also reads while connecting, and a second one would be a second truth.
                     "/version",
-                    "/api/connectors", "/api/connectors/mysql", "/api/connections:test",
+                    "/api/connectors", "/api/connectors/mysql", "/api/sources?limit=50&offset=0",
+                    "/api/connections:test",
                     "/api/sources:draft",
                     "/api/connections/orders/test-result", "/api/connections:discover-schema",
                     "/api/connections/orders/schema", "/api/artifacts:validate", "/api/artifacts:apply",
-                    "/api/artifacts/orders",
+                    "/api/artifacts/orders", "/api/pipelines?limit=50&offset=0",
                     "/api/pipelines/orders:start", "/api/pipelines/orders:stop",
+                    "/api/pipelines/orders:pause", "/api/pipelines/orders:resume",
                     "/api/pipelines/orders/status", "/api/pipelines/orders/metrics",
                     "/api/pipelines/orders/snapshot", "/api/pipelines/orders/logs?limit=200",
+                    "/api/pipelines/orders/metrics/history?from=2026-09-20T10%3A00%3A00Z"
+                            + "&to=2026-09-20T11%3A00%3A00Z&resolution=raw&limit=10"
+                            + "&table=public.orders&cursor=next%20page",
+                    "/api/pipelines/orders/explain",
                     "/api/sources/views/collections",
                     "/api/sources/views/collections/order_state/stats",
                     "/api/sources/views/collections/order_state:find");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void everySharedExplanationFixtureReachesMcpWithoutASecondProjection() throws Exception {
+        List<String> fixtures = List.of(
+                "explain-stale.golden.json",
+                "explain-coded-failure.golden.json",
+                "explain-reconcile-failures.golden.json",
+                "explain-no-movement.golden.json",
+                "explain-frontier-stalled.golden.json",
+                "explain-no-match.golden.json",
+                "explain-unknown.golden.json",
+                "explain-start-pending.golden.json");
+        AtomicReference<String> response = new AtomicReference<>();
+        HttpServer server = server(exchange -> answer(exchange, 200, response.get()));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "read-token", Map.of(), client);
+            for (String fixture : fixtures) {
+                String json = observabilityFixture(fixture);
+                response.set(json);
+
+                McpResult result = executor.execute(
+                        ControlOperations.PIPELINE_EXPLAIN, Map.of("id", "orders"));
+
+                assertThat(result.error()).as(fixture).isFalse();
+                assertThat(result.body()).as(fixture).isEqualTo(JsonReader.parse(json));
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void everySharedHistoryFixtureReachesMcpWithoutASecondProjection() throws Exception {
+        List<String> fixtures = List.of(
+                "history-raw-page-1.golden.json",
+                "history-raw-page-2.golden.json",
+                "history-auto-page-1.golden.json",
+                "history-aggregate-boundaries.golden.json",
+                "history-single-metric-missing.golden.json",
+                "history-empty.golden.json");
+        AtomicReference<String> response = new AtomicReference<>();
+        HttpServer server = server(exchange -> answer(exchange, 200, response.get()));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "read-token", Map.of(), client);
+            Map<String, Object> request = Map.of(
+                    "id", "orders",
+                    "from", "2026-09-20T10:00:00Z",
+                    "to", "2026-09-20T11:00:00Z");
+            for (String fixture : fixtures) {
+                String json = observabilityFixture(fixture);
+                response.set(json);
+
+                McpResult result = executor.execute(ControlOperations.PIPELINE_METRICS_HISTORY, request);
+
+                assertThat(result.error()).as(fixture).isFalse();
+                assertThat(result.body()).as(fixture).isEqualTo(JsonReader.parse(json));
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sourceListOmitsAllConfigurationBeforeReturningToTheModel() throws Exception {
+        AtomicReference<String> path = new AtomicReference<>();
+        HttpServer server = server(exchange -> {
+            path.set(exchange.getRequestURI().toString());
+            answer(exchange, 200, """
+                    {"items":[{"id":"orders","metadata":{"labels":{"team":"sales"},
+                    "description":null,"empty":false},"connector":"mongodb",
+                    "config":{"uri":"mongodb://app:s3cr3t@db.internal/orders"},
+                    "configuredSecrets":["password"],"mode":"snapshot","tables":[]}]}
+                    """);
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.SOURCE_LIST,
+                    Map.of("limit", 2, "offset", 1));
+
+            assertThat(result.error()).isFalse();
+            assertThat(path.get()).isEqualTo("/api/sources?limit=2&offset=1");
+            Map<?, ?> item = (Map<?, ?>) ((List<?>) result.body().get("items")).getFirst();
+            assertThat(item.keySet().stream().map(String::valueOf).toList())
+                    .containsExactlyInAnyOrder("id", "metadata", "connector");
+            assertThat(item.get("id")).isEqualTo("orders");
+            assertThat(item.get("connector")).isEqualTo("mongodb");
+            assertThat(item.get("metadata")).isEqualTo(Map.of("labels", Map.of("team", "sales")));
+            assertThat(JsonWriter.write(result.body()))
+                    .doesNotContain("s3cr3t", "config", "configuredSecrets", "uri", "empty");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listToolsSendABoundedPageToTheServer() throws Exception {
+        List<String> paths = new ArrayList<>();
+        HttpServer server = server(exchange -> {
+            paths.add(exchange.getRequestURI().toString());
+            answer(exchange, 200, "{\"items\":[]}");
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            assertThat(executor.execute(ControlOperations.SOURCE_LIST, Map.of()).error()).isFalse();
+            assertThat(executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("limit", 999, "offset", 3)).error()).isFalse();
+
+            assertThat(paths).containsExactly(
+                    "/api/sources?limit=50&offset=0", "/api/pipelines?limit=200&offset=3");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sourceListPreservesServerErrorsInsteadOfProjectingThem() throws Exception {
+        HttpServer server = server(exchange -> answer(exchange, 400,
+                "{\"code\":\"control.malformed-request\",\"message\":\"bad page\"}"));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
+
+            assertThat(result.error()).isTrue();
+            assertThat(result.body()).containsEntry("code", "control.malformed-request");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void sourceListFailsClosedForMissingItemsOrRequiredSummaryFields() throws Exception {
+        List<String> responses = List.of(
+                "{\"items\":{}}",
+                "{\"items\":[{\"id\":\"orders\"}]}");
+        AtomicInteger response = new AtomicInteger();
+        HttpServer server = server(exchange -> answer(exchange, 200,
+                responses.get(response.getAndIncrement())));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            McpResult missingItems = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
+            McpResult missingConnector = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
+
+            assertThat(missingItems.body()).containsEntry("code", "mcp.invalid-server-response");
+            assertThat(missingConnector.body()).containsEntry("code", "mcp.invalid-server-response");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listArgumentsAcceptIntegralFloatingPointValuesAndRejectMalformedValues() throws Exception {
+        List<String> paths = new ArrayList<>();
+        HttpServer server = server(exchange -> {
+            paths.add(exchange.getRequestURI().toString());
+            answer(exchange, 200, "{\"items\":[]}");
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    baseOf(server), "token", Map.of(), client);
+
+            McpResult floatingPoint = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("limit", 2.0d, "offset", 1.0f));
+            McpResult fractional = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("limit", 1.5d));
+            McpResult text = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("limit", "two"));
+            McpResult negativeOffset = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("offset", -1));
+            McpResult largeOffset = executor.execute(ControlOperations.PIPELINE_LIST,
+                    Map.of("offset", (long) Integer.MAX_VALUE + 1));
+
+            assertThat(floatingPoint.error()).isFalse();
+            assertThat(paths).containsExactly("/api/pipelines?limit=2&offset=1");
+            assertThat(fractional.body()).containsEntry("code", "control.malformed-request");
+            assertThat(text.body()).containsEntry("code", "control.malformed-request");
+            assertThat(negativeOffset.body()).containsEntry("code", "control.malformed-request");
+            assertThat(largeOffset.body()).containsEntry("code", "control.malformed-request");
         } finally {
             server.stop(0);
         }
@@ -525,6 +742,16 @@ class McpOperationExecutorTest {
     }
 
     private record SourceDraftExchange(McpResult result, Map<?, ?> posted) { }
+
+    private static String observabilityFixture(String name) throws IOException {
+        try (var input = McpOperationExecutorTest.class.getResourceAsStream(
+                "/golden/observability/" + name)) {
+            if (input == null) {
+                throw new IOException("missing shared explanation fixture: " + name);
+            }
+            return new String(input.readAllBytes(), StandardCharsets.UTF_8).stripTrailing();
+        }
+    }
 
     private static void assertSourceDraftUnavailable(
             int connectorStatus, String connectorBody, String draftBody) throws Exception {

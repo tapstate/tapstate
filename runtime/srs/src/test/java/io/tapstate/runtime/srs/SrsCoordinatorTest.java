@@ -240,6 +240,12 @@ class SrsCoordinatorTest {
         }
 
         @Override
+        public void dropChain(String miningChainId) {
+            throw new UnsupportedOperationException(
+                    "chain removal is not exercised by this double");
+        }
+
+        @Override
         public void detachConsumer(String miningChainId, String pipelineId) {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");
         }
@@ -260,12 +266,18 @@ class SrsCoordinatorTest {
                 throw new IllegalStateException("chain already seeded: " + miningChainId);
             }
             created.put(miningChainId, retention);
-            records.put(miningChainId, new SrsMeta(miningChainId, null, List.of(), null, List.of(), retention));
+            records.put(miningChainId, new SrsMeta(miningChainId, null, List.of(), List.of(), retention));
             mutations.add("create:" + miningChainId);
         }
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        public void rewindSourceReadOffset(String miningChainId, String token) {
+            // No test on this double writes a position back; a call here is a wiring mistake, not a case.
+            throw new UnsupportedOperationException("rewindSourceReadOffset");
+        }
+
+        @Override
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             mutations.add("advance:" + miningChainId);
         }
 
@@ -285,7 +297,8 @@ class SrsCoordinatorTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             mutations.add("cdcStart:" + miningChainId);
         }
 
@@ -296,7 +309,7 @@ class SrsCoordinatorTest {
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String table) {
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             mutations.add("snapshotComplete:" + miningChainId + "/" + table);
         }
 

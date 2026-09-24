@@ -4,7 +4,9 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureListener;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -39,10 +41,10 @@ class CaptureHealthTest {
     void theRecordingListenerPassesEventsThroughAndRecordsAnError() {
         CaptureHealth health = new CaptureHealth();
         Envelope[] delivered = new Envelope[1];
-        CaptureListener listener = health.recording(e -> delivered[0] = e);
+        CaptureListener listener = health.recording((events, pos) -> delivered[0] = events.get(0));
         Envelope event = Envelope.insert(1L, "orders", Map.of("id", 1), Map.of());
 
-        listener.onEvent(event);
+        listener.onBatch(List.of(event), Optional.empty());
         assertThat(delivered[0]).as("events pass through to the wrapped handler").isSameAs(event);
         assertThat(health.failure()).as("no failure while only events flow").isEmpty();
 

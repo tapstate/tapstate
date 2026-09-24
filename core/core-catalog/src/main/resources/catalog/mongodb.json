@@ -147,7 +147,7 @@
     },
     {
       "name": "schemaLimit",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Fields Load Limit For Each Collection"
       },
@@ -252,7 +252,7 @@
     },
     {
       "name": "mongodbLoadSchemaSampleSize",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Number of sampling records (rows) for Mongodb loading model"
       },
@@ -265,7 +265,7 @@
   ],
   "provenance": {
     "specPath": "connectors/mongodb-connector/src/main/resources/spec.json",
-    "specContentHash": "6e934734bc1762eb",
+    "specContentHash": "8dafcf876e0baacb",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

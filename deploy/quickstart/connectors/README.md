@@ -5,16 +5,75 @@ This directory is bind-mounted into the server as its connector seed directory. 
 startup, through the same register-if-absent path `tapstate register` uses. It is a convenience
 for staging jars offline or in bulk.
 
-This release registers **MySQL and MongoDB only**. A jar declaring any other connector is refused
-here exactly as it is refused over the wire — staging it in this directory is a different way to
-reach the same registration, not a way around what that registration accepts. The refusal is
-reported for that jar alone and the sweep carries on with the rest.
+This preview certifies the following database kinds, with certification scoped by direction:
+
+| Database | Connector kind | Certified use |
+|---|---|---|
+| MySQL | `mysql` | Read |
+| PostgreSQL | `postgres` | Read |
+| MongoDB | `mongodb` | Read and write |
+| Oracle | `oracle` | Read |
+| SQL Server | `sqlserver` | Read |
+
+A `serve.sync` element installs onto the `mongodb` kind and no other,
+on any of its accepted ids. Applying a pipeline whose sync names one of the other
+certified connectors is refused, naming that connector and the document the element is
+written in; reading through it is unaffected.
+
+Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other kinds,
+with snapshot and CDC inserts, updates and deletes.
+Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
+negative fractions and CDC updates. This is not an exhaustive cross-version or
+all-data-type matrix. The default accepted set contains 16 connector ids
+across these five database kinds, including existing managed variants of MySQL,
+PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
+Other managed variants of Oracle and SQL Server are outside the default accepted set.
+
+`tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
+on this server. Configuring it puts that server outside the supported configuration;
+acceptance does not certify the added connectors. The setting is empty by default and
+is not configured in release or quickstart artifacts. A `connector.not-official` refusal
+reports the server's actual accepted set, including any additional ids configured there.
+Registration through an upload and registration through the seed directory use the same
+acceptance check.
+
+Numeric source attributes, including precision, scale and value bounds, are preserved
+through schema storage and target preparation. Decimal columns whose metadata was
+stored by an older build need schema rediscovery before automatic target creation.
+Missing or inconsistent decimal metadata is refused before writing; computed decimal
+outputs without a declared numeric domain cannot be auto-created safely.
+
+Oracle and SQL Server connector jars are separate assets on the floating
+`connectors-preview` release. They remain outside versioned Tapstate releases and this
+three-database quickstart does not fetch them automatically. An authenticated CLI can
+download and register either one explicitly:
+
+```
+tapstate register oracle
+tapstate register sqlserver
+```
+
+The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under the
+Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under the MIT License.
+Those dependency terms govern only the bundled drivers and do not change Tapstate's Apache-2.0
+license. The Oracle and SQL Server implementations are paid connector implementations; their use
+remains subject to the applicable Tapdata agreement.
+The upstream enterprise connector repository has no LICENSE file; publishing these binary
+assets does not relicense that source repository.
+
+The Oracle Free 23 source example selects `autoLog: false` and uses schema, table
+and column identifiers no longer than 30 characters. The automatic miner requests
+`CONTINUOUS_MINE`, which that database no longer supports. Long schema identifiers
+can pass snapshot reads while Oracle LogMiner marks their changes unsupported;
+Tapstate does not yet reject that configuration before starting.
+
+A refusal is reported for that jar alone and the seed sweep carries on with the rest.
 
 It is **not** how a connector is normally registered, and it is **not** a precondition for
 registration. The usual path is:
 
 ```
-tapstate register <path-to-jar>
+tapstate register <path-to-jar-or-published-id>
 ```
 
 which uploads the jar's bytes to the running server over HTTP -- no mount, and nothing in this

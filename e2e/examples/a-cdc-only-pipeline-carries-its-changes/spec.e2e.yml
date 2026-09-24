@@ -1,0 +1,39 @@
+# A pipeline declared cdc_only carries its change stream to the target. There is no snapshot in this
+# mode, so the stream is the only thing that ever reads: if it does not deliver, nothing does.
+#
+# Why this example exists at all: cdc_only was reachable from the authoring surface with no end-to-end
+# case behind it anywhere, and the one example that did name the mode is a-cdc-failure-is-observable,
+# whose stream is made to die at the start. That example asserts a count resting at zero, so it passes
+# whether the mode works or not - it never reaches the point where a delivered change is acknowledged.
+# This one does, and that acknowledgement is where the mode was broken: the job died with a bare
+# invariant violation and the target stayed empty.
+#
+# The counts, and why they are these. This connector's tail re-reads its file from the beginning and
+# has no position to resume from, so the seeded rows arrive through the change stream rather than
+# through a snapshot - which is what makes two an honest number here rather than a snapshot smuggled
+# in under another name. The insert then adds three more and the target rests at five. Both awaits are
+# bounded, so a product that delivers nothing fails on the first one rather than hanging.
+#
+# The state is asserted after the counts, not instead of them. A pipeline whose capture dies is driven
+# to FAILED, so a run that crashes in the acknowledgement path fails the count first and the state
+# second; a run that delivers and then dies would pass the counts and fail here. Neither on its own
+# says the mode works.
+#
+# The source is read directly, with the shared replay buffer off, because that is the shape the defect
+# was reported in. The buffer is not what is being tested: it is switched off so that the change
+# reaches the sink by the shortest route the product has, leaving the acknowledgement as the only
+# thing between the stream and the target.
+name: a-cdc-only-pipeline-carries-its-changes
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  discover: [src_file]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders: { rows: 2 }
+steps:
+  - start
+  - await: { count: { tgt_file.orders: 2 } }
+  - cdc: { src_file.orders: insert 3 }
+  - await: { count: { tgt_file.orders: 5 } }
+  - assert: { state: RUNNING }

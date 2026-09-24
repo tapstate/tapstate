@@ -4,6 +4,7 @@ import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import org.bson.Document;
 
@@ -53,6 +54,16 @@ final class StoreDocuments implements AutoCloseable {
         return database.getCollection(collection).find(new Document("_id", id)).first() != null;
     }
 
+    /**
+     * How many samples of {@code pipelineId} the rate history holds. A history is one document per sample
+     * under the pipeline's id rather than one document per pipeline, so "still there" is a count, and the
+     * count is taken off the collection because the history has no read face of its own.
+     */
+    long rateSamplesOf(String pipelineId) {
+        return database.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY)
+                .countDocuments(new Document(MongoRateHistoryStore.PIPELINE_ID, pipelineId));
+    }
+
     /** Every {@code _id} in {@code collection} - the reconciliation set a converger would work from. */
     Set<String> ids(String collection) {
         return StreamSupport.stream(
@@ -64,28 +75,29 @@ final class StoreDocuments implements AutoCloseable {
 
     /**
      * The pipeline ids carrying a cursor on {@code miningChainId}, or none when the chain is gone. A chain
-     * that is absent and a chain that is present with no consumers are told apart by {@link #holds}, and
-     * the difference matters: the first is the shared record this design forbids removing.
+     * that is absent and a chain that is present with no consumers are told apart by {@link #holds}; the
+     * difference matters because removing the shared root while another pipeline remains is forbidden.
      */
     Set<String> consumersOf(String miningChainId) {
-        Document chain = database.getCollection(MongoStorePort.SRS_META)
-                .find(new Document("_id", miningChainId))
-                .first();
-        if (chain == null || !(chain.get("consumerOffsets") instanceof Document consumers)) {
+        if (!holds(MongoStorePort.SRS_META, miningChainId)) {
             return Set.of();
         }
-        return Set.copyOf(consumers.keySet());
+        return StreamSupport.stream(database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
+                        .find(new Document("miningChainId", miningChainId))
+                        .projection(new Document("pipelineId", 1))
+                        .spliterator(), false)
+                .map(document -> document.getString("pipelineId"))
+                .collect(Collectors.toSet());
     }
 
     /** The whole consumer cursor of one pipeline on one chain, for comparing it byte for byte across a removal. */
     Document consumerOffset(String miningChainId, String pipelineId) {
-        Document chain = database.getCollection(MongoStorePort.SRS_META)
-                .find(new Document("_id", miningChainId))
-                .first();
-        if (chain == null || !(chain.get("consumerOffsets") instanceof Document consumers)) {
+        if (!holds(MongoStorePort.SRS_META, miningChainId)) {
             return null;
         }
-        return consumers.get(pipelineId) instanceof Document offset ? offset : null;
+        return database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
+                .find(new Document("miningChainId", miningChainId).append("pipelineId", pipelineId))
+                .first();
     }
 
     /** Every mining chain id the store holds. */

@@ -9,7 +9,8 @@ import java.util.Map;
  * A minimal, dependency-free JSON reader for the core ring. The core ring ships no third-party
  * library (rule R1), so this hand-rolls the small parser runtime loaders need. It produces the same
  * tree shape a JSON library would
- * ({@code Map}/{@code List}/{@code String}/{@code Long}/{@code Double}/{@code BigInteger}/{@code Boolean}/{@code null}),
+ * ({@code Map}/{@code List}/{@code String}/{@code Long}/{@code Double}/{@code BigInteger}/{@code BigDecimal}/
+ * {@code Boolean}/{@code null}),
  * preserving object key order ({@link LinkedHashMap}) so consumers stay deterministic. Lives in
  * core-common because more than one core module needs it (rule R1 admission) and it carries no
  * business semantics.
@@ -208,7 +209,21 @@ public final class JsonReader {
             String number = src.substring(start, pos);
             try {
                 if (floating) {
-                    return Double.parseDouble(number);
+                    double value = Double.parseDouble(number);
+                    // A magnitude past what a double holds is kept exactly, the same call this makes one
+                    // line down for an integer past long. Left as the infinity the parse produces, its
+                    // text form is the word "Infinity" - not a number at all - and whatever reads the
+                    // value back rejects it, dropping the thing it was part of rather than the value.
+                    //
+                    // Below the range is the same loss and the quieter one: the parse answers zero, which
+                    // is well-formed and reads as a value somebody meant. A type's bounds come in pairs,
+                    // so a literal that reaches the first of these reaches the second. A literal that is
+                    // itself zero is not this and stays a double.
+                    if (!Double.isInfinite(value) && value != 0.0) {
+                        return value;
+                    }
+                    java.math.BigDecimal exact = new java.math.BigDecimal(number);
+                    return Double.isInfinite(value) || exact.signum() != 0 ? exact : value;
                 }
                 try {
                     return Long.parseLong(number);

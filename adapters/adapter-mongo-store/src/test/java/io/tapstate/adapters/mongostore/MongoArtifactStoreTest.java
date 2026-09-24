@@ -59,6 +59,13 @@ class MongoArtifactStoreTest {
               read_mode: cdc_only
             """;
 
+    private static final String EMPTY_PIPELINE = """
+            version: tapstate/v1
+            kind: pipeline
+            id: blank
+            source: []
+            """;
+
     private static final String TRANSFORM = """
             version: tapstate/v1
             kind: transform
@@ -97,22 +104,28 @@ class MongoArtifactStoreTest {
     private static final List<Fixture> FIXTURES = List.of(
             new Fixture("source", "orders", "source", SOURCE),
             new Fixture("pipeline", "orders_sync", "pipeline", PIPELINE),
+            new Fixture("blank pipeline", "blank", "pipeline", EMPTY_PIPELINE),
             new Fixture("transform", "normalize", "transform", TRANSFORM),
             new Fixture("view", "customer_view", "view", VIEW),
             new Fixture("serve", "orders_api", "serve", SERVE));
 
     @Test
-    void documentCarriesIdKindAndCanonicalBodyForEveryKind() {
+    void documentCarriesIdKindAndStructuredBodyForEveryKind() {
         for (Fixture fixture : FIXTURES) {
-            String canonical = canonical(fixture.raw());
-            Document document = MongoArtifactStore.toDocument(PARSER.parse(canonical));
+            Resource resource = PARSER.parse(canonical(fixture.raw()));
+            Document document = MongoArtifactStore.toDocument(resource);
 
             assertThat(document.getString("_id")).as("%s _id", fixture.label()).isEqualTo(fixture.id());
             assertThat(document.getString("kind")).as("%s kind", fixture.label()).isEqualTo(fixture.kind());
-            assertThat(document.getString("canonical")).as("%s body", fixture.label()).isEqualTo(canonical);
+            assertThat(document.get("body")).as("%s body", fixture.label())
+                    .isEqualTo(new Document(WRITER.tree(resource)));
+            assertThat(document.get("canonical"))
+                    .as("%s keeps no text: a form that is rendered on demand stored beside the structure "
+                            + "would be a second copy nothing keeps in step", fixture.label())
+                    .isNull();
             assertThat(document.getString("contentHash"))
-                    .as("%s canonical content hash", fixture.label())
-                    .isEqualTo(CanonicalHash.of(canonical));
+                    .as("%s content hash", fixture.label())
+                    .isEqualTo(CanonicalHash.of(resource));
         }
     }
 
@@ -130,30 +143,60 @@ class MongoArtifactStoreTest {
     }
 
     @Test
-    void toResourceOnAMissingCanonicalBodyIsDocumentUnreadable() {
+    void toResourceOnAMissingBodyNamesTheBodyAsTheFault() {
         Document corrupt = new Document("_id", "orders").append("kind", "source");
 
-        Throwable thrown = catchThrowable(() -> MongoArtifactStore.toResource(corrupt));
-
-        assertThat(thrown).isInstanceOf(TapstateException.class);
-        TapstateException coded = (TapstateException) thrown;
-        assertThat(coded.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
-        assertThat(coded.args()).containsEntry("id", "orders");
+        assertThat(unreadableFrom(corrupt).args())
+                .containsEntry("id", "orders")
+                .containsEntry("field", "body");
     }
 
     @Test
-    void toResourceOnACorruptCanonicalBodyIsDocumentUnreadable() {
-        // A stored body that no longer parses (corruption, or a newer grammar) surfaces as a storage io
-        // diagnostic — not a leaked authoring (dsl.*) code for a document the user never authored.
-        Document corrupt =
-                new Document("_id", "orders").append("kind", "source").append("canonical", "not: [valid");
+    void toResourceOnABodyMissingARequiredFieldNamesThatField() {
+        // A stored body missing what this build requires is storage corruption, surfaced as a storage io
+        // diagnostic — not a leaked authoring (dsl.*) code for a document the user never authored. The
+        // field is the whole of the position: a stored document has no line to send anyone to.
+        Document corrupt = new Document("_id", "orders").append("kind", "source")
+                .append("body", new Document("version", "tapstate/v1").append("kind", "source").append("id", "orders"));
 
+        assertThat(unreadableFrom(corrupt).args())
+                .containsEntry("id", "orders")
+                .containsEntry("field", "connector");
+    }
+
+    @Test
+    void toResourceOnABodyFieldOfTheWrongShapeNamesThatField() {
+        Document corrupt = new Document("_id", "orders").append("kind", "source")
+                .append("body", new Document("version", "tapstate/v1").append("kind", "source")
+                        .append("id", "orders").append("connector", "postgres")
+                        .append("srs", List.of("not", "a", "mapping")));
+
+        assertThat(unreadableFrom(corrupt).args())
+                .containsEntry("id", "orders")
+                .containsEntry("field", "srs");
+    }
+
+    @Test
+    void toResourceOnAFreeMapFieldHoldingAListNamesThatField() {
+        // config is read as a free map, so a stored list there is a shape the binder has to refuse
+        // rather than hand on: the model would take it and fail somewhere with no document in hand.
+        Document corrupt = new Document("_id", "orders").append("kind", "source")
+                .append("body", new Document("version", "tapstate/v1").append("kind", "source")
+                        .append("id", "orders").append("connector", "postgres")
+                        .append("config", List.of("host", "port")));
+
+        assertThat(unreadableFrom(corrupt).args())
+                .containsEntry("id", "orders")
+                .containsEntry("field", "config");
+    }
+
+    private static TapstateException unreadableFrom(Document corrupt) {
         Throwable thrown = catchThrowable(() -> MongoArtifactStore.toResource(corrupt));
 
         assertThat(thrown).isInstanceOf(TapstateException.class);
         TapstateException coded = (TapstateException) thrown;
         assertThat(coded.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
-        assertThat(coded.args()).containsEntry("id", "orders");
+        return coded;
     }
 
     @Test
@@ -175,7 +218,7 @@ class MongoArtifactStoreTest {
                 .extracting(StoredArtifactRecord::id, StoredArtifactRecord::kind,
                         StoredArtifactRecord::canonicalForm, StoredArtifactRecord::contentHash,
                         StoredArtifactRecord::readable)
-                .containsExactly("corrupt", "pipeline", "not: [valid", "stale-hash", false);
+                .containsExactly("corrupt", "pipeline", null, "stale-hash", false);
     }
 
     @Test

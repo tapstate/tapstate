@@ -84,6 +84,16 @@ public interface TierBinding {
      */
     void driveStream(String sourceId, StreamVerb verb);
 
+    /**
+     * Cycles the pipeline the way the terminal's {@code restart} does, and says which of its two
+     * forms this is: {@code rereadEverything} is the answer its stop carries, and it is the whole
+     * difference between carrying on and reading the source again.
+     *
+     * <p>The expansion lives in the binding rather than in the executor because it is the product's,
+     * and a tier that ever offers the word directly should be free to send it as one call.
+     */
+    void restart(String pipelineId, boolean rereadEverything);
+
     /** Produces changes against a table while the pipeline runs. */
     void cdc(TableAlias table, CdcOp op, long rows);
 
@@ -149,4 +159,16 @@ public interface TierBinding {
      * one, and that is the one place this reading's emptiness differs from the others'.
      */
     Optional<Long> deadLettered(String pipelineId);
+
+    /**
+     * Reads how many rows a pipeline has had confirmed by its targets, added up over its tables and source
+     * operations, from its metrics face; empty when it has published no observation yet.
+     *
+     * <p>A pipeline that has had nothing confirmed answers nought rather than empty, on the same terms as
+     * the reading above: the face carries no entry until something settles, and no entry is the honest
+     * answer for a pipeline that has settled nothing. What that costs is that nought cannot on its own tell
+     * "nothing has crossed" from "this is not wired", which is why a specification asserting nought here
+     * belongs beside a sibling asserting a real total.
+     */
+    Optional<Long> recordsOut(String pipelineId);
 }

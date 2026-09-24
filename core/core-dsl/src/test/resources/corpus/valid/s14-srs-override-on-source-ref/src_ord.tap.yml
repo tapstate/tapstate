@@ -1,0 +1,10 @@
+# Buffered through the shared replay store by its own configuration; the pipelines below each
+# record their own switch for it, so this value is only ever read when one is first created.
+version: tapstate/v1
+kind: source
+id: src_ord
+connector: mysql
+config: { host: 10.40.0.4, username: cdc_user, password: Ord_2026 }
+mode: cdc
+tables: [ orders ]
+srs: { retention: 7d, schema_evolution: track }

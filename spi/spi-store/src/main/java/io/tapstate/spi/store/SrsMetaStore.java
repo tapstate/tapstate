@@ -16,7 +16,7 @@ import java.util.Optional;
  * is a caller ordering error; a caller that needs to know can {@link #read} first.
  *
  * <p>The mutators each update one facet of an already-seeded record — the source read offset, one
- * consumer's cursor, the cdc start position, or the schema history. A mutate on a chain that has not been
+ * consumer's cursor or snapshot start, or the schema history. A mutate on a chain that has not been
  * seeded is a caller ordering error, surfaced bare (an {@code IllegalStateException}), not laundered into
  * a coded diagnostic that would hide the defect. The durable-frontier bound on a source-read-offset
  * advance (an advance must not pass the slowest consumer's acked position) is the caller's concern; this
@@ -28,6 +28,22 @@ public interface SrsMetaStore {
     Optional<SrsMeta> read(String miningChainId);
 
     /**
+     * The chain's consumer cursors alone, empty when the chain has not been seeded — what the cdc write
+     * path needs, and all of it. Both bounds that path applies are functions of these cursors: the
+     * headroom the ring has left, and how far the durable read offset may advance.
+     *
+     * <p>Separate from {@link #read} because the record also carries a schema history — one entry per DDL,
+     * bounded by what the store retains of it — and this path never looks at it. Fetching the whole record
+     * on every run of changes therefore carries that history back across the wire each time, and the cost
+     * of doing so grows with what the record holds for the life of the chain. A store that can answer this
+     * without the history stops paying for it; one that cannot is still correct, which is why this has a
+     * default at all.
+     */
+    default List<ConsumerOffset> consumerOffsets(String miningChainId) {
+        return read(miningChainId).map(SrsMeta::consumerOffsets).orElse(List.of());
+    }
+
+    /**
      * Seeds a mining chain's first record — no offsets, no consumers, no schema history, carrying only
      * the pass-through {@code retention} config (which may be absent). Insert-only: it must not overwrite
      * an existing record (which would discard the chain's accumulated offset / cursor / schema truth).
@@ -35,11 +51,45 @@ public interface SrsMetaStore {
     void create(String miningChainId, String retention);
 
     /**
-     * Sets the chain's source read offset to {@code sourceReadOffset}, an opaque source capture
-     * watermark. The durable-frontier bound is the caller's concern; this persists the resolved value.
-     * A mutate on an unseeded chain is a caller ordering error.
+     * Advances the chain's source read offset to {@code position} — the source's own token paired with
+     * the order the engine assigned it. The durable-frontier bound (an advance must not pass the slowest
+     * consumer's acked position) is the caller's concern; this persists the resolved value. A mutate on
+     * an unseeded chain is a caller ordering error.
+     *
+     * <p><strong>It only ever moves forward.</strong> A position that does not rank after the one already
+     * recorded is ignored, silently and successfully — not an error, because two writers racing to advance
+     * the same chain is ordinary, and the loser has nothing to report. This is a store guarantee rather
+     * than a caller convention because the failure it prevents is invisible in every other way: a restart
+     * raises the generation while the consumers' acked positions still sit in the generation before it, so
+     * the clamp resolves to a position the chain has already passed. Written down, the next restart resumes
+     * from there and re-mines everything after it — or, once the source has aged past it, cannot.
+     *
+     * <p>Both halves are persisted. The token is what a read resumes from; the order is what the next
+     * comparison — this one included — runs on, and a stored token without it can no longer be ranked
+     * against anything.
      */
-    void advanceSourceReadOffset(String miningChainId, String sourceReadOffset);
+    void advanceSourceReadOffset(String miningChainId, ChainPosition position);
+
+    /**
+     * Puts the chain's source read offset at exactly {@code token}, forward or back, and drops the order
+     * recorded beside it.
+     *
+     * <p>The write-back path, and the only one that may move the offset backwards.
+     * {@link #advanceSourceReadOffset} carries its ordering condition inside its own filter, so handed an
+     * earlier position it matches nothing — silently, because for a reader that is the ordinary case of a
+     * clamp to a consumer that is behind. A rewind routed through it would report success and change
+     * nothing.
+     *
+     * <p>The order goes because there is no truthful value to put there. An order is where the engine
+     * observed that token in the ring; a written-back position names a spot in the source's own log,
+     * which was never observed here and may predate every ring this chain has had. Writing one anyway
+     * would put a made-up coordinate into the comparison that decides which changes are safe to forget.
+     * With none recorded the next advance is admitted whatever generation it carries, which is the state
+     * a fresh run comes back in regardless.
+     *
+     * <p>A mutate on an unseeded chain is a caller ordering error, as with every other mutator here.
+     */
+    void rewindSourceReadOffset(String miningChainId, String token);
 
     /**
      * Inserts or replaces one consumer pipeline's cursor on the chain, keyed by its pipeline id. A
@@ -74,9 +124,10 @@ public interface SrsMetaStore {
     void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position);
 
     /**
-     * Records the chain's snapshot-to-cdc seam: the opaque position the cdc tail starts from, together
-     * with the ring generation the snapshot that reached this seam began in. A mutate on an unseeded chain
-     * is a caller ordering error.
+     * Records one pipeline's snapshot-to-cdc seam: the opaque position its cdc tail starts from, together
+     * with the ring generation that pipeline's snapshot began in. A mutate on an unseeded chain is a
+     * caller ordering error. The consumer entry is created when the pipeline has none yet, and only these
+     * two fields are touched.
      *
      * <p>The two are one call because they are only ever read together. The seam position is the sole
      * record that a snapshot began at all, so a snapshot resuming after a restart looks here to learn
@@ -84,7 +135,7 @@ public interface SrsMetaStore {
      * position without its generation would leave a resumed snapshot with nothing to pin to, and a rerun
      * that then took the current generation would overwrite changes the earlier one had already applied.
      */
-    void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch);
+    void setCdcStart(String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch);
 
     /**
      * Opens the chain's next ring generation and returns it — the monotonic counter every order on this
@@ -94,35 +145,55 @@ public interface SrsMetaStore {
      * <p>Called once per ring establishment: a restart or a re-mine rebuilds the ring and takes a new
      * generation, while a second source force-merging onto an already-open chain joins the generation
      * already running rather than opening one. Generations are per chain, because an order is only ever
-     * compared against another order of the same chain. It leaves the recorded snapshot generation alone —
-     * that is the whole point of keeping the two apart. A mutate on an unseeded chain is a caller ordering
-     * error.
+     * compared against another order of the same chain. It leaves every pipeline's recorded snapshot
+     * generation alone — that is the whole point of keeping them apart. A mutate on an unseeded chain is
+     * a caller ordering error.
      */
     long openEpoch(String miningChainId);
 
     /**
-     * Appends a version to the chain's append-only schema history. A mutate on an unseeded chain is a
-     * caller ordering error.
+     * Appends a version to the chain's schema history — the version just appended is always recorded. A
+     * mutate on an unseeded chain is a caller ordering error.
+     *
+     * <p>A store may bound how much of the history it retains, dropping the oldest versions once the bound
+     * is reached, so a caller must not assume every version ever appended is still there. What it may
+     * assume is that the version it just appended is, because recording a schema change is the whole of
+     * what this call is for. The bound belongs to the store rather than to this contract because the room
+     * it is measured against is the store's own — a record that is one document under a fixed ceiling, of
+     * which this history is the only facet that grows for the life of a chain. A store that kept every
+     * version arrives at a state where this call, the one write that can record a schema change, is the
+     * write the store refuses.
      */
     void appendSchemaVersion(String miningChainId, SchemaVersion version);
 
     /**
-     * Marks one table's bounded snapshot read as drained to completion on the chain. The caller marks a
-     * table only once that table's snapshot has finished, so a reader may take the mark as "every row of
-     * this table has been through" — a distinct question from the one {@link #setCdcStart}
-     * answers, which is where the tail resumes and is written before the snapshot begins. Completion is
-     * per table because one chain carries many, each snapshotted by its own capture run. Marking is
-     * idempotent (set membership): a table already marked stays marked once, so a re-run or replay of a
-     * table's snapshot is safe. A mutate on an unseeded chain is a caller ordering error.
+     * Marks one table's bounded snapshot read as drained to completion <em>for one consumer pipeline</em>.
+     * The caller marks a table only once that pipeline's sink has confirmed that table's rows, so a reader
+     * may take the mark as "every row of this table is in this pipeline's target" — a distinct question
+     * from the one {@link #setCdcStart} answers, which is where that pipeline's tail resumes and is written before the
+     * snapshot begins.
+     *
+     * <p>Per table because one chain carries many, each snapshotted by its own capture run; per pipeline
+     * because each pipeline writes to a target of its own. A chain excludes the table subset from its
+     * identity, so two pipelines reading one database share a chain by construction — and a mark recorded
+     * against the chain alone would answer the second pipeline's question with the first one's answer. It
+     * would then skip a load it had never done and leave its target short of every row of that table, with
+     * the run healthy and nothing logged.
+     *
+     * <p>It creates the consumer entry when the pipeline has none yet, and it touches only the completion
+     * set, so it never clobbers the {@code perTableSeq} the pipeline's reader writes or the
+     * {@code sinkAckedSrcpos} its sink writes to the same record. Marking is idempotent (set membership):
+     * a table already marked stays marked once, so a re-run or replay of a table's snapshot is safe. A
+     * mutate on an unseeded chain is a caller ordering error.
      */
-    void markSnapshotComplete(String miningChainId, String table);
+    void markSnapshotComplete(String miningChainId, String pipelineId, String table);
 
     /**
      * Lists the id of every mining chain that carries a cursor for {@code pipelineId} — exactly the
-     * chains a departing consumer still has to be detached from. It answers from the chains' own records
-     * rather than from the consumer's side, so a caller that cannot derive which chains a pipeline reads
-     * (chain identity is resolved where captures are built, not where artifacts are removed) can still
-     * detach from all of them, and a chain the pipeline never joined is never touched.
+     * chains a departing consumer still has to be detached from. It answers from durable cursor membership,
+     * so a caller that cannot derive which chains a pipeline reads (chain identity is resolved where captures
+     * are built, not where artifacts are removed) can still detach from all of them, and a chain the pipeline
+     * never joined is never touched.
      *
      * <p>It returns ids only, never reconstructed records, so enumerating never fails on a single corrupt
      * document.
@@ -136,6 +207,10 @@ public interface SrsMetaStore {
      * write headroom over every consumer's read cursor — and a consumer that will never advance again
      * pins both, permanently and silently, for every other pipeline on the shared chain.
      *
+     * <p>It removes the whole of that consumer's record, the tables it had finished loading included. That
+     * is what makes a pipeline asked to re-read everything actually re-read it while others stay on the
+     * chain: its completion marks are its own, so clearing them decides nothing on anybody else's behalf.
+     *
      * <p>Unlike the other mutators, this one is idempotent rather than an ordering error on an unseeded
      * chain: a detach states the end condition "this consumer holds nothing here", which an absent chain
      * and an absent cursor already satisfy. Refusing them would let one benign race abort a removal
@@ -143,4 +218,18 @@ public interface SrsMetaStore {
      * exists to prevent.
      */
     void detachConsumer(String miningChainId, String pipelineId);
+
+    /**
+     * Removes a mining chain's whole record — the read offset, every pipeline's seam, the schema
+     * history, and every consumer's cursor with it. Only the last pipeline to leave a chain may call this:
+     * what it removes is shared, and taking it away while another pipeline reads the chain would have that
+     * pipeline read its whole source again with nothing anywhere saying why. A pipeline leaving a chain
+     * others are still on gives back its own record instead — {@link #detachConsumer}.
+     *
+     * <p>Idempotent rather than an ordering error on an absent chain, for the reason
+     * {@link #detachConsumer} is: this states the end condition "there is no record for this chain",
+     * which an absent one already satisfies, and refusing it would let one benign race abandon a
+     * clearing partway.
+     */
+    void dropChain(String miningChainId);
 }

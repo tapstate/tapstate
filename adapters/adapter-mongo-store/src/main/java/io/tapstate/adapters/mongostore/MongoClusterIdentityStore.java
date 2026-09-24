@@ -44,12 +44,13 @@ public final class MongoClusterIdentityStore implements ClusterIdentityStore {
         Object id = document == null ? DOCUMENT_ID : document.get("_id");
         if (document == null) {
             throw new TapstateException(
-                    IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), null);
+                    IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id), "field", "document"), null);
         }
         try {
             return new ClusterIdentity(document.getString("clusterId"));
         } catch (RuntimeException invalid) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", String.valueOf(id)), invalid);
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id), "field", "clusterId"), invalid);
         }
     }
 }

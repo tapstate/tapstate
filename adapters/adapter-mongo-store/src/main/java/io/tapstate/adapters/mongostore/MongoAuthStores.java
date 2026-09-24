@@ -44,11 +44,11 @@ public final class MongoAuthStores {
     public MongoAuthStores(MongoConnection connection) {
         Objects.requireNonNull(connection, "connection");
         MongoDatabase database = connection.database();
-        this.users = new MongoUserStore(database.getCollection(USERS));
-        this.tokens = new MongoTokenStore(database.getCollection(TOKENS));
-        this.sessions = new MongoSessionStore(database.getCollection(SESSIONS));
-        this.audit = new MongoAuditStore(database.getCollection(AUDIT));
-        this.clusterIdentity = new MongoClusterIdentityStore(database.getCollection(CLUSTER_IDENTITY));
+        this.users = new MongoUserStore(SystemCollections.USERS.on(database));
+        this.tokens = new MongoTokenStore(SystemCollections.TOKENS.on(database));
+        this.sessions = new MongoSessionStore(SystemCollections.SESSIONS.on(database));
+        this.audit = new MongoAuditStore(SystemCollections.AUDIT.on(database));
+        this.clusterIdentity = new MongoClusterIdentityStore(SystemCollections.CLUSTER_IDENTITY.on(database));
     }
 
     public UserStore users() {

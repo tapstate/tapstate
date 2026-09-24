@@ -126,6 +126,16 @@
       <artifactId>adapter-pdk</artifactId>
       <version>${revision}</version>
     </dependency>
+    <!-- The bridge's test classes, for its synthetic connectors alone: the sink-writer factory built here
+         can only be driven end to end against a connector, and those are the only ones in the build that
+         need no real jar. Test scope and a test-jar, so nothing from it reaches the shipped artifact. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>adapter-pdk</artifactId>
+      <version>${revision}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
     <!-- The PDK runtime, on the host classpath so a real connector's base class can bootstrap TapRuntime
          through the host loader (a single-arg Class.forName resolved by the host, not the isolated
          connector loader). Runtime scope, not compile: adapter-pdk still compiles against the frozen API
@@ -161,6 +171,19 @@
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>adapter-transform</artifactId>
+      <version>${revision}</version>
+    </dependency>
+    <!-- The metrics export: the port the convergence loop offers facts through, and the OpenTelemetry
+         adapter that carries them out when an endpoint is configured. Wired here so the runtime and the
+         control ring see the port only (rule R7); the SDK stays inside the adapter (rule R3). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>spi-metrics</artifactId>
+      <version>${revision}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>adapter-otel</artifactId>
       <version>${revision}</version>
     </dependency>
     <!-- The driver-free storage port the assembly root exposes to the service rings (StorePort),
@@ -241,6 +264,18 @@
   </dependencies>
 
   <build>
+    <!-- Release packaging stages the pinned Web bundle here before Maven processes resources. Keeping it
+         under target prevents a generated browser asset from becoming a source-tree artifact. A normal
+         developer build without this directory remains a server-only build; the release entry point
+         refuses to package when staging did not happen. -->
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+      </resource>
+      <resource>
+        <directory>${project.build.directory}/generated-resources/tapstate-web</directory>
+      </resource>
+    </resources>
     <plugins>
       <!-- Stamp Add-Opens into the jar manifest so the shipped boot jar opens java.base/java.lang to
            unnamed modules under a bare `java -jar` (the spring-boot repackage below preserves the jar

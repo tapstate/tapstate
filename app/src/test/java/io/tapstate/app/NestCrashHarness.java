@@ -151,7 +151,7 @@ public final class NestCrashHarness {
 
         report = new Report(reportFile);
         KeyedStateStore cold = new MongoKeyedStateStore(MongoClients.create(uri)
-                .getDatabase(MongoStorePort.NEST_STATE_DATABASE)
+                .getDatabase(MongoProperties.DEFAULT_OPERATOR_STATE_DATABASE)
                 .getCollection(MongoStorePort.OPERATOR_STATE));
 
         HazelcastInstance member = member();
@@ -419,6 +419,12 @@ public final class NestCrashHarness {
         public void save(String namespace, String key, byte[] state) {
             LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(delayMillis));
             delegate.save(namespace, key, state);
+        }
+
+        @Override
+        public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(delayMillis));
+            return delegate.saveIfAbsent(namespace, key, state);
         }
 
         @Override

@@ -1,0 +1,143 @@
+# The join operator's performance lane.
+#
+# The ordinary build already runs this gate, on three scenarios and one tier, because a gate that only
+# runs where somebody remembers to look is one this repository has shipped before and found green over
+# cases that had never executed. What that leaves out is the rest of the matrix: eleven scenarios across
+# the three places the operator's state can sit, which is far too much to put in front of every pull
+# request and far too much to leave unmeasured.
+#
+# Where the state sits is not a detail. The resident tier holds everything in memory and the cold tier
+# holds almost none of it, and the two are orders of magnitude apart - so a number with no tier beside it
+# says nothing, and a lane that ran one tier would be reporting on a third of the product.
+#
+# Three triggers, and each is there for a reason the others do not cover:
+#
+#   - schedule, so slow decay is seen. A number measured daily and thrown away is not a trend, and
+#     nothing else here would notice an operator getting five percent worse a month for a year.
+#   - workflow_dispatch, so a release can start this lane on the commit it is about to ship, and so
+#     anyone can ask for it by hand.
+#   - pull_request, path-gated. This one is easy to mistake for redundancy with the ordinary build and
+#     is not: a workflow file that has never been on the default branch cannot be started any other way.
+#     A schedule fires only on the default branch, and a dispatch needs the workflow registered there
+#     first - so on the change that introduces this lane, this trigger is the only thing that can
+#     demonstrate the lane runs at all, rather than being asserted to run once it merges.
+#
+# The measured rows are kept as an artifact and read back from the previous run, which is the whole of
+# what makes this a trend rather than a daily reading. The comparison prints; it does not fail. What
+# fails is the gate itself, in the test - a second opinion about the same numbers would only ever
+# disagree with the first one.
+name: join performance
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Off the hour: scheduled runs queue, and the top of an hour is where everyone else's are.
+    - cron: "40 18 * * *"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "runtime/engine/src/main/java/io/tapstate/runtime/engine/join/**"
+      - "runtime/engine/src/test/java/io/tapstate/runtime/engine/join/**"
+      - "runtime/engine/src/test/resources/join-performance.golden"
+      - ".github/workflows/join-perf.yml"
+
+concurrency:
+  group: join-perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  join-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read # read the previous run's artifact, for the trend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: every scenario, on every tier
+        run: |
+          set -o pipefail
+          # -Dtest= reaches every module -am builds, and surefire fails the first upstream one
+          # that holds no such test. The flag below is the one that governs that, and it does not
+          # weaken the lane: a run that measured nothing is caught by the row count in the next
+          # step, which is stricter than surefire could be about it.
+          mvn -B -pl runtime/engine -am test -Dtest=JoinPerformanceGateTest \
+              -Dsurefire.failIfNoSpecifiedTests=false -Djacoco.skip=true \
+              -Djoinperf.scenarios=F1,F2,I1,I2,I3,I4,R1,R2,R3,R4,R5 \
+              -Djoinperf.tiers=hot,mixed,cold 2>&1 | tee run.log
+
+      - name: the rows this run measured
+        # Extracted rather than scraped later: a lane that finished green having measured nothing is
+        # the failure this whole file exists against, so the count is checked here where it is still
+        # attributable, instead of showing up as an empty artifact nobody opens.
+        run: |
+          grep '^joinperf	' run.log > join-perf.tsv || true
+          rows=$(grep -c '^joinperf	' join-perf.tsv || true)
+          echo "measured $rows row(s)"
+          # One header line plus eleven scenarios on each of three tiers.
+          if [ "$rows" -lt 34 ]; then
+            echo "::error::the lane produced $rows row(s) where 34 were expected - it ran a subset, or it did not run"
+            exit 1
+          fi
+          cat join-perf.tsv >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: join-perf-trend
+          path: join-perf.tsv
+          retention-days: 90
+
+      - name: what moved since the last run of this lane
+        # Informational on purpose. The threshold lives in the test, where the recorded numbers are;
+        # a second judgement here would be a second place to argue with, and the two would drift.
+        #
+        # Paired by scenario and tier rather than diffed line by line. A plain diff of this file marks
+        # every row every night, because two of its columns are milliseconds and no two runs agree on
+        # those to a tenth - so the reader is handed thirty-three changed lines and no way to see which
+        # one moved for a reason. What a slow decay looks like is one ratio climbing a few percent a
+        # month, and it is only visible next to the number it used to be.
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          previous="$(gh run list --workflow join-perf.yml --branch "${GITHUB_REF_NAME}" \
+              --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          if [ -z "$previous" ]; then
+            echo "no earlier successful run of this lane on ${GITHUB_REF_NAME} - this is the baseline."
+            exit 0
+          fi
+          gh run download "$previous" --name join-perf-trend --dir previous || {
+            echo "the earlier run kept no rows; nothing to compare against."
+            exit 0
+          }
+          {
+            echo "### against run $previous"
+            echo ""
+            echo "| scenario | tier | ratio then | ratio now | move |"
+            echo "|---|---|---|---|---|"
+            awk -F'\t' '
+              FNR==NR { if ($2 != "scenario") was[$2 "/" $3] = $8; next }
+              $2 == "scenario" { next }
+              {
+                key = $2 "/" $3
+                then_ = (key in was) ? was[key] : ""
+                if (then_ == "" || then_ + 0 == 0) { move = "new" }
+                else {
+                  pct = ($8 - then_) / then_ * 100
+                  move = sprintf("%+.0f%%", pct)
+                  if (pct > 20 || pct < -20) move = move " <-"
+                }
+                printf "| %s | %s | %s | %s | %s |\n", $2, $3, (then_ == "" ? "-" : then_), $8, move
+              }
+            ' previous/join-perf.tsv join-perf.tsv
+            echo ""
+            echo "An arrow marks a fifth either way. One of those is noise; the same one every night is not."
+          } >> "$GITHUB_STEP_SUMMARY"

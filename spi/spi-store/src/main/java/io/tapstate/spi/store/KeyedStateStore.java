@@ -30,35 +30,42 @@ public interface KeyedStateStore {
     Optional<byte[]> load(String namespace, String key);
 
     /**
-     * The states held under {@code keys} in {@code namespace}, by the key each was found under. A key with
-     * nothing under it is absent from the answer rather than mapped to null, so the size of what comes back
-     * is how many of them existed.
+     * The states held under {@code keys} in {@code namespace}, under the names they were asked for, with
+     * a key that has no state simply absent. Order is not part of the answer.
      *
-     * <p><b>This is not the listing the contract above forbids.</b> The caller names every key it wants, so
-     * this reads exactly what the same keys passed one at a time would have read and never touches the
-     * keyspace. The distinction is between being handed keys and being asked to find them.
+     * <p><b>This is not the enumeration the class note forbids, and the difference is which side holds
+     * the keys.</b> The caller arrives already knowing every key it wants — they came off a reverse index
+     * or off a batch of changes — and asks for their states; it never asks what a namespace contains. A
+     * listing would answer a question nobody here can pose.
      *
-     * <p>It exists because the per-key form is a round trip each, and that cost is invisible from above: a
-     * caller holding a whole set of keys would otherwise turn one reach into as many trips as it has keys,
-     * and the only trace is a number that grows with the keys asked for while the reach count stays at one.
+     * <p><b>An implementation must not answer it by scanning</b>, for the reason {@link #count} must not
+     * either: a whole-collection read wearing the name of a keyed one is the same cost with none of the
+     * warning, and it would be paid per batch rather than once. It must also not answer it by looping over
+     * {@link #load} while <em>believing</em> it batched — the default below loops openly, so a store that
+     * cannot do better inherits the honest version and a store that overrides is saying it did better.
      *
-     * <p><b>How much it saves depends on how the keys reach here, and a caller in front of a partitioned
-     * map should not expect much.</b> Measured on the nest operator, whose batches arrive through such a
-     * map: the substrate hands a store the missing keys one partition at a time, so forty identities in
-     * forty partitions arrive as forty calls of one key each and the count is unchanged. What it saves
-     * there is only the keys that happen to share a partition - measured, two trips out of sixty-nine.
-     * A caller that holds its keys directly saves the whole difference.
+     * <p>Its reason for existing is a caller that would otherwise ask for a million keys one at a time.
+     * Where the store is remote that is a million round trips: the same work as a few thousand batched
+     * ones, taking three orders of magnitude longer, with nothing anywhere reporting a problem — the run
+     * is merely slow, and the most natural diagnosis (the store is slow) points away from the cause.
      *
-     * <p>The default asks one at a time, so an implementation with no batch read of its own stays correct
-     * without writing anything. One that has a batch read should override this - that is the whole point of
-     * the method, and an implementation that leaves the default in place has not made the cost go away.
+     * <p><b>How much it saves depends on how the keys reach here, and a caller in front of a
+     * partitioned map should not expect much.</b> Measured on the nest operator, whose batches arrive
+     * through such a map: the substrate hands a store the missing keys one partition at a time, so
+     * forty identities in forty partitions arrive as forty calls of one key each and the count is
+     * unchanged. What it saves there is only the keys that happen to share a partition - measured, two
+     * trips out of sixty-nine. A caller that holds its keys directly saves the whole difference.
+     *
+     * <p>An empty {@code keys} reaches the store not at all. A caller on the event path arrives with one
+     * routinely — a change touching only keys already in memory — so the round trip it would otherwise
+     * cost is paid in the common case rather than the odd one.
      */
     default Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
-        Map<String, byte[]> found = new LinkedHashMap<>();
+        Map<String, byte[]> loaded = new LinkedHashMap<>();
         for (String key : keys) {
-            load(namespace, key).ifPresent(state -> found.put(key, state));
+            load(namespace, key).ifPresent(state -> loaded.put(key, state));
         }
-        return found;
+        return loaded;
     }
 
     /**
@@ -67,6 +74,20 @@ public interface KeyedStateStore {
      * so a write that is still in flight is a write that a crash loses with nothing reporting it.
      */
     void save(String namespace, String key, byte[] state);
+
+    /**
+     * Stores {@code state} under {@code key} only if the key holds nothing, and says what was already
+     * there: empty when this call is what stored it, and the value that was already present when it was
+     * not. One operation rather than a load followed by a save, because the answer is what callers decide
+     * on -- a connector minting an identity keeps the one that is returned, so two callers that both read
+     * "nothing there" would mint two identities and each keep its own. Where that identity names an
+     * external resource, the second one is a resource nobody will ever come back for.
+     *
+     * <p>Reaching durable storage before returning is required of it exactly as it is of {@code save}. An
+     * implementation that cannot do this in one atomic step must say so by refusing rather than by
+     * approximating it with a load and a save.
+     */
+    Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state);
 
     /** Removes the entry under {@code key}, if there is one. Removing what is not there is not an error. */
     void delete(String namespace, String key);

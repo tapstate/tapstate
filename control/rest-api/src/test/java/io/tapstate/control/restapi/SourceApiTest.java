@@ -3,18 +3,29 @@ package io.tapstate.control.restapi;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import io.tapstate.control.core.AuditGate;
-import io.tapstate.control.core.AuditedSourceService;
+import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.ArtifactMutationService;
+import io.tapstate.control.core.ArtifactQueryService;
+import io.tapstate.control.core.ConnectionTestResultQueryService;
+import io.tapstate.control.core.ConnectionTestService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.OperationRegistry;
+import io.tapstate.control.core.SchemaDiscoveryService;
+import io.tapstate.control.core.SchemaQueryService;
+import io.tapstate.control.core.SchemaReport;
+import io.tapstate.control.core.SourceConnectionResolver;
 import io.tapstate.control.core.Scope;
-import io.tapstate.control.core.SourceService;
+import io.tapstate.control.core.SourceSchemaQueryService;
+import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -23,8 +34,19 @@ import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
+import io.tapstate.spi.store.ConnectionTestResult;
+import io.tapstate.spi.store.ConnectionTestResultStore;
+import io.tapstate.runtime.probe.ConnectionProbe;
+import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
+import io.tapstate.spi.store.ConnectionConfig;
+import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
+import io.tapstate.spi.store.SchemaStore;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -82,7 +104,65 @@ class SourceApiTest {
     @BeforeEach
     void reset() {
         context.getBean(InMemoryArtifactStore.class).clear();
+        context.getBean(InMemorySchemaStore.class).clear();
+        context.getBean(RecordingConnectionProbe.class).clear();
+        context.getBean(InMemoryConnectionTestResultStore.class).clear();
         context.getBean(RecordingAuditStore.class).reset();
+    }
+
+    @Test
+    void sourceSchemaContainsOnlyTablesTheSourceSelects() throws Exception {
+        create("orders", "before");
+        context.getBean(InMemorySchemaStore.class).save(new DiscoveredSourceModel(
+                "orders", "mysql", 1_700_000_000_000L, new SourceModel(List.of(
+                        new SourceTable("orders", List.of(new SourceField("id", "bigint")), List.of("id"), List.of()),
+                        new SourceTable("payments", List.of(new SourceField("id", "varchar")), List.of("id"), List.of()),
+                        new SourceTable("audit_log", List.of(new SourceField("id", "bigint")), List.of("id"), List.of()),
+                        new SourceTable("customers", List.of(new SourceField("id", "bigint")), List.of("id"), List.of())))));
+
+        ResponseEntity<String> response = request("reader").get().uri("/api/sources/orders/schema")
+                .retrieve().toEntity(String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode body = JSON.readTree(response.getBody());
+        assertThat(body.path("connectionId").asText()).isEqualTo("orders");
+        assertThat(body.path("tables")).extracting(table -> table.path("name").asText())
+                .containsExactly("orders", "audit_log", "customers");
+    }
+
+    @Test
+    void refreshingASavedSourceDoesNotLoseItsPersistedPassword() throws Exception {
+        create("mysql-refresh", "saved");
+
+        JsonNode saved = JSON.readTree(request("reader").get().uri("/api/sources/mysql-refresh")
+                .retrieve().body(String.class));
+        assertThat(saved.path("config").has("password")).isFalse();
+
+        Map<String, Object> redactedConfig = JSON.convertValue(saved.path("config"), Map.class);
+        SchemaReport report = request("writer").post().uri("/api/connections:discover-schema")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of(
+                        "id", saved.path("id").asText(),
+                        "connectorId", saved.path("connector").asText(),
+                        "settings", redactedConfig))
+                .retrieve().toEntity(SchemaReport.class).getBody();
+
+        assertThat(report.connectionId()).isEqualTo("mysql-refresh");
+        assertThat(context.getBean(RecordingSchemaDiscoveryProbe.class).captured().settings())
+                .containsEntry("password", SECRET);
+    }
+
+    @Test
+    void aSavedSourceCanBeTestedOverRestWithoutPostingSettings() {
+        create("mysql-test", "saved");
+
+        request("writer").post().uri("/api/connections:test")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "mysql-test", "connectorId", "mysql"))
+                .retrieve().toBodilessEntity();
+
+        assertThat(context.getBean(RecordingConnectionProbe.class).captured().settings())
+                .containsEntry("password", SECRET);
     }
 
     @Test
@@ -201,6 +281,34 @@ class SourceApiTest {
     }
 
     @Test
+    void concurrentCreatesOfTheSameIdAllowExactlyOneWinner() throws Exception {
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try (ExecutorService callers = Executors.newFixedThreadPool(2)) {
+            Future<RaceResult> alpha = callers.submit(
+                    () -> createAtBarrier("alpha", ready, start));
+            Future<RaceResult> beta = callers.submit(
+                    () -> createAtBarrier("beta", ready, start));
+            ready.await();
+            start.countDown();
+
+            List<RaceResult> outcomes = List.of(alpha.get(), beta.get());
+            assertThat(outcomes).extracting(RaceResult::status)
+                    .containsExactlyInAnyOrder(HttpStatus.CREATED, HttpStatus.CONFLICT);
+            assertThat(outcomes).filteredOn(result -> result.status() == HttpStatus.CONFLICT)
+                    .singleElement().extracting(RaceResult::code).isEqualTo("source.already-exists");
+            String winner = outcomes.stream()
+                    .filter(result -> result.status() == HttpStatus.CREATED)
+                    .findFirst().orElseThrow().description();
+            String stored = request("reader").get().uri("/api/sources/orders")
+                    .retrieve().body(String.class);
+            assertThat(JSON.readTree(stored).path("metadata").path("description").asText())
+                    .isEqualTo(winner);
+        }
+    }
+
+    @Test
     void mapsDomainConflictsAndRejectsResponseOnlyOrUnknownRequestFields() {
         ResponseEntity<String> created = create("orders", "before");
         assertError(request("writer").post().uri("/api/sources")
@@ -223,10 +331,46 @@ class SourceApiTest {
                 HttpStatus.BAD_REQUEST, "control.malformed-request");
 
         context.getBean(InMemoryArtifactStore.class).save(
-                new PipelineResource("pipeline", null, List.of("orders"), null, null, null, null, null));
+                new PipelineResource("pipeline", null, List.of(SourceRef.bare("orders")), null, null, null, null, null));
         assertError(request("writer").delete().uri("/api/sources/orders")
                         .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag()),
                 HttpStatus.CONFLICT, "source.in-use");
+    }
+
+    @Test
+    void sourceCreateRejectsABodyMissingATopLevelRequiredField() {
+        // This path builds the record straight from JSON, so a required component left out is refused
+        // by the record's own constructor rather than by any rule that could carry a diagnostic. That
+        // refusal still has to reach the caller as a code: uncaught it becomes the stack trace this
+        // API reserves for a defect on its own side. Neither neighbour covers it - one adds a field
+        // the shape does not have, the other omits a field inside the connector config.
+        for (String required : List.of("\"connector\":\"mysql\",", "\"id\":\"gap\",")) {
+            String body = sourceJson("gap", "bad").replace(required, "");
+            assertThat(body).doesNotContain(required);
+            assertError(request("writer").post().uri("/api/sources")
+                            .contentType(MediaType.APPLICATION_JSON).body(body),
+                    HttpStatus.BAD_REQUEST, "control.malformed-request");
+        }
+    }
+
+    @Test
+    void sourceCreateRejectsAConfigNumberNoStoreCanHoldInsteadOfCrashingOnTheWayToOne() {
+        // The accepted-types list admits any JSON integer, and past 64 bits there is no store to put one
+        // in. It used to be taken here and met further in by the writer that turns the model into text --
+        // which has no field, no document and no code to answer with, so the caller got a component name
+        // and a 500 about a value they had written themselves.
+        //
+        // Only the integer is driven from here. The other unstorable width is a decimal that is not the
+        // same decimal once it is a double, and this face cannot deliver one: nothing configures Jackson
+        // to bind a JSON float as BigDecimal, so it arrives already narrowed to a double. Refusing it is
+        // kept where a value that has not been through a face is written, and is a guard rather than a
+        // path -- asserting it here would assert something no request can reach.
+        String body = sourceJson("wide", "bad").replace("\"port\":3306", "\"port\":99999999999999999999");
+        assertThat(body).contains("99999999999999999999");
+
+        assertError(request("writer").post().uri("/api/sources")
+                        .contentType(MediaType.APPLICATION_JSON).body(body),
+                HttpStatus.BAD_REQUEST, "control.malformed-request");
     }
 
     @Test
@@ -324,6 +468,26 @@ class SourceApiTest {
                 });
     }
 
+    private RaceResult createAtBarrier(
+            String description, CountDownLatch ready, CountDownLatch start) throws Exception {
+        ready.countDown();
+        start.await();
+        return request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(sourceJson("orders", description))
+                .exchange((req, res) -> {
+                    HttpStatus status = HttpStatus.valueOf(res.getStatusCode().value());
+                    if (status == HttpStatus.CREATED) {
+                        String body = res.bodyTo(String.class);
+                        String storedDescription = JSON.readTree(body)
+                                .path("metadata").path("description").asText();
+                        return new RaceResult(status, null, storedDescription);
+                    }
+                    ApiError error = res.bodyTo(ApiError.class);
+                    return new RaceResult(status, error.code(), null);
+                });
+    }
+
     private ResponseEntity<String> create(String id, String description) {
         return request("writer").post().uri("/api/sources")
                 .contentType(MediaType.APPLICATION_JSON).body(sourceJson(id, description))
@@ -375,16 +539,57 @@ class SourceApiTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class,
-            SourceDraftTestConfiguration.class, SourceServiceTestConfiguration.class,
+            SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             SourceController.class,
             SourceDraftController.class,
+            ConnectionController.class,
             ApiExceptionHandler.class})
     static class TestApp {
         @Bean InMemoryArtifactStore artifactStore() { return new InMemoryArtifactStore(); }
+        @Bean InMemorySchemaStore schemaStore() { return new InMemorySchemaStore(); }
+        @Bean SourceConnectionResolver sourceConnectionResolver(InMemoryArtifactStore artifacts) {
+            return new SourceConnectionResolver(artifacts);
+        }
+        @Bean SourceSchemaQueryService sourceSchemaQueryService(ArtifactStore artifacts, SchemaStore schemas) {
+            return new SourceSchemaQueryService(artifacts, schemas);
+        }
+        @Bean RecordingSchemaDiscoveryProbe schemaDiscoveryProbe() { return new RecordingSchemaDiscoveryProbe(); }
+        @Bean SchemaDiscoveryService schemaDiscoveryService(
+                RecordingSchemaDiscoveryProbe probe, InMemorySchemaStore schemas, AuditGate auditGate, Clock clock,
+                SourceConnectionResolver sourceConnections) {
+            return new SchemaDiscoveryService(probe, schemas, auditGate, clock, null, sourceConnections);
+        }
+        @Bean RecordingConnectionProbe connectionProbe() { return new RecordingConnectionProbe(); }
+        @Bean InMemoryConnectionTestResultStore connectionTestResultStore() {
+            return new InMemoryConnectionTestResultStore();
+        }
+        @Bean ConnectionTestService connectionTestService(
+                ConnectionProbe probe, ConnectionTestResultStore results, AuditGate auditGate,
+                SourceConnectionResolver sourceConnections) {
+            return new ConnectionTestService(probe, results, auditGate, null, sourceConnections);
+        }
+        @Bean ConnectionTestResultQueryService connectionTestResultQueryService(ConnectionTestResultStore results) {
+            return new ConnectionTestResultQueryService(results);
+        }
+        @Bean SchemaQueryService schemaQueryService(SchemaStore schemas) {
+            return new SchemaQueryService(schemas);
+        }
         @Bean RecordingAuditStore auditStore() { return new RecordingAuditStore(); }
         @Bean Clock clock() { return Clock.fixed(Instant.parse("2026-07-13T00:00:00Z"), ZoneOffset.UTC); }
-        @Bean AuditedSourceService auditedSourceService(SourceService source, AuditStore audits, Clock clock) {
-            return new AuditedSourceService(source, new AuditGate(audits, clock));
+        @Bean AuditGate auditGate(AuditStore auditStore, Clock clock) {
+            return new AuditGate(auditStore, clock);
+        }
+        @Bean ApplyService applyService(ArtifactStore store, AuditGate auditGate) {
+            return new ApplyService(TapstateCatalog::load, store, auditGate, new EmptySchemaStore(),
+                    PlanAdvisories.none(), io.tapstate.control.core.SchemaDerivation.none());
+        }
+        @Bean ArtifactQueryService artifactQueryService(ArtifactStore store) {
+            return new ArtifactQueryService(store);
+        }
+        @Bean ArtifactMutationService artifactMutationService(ArtifactStore store, AuditGate auditGate) {
+            return new ArtifactMutationService(
+                    store, NoReclaimStores.desired(), NoReclaimStores.state(),
+                    NoReclaimStores.observations(), NoReclaimStores.srsMeta(), auditGate, DataBrowserFollows.NONE);
         }
         @Bean OperationRegistry operationRegistry() { return ControlOperations.registry(); }
         @Bean TokenStore tokenStore() { return new EmptyTokenStore(); }
@@ -454,7 +659,77 @@ class SourceApiTest {
         public synchronized Optional<Resource> get(String id) { return Optional.ofNullable(byId.get(id)); }
         public synchronized List<Resource> list() { return new ArrayList<>(byId.values()); }
         private static String hash(Resource resource) {
-            return CanonicalHash.of(new CanonicalWriter().write(resource));
+            return CanonicalHash.of(resource);
+        }
+    }
+
+    private static final class InMemorySchemaStore implements SchemaStore {
+        private final Map<String, DiscoveredSourceModel> byId = new LinkedHashMap<>();
+
+        synchronized void clear() {
+            byId.clear();
+        }
+
+        @Override
+        public synchronized void save(DiscoveredSourceModel discovered) {
+            byId.put(discovered.connectionId(), discovered);
+        }
+
+        @Override
+        public synchronized Optional<DiscoveredSourceModel> get(String connectionId) {
+            return Optional.ofNullable(byId.get(connectionId));
+        }
+    }
+
+    private static final class InMemoryConnectionTestResultStore implements ConnectionTestResultStore {
+        private final Map<String, ConnectionTestResult> byId = new LinkedHashMap<>();
+
+        synchronized void clear() {
+            byId.clear();
+        }
+
+        @Override
+        public synchronized void save(ConnectionTestResult result) {
+            byId.put(result.connectionId(), result);
+        }
+
+        @Override
+        public synchronized Optional<ConnectionTestResult> find(String connectionId) {
+            return Optional.ofNullable(byId.get(connectionId));
+        }
+    }
+
+    private static final class RecordingConnectionProbe implements ConnectionProbe {
+        private ConnectionConfig captured;
+
+        void clear() {
+            captured = null;
+        }
+
+        ConnectionConfig captured() {
+            return captured;
+        }
+
+        @Override
+        public ConnectionTestResult probe(ConnectionConfig config) {
+            captured = config;
+            return new ConnectionTestResult(
+                    config.id(), config.connectorId(), ConnectionTestResult.Outcome.PASSED, List.of(), 1L);
+        }
+    }
+
+    private static final class RecordingSchemaDiscoveryProbe implements SchemaDiscoveryProbe {
+        private ConnectionConfig captured;
+
+        ConnectionConfig captured() {
+            return captured;
+        }
+
+        @Override
+        public SourceModel discover(ConnectionConfig config) {
+            captured = config;
+            return new SourceModel(List.of(new SourceTable(
+                    "orders", List.of(new SourceField("id", "bigint")), List.of("id"), List.of())));
         }
     }
 }

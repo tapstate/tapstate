@@ -14,11 +14,12 @@ class ControlApiSchemaTest {
     private static final Set<String> MCP_OPERATIONS = Set.of(
             "system.version",
             "connector.list", "connector.get",
-            "source.draft",
+            "source.draft", "source.list",
             "connection.test", "connection.test-result", "connection.discover-schema", "connection.schema",
             "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
-            "pipeline.start", "pipeline.stop", "pipeline.status", "pipeline.metrics",
-            "pipeline.snapshot", "pipeline.logs",
+            "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+            "pipeline.status", "pipeline.metrics",
+            "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain",
             "data-browser.collections", "data-browser.find", "data-browser.stats");
 
     @Test
@@ -79,6 +80,43 @@ class ControlApiSchemaTest {
             assertThat(definitions.containsKey(
                     operation.schema().result().substring("#/$defs/".length()))).isTrue();
         }
+    }
+
+    @Test
+    void observabilityReadsPublishClosedTypedSchemas() {
+        Map<?, ?> historyRequest = ControlApiSchema.resolve(
+                ControlOperations.PIPELINE_METRICS_HISTORY.schema().params());
+        assertThat(historyRequest.get("additionalProperties")).isEqualTo(false);
+        assertThat(historyRequest.get("required")).isEqualTo(List.of("id", "from", "to"));
+        Map<?, ?> requestProperties = (Map<?, ?>) historyRequest.get("properties");
+        assertThat(requestProperties.keySet().stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("id", "from", "to", "resolution", "limit", "table", "cursor");
+        assertThat(((Map<?, ?>) requestProperties.get("limit")).get("maximum"))
+                .isEqualTo(PipelineHistoryQuery.MAX_LIMIT);
+        assertThat(((Map<?, ?>) requestProperties.get("table")).get("maxItems"))
+                .isEqualTo(PipelineHistoryQuery.MAX_TABLES);
+
+        Map<?, ?> historyResult = ControlApiSchema.resolve(
+                ControlOperations.PIPELINE_METRICS_HISTORY.schema().result());
+        assertThat(historyResult.get("additionalProperties")).isEqualTo(false);
+        assertThat(((List<?>) historyResult.get("required")).stream().map(String::valueOf).toList())
+                .contains("segments", "gaps", "unavailable", "nextCursor", "consistency");
+        Map<?, ?> historyProperties = (Map<?, ?>) historyResult.get("properties");
+        Map<?, ?> segments = (Map<?, ?>) historyProperties.get("segments");
+        Map<?, ?> segment = (Map<?, ?>) segments.get("items");
+        Map<?, ?> segmentProperties = (Map<?, ?>) segment.get("properties");
+        Map<?, ?> startReason = (Map<?, ?>) segmentProperties.get("startReason");
+        assertThat(((List<?>) startReason.get("enum")).stream().map(String::valueOf).toList())
+                .containsExactly("WINDOW_START", "CONTINUATION", "COUNTER_RESET", "GAP");
+
+        Map<?, ?> explainResult = ControlApiSchema.resolve(ControlOperations.PIPELINE_EXPLAIN.schema().result());
+        assertThat(explainResult.get("additionalProperties")).isEqualTo(false);
+        assertThat(((List<?>) explainResult.get("required")).stream().map(String::valueOf).toList())
+                .contains("kind", "evidence", "cannotSay", "next", "freshness");
+        Map<?, ?> evidence = (Map<?, ?>) ((Map<?, ?>) ((Map<?, ?>) explainResult.get("properties"))
+                .get("evidence")).get("items");
+        assertThat(((List<?>) evidence.get("required")).stream().map(String::valueOf).toList())
+                .containsExactly("source", "field", "value");
     }
 
     /**

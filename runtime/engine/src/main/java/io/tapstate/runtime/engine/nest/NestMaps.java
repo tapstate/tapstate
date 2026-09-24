@@ -7,6 +7,8 @@ import com.hazelcast.config.MapConfig;
 import com.hazelcast.config.MapStoreConfig;
 import com.hazelcast.config.MaxSizePolicy;
 
+import java.util.Properties;
+
 /**
  * What every map holding nest state is configured to be. The maps themselves are created on demand, by
  * name, as vertices start asking for them; this is the one place that decides what they are when they
@@ -53,6 +55,9 @@ final class NestMaps {
      */
     static final String NAMESPACE_PREFIX = "nest.";
 
+    /** Map-store property carrying the database selected for one exact nest namespace. */
+    static final String STATE_DATABASE_PROPERTY = "tapstate.nest.state-database";
+
     /**
      * The smallest memory budget that still means what it says, which is the substrate's partition count.
      * The budget is spent per partition rather than per map: below this it has been rounded up to one entry
@@ -80,7 +85,11 @@ final class NestMaps {
      * only for the keys it is actually asked about.
      */
     static MapConfig backedStateMaps(long entriesHeldInMemory) {
-        return backedStateMaps(NAMESPACE_PREFIX + "*", entriesHeldInMemory);
+        return backedStateMaps(NAMESPACE_PREFIX + "*", entriesHeldInMemory, null);
+    }
+
+    static MapConfig backedStateMaps(long entriesHeldInMemory, String database) {
+        return backedStateMaps(NAMESPACE_PREFIX + "*", entriesHeldInMemory, database);
     }
 
     /**
@@ -94,11 +103,22 @@ final class NestMaps {
      * live store does not survive being written down.
      */
     static MapConfig backedStateMaps(String name, long entriesHeldInMemory) {
+        return backedStateMaps(name, entriesHeldInMemory, null);
+    }
+
+    static MapConfig backedStateMaps(String name, long entriesHeldInMemory, String database) {
+        Properties properties = new Properties();
+        // Absence means the OperatorStateStores deployment default. A magic string cannot represent that:
+        // every legal string, including "default", is also a real MongoDB database name.
+        if (database != null) {
+            properties.setProperty(STATE_DATABASE_PROPERTY, database);
+        }
         MapConfig config = stateMaps().setName(name).setMapStoreConfig(new MapStoreConfig()
                 .setEnabled(true)
                 .setWriteDelaySeconds(0)
                 .setInitialLoadMode(MapStoreConfig.InitialLoadMode.LAZY)
-                .setFactoryClassName(NestStateMapStoreFactory.class.getName()));
+                .setFactoryClassName(NestStateMapStoreFactory.class.getName())
+                .setProperties(properties));
         // Only ever here, where the store above is what an evicted entry comes back from. On the
         // configuration without one, evicting is losing: the entry is in no other place, and what the map
         // answers afterwards is the absence rather than the state - a resolver that stops answering for
@@ -109,6 +129,13 @@ final class NestMaps {
                 .setMaxSizePolicy(MaxSizePolicy.PER_NODE)
                 .setSize(Math.toIntExact(entriesHeldInMemory));
         return config;
+    }
+
+    static String stateDatabase(MapConfig config) {
+        if (config == null || config.getMapStoreConfig() == null) {
+            return null;
+        }
+        return config.getMapStoreConfig().getProperties().getProperty(STATE_DATABASE_PROPERTY);
     }
 
     /**

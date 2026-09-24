@@ -3,11 +3,17 @@ package io.tapstate.adapters.pdk;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.JsonReader;
 import io.tapdata.entity.codec.TapCodecsRegistry;
+import io.tapdata.entity.codec.filter.TapCodecsFilterManager;
+import io.tapdata.entity.conversion.impl.TargetTypesGeneratorImpl;
+import io.tapdata.entity.schema.TapField;
+import io.tapdata.entity.schema.type.TapRaw;
 import io.tapdata.entity.conversion.impl.TableFieldTypesGeneratorImpl;
 import io.tapdata.entity.mapping.DefaultExpressionMatchingMap;
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.utils.DataMap;
 import io.tapdata.pdk.apis.TapConnector;
+import io.tapstate.core.model.PipelineNode;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.entity.ConnectorCapabilities;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
@@ -47,28 +53,65 @@ final class PdkConnector implements AutoCloseable {
     private final TapConnector connector;
     private final ConnectorFunctions functions;
     private final TapConnectorContext context;
-    private final DefaultExpressionMatchingMap dataTypesMap;
+    private final String stateNamespace;
+    /** The pipeline this handle was opened for, or null for a drive that names none. */
+    private final String pipelineId;
+    private final TapCodecsRegistry codecs;
     /** Volatile because the thread that stops an instance is rarely the thread that drove it. */
     private volatile boolean stopped;
 
     private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
-                         DefaultExpressionMatchingMap dataTypesMap) {
+                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId) {
         this.connectorId = connectorId;
         this.loader = loader;
         this.connector = connector;
         this.functions = functions;
         this.context = context;
-        this.dataTypesMap = dataTypesMap;
+        this.stateNamespace = stateNamespace;
+        this.pipelineId = pipelineId;
+        this.codecs = codecs;
+    }
+
+    /**
+     * Loads, level-gates and constructs the connector named by {@code ref} for a drive that scopes
+     * nothing it keeps for itself — the read-only drives, which live for a single call and so have no
+     * later drive for anything they wrote to be read back by.
+     */
+    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings) {
+        return open(connectorId, ref, settings, null, null);
     }
 
     /**
      * Loads, level-gates and constructs the connector named by {@code ref}, returning a drivable
      * handle. Throws a coded connector-domain exception for the structural failures: an incompatible
      * API level, a missing / non-connector class, or an un-instantiable connector.
+     *
+     * <p>{@code node} is the pipeline node the drive is for, and null for a drive that names none. It
+     * decides two things at once, which is why it is carried rather than derived away at the call: where
+     * whatever this connector keeps for itself belongs, and which pipeline its own log lines are filed
+     * against. Passing one and not the other would let a connector's notes and its words disagree about
+     * whose run they belong to.
      */
-    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings) {
+    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+                             PipelineNode node) {
+        return open(connectorId, ref, settings, node, null);
+    }
+
+    /**
+     * As above, with the store the connector's own notes are kept in. When a namespace and a store are
+     * both present the notes outlive this handle and the next open of the same node reads them back;
+     * with either missing they live and die with the handle, which is what the read-only drives get and
+     * what every caller got before there was anywhere to put them.
+     */
+    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+                             PipelineNode node, KeyedStateStore stateStore) {
         ensureDeploymentIdentity();
+        // The contract's shared static log channel prints to standard output until somebody listens, and
+        // the first connector opened is the earliest point at which anybody has.
+        ConnectorLog.installSharedChannel();
+        String stateNamespace = ConnectorStateNamespace.of(node);
+        String pipelineId = node == null ? null : node.pipelineId();
         gateApiLevel(connectorId, ref);
 
         ConnectorClassLoader loader;
@@ -83,12 +126,17 @@ final class PdkConnector implements AutoCloseable {
             ClassLoader restore = Thread.currentThread().getContextClassLoader();
             TapConnector connector;
             ConnectorFunctions functions = new ConnectorFunctions();
+            // Held, not discarded: the value codecs a connector registers here are the only place it
+            // says how its own driver types become portable values, and every row it hands over is
+            // read through them. A registry constructed inline at the call and dropped registers the
+            // connector's answers into nothing.
+            TapCodecsRegistry codecs = new TapCodecsRegistry();
             try {
                 // Construct under the connector's own loader so any context-loader-based PDK lookup
                 // resolves against the connector's classpath rather than the host.
                 Thread.currentThread().setContextClassLoader(connectorClass.getClassLoader());
                 connector = connectorClass.getDeclaredConstructor().newInstance();
-                connector.registerCapabilities(functions, new TapCodecsRegistry());
+                connector.registerCapabilities(functions, codecs);
             } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
                 // A connector that will not construct, register, or link (e.g. a missing bundled
                 // dependency surfacing as NoClassDefFoundError, or a throwing static initializer) is a
@@ -98,18 +146,40 @@ final class PdkConnector implements AutoCloseable {
             } finally {
                 Thread.currentThread().setContextClassLoader(restore);
             }
+            // The connector reads its own database-type-to-PDK-type mapping off the specification it is
+            // driven with, and the host reads the same one to fill a discovered field's type. Put on the
+            // specification, there is one of it: kept beside it instead, the two feed from one parse today
+            // and drift the first time either grows a second source.
+            TapNodeSpecification specification = new TapNodeSpecification();
+            specification.setDataTypesMap(dataTypesFrom(ref.spec()));
+            Map<String, Object> config = ConfigTypeCoercion.coerce(connectorId, ref.spec(), settings);
             TapConnectorContext context = new TapConnectorContext(
-                    new TapNodeSpecification(), DataMap.create(settings), null, new SilentLog());
-            // A connector reaches per-run scratch through the context's state maps during init, discovery
-            // and the drive; the context leaves them null, so give it live ones or the first touch NPEs.
-            context.setStateMap(new InMemoryStateMap());
-            context.setGlobalStateMap(new InMemoryStateMap());
+                    specification, DataMap.create(config), nodeConfigFrom(ref.spec(), config),
+                    new ConnectorLog(connectorId, pipelineId));
+            // A connector reaches what it keeps for itself through the context's state maps during init,
+            // discovery and the drive; the context leaves them null, so give it live ones or the first
+            // touch NPEs. The map handed over here is the same reference for as long as this handle
+            // lives: a connector may compare the map it was bound to against the one it is later handed
+            // and refuse to run when they differ, and that expectation is nowhere in the signatures.
+            context.setStateMap(stateNamespace == null || stateStore == null
+                    ? new InMemoryStateMap()
+                    : new DurableStateMap(stateStore, stateNamespace));
+            // The map the contract calls global is one the whole deployment shares, so it is the store
+            // that makes it so: every member reads and writes the same namespace, and a write is visible
+            // to the next reader wherever it runs. It is read through rather than loaded once on the way
+            // up — a copy taken at startup stops being shared the moment another member writes, and the
+            // store has no way to list a namespace precisely so that nothing is tempted to take one.
+            // The node plays no part in the name: being tied to no node is the whole of what makes it
+            // global, which is why this asks only whether there is somewhere to keep it.
+            context.setGlobalStateMap(stateStore == null
+                    ? new InMemoryStateMap()
+                    : new DurableStateMap(stateStore, ConnectorStateNamespace.GLOBAL));
             // A connector reads its capability alternatives off the context during the drive; the context
             // leaves them null, so give it an empty set or the first read NPEs. Empty means no overrides:
             // the connector uses its own default capability behaviour, which is the L1 intent.
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
-                    connectorId, loader, connector, functions, context, dataTypesFrom(ref.spec()));
+                    connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId);
             opened = true;
             return result;
         } finally {
@@ -181,8 +251,23 @@ final class PdkConnector implements AutoCloseable {
         return connectorId;
     }
 
+    /**
+     * Where whatever this connector keeps for itself belongs, or null when the drive names no node.
+     * Derived from the pipeline node that opened it, so the full load and the change tail of one run
+     * answer with the same name while two pipelines reading the same database answer with different
+     * ones. What is filed under it is the state maps handed to the context above.
+     */
+    String stateNamespace() {
+        return stateNamespace;
+    }
+
     TapConnector connector() {
         return connector;
+    }
+
+    /** The value codecs this connector registered when it was opened; empty when it registered none. */
+    TapCodecsRegistry codecs() {
+        return codecs;
     }
 
     ConnectorFunctions functions() {
@@ -196,10 +281,67 @@ final class PdkConnector implements AutoCloseable {
      * runs. A connector with no spec, or none declaring dataTypes, leaves the fields as discovered.
      */
     void fillFieldTypes(TapTable table) {
+        DefaultExpressionMatchingMap dataTypesMap = context.getSpecification().getDataTypesMap();
         if (dataTypesMap == null || table.getNameFieldMap() == null) {
             return;
         }
         new TableFieldTypesGeneratorImpl().autoFill(table.getNameFieldMap(), dataTypesMap);
+    }
+
+    /** Converts inferred portable types through the target connector's own declared type mapping. */
+    void resolveTargetTypes(TapTable table) {
+        DefaultExpressionMatchingMap dataTypes = context.getSpecification().getDataTypesMap();
+        LinkedHashMap<String, TapField> inferred = new LinkedHashMap<>();
+        for (TapField field : table.getNameFieldMap().values()) {
+            if (field.getTapType() != null) {
+                inferred.put(field.getName(), field);
+            } else if (dataTypes != null && field.getDataType() != null) {
+                new TableFieldTypesGeneratorImpl().autoFill(field, dataTypes);
+            }
+            if (field.getTapType() == null) {
+                field.tapType(new TapRaw());
+            }
+        }
+        if (!inferred.isEmpty() && dataTypes != null) {
+            var converted = new TargetTypesGeneratorImpl().convert(
+                    inferred, dataTypes, new TapCodecsFilterManager(codecs));
+            if (converted == null || converted.getData() == null) {
+                throw new IllegalStateException("target type conversion returned no fields for table " + table.getId());
+            }
+            converted.getData().forEach(table.getNameFieldMap()::put);
+        }
+    }
+
+    /**
+     * The node config to hand the connector: every setting the connector's own spec declares under its
+     * {@link ConnectorForm#NODE node form}.
+     *
+     * <p>A connector reads a setting that form declares off this map and nowhere else, so a host that
+     * hands over none of them silences every one of them, whatever the workspace wrote. The host
+     * authors one settings map, and the connector's own spec is what says which part of it belongs to
+     * the node — a MongoDB source reads its before-image behaviour from one such setting, and without
+     * it a delete carries the document key alone.
+     *
+     * <p>A projection of the authored settings rather than a split of them: a name can be declared in
+     * both forms, and the connection config stays the whole authored map as it has always been, so
+     * nothing a connector reads today stops arriving.
+     *
+     * <p>Never null, even when it stays empty — a connector that reads its node config without first
+     * checking for one crashes bare on a null, while an empty map answers every question it asks with
+     * the same "not set" a missing field would.
+     */
+    private static DataMap nodeConfigFrom(String spec, Map<String, Object> settings) {
+        DataMap nodeConfig = DataMap.create();
+        if (settings == null || settings.isEmpty()) {
+            return nodeConfig;
+        }
+        Map<String, Map<?, ?>> declared = ConnectorForm.NODE.items(spec);
+        settings.forEach((name, value) -> {
+            if (declared.containsKey(name)) {
+                nodeConfig.put(name, value);
+            }
+        });
+        return nodeConfig;
     }
 
     /**
@@ -227,14 +369,28 @@ final class PdkConnector implements AutoCloseable {
         return context;
     }
 
-    /** Runs {@code action} with the connector's own loader installed as the thread context loader. */
+    /**
+     * Runs {@code action} with the connector's own loader installed as the thread context loader, and
+     * with this handle's pipeline named for as long as it runs.
+     *
+     * <p>The attribution is here rather than at each drive because this is the one seam every drive goes
+     * through, and because what it covers is not only the connector's own calls: the libraries a
+     * connector brings with it log through the host's facade too, on whatever thread is running the
+     * drive, and those lines are as much part of why a run is stuck as anything the connector says
+     * itself. Both the loader and the attribution are handed back afterwards -- the threads this runs on
+     * are shared and outlive the drive.
+     */
     <T> T underLoader(Action<T> action) throws Throwable {
         ClassLoader restore = Thread.currentThread().getContextClassLoader();
+        String previousPipeline = pipelineId == null ? null : ConnectorAttribution.claim(pipelineId);
         try {
             Thread.currentThread().setContextClassLoader(connector.getClass().getClassLoader());
             return action.run();
         } finally {
             Thread.currentThread().setContextClassLoader(restore);
+            if (pipelineId != null) {
+                ConnectorAttribution.restore(previousPipeline);
+            }
         }
     }
 

@@ -186,8 +186,24 @@ class SchemaGeneratorTest {
         assertThat(pipeline.get("sources")).isNull();
         Json.Obj source = (Json.Obj) pipeline.get("source");
         assertThat(source).isNotNull();
+        // The element is a union now -- a bare id, or an object carrying this pipeline's own srs
+        // switch for that source -- so the scalar branch sits one $ref down instead of inline. What
+        // has to stay true is that `source: src_a` still validates, not where the branch is written,
+        // so the ref is resolved rather than the assertion being weakened to whatever is emitted.
         assertThat(((Json.Arr) source.get("oneOf")).items()).contains(
-                new Json.Obj(List.of(new Json.Entry("type", new Json.Str("string")))));
+                new Json.Obj(List.of(new Json.Entry("$ref", new Json.Str("#/$defs/SourceRef")))));
+        List<Json> element = ((Json.Arr) ((Json.Obj) defs.get("SourceRef")).get("oneOf")).items();
+        assertThat(element).contains(
+                new Json.Obj(List.of(new Json.Entry("type", new Json.Str("string")))),
+                new Json.Obj(List.of(new Json.Entry("$ref", new Json.Str("#/$defs/SourceRef.Spec")))));
+        // Both keys are required on the object form: `srs` is registered as having no constant
+        // default, because reading it back as absent would mean "take the source's value" -- the
+        // link the field exists to cut.
+        Json.Obj spec = (Json.Obj) defs.get("SourceRef.Spec");
+        assertThat(((Json.Arr) spec.get("required")).items())
+                .containsExactlyInAnyOrder(new Json.Str("id"), new Json.Str("srs"));
+        assertThat(((Json.Obj) ((Json.Obj) spec.get("properties")).get("srs")).get("type"))
+                .isEqualTo(new Json.Str("boolean"));
 
         // embed keeps camelCase keys (the canonical writer's exception to snake_case).
         Json.Obj embed = (Json.Obj) ((Json.Obj) defs.get("Embed")).get("properties");
@@ -200,6 +216,35 @@ class SchemaGeneratorTest {
         Json.Obj nestRoot = (Json.Obj) ((Json.Obj) defs.get("NestRoot")).get("properties");
         assertThat(nestRoot.get("trackKeyChanges")).isNotNull();
         assertThat(nestRoot.get("track_key_changes")).isNull();
+
+        Json.Obj nest = (Json.Obj) ((Json.Obj) defs.get("TransformBody.Nest")).get("properties");
+        Json.Obj state = (Json.Obj) nest.get("state");
+        assertThat(state.get("$ref")).isEqualTo(new Json.Str("#/$defs/NestStateStorage"));
+        assertThat(state.get("description")).isNotNull();
+        Json.Obj stateProperties =
+                (Json.Obj) ((Json.Obj) defs.get("NestStateStorage")).get("properties");
+        assertThat(stateProperties.get("database")).isNotNull();
+    }
+
+    @Test
+    void flatEmbedOmitsPathAndArrayKeyWhileOtherShapesStillRequirePath() {
+        Json.Obj defs = (Json.Obj) generator.generateTree().get("$defs");
+        Json.Obj embed = (Json.Obj) defs.get("Embed");
+
+        assertThat(((Json.Arr) embed.get("required")).items())
+                .containsExactlyInAnyOrder(new Json.Str("from"), new Json.Str("on"), new Json.Str("as"));
+        Json.Obj conditional = (Json.Obj) ((Json.Arr) embed.get("allOf")).items().getFirst();
+        Json.Obj when = (Json.Obj) conditional.get("if");
+        Json.Obj whenProperties = (Json.Obj) when.get("properties");
+        assertThat(((Json.Obj) whenProperties.get("as")).get("const")).isEqualTo(new Json.Str("flat"));
+        Json.Obj otherwise = (Json.Obj) conditional.get("else");
+        assertThat(((Json.Arr) otherwise.get("required")).items()).containsExactly(new Json.Str("path"));
+        Json.Arr flatRules = (Json.Arr) ((Json.Obj) conditional.get("then")).get("allOf");
+        assertThat(flatRules.items()).containsExactly(
+                new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
+                        new Json.Entry("required", new Json.Arr(List.of(new Json.Str("path"))))))))),
+                new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
+                        new Json.Entry("required", new Json.Arr(List.of(new Json.Str("arrayKey"))))))))));
     }
 
     @Test

@@ -1,4 +1,3 @@
 rule: duplicate-id
-adr: "ADR-0016 §2 (F8)"
 path: id
 note: "two resources in the batch declare id 'src_orders'; top-level ids are workspace-unique"

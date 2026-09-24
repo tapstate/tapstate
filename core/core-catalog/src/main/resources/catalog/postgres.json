@@ -62,7 +62,7 @@
     },
     {
       "name": "port",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Port"
       },
@@ -271,6 +271,30 @@
       "visibleWhen": null
     },
     {
+      "name": "walArchiveDir",
+      "type": "string",
+      "label": {
+        "en_US": "WAL archive directory"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "walArchiveRestoreCommand",
+      "type": "string",
+      "label": {
+        "en_US": "WAL archive restore command"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
       "name": "pgtoHost",
       "type": "string",
       "label": {
@@ -284,7 +308,7 @@
     },
     {
       "name": "pgtoPort",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Pgto Server Port"
       },
@@ -519,7 +543,7 @@
     },
     {
       "name": "defaultWalLogSize",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Default Wal log total size(MB)"
       },
@@ -532,7 +556,7 @@
   ],
   "provenance": {
     "specPath": "connectors/postgres-connector/src/main/resources/spec_postgres.json",
-    "specContentHash": "6a56d1e1f2cadf30",
+    "specContentHash": "f4ae5fee7ccfd57a",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

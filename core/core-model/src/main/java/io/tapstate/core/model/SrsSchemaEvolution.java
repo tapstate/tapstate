@@ -1,6 +1,6 @@
 package io.tapstate.core.model;
 
-/** {@code srs.schema_evolution} values (ADR-0016 §4). */
+/** {@code srs.schema_evolution} values (§4). */
 @Doc("How the source reacts to schema changes detected at the origin during streaming.")
 public enum SrsSchemaEvolution {
     @Doc("Track schema changes and propagate them downstream as they occur.")

@@ -4,19 +4,22 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.runtime.engine.nest.NestStateStats;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
+import io.tapstate.spi.store.OperatorStateStores;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * Lets go of the state a pipeline's nests kept, in the two places it is kept: the maps holding it on the
- * member, and the store behind them holding what those maps wrote through. Both, because either alone
- * leaves the state readable - dropping only the store leaves the live map answering from memory, and
- * destroying only the map leaves the next run's first read pulling it all back off disk.
+ * Lets go of the operator state a pipeline's runs kept - a nest's and a join's alike, since both are named
+ * the same way and neither is a cache - in the two places it is kept: the maps holding it on the member,
+ * and the store behind them holding what those maps wrote through. Both, because either alone leaves the
+ * state readable - dropping only the store leaves the live map answering from memory and writing its
+ * entries straight back through as they are asked for, and destroying only the map leaves the next run's
+ * first read pulling it all back off disk.
  *
  * <p>A drop is written down before it is done and forgotten only once it is finished, so that a process
  * that dies halfway through one leaves behind a note saying so rather than a pipeline half let go of. The
@@ -54,15 +57,24 @@ final class NestStateTeardown {
     private static final String KEPT_KEY = "kept";
 
     private static final String SEPARATOR = "\n";
+    private static final String ROUTED_PREFIX = "v2:";
 
     private final HazelcastInstance member;
-    private final KeyedStateStore store;
-    private final NestDeadLetterStore deadLetters;
+    private final OperatorStateStores stores;
+    private final KeyedStateStore ledger;
 
     NestStateTeardown(HazelcastInstance member, KeyedStateStore store, NestDeadLetterStore deadLetters) {
+        this(member, OperatorStateStores.fixed("default", store, deadLetters));
+    }
+
+    NestStateTeardown(HazelcastInstance member, OperatorStateStores stores) {
         this.member = Objects.requireNonNull(member, "member");
-        this.store = Objects.requireNonNull(store, "store");
-        this.deadLetters = Objects.requireNonNull(deadLetters, "deadLetters");
+        this.stores = Objects.requireNonNull(stores, "stores");
+        this.ledger = stores.inDatabase(stores.defaultDatabase()).state();
+    }
+
+    String defaultDatabase() {
+        return stores.defaultDatabase();
     }
 
     /**
@@ -71,22 +83,36 @@ final class NestStateTeardown {
      * reads as by the time it is taken down.
      *
      * <p>What is recorded adds to what is already there rather than replacing it. A run keeping state
-     * somewhere new does not move what an earlier run left where it left it - an embed renamed, or taken
-     * out and put back, keeps its old entries under the old names - and a record holding only the most
-     * recent run's names would strand precisely the entries this exists to reach. They add up until a stop
-     * lets go of them, which is the point they stop being anybody's.
+     * under a new namespace does not move what an earlier run left under the old name - an embed renamed,
+     * or taken out and put back, keeps its old entries - and a record holding only the most recent run's
+     * names would strand precisely the entries this exists to reach. They add up until a stop lets go of
+     * them, which is the point they stop being anybody's.
+     *
+     * <p>A database relocation is different: the same namespace in its newly selected database supersedes
+     * that namespace's old physical location. The copied old location is a rollback source, not state the
+     * new run owns, so a later purge must not reach back and delete it. Only that same-namespace move is
+     * pruned; namespaces absent from the new run remain recorded for the edit/removal case above.
      *
      * <p>A run that keeps state nowhere records nothing, so a pipeline with no nest in it never grows one
      * of these and a later reader is never handed an empty record to tell apart from a full one.
      */
     void willKeepStateIn(String pipelineId, Set<String> namespaces) {
-        if (namespaces.isEmpty()) {
+        willKeepStateAt(pipelineId, defaultLocations(namespaces));
+    }
+
+    void willKeepStateAt(String pipelineId, Set<OperatorStateLocation> locations) {
+        if (locations.isEmpty()) {
             // Not what keeps a pipeline with no nest from getting a record - the check below does that on
             // its own. This spares every such pipeline a read of the store on every start it ever makes.
             return;
         }
-        Set<String> kept = read(pipelineId, KEPT_KEY);
-        if (!kept.addAll(namespaces)) {
+        Set<OperatorStateLocation> kept = read(pipelineId, KEPT_KEY);
+        Set<String> currentNamespaces = new LinkedHashSet<>();
+        locations.forEach(location -> currentNamespaces.add(location.namespace()));
+        boolean changed = kept.removeIf(location -> currentNamespaces.contains(location.namespace())
+                && !locations.contains(location));
+        changed |= kept.addAll(locations);
+        if (!changed) {
             // Every name is already down, which is the ordinary case: a pipeline restarted unchanged says
             // what it said last time. Rewriting the same bytes would be a write per start for no difference.
             return;
@@ -108,8 +134,12 @@ final class NestStateTeardown {
      * writes nothing, so a pipeline with no nest in it leaves no note for a later start to read.
      */
     void note(String pipelineId, Set<String> namespaces) {
-        Set<String> dropping = read(pipelineId, KEPT_KEY);
-        dropping.addAll(namespaces);
+        noteLocations(pipelineId, defaultLocations(namespaces));
+    }
+
+    void noteLocations(String pipelineId, Set<OperatorStateLocation> locations) {
+        Set<OperatorStateLocation> dropping = read(pipelineId, KEPT_KEY);
+        dropping.addAll(locations);
         if (dropping.isEmpty()) {
             return;
         }
@@ -126,32 +156,34 @@ final class NestStateTeardown {
      * namespace already dropped drops as a no-op, and the note stays until the last one has.
      */
     void finishPending(String pipelineId) {
-        Set<String> pending = noted(pipelineId);
+        Set<OperatorStateLocation> pending = noted(pipelineId);
         if (pending.isEmpty()) {
             return;
         }
         NestStateStats stats = NestStateStats.of(member);
-        for (String namespace : pending) {
+        Set<String> namespaces = new TreeSet<>();
+        pending.forEach(location -> namespaces.add(location.namespace()));
+        for (String namespace : namespaces) {
             member.getMap(namespace).destroy();
-            store.dropNamespace(namespace);
+            stats.forget(namespace);
+        }
+        for (OperatorStateLocation location : pending) {
+            var routed = stores.inDatabase(location.database());
+            routed.state().dropNamespace(location.namespace());
             // What the run could not assemble is kept under the same namespace and is as much this run's
             // as the state is. Left behind it outlives what it describes, and a later run of the same
             // pipeline reads records of changes it never saw as though they were its own.
-            deadLetters.dropNamespace(namespace);
-            // What was counted about a namespace goes with the namespace. Left behind, the counts would
-            // keep describing a run that is over, and a reader cannot tell a count standing still from one
-            // that is merely quiet.
-            stats.forget(namespace);
+            routed.deadLetters().dropNamespace(location.namespace());
         }
         // Last, and only once the namespaces above are gone: what is written here outliving what it
         // describes costs a repeated drop, where what it describes outliving it is state nothing will name
         // again. This takes the record of where the runs kept state with it, which is right - the state it
         // named is gone, and a run starting after this says where it keeps state for itself.
-        store.dropNamespace(namespaceOf(pipelineId));
+        ledger.dropNamespace(namespaceOf(pipelineId));
     }
 
     /** The namespaces noted as outstanding for this pipeline, empty where none are. */
-    private Set<String> noted(String pipelineId) {
+    private Set<OperatorStateLocation> noted(String pipelineId) {
         return read(pipelineId, KEY);
     }
 
@@ -159,11 +191,17 @@ final class NestStateTeardown {
      * One of this pipeline's lists of namespaces, empty where it has none. Mutable, because both callers
      * read a list in order to add to it.
      */
-    private Set<String> read(String pipelineId, String key) {
-        return store.load(namespaceOf(pipelineId), key)
+    private Set<OperatorStateLocation> read(String pipelineId, String key) {
+        return ledger.load(namespaceOf(pipelineId), key)
                 .map(bytes -> new String(bytes, StandardCharsets.UTF_8))
                 .filter(stored -> !stored.isEmpty())
-                .map(stored -> new LinkedHashSet<>(List.of(stored.split(SEPARATOR, -1))))
+                .map(stored -> {
+                    Set<OperatorStateLocation> locations = new LinkedHashSet<>();
+                    for (String line : stored.split(SEPARATOR, -1)) {
+                        locations.add(decode(line));
+                    }
+                    return locations;
+                })
                 .orElseGet(LinkedHashSet::new);
     }
 
@@ -171,9 +209,41 @@ final class NestStateTeardown {
      * Writes one of this pipeline's lists of namespaces, a line each and sorted, so that the same set is
      * the same bytes however it was arrived at.
      */
-    private void write(String pipelineId, String key, Set<String> namespaces) {
-        store.save(namespaceOf(pipelineId), key,
-                String.join(SEPARATOR, new TreeSet<>(namespaces)).getBytes(StandardCharsets.UTF_8));
+    private void write(String pipelineId, String key, Set<OperatorStateLocation> locations) {
+        Set<String> encoded = new TreeSet<>();
+        locations.forEach(location -> encoded.add(encode(location)));
+        ledger.save(namespaceOf(pipelineId), key,
+                String.join(SEPARATOR, encoded).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private Set<OperatorStateLocation> defaultLocations(Set<String> namespaces) {
+        Set<OperatorStateLocation> locations = new LinkedHashSet<>();
+        namespaces.forEach(namespace -> locations.add(
+                new OperatorStateLocation(stores.defaultDatabase(), namespace)));
+        return locations;
+    }
+
+    private String encode(OperatorStateLocation location) {
+        Base64.Encoder encoder = Base64.getUrlEncoder().withoutPadding();
+        return ROUTED_PREFIX
+                + encoder.encodeToString(location.database().getBytes(StandardCharsets.UTF_8))
+                + ":"
+                + encoder.encodeToString(location.namespace().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private OperatorStateLocation decode(String stored) {
+        if (!stored.startsWith(ROUTED_PREFIX)) {
+            return new OperatorStateLocation(stores.defaultDatabase(), stored);
+        }
+        int separator = stored.indexOf(':', ROUTED_PREFIX.length());
+        if (separator < 0) {
+            throw new IllegalStateException("operator-state location has no target separator");
+        }
+        Base64.Decoder decoder = Base64.getUrlDecoder();
+        String database = new String(decoder.decode(
+                stored.substring(ROUTED_PREFIX.length(), separator)), StandardCharsets.UTF_8);
+        String namespace = new String(decoder.decode(stored.substring(separator + 1)), StandardCharsets.UTF_8);
+        return new OperatorStateLocation(database, namespace);
     }
 
     private static String namespaceOf(String pipelineId) {

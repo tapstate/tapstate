@@ -4,9 +4,11 @@ import io.tapstate.control.client.ControlResponse;
 import io.tapstate.control.client.HttpControlClient;
 import io.tapstate.control.client.RequestBudget;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.ListBounds;
 import io.tapstate.control.core.Operation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -48,6 +50,7 @@ final class McpOperationExecutor {
                 case "system.version" -> get("/version");
                 case "connector.list" -> get("/api/connectors");
                 case "connector.get" -> get("/api/connectors/" + segment(required(args, "id")));
+                case "source.list" -> sourceList(args);
                 case "source.draft" -> sourceDraft(args);
                 case "connection.test" -> connectionWrite(args, "/api/connections:test");
                 case "connection.test-result" -> get(
@@ -61,12 +64,17 @@ final class McpOperationExecutor {
                 case "artifact.apply" -> post("/api/artifacts:apply", args, RequestBudget.HEAVY);
                 case "artifact.get" -> get("/api/artifacts/" + segment(required(args, "id")));
                 case "artifact.delete" -> artifactDelete(args);
+                case "pipeline.list" -> get(listPath("/api/pipelines", args));
                 case "pipeline.start" -> pipelineAction(args, "start");
-                case "pipeline.stop" -> pipelineAction(args, "stop");
+                case "pipeline.stop" -> pipelineStop(args);
+                case "pipeline.pause" -> pipelineAction(args, "pause");
+                case "pipeline.resume" -> pipelineAction(args, "resume");
                 case "pipeline.status" -> pipelineRead(args, "status");
                 case "pipeline.metrics" -> pipelineRead(args, "metrics");
                 case "pipeline.snapshot" -> pipelineRead(args, "snapshot");
                 case "pipeline.logs" -> pipelineLogs(args);
+                case "pipeline.metrics.history" -> pipelineHistory(args);
+                case "pipeline.explain" -> pipelineRead(args, "explain");
                 case "data-browser.collections" -> get(collectionsOf(args));
                 case "data-browser.stats" -> get(collectionOf(args) + "/stats");
                 case "data-browser.find" -> post(
@@ -84,6 +92,27 @@ final class McpOperationExecutor {
         return post(
                 "/api/pipelines/" + segment(required(arguments, "id")) + ":" + action,
                 null,
+                RequestBudget.LIGHT);
+    }
+
+    /**
+     * Stop is the one lifecycle verb that carries a body: whether to clear what the pipeline has. The
+     * argument is demanded here rather than left to the server, for the reason the delete below demands
+     * its precondition -- the server refuses without it anyway, and refusing at this end names the
+     * argument that was missing instead of handing back a refusal the caller has to decode.
+     *
+     * <p>A value that is not a boolean is treated as not stated. A model that answered "yes" in some
+     * other shape has not said what this asks, and reading it as either answer is exactly the guess the
+     * whole argument exists to stop.
+     */
+    private McpResult pipelineStop(Map<String, Object> arguments) {
+        String id = required(arguments, "id");
+        if (!(arguments.get("purgeState") instanceof Boolean purgeState)) {
+            return McpResult.coded(LifecycleError.PURGE_STATE_NOT_STATED, Map.of("pipeline", id));
+        }
+        return post(
+                "/api/pipelines/" + segment(id) + ":stop",
+                Map.of("purgeState", purgeState),
                 RequestBudget.LIGHT);
     }
 
@@ -135,6 +164,89 @@ final class McpOperationExecutor {
                 secretFields,
                 connector,
                 originalConfig);
+    }
+
+    /** Projects the REST Source view to the metadata-only shape safe for a remote model. */
+    private McpResult sourceList(Map<String, Object> arguments) {
+        McpResult result = get(listPath("/api/sources", arguments));
+        if (result.error()) {
+            return result;
+        }
+        Object rawItems = result.body().get("items");
+        if (!(rawItems instanceof List<?> items)) {
+            return invalidServerResponse("source.list");
+        }
+        List<Map<String, Object>> summaries = new java.util.ArrayList<>(items.size());
+        for (Object rawItem : items) {
+            if (!(rawItem instanceof Map<?, ?> item)
+                    || !(item.get("id") instanceof String id)
+                    || !(item.get("connector") instanceof String connector)) {
+                return invalidServerResponse("source.list");
+            }
+            Map<String, Object> summary = new LinkedHashMap<>();
+            summary.put("id", id);
+            Object rawMetadata = item.get("metadata");
+            if (rawMetadata instanceof Map<?, ?> metadata) {
+                Map<String, Object> projectedMetadata = new LinkedHashMap<>();
+                Object labels = metadata.get("labels");
+                if (labels != null) {
+                    projectedMetadata.put("labels", labels);
+                }
+                Object description = metadata.get("description");
+                if (description instanceof String text && !text.isEmpty()) {
+                    projectedMetadata.put("description", text);
+                }
+                if (!projectedMetadata.isEmpty()) {
+                    summary.put("metadata", projectedMetadata);
+                }
+            }
+            summary.put("connector", connector);
+            summaries.add(summary);
+        }
+        return McpResult.success(Map.of("items", summaries));
+    }
+
+    private static McpResult invalidServerResponse(String operation) {
+        return McpResult.coded(McpError.INVALID_SERVER_RESPONSE, Map.of("operation", operation));
+    }
+
+    private static String listPath(String path, Map<String, Object> arguments) {
+        return path + "?limit=" + listLimit(arguments) + "&offset=" + listOffset(arguments);
+    }
+
+    private static int listLimit(Map<String, Object> arguments) {
+        long value = integerArgument(arguments, "limit", ListBounds.DEFAULT_LIMIT);
+        return (int) Math.max(1, Math.min(ListBounds.MAX_LIMIT, value));
+    }
+
+    private static int listOffset(Map<String, Object> arguments) {
+        long value = integerArgument(arguments, "offset", 0);
+        if (value < 0 || value > Integer.MAX_VALUE) {
+            throw malformedListArgument("offset must be between 0 and " + Integer.MAX_VALUE);
+        }
+        return (int) value;
+    }
+
+    private static long integerArgument(Map<String, Object> arguments, String name, long defaultValue) {
+        Object value = arguments.get(name);
+        if (value == null) {
+            return defaultValue;
+        }
+        if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long) {
+            return ((Number) value).longValue();
+        }
+        if (value instanceof Float || value instanceof Double) {
+            double number = ((Number) value).doubleValue();
+            if (Double.isFinite(number) && number == Math.rint(number)
+                    && number >= Long.MIN_VALUE && number <= Long.MAX_VALUE) {
+                return (long) number;
+            }
+        }
+        throw malformedListArgument("`" + name + "` must be an integer");
+    }
+
+    private static TapstateException malformedListArgument(String reason) {
+        return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", reason), null);
     }
 
     private List<String> connectorSecretFields(String connector) {
@@ -198,7 +310,6 @@ final class McpOperationExecutor {
                     config,
                     source.mode(),
                     source.tables(),
-                    source.options(),
                     source.srs(),
                     source.experimental());
             Map<String, Object> body = new LinkedHashMap<>(result.body());
@@ -222,6 +333,46 @@ final class McpOperationExecutor {
             path += "?limit=" + Math.max(1, Math.min(200, number.intValue()));
         }
         return get(path);
+    }
+
+    private McpResult pipelineHistory(Map<String, Object> arguments) {
+        String id = required(arguments, "id");
+        StringBuilder path = new StringBuilder("/api/pipelines/")
+                .append(segment(id))
+                .append("/metrics/history?from=")
+                .append(segment(required(arguments, "from")))
+                .append("&to=")
+                .append(segment(required(arguments, "to")));
+        optionalText(path, arguments, "resolution");
+        if (arguments.containsKey("limit")) {
+            path.append("&limit=").append(integerArgument(arguments, "limit", 0));
+        }
+        Object selected = arguments.get("table");
+        if (selected != null) {
+            if (!(selected instanceof List<?> tables)) {
+                throw malformedListArgument("`table` must be an array of strings");
+            }
+            for (Object table : tables) {
+                if (!(table instanceof String value) || value.isBlank()) {
+                    throw malformedListArgument("`table` entries must be non-blank strings");
+                }
+                path.append("&table=").append(segment(value));
+            }
+        }
+        optionalText(path, arguments, "cursor");
+        return get(path.toString());
+    }
+
+    private static void optionalText(
+            StringBuilder path, Map<String, Object> arguments, String name) {
+        Object value = arguments.get(name);
+        if (value == null) {
+            return;
+        }
+        if (!(value instanceof String text) || text.isBlank()) {
+            throw malformedListArgument("`" + name + "` must be a non-blank string");
+        }
+        path.append('&').append(name).append('=').append(segment(text));
     }
 
     /** The listing path for the source a read names. */

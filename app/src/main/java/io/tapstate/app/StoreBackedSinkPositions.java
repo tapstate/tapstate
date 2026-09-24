@@ -42,11 +42,12 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
             return Map.of();
         }
         Map<String, String> positions = new LinkedHashMap<>();
-        for (String sourceId : pipeline.get().sources()) {
+        for (String sourceId : pipeline.get().sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
             SourceCaptureResolution resolution;
             try {
-                resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
+                resolution = SourceCaptureResolution.forPipeline(
+                        pipeline.get(), source, SourceDiscovery.model(storePort, source)).orElse(null);
             } catch (TapstateException unresolved) {
                 if (unresolved.code() == ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED) {
                     // The read face treats a not-yet-resolvable selection as absent while discovery catches up.
@@ -54,8 +55,10 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
                 }
                 throw unresolved;
             }
-            ackedSrcpos(resolution.chainId().value(), pipelineId)
-                    .ifPresent(srcpos -> resolution.tables().forEach(table -> positions.put(table, srcpos)));
+            if (resolution != null) {
+                ackedSrcpos(resolution.chainId().value(), pipelineId)
+                        .ifPresent(srcpos -> resolution.tables().forEach(table -> positions.put(table, srcpos)));
+            }
         }
         return positions;
     }

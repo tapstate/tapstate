@@ -1,0 +1,59 @@
+# A customer is deleted, and the orders that were joined to them must stop being reported.
+#
+# The failure this catches is the one that looks most like success. An implementation that copied the
+# customer's name into each order when the order arrived, and never went back, keeps serving those
+# orders afterwards with the name of a customer who no longer exists. Nothing errors, the row count
+# looks plausible, and the target is simply describing something that is not there. In every steady
+# state that implementation and a correct one are identical; the delete is the only moment they differ.
+#
+# This pipeline joins with an inner join, so an order whose customer is gone no longer satisfies the
+# join and is withdrawn. The count is therefore the reading that matters, and it is taken twice.
+#
+# What the assertions have to discriminate:
+#
+# - The orders are read with their customer's name before the delete. Without that, an implementation
+#   that never joined anything satisfies everything after it.
+# - Both of the deleted customer's orders are gone, checked through the count rather than through a
+#   lookup: a lookup that finds nothing cannot tell "withdrawn" from "never written", and the count
+#   moving from three to one says both orders left and no others did.
+# - The surviving order is read again, by name and value. An implementation that reacted to the delete
+#   by clearing the target passes a count of one only by accident, and this reading is what refuses it.
+# - The customer that remains is not the one adjacent to the deleted rows in insertion order, so an
+#   implementation that dropped a fixed number of rows cannot pass.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+name: a-deleted-customer-takes-its-orders-out-of-the-target
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [shop_db.tap.yml, views.tap.yml, join_pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: join_pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 1, name: ada }
+      - { id: 2, name: bo }
+  shop_db.orders:
+    values:
+      - { id: 10, customer_id: 1, qty: 2 }
+      - { id: 11, customer_id: 2, qty: 5 }
+      - { id: 12, customer_id: 1, qty: 7 }
+steps:
+  - start
+  - await: { count: { views.order_state: 3 } }
+  # Before the delete: the orders really are carrying the name that is about to disappear.
+  - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: ada } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: ada } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo } } } }
+  # The row the orders depend on, removed from under them. The orders themselves are untouched.
+  - cdc: { shop_db.customers: { delete: { where: { id: 1 } } } }
+  # Both of ada's orders leave, and only those. A lookup could not say this: it cannot tell a row
+  # that was withdrawn from one that was never written.
+  - await: { count: { views.order_state: 1 } }
+  # And what is left is the right one, still whole. A target that was simply cleared would also
+  # settle on a small number, and this refuses that.
+  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo } } } }

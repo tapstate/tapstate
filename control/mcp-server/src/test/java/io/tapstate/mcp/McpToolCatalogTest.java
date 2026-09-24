@@ -20,14 +20,15 @@ class McpToolCatalogTest {
     private static final List<String> READ_TOOLS = List.of(
             "system_version",
             "connector_list", "connector_get",
-            "source_draft",
+            "source_draft", "source_list",
             "connection_test_result", "connection_schema", "artifact_validate", "artifact_get",
-            "pipeline_status", "pipeline_metrics", "pipeline_snapshot", "pipeline_logs",
+            "pipeline_list", "pipeline_status", "pipeline_metrics", "pipeline_snapshot", "pipeline_logs",
+            "pipeline_metrics_history", "pipeline_explain",
             "data_browser_collections", "data_browser_find", "data_browser_stats");
 
     private static final List<String> WRITE_TOOLS = List.of(
             "artifact_apply", "artifact_delete", "connection_test", "connection_discover_schema",
-            "pipeline_start", "pipeline_stop");
+            "pipeline_start", "pipeline_stop", "pipeline_pause", "pipeline_resume");
 
     /**
      * The read that supplies the removal's precondition has to be reachable without write access.
@@ -41,7 +42,7 @@ class McpToolCatalogTest {
     }
 
     @Test
-    void defaultSurfaceContainsExactlyTheFifteenReadTools() {
+    void defaultSurfaceContainsExactlyTheReadTools() {
         assertThat(McpToolCatalog.operations(false).stream().map(McpToolCatalog::toolName))
                 .containsExactlyInAnyOrderElementsOf(READ_TOOLS);
     }
@@ -93,9 +94,53 @@ class McpToolCatalogTest {
     }
 
     @Test
-    void allowWriteAddsExactlyTheSixWriteTools() {
+    void listToolsDeclareBoundedPagesAndAConfigurationFreeSourceSummary() {
+        Map<?, ?> sourceRequest = ControlApiSchema.resolve(ControlOperations.SOURCE_LIST.schema().params());
+        Map<?, ?> sourceProperties = (Map<?, ?>) sourceRequest.get("properties");
+        assertThat(sourceProperties.keySet().stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("limit", "offset");
+        assertThat(((Map<?, ?>) sourceProperties.get("limit")).get("minimum")).isEqualTo(1);
+        assertThat(((Map<?, ?>) sourceProperties.get("limit")).get("maximum")).isEqualTo(200);
+        assertThat(((Map<?, ?>) sourceProperties.get("offset")).get("minimum")).isEqualTo(0);
+
+        Map<?, ?> sourceResult = ControlApiSchema.resolve(ControlOperations.SOURCE_LIST.schema().result());
+        Map<?, ?> sourceItem = (Map<?, ?>) ((Map<?, ?>) sourceResult.get("properties"))
+                .get("items");
+        sourceItem = (Map<?, ?>) sourceItem.get("items");
+        assertThat(((List<?>) sourceItem.get("required")).stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("id", "connector");
+        assertThat(((Map<?, ?>) sourceItem.get("properties")).keySet().stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("id", "metadata", "connector");
+        assertThat(ControlOperations.SOURCE_LIST.description())
+                .contains("omitted").contains("limit").contains("offset");
+        assertThat(ControlOperations.PIPELINE_LIST.description())
+                .contains("limit").contains("offset").contains("status");
+    }
+
+    @Test
+    void allowWriteAddsExactlyTheEightWriteTools() {
         assertThat(McpToolCatalog.operations(true).stream().map(McpToolCatalog::toolName))
                 .containsExactlyInAnyOrderElementsOf(concat(READ_TOOLS, WRITE_TOOLS));
+    }
+
+    /**
+     * There has to be a way to make a Pipeline stop moving that does not clear it. Without one, the only
+     * "stop" a model can reach is the verb that drops the Pipeline's position and everything it
+     * assembled -- and a caller that has to pick something is going to pick the thing that is there.
+     * The required answer on the stop is a real question only while a second door exists.
+     */
+    @Test
+    void thereIsAWayToHoldAPipelineThatClearsNothing() {
+        assertThat(McpToolCatalog.operations(true).stream().map(McpToolCatalog::toolName))
+                .contains("pipeline_pause", "pipeline_resume");
+        // Write access, like every other verb that changes a Pipeline: holding one is not a read.
+        assertThat(McpToolCatalog.operations(false).stream().map(McpToolCatalog::toolName))
+                .doesNotContain("pipeline_pause", "pipeline_resume");
+        // The description is what a model reads before choosing, and choosing between these two and the
+        // stop is the whole point of opening them -- so it has to say that this one keeps everything.
+        assertThat(ControlOperations.PIPELINE_PAUSE.description())
+                .contains("Nothing is cleared")
+                .contains("carries on");
     }
 
     /**

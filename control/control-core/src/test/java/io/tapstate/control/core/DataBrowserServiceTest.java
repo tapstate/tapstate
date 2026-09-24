@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -49,7 +50,7 @@ class DataBrowserServiceTest {
     private static final SourceResource VIEWS = new SourceResource(
             "views", null, "mongodb",
             Map.of("uri", "mongodb://db.local", "database", "shop"),
-            null, null, null, null, null);
+            null, null, null, null);
 
     @Test
     void listsThroughTheProbeOnTheSourcesOwnConnection() {
@@ -95,7 +96,7 @@ class DataBrowserServiceTest {
         // A pipeline has an id like a source's and no connection at all; resolving one would otherwise
         // fall through to a null connector and fail somewhere far from the name the user typed.
         Resource pipeline =
-                new PipelineResource("orders", null, List.of("views"), null, null, null, null, null);
+                new PipelineResource("orders", null, List.of(SourceRef.bare("views")), null, null, null, null, null);
         DataBrowserService service = service(store(pipeline), config -> List.of());
 
         assertThatThrownBy(() -> service.collections("orders"))
@@ -537,7 +538,7 @@ class DataBrowserServiceTest {
     private static final SourceResource ON_A_CONNECTOR_THAT_IS_NOT_BROWSABLE = new SourceResource(
             "rows_in_sql", null, "mysql",
             Map.of("host", "db.local", "database", "shop"),
-            null, null, null, null, null);
+            null, null, null, null);
 
     /** A service over a source holding one collection, recording the query its find probe is driven with. */
     private static DataBrowserService finding(AtomicReference<DataBrowserQuery> driven) {

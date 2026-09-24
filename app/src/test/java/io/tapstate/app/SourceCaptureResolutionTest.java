@@ -73,7 +73,7 @@ class SourceCaptureResolutionTest {
     @Test
     void expandsAnOmittedTableListToTheDiscoveryOrder() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null, null);
+                SourceMode.CDC, null, null, null);
 
         SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discovered("players", "cards"));
 
@@ -84,7 +84,7 @@ class SourceCaptureResolutionTest {
     @Test
     void expandsRegexWithFullMatchAndKeepsSelectorOrder() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.regex("Player.*"), TableRef.literal("Orders")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.regex("Player.*"), TableRef.literal("Orders")), null, null);
 
         SourceCaptureResolution resolution = SourceCaptureResolution.of(
                 source, discovered("Player", "PlayerCard", "XPlayer", "Orders"));
@@ -95,7 +95,7 @@ class SourceCaptureResolutionTest {
     @Test
     void deDuplicatesOverlappingSelectorsOnFirstOccurrence() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("Player"), TableRef.regex("Player.*")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.literal("Player"), TableRef.regex("Player.*")), null, null);
 
         SourceCaptureResolution resolution = SourceCaptureResolution.of(
                 source, discovered("Player", "PlayerCard"));
@@ -106,7 +106,7 @@ class SourceCaptureResolutionTest {
     @Test
     void requiresDiscoveryForAnOmittedOrRegexTableList() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null, null);
+                SourceMode.CDC, null, null, null);
 
         assertThatThrownBy(() -> SourceCaptureResolution.of(source))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
@@ -116,7 +116,7 @@ class SourceCaptureResolutionTest {
     @Test
     void rejectsAnOmittedTableListWhenDiscoveryContainsNoTables() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null, null);
+                SourceMode.CDC, null, null, null);
 
         assertThatThrownBy(() -> SourceCaptureResolution.of(source, discovered()))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
@@ -126,7 +126,7 @@ class SourceCaptureResolutionTest {
     @Test
     void rejectsASelectorThatMatchesNoDiscoveredTable() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.regex("Missing.*")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.regex("Missing.*")), null, null);
 
         assertThatThrownBy(() -> SourceCaptureResolution.of(source, discovered("orders")))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
@@ -136,7 +136,7 @@ class SourceCaptureResolutionTest {
     @Test
     void supportsMultipleConcreteStreams() {
         SourceResource multiTable = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("items")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("items")), null, null);
 
         SourceCaptureResolution resolution = SourceCaptureResolution.of(multiTable);
 
@@ -148,8 +148,7 @@ class SourceCaptureResolutionTest {
     void rejectsUnsupportedTableSpecSettingsBeforeCapture() {
         SourceResource source = new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC,
-                List.of(TableRef.spec("orders", "amount > 0", List.of("id"), Map.of("region", "eu"))),
-                null, null, null);
+                List.of(TableRef.spec("orders", "amount > 0", List.of("id"))), null, null);
 
         assertThatThrownBy(() -> SourceCaptureResolution.of(source))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
@@ -165,6 +164,6 @@ class SourceCaptureResolutionTest {
     private static SourceResource cdcSource(String id, String table, String srsKey) {
         Srs srs = srsKey == null ? null : new Srs(srsKey, null, null, null, null);
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, srs, null);
+                List.of(TableRef.literal(table)), srs, null);
     }
 }

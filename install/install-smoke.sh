@@ -14,6 +14,10 @@ set -uo pipefail
 # nothing listens on: the send is refused instantly and the installer swallows it, exactly as it does
 # for a user who is offline. A case that wants to observe an event still sets its own URL.
 export TAPSTATE_TELEMETRY_URL="${TAPSTATE_TELEMETRY_URL:-http://127.0.0.1:1/e}"
+# Cleared rather than defaulted. One case below is about what an install reports when nothing set a
+# channel at all, and a value inherited from whatever started this suite would make that case an
+# assertion about the caller instead of about the installer.
+unset TAPSTATE_TELEMETRY_CHANNEL
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_SH="$HERE/install.sh"
@@ -382,6 +386,46 @@ else
   bad "missing minimums must produce no notice (rc=$RC): $OUT"
 fi
 
+# --- the CPU the x86-64 binary needs: a build choice nothing downstream can see ----------------------
+# Every case above asks whether the machine is old in a way the installer can measure -- an OS version,
+# a glibc. There is a third way to be too old, and it is the one nothing here can see: a native image is
+# compiled for a CPU feature set, and on AMD64 native-image's default requires AVX, AVX2, BMI1, BMI2 and
+# FMA. A machine without them does not get a slower CLI, it gets one that cannot start at all -- the
+# image refuses, so the CLI never runs and the runtime's own diagnosis ("The current machine does not
+# support all of the following CPU features that are required by the image") surfaces only on the
+# machine that is already broken. Reported from an Ivy Bridge Xeon where every container came up healthy
+# and the CLI could not run.
+#
+# The feature set is a build flag in cli/pom.xml's native profile, which is where this reads it. A
+# binary exists only inside the release job, and by the time one does the choice has already been made;
+# the installer meanwhile publishes linux-x64 and darwin-x64 with no way of knowing what was chosen.
+POM="$HERE/../cli/pom.xml"
+[ -r "$POM" ] || { printf 'cannot read %s\n' "$POM" >&2; exit 1; }
+# The build args, with XML comments removed: an option written inside one is passed to nobody, so a
+# commented-out flag must not be what this reads.
+ARGS="$(sed -e 's/<!--.*-->//g' -e '/<!--/,/-->/d' "$POM")"
+# Features named on their own are added to whatever the baseline chose -- native-image's own words are
+# "in addition to -march" -- so a right baseline beside one of these is not the CPU that gets built.
+# Matched with a `case` and not `grep -q`: under `pipefail` a grep that matches and exits early leaves
+# its writer with SIGPIPE, and the pipeline then reports 141, which reads a match as no match.
+case "$ARGS" in
+  *CPUFeatures=?*)
+    bad "cli/pom.xml's native profile passes -H:CPUFeatures, whose features are in addition to the baseline, so the CPU the CLI needs is not the one -march names" ;;
+  *)
+    # Either spelling reaches native-image; -H:MicroArchitecture is the name it prints for the option.
+    march="$(printf '%s\n' "$ARGS" | sed -nE 's/.*<buildArg>-(march|H:MicroArchitecture)=([^<]*)<\/buildArg>.*/\2/p' | head -1)"
+    case "$march" in
+      compatibility)
+        ok "the x86-64 CLI is built for a CPU baseline that predates AVX2 (-march=$march)" ;;
+      "")
+        bad "cli/pom.xml's native profile pins no CPU baseline, so the CLI is built for native-image's default, which needs AVX2/BMI2/FMA -- a CPU without them cannot start it" ;;
+      *)
+        # One profile builds every platform this release publishes, so a name is usable only if it is
+        # valid on all of them, and `compatibility` is the only one that is.
+        bad "the CLI is built with -march=$march, which is not the baseline every published platform can run (compatibility is the only name valid on all of them, and the only one that needs no AVX2/BMI2/FMA)" ;;
+    esac ;;
+esac
+
 # --- the tap alias: opt-in shortcut, never a second copy of the binary --------------------------------
 # `tapstate` stays the only real command; `tap` exists to save keystrokes. It is a link to the same
 # target the stable entry points at, so an upgrade moves both at once -- two independent copies would
@@ -515,41 +559,34 @@ rm -rf "$shim"
 
 # --- the install event: what it carries, when it fires, and when it must not ------------------------
 # A local sink stands in for the endpoint, so these run with no network and no credentials. Each case
-# asserts on what actually arrived, not on what the script claims it sends.
+# asserts on what actually arrived, not on what the script claims it sends. The sink and the wait for
+# its port are in _event-sink.sh beside this file, which the quickstart smoke sources as well.
+#
+# The sink is a fixture, and a fixture that never started is one failure that says so. Reading a port it
+# never published points every case below at an endpoint with no port, and each of them then fails as
+# though the installer had sent the wrong thing: a sink that did not start, reported as defects in the
+# thing this suite exists to test.
+# shellcheck source=install/_event-sink.sh
+. "$HERE/_event-sink.sh"
+# This section's lines are bracketed in the output. install-smoke-test.sh reads the sink's verdict from
+# between the two markers alone, so a case elsewhere in this file that fails for its own reasons is not
+# reported a second time as though the sink had failed.
+printf '  ----  install event cases\n'
 if ! command -v python3 >/dev/null 2>&1; then
   bad "install event: python3 is needed for the local sink"
+elif ! start_sink; then
+  bad "install event: the local sink $SINK_FAILURE, so none of the install-event cases ran"
+  stop_sink
 else
-  BEACON_DIR="$(mktemp -d)"
-  : > "$BEACON_DIR/log"
-  python3 - "$BEACON_DIR" <<'PYEOF' &
-import http.server, os, sys
-d = sys.argv[1]
-class H(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        n = int(self.headers.get('Content-Length') or 0)
-        body = self.rfile.read(n).decode('utf-8', 'replace')
-        with open(os.path.join(d, 'log'), 'a') as fh:
-            fh.write(body + "\n")
-        self.send_response(204); self.end_headers()
-    def log_message(self, *a): pass
-srv = http.server.HTTPServer(('127.0.0.1', 0), H)
-with open(os.path.join(d, 'port'), 'w') as fh:
-    fh.write(str(srv.server_address[1]))
-srv.serve_forever()
-PYEOF
-  BEACON_PID=$!
-  for _ in $(seq 1 50); do [ -s "$BEACON_DIR/port" ] && break; sleep 0.1; done
-  BEACON_URL="http://127.0.0.1:$(cat "$BEACON_DIR/port")/e"
-
   # A second stub version, so "which version did it report" has two possible answers. With only the
   # pinned one in the tree the assertion cannot fail, and the field it guards is what makes the funnel
   # per-version at all.
   OTHER_VERSION=9.9.9
   _real_version="$VERSION"; VERSION="$OTHER_VERSION"; make_asset darwin-arm64; VERSION="$_real_version"
 
-  beacon_reset() { : > "$BEACON_DIR/log"; }
-  beacon_count() { grep -c . "$BEACON_DIR/log" 2>/dev/null | tr -d ' '; }
-  beacon_field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$BEACON_DIR/log" | head -1; }
+  beacon_reset() { : > "$SINK_DIR/log"; }
+  beacon_count() { grep -c . "$SINK_DIR/log" 2>/dev/null | tr -d ' '; }
+  beacon_field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$SINK_DIR/log" | head -1; }
 
   # run the installer with an explicit version and arbitrary args, capturing stderr separately
   # $1 install_dir  $2 version  $3 stderr_file  $4 stdout_file  rest: args to install.sh
@@ -568,7 +605,7 @@ PYEOF
       TAPSTATE_VERSION="$fver" \
       TAPSTATE_BASE_URL="file://$STUB" \
       TAPSTATE_INSTALL_DIR="$idir" \
-      TAPSTATE_TELEMETRY_URL="$BEACON_URL" \
+      TAPSTATE_TELEMETRY_URL="$SINK_URL" \
       sh "$INSTALL_SH" "$@" >"$outf" 2>"$errf"
     rm -rf "$shim"
   }
@@ -603,6 +640,26 @@ PYEOF
   if [ -n "$other_id" ] && [ "$other_id" != "$first_id" ]; then ok "a second installation root gets its own id"
   else bad "second installation root reused the first id ('$other_id')"; fi
 
+  # the channel: which side of the denominator this install falls on. The default has to be the
+  # community one, because unset is the path every real machine takes.
+  d_ch="$(mktemp -d)/bin"
+  beacon_reset; ev_run "$d_ch" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if [ "$(beacon_field channel)" = community ]; then ok "install event defaults channel=community"
+  else bad "install event channel: expected community by default, got '$(beacon_field channel)'"; fi
+
+  d_ch2="$(mktemp -d)/bin"
+  beacon_reset; EV_ENV="TAPSTATE_TELEMETRY_CHANNEL=internal" ev_run "$d_ch2" "$OTHER_VERSION" "$ev_err" "$ev_out"; EV_ENV=""
+  if [ "$(beacon_field channel)" = internal ]; then ok "TAPSTATE_TELEMETRY_CHANNEL=internal marks the event as ours"
+  else bad "TAPSTATE_TELEMETRY_CHANNEL=internal produced channel='$(beacon_field channel)'"; fi
+
+  # A near miss is a community install, deliberately. Normalising it to "internal" would make a typo
+  # in one of our own lanes invisible -- and an invisible typo in exactly this variable is the failure
+  # the field exists to end. The lane is held to the exact word by a gate that reads the lane.
+  d_ch3="$(mktemp -d)/bin"
+  beacon_reset; EV_ENV="TAPSTATE_TELEMETRY_CHANNEL=interal" ev_run "$d_ch3" "$OTHER_VERSION" "$ev_err" "$ev_out"; EV_ENV=""
+  if [ "$(beacon_field channel)" = community ]; then ok "a misspelt channel is community, not quietly internal"
+  else bad "a misspelt channel produced channel='$(beacon_field channel)'"; fi
+
   # opt-out: nothing sent AND nothing written. Skipping only the request still leaves an identifier on
   # the user's disk, and no network assertion would ever notice.
   d3="$(mktemp -d)/bin"
@@ -634,13 +691,16 @@ PYEOF
     bad "disclosure not on stderr; a quickstart user would never see it"
   elif ! grep -qi 'TAPSTATE_TELEMETRY=off' "$ev_err"; then
     bad "disclosure on stderr does not say how to turn it off"
+  elif ! grep -qi 'channel' "$ev_err"; then
+    bad "the disclosure does not name the channel, which is a field the event carries"
   elif grep -qiE 'anonymous install event|TAPSTATE_TELEMETRY=off' "$ev_out"; then
     bad "part of the disclosure went to stdout, which the quickstart drops"
   else ok "the whole disclosure is on stderr, none of it on stdout"; fi
 
   rm -f "$ev_err" "$ev_out"
-  kill "$BEACON_PID" 2>/dev/null; wait "$BEACON_PID" 2>/dev/null
+  stop_sink
 fi
+printf '  ----  end of install event cases\n'
 
 # --- the harness itself must not report installs -----------------------------------------------------
 # The subject of this case is one line at the top of this file, and losing that line is silent: the

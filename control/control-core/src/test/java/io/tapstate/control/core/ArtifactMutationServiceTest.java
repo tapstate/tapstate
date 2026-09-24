@@ -8,6 +8,7 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeResource;
@@ -24,12 +25,18 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.DerivedSchema;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayout;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -53,13 +60,16 @@ class ArtifactMutationServiceTest {
     private final InMemoryDesiredStore desired = new InMemoryDesiredStore();
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final InMemoryObservationStore observations = new InMemoryObservationStore();
+    private final InMemoryPipelineLayoutStore layouts = new InMemoryPipelineLayoutStore();
     private final InMemorySrsMetaStore srsMeta = new InMemorySrsMetaStore();
+    private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
     private final List<String> reclaimOrder = new ArrayList<>();
     private final RecordingAuditStore auditStore = new RecordingAuditStore();
     private final List<String> followsStopped = new ArrayList<>();
+    private final RecordingRateHistory rateHistory = new RecordingRateHistory();
     private final ArtifactMutationService service = new ArtifactMutationService(
-            store, desired, state, observations, srsMeta, new AuditGate(auditStore, FIXED_CLOCK),
-            followsStopped::add);
+            store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+            new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add);
 
     private static final Clock FIXED_CLOCK =
             Clock.fixed(Instant.parse("2026-08-11T09:00:00Z"), ZoneOffset.UTC);
@@ -162,6 +172,24 @@ class ArtifactMutationServiceTest {
     }
 
     @Test
+    void aPreconditionHeldFromBeforeTheHashWasReboundIsARefusalRatherThanACrash() {
+        // A client that read an artifact before the upgrade holds the digest of its canonical text. The
+        // stored hash is now taken over the structure, so that value names no version -- and the answer
+        // has to be the ordinary conflict, which tells the client to read again. Anything else (a crash,
+        // or io.document-unreadable) would read as "the store is damaged" over a client that is merely
+        // out of date.
+        SourceResource orders = source("orders");
+        store.save(orders);
+        String heldBeforeTheUpgrade = CanonicalHash.ofText(new CanonicalWriter().write(orders));
+
+        assertArtifactError(
+                () -> service.delete(PRINCIPAL, "orders", heldBeforeTheUpgrade),
+                ArtifactError.VERSION_CONFLICT,
+                Map.of("id", "orders"));
+        assertThat(store.get("orders")).contains(orders);
+    }
+
+    @Test
     void referencedDeleteIsRefusedWithSortedReferrersAndNoCascade() {
         SourceResource orders = source("orders");
         store.save(orders);
@@ -175,6 +203,24 @@ class ArtifactMutationServiceTest {
         assertThat(store.get("orders")).isPresent();
         assertThat(store.get("alpha")).isPresent();
         assertThat(store.get("zeta")).isPresent();
+    }
+
+    @Test
+    void anUnreadableReferencingPipelineFailsClosedAndLeavesItsSourceStored() {
+        SourceResource orders = source("orders");
+        PipelineResource reader = pipelineReading("reader", "orders");
+        store.saveAll(List.of(orders, reader));
+
+        // The raw row still contains the source edge, but another part of its body can no longer be
+        // reconstructed by this build. A destructive check cannot turn that unknown edge into no edge.
+        store.makeUnreadable("reader");
+
+        assertThatThrownBy(() -> service.delete(PRINCIPAL, "orders", hash(orders)))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                    assertThat(failure.args()).containsEntry("id", "reader");
+                });
+        assertThat(store.get("orders")).contains(orders);
     }
 
     @Test
@@ -266,6 +312,8 @@ class ArtifactMutationServiceTest {
         state.put("flow", PipelineState.STOPPED);
         desired.put("flow", PipelineState.STOPPED);
         observations.put("flow");
+        layouts.save(new PipelineLayout("flow", Map.of(), new PipelineLayout.Viewport(0, 0, 1)));
+        derivedSchemas.put("flow", "widen");
         srsMeta.seed("chain-a", consumer("flow"), consumer("other"));
 
         service.delete(PRINCIPAL, "flow", hash(flow));
@@ -276,10 +324,80 @@ class ArtifactMutationServiceTest {
         assertThat(desired.pipelineIds()).doesNotContain("flow");
         assertThat(state.read("flow")).isEmpty();
         assertThat(observations.read("flow")).isEmpty();
+        assertThat(layouts.get("flow")).isEmpty();
+        // Left behind, this one is worse than residue: the next pipeline applied under the id would be
+        // refused at start over a difference against a schema belonging to something that is gone.
+        assertThat(derivedSchemas.holdsAnythingFor("flow")).isFalse();
         assertThat(srsMeta.consumerIds("chain-a")).containsExactly("other");
         // Shared first: it is the only residue that stalls a different pipeline, so a process that dies
         // mid-reclaim has already contained the damage that was not this pipeline's alone to suffer.
-        assertThat(reclaimOrder).containsExactly("srs", "desired", "state", "observation");
+        assertThat(rateHistory.deleted).containsExactly("flow");
+        assertThat(reclaimOrder)
+                .containsExactly("srs", "desired", "state", "observation", "layout", "derived-schema",
+                        "rate-history");
+    }
+
+    @Test
+    void deletingAPipelineReclaimsItsLayoutBeforeTheIdCanBeReused() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        layouts.save(new PipelineLayout("flow", Map.of(
+                "source:orders", new PipelineLayout.NodePosition(40, 80)),
+                new PipelineLayout.Viewport(5, 10, 1.25)));
+
+        service.delete(PRINCIPAL, "flow", hash(flow));
+        store.save(pipeline("flow"));
+
+        assertThat(layouts.get("flow"))
+                .as("a recreated pipeline must not inherit canvas state from the deleted pipeline")
+                .isEmpty();
+    }
+
+    @Test
+    void aDerivedSchemaOfAnotherPipelineSurvivesThisOnesRemoval() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        derivedSchemas.put("flow", "widen");
+        derivedSchemas.put("other", "widen");
+
+        service.delete(PRINCIPAL, "flow", hash(flow));
+
+        assertThat(derivedSchemas.holdsAnythingFor("flow")).isFalse();
+        assertThat(derivedSchemas.holdsAnythingFor("other")).isTrue();
+    }
+
+    @Test
+    void aServiceBuiltWithoutARateHistoryStoreReportsThatStepRatherThanACleanSweep() {
+        // The shape that keeps an older call site working substitutes a store for the one it was not
+        // given. A substitute that deletes nothing and says nothing has the reclaim run every step and
+        // report the pipeline reclaimed whole, while every sample it ever took stays in the collection to
+        // be read as the past of whatever is applied under that id next.
+        ArtifactMutationService withoutHistory = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add);
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+
+        assertThatThrownBy(() -> withoutHistory.delete(PRINCIPAL, "flow", hash(flow)))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.args()).containsEntry("residue", List.of("rate-history")));
+        assertThat(store.get("flow")).isEmpty();
+    }
+
+    @Test
+    void aDerivedSchemaThatCannotBeReclaimedIsReportedAsResidueLikeEveryOtherStep() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        derivedSchemas.put("flow", "widen");
+        derivedSchemas.failDeleteWith(new IllegalStateException("store down"));
+
+        assertThatThrownBy(() -> service.delete(PRINCIPAL, "flow", hash(flow)))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.args()).containsEntry("residue", List.of("derived-schema")));
+        // The artifact is gone either way: a removal the caller was told succeeded must not undo itself.
+        assertThat(store.get("flow")).isEmpty();
+        // The residue the report is about really is left behind — otherwise this witnesses nothing.
+        assertThat(derivedSchemas.holdsAnythingFor("flow")).isTrue();
     }
 
     @Test
@@ -416,7 +534,7 @@ class ArtifactMutationServiceTest {
     @Test
     void anUnavailableAuditBackendRefusesTheDeleteAndLeavesTheArtifactByteForByte() {
         ArtifactMutationService blocked = new ArtifactMutationService(
-                store, desired, state, observations, srsMeta,
+                store, desired, state, observations, srsMeta, derivedSchemas,
                 new AuditGate(new FailingAuditStore(), FIXED_CLOCK), followsStopped::add);
         SourceResource orders = source("orders");
         store.save(orders);
@@ -534,6 +652,12 @@ class ArtifactMutationServiceTest {
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
                     assertThat(error.code()).isEqualTo(ArtifactError.RECLAIM_INCOMPLETE);
                     assertThat(error.args()).containsEntry("reason", "pipeline-live");
+                    // Everything the reclaim would have taken, by the names it takes them under: the
+                    // person clearing up by hand works from this list, so a step missing from it is a
+                    // residue they are never told about.
+                    assertThat(error.args().get("residue")).isEqualTo(List.of(
+                            "mining-chain-consumer", "desired", "state", "observation", "layout",
+                            "derived-schema", "rate-history"));
                 });
 
         // The artifact is gone — the removal is not undone — and none of the live pipeline's own
@@ -543,6 +667,7 @@ class ArtifactMutationServiceTest {
         assertThat(desired.read("flow")).isPresent();
         assertThat(observations.read("flow")).isPresent();
         assertThat(srsMeta.consumerIds("chain-a")).containsExactly("flow");
+        assertThat(rateHistory.deleted).as("the live pipeline's samples are left alone too").isEmpty();
     }
 
     @Test
@@ -621,7 +746,7 @@ class ArtifactMutationServiceTest {
         return new SourceResource(
                 id, null, "mysql",
                 Map.of("host", "localhost", "port", "3306", "database", "orders", "username", "app"),
-                SourceMode.SNAPSHOT, null, null, null, null);
+                SourceMode.SNAPSHOT, null, null, null);
     }
 
     private static PipelineResource pipeline(String id) {
@@ -629,15 +754,15 @@ class ArtifactMutationServiceTest {
     }
 
     private static PipelineResource pipelineReading(String id, String sourceId) {
-        return new PipelineResource(id, null, List.of(sourceId), null, null, null, null, null);
+        return new PipelineResource(id, null, List.of(SourceRef.bare(sourceId)), null, null, null, null, null);
     }
 
     private static TransformResource transform(String id) {
-        return new TransformResource(id, null, new TransformBody.Js("function process(r) { return r; }"), null, null);
+        return new TransformResource(id, null, new TransformBody.Js("function process(r) { return r; }"), null);
     }
 
     private static ViewResource view(String id) {
-        return new ViewResource(id, null, null, null, null, null);
+        return new ViewResource(id, null, null, null, null);
     }
 
     private static ServeResource serve(String id) {
@@ -645,7 +770,7 @@ class ArtifactMutationServiceTest {
     }
 
     private static String hash(Resource resource) {
-        return CanonicalHash.of(new CanonicalWriter().write(resource));
+        return CanonicalHash.of(resource);
     }
 
     private static void assertArtifactError(
@@ -665,6 +790,7 @@ class ArtifactMutationServiceTest {
     private static final class InMemoryArtifactStore implements ArtifactStore {
 
         private final Map<String, Resource> artifacts = new LinkedHashMap<>();
+        private final List<String> unreadable = new ArrayList<>();
         /** Another caller acting in the window between the removal and the reclaim that follows it. */
         private Runnable afterDelete = null;
 
@@ -688,17 +814,48 @@ class ArtifactMutationServiceTest {
 
         @Override
         public synchronized void saveAll(List<Resource> resources) {
-            resources.forEach(resource -> artifacts.put(resource.id(), resource));
+            resources.forEach(resource -> {
+                artifacts.put(resource.id(), resource);
+                unreadable.remove(resource.id());
+            });
         }
 
         @Override
         public synchronized Optional<Resource> get(String id) {
+            if (unreadable.contains(id)) {
+                throw unreadable(id);
+            }
             return Optional.ofNullable(artifacts.get(id));
         }
 
         @Override
         public synchronized List<Resource> list() {
+            if (!unreadable.isEmpty()) {
+                throw unreadable(unreadable.getFirst());
+            }
             return new ArrayList<>(artifacts.values());
+        }
+
+        @Override
+        public synchronized List<StoredArtifactRecord> listStored() {
+            return artifacts.values().stream()
+                    .map(resource -> unreadable.contains(resource.id())
+                            ? new StoredArtifactRecord(
+                                    resource.id(), resource.kind(), null, hash(resource), false)
+                            : StoredArtifactRecord.of(resource))
+                    .toList();
+        }
+
+        synchronized void makeUnreadable(String id) {
+            if (!artifacts.containsKey(id)) {
+                throw new IllegalArgumentException("no stored artifact " + id);
+            }
+            unreadable.add(id);
+        }
+
+        private static TapstateException unreadable(String id) {
+            return new TapstateException(
+                    IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", "settings"), null);
         }
     }
 
@@ -712,6 +869,48 @@ class ArtifactMutationServiceTest {
         reclaimOrder.add(name);
         if (failure != null) {
             throw failure;
+        }
+    }
+
+    /** The samples a pipeline left behind, reclaimed last: nothing else bounds them but their age. */
+    private final class RecordingRateHistory implements io.tapstate.spi.store.RateHistoryStore {
+        private final List<String> deleted = new ArrayList<>();
+
+        @Override
+        public void append(io.tapstate.core.lifecycle.RateSample sample) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Page readPage(String pipelineId, java.time.Instant from, java.time.Instant to,
+                Key after, int limit) {
+            return new Page(List.of(), false);
+        }
+
+        @Override
+        public java.util.Optional<Entry> predecessor(String pipelineId, java.time.Instant at) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public java.util.Optional<Entry> read(String pipelineId, Key key) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public java.util.Optional<Entry> successor(String pipelineId, java.time.Instant at) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public void deleteAll(String pipelineId) {
+            step("rate-history", null);
+            deleted.add(pipelineId);
+        }
+
+        @Override
+        public java.time.Duration retention() {
+            return java.time.Duration.ofDays(15);
         }
     }
 
@@ -823,6 +1022,82 @@ class ArtifactMutationServiceTest {
         }
     }
 
+    private final class InMemoryPipelineLayoutStore implements PipelineLayoutStore {
+
+        private final Map<String, PipelineLayout> documents = new LinkedHashMap<>();
+
+        @Override
+        public Optional<PipelineLayout> get(String pipelineId) {
+            return Optional.ofNullable(documents.get(pipelineId));
+        }
+
+        @Override
+        public void save(PipelineLayout layout) {
+            documents.put(layout.pipelineId(), layout);
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            step("layout", null);
+            documents.remove(pipelineId);
+        }
+    }
+
+    private final class InMemoryDerivedSchemaStore implements DerivedSchemaStore {
+
+        private final Map<String, DerivedSchema> byStep = new LinkedHashMap<>();
+        private final Map<String, Long> pins = new LinkedHashMap<>();
+        private RuntimeException deleteFailure;
+
+        void put(String pipelineId, String stepId) {
+            byStep.put(pipelineId + "/" + stepId,
+                    new DerivedSchema(0L, Map.of("id", "LONG"), "sql-v1", "src-v1", "calcite"));
+        }
+
+        boolean holdsAnythingFor(String pipelineId) {
+            return byStep.keySet().stream().anyMatch(key -> key.startsWith(pipelineId + "/"));
+        }
+
+        void failDeleteWith(RuntimeException failure) {
+            this.deleteFailure = failure;
+        }
+
+        @Override
+        public Optional<DerivedSchema> latest(String pipelineId, String stepId) {
+            return Optional.ofNullable(byStep.get(pipelineId + "/" + stepId));
+        }
+
+        @Override
+        public void record(String pipelineId, String stepId, Map<String, String> schema,
+                String statement, String derivedFrom, String derivedBy) {
+            byStep.put(pipelineId + "/" + stepId,
+                    new DerivedSchema(0L, schema, statement, derivedFrom, derivedBy));
+        }
+
+        @Override
+        public void pin(String pipelineId, String stepId, long version) {
+            pins.put(pipelineId + "/" + stepId, version);
+        }
+
+        @Override
+        public Optional<DerivedSchema> pinned(String pipelineId, String stepId) {
+            Long version = pins.get(pipelineId + "/" + stepId);
+            DerivedSchema recorded = byStep.get(pipelineId + "/" + stepId);
+            return version != null && recorded != null && recorded.version() == version
+                    ? Optional.of(recorded)
+                    : Optional.empty();
+        }
+
+        @Override
+        public void delete(String pipelineId) {
+            // Fail before mutating, so an armed failure leaves the record behind — the residue the
+            // reporting is about.
+            step("derived-schema", deleteFailure);
+            byStep.keySet().removeIf(key -> key.startsWith(pipelineId + "/"));
+            pins.keySet().removeIf(key -> key.startsWith(pipelineId + "/"));
+        }
+    }
+
     private final class InMemorySrsMetaStore implements SrsMetaStore {
 
         private final Map<String, SrsMeta> chains = new LinkedHashMap<>();
@@ -830,7 +1105,8 @@ class ArtifactMutationServiceTest {
 
         void seed(String miningChainId, ConsumerOffset... consumers) {
             chains.put(miningChainId,
-                    new SrsMeta(miningChainId, "srcpos-1", List.of(consumers), null, List.of(), null));
+                    new SrsMeta(miningChainId, new ChainPosition(new SourceOrder(1L, 1L), "srcpos-1"),
+                            List.of(consumers), List.of(), null));
         }
 
         /** Arms one chain to refuse a detach, standing in for a chain whose store is momentarily down. */
@@ -864,6 +1140,13 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
+        public void dropChain(String miningChainId) {
+            // Removing a whole chain is a stop's act, not a removal's: what this double stands in for
+            // never reaches it, so it refuses rather than quietly answering.
+            throw new UnsupportedOperationException("chain removal is not exercised by this double");
+        }
+
+        @Override
         public void detachConsumer(String miningChainId, String pipelineId) {
             // Fail before mutating, so an armed chain keeps the departing consumer's cursor — the residue
             // the report is about has to really be there for the assertions to witness anything.
@@ -872,8 +1155,9 @@ class ArtifactMutationServiceTest {
             List<ConsumerOffset> kept = chain.consumerOffsets().stream()
                     .filter(offset -> !offset.pipelineId().equals(pipelineId))
                     .toList();
-            chains.put(miningChainId, new SrsMeta(chain.miningChainId(), chain.sourceReadOffset(), kept,
-                    chain.cdcStartPosition(), chain.schemaHistory(), chain.retention()));
+            // Everything but the departing consumer is carried across.
+            chains.put(miningChainId, new SrsMeta(chain.miningChainId(), chain.sourceRead(), kept,
+                    chain.schemaHistory(), chain.retention(), chain.epoch()));
         }
 
         @Override
@@ -882,7 +1166,13 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, String sourceReadOffset) {
+        public void rewindSourceReadOffset(String miningChainId, String token) {
+            // No test on this double writes a position back; a call here is a wiring mistake, not a case.
+            throw new UnsupportedOperationException("rewindSourceReadOffset");
+        }
+
+        @Override
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             throw new UnsupportedOperationException("the delete path never advances a chain");
         }
 
@@ -902,12 +1192,13 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
-        public void setCdcStart(String miningChainId, String cdcStartPosition, long snapshotEpoch) {
+        public void setCdcStart(
+                String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             throw new UnsupportedOperationException("the delete path never advances a chain");
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String table) {
+        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             throw new UnsupportedOperationException("the delete path never advances a chain");
         }
 

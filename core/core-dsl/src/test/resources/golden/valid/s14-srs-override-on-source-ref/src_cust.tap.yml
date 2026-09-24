@@ -1,0 +1,11 @@
+version: tapstate/v1
+kind: source
+id: src_cust
+connector: postgres
+config:
+  database: crm
+  host: 10.40.0.8
+  password: Crm_2026
+  username: cdc_user
+mode: cdc
+tables: [customers]

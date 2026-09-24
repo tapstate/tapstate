@@ -169,6 +169,7 @@ class TierBindingsIT {
                 kind: source
                 id: tgt_mongo
                 connector: mongodb
+                mode: cdc
                 config: { uri: "${MONGO_URI}" }
                 """);
         write("pipeline.tap.yml", """

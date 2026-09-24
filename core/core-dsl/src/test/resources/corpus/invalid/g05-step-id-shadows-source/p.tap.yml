@@ -1,6 +1,6 @@
 # Invalid: the step is named 'src_a', which is also the id of the referenced source — the
 # <source_id>.<table> disambiguation prefix could no longer tell a step from a source
-# (ADR-0016 §5, no shadowing). Rename the step and the batch is valid.
+# (§5, no shadowing). Rename the step and the batch is valid.
 version: tapstate/v1
 kind: pipeline
 id: p

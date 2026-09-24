@@ -51,6 +51,43 @@ class TransformWizardTest {
     }
 
     @Test
+    void buildsAnUnwindTransform() {
+        // path, then the element's own identifying field, then the ordinal column, then whether an
+        // empty array still produces a row, then the declared type of the expanded field
+        ScriptedPrompter p = new ScriptedPrompter(
+                "explode", "unwind", "items", "sku", "item_no", "yes", "json");
+        assertThat(yaml(new TransformWizard(p).run())).isEqualTo(
+                """
+                version: tapstate/v1
+                kind: transform
+                id: explode
+                type: unwind
+                path: items
+                include_array_index: item_no
+                preserve_null_and_empty_arrays: true
+                element_key: sku
+                element_type: json
+                """);
+    }
+
+    @Test
+    void anUnwindsUnansweredOptionsAreWrittenAsAbsentRatherThanAsTheirDefaults() {
+        // Four of the five keys are optional and a blank answer means "not this one". Writing the
+        // defaults out instead would produce an artifact an author has to read past to find the two
+        // lines they actually chose, and would state a false as though it had been decided.
+        ScriptedPrompter p = new ScriptedPrompter("explode", "unwind", "items", "", "item_no", "no", "");
+        assertThat(yaml(new TransformWizard(p).run())).isEqualTo(
+                """
+                version: tapstate/v1
+                kind: transform
+                id: explode
+                type: unwind
+                path: items
+                include_array_index: item_no
+                """);
+    }
+
+    @Test
     void buildsAJsTransformAsAMultilineLiteralBlock() {
         // the whole script is captured as one multi-line block via the lines() primitive
         ScriptedPrompter p = new ScriptedPrompter("parse", "js", "emit(after)\nemit(before)");
@@ -79,21 +116,21 @@ class TransformWizardTest {
     }
 
     @Test
-    void buildsAJoinTransformWithDefaultEngineAndMultilineSql() {
-        // a blank engine reply takes the duckdb default; the SQL is a multi-line block
+    void buildsAJoinTransformWithTheOnlyEngineAndMultilineSql() {
+        // the wizard asks no engine question any more, so the replies are id, type and the SQL
         ScriptedPrompter p = new ScriptedPrompter(
-                "cust_wide", "join", "",
-                "SELECT c.id AS customer_id, count(*) AS n\nFROM c JOIN o ON o.customer_id = c.id GROUP BY c.id");
+                "cust_wide", "join",
+                "SELECT c.id AS customer_id, o.amount AS amount\nFROM c JOIN o ON o.customer_id = c.id");
         assertThat(yaml(new TransformWizard(p).run())).isEqualTo(
                 """
                 version: tapstate/v1
                 kind: transform
                 id: cust_wide
                 type: join
-                engine: duckdb
+                engine: builtin
                 sql: |
-                  SELECT c.id AS customer_id, count(*) AS n
-                  FROM c JOIN o ON o.customer_id = c.id GROUP BY c.id
+                  SELECT c.id AS customer_id, o.amount AS amount
+                  FROM c JOIN o ON o.customer_id = c.id
                 """);
     }
 
@@ -298,7 +335,7 @@ class TransformWizardTest {
         assertFixedPoint(new ScriptedPrompter("mask_pii", "map", "ssn", "false", ""));
         assertFixedPoint(new ScriptedPrompter("parse", "js", "emit(after)"));
         assertFixedPoint(new ScriptedPrompter("merged", "union"));
-        assertFixedPoint(new ScriptedPrompter("wide", "join", "duckdb", "SELECT 1 FROM c"));
+        assertFixedPoint(new ScriptedPrompter("wide", "join", "SELECT 1 FROM c"));
         assertFixedPoint(new ScriptedPrompter("root_only", "nest", "customer", "customer_id", "(done)"));
         // a deep tree (root -> policy -> claim) round-trips, exercising recursive embed serialization
         assertFixedPoint(new ScriptedPrompter(

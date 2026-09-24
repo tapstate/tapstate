@@ -41,6 +41,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>No serve block anywhere in the pipeline: the view is the whole instruction, and the collection it
  * lands in is named for the view rather than for the source table.
+ * The snapshot-and-CDC source still needs replication privileges even though the transform admits
+ * only snapshot rows into the view.
  *
  * <p>Gated on Docker and on a directory of real connector jars, exactly like its siblings. Naming no
  * directory skips it, so the default build stays green; naming one whose jars do not resolve fails
@@ -75,6 +77,7 @@ class RealMysqlToMongoViewIndexIT {
     void aDeclaredViewMaterializesAndCarriesItsKeyIndex(Tiers tier) throws Exception {
         try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))) {
             mysql.start();
+            SharedMySql.grantReplication(mysql);
             seedMysqlOrders(mysql, SEEDED_ROWS);
 
             String suffix = tier.name().toLowerCase(Locale.ROOT);

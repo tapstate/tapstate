@@ -6,7 +6,7 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
- * The target name a rename spec gives a source table (ADR-0016 §8, X4). These cases are the shared contract
+ * The target name a rename spec gives a source table (§8, X4). These cases are the shared contract
  * between the validate gate that rejects a workspace by these names and the write side that creates tables
  * by them, so they live with the computation rather than at either use site.
  */

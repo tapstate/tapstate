@@ -3,8 +3,10 @@
 # The weekly funnel report, computed entirely from the stored series -- no manual scraping, which is
 # the point: a number nobody can reproduce is a number nobody can act on.
 #
-# The report has one denominator and it is stated as such. Canonical L1 is "an install completed",
-# counted by unique installation_id, and it is the only figure anything may be divided by. Everything
+# The report has one denominator and it is stated as such. Canonical L1 is "a community install
+# completed", counted by unique installation_id, and it is the only figure anything may be divided by.
+# Our own test harnesses install constantly, so the events carry which side they are on and the ones
+# that are ours are printed apart from the denominator rather than inside it. Everything
 # under distribution signals is listed item by item and never added up: one person contributes clones
 # and downloads at once, and CI contributes far more than any person. Measured on this repo over
 # 2026-08-18..08-31: 6525 clones from 316 unique cloners against 750 views from 34 unique visitors.
@@ -92,33 +94,94 @@ def read_events():
 print("tapstate funnel -- week of %s (%s..%s)" % (start, start, end))
 print()
 
+WINDOW_SECONDS = 180
+
+def machine_shaped(events):
+    """Bursts that no person produces: three or more os/arch combinations inside one three-minute window.
+
+    The channel field is what separates our traffic from everyone else's, but it only works while the
+    lane that installs remembers to set it -- and the failure it replaced was exactly a lane that
+    forgot. So the report keeps a second, independent read that owes nothing to what the sender
+    claimed: nobody installs on macOS Intel, macOS ARM, Linux x64 and Linux ARM inside the same
+    minute.
+
+    The window is measured from its own first event, never from the previous one. Grouping by the gap
+    between neighbours chains: three installs at 00:00, 02:50 and 05:40 are each under three minutes
+    apart and span nearly six, so an ordinary week on three platforms would be reported as a test
+    matrix. A false alarm here is the same defect this whole field exists to remove -- a figure that
+    looks right and is not -- only pointing the other way.
+
+    Returns (timestamp, events in the window, platforms) for each flagged window, skipping past one
+    once it is reported so a single burst is named once rather than once per event in it."""
+    rows = []
+    for row in sorted((e for e in events if e.get("timestamp")), key=lambda e: e["timestamp"]):
+        try:
+            rows.append((datetime.datetime.strptime(row["timestamp"], "%Y-%m-%dT%H:%M:%SZ"), row))
+        except ValueError:
+            continue
+    out, i, n = [], 0, len(rows)
+    while i < n:
+        j = i
+        while j + 1 < n and (rows[j + 1][0] - rows[i][0]).total_seconds() <= WINDOW_SECONDS:
+            j += 1
+        platforms = {"%s/%s" % (r.get("os"), r.get("arch")) for _, r in rows[i:j + 1]}
+        if len(platforms) >= 3:
+            out.append((rows[i][1]["timestamp"], j - i + 1, sorted(platforms)))
+            i = j + 1
+        else:
+            i += 1
+    return out
+
 # --- canonical L1 -----------------------------------------------------------------------------
 # Unique installation_id, not event count: a reinstall in the same place is one installation, and
 # counting rows would inflate the one figure everything else is divided by.
+#
+# Counted over the community channel alone. Our own harnesses are printed below it and never added
+# in -- a denominator that includes the machines testing the product measures the tests.
 all_events = read_events()
-print("CANONICAL L1 -- installs completed (unique installation_id)")
+print("CANONICAL L1 -- community installs completed (unique installation_id)")
 l1 = None
+community = []
+# Events that arrived this week, whatever channel they claimed. Kept apart from the denominator on
+# purpose: the cross-check at the bottom asks whether the receiver is alive, and the denominator
+# cannot answer that any more. A week of nothing but our own harnesses, or of installers too old to
+# say, has a community L1 of zero while every event arrived exactly as it should.
+arrivals = None
 if all_events is None:
     print("  no event store yet -- the install endpoint is not receiving. L1 is unavailable,")
     print("  which is different from L1 being zero.")
 else:
     events = [e for e in all_events if e.get("timestamp", "")[:10] in days]
-    ids = {e.get("installation_id") for e in events if e.get("installation_id")}
+    arrivals = len(events)
+    # An event with no channel key at all predates the field. It is neither ours nor demonstrably
+    # somebody else's, and calling it community would put whatever it was into the denominator.
+    by_channel = {}
+    for e in events:
+        by_channel.setdefault(e.get("channel", "unknown"), []).append(e)
+    community = by_channel.get("community", [])
+    ids = {e.get("installation_id") for e in community if e.get("installation_id")}
     l1 = len(ids)
     print("  installs completed: %d" % l1)
     by_version = {}
-    for e in events:
+    for e in community:
         by_version.setdefault(e.get("version", "unknown"), set()).add(e.get("installation_id"))
     if by_version:
         print("  by version:")
         for v in sorted(by_version, reverse=True):
             print("    %-10s %d" % (v, len(by_version[v])))
     by_entry = {}
-    for e in events:
+    for e in community:
         by_entry.setdefault(e.get("entrypoint", "unknown"), set()).add(e.get("installation_id"))
     if by_entry:
         print("  by entry point: " + ", ".join(
             "%s %d" % (k, len(v)) for k, v in sorted(by_entry.items())))
+    print()
+    print("  NOT the denominator, and never added to it:")
+    for label, why in (("internal", "our own test harnesses -- installs nobody performed"),
+                       ("unknown", "no channel was reported: an installer older than the field")):
+        rows = by_channel.get(label, [])
+        n = len({e.get("installation_id") for e in rows if e.get("installation_id")})
+        print("    %-9s %-6d (%s)" % (label, n, why))
 print()
 
 # --- distribution signals ---------------------------------------------------------------------
@@ -224,10 +287,26 @@ if not missing_any:
 # through completely separate paths -- a pull from GitHub's API versus a push from the installer -- so
 # traffic with no installs at all is either a real collapse or, far more often, the callback failing
 # quietly. Neither is visible in any single figure above.
-if distribution_seen > 0 and (l1 is None or l1 == 0):
+# The channel says what the sender claimed. This says what the traffic looks like, and the two are
+# independent on purpose: the one failure this field cannot catch by itself is a lane that installs
+# without setting it, whose events arrive claiming to be community and look exactly like a person's.
+bursts = machine_shaped(community)
+if bursts:
     print()
-    print("  WARNING: distribution signals are non-zero for this week while L1 is %s."
-          % ("unavailable" if l1 is None else "zero"))
+    print("  WARNING: %d burst(s) counted as community have a shape no person produces." % len(bursts))
+    for at, n, platforms in bursts[:5]:
+        print("    %s  %d events across %s" % (at, n, ", ".join(platforms)))
+    print("  Three or more platforms inside three minutes is a test matrix. Find the lane that")
+    print("  installed without declaring itself, and read this week's L1 as an upper bound.")
+
+# Read off arrivals, not off the denominator. Keyed on community L1 this fired for every week
+# collected before the channel existed -- events had arrived, been stored and been counted, and the
+# page still said the callback might not be reaching us. A cross-check that cries wolf on the
+# archive is one nobody believes on the day it is right.
+if distribution_seen > 0 and (arrivals is None or arrivals == 0):
+    print()
+    print("  WARNING: distribution signals are non-zero for this week while %s."
+          % ("no event store exists" if arrivals is None else "not one install event arrived"))
     print("  Either nobody who fetched the software ran the installer, or the install callback is")
     print("  not arriving. Check the receiver before reading any ratio off this page.")
 print("  This covers the community funnel only. Offline and restricted-network deployments never")

@@ -14,6 +14,8 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.JoinEngine;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -43,7 +45,7 @@ class PipelineDagBuilderTest {
     void source_to_serve_without_transforms_is_a_source_then_sink() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 null,
                 null,
                 serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")),
@@ -57,10 +59,47 @@ class PipelineDagBuilderTest {
     }
 
     @Test
+    void one_serve_sink_accepts_multiple_explicit_source_table_references() {
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of(SourceRef.bare("src")),
+                null,
+                null,
+                new ServeBlock.Inline(
+                        "serve",
+                        FromClause.list(
+                                FromRef.literal("src.orders"),
+                                FromRef.literal("src.customers")),
+                        List.of(sync("sync_1", "orders_dest")),
+                        null,
+                        null),
+                null, null);
+
+        DagBindings bindings = new DagBindings(
+                srcId -> stubMeta(),
+                step -> (SupplierEx<TransformPort>) () -> ev -> List.of(ev),
+                syncElement -> stubWriter(),
+                ref -> Map.of(
+                        FromRef.literal("src.orders"), List.of("src.orders"),
+                        FromRef.literal("src.customers"), List.of("src.customers"))
+                        .getOrDefault(ref, List.of()),
+                sourceId -> List.of("src.orders", "src.customers"),
+                viewBlock -> stubWriter());
+
+        DAG dag = PipelineDagBuilder.build(pipeline, bindings);
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "src.orders", "src.customers", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrder(
+                edge("src.orders", "serve.sync_1", 0, 0),
+                edge("src.customers", "serve.sync_1", 0, 1));
+    }
+
+    @Test
     void view_without_serve_is_a_source_then_a_materialization_sink() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 null,
                 view("order_state", FromRef.literal("orders_src")),
                 null,
@@ -79,7 +118,7 @@ class PipelineDagBuilderTest {
         // output. If this stopped building, the demo would fail on a clean machine and nowhere else.
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 List.of(filter("shape_orders", "row.id % 2 == 0", FromRef.literal("orders_src"))),
                 view("order_state", FromRef.literal("shape_orders")),
                 null, null, null);
@@ -101,7 +140,7 @@ class PipelineDagBuilderTest {
         // the shape a real workspace produces - not a hand-built curiosity.
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 null,
                 view("order_state", FromRef.literal("orders_src")),
                 serve(FromRef.literal("order_state"), sync("sync_1", "orders_dest")),
@@ -121,7 +160,7 @@ class PipelineDagBuilderTest {
     void stateless_step_wires_source_through_a_transform_vertex_to_sink() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 List.of(filter("keep_even", "row.id % 2 == 0", FromRef.literal("orders_src"))),
                 null,
                 serve(FromRef.literal("keep_even"), sync("sync_1", "orders_dest")),
@@ -142,7 +181,7 @@ class PipelineDagBuilderTest {
     void linear_chain_wires_a_vertex_per_step_in_declared_order() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 List.of(
                         filter("f", "row.id > 0", FromRef.literal("orders_src")),
                         map("m", FromRef.literal("f")),
@@ -170,7 +209,7 @@ class PipelineDagBuilderTest {
     void union_merges_upstreams_into_a_passthrough_vertex_without_a_transform_port() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("a_src", "b_src"),
+                List.of(SourceRef.bare("a_src"), SourceRef.bare("b_src")),
                 List.of(union("u", FromRef.literal("a_src"), FromRef.literal("b_src"))),
                 null,
                 serve(FromRef.literal("u"), sync("sync_1", "orders_dest")),
@@ -204,7 +243,7 @@ class PipelineDagBuilderTest {
         // or union would re-lane events and break that order.
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("a_src", "b_src"),
+                List.of(SourceRef.bare("a_src"), SourceRef.bare("b_src")),
                 List.of(
                         union("u", FromRef.literal("a_src"), FromRef.literal("b_src")),
                         map("m", FromRef.literal("u"))),
@@ -226,7 +265,7 @@ class PipelineDagBuilderTest {
     void multi_ref_stateless_step_merges_all_upstreams_by_fan_in() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("a_src", "b_src"),
+                List.of(SourceRef.bare("a_src"), SourceRef.bare("b_src")),
                 List.of(filter("f", "true", FromRef.literal("a_src"), FromRef.literal("b_src"))),
                 null,
                 serve(FromRef.literal("f"), sync("sync_1", "orders_dest")),
@@ -247,7 +286,7 @@ class PipelineDagBuilderTest {
     void multiple_sync_elements_fan_out_from_the_serve_upstream() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 null,
                 null,
                 serve(FromRef.literal("orders_src"),
@@ -264,11 +303,64 @@ class PipelineDagBuilderTest {
                 edge("orders_src", "serve.sync_2", 1, 0));
     }
 
+    /**
+     * The positive control for the case below: with the binding supplied, the join is drawn rather than
+     * refused. Source changes keep their own ordinals, and final projection meets at the output key.
+     */
     @Test
-    void stateful_join_step_is_out_of_scope_and_rejected() {
+    void join_step_routes_final_projection_by_the_fact_key() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src"), SourceRef.bare("customers_src")),
+                List.of(joinStep("j", FromRef.literal("orders_src"), FromRef.literal("customers_src"))),
+                null,
+                serve(FromRef.literal("j"), sync("sync_1", "orders_dest")),
+                null, null);
+
+        DAG dag = PipelineDagBuilder.build(pipeline, bindings(Map.of(
+                FromRef.literal("orders_src"), List.of("orders_src"),
+                FromRef.literal("customers_src"), List.of("customers_src"),
+                FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()));
+
+        assertThat(vertexNames(dag))
+                .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "j:project", "serve.sync_1");
+        assertThat(edges(dag)).contains(
+                edge("orders_src", "j", 0, 0),
+                edge("customers_src", "j", 0, 1),
+                edge("j", "j:project", 0, 0),
+                edge("j:project", "serve.sync_1", 0, 0));
+        Edge projection = dag.getInboundEdges("j:project").getFirst();
+        assertThat(projection.isDistributed()).isTrue();
+        assertThat(projection.getPartitioner()).isNotNull();
+        @SuppressWarnings("unchecked")
+        com.hazelcast.jet.core.Partitioner<Object> partitioner =
+                (com.hazelcast.jet.core.Partitioner<Object>) projection.getPartitioner();
+        java.util.concurrent.atomic.AtomicReference<Object> routed = new java.util.concurrent.atomic.AtomicReference<>();
+        partitioner.init(key -> {
+            routed.set(key);
+            return 0;
+        });
+        partitioner.getPartition(new io.tapstate.runtime.engine.join.JoinUpdate(
+                io.tapstate.core.sql.JoinKey.of(List.of(10L)).name(),
+                Envelope.insert(1, "j", Map.of("customer", "new"), null)), 17);
+        assertThat(routed.get()).isEqualTo(io.tapstate.core.sql.JoinKey.of(List.of(10L)).name());
+        partitioner.getPartition(new io.tapstate.runtime.engine.join.JoinUpdate(
+                io.tapstate.core.sql.JoinKey.of(List.of(10L)).name(),
+                Envelope.delete(1, "j", Map.of("customer", "old"), null)), 17);
+        assertThat(routed.get()).isEqualTo(io.tapstate.core.sql.JoinKey.of(List.of(10L)).name());
+    }
+
+    /**
+     * A join draws its own vertex and its own edges, and what it needs to do that - the compiled plan,
+     * the driving source's key columns, where its state lives - comes from the assembly root. A builder
+     * handed a join and no binding cannot make any of it up, and inventing a default would be a graph
+     * that runs and holds its state somewhere nobody chose.
+     */
+    @Test
+    void join_step_without_its_binding_is_a_wiring_mistake() {
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of(SourceRef.bare("orders_src")),
                 List.of(joinStep("j", FromRef.literal("orders_src"))),
                 null,
                 serve(FromRef.literal("j"), sync("sync_1", "orders_dest")),
@@ -277,16 +369,16 @@ class PipelineDagBuilderTest {
         assertThatThrownBy(() -> PipelineDagBuilder.build(pipeline, bindings(Map.of(
                 FromRef.literal("orders_src"), List.of("orders_src"),
                 FromRef.literal("j"), List.of("j")))))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("j");
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("no join binding was supplied");
     }
 
     @Test
     void use_reference_step_is_not_yet_resolved_and_rejected() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
-                List.of(Step.use("u", "shared_filter", FromClause.list(FromRef.literal("orders_src")), null)),
+                List.of(SourceRef.bare("orders_src")),
+                List.of(Step.use("u", "shared_filter", FromClause.list(FromRef.literal("orders_src")))),
                 null,
                 serve(FromRef.literal("u"), sync("sync_1", "orders_dest")),
                 null, null);
@@ -301,7 +393,7 @@ class PipelineDagBuilderTest {
     void use_reference_serve_block_is_not_yet_resolved_and_rejected() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 null,
                 null,
                 new ServeBlock.Use(null, "shared_serve", FromRef.literal("orders_src")),
@@ -316,7 +408,7 @@ class PipelineDagBuilderTest {
     void reference_that_resolves_to_nothing_is_an_invariant_violation() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 List.of(filter("f", "true", FromRef.literal("ghost"))),
                 null,
                 serve(FromRef.literal("f"), sync("sync_1", "orders_dest")),
@@ -333,7 +425,7 @@ class PipelineDagBuilderTest {
     void reference_to_an_unknown_vertex_key_is_an_invariant_violation() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
-                List.of("orders_src"),
+                List.of(SourceRef.bare("orders_src")),
                 List.of(filter("f", "true", FromRef.literal("orders_src"))),
                 null,
                 serve(FromRef.literal("f"), sync("sync_1", "orders_dest")),
@@ -349,7 +441,7 @@ class PipelineDagBuilderTest {
     @Test
     void a_source_without_vertex_keys_is_an_invariant_violation() {
         PipelineResource pipeline = new PipelineResource(
-                "p", null, List.of("orders_src"), null, null,
+                "p", null, List.of(SourceRef.bare("orders_src")), null, null,
                 serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")), null, null);
         DagBindings bindings = new DagBindings(
                 srcId -> stubMeta(),
@@ -366,7 +458,7 @@ class PipelineDagBuilderTest {
     @Test
     void a_null_source_vertex_key_result_is_an_invariant_violation() {
         PipelineResource pipeline = new PipelineResource(
-                "p", null, List.of("orders_src"), null, null,
+                "p", null, List.of(SourceRef.bare("orders_src")), null, null,
                 serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")), null, null);
         DagBindings bindings = new DagBindings(
                 srcId -> stubMeta(),
@@ -415,7 +507,7 @@ class PipelineDagBuilderTest {
     }
 
     private static ViewBlock view(String id, FromRef from) {
-        return new ViewBlock.Inline(id, from, "order_id", null, null);
+        return new ViewBlock.Inline(id, from, "order_id", null);
     }
 
     private static ServeBlock serve(FromRef from, SyncElement... sync) {
@@ -423,29 +515,63 @@ class PipelineDagBuilderTest {
     }
 
     private static SyncElement sync(String id, String dest) {
-        return new SyncElement(id, dest, null, null, null, null);
+        return new SyncElement(id, dest, null, null, null);
     }
 
     private static Step filter(String id, String expr, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Filter(expr), null);
     }
 
     private static Step map(String id, FromRef... from) {
         TransformBody body = new TransformBody.MapProjection(Map.of("out", FieldRule.rename("in")));
-        return Step.inline(id, FromClause.list(from), body, null, null);
+        return Step.inline(id, FromClause.list(from), body, null);
     }
 
     private static Step js(String id, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Js("emit(row)"), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Js("emit(row)"), null);
     }
 
     private static Step union(String id, FromRef... from) {
-        return Step.inline(id, FromClause.list(from), new TransformBody.Union(), null, null);
+        return Step.inline(id, FromClause.list(from), new TransformBody.Union(), null);
     }
 
     private static Step joinStep(String id, FromRef from) {
-        TransformBody body = new TransformBody.Join("duckdb", "SELECT 1");
-        return Step.inline(id, FromClause.aliases(Map.of("root", from)), body, null, null);
+        TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN, "SELECT 1");
+        return Step.inline(id, FromClause.aliases(Map.of("root", from)), body, null);
+    }
+
+    /** A join step reading two sources, under the alias names the plan below calls them by. */
+    private static Step joinStep(String id, FromRef fact, FromRef dimension) {
+        TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN,
+                "SELECT o.id FROM orders o JOIN customers c ON o.cust_id = c.id");
+        return Step.inline(id, FromClause.aliases(new java.util.LinkedHashMap<>(
+                Map.of("o", fact, "c", dimension))), body, null);
+    }
+
+    /**
+     * The compiled plan and the driving source's key, as the assembly root would supply them. Built by
+     * hand rather than derived: deriving needs the SQL library, which this ring cannot see.
+     */
+    private static io.tapstate.runtime.engine.join.JoinBinding joinBinding() {
+        io.tapstate.core.sql.JoinTree from = new io.tapstate.core.sql.JoinTree.Join(
+                new io.tapstate.core.sql.JoinTree.Source("o", "orders"),
+                new io.tapstate.core.sql.JoinTree.Source("c", "customers"),
+                io.tapstate.core.sql.JoinKind.INNER,
+                List.of(new io.tapstate.core.sql.JoinTree.KeyPair(
+                        new io.tapstate.core.sql.JoinTree.ColumnRef("o", "cust_id"),
+                        new io.tapstate.core.sql.JoinTree.ColumnRef("c", "id"))),
+                false);
+        io.tapstate.core.sql.JoinPlan plan = new io.tapstate.core.sql.JoinPlan(
+                List.of(new io.tapstate.core.sql.OutputField("id",
+                        io.tapstate.core.common.TapstateType.INT64, false,
+                        new io.tapstate.core.sql.Expr.Column(
+                                new io.tapstate.core.sql.JoinTree.ColumnRef("o", "id")))),
+                from, Map.of("o", List.of("cust_id", "id"), "c", List.of("id")));
+        return new io.tapstate.runtime.engine.join.JoinBinding(
+                step -> plan,
+                step -> List.of("id"),
+                (member, pipelineId, stepId) ->
+                        new io.tapstate.runtime.engine.join.MapJoinStores());
     }
 
     private static List<String> vertexNames(DAG dag) {

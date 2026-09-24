@@ -24,15 +24,15 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
- * The B3-7 semantic acceptance gate: the whole ADR-0016 §14 corpus driven end to end through
+ * The B3-7 semantic acceptance gate: the whole §14 corpus driven end to end through
  * parse + validate (the offline half). It complements {@code CorpusSmokeTest} (the structural
  * gate) by asserting DSL <em>semantics</em>:
  * <ul>
  *   <li>every valid scenario loads clean — the real false-positive guard;</li>
  *   <li>every invalid scenario is rejected with the corpus-declared {@link DslError} code at the
  *       declared field path;</li>
- *   <li>the thrown named arguments exactly satisfy that code's placeholder contract (ADR-0024
- *       D5-4, the runtime half the build gate cannot link statically);</li>
+ *   <li>the thrown named arguments exactly satisfy that code's placeholder contract — the
+ *       runtime half the build gate cannot link statically;</li>
  *   <li>every {@link DslError} is witnessed by at least one case — the corpus rule vocabulary
  *       (corpus/README.md) maps 1:1 to the enum.</li>
  * </ul>
@@ -60,7 +60,7 @@ class CorpusSemanticGateTest {
         DslException ex = (DslException) thrown;
         assertThat(ex.code()).isEqualTo(DslError.ofSymbol(rule));
         assertThat(ex.path()).isEqualTo(path);
-        // ADR-0024 D5-4 (runtime half): the thrown args exactly cover the code's placeholder contract
+        // Runtime half: the thrown args exactly cover the code's placeholder contract
         assertThat(ex.args().keySet()).containsExactlyInAnyOrderElementsOf(ex.code().placeholders());
     }
 
@@ -83,6 +83,10 @@ class CorpusSemanticGateTest {
         // lives outside it.
         //   CONFIG_REQUIRED: the verdict depends on the live connector catalog, which the offline
         //   WorkspaceLoader this corpus exercises does not consult.
+        //   UNSUPPORTED_TARGET_CONNECTOR: what may be written to is a property of the deployment
+        //   being applied to -- which widens its own accepted connector set -- so the gate runs on
+        //   the apply path and this loader never reaches it (TargetConnectorRulesTest, plus the
+        //   apply-path refusal in control-core).
         //   ROW_EXPRESSION_NEEDS_DISCOVERY / ROW_EXPRESSION_TYPE_UNSUPPORTED /
         //   ROW_EXPRESSION_TYPE_UNKNOWN: the verdict depends on whether a source has been discovered
         //   and on the column types that discovery resolved, neither of which a document declares nor
@@ -90,11 +94,23 @@ class CorpusSemanticGateTest {
         //   UPSERT_NEEDS_KEY: whether a table has a key is a property of the table, which only a
         //   discovered model carries - a document names the table but cannot say what it declares
         //   (WriteKeyRulesTest).
+        //   UNWIND_COLUMN_ALREADY_EXISTS: parent columns come from discovery or actual rows, not
+        //   the offline artifact (UnwindColumnCollisionTest and UnwindRuntimeCollisionTest, plus
+        //   the two published startup-refusal cases).
+        //
+        // inexpressible - the corpus cannot hold the document that would witness it.
+        //   UNSUPPORTED_VERSION: CorpusSmokeTest requires every artifact here to declare the
+        //   supported version, so an artifact declaring another one cannot exist in this corpus. That
+        //   requirement is worth more than the witness -- it is what stops a fixture drifting onto a
+        //   stale grammar unnoticed -- so the code is proven directly instead (DslParserTest, which
+        //   covers an unreadable version, an absent one, and that a supported version leaves an
+        //   unknown kind reported as a kind problem).
         Set<DslError> requiresCorpusWitness = EnumSet.complementOf(EnumSet.of(
                 DslError.MALFORMED_YAML, DslError.UNDEFINED_VARIABLE, DslError.MALFORMED_INTERPOLATION,
-                DslError.CONFIG_REQUIRED,
+                DslError.CONFIG_REQUIRED, DslError.UNSUPPORTED_TARGET_CONNECTOR,
                 DslError.ROW_EXPRESSION_NEEDS_DISCOVERY, DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED,
-                DslError.ROW_EXPRESSION_TYPE_UNKNOWN, DslError.UPSERT_NEEDS_KEY));
+                DslError.ROW_EXPRESSION_TYPE_UNKNOWN, DslError.UPSERT_NEEDS_KEY,
+                DslError.UNWIND_COLUMN_ALREADY_EXISTS, DslError.UNSUPPORTED_VERSION));
         assertThat(witnessed).containsExactlyInAnyOrderElementsOf(requiresCorpusWitness);
     }
 

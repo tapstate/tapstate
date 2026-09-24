@@ -22,6 +22,7 @@ class MongoStorePortTest {
                 MongoStorePort.PIPELINE_STATE,
                 MongoStorePort.PIPELINE_DESIRED,
                 MongoStorePort.PIPELINE_OBSERVATION,
+                MongoStorePort.PIPELINE_LAYOUTS,
                 MongoStorePort.CONNECTIONS,
                 MongoStorePort.SOURCE_SCHEMAS,
                 MongoStorePort.CONNECTOR_ARTIFACTS,
@@ -29,11 +30,13 @@ class MongoStorePortTest {
                 MongoStorePort.CONNECTOR_SPECS,
                 MongoStorePort.CONNECTION_TEST_RESULTS,
                 MongoStorePort.SRS_META,
+                MongoStorePort.SRS_CONSUMER_OFFSETS,
                 MongoAuthStores.CLUSTER_IDENTITY))
                 .doesNotHaveDuplicates()
-                .containsExactly("artifacts", "pipeline_state", "pipeline_desired", "pipeline_observation",
+                .containsExactly("artifacts", "pipeline_state", "pipeline_desired", "pipeline_observation", "pipeline_layouts",
                         "connections", "source_schemas", "connector_artifacts", "connector_catalog",
-                        "connector_specs", "connection_test_results", "srs_meta", "cluster_identity");
+                        "connector_specs", "connection_test_results", "srs_meta", "srs_consumer_offsets",
+                        "cluster_identity");
     }
 
     /**

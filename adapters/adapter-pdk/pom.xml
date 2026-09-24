@@ -31,6 +31,23 @@
       <artifactId>tapdata-pdk-api</artifactId>
     </dependency>
 
+    <!-- The host's logging facade. A connector's own output is written through this rather than being
+         dropped or printed straight to the console, so it lands in the same log, under the same format,
+         and with the pipeline attribution the read face files lines by. Facade only: which backend it
+         binds to stays the assembly root's choice. -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+
+    <!-- The name of the attribution slot a log line carries its pipeline in, shared with the appender
+         that files lines by it rather than spelled twice (core ring, zero third-party). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-logging</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
     <!-- The event envelope this bridge projects PDK TapEvents to and from — the shared currency the
          spi ports carry (core ring, zero third-party). Compile scope: the codec's signatures are in
          terms of it. -->
@@ -90,7 +107,44 @@
       <artifactId>assertj-core</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Test-only JSON implementation for the frozen parser interface; production uses the PDK provider. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- The driver types a connector registers conversions for, so the value-model cases can build the
+         real ones. Whether such a type can cross a wire decides which lane its value takes, and that is
+         a property of the class itself - a stand-in would answer for the stand-in. Test scope: no
+         production code in this module names a driver type, and rule R3 keeps it that way. -->
+    <dependency>
+      <groupId>org.mongodb</groupId>
+      <artifactId>bson</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Publish this module's test classes as a test-jar. The one consumer is the assembly module's own
+           test scope, which drives the sink-writer factory end to end and needs a connector to open: the
+           synthetic connectors compiled here are the only ones in the build that exist without a real jar,
+           and duplicating that fixture is what this avoids. Test scope on the consuming side, so nothing
+           from here reaches the shipped artifact. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>test-jar</id>
+            <goals>
+              <goal>test-jar</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 
   <profiles>
     <!-- Real-connector regression. Activated by the same property the gated test keys on, so

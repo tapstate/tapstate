@@ -13,6 +13,9 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.sql.JoinPlan;
+import io.tapstate.runtime.engine.join.JoinDag;
+import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.nest.NestDag;
 import io.tapstate.runtime.engine.nest.NestFrontier;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -22,6 +25,7 @@ import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -75,6 +79,95 @@ public final class PipelineDagBuilder {
             TransformBody.Nest nest = nestOf(step);
             if (nest != null) {
                 namespaces.addAll(NestTopology.compile(pipeline.id(), step.id(), nest, tables).stateNamespaces());
+            }
+        }
+        return namespaces;
+    }
+
+    /**
+     * Every map namespace of every nest, paired with the database that nest resolves to. An absent
+     * per-nest state block inherits {@code defaultDatabase}; the artifact remains absent rather than being
+     * rewritten with that environmental value.
+     */
+    public static Map<String, String> nestStateDatabases(PipelineResource pipeline,
+            Function<String, NestTable> tables, String defaultDatabase) {
+        if (pipeline.transforms() == null) {
+            return Map.of();
+        }
+        Map<String, String> databases = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms()) {
+            TransformBody.Nest nest = nestOf(step);
+            if (nest == null) {
+                continue;
+            }
+            String database = stateDatabase(nest, defaultDatabase);
+            for (String namespace :
+                    NestTopology.compile(pipeline.id(), step.id(), nest, tables).stateNamespaces()) {
+                String previous = databases.putIfAbsent(namespace, database);
+                if (previous != null && !previous.equals(database)) {
+                    throw new IllegalStateException("nest namespace '" + namespace
+                            + "' resolves to both " + previous + " and " + database);
+                }
+            }
+        }
+        return Map.copyOf(databases);
+    }
+
+    /** Each nest step's resolved state database, used by the shape ledger beside that step's state. */
+    public static Map<String, String> nestStateDatabasesByStep(
+            PipelineResource pipeline, String defaultDatabase) {
+        if (pipeline.transforms() == null) {
+            return Map.of();
+        }
+        Map<String, String> databases = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms()) {
+            TransformBody.Nest nest = nestOf(step);
+            if (nest != null) {
+                databases.put(step.id(), stateDatabase(nest, defaultDatabase));
+            }
+        }
+        return Map.copyOf(databases);
+    }
+
+    private static String stateDatabase(TransformBody.Nest nest, String defaultDatabase) {
+        return nest.state() == null ? defaultDatabase : nest.state().database();
+    }
+
+    /**
+     * Every namespace this pipeline's joins keep state in, empty for a pipeline that has none: the mirror of
+     * the driving rows, and a mirror and a reverse index for each source the step is wired to.
+     *
+     * <p>Named here rather than left out because the state is not a cache. The mirrors hold each dimension
+     * row as it last was, so a run inheriting them widens fresh driving rows with values the source no
+     * longer holds - and nothing reports that. The job runs, the row count is right, every row is present,
+     * and each column reads as plausible.
+     *
+     * <p><b>Every source the step declares, rather than only the ones a run writes to.</b> Which of them is
+     * driven from is the query's answer, not the wiring's, so telling them apart would mean deriving the
+     * plan - which needs each source's discovered model and refuses without it. A takedown must not depend
+     * on the query still compiling or on a model still being there: what it cannot name it strands for
+     * good, because the store has no way to list what it holds. Naming one that was never written costs a
+     * drop that finds nothing, which is the direction this can afford to be wrong in.
+     *
+     * <p>Which steps are joins is decided by {@link #joinOf}, the same way the build decides it, for the
+     * reason {@link #nestStateNamespaces} gives: two walks that judged it differently would drop the
+     * namespaces of one set of steps while a run wrote to another's.
+     */
+    public static Set<String> joinStateNamespaces(PipelineResource pipeline) {
+        if (pipeline.transforms() == null) {
+            return Set.of();
+        }
+        Set<String> namespaces = new LinkedHashSet<>();
+        for (Step step : pipeline.transforms()) {
+            if (joinOf(step) == null) {
+                continue;
+            }
+            namespaces.add(JoinMaps.factMirror(pipeline.id(), step.id()));
+            // A join's from: is an alias map by construction - the step model refuses any other shape for
+            // one - so this is an invariant rather than a case, and a violation crashes bare.
+            for (String alias : ((FromClause.Aliases) step.from()).aliases().keySet()) {
+                namespaces.add(JoinMaps.dimensionMirror(pipeline.id(), step.id(), alias));
+                namespaces.add(JoinMaps.reverseIndex(pipeline.id(), step.id(), alias));
             }
         }
         return namespaces;
@@ -147,6 +240,15 @@ public final class PipelineDagBuilder {
         return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest ? nest : null;
     }
 
+    /**
+     * The join this step declares, or {@code null} where the step is anything else. One place answers
+     * it so that everything walking a pipeline's transforms agrees on what a join is.
+     */
+    private static TransformBody.Join joinOf(Step step) {
+        return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join join
+                ? join : null;
+    }
+
     /** Builds the Jet DAG for a validated pipeline against the given leaf and reference bindings. */
     public static DAG build(PipelineResource pipeline, DagBindings bindings) {
         return build(pipeline, bindings, null);
@@ -183,7 +285,7 @@ public final class PipelineDagBuilder {
         Map<Vertex, Integer> inboundOrdinal = new HashMap<>();
         PipelineChains chains = frontier == null ? null : new PipelineChains();
 
-        for (String sourceId : pipeline.sources()) {
+        for (String sourceId : pipeline.sourceIds()) {
             List<String> sourceKeys = bindings.sourceKeys().apply(sourceId);
             if (sourceKeys == null || sourceKeys.isEmpty()) {
                 throw new IllegalStateException("source '" + sourceId + "' has no source vertex keys");
@@ -230,6 +332,27 @@ public final class PipelineDagBuilder {
                             chains == null ? null : new NestFrontier(axes,
                                     alias -> chains.perProducer(
                                             aliasUpstream(inline.from(), alias, bindings)))));
+                    if (chains != null) {
+                        chains.derived(step.id(), nestUpstream(inline.from(), bindings));
+                    }
+                    assembled = true;
+                    continue;
+                }
+                if (joinOf(step) != null) {
+                    Step.Inline inline = (Step.Inline) step;
+                    // A join draws its own vertex and its own edges: one edge per source it reads, each
+                    // partitioned by the key of the state that edge is about to change.
+                    if (bindings.join() == null) {
+                        throw new IllegalStateException("transform step '" + step.id()
+                                + "' is a join, but no join binding was supplied to the builder");
+                    }
+                    JoinPlan plan = bindings.join().plans().apply(step);
+                    byKey.put(step.id(), JoinDag.attach(dag, plan, pipeline.id(), step.id(),
+                            bindings.join().factKeyColumns().apply(step),
+                            bindings.join().dimensionRowKeyColumns().apply(step),
+                            alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
+                            vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
+                            bindings.join().stores(), bindings.join().displaced()));
                     if (chains != null) {
                         chains.derived(step.id(), nestUpstream(inline.from(), bindings));
                     }
@@ -310,7 +433,7 @@ public final class PipelineDagBuilder {
         }
         SupplierEx<SinkFrontier> frontier = assembled
                 ? () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)
-                : ContiguousPrefix::new;
+                : () -> new ContiguousPrefix(axes);
         return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier);
     }
 
@@ -319,9 +442,9 @@ public final class PipelineDagBuilder {
      * topology, not a transform - a passthrough vertex whose several inbound edges are the merge, so
      * the transform-port binding is never asked for one; every other stateless step (filter / map / a
      * scripted row transform) runs the one generic adapter over the port the binding supplies. A
-     * {@code nest} never reaches here: it draws a sub-graph of its own instead of a single vertex. A
-     * {@code join} or an unresolved {@code use:} reference is out of this builder's scope and is
-     * refused; extending to them replaces the refusal, not the seam.
+     * {@code nest} never reaches here: it draws a sub-graph of its own instead of a single vertex, and
+     * neither does a {@code join}, for the same reason. An unresolved {@code use:} reference is out of
+     * this builder's scope and is refused.
      */
     private static Vertex transformVertex(DAG dag, Step step, DagBindings bindings, ChainAxes axes,
             Map<Integer, List<String>> chainsByOrdinal) {
@@ -330,11 +453,6 @@ public final class PipelineDagBuilder {
                     "transform step '" + step.id() + "' is a use-reference; resolve it to an inline step first");
         }
         TransformBody body = inline.body();
-        if (body instanceof TransformBody.Join) {
-            throw new IllegalArgumentException(
-                    "transform step '" + step.id() + "' is a stateful " + body.type()
-                            + "; the linear DAG builder does not carry it");
-        }
         if (body instanceof TransformBody.Union) {
             // The merge is the topology, so nothing is transformed here - but the frontier still has to be
             // worked out per edge. The combined bound the engine would forward is never delivered at all
@@ -416,6 +534,19 @@ public final class PipelineDagBuilder {
             }
         }
         return verticesOf(resolve(ref, bindings), byKey);
+    }
+
+    /** The vertices named by a serve flow, preserving every selected table in one sink path. */
+    private static List<Vertex> upstreamOf(FromClause from, Map<String, Vertex> byKey,
+            DagBindings bindings, Map<String, List<Vertex>> readsAs) {
+        if (from instanceof FromClause.Flow flow) {
+            List<Vertex> upstream = new ArrayList<>();
+            for (FromRef ref : flow.refs()) {
+                upstream.addAll(upstreamOf(ref, byKey, bindings, readsAs));
+            }
+            return upstream;
+        }
+        throw new IllegalArgumentException("serve.from must be a flow of references");
     }
 
     /** The vertices those producer keys name, refusing a key no vertex was built for. */

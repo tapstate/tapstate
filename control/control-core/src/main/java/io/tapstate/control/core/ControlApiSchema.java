@@ -63,12 +63,17 @@ public final class ControlApiSchema {
         bind(refs, "artifact.apply", "ArtifactApply");
         bind(refs, "artifact.delete", "ArtifactDelete");
         bind(refs, "artifact.get", "ArtifactGet");
+        bind(refs, "pipeline.list", "PipelineList");
         bind(refs, "pipeline.start", "PipelineStart");
         bind(refs, "pipeline.stop", "PipelineStop");
+        bind(refs, "pipeline.pause", "PipelinePause");
+        bind(refs, "pipeline.resume", "PipelineResume");
         bind(refs, "pipeline.status", "PipelineStatus");
         bind(refs, "pipeline.metrics", "PipelineMetrics");
         bind(refs, "pipeline.snapshot", "PipelineSnapshot");
         bind(refs, "pipeline.logs", "PipelineLogs");
+        bind(refs, "pipeline.metrics.history", "PipelineMetricsHistory");
+        bind(refs, "pipeline.explain", "PipelineExplain");
         bind(refs, "data-browser.collections", "DataBrowserCollections");
         bind(refs, "data-browser.find", "DataBrowserFind");
         bind(refs, "data-browser.stats", "DataBrowserStats");
@@ -84,6 +89,26 @@ public final class ControlApiSchema {
         Map<String, Object> empty = object(List.of(), Map.of(), false);
         Map<String, Object> opaque = object(List.of(), Map.of(), true);
         Map<String, Object> id = string("Tapstate resource identifier");
+        Map<String, Object> listRequest = object(
+                List.of(),
+                Map.of(
+                        "limit", integer(1, ListBounds.MAX_LIMIT,
+                                "Maximum number of items to return. Defaults to " + ListBounds.DEFAULT_LIMIT),
+                        "offset", integer(0, Integer.MAX_VALUE,
+                                "Number of matching items to skip before returning the page")),
+                false);
+        Map<String, Object> sourceMetadata = object(List.of(), Map.of(
+                "labels", Map.of("type", "object", "additionalProperties", Map.of("type", "string")),
+                "description", string("Free-text Source description")), false);
+        Map<String, Object> sourceSummary = object(
+                List.of("id", "connector"),
+                Map.of(
+                        "id", id,
+                        "metadata", sourceMetadata,
+                        "connector", string("Registered connector id")),
+                false);
+        Map<String, Object> sourceListResult = object(
+                List.of("items"), Map.of("items", array(sourceSummary)), false);
 
         // Open rather than closed: the two reserved fields of the version answer are empty until what
         // fills them lands, and a document that typed them would have to describe an absent value.
@@ -93,7 +118,7 @@ public final class ControlApiSchema {
                 true));
         pair(defs, "ConnectorList", empty, opaque);
         pair(defs, "ConnectorGet", object(List.of("id"), Map.of("id", id), false), opaque);
-        pair(defs, "SourceList", empty, opaque);
+        pair(defs, "SourceList", listRequest, sourceListResult);
         pair(defs, "SourceGet", object(List.of("id"), Map.of("id", id), false), opaque);
 
         Map<String, Object> sourceProperties = new LinkedHashMap<>();
@@ -184,8 +209,18 @@ public final class ControlApiSchema {
         pair(defs, "ArtifactGet", object(List.of("id"), Map.of("id", id), false), artifactResult);
 
         Map<String, Object> pipelineId = object(List.of("id"), Map.of("id", id), false);
+        pair(defs, "PipelineList", listRequest, opaque);
         pair(defs, "PipelineStart", pipelineId, opaque);
-        pair(defs, "PipelineStop", pipelineId, opaque);
+        Map<String, Object> stopRequest = object(
+                List.of("id", "purgeState"),
+                Map.of("id", id, "purgeState", Map.of("type", "boolean", "description",
+                        "Clear this pipeline's resume position and operator state as it stops. "
+                                + "Required: there is no default, because the next run either continues "
+                                + "from where this one stopped or reads the whole source again.")),
+                false);
+        pair(defs, "PipelineStop", stopRequest, opaque);
+        pair(defs, "PipelinePause", pipelineId, opaque);
+        pair(defs, "PipelineResume", pipelineId, opaque);
         pair(defs, "PipelineStatus", pipelineId, opaque);
         pair(defs, "PipelineMetrics", pipelineId, opaque);
         pair(defs, "PipelineSnapshot", pipelineId, opaque);
@@ -194,6 +229,8 @@ public final class ControlApiSchema {
                 Map.of("id", id, "limit", integer(1, 200, "Maximum lines, capped by the server")),
                 false);
         pair(defs, "PipelineLogs", logsRequest, opaque);
+        pair(defs, "PipelineMetricsHistory", historyRequest(id), historyResult());
+        pair(defs, "PipelineExplain", pipelineId, explanationResult());
 
         Map<String, Object> sourceId = string("Declared Source whose own database is read");
         Map<String, Object> collection = string("Collection in that source's database");
@@ -226,6 +263,127 @@ public final class ControlApiSchema {
                 object(List.of("sourceId", "collection"), findProperties, false),
                 opaque);
         return immutableMap(defs);
+    }
+
+    private static Map<String, Object> historyRequest(Map<String, Object> id) {
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("id", id);
+        properties.put("from", instant("Inclusive beginning of the requested retained window"));
+        properties.put("to", instant("Exclusive end of the requested retained window"));
+        properties.put("resolution", enumString("auto", "raw", "PT5M", "PT30M", "PT1H", "PT3H", "PT6H"));
+        properties.put("limit", integer(1, PipelineHistoryQuery.MAX_LIMIT,
+                "Maximum total output points in this response page"));
+        Map<String, Object> table = new LinkedHashMap<>(array(string(
+                "Exact, case-sensitive table key whose target-acknowledged lag is requested")));
+        table.put("maxItems", PipelineHistoryQuery.MAX_TABLES);
+        table.put("uniqueItems", true);
+        properties.put("table", immutableMap(table));
+        properties.put("cursor", string("Opaque continuation token; repeat every other query argument unchanged"));
+        return object(List.of("id", "from", "to"), properties, false);
+    }
+
+    private static Map<String, Object> historyResult() {
+        Map<String, Object> rate = object(
+                List.of("delta", "averageRate", "maxRate"),
+                Map.of(
+                        "delta", nonNegativeNumber(),
+                        "averageRate", nonNegativeNumber(),
+                        "maxRate", nonNegativeNumber()),
+                false);
+        Map<String, Object> lag = object(
+                List.of("table", "observedAt", "last", "max"),
+                Map.of(
+                        "table", string("Exact table key"),
+                        "observedAt", instant("Time of the last real lag sample represented here"),
+                        "last", nonNegativeInteger(),
+                        "max", nonNegativeInteger()),
+                false);
+        Map<String, Object> pointProperties = new LinkedHashMap<>();
+        pointProperties.put("intervalStart", instant("Inclusive beginning of the measured interval"));
+        pointProperties.put("intervalEnd", instant("Exclusive end of the measured interval"));
+        pointProperties.put("recordsOut", rate);
+        pointProperties.put("bytesOut", rate);
+        pointProperties.put("lag", array(lag));
+        Map<String, Object> point = object(
+                List.of("intervalStart", "intervalEnd", "lag"), pointProperties, false);
+        Map<String, Object> segment = object(
+                List.of("intervalStart", "intervalEnd", "startReason", "points"),
+                Map.of(
+                        "intervalStart", instant("Inclusive beginning of this continuous segment"),
+                        "intervalEnd", instant("Exclusive end of this continuous segment"),
+                        "startReason", enumString(
+                                "WINDOW_START", "CONTINUATION", "COUNTER_RESET", "GAP"),
+                        "points", array(point)),
+                false);
+        Map<String, Object> gap = object(
+                List.of("intervalStart", "intervalEnd", "reason"),
+                Map.of(
+                        "intervalStart", instant("Beginning of the missing-sample interval"),
+                        "intervalEnd", instant("End of the missing-sample interval"),
+                        "reason", enumString("SAMPLE_GAP")),
+                false);
+        Map<String, Object> unavailable = object(
+                List.of("metric"),
+                Map.of(
+                        "metric", enumString("records.out", "bytes.out", "lag"),
+                        "table", string("Table key when the unavailable series is table lag")),
+                false);
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("pipelineId", string("Pipeline identifier"));
+        properties.put("from", instant("Normalized requested beginning"));
+        properties.put("to", instant("Normalized requested end"));
+        properties.put("effectiveFrom", instant("Retention-clipped beginning used by this cursor walk"));
+        properties.put("effectiveTo", instant("Server-now-clipped end used by this cursor walk"));
+        properties.put("retentionCutoff", instant("Samples before this instant are not readable"));
+        properties.put("effectiveResolution", enumString("PT1M", "PT5M", "PT30M", "PT1H", "PT3H", "PT6H"));
+        properties.put("status", enumString("OK", "NO_RETAINED_SAMPLES"));
+        properties.put("consistency", enumString("EVENTUAL"));
+        properties.put("segments", array(segment));
+        properties.put("gaps", array(gap));
+        properties.put("unavailable", array(unavailable));
+        properties.put("nextCursor", nullable(string("Opaque continuation token")));
+        return object(List.of(
+                "pipelineId", "from", "to", "effectiveFrom", "effectiveTo", "retentionCutoff",
+                "effectiveResolution", "status", "consistency", "segments", "gaps", "unavailable",
+                "nextCursor"), properties, false);
+    }
+
+    private static Map<String, Object> explanationResult() {
+        Map<String, Object> evidence = object(
+                List.of("source", "field", "value"),
+                Map.of(
+                        "source", enumString("status", "metrics", "snapshot", "lifecycle"),
+                        "field", string("Field read from that source"),
+                        "value", Map.of("description", "JSON-typed value exactly as the evidence carried it")),
+                false);
+        Map<String, Object> next = object(
+                List.of("action", "message"),
+                Map.of(
+                        "action", enumString("OPEN_PIPELINE_LOGS", "CHECK_SERVER", "CHECK_TARGET"),
+                        "message", string("Catalog-rendered next-step text")),
+                false);
+        Map<String, Object> pending = object(
+                List.of("reason"),
+                Map.of("reason", enumString(
+                        "START_CAPACITY", "STOP_CAPACITY", "START_PENDING", "STOP_PENDING")),
+                false);
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("pipelineId", string("Pipeline identifier"));
+        properties.put("state", enumString("NEW", "RUNNING", "PAUSED", "STOPPED", "COMPLETED", "FAILED"));
+        properties.put("kind", enumString(
+                "OBSERVATION_STALE", "CODED_FAILURE", "RECONCILE_FAILURES", "NO_MOVEMENT",
+                "FRONTIER_STALLED", "NO_MATCH"));
+        properties.put("message", string("Catalog-rendered explanation"));
+        properties.put("observedAt", instant("Time of the single observation used by the explanation"));
+        properties.put("observedAgeMillis", nonNegativeInteger());
+        properties.put("freshness", enumString("FRESH", "STALE", "UNKNOWN"));
+        properties.put("evidence", array(evidence));
+        properties.put("cannotSay", array(string("A fact this observation cannot establish")));
+        properties.put("next", nullable(next));
+        properties.put("pending", pending);
+        return object(List.of(
+                "pipelineId", "state", "kind", "message", "freshness", "evidence", "cannotSay", "next"),
+                properties, false);
     }
 
     /**
@@ -328,6 +486,22 @@ public final class ControlApiSchema {
 
     private static Map<String, Object> string(String description) {
         return Map.of("type", "string", "minLength", 1, "description", description);
+    }
+
+    private static Map<String, Object> instant(String description) {
+        return Map.of("type", "string", "format", "date-time", "description", description);
+    }
+
+    private static Map<String, Object> nonNegativeNumber() {
+        return Map.of("type", "number", "minimum", 0);
+    }
+
+    private static Map<String, Object> nonNegativeInteger() {
+        return Map.of("type", "integer", "minimum", 0);
+    }
+
+    private static Map<String, Object> nullable(Map<String, Object> value) {
+        return Map.of("oneOf", List.of(value, Map.of("type", "null")));
     }
 
     private static Map<String, Object> enumString(String... values) {

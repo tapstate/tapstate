@@ -1,0 +1,8 @@
+# Valid on purpose: the refusal under test is the view's, so nothing else in the batch may be wrong.
+version: tapstate/v1
+kind: source
+id: src_orders
+connector: mysql
+mode: cdc
+config: { host: 10.0.0.1, username: reader, password: Db_2026 }
+tables: [ orders ]

@@ -33,6 +33,16 @@ public enum EngineError implements TapstateErrorCode {
             Set.of("chain", "epoch", "seq")),
 
     /**
+     * Running: a view selected a discovered alternate identity, but an update or delete reached its
+     * sink without that key in the earlier row. {@code view} and {@code key} name the materialization
+     * and selected identity, while {@code operation} names the change that cannot be applied safely.
+     * Without the old key, a delete cannot remove the materialized row and a key-changing update
+     * cannot remove the row under its previous identity, leaving stale data behind.
+     */
+    VIEW_KEY_MISSING_FROM_BEFORE_IMAGE("engine.view-key-missing-from-before-image",
+            Set.of("view", "key", "operation")),
+
+    /**
      * A pipeline's data-plane job died on its own, for a reason the product had not already coded at its
      * throw site: {@code pipeline} is the pipeline whose run died and {@code cause} is what it died of.
      * A fault that does carry its own code keeps that code instead — this is the last resort, so that a
@@ -54,7 +64,23 @@ public enum EngineError implements TapstateErrorCode {
      * ability to resume, taking every pipeline mining the same chain with it.
      */
     FRONTIER_PINNED("engine.frontier-pinned",
-            Set.of("chain", "minutes", "gap", "cause"), Severity.WARNING);
+            Set.of("chain", "minutes", "gap", "cause"), Severity.WARNING),
+
+    /**
+     * Running: a second row of a joined source arrived under a join key another row was already filed
+     * under, so that earlier row has been replaced and is now unreachable. {@code source} is the source
+     * the join calls that side by and {@code key} is the key both rows share.
+     *
+     * <p>A warning because nothing failed and nothing is repaired here. One key holds one row, so every
+     * fact row under it joins to whichever arrived last and the target ends up shorter than the query
+     * describes - holding both rows instead would move dimension state, output cardinality and row
+     * identity together, which is a far larger change than this. What this removes is the third answer a
+     * query must not be given: accepted, wrong, and silent. A target quietly short of rows is
+     * indistinguishable from a correct one and every row it does hold looks entirely ordinary, so the
+     * moment of replacement is the only place anything can observe it.
+     */
+    JOIN_DIMENSION_ROW_DISPLACED("engine.join-dimension-row-displaced",
+            Set.of("source", "key"), Severity.WARNING);
 
     private final String code;
     private final Set<String> placeholders;

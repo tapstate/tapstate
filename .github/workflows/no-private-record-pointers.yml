@@ -1,0 +1,33 @@
+# No pointers to a design record this repository does not carry.
+# The reasoning behind these decisions is written up in a private repository. Naming that
+# write-up by its identifier from a tracked file resolves to nothing for anyone reading this
+# one, while still saying where to go looking -- so the gate refuses the identifier and keeps
+# the reasoning. The bare section-sign convention, with no identifier next to it, is fine.
+#
+# This check is meant to be a required status check on main (configured in branch
+# protection); a workflow that merely runs is not a gate until merges depend on it.
+name: no-private-record-pointers
+
+on:
+  push:
+    branches:
+      - main
+      - "ws/**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  no-private-record-pointers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The script carries its own liveness control (one file that must be caught, one that must
+      # not), and it runs it before deciding anything about this repository -- so a broken scan
+      # fails here rather than reporting a clean tree. That is why there is no separate smoke.
+      - name: The gate still decides the way it is supposed to
+        run: shellcheck .github/scripts/no-private-record-pointers.sh
+
+      - name: No pointers to a design record this repository does not carry
+        run: bash .github/scripts/no-private-record-pointers.sh

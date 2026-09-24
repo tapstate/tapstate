@@ -132,10 +132,18 @@ jobs:
         if: inputs.bump == 'patch'
         run: .github/scripts/changeset-parity.sh "${{ steps.next.outputs.base }}" HEAD
 
-      # The pages for this release have to be written and merged before it starts. That is the same
-      # gate the release itself runs, asked here because here it is cheap to act on -- nothing has
-      # been created yet, so finishing the pages and dispatching again costs nothing. Asked later it
-      # is a release sitting at its first gate with three branches already cut.
+      # Asked here because here it is cheap to act on: nothing has been created yet, so answering it
+      # and dispatching again costs nothing, where the same refusal later is a release sitting at its
+      # first gate with three branches already cut.
+      #
+      # What it refuses is narrower than the name. A pull request that never answered its
+      # documentation impact stops any release -- that is our own paperwork, and no other person's
+      # morning is in it. A page follow-up still open in the documentation repository stops a major
+      # and nothing below it: a release is not held for an issue somebody else has to close. The ones
+      # it lets past are written to the file the next step carries into the request this release is
+      # already making of the documentation site, so they reach the person who owes them instead of
+      # stopping the train. That file is this step's real output, and the step after it is the only
+      # reader.
       #
       # This is about the pages for what is shipping. Publishing the site is a separate thing, asked
       # for below in an issue, and it deliberately does not gate anything.
@@ -146,7 +154,8 @@ jobs:
           .github/scripts/docs-gate.sh \
             --base "${{ steps.next.outputs.base }}" \
             --sha "${{ steps.sha.outputs.sha }}" \
-            --bump "${{ inputs.bump }}"
+            --bump "${{ inputs.bump }}" \
+            --list-open "$RUNNER_TEMP/docs-open.tsv"
 
       - name: the satellite token reaches every satellite
         env:
@@ -190,11 +199,15 @@ jobs:
       # into `main`, so it is asked for in an issue. It gates nothing -- see the script for what
       # happens when it is not done by the time the release publishes, and for what happens to the
       # request when the attempt is abandoned instead.
+      #
+      # It also carries what the gate above let past: the page follow-ups this release is not waiting
+      # for are listed in this issue, which is the one already in front of the person who owes them.
       - name: ask for the documentation site to be published
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
         run: |
           bash .github/scripts/docs-release.sh open "${{ steps.next.outputs.version }}" \
+            --followups "$RUNNER_TEMP/docs-open.tsv" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: say what this run is about to make
@@ -233,6 +246,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
       # Before anything is built. The version enters the tree once, here, and the build downstream of
       # it cannot disagree with the release it is part of.
       - name: write the release version into every file that pins one
@@ -325,12 +339,55 @@ jobs:
     # what makes building arm64 under emulation cheap.
     needs: version
     runs-on: ubuntu-latest
+    outputs:
+      web_revision: ${{ steps.web-provenance.outputs.revision }}
+      web_files_sha256: ${{ steps.web-provenance.outputs.files-sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
       - name: write the release version into every file that pins one
         run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      # The satellite branch was created during the freeze before this build begins. Checking out its
+      # explicit branch makes the Web revision a release input rather than whatever reaches main while
+      # this workflow is running. The token is the existing satellite credential and never appears in
+      # output or in the packaged provenance.
+      - uses: actions/checkout@v4
+        with:
+          repository: tapstate/tapstate-web
+          ref: ws/release-${{ needs.version.outputs.version }}
+          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+          path: tapstate-web
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: enable the pinned package manager
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: tapstate-web/pnpm-lock.yaml
+      - name: build the pinned Web production bundle
+        working-directory: tapstate-web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm lint
+          pnpm --filter web i18n:check
+          pnpm --filter web test
+          pnpm build
+      - name: stage the pinned Web bundle for the Boot JAR
+        run: |
+          web_revision="$(git -C tapstate-web rev-parse HEAD)"
+          bash scripts/prepare-web-assets.sh \
+            --web-root tapstate-web \
+            --web-revision "$web_revision" \
+            --tapstate-revision "${{ needs.version.outputs.sha }}" \
+            --release-version "${{ needs.version.outputs.version }}" \
+            --output app/target/generated-resources/tapstate-web
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -338,6 +395,17 @@ jobs:
           cache: maven
       - name: build the boot jar the image ships
         run: mvn -B -pl app -am -DskipTests package
+      - name: read the staged Web provenance
+        id: web-provenance
+        shell: bash
+        run: |
+          properties=app/target/classes/META-INF/tapstate-web.properties
+          revision="$(sed -n 's/^revision=//p' "$properties")"
+          files_sha256="$(sed -n 's/^files.sha256=//p' "$properties")"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$files_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "files-sha256=$files_sha256" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       # Into a local archive, not a registry. The completeness check reads both architectures out of
@@ -350,6 +418,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: false
           tags: ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}
+          build-args: |
+            TAPSTATE_RELEASE_VERSION=${{ needs.version.outputs.version }}
+            TAPSTATE_REVISION=${{ needs.version.outputs.sha }}
+            TAPSTATE_WEB_REVISION=${{ steps.web-provenance.outputs.revision }}
+            TAPSTATE_WEB_FILES_SHA256=${{ steps.web-provenance.outputs.files-sha256 }}
           outputs: type=oci,dest=${{ runner.temp }}/server-image.tar
       - uses: actions/upload-artifact@v4
         with:
@@ -394,13 +467,45 @@ jobs:
           gh workflow run nightly-real-connectors.yml --ref "${GITHUB_REF_NAME}"
           echo "Dispatched the real-connector lane on ${GITHUB_REF_NAME} (${tip})."
 
-  gates:
-    # The release gate. Six conditions, all decided by machine, none of them a box a person can tick
-    # -- a switch somebody can flip is not a check, and every one of them is another way to produce a
-    # release that did not go the standard way.
+  join-perf:
+    # The join operator's performance lane, started here for the same reason as the connector one
+    # above: the ordinary build runs three of its scenarios on one tier, so a release could otherwise
+    # go out having never had the other eight measured, or the resident and cold tiers looked at at
+    # all - and where that state sits moves the numbers by orders of magnitude.
     #
-    # Two of the six are not steps here, because they are already the reason this job can run at all,
-    # and re-asserting them would be this workflow grading its own dependency graph:
+    # Dispatched rather than waited on, and started beside the build rather than after it. The same
+    # rule about a bare commit applies: `workflow_dispatch` takes a ref, so when the release commit is
+    # not the tip of the one this ran from, nothing is started and the gate below asks for a run that
+    # already exists on that commit. It refuses if there is none, which is the true answer.
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write   # dispatch the performance lane
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: start the join performance lane on the commit being released
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tip="$(gh api "repos/${{ github.repository }}/commits/${GITHUB_REF_NAME}" --jq '.sha' 2>/dev/null || true)"
+          if [ "$tip" != "${{ needs.version.outputs.sha }}" ]; then
+            echo "The release commit is not the tip of ${GITHUB_REF_NAME}, so the lane cannot be dispatched at it."
+            echo "The gate will ask for a run that already succeeded on ${{ needs.version.outputs.sha }}."
+            exit 0
+          fi
+          gh workflow run join-perf.yml --ref "${GITHUB_REF_NAME}"
+          echo "Dispatched the join performance lane on ${GITHUB_REF_NAME} (${tip})."
+
+  gates:
+    # The release gate. Eight conditions, all decided by machine, none of them a box a person can
+    # tick -- a switch somebody can flip is not a check, and every one of them is another way to
+    # produce a release that did not go the standard way.
+    #
+    # Two of the eight are not steps here, because they are already the reason this job can run at
+    # all, and re-asserting them would be this workflow grading its own dependency graph:
     #
     #   2. the release smoke tests are green   `cli-native` runs the native and MCP smokes against
     #                                          each produced binary; a red one fails that job and
@@ -408,8 +513,8 @@ jobs:
     #   3. the distribution is complete        `release-manifest.sh`, in the job below, opening every
     #                                          asset before the draft is assembled
     #
-    # The four that are steps are the ones nothing else was asking.
-    needs: [version, connectors, cli-native, server-image]
+    # The six that are steps are the ones nothing else was asking.
+    needs: [version, connectors, join-perf, cli-native, server-image]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -462,7 +567,29 @@ jobs:
               exit 1
             fi
             echo "waiting for the real-connector lane..."
-            sleep 60
+            sleep 20
+          done
+
+      # 8. And so is the join performance lane, for the same reason and read the same way. It is the
+      #    other lane no merge gate covers in full: the ordinary build measures three of its scenarios
+      #    on one tier, and this is where the rest of the matrix is required to have been green on the
+      #    commit going out. A shipped release that got slower is not something a later run can undo.
+      - name: 8. the join performance lane is green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deadline=$(( SECONDS + 90 * 60 ))
+          while true; do
+            .github/scripts/checks-on-commit.sh --sha "${{ needs.version.outputs.sha }}" --required join-perf && break
+            # As above: 3 alone means nothing has concluded yet, and anything else has concluded
+            # something that waiting will not change.
+            [ "$?" = 3 ] || exit 1
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::the join performance lane has not finished on ${{ needs.version.outputs.sha }} within 90 minutes"
+              exit 1
+            fi
+            echo "waiting for the join performance lane..."
+            sleep 20
           done
 
       # 4. Every pull request in this release's range answered its documentation impact, and the ones
@@ -614,6 +741,15 @@ jobs:
         run: |
           mkdir -p image/layout
           tar -xf image/server-image.tar -C image/layout
+          provenance="staging/tapstate-${{ needs.version.outputs.version }}-provenance.json"
+          python3 .github/scripts/web-provenance.py create \
+            --oci-layout image/layout \
+            --output "$provenance" \
+            --version '${{ needs.version.outputs.version }}' \
+            --tapstate-revision '${{ needs.version.outputs.sha }}' \
+            --web-revision '${{ needs.server-image.outputs.web_revision }}'
+          python3 .github/scripts/web-provenance.py verify \
+            --oci-layout image/layout --provenance "$provenance"
           .github/scripts/release-manifest.sh "${{ needs.version.outputs.version }}" staging image/layout
       - name: assemble the draft release
         id: create
@@ -640,6 +776,7 @@ jobs:
             staging/tapstate-*.tar.gz.sha256
             staging/checksums.txt
             staging/platform-minimums.txt
+            staging/tapstate-${{ needs.version.outputs.version }}-provenance.json
       - name: where to look before approving
         run: |
           {
@@ -734,6 +871,18 @@ jobs:
           docker buildx imagetools create \
             --tag "ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}" \
             "oci-layout://$(pwd)/image/layout@${digest}"
+      - name: confirm the published registry digest matches the checked archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(jq -r '.manifests[0].digest' image/layout/index.json)"
+          image="ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}"
+          actual="sha256:$(docker buildx imagetools inspect --raw "$image" | sha256sum | awk '{print $1}')"
+          if [ "$actual" != "$expected" ]; then
+            echo "published image digest $actual differs from checked OCI archive $expected" >&2
+            exit 1
+          fi
+          echo "published image digest matches checked archive: $actual"
       # Publishing is what creates the tag, at the commit the draft named. `--notes` is deliberately not
       # passed: whoever reviewed the draft may have edited the body, and re-sending the assembled body
       # would silently put their edit back the way it was.
@@ -797,12 +946,32 @@ jobs:
       # one branch into another, which was asked for when the release started; this either finds that
       # done and creates the tag, or asks again in a new issue. It exits 0 either way -- a release
       # that stopped here would be hostage to one person's morning.
+      #
+      # The same scan the release opened with, run again and reaching no verdict. Hours separate the
+      # two, and they are exactly the hours the documentation owner may have spent closing the things
+      # the first scan listed -- so replaying what the pin job found would hand somebody a list of
+      # work they have already done. --report-only cannot refuse; `continue-on-error` is for
+      # everything else, because this step must never be the reason the step below it does not run,
+      # on a release that has already gone out.
+      - name: what documentation this release still owes
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_REPO_TOKEN || github.token }}
+        run: |
+          .github/scripts/docs-gate.sh \
+            --base "${{ needs.version.outputs.base }}" \
+            --sha "${{ needs.version.outputs.sha }}" \
+            --report-only \
+            --list-open "$RUNNER_TEMP/docs-open.tsv" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: settle the documentation site
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
         run: |
           .github/scripts/docs-release.sh settle "${{ needs.version.outputs.version }}" \
             --notes-url "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}" \
+            --followups "$RUNNER_TEMP/docs-open.tsv" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
 

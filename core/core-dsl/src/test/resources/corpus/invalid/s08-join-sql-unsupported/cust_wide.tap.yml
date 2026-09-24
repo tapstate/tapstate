@@ -1,0 +1,19 @@
+# The join is written with a FULL OUTER JOIN: valid SQL, type-checks, and outside what this
+# release runs. Refused while the artifact is read, not when a pipeline is assembled from it.
+version: tapstate/v1
+kind: pipeline
+id: cust_wide
+source: [ src_crm, src_erp ]
+transforms:
+  - id: cust_orders
+    type: join
+    from: { c: customers, o: orders }
+    engine: builtin
+    sql: |
+      SELECT c.id AS customer_id, o.id AS order_id
+      FROM c FULL OUTER JOIN o ON o.customer_id = c.id
+view:
+  id: cust_wide
+  from: cust_orders
+  primary_key: customer_id
+  storage: { warm: { collection: cust_wide } }

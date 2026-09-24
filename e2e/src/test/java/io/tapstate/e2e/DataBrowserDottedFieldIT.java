@@ -46,7 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <pre>
  *   mvn -pl e2e -am verify -Dapi.version=1.44 \
  *     -Dtapstate.e2e.connectors-dir=/path/to/connectors \
- *     -Dit.test=DataBrowserDottedFieldIT
+ *     -Dit.test=DataBrowserDottedFieldIT -Dfailsafe.failIfNoSpecifiedTests=false
  * </pre>
  */
 class DataBrowserDottedFieldIT {

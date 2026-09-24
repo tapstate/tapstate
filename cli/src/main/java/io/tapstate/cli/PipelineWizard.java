@@ -2,6 +2,7 @@ package io.tapstate.cli;
 
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.PushElement;
 import io.tapstate.core.model.QueryElement;
@@ -74,7 +75,7 @@ final class PipelineWizard {
         ViewBlock view = askView(output, servePlan, reservedIds(transforms, servePlan));
         FromRef serveFrom = view != null ? FromRef.literal(viewId(view)) : output;
         ServeBlock serve = buildServe(servePlan, serveFrom);
-        return new PipelineResource(id, null, List.of(source),
+        return new PipelineResource(id, null, List.of(SourceRef.bare(source)),
                 transforms.isEmpty() ? null : transforms, view, serve, null, null);
     }
 
@@ -141,13 +142,13 @@ final class PipelineWizard {
 
     private List<SyncElement> askSync() {
         String sink = askSourceRef("Sync to (target source id)", false);
-        return List.of(new SyncElement("sync_1", sink, null, null, null, null));
+        return List.of(new SyncElement("sync_1", sink, null, null, null));
     }
 
     private List<PushElement> askPush() {
         String sink = askSourceRef("Push to (target source id)", false);
         String topic = WizardPrompts.blankToNull(prompter.ask("Topic (blank for none)", null));
-        return List.of(new PushElement("push_1", sink, topic, null, null));
+        return List.of(new PushElement("push_1", sink, topic, null));
     }
 
     private List<QueryElement> askQuery() {
@@ -186,7 +187,7 @@ final class PipelineWizard {
         // prompt always settles on a valid distinct id and the re-prompt loop terminates
         String viewId = askId("View id", freshId("view", reserved), reserved);
         String primaryKey = WizardPrompts.askPrimaryKey(prompter);
-        return new ViewBlock.Inline(viewId, from, primaryKey, null, null);
+        return new ViewBlock.Inline(viewId, from, primaryKey, null);
     }
 
     /** {@code base}, else {@code base_2}, {@code base_3}, … — the first id not already in {@code taken}. */
@@ -228,13 +229,13 @@ final class PipelineWizard {
             String prevId = steps.isEmpty() ? null : steps.get(steps.size() - 1).id();
             if (USE.equals(type)) {
                 String def = prompter.choose("Reuse which transform?", reusableTransformIds);
-                steps.add(Step.use(null, def, askFlow(prevId), null));
+                steps.add(Step.use(null, def, askFlow(prevId)));
             } else {
                 String id = askId("Transform id", type + "_" + (steps.size() + 1));
                 FromClause from = askFlow(prevId);
                 TransformBody body = bodyPrompter.askBody(type);
                 if (body != null) {
-                    steps.add(Step.inline(id, from, body, null, null));
+                    steps.add(Step.inline(id, from, body, null));
                 }
             }
         }

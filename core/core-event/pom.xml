@@ -23,6 +23,16 @@
   <description>Standard event envelope (op / ts / src / before / after / schema); pure data, zero third-party</description>
 
   <dependencies>
+    <!--
+      The tapstate type namespace, for the one thing in this module that has to name a kind of column
+      rather than merely carry a value: what a row's payload costs in bytes is defined per kind, and the
+      kinds are that namespace's. Core ring to core ring, both zero third-party.
+    -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-common</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>

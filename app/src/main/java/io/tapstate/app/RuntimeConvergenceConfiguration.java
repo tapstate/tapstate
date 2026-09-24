@@ -1,5 +1,8 @@
 package io.tapstate.app;
 
+import java.util.OptionalLong;
+import java.time.Instant;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.runtime.engine.Engine;
@@ -7,9 +10,13 @@ import io.tapstate.runtime.scheduler.FrontierStallWatch;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.NestColdLayerWatch;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
+import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.adapters.otel.OtelMetricsExport;
+import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.StorePort;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableScheduling;
@@ -27,9 +34,25 @@ import java.time.Clock;
  * brings up neither the store nor the convergence loop.
  */
 @Configuration
+@EnableConfigurationProperties({MetricsHistoryProperties.class, MetricsExportProperties.class})
 @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
 @EnableScheduling
 class RuntimeConvergenceConfiguration {
+
+    /**
+     * The metrics export the convergence loop offers every published observation's facts to. Opt-in: with
+     * no OTLP endpoint and no Prometheus port configured this is the port's no-op, and the SDK, its
+     * listener and its push thread are never started. The read faces are the same either way; export is
+     * a second projection of the facts, never a change to the first.
+     */
+    @Bean(destroyMethod = "close")
+    MetricsExport metricsExport(MetricsExportProperties export) {
+        return metricsExportFor(export);
+    }
+
+    static MetricsExport metricsExportFor(MetricsExportProperties export) {
+        return export.settings().exportsAnything() ? OtelMetricsExport.start(export.settings()) : MetricsExport.none();
+    }
 
     @Bean
     PipelineConverger pipelineConverger(StorePort storePort, LifecycleActuator lifecycleActuator, Clock clock) {
@@ -59,12 +82,59 @@ class RuntimeConvergenceConfiguration {
                 // statistics everywhere else, because the rows counted here were never going to appear in
                 // any document. Without it on this face, "is anything being thrown away" is answerable
                 // only by reading logs on whichever member happened to run the vertex.
-                engine::nestDeadLetters);
+                engine::nestDeadLetters,
+                // What a large rebuild is doing while it does it. A single dimension row edited can owe a
+                // million rows of writing, and for as long as that takes the target holds half the old
+                // value and half the new one while every other reading on this face says healthy: the job
+                // runs, the queues drain, the error count is zero. Without these two an operator cannot
+                // tell that from a pipeline that has finished, and so cannot tell whether to wait.
+                engine::joinRecomputeDone, engine::joinRecomputeExpected,
+                // How much reached the targets and how current the newest of it is. Composed here from
+                // three readings the engine reports separately because none of them is readable alone: a
+                // running total means nothing without what it counts from, and a count of rows says
+                // nothing about whether they are current -- which is the question a pipeline quietly
+                // falling behind answers with a perfectly healthy count.
+                // The near end of the same crossing, read from the capture side rather than the engine:
+                // rows counted where a source handed them over. On its own it says a pipeline is reading;
+                // beside the far end it says whether what it reads is arriving, which neither answers.
+                captureCoordinator::capturedRows,
+                id -> deliveredBy(engine, id),
+                // Where the run spends its time, per stage of the graph, as the processors time their own
+                // units of work; a run that has timed nothing yet reports nothing rather than a stage at zero.
+                engine::stageDurations,
+                Clock.systemUTC());
+    }
+
+    /**
+     * What {@code engine}'s live job for {@code pipelineId} reports about rows that reached a target.
+     * A run with no start reported has counted nothing, so it reports nothing rather than totals nobody
+     * could place against a starting point.
+     */
+    private static DeliveryReading deliveredBy(Engine engine, String pipelineId) {
+        OptionalLong since = engine.countingSince(pipelineId);
+        if (since.isEmpty()) {
+            return DeliveryReading.NONE;
+        }
+        return new DeliveryReading(engine.recordsDelivered(pipelineId),
+                engine.bytesDelivered(pipelineId),
+                engine.newestDeliveredEventTime(pipelineId), Instant.ofEpochMilli(since.getAsLong()),
+                engine.deliveryDurations(pipelineId));
+    }
+
+    /**
+     * Takes one sample per interval off what each pass publishes, into the history the store keeps for a
+     * bounded time. Its own bean so the interval is bound once, here, and the driver only hands it what
+     * was published.
+     */
+    @Bean
+    RateSampler rateSampler(StorePort storePort, MetricsHistoryProperties history) {
+        return new RateSampler(storePort.rateHistory(), history.getSampleInterval());
     }
 
     @Bean
-    ConvergenceDriver convergenceDriver(
-            PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher) {
-        return new ConvergenceDriver(pipelineConverger, storePort.desired(), observationPublisher);
+    ConvergenceDriver convergenceDriver(PipelineConverger pipelineConverger, StorePort storePort,
+            ObservationPublisher observationPublisher, RateSampler rateSampler, MetricsExport metricsExport) {
+        return new ConvergenceDriver(pipelineConverger, storePort.desired(), observationPublisher, rateSampler,
+                metricsExport);
     }
 }

@@ -45,9 +45,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       parent is inserted, and its array is empty. So the array is read, element for element.</li>
  * </ul>
  *
- * <p>Read mode is {@code snapshot_and_cdc} rather than {@code snapshot_only} deliberately: a stateful
- * node needs every row to carry its order, and a source reading no chain of its own supplies none. It is
- * also what lets the parent arrive at all - it is inserted after the snapshot has been taken.
+ * <p>Read mode is {@code snapshot_and_cdc} because this case exercises the complete snapshot-to-tail
+ * path. The tail is also what lets the parent arrive at all - it is inserted after the snapshot.
  *
  * <p>Gated on Docker and on a directory of real connector jars, like its flat siblings
  * {@link RealMysqlToMongoSnapshotIT} and {@link RealMysqlToMongoCdcIT}. Run it with:
@@ -82,10 +81,10 @@ class NestConvergesWhenChildArrivesBeforeParentIT {
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state.
      *
-     * <p>A nest keeps its state in a database of a fixed name, addressed by a namespace built from the
-     * pipeline and step ids - so two installs on one Mongo running a pipeline of the same id share one
-     * state, knowingly and by design. The tiers are two such installs, and giving each its own store and
-     * its own target leaves that third thing shared: the second tier starts on the state the first one
+     * <p>A nest keeps its state in the deployment's configured database, addressed by a namespace built
+     * from the pipeline and step ids. Both tiers in this witness use the same configured database, so
+     * giving each its own control store and target still leaves operator state shared, so the second tier
+     * starts on the state the first one
      * finished with. A witness that ends where its own snapshot would have put it cannot see this; one
      * that changes something can.
      *

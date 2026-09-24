@@ -17,7 +17,9 @@ enum DatabaseKind {
 
     MYSQL("mysql"),
     POSTGRES("postgres"),
-    MONGO("mongodb");
+    MONGO("mongodb"),
+    ORACLE("oracle"),
+    SQLSERVER("sqlserver");
 
     private final String connectorId;
 

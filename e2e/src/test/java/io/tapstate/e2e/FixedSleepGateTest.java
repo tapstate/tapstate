@@ -74,6 +74,10 @@ class FixedSleepGateTest {
             entry("test/java/io/tapstate/e2e/E2eExecutor.java", 1L),
             entry("test/java/io/tapstate/e2e/RealProcessServer.java", 1L),
             entry("test/java/io/tapstate/e2e/connector/CsvConnector.java", 1L),
+            // SQL Agent startup errors during CDC enablement and the non-null initial LSN each
+            // have a 60-second deadline. Enablement uses the remaining query budget; LSN reads use
+            // five-second query timeouts. Both waits observe readiness.
+            entry("test/java/io/tapstate/e2e/SqlServerEndpoints.java", 2L),
             // One bounded read of its own target per witness class, each a poll inside a deadline loop.
             entry("test/java/io/tapstate/e2e/LosslessNumericTypeIsAcceptedIT.java", 1L),
             entry("test/java/io/tapstate/e2e/RealMysqlToMongoSnapshotIT.java", 1L),
@@ -106,7 +110,21 @@ class FixedSleepGateTest {
             entry("test/java/io/tapstate/e2e/DataBrowserCollectionsIT.java", 1L),
             entry("test/java/io/tapstate/e2e/DataBrowserDottedFieldIT.java", 1L),
             entry("test/java/io/tapstate/e2e/TailIT.java", 1L),
-            entry("test/java/io/tapstate/e2e/WatchRedrawsIT.java", 1L));
+            entry("test/java/io/tapstate/e2e/WatchRedrawsIT.java", 1L),
+            // The guided first run's own bounded read of the view its recipe materializes into: one
+            // named sleep() called from a deadline loop whose count condition decides the outcome.
+            entry("test/java/io/tapstate/e2e/GuidedFirstRunIT.java", 1L),
+            // The restart witnesses: one bounded read each, and both of them poll something that
+            // outlives the server they are watching, so the loop's condition is the whole point.
+            // Each is a single named sleep() called from a `while (nanoTime - deadline < 0)` loop -
+            // one waiting on a count in the target, one on a record count that has stopped moving.
+            entry("test/java/io/tapstate/e2e/ADeleteDuringDowntimeReachesTheTargetIT.java", 1L),
+            entry("test/java/io/tapstate/e2e/RestartResumesTheTailIT.java", 1L),
+            // The third restart witness, and the same shape: one named sleep() called from three
+            // bounded loops - one waiting on the durable record naming the tables a sink confirmed,
+            // one on per-table read counts that have stopped moving, one on rows in the target. Each
+            // loop's condition decides the outcome; the sleep only spaces the reads out.
+            entry("test/java/io/tapstate/e2e/PauseInSnapshotResumesAtTheUnfinishedTableIT.java", 1L));
 
     private static final Pattern SLEEP = Pattern.compile(
             "Thread\\s*\\.\\s*sleep\\s*\\(|TimeUnit\\s*\\.\\s*[A-Z_]+\\s*\\.\\s*sleep\\s*\\(");

@@ -84,9 +84,11 @@ class ConvergenceDriverTest {
 
         Observation observed = observations.read("broken").orElseThrow();
         // Never converged, so no lifecycle state was ever witnessed: the projection stays NEW rather than a
-        // fabricated FAILED, and the climbing errorCount is what marks it broken.
+        // fabricated FAILED, and the climbing streak is what marks it broken. It is published as a streak
+        // and named as one -- a pass that keeps throwing never reaches a publish, so there is no witnessed
+        // failure with a code to count, only the fact that the attempt is not getting through.
         assertThat(observed.state()).isEqualTo(NEW);
-        assertThat(observed.metrics()).containsOnly(entry("errorCount", 3L));
+        assertThat(observed.metrics()).containsOnly(entry("reconcileFailuresInARow", 3L));
     }
 
     @Test
@@ -95,21 +97,24 @@ class ConvergenceDriverTest {
         state.failFor("orders");
         driver.reconcile();
         driver.reconcile();
-        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 2L));
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsOnly(entry("reconcileFailuresInARow", 2L));
 
-        // The store recovers: the next pass converges normally and republishes the real state, so the error
-        // count drops back to zero rather than staying stuck at the earlier failure total.
+        // The store recovers: the next pass converges normally and republishes the real state, so the
+        // streak stops being published rather than staying stuck at the earlier total. Absent and not
+        // nought: there is no streak running, and a nought would say there is one that has just reset.
         state.recover("orders");
         driver.reconcile();
         Observation recovered = observations.read("orders").orElseThrow();
         assertThat(recovered.state()).isEqualTo(RUNNING);
-        assertThat(recovered.metrics()).containsOnly(entry("errorCount", 0L));
+        assertThat(recovered.metrics()).isEmpty();
 
         // A later failure starts a fresh streak from one, not from the earlier total of two, so the clean pass
         // in between must have cleared the counter.
         state.failFor("orders");
         driver.reconcile();
-        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 1L));
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsOnly(entry("reconcileFailuresInARow", 1L));
     }
 
     @Test
@@ -127,7 +132,8 @@ class ConvergenceDriverTest {
         // Re-applied later and still failing, it starts a fresh streak from one rather than resuming at three.
         desired.save(new DesiredState("orders", RUNNING, "rev-1"));
         driver.reconcile();
-        assertThat(observations.read("orders").orElseThrow().metrics()).containsOnly(entry("errorCount", 1L));
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsOnly(entry("reconcileFailuresInARow", 1L));
     }
 
     @Test
@@ -251,6 +257,40 @@ class ConvergenceDriverTest {
         assertThat(failure).isNotNull();
         assertThat(failure.code()).isEqualTo("engine.job-failed");
         assertThat(failure.params()).containsEntry("cause", "sink write failed");
+        // One death is one count, driven through the real converger rather than asserted against a
+        // publisher fed by hand: the cause arrives on one pass and the three after it carry none, so a
+        // count taken from the state instead of from the witness would read four here.
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsOnly(entry("errors.engine.job-failed", 1L));
+    }
+
+    @Test
+    void aDeletedPipelinesFailureCountsGoWithIt() {
+        // The sweep through its actual trigger. Nothing else can witness this: the publisher's own case
+        // calls the method directly, so a sweep that existed and was never called would pass it -- and a
+        // count kept per pipeline id, never cleared, grows with every pipeline the process ever saw.
+        FailingActuator actuator = new FailingActuator();
+        PipelineConverger converger =
+                new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
+        ConvergenceDriver driver =
+                new ConvergenceDriver(converger, desired, new ObservationPublisher(state, observations));
+        desired.save(new DesiredState("orders", RUNNING, "rev-1"));
+        driver.reconcile();
+        actuator.failWith(new IllegalStateException("sink write failed"));
+        driver.reconcile(); // orders -> FAILED, one failure counted
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsOnly(entry("errors.engine.job-failed", 1L));
+
+        // Deleted: its intent is removed, which is the only thing that takes a pipeline out of the set the
+        // pass reads. A stopped pipeline would still be in it and would keep its counts.
+        desired.remove("orders");
+        driver.reconcile();
+
+        // Re-applied under the same id. Its checkpoint is still FAILED, so this pass converges with no
+        // cause to report and publishes whatever the account holds -- nothing, if the delete was seen.
+        desired.save(new DesiredState("orders", RUNNING, "rev-1"));
+        driver.reconcile();
+        assertThat(observations.read("orders").orElseThrow().metrics()).isEmpty();
     }
 
     @Test
@@ -329,7 +369,7 @@ class ConvergenceDriverTest {
         }
 
         @Override
-        public void stop(String pipelineId) {
+        public void stop(String pipelineId, boolean purgeState) {
         }
 
         @Override

@@ -39,6 +39,18 @@ public enum NestError implements TapstateErrorCode {
     EMBED_PATH_CONFLICT("nest.embed-path-conflict", Set.of("path", "embedPathA", "embedPathB")),
 
     /**
+     * Checking the tree: pathless flat siblings reuse one alias, so they would share one durable state
+     * identity and changes from one would be read as changes from the other.
+     */
+    FLAT_EMBED_ALIAS_CONFLICT("nest.flat-embed-alias-conflict", Set.of("parentPath", "alias")),
+
+    /**
+     * Checking or rendering the tree: a flat embed contributes a field already occupied by its parent,
+     * a path-based sibling, or another flat embed. Refused rather than resolved by declaration order.
+     */
+    FLAT_FIELD_CONFLICT("nest.flat-field-conflict", Set.of("embedPath", "fields", "occupiedBy")),
+
+    /**
      * Checking the tree: the root declares no key, so its documents have no identity for children to be
      * grouped under and nothing to partition the assembled documents by.
      */
@@ -87,6 +99,10 @@ public enum NestError implements TapstateErrorCode {
     /** Checking the tree: a nest may not pass its snapshot reads straight to the sink, unassembled. */
     SNAPSHOT_PASSTHROUGH_FORBIDDEN("nest.snapshot-passthrough-forbidden", Set.of("rootCollection")),
 
+    /** Running: more than one live row belongs to one flat embed of one parent document. */
+    FLAT_CARDINALITY_VIOLATION(
+            "nest.flat-cardinality-violation", Set.of("embedPath", "rows")),
+
     /**
      * Starting up: the memory budget a namespace was given is smaller than the partitions it is spent
      * across, so what is held is the partition count rather than the number that was asked for.
@@ -106,6 +122,11 @@ public enum NestError implements TapstateErrorCode {
      */
     MEMORY_BUDGET_CHANGED_WHILE_RUNNING(
             "nest.memory-budget-changed-while-running",
+            Set.of("namespace", "configured", "requested")),
+
+    /** Starting up: this process already fixed a namespace to another operator-state database. */
+    STATE_DATABASE_CHANGED_WHILE_RUNNING(
+            "nest.state-database-changed-while-running",
             Set.of("namespace", "configured", "requested")),
 
     /**
@@ -207,11 +228,17 @@ public enum NestError implements TapstateErrorCode {
             Severity.WARNING),
 
     /**
-     * Running: a stream tracks structural key changes but its source does not provide a before image, so
-     * a key change cannot be told from an ordinary update and the document would silently diverge.
+     * Running: a stream tracks structural key changes but the row an update replaces does not carry the
+     * columns the tracking compares, so a key change cannot be told from an ordinary update and the
+     * document would silently diverge.
+     *
+     * <p><b>{@code columns} names what is missing, and it is the only useful half of the answer under a
+     * minimal row image.</b> That image sends the columns identifying the row and nothing else, so the
+     * earlier row is present and the compared column is not - an operator told only the stream and the
+     * table would go looking for a row image that is, from where they stand, already there.
      */
     KEY_CHANGE_TRACKING_REQUIRES_BEFORE_IMAGE(
-            "nest.key-change-tracking-requires-before-image", Set.of("alias", "table")),
+            "nest.key-change-tracking-requires-before-image", Set.of("alias", "table", "columns")),
 
     /**
      * Running: the rows of a stream are recorded against the row they point at, but its source sends an

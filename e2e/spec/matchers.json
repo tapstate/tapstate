@@ -12,15 +12,19 @@
     },
     {
       "word": "doc",
-      "description": "One document at an endpoint, located by equality settings and held to scalar values by path and list lengths by path - what makes 'the right rows crossed' assertable rather than only 'rows crossed'."
+      "description": "One document at an endpoint, located by equality settings and held to scalar values by path, list lengths by path, and paths that must not be there at all - what makes 'the right rows crossed' assertable rather than only 'rows crossed'. The last of the three is the only one a wider document fails: every value and length is satisfied by a document carrying extra fields beside them."
     },
     {
       "word": "error_count",
-      "description": "The pipeline's published error count, read from the metrics face: one while it is FAILED, zero otherwise."
+      "description": "How many failures the pipeline has counted, added up over the codes it counted them under, read from the metrics face. A count of failed operations, one each, rather than a reading derived from the state the pipeline is in. A nought asserted here is satisfied by a publisher that has stopped, because the face carries no entry for a pipeline that has failed at nothing: pair it with a word that has to read a live observation, such as a state awaited ahead of it."
     },
     {
       "word": "failure_code",
       "description": "The canonical code of the failure the pipeline published, read from the status face: what killed the run, not just that it died."
+    },
+    {
+      "word": "records_out",
+      "description": "How many rows the pipeline has had confirmed by its targets, added up over its tables and the operations its sources performed, read from the metrics face. Counted where the target confirmed them and nowhere earlier: a pipeline handing rows to a sink that rejects every one of them reads healthy on every other word here and differs only in that this total stays at nought. A nought asserted here needs a sibling asserting a real total to mean anything, because the face publishes no entry until something settles."
     },
     {
       "word": "state",
@@ -43,6 +47,14 @@
     {
       "word": "stop",
       "description": "A lifecycle verb, driven on the pipeline. Written on its own."
+    },
+    {
+      "word": "restart",
+      "description": "A word the terminal offers, driven on the pipeline. It expands into the product's own verbs; the vocabulary follows what a person types."
+    },
+    {
+      "word": "restart --rerun",
+      "description": "A word the terminal offers, driven on the pipeline. It expands into the product's own verbs; the vocabulary follows what a person types."
     },
     {
       "word": "assert",
@@ -102,8 +114,16 @@
       "description": "Provides a mysql store."
     },
     {
+      "word": "oracle",
+      "description": "Provides a oracle store."
+    },
+    {
       "word": "postgres",
       "description": "Provides a postgres store."
+    },
+    {
+      "word": "sqlserver",
+      "description": "Provides a sqlserver store."
     }
   ]
 }

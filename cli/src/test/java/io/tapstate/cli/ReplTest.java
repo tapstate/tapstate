@@ -1,13 +1,18 @@
 package io.tapstate.cli;
 
+import com.sun.net.httpserver.HttpServer;
+import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -17,7 +22,9 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -25,6 +32,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -36,6 +45,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * The JLine read loop itself is not unit-tested; {@link Repl#dispatch} is the testable seam.
  */
 class ReplTest {
+
+    /**
+     * A hash the server sent and nothing local could have produced. The precondition the CLI sends must
+     * be this exact value: it is taken over the resource's structure, so a client holding only the
+     * canonical bytes beside it cannot derive it, and one that tried would send something the server has
+     * never stored — refused on every request, with the canonical text sitting right there looking right.
+     */
+    private static final String STORED_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     private static final UUID TEST_CONTEXT_ID =
             UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
@@ -60,6 +77,20 @@ class ReplTest {
                 sessionToken,
                 now.plusSeconds(3600),
                 now.plusSeconds(7200));
+    }
+
+    private static byte[] completeConnectorJar() {
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (JarOutputStream jar = new JarOutputStream(bytes)) {
+                jar.putNextEntry(new JarEntry("connector.txt"));
+                jar.write("connector".getBytes());
+                jar.closeEntry();
+            }
+            return bytes.toByteArray();
+        } catch (IOException failed) {
+            throw new AssertionError("could not create the connector jar fixture", failed);
+        }
     }
 
     private record Harness(Repl repl, StringWriter sink) {
@@ -120,6 +151,10 @@ class ReplTest {
         final List<URI> discovered = new ArrayList<>();
         /** What the server answers when asked its version; null is a server that does not say. */
         String serverVersion;
+        /** The grammars it accepts and the schema version of its store; null in either is a server
+         * that does not say, which is not the same as a server that reports none. */
+        List<String> dslVersions;
+        Integer dataVersion;
         /** The canned login outcome and a log of the login calls made ({@code user:pass@base}). */
         LoginOutcome loginOutcome = new LoginOutcome.Unreachable();
         final List<String> loginCalls = new ArrayList<>();
@@ -148,9 +183,32 @@ class ReplTest {
         /** Per-artifact register outcomes keyed by artifact byte length (for batch/directory tests); falls back to {@link #registerOutcome}. */
         final Map<Integer, ConnectorRegisterOutcome> registerOutcomeByLength = new HashMap<>();
         ConnectorListOutcome connectorListOutcome = new ConnectorListOutcome.Unreachable();
+        /** The canned derived-schema answer, and every call as {@code read|accept credential@base/id}. */
+        DerivedSchemaOutcome derivedSchemaOutcome = new DerivedSchemaOutcome.Unreachable();
+        final List<String> derivedSchemaCalls = new ArrayList<>();
         LifecycleOutcome lifecycleOutcome = new LifecycleOutcome.Unreachable();
+        /**
+         * Per-verb outcomes, falling back to {@link #lifecycleOutcome}. A composed verb drives
+         * several of these in one go, and its interesting cases are the ones where they answer
+         * differently -- a pause that goes through and a resume that is refused is the whole of
+         * what "the definition changed under the run" looks like from here.
+         */
+        final Map<String, LifecycleOutcome> lifecycleOutcomeByVerb = new HashMap<>();
         StatusOutcome statusOutcome = new StatusOutcome.Unreachable();
+        /**
+         * The states successive status reads answer, in order; the last one sticks. A single value
+         * cannot express what a pipeline being paused looks like -- it is running, then it is not --
+         * and a verb that waits for that transition is unaskable without it.
+         */
+        final Deque<StatusOutcome> statusOutcomes = new ArrayDeque<>();
         MetricsOutcome metricsOutcome = new MetricsOutcome.Unreachable();
+        HistoryOutcome historyOutcome = new HistoryOutcome.Unreachable();
+        ExplainOutcome explainOutcome;
+        /** The readings successive metrics reads answer, in order; the last one sticks, as for status. */
+        final Deque<MetricsOutcome> metricsOutcomes = new ArrayDeque<>();
+        /** How long each metrics read takes to answer -- a slow wire, for a case about whose clock a rate is over. */
+        long metricsDelayMillis;
+        PositionOutcome positionOutcome = new PositionOutcome.Unreachable();
         SnapshotOutcome snapshotOutcome = new SnapshotOutcome.Unreachable();
         LogsOutcome logsOutcome = new LogsOutcome.Unreachable();
         /** The states a watch stream feeds, and the line batches a follow stream feeds, in order. */
@@ -174,6 +232,11 @@ class ReplTest {
         final List<String> lifecycleCalls = new ArrayList<>();
         final List<String> statusCalls = new ArrayList<>();
         final List<String> metricsCalls = new ArrayList<>();
+        final List<String> historyCalls = new ArrayList<>();
+        final List<String> explainCalls = new ArrayList<>();
+        HistoryRequest lastHistoryRequest;
+        final List<String> positionCalls = new ArrayList<>();
+        final List<String> positionBodies = new ArrayList<>();
         final List<String> snapshotCalls = new ArrayList<>();
         final List<String> logsCalls = new ArrayList<>();
         final List<String> watchCalls = new ArrayList<>();
@@ -231,6 +294,13 @@ class ReplTest {
         @Override
         public String serverVersion(URI baseUrl) {
             return healthy.contains(baseUrl) ? serverVersion : null;
+        }
+
+        @Override
+        public ServerVersion serverVersionDetail(URI baseUrl) {
+            return healthy.contains(baseUrl) && serverVersion != null
+                    ? new ServerVersion(serverVersion, dslVersions, dataVersion)
+                    : null;
         }
 
         @Override
@@ -374,21 +444,101 @@ class ReplTest {
         }
 
         @Override
-        public LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb) {
-            lifecycleCalls.add(credential + "@" + baseUrl + " " + verb + " " + pipelineId);
-            return healthy.contains(baseUrl) ? lifecycleOutcome : new LifecycleOutcome.Unreachable();
+        public LifecycleOutcome lifecycle(
+                URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState) {
+            lifecycleCalls.add(credential + "@" + baseUrl + " " + verb + " " + pipelineId
+                    + (purgeState == null ? "" : " purgeState=" + purgeState));
+            LifecycleOutcome answer = lifecycleOutcomeByVerb.getOrDefault(verb, lifecycleOutcome);
+            return healthy.contains(baseUrl) ? answer : new LifecycleOutcome.Unreachable();
         }
 
         @Override
         public StatusOutcome status(URI baseUrl, String credential, String pipelineId) {
             statusCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
-            return healthy.contains(baseUrl) ? statusOutcome : new StatusOutcome.Unreachable();
+            if (!healthy.contains(baseUrl)) {
+                return new StatusOutcome.Unreachable();
+            }
+            if (statusOutcomes.isEmpty()) {
+                return statusOutcome;
+            }
+            // The last one sticks rather than draining: a wait polls an unknown number of times, and a
+            // queue that empties would answer the next poll with something nobody scripted.
+            return statusOutcomes.size() == 1 ? statusOutcomes.peek() : statusOutcomes.poll();
+        }
+
+        @Override
+        public DerivedSchemaOutcome derivedSchema(URI baseUrl, String credential, String pipelineId) {
+            derivedSchemaCalls.add("read " + credential + "@" + baseUrl + "/" + pipelineId);
+            return healthy.contains(baseUrl)
+                    ? derivedSchemaOutcome : new DerivedSchemaOutcome.Unreachable();
+        }
+
+        @Override
+        public DerivedSchemaOutcome acceptDerivedSchema(
+                URI baseUrl, String credential, String pipelineId) {
+            derivedSchemaCalls.add("accept " + credential + "@" + baseUrl + "/" + pipelineId);
+            return healthy.contains(baseUrl)
+                    ? derivedSchemaOutcome : new DerivedSchemaOutcome.Unreachable();
         }
 
         @Override
         public MetricsOutcome metrics(URI baseUrl, String credential, String pipelineId) {
             metricsCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
-            return healthy.contains(baseUrl) ? metricsOutcome : new MetricsOutcome.Unreachable();
+            if (metricsDelayMillis > 0) {
+                try {
+                    Thread.sleep(metricsDelayMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            if (!healthy.contains(baseUrl)) {
+                return new MetricsOutcome.Unreachable();
+            }
+            if (metricsOutcomes.isEmpty()) {
+                return metricsOutcome;
+            }
+            return metricsOutcomes.size() == 1 ? metricsOutcomes.peek() : metricsOutcomes.poll();
+        }
+
+        @Override
+        public HistoryOutcome history(
+                URI baseUrl, String credential, String pipelineId, HistoryRequest request) {
+            historyCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
+            lastHistoryRequest = request;
+            return healthy.contains(baseUrl) ? historyOutcome : new HistoryOutcome.Unreachable();
+        }
+
+        @Override
+        public ExplainOutcome explain(URI baseUrl, String credential, String pipelineId) {
+            explainCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
+            if (!healthy.contains(baseUrl)) {
+                return new ExplainOutcome.Unreachable();
+            }
+            if (explainOutcome != null) {
+                return explainOutcome;
+            }
+            StatusOutcome status = statusOutcome;
+            if (status instanceof StatusOutcome.Found found) {
+                return noMatch(found.pipelineId(), found.state(), found.observedAgeMillis());
+            }
+            if (status instanceof StatusOutcome.Rejected rejected) {
+                return new ExplainOutcome.Rejected(rejected.code(), rejected.message());
+            }
+            return new ExplainOutcome.Unreachable();
+        }
+
+        @Override
+        public PositionOutcome position(URI baseUrl, String credential, String pipelineId) {
+            positionCalls.add("read " + credential + "@" + baseUrl + "/" + pipelineId);
+            return healthy.contains(baseUrl) ? positionOutcome : new PositionOutcome.Unreachable();
+        }
+
+        @Override
+        public PositionOutcome setPosition(
+                URI baseUrl, String credential, String pipelineId, String document) {
+            positionCalls.add("write " + credential + "@" + baseUrl + "/" + pipelineId);
+            positionBodies.add(document);
+            return healthy.contains(baseUrl) ? positionOutcome : new PositionOutcome.Unreachable();
         }
 
         @Override
@@ -454,6 +604,38 @@ class ReplTest {
     @Test
     void quitStopsTheLoop() {
         assertThat(harness().repl().dispatch("quit")).isFalse();
+    }
+
+    @Test
+    void aSessionKeepsTheStatusOfItsFirstRefusalAndNotOfItsLastLine(@TempDir Path base) {
+        Harness h = harness(base);
+        // The two refusals are chosen to carry different codes -- `cd` to a missing directory is a usage
+        // refusal, `apply` with nothing naming a server is a verb that could not run -- so which of them
+        // the session keeps is visible rather than inferred. The successful line and the `exit` after
+        // them are the shape a script has, and the reason the end of a session cannot speak for it.
+        assertThat(h.repl().dispatch("cd nope")).isTrue();
+        assertThat(h.repl().dispatch("apply nope")).isTrue();
+        assertThat(h.repl().dispatch("pwd")).isTrue();
+        assertThat(h.repl().dispatch("exit")).isFalse();
+
+        // Reading the status off the end of the session would find this one, and call the run successful.
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().sessionExitCode())
+                .withFailMessage("the session kept %s: EXIT_USAGE is the first refusal, "
+                        + "EXIT_VERB_UNAVAILABLE the last one, and zero the last line",
+                        h.repl().sessionExitCode())
+                .isEqualTo(Cli.EXIT_USAGE);
+    }
+
+    @Test
+    void aSessionThatRefusedNothingEndsSuccessful(@TempDir Path base) {
+        // The other direction, so a session that had simply started failing everything could not pass
+        // the case above.
+        Harness h = harness(base);
+        assertThat(h.repl().dispatch("pwd")).isTrue();
+        assertThat(h.repl().dispatch("exit")).isFalse();
+
+        assertThat(h.repl().sessionExitCode()).isZero();
     }
 
     @Test
@@ -723,7 +905,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.serverVersion = "9.9.9";
         client.listOutcome = new ListOutcome.Listed(List.of(
-                new RemoteArtifact("src_kfk", "source", "kind: source\n")));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n")));
         Harness h = onlineSession(Path.of("tap-work"), client);
 
         int mark = h.sink().toString().length();
@@ -818,6 +1000,88 @@ class ReplTest {
         assertThat(out).contains("not reported").contains("node1:7900");
         // never its own number in the server's half -- that is the failure this shape exists to avoid
         assertThat(out).doesNotContain("server " + buildVersion());
+    }
+
+    /**
+     * The question an operator has straight after an upgrade is which system-data version they are on
+     * now, and the verb named after versions is where they go to ask it. The server sends the grammars
+     * and that number in the same body as its own version, so anything short of printing them is the
+     * CLI dropping what it already received and sending the reader to a second command for it.
+     */
+    @Test
+    void theVersionVerbAnswersWithTheGrammarsAndTheDataVersionTheServerSent() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.dslVersions = List.of("tapstate/v1", "tapstate/v2");
+        client.dataVersion = 4;
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out.lines().toList())
+                .contains("dsl    tapstate/v1, tapstate/v2")
+                .contains("data   4");
+    }
+
+    /**
+     * A server that answers with its own number and nothing else -- a build older than either field, or
+     * a run with no store behind it. Not knowing is printed as not knowing, the stance the server half
+     * already takes: a blank where a number belongs reads as agreement, and so does saying nothing.
+     */
+    @Test
+    void theVersionVerbSaysNotReportedForTheHalvesAServerLeavesOut() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.dslVersions = null;
+        client.dataVersion = null;
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out.lines().toList())
+                .contains("dsl    not reported")
+                .contains("data   not reported");
+    }
+
+    /**
+     * A server that sends an empty grammar list is saying it accepts none, which is a different answer
+     * from not sending the field at all -- and printing them alike would hide a server nothing can be
+     * authored against behind a word that means "we could not tell".
+     */
+    @Test
+    void aServerThatAcceptsNoGrammarSaysSoRatherThanReadingAsSilence() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.serverVersion = "9.9.9";
+        client.dslVersions = List.of();
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out.lines().toList()).contains("dsl    none").doesNotContain("dsl    not reported");
+    }
+
+    /**
+     * Offline the two extra halves are left out entirely rather than reported as unknown. Nothing about
+     * a grammar set or a store is knowable without a server, and "not reported" there would describe a
+     * server that was never asked -- three lines of not-knowing where one already said it.
+     */
+    @Test
+    void theOfflineVerbLeavesOutTheHalvesOnlyAServerCanAnswer() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = harness(Path.of("tap-work"), client);
+
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("version")).isTrue();
+        String out = h.sink().toString().substring(mark);
+
+        assertThat(out).contains("not connected");
+        assertThat(out.lines().toList()).noneMatch(line -> line.startsWith("dsl") || line.startsWith("data"));
     }
 
     /** The version the build was run at -- handed in by surefire, so it is not read back off the code. */
@@ -1169,6 +1433,16 @@ class ReplTest {
     /** Connects to a single healthy node and logs in, so a test starts from an authenticated session. */
     private static Harness onlineSession(Path workdir, FakeControlPlane client) {
         Harness h = harness(workdir, client, new ScriptedPrompter("pw"));
+        authenticateOnNode1(h.repl());
+        return h;
+    }
+
+    /**
+     * The same authenticated session over a prompter the test owns, for a case whose answers are its
+     * own. Signing in consumes no answer, so the script starts at the first question the case asks.
+     */
+    private static Harness onlineSession(Path workdir, FakeControlPlane client, ScriptedPrompter prompter) {
+        Harness h = harness(workdir, client, prompter);
         authenticateOnNode1(h.repl());
         return h;
     }
@@ -1534,7 +1808,7 @@ class ReplTest {
     void getWhileAuthenticatedFetchesTheArtifactFromTheServer() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("src_kfk", "source", "kind: source\nid: src_kfk\n"));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get src_kfk")).isTrue();
@@ -1568,15 +1842,15 @@ class ReplTest {
 
     /**
      * Without {@code --if-match} the verb reads first and removes the version it read. The hash sent is
-     * asserted against the canonical bytes that came back: sending anything else — a blank, a literal
-     * null, a hash of something else — would make the removal unconditional in effect, which is the one
-     * property the precondition exists to provide.
+     * asserted against the one the read handed over: sending anything else — a blank, a literal null, a
+     * hash recomputed from the canonical bytes — would make the removal unconditional in effect, which is
+     * the one property the precondition exists to provide.
      */
     @Test
     void deleteWithoutAPreconditionReadsTheArtifactAndRemovesThatExactVersion() {
-        String canonical = "kind: source\nid: src_kfk\n";
+        String canonical = "version: tapstate/v1\nkind: source\nid: src_kfk\n";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical, STORED_HASH, true));
         client.deleteOutcome = new DeleteOutcome.Removed("src_kfk");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -1585,7 +1859,7 @@ class ReplTest {
 
         assertThat(h.sink().toString().substring(mark)).contains("deleted").contains("source").contains("src_kfk");
         assertThat(client.deleteCalls).containsExactly(
-                "jwt-tok@http://node1:7900/src_kfk#" + CanonicalHash.of(canonical));
+                "jwt-tok@http://node1:7900/src_kfk#" + STORED_HASH);
     }
 
     @Test
@@ -1619,9 +1893,9 @@ class ReplTest {
         // A script removing resources needs to know what it removed, and "deleted source src_kfk" is a
         // sentence, not a result. The precondition actually used is part of it: without --if-match the
         // verb picks the version itself, and the caller has no other way to learn which one went.
-        String canonical = "kind: source\nid: src_kfk\n";
+        String canonical = "version: tapstate/v1\nkind: source\nid: src_kfk\n";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", canonical, STORED_HASH, true));
         client.deleteOutcome = new DeleteOutcome.Removed("src_kfk");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -1633,7 +1907,7 @@ class ReplTest {
                 .contains("\"id\": \"src_kfk\"")
                 .contains("\"kind\": \"source\"")
                 .contains("\"removed\": true")
-                .contains("\"expectedContentHash\": \"" + CanonicalHash.of(canonical) + "\"");
+                .contains("\"expectedContentHash\": \"" + STORED_HASH + "\"");
         assertThat(h.repl().lastExitCode()).isZero();
     }
 
@@ -1971,8 +2245,8 @@ class ReplTest {
     void lsWhileConnectedListsServerArtifactsNotTheLocalWorkspace() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.listOutcome = new ListOutcome.Listed(List.of(
-                new RemoteArtifact("src_kfk", "source", "kind: source\n"),
-                new RemoteArtifact("kfk2my", "pipeline", "kind: pipeline\n")));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n"),
+                new RemoteArtifact("kfk2my", "pipeline", "version: tapstate/v1\nkind: pipeline\n")));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("ls")).isTrue();
@@ -1985,7 +2259,7 @@ class ReplTest {
     void lsWhileConnectedShowsUnreadableServerArtifactsWithoutFailingTheListing() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.listOutcome = new ListOutcome.Listed(List.of(
-                new RemoteArtifact("src_kfk", "source", "kind: source\n"),
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n"),
                 new RemoteArtifact("p1", "pipeline", "not: [valid", false)));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -2059,7 +2333,7 @@ class ReplTest {
     /** A stored source connection whose canonical form carries the connector id and its connection config. */
     private static GetOutcome.Found storedConnection() {
         return new GetOutcome.Found(new RemoteArtifact("my-mongo", "source",
-                "kind: source\nid: my-mongo\nconnector: mongodb\nconfig:\n  host: db.internal\n  username: cdc\n"));
+                "version: tapstate/v1\nkind: source\nid: my-mongo\nconnector: mongodb\nconfig:\n  host: db.internal\n  username: cdc\n"));
     }
 
     private static ConnectionTestOutcome.Tested passedReport() {
@@ -2362,7 +2636,7 @@ class ReplTest {
     void testOnANonSourceIdReportsNotATestableConnectionAndDoesNotProbe() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("kfk2my", "pipeline", "kind: pipeline\nid: kfk2my\n"));
+                new RemoteArtifact("kfk2my", "pipeline", "version: tapstate/v1\nkind: pipeline\nid: kfk2my\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -2610,7 +2884,7 @@ class ReplTest {
     void discoverSchemaOnANonSourceIdReportsNotDiscoverableAndDoesNotDiscover() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("kfk2my", "pipeline", "kind: pipeline\nid: kfk2my\n"));
+                new RemoteArtifact("kfk2my", "pipeline", "version: tapstate/v1\nkind: pipeline\nid: kfk2my\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -2672,7 +2946,7 @@ class ReplTest {
         assertThat(h.sink().toString()).contains("cli.not-connected").contains("discover-schema");
     }
 
-    // --- register: `register <path>` uploads a local artifact to the server -----------------------
+    // --- register: local paths upload directly; published ids download, then upload ---------------
 
     @Test
     void registerUploadsALocalArtifactAndRendersTheRegistration(@TempDir Path workdir) throws Exception {
@@ -2689,6 +2963,146 @@ class ReplTest {
         assertThat(out).contains("registered").contains("orders").contains("hash-abc");
         // the artifact bytes (4) travel to the current landing node under the session credential
         assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x4");
+    }
+
+    @Test
+    void registerDownloadsBothPublishedEnterpriseConnectorsById(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("enterprise", "hash-abc", "2.0.9", true));
+        Harness h = onlineSession(workdir, client);
+        List<URI> fetched = new ArrayList<>();
+        byte[] jar = completeConnectorJar();
+        h.repl().connectorFetcher((from, expected) -> {
+            fetched.add(from);
+            return PublishedConnectorArtifacts.Fetched.verified(jar);
+        });
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register oracle")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().dispatch("register sqlserver")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
+
+        assertThat(fetched).containsExactly(
+                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/oracle-connector.jar"),
+                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/sqlserver-connector.jar"));
+        assertThat(client.registerCalls).containsExactly(
+                "jwt-tok@http://node1:7900 x" + jar.length,
+                "jwt-tok@http://node1:7900 x" + jar.length);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("downloading oracle-connector.jar from github.com")
+                .contains("downloading sqlserver-connector.jar from github.com")
+                .contains("uploading oracle-connector.jar (" + jar.length + " B)")
+                .contains("uploading sqlserver-connector.jar (" + jar.length + " B)");
+    }
+
+    @Test
+    void registerDownloadsFromTheConfiguredMirrorWithoutPollutingJson(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("sqlserver", "hash-sql", "2.0.9", true));
+        Harness h = onlineSession(workdir, client,
+                Map.of("TAPSTATE_CONNECTORS_URL", "https://mirror.example/connectors"));
+        List<URI> fetched = new ArrayList<>();
+        byte[] jar = completeConnectorJar();
+        h.repl().connectorFetcher((from, expected) -> {
+            fetched.add(from);
+            return PublishedConnectorArtifacts.Fetched.verified(jar);
+        });
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register sqlserver -o json")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(fetched).containsExactly(
+                URI.create("https://mirror.example/connectors/sqlserver-connector.jar"));
+        assertThat(out).contains("\"connectorId\"").contains("\"sqlserver\"")
+                .doesNotContain("downloading", "uploading");
+    }
+
+    @Test
+    void anExistingFileNamedLikeAConnectorIdWinsOverTheDownload(@TempDir Path workdir) throws Exception {
+        Files.write(workdir.resolve("oracle"), new byte[] {1, 2, 3, 4});
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("local", "hash-local", "1.0", true));
+        Harness h = onlineSession(workdir, client);
+        h.repl().connectorFetcher((from, expected) -> {
+            throw new AssertionError("a local file must not reach the release downloader");
+        });
+
+        assertThat(h.repl().dispatch("register oracle")).isTrue();
+
+        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x4");
+        assertThat(h.sink().toString()).contains("uploading oracle (4 B)").doesNotContain("downloading");
+    }
+
+    @Test
+    void aFailedPublishedDownloadIsCodedAndNeverUploaded(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(workdir, client);
+        h.repl().connectorFetcher((from, expected) -> {
+            throw new IOException("HTTP 404");
+        });
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register oracle -o json")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(out).contains("\"error\"").contains("cli.connector-download-failed")
+                .contains("oracle").contains("HTTP 404")
+                .doesNotContain("uploading");
+        assertThat(client.registerCalls).isEmpty();
+    }
+
+    @Test
+    void aSuccessfulErrorPageCannotBeUploadedAsAConnector(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(workdir, client);
+        h.repl().connectorFetcher((from, expected) ->
+                PublishedConnectorArtifacts.Fetched.unverified("not a jar".getBytes()));
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register sqlserver")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(out).contains("cli.connector-download-failed")
+                .contains("length does not match the published asset");
+        assertThat(client.registerCalls).isEmpty();
+    }
+
+    @Test
+    void aTruncatedSuccessfulResponseIsCodedAndNeverUploaded(@TempDir Path workdir) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/connector.jar", exchange -> {
+            exchange.sendResponseHeaders(200, 100);
+            exchange.getResponseBody().write(new byte[] {(byte) 'P', (byte) 'K', 3, 4, 9});
+            exchange.close();
+        });
+        server.start();
+        try {
+            URI truncated = URI.create(
+                    "http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
+            FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+            Harness h = onlineSession(workdir, client);
+            PublishedConnectorArtifacts.Fetcher http = PublishedConnectorArtifacts.Fetcher.http();
+            h.repl().connectorFetcher((ignored, expected) -> http.fetch(
+                    truncated, new PublishedConnectorArtifacts.Artifact(100, "unused-after-truncation")));
+            int mark = h.sink().toString().length();
+
+            assertThat(h.repl().dispatch("register oracle")).isTrue();
+
+            String out = h.sink().toString().substring(mark);
+            assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+            assertThat(out).contains("cli.connector-download-failed").contains("truncated")
+                    .doesNotContain("uploading");
+            assertThat(client.registerCalls).isEmpty();
+        } finally {
+            server.stop(0);
+        }
     }
 
     @Test
@@ -3280,7 +3694,7 @@ class ReplTest {
         copyWorkspace("/ws-valid", base);   // a real local source/src_kfk.tap.yml exists in the workspace
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(new RemoteArtifact(
-                "src_kfk", "source", "kind: source\nid: src_kfk\nserver_marker: REMOTE\n"));
+                "src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\nserver_marker: REMOTE\n"));
         Harness h = onlineSession(base, client);
         int mark = h.sink().toString().length();
         h.repl().dispatch("get src_kfk");
@@ -3335,6 +3749,26 @@ class ReplTest {
         assertThat(h.repl().lastExitCode())
                 .as("a warning is a note about a batch that applied — it never changes the exit status")
                 .isEqualTo(Cli.EXIT_OK);
+    }
+
+    @Test
+    void applyRefreshWarningExplainsCommittedArtifactsPartialModelsAndRetry(@TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.applyOutcome = new ApplyOutcome.Applied(
+                List.of(new ApplyOutcome.Item("kfk2my", "pipeline", "CREATED")),
+                List.of(new ApplyOutcome.Warning("control.schema-derivation-incomplete", Map.of(
+                        "pipeline", "kfk2my", "causeCode", "io.store-unavailable",
+                        "causeParams", Map.of("detail", "test outage")))));
+        SplitHarness h = onlineSplitStreamSession(base, client);
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+
+        assertThat(h.out().toString()).contains("created").contains("kfk2my").doesNotContain("warning:");
+        assertThat(h.err().toString()).contains("warning:").contains("artifacts were applied")
+                .contains("kfk2my").contains("io.store-unavailable").contains("test outage")
+                .contains("partially refreshed").contains("apply again").contains("Stop the pipeline");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
     }
 
     @Test
@@ -3469,7 +3903,7 @@ class ReplTest {
         // a subdirectory that cannot be listed makes Files.walk raise UncheckedIOException mid-traversal;
         // apply must render a benign "cannot read" line, not let that escape and crash the REPL session
         Path locked = Files.createDirectory(base.resolve("source"));
-        Files.writeString(locked.resolve("s.tap.yml"), "kind: source\nid: x\n");
+        Files.writeString(locked.resolve("s.tap.yml"), "version: tapstate/v1\nkind: source\nid: x\n");
         assumeTrue(Files.getFileAttributeView(locked, PosixFileAttributeView.class) != null,
                 "POSIX permissions required to make a subdirectory unreadable");
         Files.setPosixFilePermissions(locked, PosixFilePermissions.fromString("---------"));
@@ -3559,6 +3993,589 @@ class ReplTest {
         assertThat(client.lifecycleCalls).containsExactly("jwt-tok@http://node1:7900 start pl1");
     }
 
+    // ---- restart: composed here out of the four verbs, never a fifth ----------------------------
+
+    @Test
+    void restartOnARunningPipelineCyclesItAndCarriesOn() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        // Running when asked, paused once the pause has been carried out.
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // The order is the assertion. A resume before the pause, or a stop anywhere in here, is a
+        // different act on the pipeline's state -- and all three end with it running again.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 pause pl1",
+                "jwt-tok@http://node1:7900 resume pl1");
+    }
+
+    @Test
+    void restartDoesNotResumeUntilThePauseHasBeenCarriedOut() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        // Still running for two polls after the pause was accepted, then paused.
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // This is the case. A pipeline has one slot for its intent and the converge side samples it, so
+        // a resume written before the pause has been read leaves only itself -- asking for the state the
+        // pipeline is already in, which actuates nothing while every face reports success. The pipeline
+        // never stops, and nothing anywhere says so. What separates the two verbs is this wait, and the
+        // count of status reads is the only place from here that it is observable at all.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 pause pl1",
+                "jwt-tok@http://node1:7900 resume pl1");
+        assertThat(client.statusCalls)
+                .as("one read to learn it is running, then reads until the pause is what it actually is")
+                .hasSizeGreaterThan(2);
+    }
+
+    @Test
+    void restartThatNeverSeesThePauseCarriedOutResumesNothingAndSaysSo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        // It never reports paused, which is what a converge side that has stopped looks like.
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client,
+                Map.of("TAPSTATE_RESTART_PAUSE_TIMEOUT_MS", "0"));
+
+        h.repl().dispatch("restart pl1");
+
+        // Giving up without resuming is the answer, not a half-done one: the pipeline is on its way to
+        // paused and will stay there, which somebody can act on. A resume sent here would be the very
+        // write that erases the pause nobody has read yet.
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 pause pl1");
+        // The state it is in, not the one it is not: a pipeline that failed while pausing never
+        // reports paused either, and one message for both sends half of them to wait for nothing.
+        assertThat(h.sink().toString()).contains("it is still running");
+        assertThat(h.sink().toString()).contains("running restart again picks it up");
+    }
+
+    @Test
+    void restartOnAPipelineWhoseDefinitionChangedNamesTheOptionThatWorks() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
+        // The pause goes through; the resume is refused because the definition moved under the run.
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-old");
+        client.lifecycleOutcomeByVerb.put("resume", new LifecycleOutcome.Rejected(
+                "lifecycle.incompatible-revision", "rev-old is not rev-new."));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // The refusal is correct and the obvious advice is wrong: nothing about trying again changes the
+        // definition, so a caller told to retry retries forever. What they can actually do is named.
+        assertThat(h.sink().toString()).contains("--rerun");
+        assertThat(h.sink().toString()).doesNotContain("running restart again picks it up");
+    }
+
+    @Test
+    void restartLeftPausedByAnOrdinaryRefusalSaysTryingAgainWorks() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
+        client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-old");
+        client.lifecycleOutcomeByVerb.put("resume", new LifecycleOutcome.Rejected(
+                "lifecycle.illegal-transition", "Not paused."));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // Its pair above. Every other refusal leaves the pipeline paused with everything it had, and
+        // retrying is a real answer -- so telling both kinds the same thing makes one of them a lie.
+        assertThat(h.sink().toString()).contains("running restart again picks it up");
+    }
+
+    @Test
+    void restartOnAPausedPipelineOnlyResumesIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "PAUSED");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // Pausing something already paused is refused by the state machine, so a restart that always
+        // paused first would fail here -- on a pipeline whose owner asked for the ordinary thing.
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 resume pl1");
+    }
+
+    @Test
+    void restartOnACleanPipelineSaysItIsAFullRun() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "STOPPED");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        assertThat(client.lifecycleCalls).containsExactly("jwt-tok@http://node1:7900 start pl1");
+        // This assertion is the case. Both outcomes end with the pipeline running, and which one
+        // happened shows only in how much of the source gets read -- hours later, if at all. An
+        // implementation that degraded quietly passes every other assertion here.
+        assertThat(h.sink().toString())
+                .contains("no position to carry on from")
+                .contains("reads everything from the start");
+    }
+
+    @Test
+    void restartRerunClearsWhatThePipelineHasAndThenStartsIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1 --rerun -y");
+
+        // The stop carries the clearing answer, and nothing here reads the pipeline's state first: what
+        // --rerun asks for is the same whatever the pipeline was doing.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true",
+                "jwt-tok@http://node1:7900 start pl1");
+    }
+
+    @Test
+    void restartRerunDoesNotStartWhenTheStopWasRefused() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Rejected("lifecycle.illegal-transition", "Not running.");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1 --rerun -y");
+
+        // A start after a refused stop would run a pipeline whose owner asked for it to be re-read from
+        // scratch, without the clearing that makes it one -- so it would carry on while reporting the
+        // opposite. The refusal ends the sequence.
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=true");
+    }
+
+    @Test
+    void restartRerunWhoseStartIsRefusedAfterTheStopSaysWhatThatLeftBehind() {
+        // The one ordering the product concedes it cannot make atomic: the stop went through, so the
+        // position is already gone, and the start is then refused. Nothing here can undo that, which is
+        // exactly why what it says has to be right.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcomeByVerb.put("stop", new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc"));
+        client.lifecycleOutcomeByVerb.put(
+                "start", new LifecycleOutcome.Rejected("lifecycle.artifact-missing", "No such pipeline."));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1 --rerun -y");
+
+        // Both verbs really went, in that order: without this the case could pass on a run that was
+        // refused before the stop, which is a different situation with nothing to report.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true",
+                "jwt-tok@http://node1:7900 start pl1");
+
+        // All three, because a reader told only the first is told the least useful of them.
+        String out = h.sink().toString();
+        assertThat(out).contains("was stopped and its state cleared");
+        assertThat(out).contains("no position to resume from");
+        assertThat(out).contains("reads the whole source");
+    }
+
+    @Test
+    void restartOnAFailedPipelineCarriesOnFromWhereItGotTo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        // purgeState=false is the whole case. The same two verbs with the clearing answer would also
+        // leave the pipeline running -- and would have thrown away the position the failed run reached,
+        // so the next run reads the entire source. Both look identical until it is well under way, and
+        // only this argument tells them apart.
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=false",
+                "jwt-tok@http://node1:7900 start pl1");
+    }
+
+    @Test
+    void statusPrintsTheStateLineFirstAndTheAnswerUnderIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 252_000L);
+        client.explainOutcome = stale("pl1", "RUNNING", 252_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // The state line is untouched and still first: anything that reads this output by its first line
+        // keeps working, and the answer is added below rather than replacing what was there.
+        assertThat(out.lines().findFirst().orElseThrow()).isEqualTo("pl1  running");
+        assertThat(out).contains("why:").contains("publisher may have stopped").contains("4m12s");
+        assertThat(out).contains("read       status.observedAgeMillis = 252000");
+        assertThat(out).contains("next       ");
+    }
+
+    @Test
+    void statusThatTheSharedExplanationAnsweredDoesNotReadMovementOrSnapshot() {
+        // A reading this old makes every other face a re-read of the same old observation, so asking them
+        // costs two round trips to learn nothing. Pinned because the cost is invisible in the output.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 252_000L);
+        client.explainOutcome = stale("pl1", "RUNNING", 252_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("status pl1");
+
+        assertThat(client.metricsCalls).isEmpty();
+        assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void statusRendersTheServerNoMatchAndDoesNotRebuildItFromOtherFaces() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found(
+                "pl1", Map.of("errors.connector.write-failed", 1L, "recordCount", 128L));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // Its opposite is the failure mode: five rules coming up empty is a statement about five rules,
+        // and printing it as a clean bill of health is the product defaulting to healthy on thin signals.
+        assertThat(out).contains("No diagnostic rule matched");
+        assertThat(out).contains("cannot say Whether the source has changes waiting");
+        assertThat(client.explainCalls).hasSize(1);
+        assertThat(client.metricsCalls).hasSize(1);
+        assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    /** A metrics reading whose facts say the run has moved {@code out} rows across two tables, observed at {@code at}. */
+    private static MetricsOutcome.Found moved(java.time.Instant at, long out, long lagSeconds) {
+        return new MetricsOutcome.Found("pl1", Map.of("recordCount", out), Map.of(), List.of(), List.of(
+                new MetricsOutcome.FactPoint("tapstate.pipeline.records",
+                        Map.of("direction", "out", "tapstate.table.id", "orders"), at, out - out / 3),
+                new MetricsOutcome.FactPoint("tapstate.pipeline.records",
+                        Map.of("direction", "out", "tapstate.table.id", "items"), at, out / 3),
+                new MetricsOutcome.FactPoint("tapstate.pipeline.lag",
+                        Map.of("tapstate.table.id", "orders"), at, lagSeconds)));
+    }
+
+    private static ExplainOutcome.Found noMatch(String id, String state, Long ageMillis) {
+        return new ExplainOutcome.Found(id, state, "NO_MATCH", "No diagnostic rule matched.",
+                ageMillis == null ? null : "2026-09-17T10:00:00Z", ageMillis,
+                ageMillis == null ? "UNKNOWN" : "FRESH",
+                List.of(new ExplainOutcome.Evidence("status", "observedAgeMillis", ageMillis)),
+                List.of("Whether the source has changes waiting is not measured."), null, null);
+    }
+
+    private static ExplainOutcome.Found stale(String id, String state, long ageMillis) {
+        return new ExplainOutcome.Found(id, state, "OBSERVATION_STALE",
+                "The latest observation is 4m12s old, so the publisher may have stopped.",
+                "2026-09-17T10:00:00Z", ageMillis, "STALE",
+                List.of(new ExplainOutcome.Evidence("status", "observedAgeMillis", ageMillis)),
+                List.of("What the pipeline is doing now is unknown."),
+                new ExplainOutcome.Next("CHECK_SERVER", "Check that the server is running and converging."),
+                null);
+    }
+
+    private static ExplainOutcome.Found noMovement(String id, long rowsDone) {
+        return new ExplainOutcome.Found(id, "RUNNING", "NO_MOVEMENT",
+                "Nothing has moved: no records driven and no rows loaded.",
+                "2026-09-17T10:00:00Z", 2_000L, "FRESH",
+                List.of(
+                        new ExplainOutcome.Evidence("metrics", "recordCount", 0L),
+                        new ExplainOutcome.Evidence("snapshot", "rowsDone", rowsDone)),
+                List.of("Whether the source has changes waiting is not measured."),
+                new ExplainOutcome.Next("OPEN_PIPELINE_LOGS", "Open the logs for pipeline " + id + "."),
+                null);
+    }
+
+    private static ExplainOutcome.Found noMatchWithSnapshot(String id, long rowsDone) {
+        return new ExplainOutcome.Found(id, "RUNNING", "NO_MATCH", "No diagnostic rule matched.",
+                "2026-09-17T10:00:00Z", 2_000L, "FRESH",
+                List.of(new ExplainOutcome.Evidence("snapshot", "rowsDone", rowsDone)),
+                List.of("Whether an initial load is still running cannot be determined from loaded rows alone."),
+                null, null);
+    }
+
+    private static ExplainOutcome.Found codedFailure(String id, String message) {
+        Map<String, Object> failure = new java.util.LinkedHashMap<>();
+        failure.put("code", "engine.job-failed");
+        failure.put("params", Map.of("pipeline", id, "cause", "the sink rejected the batch"));
+        failure.put("message", message);
+        return new ExplainOutcome.Found(id, "FAILED", "CODED_FAILURE",
+                "The run failed, and said why: engine.job-failed.",
+                "2026-09-17T10:00:00Z", 2_000L, "FRESH",
+                List.of(new ExplainOutcome.Evidence("status", "failure", failure)), List.of(),
+                new ExplainOutcome.Next("OPEN_PIPELINE_LOGS", "Open the logs for pipeline " + id + "."),
+                null);
+    }
+
+    @Test
+    void statusShowsHowFastThePipelineMovesOffTwoReadingsOfItsOwnTime() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        java.time.Instant at = java.time.Instant.parse("2026-09-17T10:00:00Z");
+        client.metricsOutcomes.add(moved(at, 300, 3));
+        client.metricsOutcomes.add(moved(at.plusSeconds(1), 330, 2));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> true);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // Thirty rows over the one second between the two observations, summed over both tables; the
+        // lag is the later reading's, since it is a level and not a difference.
+        assertThat(out).contains("moving     out 30.0 rows/s (over 1.0s of the pipeline's own time)");
+        assertThat(out).contains("lag        orders 2s");
+        assertThat(client.metricsCalls).hasSize(2);
+    }
+
+    @Test
+    void statusMeasuresTheRateOverThePipelinesOwnTimeNotThisMachinesClock() {
+        // The second reading arrives late by the wall -- a slow wire, a busy server -- while the two
+        // observations are one second apart by their own stamps. Thirty rows over that one second is the
+        // rate; thirty over however long this machine happened to wait is a number about the wire.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        java.time.Instant at = java.time.Instant.parse("2026-09-17T10:00:00Z");
+        client.metricsOutcomes.add(moved(at, 300, 3));
+        client.metricsOutcomes.add(moved(at.plusSeconds(1), 330, 2));
+        client.metricsDelayMillis = 400;
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> true);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        assertThat(h.sink().toString().substring(mark))
+                .contains("moving     out 30.0 rows/s (over 1.0s of the pipeline's own time)");
+    }
+
+    @Test
+    void statusSaysTheRateIsNotKnownWhileThereIsOnlyOneReading() {
+        // The publisher has stalled: every read answers the same observation, however long the wall
+        // says has passed. That is one reading, and one reading is not a rate of nought -- a pipeline
+        // observed once and a pipeline that moved nothing call for different next steps.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = moved(java.time.Instant.parse("2026-09-17T10:00:00Z"), 300, 3);
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> true);
+        h.repl().rateWait(java.time.Duration.ofMillis(300));
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("moving     not known -- the reading did not advance in 0.3s; one reading gives no rate");
+        assertThat(out).doesNotContain("rows/s");
+        assertThat(out).contains("lag        orders 3s");
+        assertThat(client.metricsCalls).hasSizeGreaterThan(1);
+    }
+
+    @Test
+    void statusWithoutATerminalAnswersAtOnceRatherThanWaitingForASecondReading() {
+        // This is the verb people run in a loop over every pipeline they have, and from cron. A rate is
+        // two readings apart in the pipeline's own time, so waiting for the second costs about a second
+        // per pipeline against a healthy publisher and the whole bound against a stalled one -- seconds
+        // nothing in the script asked for, to print a number nothing in the script reads.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        java.time.Instant at = java.time.Instant.parse("2026-09-17T10:00:00Z");
+        client.metricsOutcomes.add(moved(at, 300, 3));
+        client.metricsOutcomes.add(moved(at.plusSeconds(1), 330, 2));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("moving     not known -- one reading, and not a terminal to wait for a"
+                + " second; --rate waits for it, --watch streams them");
+        assertThat(out).doesNotContain("rows/s");
+        // The distance behind is a level rather than a difference, so the one reading answers it.
+        assertThat(out).contains("lag        orders 3s");
+        // One read of the metrics face: what this verb cost before a rate was put under it.
+        assertThat(client.metricsCalls).hasSize(1);
+    }
+
+    @Test
+    void statusWaitsForTheSecondReadingWithoutATerminalWhenRateIsAskedFor() {
+        // The other half of the default above: a script that does want the number says so. Without this
+        // the rate would be unavailable to every non-interactive caller, which includes the end-to-end
+        // case that witnesses the CLI computing one at all.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        java.time.Instant at = java.time.Instant.parse("2026-09-17T10:00:00Z");
+        client.metricsOutcomes.add(moved(at, 300, 3));
+        client.metricsOutcomes.add(moved(at.plusSeconds(1), 330, 2));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1 --rate");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("moving     out 30.0 rows/s (over 1.0s of the pipeline's own time)");
+        assertThat(client.metricsCalls).hasSize(2);
+    }
+
+    @Test
+    void statusSaysTheRateIsNotKnownWhenNoCounterIsPublishedAndDoesNotWaitForOne() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "STOPPED", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of());
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("moving     not known -- no records counter is published (no live job)");
+        assertThat(out).contains("lag        not published");
+        assertThat(client.metricsCalls).hasSize(1);
+    }
+
+    @Test
+    void statusThatTheStatusFaceAnsweredSaysTheMovementIsNotKnownWithoutMeasuringIt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 252_000L);
+        client.explainOutcome = stale("pl1", "RUNNING", 252_000L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        assertThat(h.sink().toString().substring(mark)).contains("moving     not known -- this reading is old");
+        assertThat(client.metricsCalls).isEmpty();
+    }
+
+    @Test
+    void statusRendersNoMovementEvidenceWithoutReadingSnapshotLocally() {
+        // Three tables selected, none of which has loaded a row -- a snapshot pipeline stuck at the start,
+        // which is the situation the "nothing has moved" rule exists for. The face holds an entry for every
+        // selected table from the moment the run starts and keeps it for the life of the run, so counting
+        // its entries answers a different question (how many tables were selected) and never reaches zero
+        // on a pipeline like this one.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 0L));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
+                "orders", new RemoteTableSnapshot(0L, null, null),
+                "items", new RemoteTableSnapshot(0L, null, null),
+                "shipments", new RemoteTableSnapshot(0L, null, null)));
+        client.explainOutcome = noMovement("pl1", 0L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("Nothing has moved");
+        assertThat(out).contains("read       snapshot.rowsDone = 0");
+        assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void statusRendersSnapshotEvidenceCalculatedByTheServer() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 0L));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
+                "orders", new RemoteTableSnapshot(900L, null, null),
+                "items", new RemoteTableSnapshot(124L, null, null)));
+        client.explainOutcome = noMatchWithSnapshot("pl1", 1_024L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).doesNotContain("Nothing has moved");
+        assertThat(out).contains("read       snapshot.rowsDone = 1024");
+        assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void statusRendersExplicitUnknownEvidenceFromTheServer() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        client.explainOutcome = new ExplainOutcome.Found("pl1", "RUNNING", "NO_MATCH",
+                "No diagnostic rule matched.", "2026-09-17T10:00:00Z", 2_000L, "FRESH",
+                List.of(
+                        new ExplainOutcome.Evidence("metrics", "unavailable", null),
+                        new ExplainOutcome.Evidence("snapshot", "unavailable", null)),
+                List.of("Metrics and snapshot facts were unavailable."), null, null);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("metrics.unavailable = null").contains("snapshot.unavailable = null");
+        assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void restartStillNeedsAPipelineToRestart() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart --rerun");
+
+        // The option must not be read as the operand, for the reason --keep-state must not be.
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(client.lifecycleCalls).isEmpty();
+    }
+
+    @Test
+    void stopKeepingStateSendsTheOtherAnswerRatherThanNoneAtAll() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("stop pl1 --keep-state");
+
+        // Paired with the plain stop below, which sends true. The word changes what the stop does, not
+        // how it is shown, so the only place the difference exists is the argument on the wire -- and
+        // sending nothing at all would be refused by the server rather than meaning "keep".
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+    }
+
+    @Test
+    void stopKeepingStateStillNeedsAPipelineToStop() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("stop --keep-state");
+
+        // The option must not be read as the operand. Taken for one, this would have stopped a pipeline
+        // named "--keep-state" -- or, worse on a server that has one, some other pipeline entirely.
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(client.lifecycleCalls).isEmpty();
+    }
+
     @Test
     void theFourLifecycleVerbsEachRouteToTheirOwnServerVerb() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
@@ -3567,12 +4584,16 @@ class ReplTest {
         h.repl().dispatch("start pl1");
         h.repl().dispatch("pause pl1");
         h.repl().dispatch("resume pl1");
-        h.repl().dispatch("stop pl1");
+        // -y because this case is about which server verb each word reaches; the gate in front of the
+        // clearing one is its own case, and a test process has no terminal to answer at.
+        h.repl().dispatch("stop pl1 -y");
         assertThat(client.lifecycleCalls).containsExactly(
                 "jwt-tok@http://node1:7900 start pl1",
                 "jwt-tok@http://node1:7900 pause pl1",
                 "jwt-tok@http://node1:7900 resume pl1",
-                "jwt-tok@http://node1:7900 stop pl1");
+                // The terminal's plain stop is the product's stop, and the product's stop clears. The
+                // three above carry nothing because there is nothing for them to say.
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true");
     }
 
     @Test
@@ -3638,6 +4659,91 @@ class ReplTest {
 
     // --- observation read verbs route online to GET /api/pipelines/{id}/{face} --------------------
 
+    private static DerivedSchemaOutcome.Found oneStep(RemoteDerivedColumn... columns) {
+        return new DerivedSchemaOutcome.Found("pl1",
+                List.of(new RemoteDerivedStep("widen", "orders", true, List.of(columns))));
+    }
+
+    @Test
+    void derivedSchemaRoutesToTheReadAndPrintsAllThreeSides() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = oneStep(
+                new RemoteDerivedColumn("o_total", "DECIMAL NOT NULL", "DOUBLE NOT NULL", "decimal(10,2)"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("derived-schema pl1")).isTrue();
+
+        String printed = h.sink().toString().substring(mark);
+        // All three, because the two that decide anything are the recorded-versus-derived difference and
+        // whether the target can hold the result, and dropping either leaves the reader guessing at it.
+        assertThat(printed).contains("o_total").contains("DECIMAL NOT NULL")
+                .contains("DOUBLE NOT NULL").contains("decimal(10,2)");
+        assertThat(client.derivedSchemaCalls).containsExactly("read jwt-tok@http://node1:7900/pl1");
+    }
+
+    @Test
+    void derivedSchemaWithAcceptRoutesToTheAcceptAndNotToTheRead() {
+        // The one assertion that matters most here. A --accept that reached the read would print exactly
+        // the same thing and report success, and the operator would carry on believing the difference had
+        // been accepted while the next start refused it again.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = oneStep(
+                new RemoteDerivedColumn("o_total", "DOUBLE NOT NULL", "DOUBLE NOT NULL", "double"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("derived-schema pl1 --accept")).isTrue();
+
+        assertThat(client.derivedSchemaCalls).containsExactly("accept jwt-tok@http://node1:7900/pl1");
+        assertThat(h.sink().toString().substring(mark)).contains("accepted");
+    }
+
+    @Test
+    void aColumnMissingFromOneSideIsPrintedAsAbsentRatherThanBlank() {
+        // A blank cell reads as a value that failed to render. This is a column that is not there, which
+        // is the whole finding for one that appeared or went.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = oneStep(
+                new RemoteDerivedColumn("surcharge", null, "DECIMAL NULL", null));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("derived-schema pl1")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("surcharge").contains("-");
+    }
+
+    @Test
+    void aTargetNobodyHasDiscoveredSaysSoRatherThanReadingAsAgreement() {
+        // An unknown printed as an empty cell is indistinguishable from a target that holds none of these
+        // columns, and only one of those means "go and look" before starting.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = new DerivedSchemaOutcome.Found("pl1",
+                List.of(new RemoteDerivedStep("widen", "orders", false,
+                        List.of(new RemoteDerivedColumn("o_id", "INT64 NOT NULL", "INT64 NOT NULL", null)))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("derived-schema pl1")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("target columns unknown");
+    }
+
+    @Test
+    void derivedSchemaRefusesAnArgumentItDoesNotKnow() {
+        // A misspelt --accept must not be swallowed into a plain read reported as success: that is the
+        // same silent no-op the accept routing test guards from the other side.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.derivedSchemaOutcome = oneStep(
+                new RemoteDerivedColumn("o_id", "INT64 NOT NULL", "INT64 NOT NULL", "bigint"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("derived-schema pl1 --accpet")).isTrue();
+
+        assertThat(client.derivedSchemaCalls).isEmpty();
+    }
+
     @Test
     void statusWhileAuthenticatedRoutesToTheServerAndPrintsTheState() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
@@ -3646,7 +4752,8 @@ class ReplTest {
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("status pl1")).isTrue();
         assertThat(h.sink().toString().substring(mark)).contains("pl1").contains("running");
-        assertThat(client.statusCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
+        assertThat(client.explainCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
+        assertThat(client.statusCalls).isEmpty();
     }
 
     @Test
@@ -3656,6 +4763,8 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed",
                 "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
+        client.explainOutcome = codedFailure(
+                "pl1", "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -3676,6 +4785,8 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed",
                 "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
+        client.explainOutcome = codedFailure(
+                "pl1", "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
         SplitHarness h = onlineSplitStreamSession(Path.of("tap-work"), client);
         int outMark = h.out().toString().length();
         int errMark = h.err().toString().length();
@@ -3700,15 +4811,180 @@ class ReplTest {
         assertThat(h.sink().toString().substring(mark)).doesNotContain("engine.");
     }
 
+    /**
+     * The read prints the server's document as it arrived, unchanged. It is the thing that gets saved,
+     * edited and sent back, and the write-back is refused for every difference from what the server
+     * holds — so a rendering of our own here would be refused edits nobody made.
+     */
+    @Test
+    void positionPrintsTheServersDocumentByteForByte() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        String document = "{\"pipelineId\":\"pl1\",\"chains\":[{\"chainId\":\"shop@mysql-1\","
+                + "\"resumeFrom\":{\"token\":\"mysql-bin.000004:154\"}}]}";
+        client.positionOutcome = new PositionOutcome.Found(document,
+                List.of(new PositionOutcome.Chain("shop@mysql-1", "mysql-bin.000004:154", List.of())));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains(document);
+        assertThat(client.positionCalls).containsExactly("read jwt-tok@http://node1:7900/pl1");
+    }
+
+    @Test
+    void positionWithAFileSendsItsBytesUnchangedAndReportsWhereEachChainStands() throws Exception {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.positionOutcome = new PositionOutcome.Found("{}",
+                List.of(new PositionOutcome.Chain(
+                        "shop@mysql-1", "mysql-bin.000001:4", List.of("orders_audit"))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        Path edited = Files.createTempFile("position", ".json");
+        String document = "{\"chains\":[{\"chainId\":\"shop@mysql-1\","
+                + "\"resumeFrom\":{\"token\":\"mysql-bin.000001:4\"}}]}";
+        Files.writeString(edited, document);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1 -f " + edited)).isTrue();
+
+        assertThat(client.positionBodies).containsExactly(document);
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("position written back for pl1").contains("mysql-bin.000001:4");
+        // The other pipeline on the chain moved too, and this is the last moment anybody is told.
+        assertThat(out).contains("also read by: orders_audit");
+    }
+
+    @Test
+    void positionWriteBackKeepsSerializedTokenOnTheWireButNotInConfirmation(@TempDir Path dir)
+            throws IOException {
+        String serializedPosition = "rO0ABXNyADdpby50YXBkYXRhLmNvbm5lY3Rvci5wb3N0Z3Jlcy5jZGMub2Zmc2V0"
+                + "LlBvc3RncmVzT2Zmc2V0KScGvwPaw5wCAANMAAtvZmZzZXRWYWx1ZXQAEExqYXZhL2xhbmcvTG9uZztM"
+                + "AApzb3J0U3RyaW5ndAASTGphdmEvbGFuZy9TdHJpbmc7TAAMc291cmNlT2Zmc2V0cQB+AAJ4cHBwcA==";
+        String document = "{\"chains\":[{\"chainId\":\"shop@postgres-1\",\"resumeFrom\":{\"token\":\""
+                + serializedPosition + "\"}}]}";
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.positionOutcome = new PositionOutcome.Found("{}",
+                List.of(new PositionOutcome.Chain("shop@postgres-1", serializedPosition, List.of())));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        Path edited = dir.resolve("position.json");
+        Files.writeString(edited, document);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1 -f " + edited)).isTrue();
+
+        assertThat(client.positionBodies).containsExactly(document);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("opaque position recorded (source coordinate unavailable)")
+                .doesNotContain(serializedPosition);
+    }
+
+    @Test
+    void positionRefusesAFileItCannotRead() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1 -f no/such/file.json")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("cannot read");
+        // Nothing was sent: a write-back the caller could not have meant is not attempted.
+        assertThat(client.positionCalls).isEmpty();
+    }
+
+    @Test
+    void positionRendersACodedRefusalRatherThanReportingSuccess() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.positionOutcome = new PositionOutcome.Rejected(
+                "position.write-back-while-live", "Chain shop@mysql-1 is still being read by: orders_sync.");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("position pl1")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark))
+                .contains("position.write-back-while-live")
+                .contains("still being read by");
+    }
+
+    @Test
+    void explainRendersTheServerOwnedConclusionAndEvidence() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.explainOutcome = noMovement("pl1", 0L);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("explain pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("pl1  running")
+                .contains("kind       NO_MOVEMENT")
+                .contains("read       metrics.recordCount = 0")
+                .contains("cannot say Whether the source has changes waiting")
+                .contains("[OPEN_PIPELINE_LOGS]");
+        assertThat(client.explainCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
+        assertThat(client.statusCalls).isEmpty();
+        assertThat(client.metricsCalls).isEmpty();
+        assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void metricsHistoryPassesEveryBoundAndAliasAndPrintsTheContinuation() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.historyOutcome = new HistoryOutcome.Found(
+                "pl1", "2026-09-20T10:00:00Z", "2026-09-20T11:00:00Z",
+                "2026-09-20T10:00:00Z", "2026-09-20T11:00:00Z",
+                "2026-09-05T11:00:00Z", "PT30M", "OK", "EVENTUAL",
+                List.of(new HistoryOutcome.Segment(
+                        "2026-09-20T10:00:00Z", "2026-09-20T10:30:00Z", "WINDOW_START",
+                        List.of(new HistoryOutcome.Point(
+                                "2026-09-20T10:00:00Z", "2026-09-20T10:30:00Z",
+                                new HistoryOutcome.Rate(1_800, 1, 3), null,
+                                List.of(new HistoryOutcome.Lag(
+                                        "orders", "2026-09-20T10:29:00Z", 2, 9)))))),
+                List.of(), List.of(new HistoryOutcome.Unavailable("bytes.out", null)), "opaque-next");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("metrics pl1 --from 2026-09-20T10:00:00Z --to 2026-09-20T11:00:00Z "
+                + "--resolution 30m --limit 1 --table orders --table items --cursor opaque-current");
+
+        assertThat(client.lastHistoryRequest).isEqualTo(new HistoryRequest(
+                "2026-09-20T10:00:00Z", "2026-09-20T11:00:00Z", "PT30M", 1,
+                List.of("orders", "items"), "opaque-current"));
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("PT30M")
+                .contains("records.out=1/s")
+                .contains("lag.orders=2s max=9s")
+                .contains("unavailable bytes.out")
+                .contains("nextCursor opaque-next");
+    }
+
+    @Test
+    void metricsHistoryRequiresFromAndToAsOneCodedPair() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("metrics pl1 --from 2026-09-20T10:00:00Z");
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("control.malformed-request")
+                .contains("history requires both --from and --to");
+        assertThat(client.historyCalls).isEmpty();
+    }
+
     @Test
     void metricsWhileAuthenticatedPrintsEachStat() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 42L, "errorCount", 0L));
+        client.metricsOutcome = new MetricsOutcome.Found(
+                "pl1", Map.of("recordCount", 42L, "errors.engine.job-failed", 2L));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("recordCount").contains("42").contains("errorCount");
+        assertThat(out).contains("recordCount").contains("42")
+                .contains("errors.engine.job-failed");
         assertThat(client.metricsCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
     }
 
@@ -3743,7 +5019,7 @@ class ReplTest {
     }
 
     @Test
-    void metricsPrintsPerTableOffsetLinesAlongsideTheStats() {
+    void metricsPrintsTheTargetAckedPositionAlongsideTheStats() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found(
                 "pl1", Map.of("recordCount", 6L), Map.of("orders", "w7"));
@@ -3751,12 +5027,59 @@ class ReplTest {
         int mark = h.sink().toString().length();
         h.repl().dispatch("metrics pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("recordCount").contains("perTableOffset.orders").contains("w7");
+        assertThat(out).contains("recordCount").contains("targetAckedPosition.orders").contains("w7");
     }
 
     @Test
-    void metricsWithOnlyPerTableOffsetPrintsItRatherThanNoMetrics() {
-        // Positions-only: numeric stats empty but a per-table position is wired, so the offset prints and
+    void metricsTextDoesNotPrintSerializedPostgresOffsetsForEachTable() {
+        // An observed Postgres CDC position: Java serialization of PostgresOffset with null fields.
+        String serializedPosition = "rO0ABXNyADdpby50YXBkYXRhLmNvbm5lY3Rvci5wb3N0Z3Jlcy5jZGMub2Zmc2V0"
+                + "LlBvc3RncmVzT2Zmc2V0KScGvwPaw5wCAANMAAtvZmZzZXRWYWx1ZXQAEExqYXZhL2xhbmcvTG9uZztM"
+                + "AApzb3J0U3RyaW5ndAASTGphdmEvbGFuZy9TdHJpbmc7TAAMc291cmNlT2Zmc2V0cQB+AAJ4cHBwcA==";
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
+                Map.of("orders", serializedPosition, "accounts", serializedPosition),
+                List.of("sourceHeadPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("metrics pl1")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("recordCount  6", "sourceHeadPosition  not collected");
+        assertThat(out).containsPattern("targetAckedPosition.orders  opaque position fingerprint [0-9a-f]{16}")
+                .containsPattern("targetAckedPosition.accounts  opaque position fingerprint [0-9a-f]{16}");
+        assertThat(out).as("text metrics must not expose an opaque serialized connector object")
+                .doesNotContain(serializedPosition);
+    }
+
+    @Test
+    void metricsShowsWhenOneOpaquePositionAdvances() {
+        String firstPosition = "rO0ABXQAA29uZQ==";
+        String nextPosition = "rO0ABXQAA3R3bw==";
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", firstPosition));
+        int mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("metrics pl1")).isTrue();
+        String first = h.sink().toString().substring(mark);
+
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", nextPosition));
+        mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("metrics pl1")).isTrue();
+        String next = h.sink().toString().substring(mark);
+
+        assertThat(first).containsPattern("targetAckedPosition.orders  opaque position fingerprint [0-9a-f]{16}")
+                .doesNotContain(firstPosition, nextPosition);
+        assertThat(next).containsPattern("targetAckedPosition.orders  opaque position fingerprint [0-9a-f]{16}")
+                .doesNotContain(firstPosition, nextPosition);
+        assertThat(next).isNotEqualTo(first);
+    }
+
+    @Test
+    void metricsWithOnlyAPositionPrintsItRatherThanNoMetrics() {
+        // Positions-only: numeric stats empty but a per-table position is wired, so the position prints and
         // "no metrics" must not — it fires only when both sources are empty.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", "w7"));
@@ -3764,7 +5087,61 @@ class ReplTest {
         int mark = h.sink().toString().length();
         h.repl().dispatch("metrics pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("perTableOffset.orders").contains("w7").doesNotContain("no metrics");
+        assertThat(out).contains("targetAckedPosition.orders").contains("w7").doesNotContain("no metrics");
+        // And the disclaimer covers it. A position is not a metric, so a note about metric names printed
+        // under a face whose only name is a position would be a promise nobody made about the one line
+        // on screen.
+        assertThat(out)
+                .as("the only name printed here is the position's, and it is the one the note is about")
+                .contains("unstable");
+    }
+
+    @Test
+    void metricsNamesThePositionsNobodyRecordsInsteadOfLeavingThemOut() {
+        // The line that is printed says how far the target has confirmed writes. A reader who wanted to
+        // know whether the source had gone quiet supplies the other two from expectation unless the output
+        // says they are not measured — and then reads a stalled target as an idle source.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
+                Map.of("orders", "w7"), List.of("sourceHeadPosition", "processedPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("metrics pl1");
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("sourceHeadPosition  not collected");
+        assertThat(out).contains("processedPosition  not collected");
+        assertThat(out).contains("targetAckedPosition.orders  w7");
+    }
+
+    @Test
+    void metricsSaysARecordedPositionHasNothingYetRatherThanLeavingItOut() {
+        // "Recorded and still empty" and "not recorded at all" are one blank line apart on screen and a
+        // different problem apart in the world: the first is a run that has not landed anything yet, the
+        // second is a measurement this product does not take. Printing neither makes them the same answer.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
+                Map.of(), List.of("sourceHeadPosition", "processedPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("metrics pl1");
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("targetAckedPosition  nothing acked yet");
+        assertThat(out).contains("sourceHeadPosition  not collected");
+    }
+
+    @Test
+    void metricsWithNothingWiredAtAllNamesNoPositionAtAll() {
+        // Nothing is on screen for a name to be read as, so naming the absent positions here would be an
+        // answer about positions given to somebody the face just told it knows nothing about.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of(),
+                List.of("sourceHeadPosition", "processedPosition"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("metrics pl1");
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("no metrics");
+        assertThat(out).doesNotContain("not collected").doesNotContain("targetAckedPosition");
     }
 
     @Test
@@ -3840,6 +5217,23 @@ class ReplTest {
         assertThat(out).contains("running").contains("paused");
         assertThat(out.indexOf("running")).isLessThan(out.indexOf("paused"));
         assertThat(client.watchCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
+    }
+
+    @Test
+    void statusWatchOpensWithOneReadingAndSaysARateFollows() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.watchStates = List.of("RUNNING");
+        client.metricsOutcome = moved(java.time.Instant.parse("2026-09-17T10:00:00Z"), 300, 3);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("status pl1 --watch")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        // One reading is what a watch has when it opens, and it says so rather than printing nought.
+        assertThat(out).contains("pl1  moving  not known yet -- one reading; a rate follows in 5s");
+        assertThat(out).contains("pl1  running");
+        assertThat(out).doesNotContain("rows/s");
     }
 
     @Test
@@ -4034,7 +5428,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(
                 URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", "kind: source\n"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
         h.repl().dispatch("connect localhost:7900,localhost:7901");
         h.repl().dispatch("login alice");
@@ -4054,7 +5448,7 @@ class ReplTest {
     void anOnlineVerbWithNoReachableMemberLosesTheConnectionAndReportsItOnce() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
         client.loginOutcome = new LoginOutcome.Success("jwt-tok");
-        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("x", "source", "kind: source\n"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("x", "source", "version: tapstate/v1\nkind: source\n"));
         Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
         h.repl().dispatch("connect localhost:7900");
         h.repl().dispatch("login alice");
@@ -4074,7 +5468,7 @@ class ReplTest {
     void aSuccessfulOnlineVerbYieldsSuccess() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("src_kfk", "source", "kind: source\nid: src_kfk\n"));
+                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         h.repl().dispatch("get src_kfk");
         assertThat(h.repl().lastExitCode()).isZero();
@@ -5189,5 +6583,284 @@ class ReplTest {
                         + "over the wire, which is the cost the filter exists to cut")
                 .anySatisfy(call -> assertThat(call).contains("tail views.order_state")
                         .contains("status").contains("Paid"));
+    }
+
+    // --- a stop that clears asks first, and says in the same breath what "clear" takes ------------
+
+    /**
+     * Every kind of state the product declares, as the labels a surface speaks from. Read rather than
+     * written out, so a component that starts holding state widens this assertion by being declared --
+     * which is the property the list has to have to be worth printing at all.
+     */
+    private static String[] everyKindOfStateAPipelineHolds() {
+        return PipelineStateInventory.vocabulary().stream()
+                .map(PipelineStateHolding::label)
+                .toArray(String[]::new);
+    }
+
+    @Test
+    void stopAtATerminalListsWhatItWouldTakeAndTakesNothingWhenTheAnswerIsNo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("no");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("stop pl1");
+
+        // Nothing reached the server: a stop that was declined has to be a stop that did not happen,
+        // and the pipeline is still running.
+        assertThat(client.lifecycleCalls).isEmpty();
+        String output = h.sink().toString().substring(mark);
+        // The confirmation is only worth asking if it says what is at stake, item by item. A prompt that
+        // says "are you sure?" and nothing else trains its reader to answer yes without reading.
+        assertThat(output).contains(everyKindOfStateAPipelineHolds());
+        assertThat(output).contains(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
+        // Reporting success for a thing that did not happen is how a script concludes the opposite.
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void stopAtATerminalClearsOnceTheAnswerIsYes() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter("yes"));
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("stop pl1");
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=true");
+        assertThat(h.repl().lastExitCode()).isZero();
+    }
+
+    @Test
+    void stopWithNoTerminalRefusesAndSaysWhichWayOutIsWhich() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("stop pl1");
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        // The half that matters most and shows least: a script, a CI job or a container step has nothing
+        // on its input, so a question here waits until something times it out -- and a hung run and a
+        // slow one are the same thing from outside.
+        assertThat(prompter.questions).isEmpty();
+        String output = h.sink().toString().substring(mark);
+        assertThat(output).contains("cli.confirmation-needs-a-terminal");
+        // Refusing is only useful if it names both ways on: go ahead unasked, or stop without clearing.
+        assertThat(output).contains("-y").contains("--keep-state");
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void stopWithTheNonInteractiveFlagClearsWithoutAsking() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("stop pl1 -y");
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=true");
+        assertThat(prompter.questions).isEmpty();
+    }
+
+    @Test
+    void restartRerunAtATerminalAsksFirstAndAnsweringNoStartsNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("no");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        // Neither half of the sequence ran. A declined re-run that stopped the pipeline anyway would be
+        // the worst of the three outcomes: down, and not re-reading either.
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.sink().toString().substring(mark)).contains(everyKindOfStateAPipelineHolds());
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void restartRerunWithNoTerminalRefusesAndNeitherStopsNorStarts() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(prompter.questions).isEmpty();
+    }
+
+    @Test
+    void restartRerunWithTheNonInteractiveFlagRunsTheWholeSequence() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --rerun -y");
+
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true",
+                "jwt-tok@http://node1:7900 start pl1");
+        assertThat(prompter.questions).isEmpty();
+    }
+
+    @Test
+    void stopKeepingStateNeitherAsksNorNeedsATerminalAndStillListsWhatItHoldsOnTo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("stop pl1 --keep-state");
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+        // Nothing destructive happens, so there is nothing to confirm -- which is what makes this the
+        // spelling a script reaches for.
+        assertThat(prompter.questions).isEmpty();
+        String output = h.sink().toString().substring(mark);
+        // The list is the case. Not printing it leaves a command that succeeds, exits zero and stops the
+        // pipeline exactly as it does now -- indistinguishable from this one unless somebody is watching
+        // the terminal, which is the reader this line exists for.
+        assertThat(output).contains(everyKindOfStateAPipelineHolds());
+        assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
+        // The one sentence that turns on the answer: saying it here would promise a re-read that is not
+        // going to happen, and this is the path whose whole point is that it does not.
+        assertThat(output).doesNotContain(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        assertThat(h.repl().lastExitCode()).isZero();
+    }
+
+    @Test
+    void stopKeepingStateStillKeepsWhenTheNonInteractiveFlagIsGivenAsWell() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("stop pl1 --keep-state -y");
+
+        // The two flags say orthogonal things -- one "do not ask me", the other "do not clear" -- and a
+        // reading that let the first widen the second would give the pair a meaning opposite to each.
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+    }
+
+    @Test
+    void theVerbsThatClearNothingAskNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("start pl1");
+        h.repl().dispatch("pause pl1");
+        h.repl().dispatch("resume pl1");
+        // A plain restart of a failed run stops it keeping everything, then starts it: a stop on the
+        // wire, and nothing a confirmation is for. Confirming here is how a reader learns to answer
+        // yes without reading, which costs exactly the one prompt that mattered.
+        h.repl().dispatch("restart pl1");
+
+        assertThat(prompter.questions).isEmpty();
+        assertThat(client.lifecycleCalls).contains("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+    }
+
+    @Test
+    void aOneShotStopAtATerminalAsksBeforeItClears() {
+        // The second face. Both faces reach the same dispatch, but only one of them is the one a person
+        // types into, and a guard that lived in the read loop would leave this one clearing unasked.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("no");
+        LaunchOptions launch =
+                LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "stop", "pl1")
+                        .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
+
+        int code = Cli.runSession(launch, client, () -> prompter, () -> true);
+
+        // Asked, and the answer is what stopped it. Without this the case passes on a run that never
+        // reached the question at all -- the same empty call list, the same non-zero code.
+        assertThat(prompter.questions).isNotEmpty();
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(code).isNotZero();
+    }
+
+    @Test
+    void aOneShotStopWithNoTerminalRefusesRatherThanClearing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        LaunchOptions launch =
+                LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "stop", "pl1")
+                        .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
+
+        int code = Cli.runSession(launch, client, () -> prompter, () -> false);
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(prompter.questions).isEmpty();
+        assertThat(code).isNotZero();
+    }
+
+    @Test
+    void aOneShotStopKeepingStateAlsoListsWhatItHoldsOnTo() {
+        // The keeping spelling on the second face, and the list with it. Half a gate is the failure
+        // this pair is written against: the two faces are the same words to whoever types them, and a
+        // list that only one of them prints is one a reader cannot rely on having seen.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        StringWriter sink = new StringWriter();
+        Repl repl = replWritingTo(sink, client);
+        repl.terminalCheck(() -> false);
+        repl.signIn("localhost:7900", "admin", () -> "pw", true);
+        int mark = sink.toString().length();
+
+        repl.dispatch("stop pl1 --keep-state");
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://localhost:7900 stop pl1 purgeState=false");
+        String output = sink.toString().substring(mark);
+        assertThat(output).contains(everyKindOfStateAPipelineHolds());
+        assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
+        assertThat(output).doesNotContain(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+    }
+
+    @Test
+    void aOneShotStopClearsWhenItWasToldNotToAsk() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://localhost:7900"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        LaunchOptions launch =
+                LaunchOptions.parse("-c", "localhost:7900", "-u", "admin", "stop", "pl1", "-y")
+                        .withEnv(name -> "TAPSTATE_PASSWORD".equals(name) ? "pw" : null);
+
+        int code = Cli.runSession(launch, client, ScriptedPrompter::new, () -> false);
+
+        assertThat(client.lifecycleCalls)
+                .containsExactly("jwt-tok@http://localhost:7900 stop pl1 purgeState=true");
+        assertThat(code).isZero();
     }
 }

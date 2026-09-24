@@ -5,9 +5,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -19,6 +21,7 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
+import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import java.util.LinkedHashMap;
@@ -71,10 +74,10 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         // turns overwriting the same document.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders"), TableRef.literal("invoices")), null, null, null));
+                List.of(TableRef.literal("orders"), TableRef.literal("invoices")), null, null));
         artifacts.save(managedStore());
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("src"), "id", null, null),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("src"), "id", null),
                 null, settings(), null));
 
         assertThatThrownBy(() -> dagFor(artifacts))
@@ -90,12 +93,12 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         // database the deployment does not own - silently, because the id resolved fine.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders")), null, null, null));
+                List.of(TableRef.literal("orders")), null, null));
         artifacts.save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "mysql",
                 Map.of("host", "the-users-own-warehouse"), SourceMode.CDC,
-                List.of(TableRef.literal("facts")), null, null, null));
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null, null),
+                List.of(TableRef.literal("facts")), null, null));
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
                 null, settings(), null));
 
         assertThatThrownBy(() -> dagFor(artifacts))
@@ -114,15 +117,15 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
     }
 
     @Test
-    void a_view_keyed_off_a_column_that_is_not_the_discovered_tables_key_is_refused() {
-        // The same collapse as the nest case, in the shape the gate did not cover: one table, its key
-        // discovered as id, the view upserting - and uniquely indexing - a column rows can share.
+    void a_view_keyed_off_a_column_without_a_unique_source_identity_is_refused() {
+        // The same collapse as the nest case, in the shape the gate must also cover: one table, its key
+        // discovered as id, the view upserting - and uniquely indexing - a customer value rows can share.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders")), null, null, null));
+                List.of(TableRef.literal("orders")), null, null));
         artifacts.save(managedStore());
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null),
                 null, settings(), null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
@@ -136,16 +139,153 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
     }
 
     @Test
+    void a_nonmatching_key_is_refused_against_the_only_discovered_unique_identity() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(managedStore());
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null),
+                null, settings(), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
+                new SourceTable("orders",
+                        List.of(new SourceField("email", "string"), new SourceField("customer", "string")),
+                        List.of(), List.of(new SourceIndex("email_unique", List.of("email"), true)))))));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(code("actuation.view-key-not-feed-identity"))
+                .satisfies(error -> Assertions.assertThat(((TapstateException) error).args())
+                        .containsEntry("identity", "email"));
+    }
+
+    @Test
+    void an_explicit_view_key_can_select_a_different_discovered_unique_identity() {
+        // Discovery's primary key remains a default, not an override. The explicit customer key is
+        // accepted because discovery records that its current value identifies one source row; the
+        // materialized view's writer separately requires that alternate key in CDC before images.
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(managedStore());
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null),
+                null, settings(), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
+                new SourceTable("orders",
+                        List.of(new SourceField("id", "int"), new SourceField("customer", "string")),
+                        List.of("id"), List.of(new SourceIndex("__t__{\"v\": 2, "
+                                + "\"key\": {\"customer\": 1}, \"name\": \"customer_unique\", "
+                                + "\"unique\": true}", List.of("customer"), true)))))));
+
+        Assertions.assertThatCode(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void a_qualified_unique_index_cannot_be_selected_as_the_view_identity() {
+        for (String descriptor : List.of(
+                "__t__{\"v\": 2, \"key\": {\"email\": 1}, \"name\": \"email_sparse\", "
+                        + "\"unique\": true, \"sparse\": true}",
+                "__t__{\"v\": 2, \"key\": {\"email\": 1}, \"name\": \"active_email\", "
+                        + "\"unique\": true, \"partialFilterExpression\": {\"active\": true}}")) {
+            InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+            artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
+                    List.of(TableRef.literal("orders")), null, null));
+            artifacts.save(managedStore());
+            artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                    new ViewBlock.Inline("order_state", FromRef.literal("orders"), "email", null),
+                    null, settings(), null));
+            InMemoryStorePort store = new InMemoryStorePort(artifacts);
+            store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
+                    new SourceTable("orders",
+                            List.of(new SourceField("_id", "objectId"), new SourceField("email", "string")),
+                            List.of("_id"), List.of(new SourceIndex(descriptor, List.of("email"), true)))))));
+
+            assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                    .as(descriptor)
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(code("actuation.view-key-not-feed-identity"));
+        }
+    }
+
+    @Test
+    void a_unique_index_nothing_proved_cannot_be_selected_as_the_view_identity() {
+        // The shape every discovery but one reports: a unique bit and no word on which rows it covers.
+        // A partial unique index in postgres arrives exactly like this - indisunique with no indpred -
+        // so two rows outside the predicate share the value, and the view would upsert both onto one
+        // document. Unprovable here means refused here, and the discovered primary key is what is left.
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(managedStore());
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "email", null),
+                null, settings(), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
+                new SourceTable("orders",
+                        List.of(new SourceField("id", "int"), new SourceField("email", "string")),
+                        List.of("id"), List.of(new SourceIndex("uk_active_email", List.of("email"), true)))))));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(code("actuation.view-key-not-feed-identity"))
+                .satisfies(error -> Assertions.assertThat(((TapstateException) error).args())
+                        .containsEntry("identity", "id"));
+    }
+
+    @Test
+    void a_view_key_overwritten_after_its_unique_source_identity_is_refused() {
+        InMemoryStorePort store = mappedUniqueEmail("email", FieldRule.literal("same"));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(code("actuation.view-key-not-feed-identity"));
+    }
+
+    @Test
+    void a_unique_view_key_left_unchanged_by_a_transform_is_still_accepted() {
+        InMemoryStorePort store = mappedUniqueEmail("status", FieldRule.literal("ready"));
+
+        Assertions.assertThatCode(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .doesNotThrowAnyException();
+    }
+
+    private static InMemoryStorePort mappedUniqueEmail(String output, FieldRule rule) {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(managedStore());
+        Step mapFields = Step.inline("replace_email", FromClause.list(FromRef.literal("orders")),
+                new TransformBody.MapProjection(Map.of(output, rule)), null);
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)),
+                List.of(mapFields),
+                new ViewBlock.Inline("order_state", FromRef.literal("replace_email"), "email", null),
+                null, settings(), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel("src", "fake", 0L, new SourceModel(List.of(
+                new SourceTable("orders",
+                        List.of(new SourceField("id", "int"), new SourceField("email", "string")),
+                        List.of("id"), List.of(new SourceIndex("__t__{\"v\": 2, "
+                                + "\"key\": {\"email\": 1}, \"name\": \"email_unique\", "
+                                + "\"unique\": true}", List.of("email"), true)))))));
+        return store;
+    }
+
+    @Test
     void a_view_over_an_undiscovered_table_keeps_its_own_key_because_no_identity_is_known() {
         // The undiscovered path stays permissive on purpose: the view names its own key precisely so
         // that materialization does not wait on a discovery, and with no identity on record there is
         // nothing to hold the key against.
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders")), null, null, null));
+                List.of(TableRef.literal("orders")), null, null));
         artifacts.save(managedStore());
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src"), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null, null),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "customer", null),
                 null, settings(), null));
 
         Assertions.assertThatCode(() -> dagFor(artifacts)).doesNotThrowAnyException();
@@ -169,9 +309,9 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
     private static InMemoryArtifactStore nestWorkspace(List<String> rootKey, String viewKey) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src_orders", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("orders")), null, null, null));
+                List.of(TableRef.literal("orders")), null, null));
         artifacts.save(new SourceResource("src_items", null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal("order_items")), null, null, null));
+                List.of(TableRef.literal("order_items")), null, null));
         artifacts.save(managedStore());
 
         // The embed targets the root key exactly, so the nest's own compile gate passes and the
@@ -187,18 +327,18 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("o", FromRef.literal("orders"));
         aliases.put("i", FromRef.literal("order_items"));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
 
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of("src_orders", "src_items"),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec("src_orders", true), SourceRef.spec("src_items", true)),
                 List.of(step),
-                new ViewBlock.Inline("order_state", FromRef.literal(STEP), viewKey, null, null),
+                new ViewBlock.Inline("order_state", FromRef.literal(STEP), viewKey, null),
                 null, settings(), null));
         return artifacts;
     }
 
     private static SourceResource managedStore() {
         return new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "fake",
-                Map.of("host", "d"), null, null, null, null, null);
+                Map.of("host", "d"), null, null, null, null);
     }
 
     private static Settings settings() {

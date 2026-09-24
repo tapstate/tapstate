@@ -1,6 +1,7 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -14,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
@@ -32,6 +34,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li><b>Golden</b>: each resource's canonical text is pinned byte-for-byte to a checked-in golden
  *       file. The canonical form is a long-term compatibility promise, so a diff here is a real
  *       behavior change: regenerate with {@code -Dtapstate.golden.update=true}, then review the diff.</li>
+ *   <li><b>Structured tree</b>: the same corpus survives the other serialization —
+ *       {@code fromTree(tree(r)) == r} — which is what lets the store hold a resource as a document
+ *       and read it back without parsing any text. The two directions share one binder, so this is a
+ *       round trip through a different carrier rather than through a second mapping.</li>
  * </ul>
  *
  * <p>Golden files live outside {@code corpus/} on purpose: the workspace loader walks every
@@ -68,6 +74,85 @@ class CanonicalRoundTripTest {
         assertThat(Files.readString(golden)).isEqualTo(canonical);
     }
 
+    @ParameterizedTest(name = "{0}/{1}")
+    @MethodSource("canonicalResources")
+    void theStructuredTreeBindsBackToTheSameResource(String scenario, String id, String canonical) {
+        Resource fromText = parser.parse(canonical);
+
+        Resource fromTree = parser.fromTree(writer.tree(fromText));
+
+        assertThat(fromTree).isEqualTo(fromText);
+    }
+
+    @ParameterizedTest(name = "{0}/{1}")
+    @MethodSource("canonicalResources")
+    void theStructuredTreeKeepsTheCanonicalKeyOrder(String scenario, String id, String canonical) {
+        // Key order in the tree is the key order in the text, because both come off the same render
+        // tree. It matters at the far end: the tree is what a document store keeps, and fields that
+        // shuffle between two writes of the same resource make every diff of the stored form noise.
+        List<String> inText = canonical.lines()
+                .filter(line -> !line.isBlank() && !Character.isWhitespace(line.charAt(0)) && line.charAt(0) != '-')
+                .map(line -> line.substring(0, line.indexOf(':')))
+                .toList();
+
+        assertThat(List.copyOf(writer.tree(parser.parse(canonical)).keySet())).isEqualTo(inText);
+    }
+
+    @ParameterizedTest(name = "{0}/{1}")
+    @MethodSource("canonicalResources")
+    void theStructuredTreeIsMadeOfPlainValuesOnly(String scenario, String id, String canonical) {
+        // The tree is handed to a document store, which can encode plain values and nothing else. A
+        // render node that leaked into it would compile, pass the round trip above (the binder would
+        // read it straight back), and fail only at the storage boundary in another module.
+        assertOnlyPlainValues(writer.tree(parser.parse(canonical)), "");
+    }
+
+    private static void assertOnlyPlainValues(Object value, String path) {
+        switch (value) {
+            case null -> { }
+            case Map<?, ?> map -> map.forEach((k, v) -> {
+                assertThat(k).as("key at %s", path).isInstanceOf(String.class);
+                assertOnlyPlainValues(v, path.isEmpty() ? String.valueOf(k) : path + "." + k);
+            });
+            case List<?> list -> {
+                for (int i = 0; i < list.size(); i++) {
+                    assertOnlyPlainValues(list.get(i), path + "[" + i + "]");
+                }
+            }
+            default -> assertThat(value)
+                    .as("value at %s", path.isEmpty() ? "(root)" : path)
+                    .isInstanceOfAny(String.class, Integer.class, Long.class, Double.class, Boolean.class);
+        }
+    }
+
+    @Test
+    void everyResourceHashesToItsGolden() throws IOException {
+        // The canonical text is pinned above; this pins what the text does not show. The content hash is
+        // taken over the structure, so a change to how that structure is encoded moves every stored
+        // resource's identity while leaving every canonical byte where it was -- invisible to every
+        // other assertion in this file, and to every caller until preconditions start being refused.
+        StringBuilder actual = new StringBuilder();
+        List<String> lines = new ArrayList<>();
+        for (Path dir : scenarioDirs()) {
+            String scenario = dir.getFileName().toString();
+            for (Resource r : WorkspaceLoader.load(dir).resources()) {
+                lines.add(scenario + "/" + r.id() + " " + CanonicalHash.of(r));
+            }
+        }
+        lines.stream().sorted().forEach(line -> actual.append(line).append('\n'));
+
+        Path golden = GOLDEN.getParent().resolve("content-hash.golden");
+        if (UPDATE) {
+            Files.createDirectories(golden.getParent());
+            Files.writeString(golden, actual.toString());
+            return;
+        }
+        assertThat(Files.exists(golden))
+                .as("golden %s missing -- regenerate with -Dtapstate.golden.update=true", golden)
+                .isTrue();
+        assertThat(Files.readString(golden)).isEqualTo(actual.toString());
+    }
+
     @Test
     void everyGoldenIsClaimedByACorpusResource() throws IOException {
         // Symmetric counterpart to the per-resource golden assertion above. That assertion forces
@@ -100,6 +185,43 @@ class CanonicalRoundTripTest {
         assertThat(UPDATE)
                 .as("tapstate.golden.update must not be set during a normal run — it rewrites goldens and masks regressions")
                 .isFalse();
+    }
+
+    /**
+     * A source reference written as an object but carrying no srs switch says exactly what the bare id
+     * says, so it canonicalizes to the bare id -- one state, one spelling.
+     *
+     * <p>Leaving both spellings alive would let the same pipeline canonicalize two ways, and the switch
+     * is registered as never-omitted precisely because reading it back as absent means "take the
+     * source's value" -- the link the field exists to cut. An object with the key absent must therefore
+     * not survive into canonical output as an object.
+     *
+     * <p><b>Known divergence, deliberately pinned here rather than left implicit:</b> the generated JSON
+     * schema marks both keys required on the object form, so an editor flags this input while the parser
+     * accepts it. The parser is the permissive side, so nothing schema-valid is refused; which of the two
+     * should move is an authoring-surface question, not one this test decides. It exists so the answer is
+     * chosen rather than discovered.
+     */
+    @Test
+    void aSourceObjectCarryingNoSwitchCanonicalizesToTheBareId() {
+        String raw = """
+                version: tapstate/v1
+                kind: pipeline
+                id: pl_a
+                source:
+                  - { id: src_a }
+                view:
+                  id: pl_a
+                  from: orders
+                  primary_key: id
+                  storage: { warm: { collection: pl_a } }
+                """;
+
+        String canonical = writer.write(parser.parse(raw));
+
+        assertThat(canonical).contains("source: src_a");
+        assertThat(canonical).doesNotContain("srs:");
+        assertThat(writer.write(parser.parse(canonical))).isEqualTo(canonical);
     }
 
     @Test

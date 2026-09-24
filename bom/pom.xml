@@ -59,6 +59,16 @@
          also manages these, so all four are pinned here to a single version aligned with the platform's
          managed Mongo line; the stack moves as a unit and cannot skew. -->
     <mongodb.driver.version>5.8.0</mongodb.driver.version>
+    <!-- Calcite: the SQL parser / validator / type deriver behind join declarations. Parsing
+         only, never execution, and core-sql is the only consumer (rule R1). calcite-core's own
+         25 declared dependencies are excluded there and the reachable ones are pinned here, so
+         an upgrade that reintroduces one of the excluded (a runtime Java compiler, a JDBC pool,
+         a geospatial stack) fails the ring gate instead of widening the core ring quietly.
+         avatica and commons-math3 are not optional extras: both are reached from static
+         initializers on the parse/validate path rather than from any call this repo writes. -->
+    <calcite.version>1.35.0</calcite.version>
+    <calcite.avatica.version>1.23.0</calcite.avatica.version>
+    <commons.math3.version>3.6.1</commons.math3.version>
     <!-- Hazelcast: the distributed-coordination substrate and the Jet execution engine (Jet ships
          inside the core artifact). The official Maven Central artifact is used as-is — it is pure
          Apache-2.0 (the HCL-licensed pieces live in separate artifacts, which are banned by the
@@ -78,7 +88,7 @@
     <!-- PDK API: the frozen connector contract surface (TapConnector / TapEvent / ConnectorFunctions
          and the tapdata-api entity types they reference). It is the single shared layer the isolated
          connector class loaders delegate to, so every connector binds to the same contract types; rule
-         R3 locks it to adapter-pdk. This small contract tree is managed here as one snapshot line. The
+         R3 locks it to adapter-pdk. The contract and its compatible entity companion are managed here. The
          connector plugin jars load at runtime inside per-connector class loaders and never reach the host
          classpath. The PDK runtime (TapRuntime and its transitive libraries) is the deliberate exception:
          the assembly root carries it on the host classpath at runtime scope, so a real connector's base
@@ -96,6 +106,8 @@
          with the resolver). The contract (tapdata-api) and its error-code libraries carry a different
          base version, so both are set. -->
     <pdk-api.version>2.0.8-SNAPSHOT</pdk-api.version>
+    <!-- The compatible entity companion adds the DDL warning event used by Oracle sources. -->
+    <pdk-entity.version>2.0.9-SNAPSHOT</pdk-entity.version>
     <pdk-errorcode.version>2.8-SNAPSHOT</pdk-errorcode.version>
     <!-- The PDK runtime (pdk-runner): a connector base class bootstraps TapRuntime through the host
          loader at construction, so the assembly root carries this on its runtime classpath. A separate
@@ -113,6 +125,20 @@
     <junit.version>5.11.4</junit.version>
     <assertj.version>3.26.3</assertj.version>
     <archunit.version>1.3.0</archunit.version>
+    <!-- OpenTelemetry: the metrics SDK, its OTLP exporter and its Prometheus reader. One property, so
+         the alpha BOM (the Prometheus reader has not reached a stable line) rides the same number. -->
+    <opentelemetry.version>1.66.0</opentelemetry.version>
+    <!-- The Prometheus client the OpenTelemetry Prometheus reader is built on. Spring Boot manages an
+         older line of it; the reader needs this one, so it is pinned beside the SDK it serves. -->
+    <prometheus.client.version>1.8.0</prometheus.client.version>
+    <!-- The Prometheus client above requires this protobuf line; Spring Boot manages the one before it.
+         Pinned ahead of the Boot import so one version resolves for every path that reaches it. Both
+         halves are pinned, and that is the point rather than symmetry: Boot manages them together
+         through the protobuf BOM, so pinning protobuf-java alone would move it while leaving
+         protobuf-javalite on Boot's number. The CEL expression engine brings both, and the two ship the
+         same com.google.protobuf packages: one classpath, two versions of one project, in a module that
+         has nothing to do with metrics export. -->
+    <protobuf.java.version>4.35.0</protobuf.java.version>
   </properties>
 
   <dependencyManagement>
@@ -138,10 +164,66 @@
         <type>pom</type>
         <scope>import</scope>
       </dependency>
+      <!-- OpenTelemetry, pinned here rather than taken from the Spring Boot BOM imported below: the
+           metrics exporter is written against the SDK's public data interfaces, and the Prometheus
+           reader is an alpha artifact whose version must match the SDK's exactly. Declared before the
+           Boot import so this pin wins for every io.opentelemetry artifact; Maven keeps the first
+           managed version it meets. Only adapter-otel may depend on any of it (rule R3). -->
+      <dependency>
+        <groupId>io.opentelemetry</groupId>
+        <artifactId>opentelemetry-bom</artifactId>
+        <version>${opentelemetry.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>io.opentelemetry</groupId>
+        <artifactId>opentelemetry-bom-alpha</artifactId>
+        <version>${opentelemetry.version}-alpha</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>io.prometheus</groupId>
+        <artifactId>prometheus-metrics-bom</artifactId>
+        <version>${prometheus.client.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-javalite</artifactId>
+        <version>${protobuf.java.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-java</artifactId>
+        <version>${protobuf.java.version}</version>
+      </dependency>
       <dependency>
         <groupId>org.yaml</groupId>
         <artifactId>snakeyaml</artifactId>
         <version>${snakeyaml.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.calcite</groupId>
+        <artifactId>calcite-core</artifactId>
+        <version>${calcite.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.calcite</groupId>
+        <artifactId>calcite-linq4j</artifactId>
+        <version>${calcite.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.calcite.avatica</groupId>
+        <artifactId>avatica-core</artifactId>
+        <version>${calcite.avatica.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-math3</artifactId>
+        <version>${commons.math3.version}</version>
       </dependency>
       <!-- CEL (Common Expression Language): the §12 ② row-expression layer. Used by core-dsl
            to compile + type-check filter / computed expressions at validate time (never to
@@ -269,8 +351,8 @@
       </dependency>
       <!-- PDK API contract, locked to adapter-pdk by rule R3. Only the small contract tree is managed
            into the reactor (tapdata-pdk-api + the tapdata-api entity types it exposes + the error-code
-           libraries they pull); the transitive io.tapdata versions are managed explicitly so the whole
-           contract tree tracks one snapshot line together. The connector plugins load in isolation at
+           libraries they pull); the transitive io.tapdata versions are managed explicitly against the
+           compatible API and entity baselines. The connector plugins load in isolation at
            runtime and are deliberately NOT managed here. The PDK runtime (pdk-runner) IS managed here so
            its version is single-sourced: the assembly root carries it at runtime scope, where a real
            connector's base class bootstraps the runtime through the host loader, and adapter-pdk pulls it
@@ -286,7 +368,7 @@
       <dependency>
         <groupId>io.tapdata</groupId>
         <artifactId>tapdata-api</artifactId>
-        <version>${pdk-api.version}</version>
+        <version>${pdk-entity.version}</version>
       </dependency>
       <dependency>
         <groupId>io.tapdata</groupId>

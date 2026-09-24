@@ -1,4 +1,3 @@
 rule: mode-mismatch
-adr: "ADR-0016 §1/§4"
 path: settings.read_mode
 note: "read_mode: snapshot_only over a pure stream source; an unbounded stream has no one-shot read"

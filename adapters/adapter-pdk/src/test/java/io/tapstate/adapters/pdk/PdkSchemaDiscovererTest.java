@@ -7,6 +7,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.SchemaDiscoverer;
+import io.tapdata.entity.schema.type.TapRaw;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
@@ -44,6 +45,43 @@ class PdkSchemaDiscovererTest {
     }
 
     @Test
+    void boundedStringSurvivesDiscoveryAndTargetReconstruction() throws Exception {
+        var declared = new io.tapdata.entity.schema.type.TapString().bytes(36L).fixed(false)
+                .doubleBytes(true).defaultValue(1L).byteRatio(2);
+        var field = PdkSchemaDiscoverer.class.getDeclaredMethod("field", String.class, String.class,
+                io.tapdata.entity.schema.type.TapType.class);
+        field.setAccessible(true);
+        SourceField normalized = (SourceField) field.invoke(null, "id", "varchar(36)", declared);
+        var table = TargetTapTable.build(new io.tapstate.spi.sink.TargetTable("orders", List.of(
+                new io.tapstate.spi.sink.TargetField(normalized.name(), normalized.dataType(), true,
+                        normalized.type(), normalized.numericType(), normalized.stringType()))));
+        var restored = (io.tapdata.entity.schema.type.TapString) table.getNameFieldMap().get("id").getTapType();
+        assertThat(restored.getBytes()).isEqualTo(36L);
+        assertThat(restored.getFixed()).isFalse();
+        assertThat(restored.getDoubleBytes()).isTrue();
+        assertThat(restored.getDefaultValue()).isEqualTo(1L);
+        assertThat(restored.getByteRatio()).isEqualTo(2);
+        declared.bytes(1000L);
+        assertThat(normalized.stringType().bytes()).isEqualTo(36L);
+        assertThat(table.primaryKeys()).containsExactly("id");
+    }
+
+    @Test
+    void normalizationRetainsAllDeclaredNumericAttributes() throws Exception {
+        var declared = new io.tapdata.entity.schema.type.TapNumber().bit(128).fixed(true).unsigned(false).zerofill(true)
+                .precision(18).scale(4).minValue(new java.math.BigDecimal("-99999999999999.9999"))
+                .maxValue(new java.math.BigDecimal("99999999999999.9999"));
+        var field = PdkSchemaDiscoverer.class.getDeclaredMethod("field", String.class, String.class,
+                io.tapdata.entity.schema.type.TapType.class);
+        field.setAccessible(true);
+        SourceField normalized = (SourceField) field.invoke(null, "amount", "DECIMAL(18,4)", declared);
+        assertThat(normalized.numericType()).isEqualTo(PdkTypeMapping.numericType(declared));
+        declared.scale(0).maxValue(java.math.BigDecimal.ONE);
+        assertThat(normalized.numericType().scale()).isEqualTo(4);
+        assertThat(normalized.numericType().maxValue()).isEqualByComparingTo("99999999999999.9999");
+    }
+
+    @Test
     void discoversTablesWithTheirFieldsInOrder(@TempDir Path dir) {
         SchemaDiscoverer discoverer = discoverer(Synthetic.discoverableSource(dir), "synthetic.Discoverable");
 
@@ -74,6 +112,49 @@ class PdkSchemaDiscovererTest {
         assertThat(model.tables().get(0).fields())
                 .extracting(SourceField::type)
                 .containsExactly(TapstateType.INT64, TapstateType.DECIMAL);
+    }
+
+    @Test
+    void discoveredDecimalRetainsItsPrecisionAndScale(@TempDir Path dir) {
+        String spec = """
+                {"dataTypes": {"int": {"to": "TapNumber", "bit": 32},
+                  "decimal": {"to": "TapNumber", "fixed": true, "precision": 18, "scale": 4,
+                              "minValue": "-99999999999999.9999", "maxValue": "99999999999999.9999"}}}
+                """;
+        ConnectorRef ref = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)),
+                "synthetic.Discoverable", "2.0.8", null, spec);
+        SourceField amount = new PdkSchemaDiscoverer(id -> ref).discover(config()).tables().getFirst().fields().get(1);
+        assertThat(amount.numericType()).isNotNull();
+        assertThat(amount.numericType().precision()).isEqualTo(18);
+        assertThat(amount.numericType().scale()).isEqualTo(4);
+    }
+
+    /** A spec that declares one of the two columns, so the other reaches the mapping unresolved. */
+    private static final String PARTIAL_SPEC = """
+            {"dataTypes": {"int": {"to": "TapNumber", "bit": 32}}}""";
+
+    @Test
+    void carriesTheMappingsOwnAttributionForAColumnThatResolvedToNothing(@TempDir Path dir) {
+        // The connector is open exactly here and nowhere after, so which unknown a column is has to
+        // leave with it. A discoverer that answered with a remark of its own instead - "the type did not
+        // resolve" - would be discarding the only fact that says whether the mapping is short a case,
+        // and the connector it came from cannot be asked again.
+        ConnectorRef ref = new ConnectorRef(
+                List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null,
+                PARTIAL_SPEC);
+        SchemaDiscoverer discoverer = new PdkSchemaDiscoverer(connectorId -> ref);
+
+        SourceModel model = discoverer.discover(config());
+
+        SourceField unresolved = model.tables().get(0).fields().get(1);
+        assertThat(unresolved.type()).isEqualTo(TapstateType.UNKNOWN);
+        assertThat(unresolved.unknownBecause())
+                .as("the attribution is the mapping's own, not a restatement made after the fact")
+                .isEqualTo(PdkTypeMapping.resolve(new TapRaw()).unknownBecause())
+                .contains("TapRaw");
+        assertThat(model.tables().get(0).fields().get(0).unknownBecause())
+                .as("a column that did resolve is attributed to nothing")
+                .isNull();
     }
 
     @Test

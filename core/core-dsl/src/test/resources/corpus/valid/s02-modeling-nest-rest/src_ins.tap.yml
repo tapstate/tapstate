@@ -1,4 +1,4 @@
-# ADR-0016 §14.2 — Oracle -> SRS -> transforms -> nest -> view -> REST (end-to-end modeling).
+# §14.2 — Oracle -> SRS -> transforms -> nest -> view -> REST (end-to-end modeling).
 # Owns the SRS; shared by every pipeline that references it (also s03 narrative).
 version: tapstate/v1
 kind: source

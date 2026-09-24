@@ -3,9 +3,11 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.ArtifactDraft;
 import io.tapstate.control.core.ArtifactValidationResult;
 import io.tapstate.control.core.AuditGate;
+import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ValidationDiagnostic;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
@@ -54,6 +56,15 @@ class TheAssembledApplyServiceSizesNestsTest {
             tables: [ customers, orders, lines ]
             """;
 
+    /** The write target: this release installs a sync only onto the mongodb connector. */
+    private static final String TARGET = """
+            version: tapstate/v1
+            kind: source
+            id: tgt_mg
+            connector: mongodb
+            config: { uri: "mongodb://10.30.0.11:27017/ods" }
+            """;
+
     private static final String PIPELINE = """
             version: tapstate/v1
             kind: pipeline
@@ -80,7 +91,7 @@ class TheAssembledApplyServiceSizesNestsTest {
                           arrayKey: [line_id]
             serve:
               from: doc
-              sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+              sync: [ { id: out, source: tgt_mg, write_mode: upsert } ]
             """;
 
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
@@ -92,9 +103,17 @@ class TheAssembledApplyServiceSizesNestsTest {
     private ApplyService assembled(NestSettings settings) {
         ConnectorCatalogView catalog = new ConnectorCatalogView(
                 TapstateCatalog.load(), new NoRegisteredConnectors(), specStore(), registry());
+        // A real lifecycle reading rather than none, so this stays a test of the assembly as it is
+        // built: nothing here is running, so the refusal it carries never fires and sizing is what is
+        // measured.
         return new ControlPlaneConfiguration().applyService(
                 new InMemoryArtifactStore(), catalog,
-                new AuditGate(record -> { }, FIXED_CLOCK), schemas, settings);
+                new AuditGate(record -> { }, FIXED_CLOCK), schemas, settings,
+                // This test is about the sizing advisory, and a derivation would need a whole store port
+                // behind it to answer at all. Named rather than defaulted, so an assembly that derives
+                // nothing says so.
+                SchemaDerivation.none(),
+                new LivePipelines(new InMemoryDesiredStore(), new InMemoryStateStore()));
     }
 
     /** One customer table of {@code rows} rows, plus the two the tree also reads. */
@@ -117,7 +136,8 @@ class TheAssembledApplyServiceSizesNestsTest {
     }
 
     private static List<ArtifactDraft> batch() {
-        return List.of(new ArtifactDraft("source.yaml", SOURCE), new ArtifactDraft("pipeline.yaml", PIPELINE));
+        return List.of(new ArtifactDraft("source.yaml", SOURCE), new ArtifactDraft("target.yaml", TARGET),
+                new ArtifactDraft("pipeline.yaml", PIPELINE));
     }
 
     @Test

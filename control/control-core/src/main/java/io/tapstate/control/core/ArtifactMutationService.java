@@ -9,8 +9,11 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 
@@ -54,19 +57,21 @@ import java.util.Set;
  */
 public final class ArtifactMutationService {
 
-    /** Actual states a pipeline is at rest in; any other means it is still executing. */
-    private static final Set<PipelineState> RESTING = Set.of(
-            PipelineState.NEW, PipelineState.STOPPED, PipelineState.COMPLETED, PipelineState.FAILED);
-
-    /** Desired states that will drive a pipeline back up, whatever it is doing right now. */
-    private static final Set<PipelineState> HEADED_UP = Set.of(
-            PipelineState.RUNNING, PipelineState.PAUSED);
-
     private final ArtifactStore store;
+    /**
+     * The one reading of "is this pipeline at rest". Held rather than re-derived so this refusal and
+     * every other guard that asks cannot drift apart -- they would only disagree in the states nobody
+     * checks by hand, which is where a wrong answer does its damage.
+     */
+    private final LivePipelines live;
+
     private final DesiredStore desired;
     private final StateStore state;
     private final ObservationStore observations;
+    private final PipelineLayoutStore layouts;
+    private final RateHistoryStore rateHistory;
     private final SrsMetaStore srsMeta;
+    private final DerivedSchemaStore derivedSchemas;
     private final AuditGate auditGate;
 
     private final DataBrowserFollows follows;
@@ -79,13 +84,139 @@ public final class ArtifactMutationService {
             SrsMetaStore srsMeta,
             AuditGate auditGate,
             DataBrowserFollows follows) {
+        this(store, desired, state, observations, srsMeta, new DerivedSchemaStore() {
+            @Override
+            public java.util.Optional<io.tapstate.spi.store.DerivedSchema> latest(
+                    String pipelineId, String stepId) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public void record(String pipelineId, String stepId, Map<String, String> schema,
+                    String statement, String derivedFrom, String derivedBy) {
+                throw new UnsupportedOperationException("derived schemas are not configured");
+            }
+
+            @Override
+            public void pin(String pipelineId, String stepId, long version) {
+                throw new UnsupportedOperationException("derived schemas are not configured");
+            }
+
+            @Override
+            public java.util.Optional<io.tapstate.spi.store.DerivedSchema> pinned(
+                    String pipelineId, String stepId) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public void delete(String pipelineId) {
+            }
+        }, auditGate, follows);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
+            AuditGate auditGate,
+            DataBrowserFollows follows) {
+        this(store, desired, state, observations, new PipelineLayoutStore() {
+            @Override
+            public java.util.Optional<io.tapstate.spi.store.PipelineLayout> get(String pipelineId) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public void save(io.tapstate.spi.store.PipelineLayout layout) {
+                throw new UnsupportedOperationException("pipeline layouts are not configured");
+            }
+
+            @Override
+            public void delete(String pipelineId) {
+                throw new UnsupportedOperationException("pipeline layouts are not configured");
+            }
+        }, srsMeta, derivedSchemas, auditGate, follows);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            PipelineLayoutStore layouts,
+            SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
+            AuditGate auditGate,
+            DataBrowserFollows follows) {
+        this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, new RateHistoryStore() {
+            @Override
+            public void append(io.tapstate.core.lifecycle.RateSample sample) {
+                throw new UnsupportedOperationException("rate history is not configured");
+            }
+
+            @Override
+            public Page readPage(String pipelineId, java.time.Instant from, java.time.Instant to,
+                    Key after, int limit) {
+                return new Page(java.util.List.of(), false);
+            }
+
+            @Override
+            public java.util.Optional<Entry> predecessor(String pipelineId, java.time.Instant at) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public java.util.Optional<Entry> read(String pipelineId, Key key) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public java.util.Optional<Entry> successor(String pipelineId, java.time.Instant at) {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public void deleteAll(String pipelineId) {
+                // Refusing, and not returning quietly like a store with nothing to delete. A reclaim
+                // through this shape runs every step and is reported whole; a step that did nothing
+                // leaves every sample the pipeline ever took in the collection, to be read as the past of
+                // whatever is applied under that id next. "This store is not configured" is what this
+                // object knows, and it is the answer to both halves.
+                throw new UnsupportedOperationException("rate history is not configured");
+            }
+
+            @Override
+            public java.time.Duration retention() {
+                return java.time.Duration.ZERO;
+            }
+        }, auditGate, follows);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            PipelineLayoutStore layouts,
+            SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
+            RateHistoryStore rateHistory,
+            AuditGate auditGate,
+            DataBrowserFollows follows) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
         this.observations = Objects.requireNonNull(observations, "observations");
+        this.layouts = Objects.requireNonNull(layouts, "layouts");
+        this.rateHistory = Objects.requireNonNull(rateHistory, "rateHistory");
         this.srsMeta = Objects.requireNonNull(srsMeta, "srsMeta");
+        this.derivedSchemas = Objects.requireNonNull(derivedSchemas, "derivedSchemas");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.follows = Objects.requireNonNull(follows, "follows");
+        this.live = new LivePipelines(this.desired, this.state);
     }
 
     /**
@@ -117,6 +248,9 @@ public final class ArtifactMutationService {
         Resource target = store.get(id)
                 .orElseThrow(() -> error(ArtifactError.NOT_FOUND, Map.of("id", id)));
 
+        // A read-only inventory may omit a row this build cannot reconstruct. A destructive check may
+        // not: without the resource, its references are unknown rather than absent, so the strict list
+        // fails closed before any audit record or deletion is written.
         refuseWhenReferenced(id, store.list());
         if (target instanceof PipelineResource) {
             refuseWhenNotStopped(id);
@@ -192,19 +326,49 @@ public final class ArtifactMutationService {
      * neither of which this store port offers.
      */
     private void reclaim(String id) {
+        List<ReclaimStep> steps = reclaimStepsOf(id);
         if (!isAtRest(id)) {
-            throw reclaimIncomplete(id, "pipeline-live",
-                    List.of("mining-chain-consumer", "desired", "state", "observation"), List.of());
+            throw reclaimIncomplete(id, "pipeline-live", steps.stream().map(ReclaimStep::name).toList(),
+                    List.of());
         }
         List<RuntimeException> failures = new ArrayList<>();
         List<String> residue = new ArrayList<>();
-        attempt(failures, residue, "mining-chain-consumer", () -> detachFromEveryChain(id));
-        attempt(failures, residue, "desired", () -> desired.delete(id));
-        attempt(failures, residue, "state", () -> state.delete(id));
-        attempt(failures, residue, "observation", () -> observations.delete(id));
+        for (ReclaimStep step : steps) {
+            attempt(failures, residue, step.name(), step.action());
+        }
         if (!failures.isEmpty()) {
             throw reclaimIncomplete(id, "step-failed", residue, failures);
         }
+    }
+
+    /**
+     * One step of the reclaim: the name a report calls it by, and what it does. The name is what a
+     * failed reclaim, and the refusal over a pipeline that is live, both put in front of the person who
+     * has to clear the residue by hand; a name that did not match a step would send them looking for
+     * something the reclaim never touched, or leave them unaware of something it did.
+     */
+    private record ReclaimStep(String name, Runnable action) {
+    }
+
+    /**
+     * Everything a removed pipeline owns, in the order it is reclaimed. One list serves both the reclaim
+     * and the report of what a live pipeline would have lost, so a step cannot be added to the one and
+     * left out of the other. Nothing runs while the list is built.
+     */
+    private List<ReclaimStep> reclaimStepsOf(String id) {
+        return List.of(
+                new ReclaimStep("mining-chain-consumer", () -> detachFromEveryChain(id)),
+                new ReclaimStep("desired", () -> desired.delete(id)),
+                new ReclaimStep("state", () -> state.delete(id)),
+                new ReclaimStep("observation", () -> observations.delete(id)),
+                new ReclaimStep("layout", () -> layouts.delete(id)),
+                // Left behind, this record would be read as the derivation history of whatever is applied
+                // under the id next, and would refuse to start it over a difference against a schema
+                // belonging to something that no longer exists.
+                new ReclaimStep("derived-schema", () -> derivedSchemas.delete(id)),
+                // The samples the pipeline took while it ran. Nothing else bounds them but their age, and
+                // a history left behind would be read as the past of whatever is applied under the id next.
+                new ReclaimStep("rate-history", () -> rateHistory.deleteAll(id)));
     }
 
     /**
@@ -294,21 +458,19 @@ public final class ArtifactMutationService {
      * pass exactly the pipelines the refusal exists to catch.
      */
     private boolean isAtRest(String id) {
-        return isAtRest(actualStateOf(id), intentOf(id));
+        return live.isAtRest(id);
     }
 
     private static boolean isAtRest(PipelineState actual, PipelineState intent) {
-        return RESTING.contains(actual) && !HEADED_UP.contains(intent);
+        return LivePipelines.isAtRest(actual, intent);
     }
 
     private PipelineState actualStateOf(String id) {
-        return state.read(id)
-                .map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
-                .orElse(PipelineState.NEW);
+        return live.actualStateOf(id);
     }
 
     private PipelineState intentOf(String id) {
-        return desired.read(id).map(DesiredState::targetState).orElse(PipelineState.NEW);
+        return live.intentOf(id);
     }
 
     private static TapstateException error(ArtifactError code, Map<String, Object> args) {

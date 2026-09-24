@@ -8,8 +8,10 @@ import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StoredArtifactRecord;
+import io.tapstate.spi.store.ArtifactWrite;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -80,6 +82,15 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     @Override
+    public synchronized ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
+        ArtifactBatchWrite result = delegate.writeAll(writes);
+        if (result.appliedSuccessfully()) {
+            writes.forEach(write -> track(write.resource()));
+        }
+        return result;
+    }
+
+    @Override
     public synchronized void saveAll(List<Resource> artifacts) {
         delegate.saveAll(artifacts);
         artifacts.forEach(this::track);
@@ -110,6 +121,14 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     @Override
     public List<StoredArtifactRecord> listStored() {
         return delegate.listStored();
+    }
+
+    @Override
+    public List<StoredArtifactRecord> listStored(String kind) {
+        // Delegated rather than left to the interface default: the default would filter here, over rows
+        // the delegate had already read and returned, which is the read this decorator has no reason to
+        // make more expensive than the store it wraps.
+        return delegate.listStored(kind);
     }
 
     private void track(Resource resource) {

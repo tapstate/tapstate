@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine.nest;
 
+import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
@@ -8,6 +9,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.ReplayFloor;
@@ -41,7 +44,12 @@ import java.util.Set;
  * nothing later removes. A root that is deleted is the one thing that still goes out, because the sink
  * has a document to remove; it carries the key and nothing else, and is not an assembled document.
  */
-public final class AssemblerProcessor extends AbstractProcessor {
+public final class AssemblerProcessor extends AbstractProcessor implements Staged {
+
+    @Override
+    public Stage stage() {
+        return Stage.NEST;
+    }
 
     /**
      * The shortest gap between two sweeps for changes that may stop being held.
@@ -176,9 +184,11 @@ public final class AssemblerProcessor extends AbstractProcessor {
      */
     private final Map<Object, Window> windows = new LinkedHashMap<>();
 
-    // The highest position per chain that a lookup has said owes nothing, waiting until this level holds
-    // nothing lower on that chain. In memory, like the windows beside it: a restart that has lost it has
-    // lost only a chance to advance a frontier, which is the direction to lose in.
+    // The highest position per chain that needs no further document here, waiting until this level holds
+    // nothing lower on that chain. These come from rows no document names and from a first filing already
+    // present in the document that crossed ahead of its wake. In memory, like the windows beside it: a
+    // restart that has lost one has lost only a chance to advance a frontier, which is the direction to
+    // lose in.
     private final Map<String, ChainPosition> settledAhead = new LinkedHashMap<>();
 
     /**
@@ -553,14 +563,23 @@ public final class AssemblerProcessor extends AbstractProcessor {
     @Override
     protected void init(Processor.Context context) {
         this.failures = NestFailureRecording.of(context);
+        this.timer = StageTimer.of(stage(), context);
     }
+
+    // Times each drain of arrivals, which is this stage's unit of work.
+    private StageTimer timer = StageTimer.none(Stage.NEST);
 
     @Override
     public void process(int ordinal, Inbox inbox) {
-        failures.recording(() -> {
-            processRecording(ordinal, inbox);
-            return null;
-        });
+        long started = timer.begin();
+        try {
+            failures.recording(() -> {
+                processRecording(ordinal, inbox);
+                return null;
+            });
+        } finally {
+            timer.end(started);
+        }
     }
 
     private void processRecording(int ordinal, Inbox inbox) {
@@ -661,6 +680,15 @@ public final class AssemblerProcessor extends AbstractProcessor {
             if (word.onlyIfWaiting() && !waiting.contains(word.key())) {
                 return;
             }
+            // A lookup writes a row before queueing its first wake. If the root crossed the other edge in
+            // between, it has already read that row and sent the complete document, so the wake changes no
+            // content. Its position still has to reach the sink: the row is durable in the lookup and any
+            // root that has not arrived yet will read it there, so the position can travel without another
+            // copy of the document. An edit to an existing filed row is never folded here.
+            if (word.firstFiling() && !waiting.contains(word.key())) {
+                SettledPositions.fold(settledAhead, word.positions());
+                return;
+            }
             // Nothing here changes - what the document should now show is read out of that row's own
             // namespace when it is drawn - so all this does is put the document in the drain, which is
             // what gets it drawn and sent again.
@@ -677,7 +705,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
             return;
         }
         Envelope event = (Envelope) item;
-        NestKeys.requireBeforeImageWhereKeysAreTracked(edge, event);
+        NestKeys.requireBeforeImageWhereKeysAreTracked(edge, event, comparedOn(edge));
         Map<String, Object> row = NestKeys.rowOf(event);
         SourceOrder order = NestKeys.orderOf(event);
         if (edge.pathId().isEmpty()) {
@@ -732,6 +760,26 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * here, the ordinary edge keyed by where the row now is and its twin keyed by where it was, so the
      * instance holding each side does its own half and neither reaches across.
      */
+    /**
+     * The columns this vertex reads off the row an update replaces, for the edge it arrived on - which is
+     * what a source tracking key changes on that edge has to send, and all it has to send.
+     *
+     * <p>Named per edge rather than as one set for the vertex, because the two edges read different rows
+     * for different reasons: the root's own rows are compared on the key that identifies a document, and a
+     * child's on the key that says which document it belongs to plus the one that says which element it is.
+     * A single set would refuse a source over a column the edge it arrived on never looks at.
+     */
+    private List<String> comparedOn(NestInbound edge) {
+        if (edge.pathId().isEmpty()) {
+            return vertex.partitionKey();
+        }
+        // A set: the two overlap on a table whose rows are identified by what they hang from, and naming
+        // a column twice in the failure would read as two different columns being absent.
+        Set<String> compared = new LinkedHashSet<>(edge.keyFields());
+        compared.addAll(edge.elementKey());
+        return List.copyOf(compared);
+    }
+
     private void handleRoot(NestInbound edge, Envelope event, Map<String, Object> row, SourceOrder order,
             Map<Object, Touched> touched) {
         List<Object> key = NestKeys.valuesOf(row, vertex.partitionKey());
@@ -866,7 +914,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
         // way through therefore leaves pieces nobody reads rather than an address promising pieces that are
         // not there - and the change that started the move is replayed, because the frontier is held below
         // it until it lands, so they are written again.
-        parking.save(at, new ParkedSubtree(first, pieces));
+        parking.save(at, new ParkedSubtree(first, pieces), held == null);
         // Kept from the first hand-over onto this address rather than reset by a later one: what the frontier
         // must stay below is the earliest change still in flight, and how long this has been outstanding is
         // measured from when it started rather than from the last thing added to it.
@@ -950,7 +998,8 @@ public final class AssemblerProcessor extends AbstractProcessor {
                 if (now - entry.getValue().awaitedSince() >= migrationProtection) {
                     RootAssembly asItStands = store.load(key);
                     if (asItStands != null) {
-                        Touched document = landed.computeIfAbsent(key, ignored -> new Touched(asItStands));
+                        Touched document = landed.computeIfAbsent(key,
+                                ignored -> new Touched(asItStands, false));
                         document.ts = Math.max(document.ts, entry.getValue().ts());
                     }
                     pending.remove();
@@ -966,7 +1015,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
                 if (assembly == null) {
                     continue;
                 }
-                document = new Touched(assembly);
+                document = new Touched(assembly, false);
                 landed.put(key, document);
             }
             document.ts = Math.max(document.ts, entry.getValue().ts());
@@ -1068,17 +1117,18 @@ public final class AssemblerProcessor extends AbstractProcessor {
                             return;
                         }
                         waiting.remove(key);
-                        if (mayGoOutNow(key)) {
+                        Map<String, ChainPosition> unsent = document.assembly.lowestUnsentByChain();
+                        if (mayGoOutNow(key, unsent)) {
                             outgoing.add(Envelope.insert(document.ts, outputStream, rendered, null)
                                     .withPositions(document.assembly.covered())
                                     // Said out loud, because a field that stopped being rendered and a
                                     // field this tree never had are the same document downstream - and a
                                     // target applies one by setting what is in it, so what is gone from it
                                     // stays there at its last value unless the emission names it.
-                                    .withRemoved(RootAssembly.embedsNotRendered(slots, rendered)));
+                                    .withRemoved(document.assembly.embedsNotRendered(slots, rendered)));
                             document.assembly.documentSent();
                         } else {
-                            windows.get(key).holds(document.ts, document.assembly.lowestUnsentByChain());
+                            windows.get(key).holds(document.ts, unsent);
                         }
                     },
                     () -> {
@@ -1094,7 +1144,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
                             waiting.remove(key);
                         }
                     });
-            store.save(key, document.assembly);
+            store.save(key, document.assembly, document.heldNothing);
             refuseToLetOneDocumentGrowPastItsWidth(key, document.assembly);
             long pending = document.assembly.pending();
             // Reported before it is weighed, so that the count that stopped the run is the one on record
@@ -1145,7 +1195,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
      * behind it, so a root changing less often than the window pays nothing for it at all. Trailing edge
      * would delay every change by the window to merge the ones that mostly are not there.
      */
-    private boolean mayGoOutNow(Object key) {
+    private boolean mayGoOutNow(Object key, Map<String, ChainPosition> unsent) {
         if (sending.windowMillis() <= 0) {
             return true;
         }
@@ -1155,11 +1205,36 @@ public final class AssemblerProcessor extends AbstractProcessor {
             windows.put(key, new Window(now));
             return true;
         }
-        if (now - window.openedAt < sending.windowMillis()) {
+        if (now - window.openedAt < sending.windowMillis() && !theBoundIsAlreadyPast(unsent)) {
             return false;
         }
         window.reopen(now);
         return true;
+    }
+
+    /**
+     * Whether this level has already let the frontier past something this version is carrying. Folding is a
+     * delay, and a delay is free only while the frontier is still behind what is being delayed.
+     *
+     * <p>A change waiting for an ancestor is deliberately not counted among what this level holds the
+     * frontier below - it is in this level's state, it comes back out when its ancestor arrives, and
+     * counting it would pin a source on a foreign key pointing at a row that never comes. So the bound on
+     * its chain goes on climbing past it. When the ancestor does arrive, the change joins its document, and
+     * a document that has changed and not gone out <em>is</em> counted: the same change crosses into the
+     * held set underneath a bound already published past it. Folded from there, no restart replays it - the
+     * source resumes above it - and no later version sends it either, because none is due for that root. It
+     * goes out now instead, which is the only moment left at which anything can.
+     */
+    private boolean theBoundIsAlreadyPast(Map<String, ChainPosition> unsent) {
+        if (bounds == null) {
+            return false;
+        }
+        for (Map.Entry<String, ChainPosition> held : unsent.entrySet()) {
+            if (bounds.hasPassed(held.getKey(), held.getValue().order())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1248,7 +1323,7 @@ public final class AssemblerProcessor extends AbstractProcessor {
                     // As on the drain's own path. A document released by the window is the same document
                     // and needs the same saying-so - and this is the path a deployment with a window open
                     // sends most of them on, so leaving it out would fix nothing where it matters.
-                    .withRemoved(RootAssembly.embedsNotRendered(slots, rendered.get())));
+                    .withRemoved(assembly.embedsNotRendered(slots, rendered.get())));
             assembly.documentSent();
             store.save(entry.getKey(), assembly);
             window.reopen(now);
@@ -1266,12 +1341,12 @@ public final class AssemblerProcessor extends AbstractProcessor {
     }
 
     /**
-     * Queues on, for each chain, the position a lookup said owes nothing, once this level holds nothing
-     * lower on that chain.
+     * Queues on, for each chain, a position that needs no further document here, once this level holds
+     * nothing lower on that chain.
      *
      * <p><b>Held rather than passed straight on, and the hold is the whole of what makes it safe.</b> What
-     * it says is true where it was said: those rows are durable and no record about them is coming. What it
-     * cannot see is a document sitting here in its window holding a <em>lower</em> position on the same
+     * it says is true where it was said: those rows are durable and no further record about them is needed.
+     * What it cannot see is a document sitting here in its window holding a <em>lower</em> position on the same
      * chain - a document that is not durable anywhere, because a word about a row it points at changes
      * nothing in the state, only what has to be drawn again. Let past that document, this would have a sink
      * ack above a change that is then neither delivered nor replayable: the document stays at its previous
@@ -1399,7 +1474,11 @@ public final class AssemblerProcessor extends AbstractProcessor {
     private Touched touched(Object key, Map<Object, Touched> touched) {
         return touched.computeIfAbsent(key, k -> {
             RootAssembly held = store.load(k);
-            return new Touched(held == null ? new RootAssembly() : held);
+            // Whether anything was there is carried to the write at the end of the drain rather than worked
+            // out again there. Only the read can answer it - a write that asked would be the very fetch the
+            // answer exists to save - and by then the state to be written is there either way, so the two
+            // cases are the same object and tell nothing apart.
+            return held == null ? new Touched(new RootAssembly(), true) : new Touched(held, false);
         });
     }
 
@@ -1417,11 +1496,20 @@ public final class AssemblerProcessor extends AbstractProcessor {
     private static final class Touched {
 
         private final RootAssembly assembly;
+
+        /**
+         * That the read starting this document found nothing under its key. It says which write this
+         * document is stored by at the end of the drain, and nothing else: both writes store the same
+         * thing, so being wrong here costs a copy or a trip rather than a value.
+         */
+        private final boolean heldNothing;
+
         private boolean rootDeleted;
         private long ts;
 
-        private Touched(RootAssembly assembly) {
+        private Touched(RootAssembly assembly, boolean heldNothing) {
             this.assembly = assembly;
+            this.heldNothing = heldNothing;
         }
     }
 

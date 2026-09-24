@@ -37,6 +37,13 @@ public sealed interface Step {
      */
     record StreamLifecycle(StreamVerb verb, String sourceId) implements Step {}
 
+    /**
+     * Drives one word that expands into several of the product's verbs. The expansion is the
+     * binding's, not this record's: what a specification says is the word, and a harness that wrote
+     * the pair out instead would go on passing if the product stopped expanding it that way.
+     */
+    record Composed(ComposedVerb verb) implements Step {}
+
     /** Produces changes against a seeded table while the pipeline is running. */
     record Cdc(TableAlias table, Change change) implements Step {}
 

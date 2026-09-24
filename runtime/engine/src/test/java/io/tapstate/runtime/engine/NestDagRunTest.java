@@ -20,6 +20,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
@@ -270,13 +271,13 @@ class NestDagRunTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("order", FromRef.literal("orders"));
         aliases.put("item", FromRef.literal("order_items"));
-        Step step = Step.inline("order_doc", FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline("order_doc", FromClause.aliases(aliases), body, null);
 
         PipelineResource pipeline = new PipelineResource("p", null,
-                List.of("orders", "order_items"),
+                List.of(SourceRef.bare("orders"), SourceRef.bare("order_items")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("order_doc"),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();
@@ -314,13 +315,13 @@ class NestDagRunTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("order", FromRef.literal("orders"));
         aliases.put("customer", FromRef.literal("customers"));
-        Step step = Step.inline("order_doc", FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline("order_doc", FromClause.aliases(aliases), body, null);
 
         PipelineResource pipeline = new PipelineResource("p", null,
-                List.of("orders", "customers"),
+                List.of(SourceRef.bare("orders"), SourceRef.bare("customers")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("order_doc"),
-                        List.of(new SyncElement("sync_1", "dest", null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
 
         Map<String, ProcessorMetaSupplier> sources = new LinkedHashMap<>();

@@ -54,11 +54,20 @@ class ApplyServiceRowExpressionTypeTest {
                 """.formatted(tables);
     }
 
+    /** The write target: this release installs a sync only onto the mongodb connector. */
+    private static final String TARGET = """
+            version: tapstate/v1
+            kind: source
+            id: tgt_mg
+            connector: mongodb
+            config: { uri: "mongodb://10.30.0.11:27017/ods" }
+            """;
+
     private final InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
     private final ApplyService service = new ApplyService(
             TapstateCatalog::load, artifacts, new AuditGate(record -> { }, FIXED_CLOCK), schemas,
-            PlanAdvisories.none());
+            PlanAdvisories.none(), SchemaDerivation.none());
 
     private static String pipeline(String expr) {
         return pipeline("orders", expr);
@@ -75,7 +84,7 @@ class ApplyServiceRowExpressionTypeTest {
                   - { id: keep, from: [%s], type: filter, expr: "%s" }
                 serve:
                   from: keep
-                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                  sync: [ { id: out, source: tgt_mg, write_mode: upsert } ]
                 """.formatted(from, expr);
     }
 
@@ -85,11 +94,13 @@ class ApplyServiceRowExpressionTypeTest {
 
     private List<ArtifactDraft> batch(String source, String expr) {
         return List.of(new ArtifactDraft("src_orders.tap.yml", source),
+                new ArtifactDraft("tgt_mg.tap.yml", TARGET),
                 new ArtifactDraft("orders_out.tap.yml", pipeline(expr)));
     }
 
     private List<ArtifactDraft> batch(String source, String from, String expr) {
         return List.of(new ArtifactDraft("src_orders.tap.yml", source),
+                new ArtifactDraft("tgt_mg.tap.yml", TARGET),
                 new ArtifactDraft("orders_out.tap.yml", pipeline(from, expr)));
     }
 
@@ -288,21 +299,19 @@ class ApplyServiceRowExpressionTypeTest {
     }
 
     /**
-     * Where the wiring cannot name the table — a regex {@code from:}, which only a connection can
-     * resolve — the whole selected model is in play, and a selector that lines up with nothing must
-     * not narrow that to the empty set. Every column would then be absent, an absent column passes,
-     * and the gate would quietly stop refusing anything at all for that source.
+     * A Source exposes only its selected tables. When a stale discovery no longer carries any of
+     * them, a dynamic {@code from:} cannot reach tables outside that declared scope merely because
+     * they are still present in the connection-level model.
      */
     @Test
-    @DisplayName("an unresolvable from: still judges against the model when the selector lines up with none of it")
-    void anUnresolvableReferenceKeepsTheModelInPlay() {
+    @DisplayName("an unresolvable from: excludes every table outside the Source selection")
+    void anUnresolvableReferenceExcludesTablesOutsideTheSourceSelection() {
         discovered("src_orders", table("legacy_orders", "amount", TapstateType.DECIMAL));
 
-        DslException thrown = catchThrowableOfType(DslException.class,
-                () -> service.apply("tester", batch(source("[ orders ]"), "/.*/", "after.amount * 2 > 0")));
-
-        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
-        assertThat(thrown.args()).containsEntry("table", "legacy_orders");
+        assertThatCode(() -> service.apply(
+                "tester", batch(source("[ orders ]"), "/.*/", "after.amount * 2 > 0")))
+                .doesNotThrowAnyException();
+        assertThat(artifacts.get("orders_out")).isPresent();
     }
 
     @Test

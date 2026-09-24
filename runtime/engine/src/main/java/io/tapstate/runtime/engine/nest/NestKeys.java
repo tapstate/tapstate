@@ -6,10 +6,12 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import io.tapstate.core.event.ConvertedValue;
 import java.util.Objects;
 
 /** Reading the few things a nest vertex needs off an event, the same way at every vertex. */
@@ -27,9 +29,40 @@ final class NestKeys {
     static List<Object> valuesOf(Map<String, Object> row, List<String> fields) {
         List<Object> values = new ArrayList<>(fields.size());
         for (String field : fields) {
-            values.add(row.get(field));
+            // Unwrapped: a value a connector converted travels in a carrier, and the other side of the
+            // join need not have met a conversion at all - a carrier never equals the plain value inside
+            // it, so a key built from one matches nothing and nothing reports it: the join runs, the rows
+            // arrive, and the document simply never fills in. Two carriers do compare by their parts, so
+            // it is the mixed pairing this is here for, not the matched one.
+            values.add(normalized(ConvertedValue.unwrap(row.get(field))));
         }
         return Collections.unmodifiableList(values);
+    }
+
+    /**
+     * An exact decimal reduced to the number it is; every other value as it came.
+     *
+     * <p>A key is a number, never one spelling of it. {@code BigDecimal} equality compares the scale
+     * beside the value, so {@code 10.50} and {@code 10.5} are two keys where they are one number -
+     * one parent's elements split across two, and its state filed under two names, with nothing to
+     * report: the job runs, the rows arrive, and half of them assemble somewhere nobody looks. A
+     * fixed-scale column never produces both spellings, which is why this went unseen; a document
+     * store's exact decimal keeps whatever scale each value was written with, and one column there
+     * hands over both. A join key drops the trailing zeros for this reason, so the two key boundaries
+     * now answer alike.
+     *
+     * <p>Only the scale goes. Kinds stay apart in the state layer as they always were - {@code 1} the
+     * whole number and {@code 1.0} the decimal are still two keys - and nothing here merges them.
+     */
+    private static Object normalized(Object value) {
+        if (!(value instanceof BigDecimal decimal)) {
+            return value;
+        }
+        BigDecimal stripped = decimal.stripTrailingZeros();
+        // A stripped whole number carries a negative scale (100 becomes 1E+2), which renders in the
+        // state layer as the exponent form. The value is the same either way; this keeps the name the
+        // one an operator reading it would expect.
+        return stripped.scale() < 0 ? stripped.setScale(0) : stripped;
     }
 
     /** The row an event carries: what it became, or what it was when that is all a deletion leaves. */
@@ -58,8 +91,9 @@ final class NestKeys {
     }
 
     /**
-     * Stops the job on an update that arrives without the row it replaces, where the author asked for
-     * structural key changes to be followed on this stream.
+     * Stops the job on an update whose earlier row cannot say where the row was, where the author asked
+     * for structural key changes to be followed on this stream. {@code compared} names the columns this
+     * vertex reads off that row for the edge it arrived on.
      *
      * <p>The after image alone cannot answer the only question that matters here. A row that moved to
      * another parent and a row that had an unrelated column edited arrive looking the same - a row sitting
@@ -67,16 +101,51 @@ final class NestKeys {
      * new place while leaving it in the old one, so the document keeps a copy the source no longer has.
      * Nothing downstream can notice that, which is why it fails here instead of being worked around.
      *
+     * <p><b>An earlier row is not a boolean, and testing for one is what let the worst case through.</b> A
+     * minimal row image sends the columns identifying the row and nothing else, so the row is there and the
+     * compared column is not - which reads as a row that used to hang under nothing. What then goes out is
+     * a detach addressed to a parent that never existed and an attach to the real new one, so the element
+     * arrives under its new parent while the old one is never told, with the switch on and nothing
+     * reported. So the question asked here is which columns arrived, never whether the row did.
+     *
+     * <p>A column whose value is genuinely null still passes, which is why this asks for the key and not
+     * for the value: the column is there, so the key built from it is the key the element was filed under.
+     *
      * <p>Only updates are refused. An insert has no earlier row at all and a deletion carries one as the
      * only row it has, so refusing either would be refusing the shape of the event rather than a source
      * that sends too little.
+     *
+     * <p><b>Ahead of every read of the event, and that placement is load-bearing.</b> Nothing about this
+     * change is applied before the refusal, so a run that hits it has produced no divergent document to
+     * put right: every earlier event either carried these columns and was followed correctly, or would
+     * have been refused here in its turn.
      */
-    static void requireBeforeImageWhereKeysAreTracked(NestInbound edge, Envelope event) {
-        if (!edge.tracksKeyChanges() || event.op() != Op.UPDATE || event.before() != null) {
+    static void requireBeforeImageWhereKeysAreTracked(NestInbound edge, Envelope event,
+            List<String> compared) {
+        if (!edge.tracksKeyChanges() || event.op() != Op.UPDATE) {
+            return;
+        }
+        List<String> missing = absentFrom(event.before(), compared);
+        if (missing.isEmpty()) {
             return;
         }
         throw new TapstateException(NestError.KEY_CHANGE_TRACKING_REQUIRES_BEFORE_IMAGE,
-                Map.of("alias", edge.alias(), "table", edge.table()), null);
+                Map.of("alias", edge.alias(), "table", edge.table(),
+                        "columns", String.join(", ", missing)), null);
+    }
+
+    /** Which of {@code compared} the earlier row does not carry - all of them where it never came. */
+    private static List<String> absentFrom(Map<String, Object> was, List<String> compared) {
+        if (was == null) {
+            return compared;
+        }
+        List<String> absent = new ArrayList<>();
+        for (String column : compared) {
+            if (!was.containsKey(column)) {
+                absent.add(column);
+            }
+        }
+        return absent;
     }
 
     /**

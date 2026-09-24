@@ -1,0 +1,3 @@
+rule: mode-required-for-read
+path: mode
+note: "a source a pipeline reads declares no mode; the write target in the same batch correctly declares none"

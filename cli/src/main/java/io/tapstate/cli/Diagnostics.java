@@ -12,7 +12,7 @@ import java.util.TreeMap;
 /**
  * Renders a coded diagnostic into the CLI's stable structured shape — the single source of truth for
  * the {@code {code, severity, message, solution?, source?, line?, column?, params?}} envelope the
- * offline verbs emit ({@code validate}, {@code desc}, {@code new}). The message and solution come from
+ * offline verbs emit ({@code validate}, {@code desc}, {@code new}, {@code add}). The message and solution come from
  * the bundled message catalog; {@code params} carries the named arguments sorted for a stable machine
  * contract regardless of throw-site order, and the location fields appear only when known.
  */

@@ -6,6 +6,7 @@ import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.QueryElement;
 import io.tapstate.core.model.QueryType;
@@ -54,9 +55,9 @@ class CanonicalOutputWellFormednessTest {
     void nestPipelineOutputParsesBackLosslessly() {
         // The gnarliest shape: alias maps, full nest tree with the `on` key (a YAML 1.1
         // boolean literal!), quoted expression, flow sequences.
-        PipelineResource p = new PipelineResource("customer_360", null, List.of("src_ins"),
+        PipelineResource p = new PipelineResource("customer_360", null, List.of(SourceRef.bare("src_ins")),
                 List.of(Step.inline("clean", FromClause.list(FromRef.literal("CUSTOMERS")),
-                                new TransformBody.MapProjection(fields()), null, null),
+                                new TransformBody.MapProjection(fields()), null),
                         Step.inline("c360",
                                 FromClause.aliases(Map.of(
                                         "customer", FromRef.literal("clean"),
@@ -66,10 +67,9 @@ class CanonicalOutputWellFormednessTest {
                                                 List.of(new Embed("policy",
                                                         Map.of("CUST_ID", "customer_id"),
                                                         EmbedAs.ARRAY, "policies",
-                                                        List.of("POLICY_ID"), null, null, null)))),
-                                null, null)),
+                                                        List.of("POLICY_ID"), null, null, null)))), null)),
                 new ViewBlock.Inline("customer_360", FromRef.literal("c360"), "customer_id",
-                        new Storage(new Storage.Hot("1h"), null, null), null),
+                        new Storage(new Storage.Hot("1h"), null, null)),
                 new ServeBlock.Inline(null, FromRef.literal("customer_360"), null,
                         List.of(new QueryElement(QueryType.REST, null)), null),
                 null, null);
@@ -112,7 +112,7 @@ class CanonicalOutputWellFormednessTest {
         config.put("answer", "yes");
 
         SourceResource src = new SourceResource("tgt_x", null, "mysql", config,
-                SourceMode.CDC, List.of(TableRef.regex(".*")), null, null, null);
+                SourceMode.CDC, List.of(TableRef.regex(".*")), null, null);
 
         Map<String, Object> doc = parse(writer.write(src));
 

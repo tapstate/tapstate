@@ -1,0 +1,30 @@
+explain.observation-stale:
+  message: "The latest observation is {age} old, so the publisher may have stopped."
+explain.coded-failure:
+  message: "The run failed, and said why: {code}."
+explain.reconcile-failures:
+  message: "The server keeps failing to bring this pipeline up: {count} passes in a row have thrown."
+explain.no-movement:
+  message: "Nothing has moved: no records driven and no rows loaded."
+explain.frontier-stalled:
+  message: "A chain has stopped advancing: {chains}."
+explain.no-match:
+  message: "No diagnostic rule matched."
+explain.cannot-current-now:
+  message: "What the pipeline is doing now is unknown: only the last published observation is available."
+explain.cannot-job-alive:
+  message: "Whether the job itself is still alive is unknown; no failure was observed, so state remains {state}."
+explain.cannot-source-head:
+  message: "Whether the source has changes waiting is not measured."
+explain.cannot-age:
+  message: "How old this observation is cannot be determined because it carries no observation time."
+explain.cannot-paused-job:
+  message: "Whether a paused run's job is still alive is not measured; failures are detected only while it is meant to run."
+explain.cannot-snapshot-phase:
+  message: "Whether an initial load is still running cannot be determined from loaded rows alone."
+explain.next-check-server:
+  message: "Check that the server is running and converging."
+explain.next-open-logs:
+  message: "Open the logs for pipeline {pipeline}."
+explain.next-check-target:
+  message: "Check that the target is accepting writes."

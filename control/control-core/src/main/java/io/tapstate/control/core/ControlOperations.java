@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.PipelineStateInventory;
+
 import java.util.List;
 import java.util.Map;
 
@@ -62,8 +64,8 @@ public final class ControlOperations {
                     + "version has moved on, if another resource still references the id, or if the id is a "
                     + "pipeline that is not stopped.");
 
-    // Source CRUD remains available to the authenticated REST face while its MCP projection is retired.
-    // The draft operation is the only Source operation exposed to MCP.
+    // Source mutations and single-resource reads remain off MCP; source.list and source.draft are the
+    // read-only Source operations exposed to model-facing clients.
     public static final Operation SOURCE_CREATE = new Operation(
             "source.create", Scope.WRITE, true, ControlApiSchema.ref("source.create"),
             "Create and persist one Source through the Server control API.", CLI_ONLY);
@@ -73,10 +75,15 @@ public final class ControlOperations {
                     + " This does not create an artifact or audit record.");
     public static final Operation SOURCE_LIST = new Operation(
             "source.list", Scope.READ, false, ControlApiSchema.ref("source.list"),
-            "List Sources with secret-redacted config and configured-secret field names.", CLI_ONLY);
+            "List a bounded page of Sources by id, connector, and display metadata. Configuration is "
+                    + "intentionally omitted, including secret and non-secret fields. Use limit (1-200) "
+                    + "and offset to page.", CLI_AND_MCP);
     public static final Operation SOURCE_GET = new Operation(
             "source.get", Scope.READ, false, ControlApiSchema.ref("source.get"),
             "Get one Source with secret-redacted config and configured-secret field names.", CLI_ONLY);
+    public static final Operation SOURCE_SCHEMA = new Operation(
+            "source.schema", Scope.READ, false, null,
+            "Read a Source's latest discovered schema, limited to the tables that Source declares.", CLI_ONLY);
     public static final Operation SOURCE_UPDATE = new Operation(
             "source.update", Scope.WRITE, true, null,
             "Replace one Source through the Server control API.", CLI_ONLY);
@@ -108,7 +115,7 @@ public final class ControlOperations {
     // over the artifact bytes; the operation classloads and stores in the control process rather than
     // dispatching to the runtime, so it adds no member to the synchronous control-to-runtime whitelist.
     public static final Operation CONNECTOR_REGISTER =
-            new Operation("connector.register", Scope.WRITE, true, null, CLI_ONLY);
+    new Operation("connector.register", Scope.WRITE, true, null, CLI_ONLY);
     // connector.list reads the online catalog view — the bundled snapshot union the rows derived for
     // registered connectors — so a registered connector becomes visible without a restart. It reads
     // derived catalog state, mutates nothing, and needs no member on the synchronous control-to-runtime
@@ -119,6 +126,11 @@ public final class ControlOperations {
     public static final Operation CONNECTOR_GET =
             mcp("connector.get", Scope.READ, false,
                     "Get a connector's complete live config spec, content hash, origin, and runtime availability.");
+    // Connector icons are authenticated assets. The web picker uses the anonymous projection, while this
+    // authenticated peer remains available to any CLI or REST client that needs the protected asset.
+    public static final Operation CONNECTOR_ICON = new Operation(
+            "connector.icon", Scope.READ, false, null,
+            "Read the registered connector icon asset.", CLI_ONLY);
 
     // data-browser domain: the read face over a declared source's own database — list its collections,
     // read one collection's rows, report one collection's size. All three read through to the connector
@@ -156,22 +168,59 @@ public final class ControlOperations {
     // outside the registry. Reading topology mutates nothing, so it is read-scoped and unaudited.
     public static final Operation CLUSTER_MEMBERS = new Operation("cluster.members", Scope.READ, false, null, CLI_ONLY);
 
-    // pipeline domain: the four lifecycle verbs. Each writes the pipeline's desired state (an intent the
-    // runtime later converges), so all four are write-scoped and audited. There is no rewind verb — a
-    // re-dig is stop then start composed at the surface.
+    // pipeline domain: static projection reads, conditional definition replacement, and the four lifecycle
+    // verbs. Definition replacement is audited as an artifact write; each lifecycle verb writes the
+    // pipeline's desired state (an intent the runtime later converges). There is no rewind verb — a re-dig
+    // is stop then start composed at the surface.
+    public static final Operation PIPELINE_LIST = new Operation(
+            "pipeline.list", Scope.READ, false, ControlApiSchema.ref("pipeline.list"),
+            "List a bounded page of Pipeline artifacts with resolved Source summaries and live status. "
+                    + "Use limit (1-200) and offset to page; each item can include its DAG and transforms.", CLI_AND_MCP);
+    public static final Operation PIPELINE_GET = new Operation(
+            "pipeline.get", Scope.READ, false, null,
+            "Get one static Pipeline artifact with resolved Source summaries.", CLI_ONLY);
+    public static final Operation PIPELINE_LAYOUT_GET = new Operation(
+            "pipeline.layout.get", Scope.READ, false, null,
+            "Read editor-only node positions and viewport state for one Pipeline.", CLI_ONLY);
+    public static final Operation PIPELINE_LAYOUT_UPDATE = new Operation(
+            "pipeline.layout.update", Scope.WRITE, false, null,
+            "Replace editor-only node positions and viewport state for one Pipeline.", CLI_ONLY);
+    public static final Operation PIPELINE_CREATE = new Operation(
+            "pipeline.create", Scope.WRITE, true, null,
+            "Create one Pipeline definition after its referenced Sources and composition have been validated.",
+            CLI_ONLY);
+    public static final Operation PIPELINE_UPDATE = new Operation(
+            "pipeline.update", Scope.WRITE, true, null,
+            "Replace one Pipeline definition while its content hash precondition still matches.", CLI_ONLY);
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
+    // The description is rendered from the same declarations a stop works through, both outcomes of
+            // them. Written out by hand it would describe whatever was true when somebody last edited it,
+            // and a description that has fallen behind reads exactly like one that is complete.
     public static final Operation PIPELINE_STOP = mcp(
             "pipeline.stop", Scope.WRITE, true,
-            "Set a Pipeline's desired state to stopped.");
-    public static final Operation PIPELINE_PAUSE = new Operation("pipeline.pause", Scope.WRITE, true, null, CLI_ONLY);
-    public static final Operation PIPELINE_RESUME = new Operation("pipeline.resume", Scope.WRITE, true, null, CLI_ONLY);
+            "Set a Pipeline's desired state to stopped. purgeState is required and has no default: it "
+                    + "says what becomes of what the Pipeline accumulated. "
+                    + PipelineStateInventory.describeBothOutcomes());
+    // Open on the same face as the stop above, and for its sake. Behind a stop that clears, these are
+    // the way to make a Pipeline stop moving without losing anything -- and the caller on that face is a
+    // model, which will reach for whatever verb is there. Leaving only the clearing one open turns the
+    // answer it demands into a formality that is always yes.
+    public static final Operation PIPELINE_PAUSE = mcp(
+            "pipeline.pause", Scope.WRITE, true,
+            "Hold a Pipeline where it is. Nothing is cleared: its position and everything it assembled "
+                    + "stay, and a resume carries on from there. This is how to make a Pipeline stop "
+                    + "moving without losing what it has.");
+    public static final Operation PIPELINE_RESUME = mcp(
+            "pipeline.resume", Scope.WRITE, true,
+            "Carry a paused Pipeline on from the position it was holding, reading nothing again.");
 
-    // pipeline observation reads: the four read faces. status/metrics/snapshot are store-backed over the
+    // pipeline observation reads: status/metrics/snapshot are store-backed over the
     // per-pipeline observation doc (status = lifecycle state, metrics = open stat map, snapshot = per-table
-    // load progress); logs tails the node-local process log output for the pipeline. Each reads and mutates
-    // nothing, so all four are read-scoped and unaudited.
+    // load progress); history projects bounded retained samples, explain applies the shared diagnostic
+    // checklist to one current observation, and logs tails the node-local process log output for the
+    // pipeline. Each reads and mutates nothing, so all are read-scoped and unaudited.
     public static final Operation PIPELINE_STATUS = mcp(
             "pipeline.status", Scope.READ, false,
             "Read a Pipeline's current lifecycle status.");
@@ -184,6 +233,42 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LOGS = mcp(
             "pipeline.logs", Scope.READ, false,
             "Read the bounded, secret-redacted log tail for a Pipeline.");
+    public static final Operation PIPELINE_METRICS_HISTORY = mcp(
+            "pipeline.metrics.history", Scope.READ, false,
+            "Read a bounded, reset-aware page of target-acknowledged output rates and selected table lag "
+                    + "over a retained time range. The result is eventually consistent; follow nextCursor "
+                    + "with every other argument unchanged.");
+    public static final Operation PIPELINE_EXPLAIN = mcp(
+            "pipeline.explain", Scope.READ, false,
+            "Read the shared evidence-backed explanation of one Pipeline's latest observation. A no-match "
+                    + "answer is not a health verdict and names what the observation cannot establish.");
+
+    // Where a pipeline resumes from, read and written back. The read mutates nothing; the write moves
+    // durable state that outlives every run on the chain -- shared with any other pipeline reading it --
+    // so it is write-scoped and audited like the lifecycle verbs.
+    //
+    // Both stay off the model-facing surface, unlike the lifecycle writes beside them. Choosing where to
+    // resume from turns on whether a position is still inside the source's retention window, which
+    // nothing on this side can check and the store cannot answer. With the write not there, the read's
+    // own reason to be there mostly goes with it: the two things it adds over the metrics face -- who
+    // else reads the chain, and when the position was recorded -- are what you look at before editing.
+    // Where a pipeline stands is on that face already.
+    public static final Operation PIPELINE_POSITION = new Operation(
+            "pipeline.position", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation PIPELINE_SET_POSITION = new Operation(
+            "pipeline.set-position", Scope.WRITE, true, null, CLI_ONLY);
+
+    // The columns a step works out for itself, and the one act that moves what they are held to. A
+    // start is refused when a step's derived columns no longer match the ones it was recorded
+    // producing; the read is how a person sees what moved and whether the target can hold it, and the
+    // accept is how they say to carry on. The accept is write-scoped and audited because it moves what
+    // a refusal is measured against, which is the only thing standing between a changed shape and a
+    // target that silently truncates - and it is a verb of its own rather than a flag on the start,
+    // because a flag on a start lives in a script and stops being anybody looking.
+    public static final Operation PIPELINE_DERIVED_SCHEMA = new Operation(
+            "pipeline.derived-schema", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation PIPELINE_ACCEPT_DERIVED_SCHEMA = new Operation(
+            "pipeline.accept-derived-schema", Scope.WRITE, true, null, CLI_ONLY);
 
     // security domain: all admin-scoped. The mutating ones are audited; the list queries are not.
     public static final Operation USER_CREATE = new Operation("user.create", Scope.ADMIN, true, null, CLI_ONLY);
@@ -204,6 +289,7 @@ public final class ControlOperations {
             SOURCE_DRAFT,
             SOURCE_LIST,
             SOURCE_GET,
+            SOURCE_SCHEMA,
             SOURCE_UPDATE,
             SOURCE_DELETE,
             CONNECTION_TEST,
@@ -213,10 +299,17 @@ public final class ControlOperations {
             CONNECTOR_REGISTER,
             CONNECTOR_LIST,
             CONNECTOR_GET,
+            CONNECTOR_ICON,
             DATA_BROWSER_COLLECTIONS,
             DATA_BROWSER_FIND,
             DATA_BROWSER_STATS,
             CLUSTER_MEMBERS,
+            PIPELINE_LIST,
+            PIPELINE_GET,
+            PIPELINE_LAYOUT_GET,
+            PIPELINE_LAYOUT_UPDATE,
+            PIPELINE_CREATE,
+            PIPELINE_UPDATE,
             PIPELINE_START,
             PIPELINE_STOP,
             PIPELINE_PAUSE,
@@ -225,6 +318,12 @@ public final class ControlOperations {
             PIPELINE_METRICS,
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
+            PIPELINE_METRICS_HISTORY,
+            PIPELINE_EXPLAIN,
+            PIPELINE_POSITION,
+            PIPELINE_SET_POSITION,
+            PIPELINE_DERIVED_SCHEMA,
+            PIPELINE_ACCEPT_DERIVED_SCHEMA,
             USER_CREATE,
             USER_PASSWD,
             USER_LIST,

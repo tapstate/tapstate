@@ -19,7 +19,10 @@ class MonitorErrorTest {
     void carriesTheMonitorVocabularyCodes() {
         assertThat(MonitorError.values()).extracting(MonitorError::code).containsExactlyInAnyOrder(
                 // a status/metrics/snapshot read of a pipeline that has published no observation
-                "monitor.no-observation");
+                "monitor.no-observation",
+                "monitor.invalid-cursor",
+                "monitor.cursor-expired",
+                "monitor.query-budget-exceeded");
     }
 
     @Test
@@ -27,5 +30,10 @@ class MonitorErrorTest {
         // pipeline = the id the caller asked to observe
         assertThat(MonitorError.NO_OBSERVATION.placeholders())
                 .containsExactlyInAnyOrder("pipeline");
+        assertThat(MonitorError.INVALID_CURSOR.placeholders())
+                .containsExactlyInAnyOrder("operation", "reason");
+        assertThat(MonitorError.CURSOR_EXPIRED.placeholders()).containsExactly("operation");
+        assertThat(MonitorError.QUERY_BUDGET_EXCEEDED.placeholders())
+                .containsExactlyInAnyOrder("operation", "budget", "limit");
     }
 }

@@ -79,6 +79,19 @@ public record SourceDraft(
                     || number instanceof Float floatValue && !Float.isFinite(floatValue)) {
                 throw new IllegalArgumentException("JSON numbers must be finite");
             }
+            // Two more the store cannot hold, refused here for the same reason the two above are: the
+            // list of accepted types is what a caller is answered against, and a type on it that no
+            // store can keep is not really accepted -- it is accepted and then either dropped or
+            // crashed on further in, where nothing can name the field the caller wrote.
+            if (number instanceof BigInteger big && big.bitLength() >= Long.SIZE) {
+                throw new IllegalArgumentException(
+                        "JSON integers must fit in 64 bits; " + big + " does not");
+            }
+            if (number instanceof BigDecimal decimal
+                    && BigDecimal.valueOf(decimal.doubleValue()).compareTo(decimal) != 0) {
+                throw new IllegalArgumentException("JSON numbers must be storable as a 64-bit float; "
+                        + decimal + " would be stored as " + decimal.doubleValue());
+            }
             return value;
         }
         if (value instanceof List<?> list) {

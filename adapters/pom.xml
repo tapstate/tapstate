@@ -28,6 +28,7 @@
     <module>adapter-pdk</module>
     <module>adapter-mongo-store</module>
     <module>adapter-transform</module>
+    <module>adapter-otel</module>
   </modules>
 
   <dependencyManagement>

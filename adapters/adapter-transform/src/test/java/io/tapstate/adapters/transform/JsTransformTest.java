@@ -4,9 +4,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.transform.TransformPort;
+import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,6 +30,163 @@ class JsTransformTest {
 
     private static Map<String, Object> after(Envelope out) {
         return out.after();
+    }
+
+    @Test
+    @DisplayName("exact decimals reach javascript as numbers without changing untouched values")
+    void exactDecimalsReachJavascriptAsNumbersWithoutChangingUntouchedValues() {
+        BigDecimal decimal = new BigDecimal("1.5");
+        ConvertedValue carried = new ConvertedValue(decimal, "DECIMAL128");
+        TransformPort js = js(
+                "function process(r, ctx) {"
+                        + " r.after.observed = {"
+                        + "  bareType: typeof r.after.bare,"
+                        + "  bareTimesTwo: r.after.bare * 2,"
+                        + "  bareGreaterThanOne: r.after.bare > 1,"
+                        + "  bareString: String(r.after.bare),"
+                        + "  carriedType: typeof r.after.carried,"
+                        + "  carriedTimesTwo: r.after.carried * 2,"
+                        + "  doubleType: typeof r.after.dbl,"
+                        + "  doubleTimesTwo: r.after.dbl * 2"
+                        + " };"
+                        + " return r;"
+                        + " }");
+        Envelope row = Envelope.insert(1L, "orders", new LinkedHashMap<>(Map.of(
+                "bare", decimal,
+                "carried", carried,
+                "dbl", 1.5d)), null);
+
+        Map<String, Object> output = after(js.transform(row).get(0));
+
+        assertThat(output)
+                .containsEntry("bare", decimal)
+                .containsEntry("carried", carried)
+                .containsEntry("dbl", 1.5d);
+        assertThat(output.get("observed")).isEqualTo(Map.of(
+                "bareType", "number",
+                "bareTimesTwo", 3L,
+                "bareGreaterThanOne", true,
+                "bareString", "1.5",
+                "carriedType", "number",
+                "carriedTimesTwo", 3L,
+                "doubleType", "number",
+                "doubleTimesTwo", 3L));
+    }
+
+    @Test
+    @DisplayName("exact decimals outside the javascript number range are refused bare or carried")
+    void refusesOutOfRangeExactDecimalsBareOrCarried() {
+        BigDecimal underflow = new BigDecimal("1E-6143");
+        BigDecimal overflow = new BigDecimal("1E+6144");
+
+        assertDecimalRefused(
+                underflow,
+                underflow,
+                "function process(r, ctx) { return r; }"
+                        + " function filter(r) { return r.after.amount > 0; }",
+                "bare underflow");
+        assertDecimalRefused(
+                underflow,
+                new ConvertedValue(underflow, "DECIMAL128"),
+                "function process(r, ctx) { return r; }"
+                        + " function filter(r) { return r.after.amount > 0; }",
+                "carried underflow");
+        assertDecimalRefused(
+                overflow,
+                overflow,
+                "function process(r, ctx) { r.after.copy = r.after.amount; return r; }",
+                "bare overflow");
+        assertDecimalRefused(
+                overflow,
+                new ConvertedValue(overflow, "DECIMAL128"),
+                "function process(r, ctx) { r.after.copy = r.after.amount; return r; }",
+                "carried overflow");
+    }
+
+    private static void assertDecimalRefused(
+            BigDecimal decimal, Object value, String script, String description) {
+        TransformPort js = js(script);
+        Envelope row = Envelope.insert(1L, "orders", Map.of("amount", value), null);
+
+        assertThatThrownBy(() -> js.transform(row))
+                .as(description)
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> {
+                    TapstateException error = (TapstateException) thrown;
+                    assertThat(error.code()).isEqualTo(TransformError.SCRIPT_DECIMAL_OUT_OF_RANGE);
+                    assertThat(error.args()).containsEntry("value", decimal.toString());
+                });
+    }
+
+    @Test
+    @DisplayName("a value a connector converted reaches the script as the value, not as a host object")
+    void aCarriedValueReachesTheScriptAsTheValue() {
+        TransformPort js = js(
+                "function process(r, ctx) { r.after.hit = (r.after._id === '64f0c0de'); return r; }");
+        Envelope row = Envelope.insert(1L, "orders", new LinkedHashMap<>(
+                Map.of("_id", new ConvertedValue("64f0c0de", "OBJECT_ID"))), null);
+
+        // A guest cannot see into a host object it was not taught about, so the comparison would be false
+        // for every row and a script that neither throws nor logs would be indistinguishable from data
+        // that genuinely did not match. The guest sees the portable value, while an untouched slot keeps
+        // the metadata the target needs to restore the source type.
+        assertThat(after(js.transform(row).get(0)))
+                .containsEntry("hit", true)
+                .containsEntry("_id", new ConvertedValue("64f0c0de", "OBJECT_ID"));
+    }
+
+    @Test
+    @DisplayName("a converted value written by javascript no longer carries source restoration metadata")
+    void aWrittenConvertedValueDoesNotKeepItsCarrier() {
+        TransformPort js = js(
+                "function process(r, ctx) { r.after._id = '64f0c0de'; return r; }");
+        Envelope row = Envelope.insert(1L, "orders", new LinkedHashMap<>(
+                Map.of("_id", new ConvertedValue("64f0c0de", "OBJECT_ID"))), null);
+
+        assertThat(after(js.transform(row).get(0)))
+                .containsEntry("_id", "64f0c0de");
+    }
+
+    @Test
+    @DisplayName("a nested write drops only the converted container provenance it invalidates")
+    void aNestedWriteDoesNotRestoreAStaleConvertedContainer() {
+        ConvertedValue untouched = new ConvertedValue("64f0c0de", "OBJECT_ID");
+        Map<String, Object> document = new LinkedHashMap<>();
+        document.put("status", "new");
+        document.put("key", untouched);
+        Envelope row = Envelope.insert(1L, "orders", Map.of(
+                "document", new ConvertedValue(document, "DOCUMENT")), null);
+        TransformPort js = js(
+                "function process(r, ctx) { r.after.document.status = 'paid'; return r; }");
+
+        Object output = after(js.transform(row).get(0)).get("document");
+
+        assertThat(output).isInstanceOf(Map.class).isNotInstanceOf(ConvertedValue.class);
+        assertThat(((Map<?, ?>) output).get("status")).isEqualTo("paid");
+        assertThat(((Map<?, ?>) output).get("key")).isEqualTo(untouched);
+    }
+
+    @Test
+    @DisplayName("an array write drops only the converted container provenance it invalidates")
+    void anArrayWriteDoesNotRestoreAStaleConvertedContainer() {
+        ConvertedValue untouched = new ConvertedValue("64f0c0de", "OBJECT_ID");
+        Envelope row = Envelope.insert(1L, "orders", Map.of(
+                "values", new ConvertedValue(List.of(untouched, "old"), "ARRAY")), null);
+        TransformPort js = js(
+                "function process(r, ctx) {"
+                        + " r.after.first = r.after.values[0];"
+                        + " r.after.values[1] = 'new';"
+                        + " r.after.values.push('tail');"
+                        + " return r;"
+                        + " }");
+
+        Map<String, Object> output = after(js.transform(row).get(0));
+
+        assertThat(output.get("values"))
+                .isInstanceOf(List.class)
+                .isNotInstanceOf(ConvertedValue.class)
+                .isEqualTo(List.of(untouched, "new", "tail"));
+        assertThat(output.get("first")).isEqualTo("64f0c0de").isNotInstanceOf(ConvertedValue.class);
     }
 
     @Test

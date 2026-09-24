@@ -81,7 +81,7 @@ class ArtifactDeletePipelineNotStoppedIT {
                             + "answers this same code")
                     .contains(before);
 
-            control.lifecycle(pipelineId, LifecycleVerb.STOP);
+            control.stop(pipelineId, true);
             Await.until(
                     pipelineId + " to reach " + PipelineState.STOPPED,
                     () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),

@@ -32,7 +32,7 @@
     },
     {
       "name": "port",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Port"
       },
@@ -123,7 +123,7 @@
     },
     {
       "name": "originPort",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "JDBC Original Port"
       },

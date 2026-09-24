@@ -63,6 +63,19 @@ final class ControlPlane {
      */
     private static final String DEAD_LETTERED_PREFIX = "nestDeadLettered.";
 
+    /**
+     * The flat face's name for rows confirmed by a target. Exact, not a prefix: the inbound total sits
+     * beside it under the same stem, and the two are meant to be read apart.
+     */
+    private static final String RECORDS_OUT_METRIC = "records.out";
+
+    /**
+     * How the failure counter lands on the flat face: one key per code, the code after the dot. Summed
+     * rather than read by an exact name, because how many codes a pipeline has failed under is up to the
+     * pipeline and the connectors it drives.
+     */
+    private static final String ERRORS_PREFIX = "errors.";
+
     private final URI baseUrl;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
 
@@ -87,13 +100,25 @@ final class ControlPlane {
      * because a client asks what it is talking to before it has a credential.
      */
     String version() {
-        HttpResponse<String> response = send(get("/version"));
-        expect(response, 200, "read the version the server reports");
-        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
-                || !(map.get("version") instanceof String version)) {
-            throw new AssertionError("a version answer carried no version: " + response.body());
+        Map<?, ?> answer = versionAnswer();
+        if (!(answer.get("version") instanceof String version)) {
+            throw new AssertionError("a version answer carried no version: " + answer);
         }
         return version;
+    }
+
+    /**
+     * The whole version answer, parsed. A caller checking what the CLI printed reads the fields from
+     * here rather than holding constants of its own, so the two ends of the claim are two readers of the
+     * same endpoint and a test cannot agree with itself.
+     */
+    Map<?, ?> versionAnswer() {
+        HttpResponse<String> response = send(get("/version"));
+        expect(response, 200, "read the version the server reports");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("a version answer was not an object: " + response.body());
+        }
+        return map;
     }
 
     /**
@@ -127,12 +152,42 @@ final class ControlPlane {
      * per file: the product resolves references within the submitted set, so resources that name each
      * other have to be submitted together.
      */
-    void apply(Map<String, String> contentBySource) {
+    List<Warning> apply(Map<String, String> contentBySource) {
         List<Map<String, String>> drafts = contentBySource.entrySet().stream()
                 .map(entry -> Map.of("source", entry.getKey(), "content", entry.getValue()))
                 .toList();
         String body = JsonWriter.write(Map.of("drafts", drafts));
-        expect(send(authed("/api/artifacts:apply", body)), 200, "apply " + contentBySource.keySet());
+        HttpResponse<String> response = send(authed("/api/artifacts:apply", body));
+        expect(response, 200, "apply " + contentBySource.keySet());
+        return warningsOf(response.body());
+    }
+
+    /**
+     * One advisory finding an apply carried: something worth telling the author about a batch that was
+     * applied rather than refused. A refusal travels in its own shape and its own status, so a caller
+     * that meant to read advice can never be handed a reason for rejection instead.
+     */
+    record Warning(String code, Map<String, Object> params) {}
+
+    /**
+     * The findings a 200 apply body carried. A body with no {@code warnings} array decodes to none
+     * rather than failing: the array is what a server with something to say sends, and a batch nobody
+     * had anything to say about is the ordinary case.
+     */
+    private static List<Warning> warningsOf(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("warnings") instanceof List<?> found)) {
+            return List.of();
+        }
+        List<Warning> warnings = new ArrayList<>(found.size());
+        for (Object entry : found) {
+            if (!(entry instanceof Map<?, ?> row)) {
+                throw new AssertionError("a warning entry was not an object: " + body);
+            }
+            Object params = row.get("params");
+            warnings.add(new Warning(String.valueOf(row.get("code")),
+                    params instanceof Map<?, ?> named ? asObject(named) : Map.of()));
+        }
+        return warnings;
     }
 
     /**
@@ -280,6 +335,16 @@ final class ControlPlane {
                 string(map, "contentHash", response.body())));
     }
 
+    /** A stored Source as the API projects it, including its secret-free configuration. */
+    Map<String, Object> source(String sourceId) {
+        HttpResponse<String> response = send(authedGet("/api/sources/" + urlSegment(sourceId)));
+        expect(response, 200, "read the source " + sourceId);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("the source read was not an object: " + response.body());
+        }
+        return asObject(map);
+    }
+
     /**
      * The content hash of the stored artifact {@code id}, failing when the server holds none.
      *
@@ -395,6 +460,46 @@ final class ControlPlane {
         String body = JsonWriter.write(
                 Map.of("id", resourceId, "connectorId", connectorId, "settings", settings));
         expect(send(authed("/api/connections:discover-schema", body)), 200, "discover the model of " + resourceId);
+    }
+
+    /** The table names a Source exposes from its latest discovery, in discovery order. */
+    List<String> sourceSchemaTables(String sourceId) {
+        return schemaTables("/api/sources/" + urlSegment(sourceId) + "/schema", "Source " + sourceId);
+    }
+
+    /** Every table the latest connection-level discovery found, in discovery order. */
+    List<String> connectionSchemaTables(String connectionId) {
+        return schemaTables(
+                "/api/connections/" + urlSegment(connectionId) + "/schema", "connection " + connectionId);
+    }
+
+    /** The field names one discovered table carries, in discovery order - the source's own spelling. */
+    List<String> sourceSchemaFields(String sourceId, String table) {
+        HttpResponse<String> response =
+                send(authedGet("/api/sources/" + urlSegment(sourceId) + "/schema"));
+        expect(response, 200, "read the schema of Source " + sourceId);
+        List<String> names = new ArrayList<>();
+        for (Map<String, Object> each : entriesOf(response.body(), "tables")) {
+            if (!table.equals(String.valueOf(each.get("name")))
+                    || !(each.get("fields") instanceof List<?> fields)) {
+                continue;
+            }
+            for (Object field : fields) {
+                if (!(field instanceof Map<?, ?> row)) {
+                    throw new AssertionError("a discovered field was not an object: " + response.body());
+                }
+                names.add(String.valueOf(row.get("name")));
+            }
+        }
+        return List.copyOf(names);
+    }
+
+    private List<String> schemaTables(String path, String subject) {
+        HttpResponse<String> response = send(authedGet(path));
+        expect(response, 200, "read the schema of " + subject);
+        return entriesOf(response.body(), "tables").stream()
+                .map(table -> String.valueOf(table.get("name")))
+                .toList();
     }
 
     /**
@@ -678,10 +783,29 @@ final class ControlPlane {
     /**
      * Records a lifecycle intent. The verb's own spelling comes from the product's enum, so the wire
      * word cannot drift from the word the product accepts.
+     *
+     * <p>A stop does not come through here. The product refuses one that does not say what becomes of
+     * the pipeline's state, and a harness that picked an answer on the caller's behalf would be the one
+     * place in the system where that question has a default -- so {@link #stop} takes it and every
+     * caller has to say. The refusal below is for a caller who reached for the wrong one.
      */
     void lifecycle(String pipelineId, LifecycleVerb verb) {
+        if (verb == LifecycleVerb.STOP) {
+            throw new IllegalArgumentException(
+                    "a stop says what becomes of the pipeline's state: call stop(pipelineId, purgeState)");
+        }
         expect(send(authed("/api/pipelines/" + pipelineId + ":" + verb.id(), "")),
                 200, verb.id() + " " + pipelineId);
+    }
+
+    /**
+     * Stops the pipeline, saying whether stopping also clears what it has accumulated -- its resume
+     * position and its operators' state.
+     */
+    void stop(String pipelineId, boolean purgeState) {
+        expect(send(authed("/api/pipelines/" + pipelineId + ":" + LifecycleVerb.STOP.id(),
+                        "{\"purgeState\":" + purgeState + "}")),
+                200, LifecycleVerb.STOP.id() + " " + pipelineId);
     }
 
     /**
@@ -770,10 +894,53 @@ final class ControlPlane {
     record ConnectionTest(String outcome, Map<String, String> statusByCheck) {
     }
 
+    /**
+     * The facts the metrics face carries beside its flat map, each as the wire lays it out: a map with the
+     * metric's {@code name}, {@code type} and {@code unit}, and its {@code points}, each point a map with its
+     * {@code attributes} and either a {@code value} or the parts of a distribution. Read as maps rather than
+     * into a type on purpose: what a specification asserts here is the wire, and a type would answer for the
+     * wire it was written against.
+     *
+     * <p>Empty when the pipeline has published no observation yet, on the same terms as {@link #metricsNamed}:
+     * not yet is a reading, and a specification asserting a fact waits for it.
+     */
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> metricFacts(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        int status = response.statusCode();
+        String body = response.body();
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return List.of();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the metrics of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("facts") instanceof List<?> facts)) {
+            throw new AssertionError("metrics answer carried no facts: " + body);
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Object fact : facts) {
+            if (!(fact instanceof Map<?, ?> shaped)) {
+                throw new AssertionError("a fact that is not an object: " + fact);
+            }
+            out.add((Map<String, Object>) shaped);
+        }
+        return out;
+    }
+
     /** The published metrics body verbatim, for the same diagnostic use and on the same terms as {@link #logs}. */
     String metrics(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
         return response.statusCode() + " " + response.body();
+    }
+
+    /** The overview of every pipeline, verbatim - the list a console draws first. */
+    String pipelines() {
+        HttpResponse<String> response = send(authedGet("/api/pipelines"));
+        expect(response, 200, "list the pipelines");
+        return response.body();
     }
 
     /**
@@ -824,6 +991,38 @@ final class ControlPlane {
      * is merely slow to converge, and the specification would sit out its whole bound and then blame the
      * data. The code is the product's contract for exactly this distinction, so the code is what is read.
      */
+    /**
+     * How old the published observation is, as the product itself reports it, or empty when nothing has
+     * been published yet.
+     *
+     * <p>Read from the product rather than computed here from a timestamp and this JVM's clock. The age
+     * is what the product offers a reader to tell a stalled publisher from a healthy run; computing it
+     * on this side would assert a subtraction the test wrote, and would keep passing if the product
+     * stopped offering one.
+     */
+    Optional<Long> observedAgeMillis(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/status"));
+        return interpretObservedAgeMillis(response.statusCode(), response.body(), pipelineId);
+    }
+
+    static Optional<Long> interpretObservedAgeMillis(int status, String body, String pipelineId) {
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return Optional.empty();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the status of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
+                || !(map.get("observedAgeMillis") instanceof Number age)) {
+            // Not waited out as though the pipeline were slow: a published observation carries its age,
+            // so a 200 without one is the contract being gone, which is the thing to say out loud.
+            throw new AssertionError("status carried no observedAgeMillis: " + body);
+        }
+        return Optional.of(age.longValue());
+    }
+
     static Optional<PipelineState> interpretState(int status, String body, String pipelineId) {
         if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
             return Optional.empty();
@@ -842,9 +1041,22 @@ final class ControlPlane {
     /**
      * What a metrics answer is allowed to mean, read exactly the way a status answer is: only the product's
      * own {@code monitor.no-observation} code reads as "nothing published yet", and every other refusal stays
-     * loud. A published observation always carries the errorCount metric - the runtime derives it from the
-     * actual state - so a 200 that omits it is a regression of that contract, surfaced rather than waited out
-     * as though the pipeline were merely slow to converge.
+     * loud.
+     *
+     * <p>How many errors a pipeline has counted, over every code it has counted one under. The product
+     * publishes a failure counter broken out by code, collapsed onto this face as one key per code, so
+     * "how many altogether" is their sum rather than a cell of its own.
+     *
+     * <p><strong>A pipeline that has failed nothing has no such key, and this reports nought for it.</strong>
+     * That is the honest total -- the sum of nothing. What it costs is one distinction: an assertion of
+     * nought here, <em>on its own</em>, is satisfied by a publisher that stopped publishing just as well as
+     * by a pipeline that is fine. It is not satisfied by a stopped publisher once it is paired with
+     * anything that had to read a live observation to pass -- a state assertion, say, since reading a state
+     * at all proves an observation is being republished. So a nought here wants a companion, not a ban.
+     *
+     * <p>This used to read a single {@code errorCount} cell that the runtime derived from the pipeline's
+     * state and always published, and a missing cell was therefore a regression worth throwing over. There
+     * is no such cell any more, because a state written as a number was never a count of anything.
      */
     static Optional<Long> interpretErrorCount(int status, String body, String pipelineId) {
         if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
@@ -858,10 +1070,14 @@ final class ControlPlane {
         if (!(JsonReader.parse(body) instanceof Map<?, ?> map) || !(map.get("metrics") instanceof Map<?, ?> metrics)) {
             throw new AssertionError("metrics answer carried no metrics: " + body);
         }
-        if (!(metrics.get("errorCount") instanceof Number errorCount)) {
-            throw new AssertionError("metrics carried no errorCount: " + body);
+        long counted = 0L;
+        for (Map.Entry<?, ?> entry : metrics.entrySet()) {
+            if (entry.getKey() instanceof String name && name.startsWith(ERRORS_PREFIX)
+                    && entry.getValue() instanceof Number count) {
+                counted += count.longValue();
+            }
         }
-        return Optional.of(errorCount.longValue());
+        return Optional.of(counted);
     }
 
     /**
@@ -888,6 +1104,49 @@ final class ControlPlane {
     }
 
     /**
+     * How many rows this pipeline has had confirmed by its targets, or empty when it has published no
+     * observation yet.
+     *
+     * <p>Read by exact name rather than by prefix, unlike the readings around it. What is being asked for
+     * is one published total, and the face carries a sibling under the same stem for the other direction:
+     * a prefix would add the two together and answer a question nobody asked.
+     */
+    Optional<Long> recordsOut(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        return interpretRecordsOut(response.statusCode(), response.body(), pipelineId);
+    }
+
+    /** What a metrics answer says about rows that reached a target, read by exact name. */
+    static Optional<Long> interpretRecordsOut(int status, String body, String pipelineId) {
+        return interpretMetricByName(status, body, pipelineId, RECORDS_OUT_METRIC);
+    }
+
+    /**
+     * One published metric of {@code pipelineId} by its exact name; empty when the pipeline has published
+     * no observation at all, and nought when it has published one that does not carry this name.
+     *
+     * <p>That nought is the deliberate half. A name absent from a published observation means the thing it
+     * counts has not happened, which is a reading; it is only an unmeasured one when nothing was published
+     * at all, and those two arrive as different HTTP answers rather than as the same missing key.
+     */
+    static Optional<Long> interpretMetricByName(
+            int status, String body, String pipelineId, String name) {
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return Optional.empty();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the metrics of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
+                || !(map.get("metrics") instanceof Map<?, ?> metrics)) {
+            throw new AssertionError("metrics answer carried no metrics: " + body);
+        }
+        return Optional.of(metrics.get(name) instanceof Number value ? value.longValue() : 0L);
+    }
+
+    /**
      * Every metric this pipeline publishes under {@code prefix}, added up, on the same terms as the reading
      * above: summed rather than keyed by namespace, because a namespace name is derived from the pipeline
      * and the embed path inside it and no specification should be copying one by hand.
@@ -896,6 +1155,44 @@ final class ControlPlane {
      * where there is something to say. It leaves the caller with the discriminating half to do: a witness
      * resting on "zero" alone would pass on a pipeline that published nothing at all.
      */
+    /**
+     * Every metric of {@code pipelineId} whose name begins with {@code prefix}, by name; empty when the
+     * pipeline has published none of them or no observation at all.
+     *
+     * <p>Keyed rather than summed, unlike {@link #metricTotal}, because these are readings whose names
+     * carry what they are about - which one of them is present is the reading. A total over them would
+     * answer "is anything happening" while losing "to what", and to what is the question a reader of a
+     * long-running rebuild is actually asking.
+     */
+    Map<String, Long> metricsNamed(String pipelineId, String prefix) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
+        return interpretMetricsNamed(response.statusCode(), response.body(), pipelineId, prefix);
+    }
+
+    static Map<String, Long> interpretMetricsNamed(
+            int status, String body, String pipelineId, String prefix) {
+        if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
+            return Map.of();
+        }
+        if (status != 200) {
+            throw new AssertionError(
+                    "could not read the metrics of " + pipelineId + ": expected HTTP 200, got " + status
+                            + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> map)
+                || !(map.get("metrics") instanceof Map<?, ?> metrics)) {
+            throw new AssertionError("metrics answer carried no metrics: " + body);
+        }
+        Map<String, Long> named = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : metrics.entrySet()) {
+            if (entry.getKey() instanceof String name && name.startsWith(prefix)
+                    && entry.getValue() instanceof Number value) {
+                named.put(name, value.longValue());
+            }
+        }
+        return named;
+    }
+
     Optional<Long> metricTotal(String pipelineId, String prefix) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
         return interpretMetricTotal(response.statusCode(), response.body(), pipelineId, prefix);
@@ -936,6 +1233,38 @@ final class ControlPlane {
         return interpretRecordCount(response.statusCode(), response.body(), pipelineId);
     }
 
+    /**
+     * How many rows each selected table's full load has read <em>on the run that is live now</em>, keyed by
+     * table. Empty when the pipeline has no live run.
+     *
+     * <p>The per-run scope is the whole reason a witness reads this rather than the target: a resumed run
+     * that skips a table reports zero for it, while the target still holds every row the earlier run put
+     * there, so the target cannot tell a skipped table from a re-read one. Every selected table appears --
+     * one that was not read reports zero rather than going absent -- so a missing key is a broken reading
+     * and not a table that was skipped.
+     */
+    Map<String, Long> snapshotRowsRead(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Map.of();
+        }
+        if (response.statusCode() != 200) {
+            throw new AssertionError("could not read the snapshot progress of " + pipelineId
+                    + ": expected HTTP 200, got " + response.statusCode() + " - " + response.body());
+        }
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                || !(map.get("snapshot") instanceof Map<?, ?> snapshot)) {
+            throw new AssertionError("snapshot answer carried no snapshot: " + response.body());
+        }
+        Map<String, Long> read = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : snapshot.entrySet()) {
+            if (entry.getValue() instanceof Map<?, ?> table && table.get("rowsDone") instanceof Number done) {
+                read.put(String.valueOf(entry.getKey()), done.longValue());
+            }
+        }
+        return read;
+    }
+
     static Optional<Long> interpretRecordCount(int status, String body, String pipelineId) {
         if (status == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(body))) {
             return Optional.empty();
@@ -954,6 +1283,47 @@ final class ControlPlane {
         return metrics.get("recordCount") instanceof Number count
                 ? Optional.of(count.longValue())
                 : Optional.empty();
+    }
+
+    /**
+     * The resume point this pipeline would start from, reduced to the two things a caller may hand back:
+     * the chain and the token it is standing at. Keyed {@code chainId} and {@code token}, empty when the
+     * face reports no chain yet.
+     *
+     * <p>Reduced rather than carried whole, because the product refuses its own rendering verbatim and is
+     * right to: the document it hands out also carries readings -- when the point was recorded, among
+     * others -- and setting one of those is meaningless, so a write-back that names one is answered with a
+     * coded refusal naming the field. What the round trip is a question about is the token's coordinate
+     * system, not the envelope it arrives in.
+     */
+    Map<String, String> resumePoint(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
+        expect(response, 200, "read the resume point of " + pipelineId);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> document)
+                || !(document.get("chains") instanceof List<?> chains) || chains.isEmpty()
+                || !(chains.getFirst() instanceof Map<?, ?> chain)) {
+            return Map.of();
+        }
+        if (!(chain.get("resumeFrom") instanceof Map<?, ?> point)
+                || !(point.get("token") instanceof String token)) {
+            return Map.of();
+        }
+        return Map.of("chainId", String.valueOf(chain.get("chainId")), "token", token);
+    }
+
+    /**
+     * Puts a chain back at a token, and answers what the product says the pipeline now stands at.
+     *
+     * <p>Only the two settable parts are sent. A body carrying anything the face reports as a reading is
+     * refused, so composing the smallest document that names a point is what a caller has to do.
+     */
+    String writeBackPosition(String pipelineId, String chainId, String token) {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", pipelineId,
+                "chains", List.of(Map.of("chainId", chainId, "resumeFrom", Map.of("token", token)))));
+        HttpResponse<String> response = send(authedPut("/api/pipelines/" + pipelineId + "/position", body));
+        expect(response, 200, "write back the resume point of " + pipelineId);
+        return response.body();
     }
 
     /**
@@ -984,7 +1354,7 @@ final class ControlPlane {
             throw new AssertionError("metrics answer did not parse: " + body);
         }
         // Absent until a position is acked, and absent is a real reading here rather than a broken face.
-        if (!(map.get("perTableOffset") instanceof Map<?, ?> offsets)) {
+        if (!(map.get("targetAckedPosition") instanceof Map<?, ?> offsets)) {
             return Optional.empty();
         }
         return offsets.get(table) instanceof String position ? Optional.of(position) : Optional.empty();
@@ -1082,6 +1452,16 @@ final class ControlPlane {
                 .timeout(TIMEOUT)
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+    }
+
+    /** The same request as a replacement rather than a submission, for the one face that takes a PUT. */
+    private HttpRequest authedPut(String path, String body) {
+        return HttpRequest.newBuilder(baseUrl.resolve(path))
+                .timeout(TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + requireCredential())
+                .PUT(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
     }
 

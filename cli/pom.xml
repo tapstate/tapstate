@@ -3,7 +3,7 @@
   cli — the surface ring: Tapstate's offline CLI product front-end.
 
   Dual-mode: bare `tapstate` opens an offline REPL; one-shot subcommands share the same verb
-  table for scripting / AI. Offline verbs are a whitelist (validate / new / explain); server
+  table for scripting / AI. Offline verbs are a whitelist (validate / new / add / explain); server
   verbs are registered too but report "requires a connection" rather than going missing.
 
   Ring rule R6: the CLI talks to services over HTTP only. Its dependency surface is allowlisted
@@ -69,6 +69,13 @@
       <artifactId>core-common</artifactId>
       <version>${revision}</version>
     </dependency>
+    <!-- The declarations of what state a pipeline holds, so the terminal's stop says what it is about
+         to clear, or keep, out of the same list the clearing itself works through. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-lifecycle</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The shared error-code message catalog + renderer (presentation layer); the CLI renders
          coded diagnostics through it rather than carrying its own catalog. -->
     <dependency>
@@ -105,6 +112,17 @@
   </dependencies>
 
   <build>
+    <testResources>
+      <testResource>
+        <directory>src/test/resources</directory>
+      </testResource>
+      <testResource>
+        <directory>${project.basedir}/../control/rest-api/src/test/resources</directory>
+        <includes>
+          <include>golden/observability/**</include>
+        </includes>
+      </testResource>
+    </testResources>
     <plugins>
       <!-- picocli's annotation processor emits the native-image reflection config for the command
            tree at compile time, so the native binary needs no hand-written reflect config. It runs
@@ -176,6 +194,7 @@
                     <include>io.tapstate:core-dsl</include>
                     <include>io.tapstate:core-schema</include>
                     <include>io.tapstate:core-catalog</include>
+                    <include>io.tapstate:core-lifecycle</include>
                     <!-- the shared presentation catalog + renderer (zero third-party itself) -->
                     <include>io.tapstate:messages</include>
                     <include>io.tapstate:control-client</include>
@@ -240,10 +259,12 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
 
       The bundled resources read at runtime via getResourceAsStream are not reachable in a native
       image unless declared: the connector catalog (/catalog/*.json), the grammar JSON Schema
-      (/schema/*.json) and the message catalog (/messages/*.yml). They are declared here as
-      IncludeResources globs. Reflection config for the picocli command tree comes from the
-      picocli-codegen processor (see the compiler plugin above); JLine / CEL / snakeyaml config
-      comes from the GraalVM reachability-metadata repository.
+      (/schema/*.json), the message catalog (/messages/*.yml) and the local development stack's
+      compose file (/local-stack/*.yml), demo recipes (/demo/*.tap.yml) and blank recipes
+      (/blank/*.tap.yml). They are declared here as IncludeResources globs.
+      Reflection config for the picocli command tree comes from the picocli-codegen processor
+      (see the compiler plugin above); JLine / CEL / snakeyaml config comes from the GraalVM
+      reachability-metadata repository.
     -->
     <profile>
       <id>native</id>
@@ -267,10 +288,19 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
               <mainClass>${mainClass}</mainClass>
               <buildArgs>
                 <buildArg>--no-fallback</buildArg>
+                <!-- The CPU this binary may assume. Left alone, native-image compiles for x86-64-v3 on
+                     AMD64, which requires AVX, AVX2, BMI1, BMI2 and FMA, and an image that needs them
+                     refuses to start on a CPU that does not have them. `compatibility` is the lowest
+                     common denominator on every architecture, so this one flag stays correct for the
+                     arm64 builds too; install-smoke.sh checks the native profile still names it. -->
+                <buildArg>-march=compatibility</buildArg>
                 <!-- bundled resources read via getResourceAsStream, declared so the image keeps them -->
                 <buildArg>-H:IncludeResources=catalog/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=schema/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=messages/.*\.yml</buildArg>
+                <buildArg>-H:IncludeResources=local-stack/.*\.yml</buildArg>
+                <buildArg>-H:IncludeResources=demo/.*\.tap\.yml</buildArg>
+                <buildArg>-H:IncludeResources=blank/.*\.tap\.yml</buildArg>
               </buildArgs>
               <metadataRepository>
                 <enabled>true</enabled>

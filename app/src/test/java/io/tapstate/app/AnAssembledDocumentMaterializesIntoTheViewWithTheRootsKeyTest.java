@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.core.model.PipelineNode;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.hazelcast.function.SupplierEx;
@@ -8,6 +10,7 @@ import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -115,13 +118,13 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
 
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
-                    WriteMode writeMode, DdlPolicy ddl, TargetTable target) {
+                    WriteMode writeMode, DdlPolicy ddl, TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;
             }
 
             @Override
             public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
-                    WriteMode writeMode, DdlPolicy ddl, Map<String, TargetTable> targets) {
+                    WriteMode writeMode, DdlPolicy ddl, Map<String, TargetTable> targets, PipelineNode node) {
                 bound.set(targets);
                 return (SupplierEx<SinkWriter>) () -> null;
             }
@@ -150,7 +153,7 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
         // The view names no target of its own: the store it lands in is the deployment's.
         artifacts.save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "fake",
-                Map.of("host", "d"), null, null, null, null, null));
+                Map.of("host", "d"), null, null, null, null));
 
         Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, EMBED_PATH, List.of("id"),
                 null, null, null);
@@ -159,12 +162,12 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("o", FromRef.literal(PARENT_TABLE));
         aliases.put("i", FromRef.literal(CHILD_TABLE));
-        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null, null);
+        Step step = Step.inline(STEP, FromClause.aliases(aliases), body, null);
 
         // A view and no serve block: declaring the view is the whole instruction to materialize.
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(PARENT_SOURCE, CHILD_SOURCE),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
                 List.of(step),
-                new ViewBlock.Inline(VIEW, FromRef.literal(STEP), "id", null, null),
+                new ViewBlock.Inline(VIEW, FromRef.literal(STEP), "id", null),
                 null,
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
         return artifacts;
@@ -177,7 +180,7 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
 
     private static SourceResource source(String id, String table) {
         return new SourceResource(id, null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(table)), null, null, null);
+                List.of(TableRef.literal(table)), null, null);
     }
 
     private static DiscoveredSourceModel discovered(String connectionId, SourceTable table) {

@@ -17,10 +17,25 @@
     (rule R2: the port depends on the core ring only).</description>
 
   <dependencies>
+    <!-- Portable inferred column types are core vocabulary (rule R2: core only). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-common</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The standard event envelope is the currency the write side accepts (rule R2: core only). -->
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>core-event</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
+    <!-- Which pipeline node a write is driven for, so a connector's own notes are scoped to it
+         (rule R2: core only). The read side names the same identity from the same place, which is
+         what keeps the two from drifting into two spellings of one node. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-model</artifactId>
       <version>${revision}</version>
     </dependency>
 

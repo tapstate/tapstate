@@ -1,5 +1,6 @@
 package io.tapstate.core.model;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -7,7 +8,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * {@code kind: pipeline} — the composing runnable unit (ADR-0016 §1, X17): references
+ * {@code kind: pipeline} — the composing runnable unit (§1, X17): references
  * pre-created sources by id (never inline), wires transforms / view / serve, carries
  * task-level settings. Minimal composition (source + view/serve) is a validate-layer rule.
  */
@@ -17,10 +18,11 @@ public record PipelineResource(
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,
-        @Doc(value = "Ids of pre-created sources this pipeline reads from; at least one is required.",
+        @Doc(value = "Pre-created sources this pipeline reads from. Each is a bare source id or an object "
+                + "carrying this pipeline's own srs switch; blank drafts may omit the list.",
                 required = true, key = "source")
         @YamlScalarOrList
-        List<String> sources,
+        List<SourceRef> sources,
         @Doc("Ordered transform steps applied to the source data.")
         List<Step> transforms,
         @Doc("View configuration that shapes the pipeline output into a queryable result.")
@@ -36,13 +38,25 @@ public record PipelineResource(
     public PipelineResource {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(sources, "sources");
-        if (sources.isEmpty()) {
+        if (sources.isEmpty() && (transforms != null && !transforms.isEmpty() || view != null || serve != null)) {
             throw new IllegalArgumentException("source: must reference at least one source (X17)");
         }
         sources = List.copyOf(sources);
         transforms = transforms == null ? null : List.copyOf(transforms);
         experimental = experimental == null ? null
                 : Collections.unmodifiableMap(new LinkedHashMap<>(experimental));
+    }
+
+    /**
+     * The ids alone, in declaration order. Most callers only need to know which sources this
+     * pipeline reads; only the capture path needs the srs switch that rides along with them.
+     */
+    public List<String> sourceIds() {
+        List<String> ids = new ArrayList<>(sources.size());
+        for (SourceRef ref : sources) {
+            ids.add(ref.id());
+        }
+        return Collections.unmodifiableList(ids);
     }
 
     @Override

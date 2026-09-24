@@ -1,4 +1,3 @@
 rule: mode-mismatch
-adr: "ADR-0016 §4"
 path: srs
 note: "srs block on mode: stream; SRS is provisioned for cdc only"

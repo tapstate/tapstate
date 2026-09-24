@@ -122,7 +122,7 @@ services:
     # tree adds the build back through docker-compose.dev.yml, which only exists inside the repository.
     # The tag is pinned rather than floating, so a demo brought up months apart runs the same server
     # both times; the quickstart smoke fails the build if it drifts from the version being built.
-    image: ghcr.io/tapstate/tapstate:0.4.4
+    image: ghcr.io/tapstate/tapstate:0.5.0
     depends_on:
       mongo:
         condition: service_healthy
@@ -134,6 +134,9 @@ services:
       # connection gives up election and failover awareness, which is why it belongs here in the
       # single-node stack's configuration and not in the server's own defaults.
       TAPSTATE_STORE_MONGO_URI: mongodb://mongo:27017/tapstate?directConnection=true
+      # Durable operator state stays separate from control data. A second deployment sharing this
+      # MongoDB service must choose another name to keep equal pipeline namespaces isolated.
+      TAPSTATE_STORE_MONGO_OPERATOR_STATE_DATABASE: tapstate_nest
       # Pin the connector seed directory to an absolute path. The setting defaults to a path relative to
       # the image's working directory, so it would shift silently if that directory ever moved; naming it
       # in full keeps it fixed to the mount target below, whatever the image's working directory is. This

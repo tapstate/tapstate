@@ -34,6 +34,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * The production {@link ControlPlaneClient}, backed by the JDK HTTP client (no third-party
@@ -118,6 +119,12 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public String serverVersion(URI baseUrl) {
+        ServerVersion detail = serverVersionDetail(baseUrl);
+        return detail == null ? null : detail.version();
+    }
+
+    @Override
+    public ServerVersion serverVersionDetail(URI baseUrl) {
         try {
             HttpRequest request = HttpRequest.newBuilder(endpoint(baseUrl, "/version"))
                     .timeout(probeTimeout)
@@ -128,10 +135,11 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             if (response.statusCode() != 200) {
                 return null;
             }
-            return JsonReader.parse(response.body()) instanceof Map<?, ?> map
-                    && map.get("version") instanceof String version && !version.isBlank()
-                    ? version
-                    : null;
+            if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                    || !(map.get("version") instanceof String version) || version.isBlank()) {
+                return null;
+            }
+            return new ServerVersion(version, grammars(map.get("dslVersions")), storeVersion(map.get("dataVersion")));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return null;
@@ -141,6 +149,36 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // in the probe above, and is no more a failure of the caller's command than a timeout is.
             return null;
         }
+    }
+
+    /**
+     * The grammar list, or null when the server did not send one. Null and empty are kept apart all the
+     * way to the screen: an empty list is a server that accepts no grammar at all, which is a fact worth
+     * printing, and a build too old to carry the field is not the same fact.
+     */
+    private static List<String> grammars(Object reported) {
+        if (!(reported instanceof List<?> list)) {
+            return null;
+        }
+        List<String> grammars = new ArrayList<>(list.size());
+        for (Object item : list) {
+            if (item instanceof String grammar) {
+                grammars.add(grammar);
+            }
+        }
+        return List.copyOf(grammars);
+    }
+
+    /**
+     * The store's schema version. Integers arrive as {@code Long} from the reader, so the range is
+     * checked rather than assumed; one outside it is reported as not said, because no build writes such
+     * a number and a wrong one printed as fact is worse than an honest blank. The endpoint still carries
+     * whatever it really answered, for anyone who needs to see it.
+     */
+    private static Integer storeVersion(Object reported) {
+        return reported instanceof Long value && value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE
+                ? value.intValue()
+                : null;
     }
 
     @Override
@@ -871,11 +909,22 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
-    public LifecycleOutcome lifecycle(URI baseUrl, String credential, String pipelineId, String verb) {
+    public LifecycleOutcome lifecycle(
+            URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + ":" + verb, credential)
-                    .POST(HttpRequest.BodyPublishers.noBody())
-                    .build();
+            // Only a stop has anything to say in a body, and it is refused by the server without one.
+            // The other three send none at all rather than an empty object, which keeps them the
+            // requests they already were.
+            HttpRequest.BodyPublisher body = purgeState == null
+                    ? HttpRequest.BodyPublishers.noBody()
+                    : HttpRequest.BodyPublishers.ofString(
+                            "{\"purgeState\":" + purgeState + "}", StandardCharsets.UTF_8);
+            HttpRequest.Builder builder =
+                    authed(baseUrl, "/api/pipelines/" + pipelineId + ":" + verb, credential).POST(body);
+            if (purgeState != null) {
+                builder = builder.header("Content-Type", "application/json");
+            }
+            HttpRequest request = builder.build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
@@ -948,6 +997,340 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public HistoryOutcome history(
+            URI baseUrl, String credential, String pipelineId, HistoryRequest request) {
+        StringBuilder path = new StringBuilder("/api/pipelines/")
+                .append(urlSegment(pipelineId))
+                .append("/metrics/history?from=")
+                .append(encode(request.from()))
+                .append("&to=")
+                .append(encode(request.to()));
+        if (request.resolution() != null) {
+            path.append("&resolution=").append(encode(request.resolution()));
+        }
+        if (request.limit() != null) {
+            path.append("&limit=").append(request.limit());
+        }
+        request.tables().forEach(table -> path.append("&table=").append(encode(table)));
+        if (request.cursor() != null) {
+            path.append("&cursor=").append(encode(request.cursor()));
+        }
+        ControlResponse response = sharedClient.get(baseUrl, credential, path.toString());
+        return switch (response) {
+            case ControlResponse.Success success -> {
+                HistoryOutcome.Found found = historyFound(success.body());
+                yield found == null ? new HistoryOutcome.Unreachable() : found;
+            }
+            case ControlResponse.Rejected rejected ->
+                    new HistoryOutcome.Rejected(rejected.code(), rejected.message());
+            case ControlResponse.Unreachable ignored -> new HistoryOutcome.Unreachable();
+            default -> new HistoryOutcome.Unreachable();
+        };
+    }
+
+    @Override
+    public ExplainOutcome explain(URI baseUrl, String credential, String pipelineId) {
+        ControlResponse response = sharedClient.get(
+                baseUrl, credential, "/api/pipelines/" + urlSegment(pipelineId) + "/explain");
+        return switch (response) {
+            case ControlResponse.Success success -> {
+                ExplainOutcome.Found found = explanationFound(success.body());
+                yield found == null ? new ExplainOutcome.Unreachable() : found;
+            }
+            case ControlResponse.Rejected rejected ->
+                    new ExplainOutcome.Rejected(rejected.code(), rejected.message());
+            case ControlResponse.Unreachable ignored -> new ExplainOutcome.Unreachable();
+            default -> new ExplainOutcome.Unreachable();
+        };
+    }
+
+    private static HistoryOutcome.Found historyFound(Object body) {
+        if (!(body instanceof Map<?, ?> map)
+                || !(map.get("pipelineId") instanceof String pipelineId)
+                || !(map.get("from") instanceof String from)
+                || !(map.get("to") instanceof String to)
+                || !(map.get("effectiveFrom") instanceof String effectiveFrom)
+                || !(map.get("effectiveTo") instanceof String effectiveTo)
+                || !(map.get("retentionCutoff") instanceof String retentionCutoff)
+                || !(map.get("effectiveResolution") instanceof String effectiveResolution)
+                || !(map.get("status") instanceof String status)
+                || !(map.get("consistency") instanceof String consistency)
+                || !map.containsKey("nextCursor")) {
+            return null;
+        }
+        List<HistoryOutcome.Segment> segments = historySegments(map.get("segments"));
+        List<HistoryOutcome.Gap> gaps = historyGaps(map.get("gaps"));
+        List<HistoryOutcome.Unavailable> unavailable = unavailable(map.get("unavailable"));
+        Object rawCursor = map.get("nextCursor");
+        if (segments == null || gaps == null || unavailable == null
+                || rawCursor != null && !(rawCursor instanceof String)) {
+            return null;
+        }
+        return new HistoryOutcome.Found(pipelineId, from, to, effectiveFrom, effectiveTo,
+                retentionCutoff, effectiveResolution, status, consistency, segments, gaps,
+                unavailable, (String) rawCursor);
+    }
+
+    private static List<HistoryOutcome.Segment> historySegments(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Segment> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> segment)
+                    || !(segment.get("intervalStart") instanceof String start)
+                    || !(segment.get("intervalEnd") instanceof String end)
+                    || !(segment.get("startReason") instanceof String reason)) {
+                return null;
+            }
+            List<HistoryOutcome.Point> points = historyPoints(segment.get("points"));
+            if (points == null) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Segment(start, end, reason, points));
+        }
+        return List.copyOf(out);
+    }
+
+    private static List<HistoryOutcome.Point> historyPoints(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Point> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> point)
+                    || !(point.get("intervalStart") instanceof String start)
+                    || !(point.get("intervalEnd") instanceof String end)) {
+                return null;
+            }
+            HistoryOutcome.Rate records = rate(point, "recordsOut");
+            HistoryOutcome.Rate bytes = rate(point, "bytesOut");
+            List<HistoryOutcome.Lag> lag = historyLag(point.get("lag"));
+            if (lag == null || point.containsKey("recordsOut") && records == null
+                    || point.containsKey("bytesOut") && bytes == null) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Point(start, end, records, bytes, lag));
+        }
+        return List.copyOf(out);
+    }
+
+    private static HistoryOutcome.Rate rate(Map<?, ?> point, String name) {
+        Object raw = point.get(name);
+        if (raw == null) {
+            return null;
+        }
+        if (raw instanceof Map<?, ?> rate
+                && rate.get("delta") instanceof Number delta
+                && rate.get("averageRate") instanceof Number average
+                && rate.get("maxRate") instanceof Number max) {
+            return new HistoryOutcome.Rate(delta, average, max);
+        }
+        return null;
+    }
+
+    private static List<HistoryOutcome.Lag> historyLag(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Lag> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> lag)
+                    || !(lag.get("table") instanceof String table)
+                    || !(lag.get("observedAt") instanceof String observedAt)
+                    || !(lag.get("last") instanceof Number last)
+                    || !(lag.get("max") instanceof Number max)) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Lag(table, observedAt, last.longValue(), max.longValue()));
+        }
+        return List.copyOf(out);
+    }
+
+    private static List<HistoryOutcome.Gap> historyGaps(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Gap> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> gap)
+                    || !(gap.get("intervalStart") instanceof String start)
+                    || !(gap.get("intervalEnd") instanceof String end)
+                    || !(gap.get("reason") instanceof String reason)) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Gap(start, end, reason));
+        }
+        return List.copyOf(out);
+    }
+
+    private static List<HistoryOutcome.Unavailable> unavailable(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<HistoryOutcome.Unavailable> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> unavailable)
+                    || !(unavailable.get("metric") instanceof String metric)) {
+                return null;
+            }
+            Object table = unavailable.get("table");
+            if (table != null && !(table instanceof String)) {
+                return null;
+            }
+            out.add(new HistoryOutcome.Unavailable(metric, (String) table));
+        }
+        return List.copyOf(out);
+    }
+
+    private static ExplainOutcome.Found explanationFound(Object body) {
+        if (!(body instanceof Map<?, ?> map)
+                || !(map.get("pipelineId") instanceof String pipelineId)
+                || !(map.get("state") instanceof String state)
+                || !(map.get("kind") instanceof String kind)
+                || !(map.get("message") instanceof String message)
+                || !(map.get("freshness") instanceof String freshness)
+                || !map.containsKey("next")) {
+            return null;
+        }
+        List<ExplainOutcome.Evidence> evidence = explanationEvidence(map.get("evidence"));
+        List<String> cannotSay = strings(map.get("cannotSay"));
+        Object rawObservedAt = map.get("observedAt");
+        Object rawAge = map.get("observedAgeMillis");
+        if (evidence == null || cannotSay == null
+                || rawObservedAt != null && !(rawObservedAt instanceof String)
+                || rawAge != null && !(rawAge instanceof Number)
+                || (rawObservedAt == null) != (rawAge == null)) {
+            return null;
+        }
+        ExplainOutcome.Next next = explanationNext(map.get("next"));
+        if (map.get("next") != null && next == null) {
+            return null;
+        }
+        ExplainOutcome.Pending pending = explanationPending(map.get("pending"));
+        if (map.get("pending") != null && pending == null) {
+            return null;
+        }
+        return new ExplainOutcome.Found(pipelineId, state, kind, message, (String) rawObservedAt,
+                rawAge == null ? null : ((Number) rawAge).longValue(), freshness,
+                evidence, cannotSay, next, pending);
+    }
+
+    private static List<ExplainOutcome.Evidence> explanationEvidence(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<ExplainOutcome.Evidence> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> evidence)
+                    || !(evidence.get("source") instanceof String source)
+                    || !(evidence.get("field") instanceof String field)
+                    || !evidence.containsKey("value")) {
+                return null;
+            }
+            out.add(new ExplainOutcome.Evidence(source, field, evidence.get("value")));
+        }
+        return List.copyOf(out);
+    }
+
+    private static ExplainOutcome.Next explanationNext(Object raw) {
+        if (raw == null) {
+            return null;
+        }
+        return raw instanceof Map<?, ?> next
+                && next.get("action") instanceof String action
+                && next.get("message") instanceof String message
+                ? new ExplainOutcome.Next(action, message) : null;
+    }
+
+    private static ExplainOutcome.Pending explanationPending(Object raw) {
+        if (raw == null) {
+            return null;
+        }
+        return raw instanceof Map<?, ?> pending && pending.get("reason") instanceof String reason
+                ? new ExplainOutcome.Pending(reason) : null;
+    }
+
+    private static List<String> strings(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<String> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof String value)) {
+                return null;
+            }
+            out.add(value);
+        }
+        return List.copyOf(out);
+    }
+
+    @Override
+    public PositionOutcome position(URI baseUrl, String credential, String pipelineId) {
+        return positionCall(() -> authed(
+                baseUrl, "/api/pipelines/" + pipelineId + "/position", credential).GET().build());
+    }
+
+    @Override
+    public PositionOutcome setPosition(
+            URI baseUrl, String credential, String pipelineId, String document) {
+        return positionCall(() -> authed(baseUrl, "/api/pipelines/" + pipelineId + "/position", credential)
+                .header("Content-Type", "application/json")
+                .PUT(HttpRequest.BodyPublishers.ofString(document, StandardCharsets.UTF_8))
+                .build());
+    }
+
+    /**
+     * The read and the write-back differ only in the request they send: both answer with the same document
+     * and are refused in the same shapes, so one place decides what a body and a status code mean.
+     */
+    private PositionOutcome positionCall(Supplier<HttpRequest> request) {
+        try {
+            HttpResponse<String> response =
+                    send(request.get(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                PositionOutcome.Found found = positionFound(response.body());
+                return found == null ? new PositionOutcome.Unreachable() : found;
+            }
+            Rejection r = rejection(response.body(), "The server refused the request.");
+            return new PositionOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new PositionOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new PositionOutcome.Unreachable();
+        }
+    }
+
+    /**
+     * The document as it arrived, plus the little of it a sentence needs: for each chain, where it now
+     * resumes and which other pipelines read it. Null unless the body is a document with a chains array,
+     * so a 200 from something that is not this server reads as unreachable rather than as an empty answer.
+     */
+    private static PositionOutcome.Found positionFound(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> m) || !(m.get("chains") instanceof List<?> raw)) {
+            return null;
+        }
+        List<PositionOutcome.Chain> chains = new ArrayList<>();
+        for (Object entry : raw) {
+            if (entry instanceof Map<?, ?> chain && chain.get("chainId") instanceof String chainId) {
+                String token = chain.get("resumeFrom") instanceof Map<?, ?> from
+                        && from.get("token") instanceof String value ? value : null;
+                List<String> shared = new ArrayList<>();
+                if (chain.get("sharedWith") instanceof List<?> others) {
+                    for (Object other : others) {
+                        if (other instanceof String id) {
+                            shared.add(id);
+                        }
+                    }
+                }
+                chains.add(new PositionOutcome.Chain(chainId, token, List.copyOf(shared)));
+            }
+        }
+        return new PositionOutcome.Found(body, List.copyOf(chains));
+    }
+
+    @Override
     public SnapshotOutcome snapshot(URI baseUrl, String credential, String pipelineId) {
         try {
             HttpRequest request =
@@ -979,9 +1362,13 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         if (JsonReader.parse(body) instanceof Map<?, ?> m
                 && m.get("pipelineId") instanceof String id
                 && m.get("state") instanceof String state) {
+            // How old the reading is, as the server measured it. Absent on a server that does not report
+            // it and on an observation stored before the time was recorded; both read back null, which
+            // means "nobody can say" and is never replaced by a subtraction against this machine's clock.
+            Long ageMillis = m.get("observedAgeMillis") instanceof Number age ? age.longValue() : null;
             Object rawFailure = m.get("failure");
             if (rawFailure == null) {
-                return new StatusOutcome.Found(id, state);
+                return new StatusOutcome.Found(id, state, null, null, ageMillis);
             }
             if (!(rawFailure instanceof Map<?, ?> failure) || !(failure.get("code") instanceof String code)) {
                 return null;
@@ -989,17 +1376,22 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // The message is the server's rendering of that code; when it is absent the code still names
             // the diagnosis, so it stands in rather than the whole read degrading to unreachable.
             String message = failure.get("message") instanceof String rendered ? rendered : code;
-            return new StatusOutcome.Found(id, state, code, message);
+            return new StatusOutcome.Found(id, state, code, message, ageMillis);
         }
         return null;
     }
 
     /**
      * The metrics decoded from a 200 body's {@code metrics} object, or {@code null} unless the body carries a
-     * string id and a metrics object. Each numeric cell is read as a long; the sibling {@code perTableOffset}
-     * object carries the per-table positions ({@code table -> srcpos}) and is absent until one is acked. Any
-     * non-numeric metrics cell is dropped, so a malformed entry never crashes the read. An empty object is a
-     * legitimate empty (no source wired yet).
+     * string id and a metrics object. Each numeric cell is read as a long; the sibling
+     * {@code targetAckedPosition} object carries how far the target has confirmed writes, per table, and is
+     * absent until one is acked -- or, from a server that predates that name, under the older one. Any non-numeric metrics cell is dropped, so a malformed entry never crashes
+     * the read. An empty object is a legitimate empty (no source wired yet).
+     *
+     * <p>{@code positionsNotCollected} is read from the body rather than known here. Which positions this
+     * product records is the server's fact, and a CLI that carried its own copy would keep saying a position
+     * is not collected for as long as it took to ship a CLI release after the server began collecting it.
+     * An older server sends no such list and reads back as an empty one, which prints nothing extra.
      */
     private static MetricsOutcome.Found metricsFound(String body) {
         if (JsonReader.parse(body) instanceof Map<?, ?> m
@@ -1011,17 +1403,77 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     stats.put(name, value.longValue());
                 }
             }
-            Map<String, String> perTableOffset = new LinkedHashMap<>();
-            if (m.get("perTableOffset") instanceof Map<?, ?> offsets) {
-                for (Map.Entry<?, ?> e : offsets.entrySet()) {
+            Map<String, String> targetAckedPosition = new LinkedHashMap<>();
+            // An older server sends the same map under its former name. Read that when the current name is
+            // absent: without it this CLI reports a position that is acked as "nothing acked yet", which is
+            // exactly the "recorded but empty" against "nobody records it" confusion this face was renamed
+            // to end -- and it would report it against a server that is answering perfectly well.
+            Object acked = m.get("targetAckedPosition") instanceof Map<?, ?> current
+                    ? current : m.get("perTableOffset");
+            if (acked instanceof Map<?, ?> positions) {
+                for (Map.Entry<?, ?> e : positions.entrySet()) {
                     if (e.getKey() instanceof String table && e.getValue() instanceof String position) {
-                        perTableOffset.put(table, position);
+                        targetAckedPosition.put(table, position);
                     }
                 }
             }
-            return new MetricsOutcome.Found(id, stats, perTableOffset);
+            List<String> notCollected = new ArrayList<>();
+            if (m.get("positionsNotCollected") instanceof List<?> names) {
+                for (Object name : names) {
+                    if (name instanceof String named) {
+                        notCollected.add(named);
+                    }
+                }
+            }
+            return new MetricsOutcome.Found(id, stats, targetAckedPosition, notCollected, factPoints(m.get("facts")));
         }
         return null;
+    }
+
+    /**
+     * The single-valued points of the body's {@code facts}, or none from a server that sends no facts. A
+     * point without a value is a distribution, which nothing here reads, and is passed over; a point whose
+     * time does not parse keeps its value and loses its time, which the reader of the time treats as "not
+     * said" rather than as now.
+     */
+    private static List<MetricsOutcome.FactPoint> factPoints(Object rawFacts) {
+        List<MetricsOutcome.FactPoint> points = new ArrayList<>();
+        if (!(rawFacts instanceof List<?> facts)) {
+            return points;
+        }
+        for (Object rawFact : facts) {
+            if (!(rawFact instanceof Map<?, ?> fact) || !(fact.get("name") instanceof String name)
+                    || !(fact.get("points") instanceof List<?> rawPoints)) {
+                continue;
+            }
+            for (Object rawPoint : rawPoints) {
+                if (!(rawPoint instanceof Map<?, ?> point) || !(point.get("value") instanceof Number value)) {
+                    continue;
+                }
+                Map<String, String> attributes = new LinkedHashMap<>();
+                if (point.get("attributes") instanceof Map<?, ?> rawAttributes) {
+                    for (Map.Entry<?, ?> attribute : rawAttributes.entrySet()) {
+                        if (attribute.getKey() instanceof String key && attribute.getValue() instanceof String text) {
+                            attributes.put(key, text);
+                        }
+                    }
+                }
+                points.add(new MetricsOutcome.FactPoint(name, attributes, instantOrNull(point.get("observedAt")),
+                        value.longValue()));
+            }
+        }
+        return points;
+    }
+
+    private static Instant instantOrNull(Object text) {
+        if (!(text instanceof String iso)) {
+            return null;
+        }
+        try {
+            return Instant.parse(iso);
+        } catch (java.time.format.DateTimeParseException malformed) {
+            return null;
+        }
     }
 
     /**
@@ -1046,6 +1498,80 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             return new SnapshotOutcome.Found(id, tables);
         }
         return null;
+    }
+
+    @Override
+    public DerivedSchemaOutcome derivedSchema(URI baseUrl, String credential, String pipelineId) {
+        HttpRequest.Builder request =
+                authed(baseUrl, "/api/pipelines/" + pipelineId + "/derived-schema", credential);
+        return derivedSchemaCall(pipelineId, request.GET().build());
+    }
+
+    @Override
+    public DerivedSchemaOutcome acceptDerivedSchema(URI baseUrl, String credential, String pipelineId) {
+        HttpRequest.Builder request =
+                authed(baseUrl, "/api/pipelines/" + pipelineId + ":accept-derived-schema", credential);
+        return derivedSchemaCall(pipelineId,
+                request.POST(HttpRequest.BodyPublishers.noBody()).build());
+    }
+
+    /**
+     * The read and the accept share this, because they answer with the same body: what a caller wants
+     * back from an accept is the shape now on record, and returning nothing would leave a scripted
+     * accept unable to say what it took.
+     */
+    private DerivedSchemaOutcome derivedSchemaCall(String pipelineId, HttpRequest request) {
+        try {
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                List<RemoteDerivedStep> steps = derivedSteps(response.body());
+                return steps == null
+                        ? new DerivedSchemaOutcome.Unreachable()
+                        : new DerivedSchemaOutcome.Found(pipelineId, steps);
+            }
+            Rejection r = rejection(response.body(), "The server refused the read.");
+            return new DerivedSchemaOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new DerivedSchemaOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new DerivedSchemaOutcome.Unreachable();
+        }
+    }
+
+    /**
+     * The step reports decoded from a 200 body, or {@code null} when the body is not the array of step
+     * objects this contract promises. An empty array is a legitimate empty answer - a pipeline with no
+     * join step derives nothing - and decodes to an empty list rather than to a shape failure.
+     */
+    private static List<RemoteDerivedStep> derivedSteps(String body) {
+        if (!(JsonReader.parse(body) instanceof List<?> reports)) {
+            return null;
+        }
+        List<RemoteDerivedStep> steps = new ArrayList<>();
+        for (Object entry : reports) {
+            if (!(entry instanceof Map<?, ?> report) || !(report.get("step") instanceof String step)) {
+                return null;
+            }
+            List<RemoteDerivedColumn> columns = new ArrayList<>();
+            if (report.get("columns") instanceof List<?> cells) {
+                for (Object cell : cells) {
+                    if (cell instanceof Map<?, ?> c && c.get("column") instanceof String column) {
+                        columns.add(new RemoteDerivedColumn(column, string(c.get("recorded")),
+                                string(c.get("derived")), string(c.get("target"))));
+                    }
+                }
+            }
+            steps.add(new RemoteDerivedStep(step, string(report.get("targetTable")),
+                    Boolean.TRUE.equals(report.get("targetKnown")), columns));
+        }
+        return steps;
+    }
+
+    /** A JSON cell as a string, or null where it is absent - which is what an absent side means here. */
+    private static String string(Object value) {
+        return value instanceof String s ? s : null;
     }
 
     @Override
@@ -1454,8 +1980,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     private static RemoteArtifact artifactOf(Map<?, ?> m) {
         if (m.get("id") instanceof String id && m.get("kind") instanceof String kind) {
             String canonical = m.get("canonicalForm") instanceof String s ? s : null;
+            String contentHash = m.get("contentHash") instanceof String h ? h : null;
             boolean readable = !(m.get("readable") instanceof Boolean b) || b;
-            return new RemoteArtifact(id, kind, canonical, readable);
+            return new RemoteArtifact(id, kind, canonical, contentHash, readable);
         }
         return null;
     }
@@ -1466,7 +1993,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 && m.get("kind") instanceof String kind
                 && m.get("canonicalForm") instanceof String canonical
                 && (!(m.get("readable") instanceof Boolean readable) || readable)) {
-            return new RemoteArtifact(id, kind, canonical);
+            return new RemoteArtifact(id, kind, canonical,
+                    m.get("contentHash") instanceof String h ? h : null, true);
         }
         return null;
     }

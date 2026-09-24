@@ -659,6 +659,76 @@ else
   bad "the stale-admin remedy leaked into an unrelated auth failure (rc=$RUN_RC): $RUN_OUT"
 fi
 
+# A verb the server refused has to stop the run where it was refused, and the session's exit status is
+# the one thing that cannot do it: a rejected line is printed and the read loop takes the next one, so a
+# session in which nothing worked ends exactly the way a healthy one does, with 0. Reported from a
+# from-scratch install of a published release, where a refused connector registration went through to the
+# row-count wait and came out half a minute later as "the two engines were not assembled ... docker
+# compose logs server" -- for a failure several steps earlier that was not the server's. The
+# discriminating part, as in the auth cases above, is that the run below delivers its rows: a check that
+# merely required a non-zero exit would pass on the row count alone.
+#
+# The two shapes a refusal can take are pinned separately, because the script reads them with two
+# different patterns. A failure the CLI can name is a coded diagnostic, and opens with the `error: <code>`
+# header every face of the CLI renders failures with. A refusal whose response body carried no code has
+# none to open with and arrives as the client's own sentence for it, under the same indent a message
+# gets -- which is the shape the reported one took, since all that is known of its body is that nothing
+# in it could be read as a code.
+FAKE_CLI_OUT='  The server refused the connector registration.' run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'were not assembled' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'docker compose logs server'; then
+  ok "a refusal the CLI could not put a code on stops the run where it was refused"
+else
+  bad "an uncoded refusal reached the row count (rc=$RUN_RC): $RUN_OUT"
+fi
+FAKE_CLI_OUT="error: connector.not-registered
+  No connector 'postgres' is registered." run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'were not assembled' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'docker compose logs server'; then
+  ok "a coded refusal in the session's output stops the run too"
+else
+  bad "a coded refusal reached the row count (rc=$RUN_RC): $RUN_OUT"
+fi
+
+FAKE_CLI_OUT='request failed: 127.0.0.1:8080 is unreachable' run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+  ok "an unreachable server stops setup before the row-count wait"
+else
+  bad "a request failure reached the row count (rc=$RUN_RC): $RUN_OUT"
+fi
+
+# A re-run reaches the same START refusal as the real lifecycle machine. Only that
+# exact diagnostic is benign; another failed verb in the session must still stop it.
+FAKE_CLI_OUT="error: lifecycle.illegal-transition
+  Cannot start a pipeline in state RUNNING." run_phase_fakes
+unset FAKE_CLI_OUT
+if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+  ok "an already-running pipeline permits a quickstart re-run"
+else
+  bad "an already-running pipeline rejected the re-run (rc=$RUN_RC): $RUN_OUT"
+fi
+for refusal in 'error: connector.not-registered' \
+               'error: lifecycle.illegal-transition
+  Cannot start a pipeline in state FAILED.' \
+               'request failed: 127.0.0.1:8080 is unreachable'; do
+  FAKE_CLI_OUT="error: lifecycle.illegal-transition
+  Cannot start a pipeline in state RUNNING.
+$refusal" run_phase_fakes
+  unset FAKE_CLI_OUT
+  if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'a verb failed' \
+     && ! printf '%s' "$RUN_OUT" | grep -q 'waiting for the two engines'; then
+    ok "an already-running refusal does not hide $refusal"
+  else
+    bad "another failure was hidden by the re-run exception (rc=$RUN_RC): $RUN_OUT"
+  fi
+done
+
 # A run whose online verbs did not take must fail, loudly and non-zero. The REPL is the reason this
 # needs its own check: an interactive session does not end because one command was rejected, so it
 # exits 0 whether register / apply / start succeeded or errored, and set -e sees nothing wrong. The
@@ -897,29 +967,20 @@ rm -rf "$DROP_DIR"
 # install-smoke.sh covers the installer in isolation. These three cover what only the composed flow can
 # show: the quickstart calls install.sh TWICE (the platform gate, then the real install) and it drops
 # the installer's stdout. Both facts are invisible from install.sh alone.
+#
+# The sink is a fixture, and a fixture that never started is one failure that says so. Reading a port it
+# never published points every case below at an endpoint with no port, and each of them then fails as
+# though the quickstart had sent the wrong thing.
+#
+# The sink and the wait for its port are the installer smoke's, sourced from install/ so a fix lands once.
+# shellcheck source=install/_event-sink.sh
+. "$REPO/install/_event-sink.sh"
 if ! command -v python3 >/dev/null 2>&1; then
   bad "quickstart install event: python3 is needed for the local sink"
+elif ! start_sink; then
+  bad "quickstart install event: the local sink $SINK_FAILURE, so none of the install-event cases ran"
+  stop_sink
 else
-  QBD="$(mktemp -d)"; : > "$QBD/log"
-  python3 - "$QBD" <<'PYEOF' &
-import http.server, os, sys
-d = sys.argv[1]
-class H(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        n = int(self.headers.get('Content-Length') or 0)
-        with open(os.path.join(d, 'log'), 'a') as fh:
-            fh.write(self.rfile.read(n).decode('utf-8', 'replace') + "\n")
-        self.send_response(204); self.end_headers()
-    def log_message(self, *a): pass
-srv = http.server.HTTPServer(('127.0.0.1', 0), H)
-with open(os.path.join(d, 'port'), 'w') as fh:
-    fh.write(str(srv.server_address[1]))
-srv.serve_forever()
-PYEOF
-  QB_PID=$!
-  for _ in $(seq 1 50); do [ -s "$QBD/port" ] && break; sleep 0.1; done
-  QB_URL="http://127.0.0.1:$(cat "$QBD/port")/e"
-
   # like run_prepare, but keeps stdout and stderr apart -- the disclosure case is about which stream
   # a message lands on, so merging them would make that case unable to fail.
   qs_run() {   # $1 stdout file  $2 stderr file
@@ -941,15 +1002,15 @@ PYEOF
       TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
       TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
       TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
-      TAPSTATE_TELEMETRY_URL="$QB_URL" \
+      TAPSTATE_TELEMETRY_URL="$SINK_URL" \
       sh "$DEMO/quickstart.sh" >"$outf" 2>"$errf" )
     rm -rf "$shim"
   }
 
   qs_out="$(mktemp)"; qs_err="$(mktemp)"
-  : > "$QBD/log"
+  : > "$SINK_DIR/log"
   qs_run "$qs_out" "$qs_err"
-  n_events="$(grep -c . "$QBD/log" 2>/dev/null | tr -d ' ')"
+  n_events="$(grep -c . "$SINK_DIR/log" 2>/dev/null | tr -d ' ')"
 
   # exactly one. The platform gate runs install.sh before the install does, so an event fired from
   # anywhere but the completed-install path doubles every quickstart install ever measured -- and the
@@ -958,8 +1019,8 @@ PYEOF
   else bad "quickstart produced $n_events install event(s), expected exactly 1"; fi
 
   # the entry point must be distinguishable, or the two front doors cannot be compared at all
-  if grep -q '"entrypoint":"quickstart"' "$QBD/log"; then ok "the event is tagged entrypoint=quickstart"
-  else bad "event not tagged as quickstart: $(cat "$QBD/log")"; fi
+  if grep -q '"entrypoint":"quickstart"' "$SINK_DIR/log"; then ok "the event is tagged entrypoint=quickstart"
+  else bad "event not tagged as quickstart: $(cat "$SINK_DIR/log")"; fi
 
   # the disclosure has to survive quickstart.sh dropping the installer's stdout. A disclosure written
   # to stdout disappears exactly here, on the path most first-time users take, while install-smoke's
@@ -992,7 +1053,7 @@ PYEOF
   rm -rf "$QS_HOME"
 
   rm -f "$qs_out" "$qs_err"
-  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null
+  stop_sink
 fi
 
 # --- the harness itself must not report installs -----------------------------------------------------

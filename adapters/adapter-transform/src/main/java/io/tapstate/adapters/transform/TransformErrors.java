@@ -2,6 +2,7 @@ package io.tapstate.adapters.transform;
 
 import io.tapstate.core.common.TapstateException;
 
+import java.math.BigDecimal;
 import java.util.Map;
 
 /**
@@ -25,6 +26,12 @@ final class TransformErrors {
         return new TapstateException(TransformError.SCRIPT_COMPILE_FAILED, Map.of("detail", detail(cause)), cause);
     }
 
+    /** An exact decimal that JavaScript would see as zero or infinity rather than its finite value. */
+    static TapstateException scriptDecimalOutOfRange(BigDecimal value) {
+        return new TapstateException(TransformError.SCRIPT_DECIMAL_OUT_OF_RANGE,
+                Map.of("value", value.toString()), null);
+    }
+
     /** A js script with no {@code process(record, ctx)} entry point. */
     static TapstateException scriptNoProcess() {
         return new TapstateException(TransformError.SCRIPT_NO_PROCESS, Map.of(), null);
@@ -38,6 +45,24 @@ final class TransformErrors {
     /** A js script whose output is not a valid record; {@code detail} names what was wrong. */
     static TapstateException scriptOutputInvalid(String detail) {
         return new TapstateException(TransformError.SCRIPT_OUTPUT_INVALID, Map.of("detail", detail), null);
+    }
+
+    /**
+     * An expansion handed an update or a delete whose earlier row is half a row; {@code detail} says
+     * which way it fell short, because the setting that fixes it differs between the two.
+     */
+    static TapstateException unwindNeedsACompleteBeforeImage(String path, String detail) {
+        return new TapstateException(TransformError.UNWIND_NEEDS_A_COMPLETE_BEFORE_IMAGE,
+                Map.of("path", path, "detail", detail), null);
+    }
+
+    /**
+     * Two elements of one row expanding onto the same key. Built and handed to the alert rather than
+     * thrown: the rows are still sent, and this severity means the run carries on.
+     */
+    static TapstateException unwindRowsShareAKey(String path, Object key) {
+        return new TapstateException(TransformError.UNWIND_ROWS_SHARE_A_KEY,
+                Map.of("path", path, "key", String.valueOf(key)), null);
     }
 
     // The developer-facing detail carried as the {detail} argument: the cause's own message, or its

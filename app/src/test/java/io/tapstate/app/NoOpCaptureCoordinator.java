@@ -11,6 +11,6 @@ final class NoOpCaptureCoordinator implements PipelineCaptureCoordinator {
     }
 
     @Override
-    public void stopCapture(String pipelineId) {
+    public void stopCapture(String pipelineId, boolean purgeState) {
     }
 }

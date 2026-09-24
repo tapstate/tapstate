@@ -37,57 +37,93 @@ class MongoSrsMetaStoreTest {
     void metaRoundTripsThroughTheDocumentMapping() {
         SrsMeta meta = new SrsMeta(
                 "orders@mysql-1",
-                "gtid:aaa-1:900",
+                new ChainPosition(new SourceOrder(1L, 900L), "gtid:aaa-1:900"),
                 List.of(
-                        new ConsumerOffset("p1", Map.of("orders", 42L), new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100")),
+                        new ConsumerOffset("p1", Map.of("orders", 42L),
+                                new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100"),
+                                List.of("orders"), "binlog.000042:1024", 1L),
                         new ConsumerOffset("p2", new LinkedHashMap<>(Map.of("orders", 7L, "items", 3L)), null)),
-                "binlog.000042:1024",
                 List.of(
                         new SchemaVersion(0, Map.of("id", "int"), 0),
                         new SchemaVersion(1, new LinkedHashMap<>(Map.of("id", "int", "name", "string")), 12)),
-                "7d",
-                List.of("orders"));
+                "7d");
 
         Document document = MongoSrsMetaStore.toDocument(meta);
 
         assertThat(document.getString("_id")).isEqualTo("orders@mysql-1");
         assertThat(document.getString("sourceReadOffset")).isEqualTo("gtid:aaa-1:900");
-        assertThat(document.getString("cdcStartPosition")).isEqualTo("binlog.000042:1024");
         assertThat(document.getString("retention")).isEqualTo("7d");
-        // consumer cursors keyed by pipeline id, so a per-consumer set targets one path
+        // consumer records keyed by pipeline id, so a per-consumer set targets one path
         assertThat(document.get("consumerOffsets", Document.class)).containsOnlyKeys("p1", "p2");
-        // snapshot completion is per table: this chain has drained orders but not items
-        assertThat(document.getList("snapshotCompletedTables", String.class)).containsExactly("orders");
+        // Snapshot completion is per table and per pipeline: p1 has drained orders, p2 has drained
+        // nothing -- and a consumer that has drained nothing carries no such field at all.
+        assertThat(document.get("consumerOffsets", Document.class)
+                .get("p1", Document.class)
+                .getList("snapshotCompletedTables", String.class)).containsExactly("orders");
+        assertThat(document.get("consumerOffsets", Document.class)
+                .get("p1", Document.class)
+                .getString("cdcStartPosition")).isEqualTo("binlog.000042:1024");
+        assertThat(document.get("consumerOffsets", Document.class)
+                .get("p1", Document.class)
+                .getLong("snapshotEpoch")).isEqualTo(1L);
+        assertThat(document.get("consumerOffsets", Document.class).get("p2", Document.class))
+                .doesNotContainKey("snapshotCompletedTables");
+        assertThat(document).doesNotContainKey("snapshotCompletedTables");
+        assertThat(document).doesNotContainKeys("cdcStartPosition", "snapshotEpoch");
         assertThat(MongoSrsMetaStore.toMeta(document)).isEqualTo(meta);
     }
 
     @Test
     void snapshotCompleteAddsToSetSoARepeatedMarkDoesNotDuplicateTheTable() {
-        Document update = MongoSrsMetaStore.snapshotCompleteUpdate("orders");
+        Document update = MongoSrsMetaStore.snapshotCompleteUpdate("p1", "orders");
 
         // $addToSet, not $push: a re-run of a table's snapshot (a restart mid-backfill, a replay) marks the
         // same table again, and the mark is a set membership question -- "has this table drained?" -- so a
         // second mark must be a no-op rather than a second entry.
-        assertThat(update).isEqualTo(new Document("$addToSet", new Document("snapshotCompletedTables", "orders")));
+        //
+        // The containing document is scoped to the marking pipeline. Writing the mark in the chain document
+        // instead is what let another pipeline read the first one's answer and skip a load it had never done.
+        assertThat(update).isEqualTo(new Document("$addToSet",
+                new Document("snapshotCompletedTables", "orders")));
     }
 
     @Test
-    void toMetaOnADocumentWrittenBeforeSnapshotCompletionExistedReadsBackAsNoTableCompleted() {
-        // The meta field set is append-only and a newer reader must stay compatible with a document written
-        // before the field existed. Absence is not corruption here: it reads as "no table has been marked",
-        // which is exactly what a chain snapshotted by an older build had recorded.
+    void toMetaOnAConsumerWithNoCompletionFieldReadsBackAsNoTableCompleted() {
+        // A consumer record is created by whichever of its three writers gets there first, and the two
+        // position writers create it without this field. Absence is not corruption: it reads as "this
+        // pipeline has marked nothing", which is what a consumer that has only ever read records.
         Document old = new Document("_id", "chain")
-                .append("consumerOffsets", new Document())
+                .append("consumerOffsets", new Document("p1", new Document("perTableSeq", new Document())))
                 .append("schemaHistory", List.of());
 
         SrsMeta meta = MongoSrsMetaStore.toMeta(old);
 
-        assertThat(meta.snapshotCompletedTables()).isEmpty();
+        assertThat(meta.snapshotCompletedTables("p1")).isEmpty();
+        assertThat(meta.snapshotCompletedTables("never-a-consumer")).isEmpty();
+    }
+
+    /**
+     * A consumer's completion set round-trips on its own, without any position beside it.
+     *
+     * <p>The three writers of a consumer record are independent, so the shape where only this one has
+     * written is real rather than hypothetical: a sink can confirm a snapshot table before the reader has
+     * published any per-table cursor and before any change has been acked.
+     */
+    @Test
+    void aConsumerWithOnlyCompletionMarksRoundTrips() {
+        SrsMeta meta = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset("p1", Map.of(), null, List.of("orders", "items"))),
+                List.of(), null);
+
+        SrsMeta back = MongoSrsMetaStore.toMeta(MongoSrsMetaStore.toDocument(meta));
+
+        assertThat(back.snapshotCompletedTables("p1")).containsExactly("orders", "items");
+        assertThat(back).isEqualTo(meta);
     }
 
     @Test
     void seedMetaRoundTripsWithNoOffsetsConsumersOrSchema() {
-        SrsMeta seed = new SrsMeta("chain", null, List.of(), null, List.of(), null);
+        SrsMeta seed = new SrsMeta("chain", null, List.of(), List.of(), null);
 
         Document document = MongoSrsMetaStore.toDocument(seed);
 
@@ -116,6 +152,26 @@ class MongoSrsMetaStoreTest {
     }
 
     @Test
+    void toMetaNamesWhicheverOfTheThreeStructuralFieldsIsActuallyAtFault() {
+        // one guard, three grounds. Naming the field of a ground that did not fire points the operator
+        // at a field that is intact, and leaves the one actually missing named nowhere at all.
+        Document noId = new Document("consumerOffsets", new Document()).append("schemaHistory", List.of());
+        Document noConsumers = new Document("_id", "chain").append("schemaHistory", List.of());
+        Document noSchema = new Document("_id", "chain").append("consumerOffsets", new Document());
+
+        assertThat(faultField(noId)).isEqualTo("_id");
+        assertThat(faultField(noConsumers)).isEqualTo("consumerOffsets");
+        assertThat(faultField(noSchema)).isEqualTo("schemaHistory");
+    }
+
+    /** The field a refused read blames, for a document that cannot be reconstructed. */
+    private static String faultField(Document document) {
+        Throwable thrown = catchThrowable(() -> MongoSrsMetaStore.toMeta(document));
+        assertThat(thrown).isInstanceOf(TapstateException.class);
+        return String.valueOf(((TapstateException) thrown).args().get("field"));
+    }
+
+    @Test
     void createDuplicateKeyIsAnOrderingErrorAndOtherWriteFailuresAreCodedIo() {
         // a duplicate _id (re-seed) is a caller ordering error, surfaced bare; any other driver write
         // failure during the seed is a coded io diagnostic. Witnessed deterministically, without a
@@ -135,13 +191,12 @@ class MongoSrsMetaStoreTest {
     @Test
     void consumerReadSeqUpdateTargetsOnlyThatTablesCursorPathNotTheWholeConsumer() {
         // The reader's per-table cursor advance is a path-scoped $set: it touches only
-        // consumerOffsets.<pipelineId>.perTableSeq.<table>, so a reader advancing its cursor never clobbers
-        // the sink-acked position the sink writes to the same consumer document -- the two are independent
-        // writers on one consumer record.
+        // perTableSeq.<table> in that pipeline's document, so a reader advancing its cursor never clobbers
+        // the sink-acked position the sink writes there -- the two are independent writers.
         Document update = MongoSrsMetaStore.consumerReadSeqUpdate("p1", "orders", 42L);
 
         assertThat(update.get("$set", Document.class))
-                .containsExactly(Map.entry("consumerOffsets.p1.perTableSeq.orders", 42L));
+                .containsExactly(Map.entry("perTableSeq.orders", 42L));
     }
 
     @Test
@@ -154,22 +209,25 @@ class MongoSrsMetaStoreTest {
         Document update = MongoSrsMetaStore.sinkAckedUpdate("p1", new ChainPosition(new SourceOrder(1, 99), "gtid:aaa-1:99"));
 
         assertThat(update.get("$set", Document.class)).containsOnly(
-                Map.entry("consumerOffsets.p1.sinkAckedEpoch", 1L),
-                Map.entry("consumerOffsets.p1.sinkAckedSeq", 99L),
-                Map.entry("consumerOffsets.p1.sinkAckedSrcpos", "gtid:aaa-1:99"));
+                Map.entry("sinkAckedEpoch", 1L),
+                Map.entry("sinkAckedSeq", 99L),
+                Map.entry("sinkAckedSrcpos", "gtid:aaa-1:99"));
     }
 
     @Test
-    void detachConsumerUpdateUnsetsOnlyThatConsumersEntryAndNothingElseOnTheChain() {
-        // A detach is a path-scoped $unset of consumerOffsets.<pipelineId>: it removes the departing
-        // consumer's whole entry -- not its positions -- so the consumer stops being folded into the two
-        // minimums taken over every consumer, while the chain's own offsets, schema history and every
-        // other consumer's cursor are outside the path and survive untouched.
-        Document update = MongoSrsMetaStore.detachConsumerUpdate("p1");
+    void sinkAckedUpdateClearsAStoredTokenWhenThePositionCarriesNone() {
+        // A change the source stated no position for is acked by its order alone. The token an earlier,
+        // lower position stored has to go with it: the two halves are read back as one position, so leaving
+        // it pairs this order with a token from beneath it. That pair is what the source-read advance both
+        // ranks and writes down -- the chain's offset would move to this order carrying the older token,
+        // and a real token arriving in between is then refused as a rewind against the inflated order.
+        Document update = MongoSrsMetaStore.sinkAckedUpdate("p1", new ChainPosition(new SourceOrder(1, 99), null));
 
+        assertThat(update.get("$set", Document.class)).containsOnly(
+                Map.entry("sinkAckedEpoch", 1L),
+                Map.entry("sinkAckedSeq", 99L));
         assertThat(update.get("$unset", Document.class))
-                .containsExactly(Map.entry("consumerOffsets.p1", ""));
-        assertThat(update.keySet()).containsExactly("$unset");
+                .containsExactly(Map.entry("sinkAckedSrcpos", ""));
     }
 
     @Test

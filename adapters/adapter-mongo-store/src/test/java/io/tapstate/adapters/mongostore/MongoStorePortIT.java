@@ -5,6 +5,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.DesiredState;
@@ -16,10 +17,12 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.NestDeadLetterRecord;
+import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -32,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Witnesses the aggregated store port against a real Mongo replica-set: one write through each of the
@@ -47,6 +51,9 @@ class MongoStorePortIT {
 
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final DslParser PARSER = new DslParser();
+    private static final String OPERATOR_STATE_DATABASE = "tapstate_nest";
+    private static final String OPERATOR_STATE_DATABASE_A = "operator_state_route_a";
+    private static final String OPERATOR_STATE_DATABASE_B = "operator_state_route_b";
 
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
@@ -61,21 +68,25 @@ class MongoStorePortIT {
             """;
 
     @Test
-    void aggregatesTheTenSubStoresEachOnItsOwnStorage() {
+    void aggregatesTheElevenSubStoresEachOnItsOwnStorage() {
         // The Testcontainers Mongo speaks plaintext; TLS is opt-in, so a plaintext URL connects with
         // no flag. TLS wiring itself is covered by MongoConnectionTest.
         String uri = REPLICA_SET.getReplicaSetUrl();
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection);
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            dropAggregateStorage(uri);
 
-            // one write through each of the ten sub-stores
+            // one write through each of the eleven sub-stores
             port.artifacts().save(PARSER.parse(ORDERS));
             port.state().create("orders_sync", "{\"phase\":\"snapshot\"}", Instant.parse("2026-07-06T00:00:00Z"));
             port.desired().save(new DesiredState("orders_sync", PipelineState.RUNNING, "rev-abc"));
             port.observations().save(new Observation("orders_sync", PipelineState.RUNNING,
                     Map.of(), Map.of(), Map.of("orders", "w7")));
+            port.layouts().save(new PipelineLayout("orders_sync",
+                    Map.of("source:orders", new PipelineLayout.NodePosition(80, 120)),
+                    new PipelineLayout.Viewport(0, 0, 1)));
             port.catalog().save(new ConnectionConfig("mysql-local", "mysql", Map.of("host", "localhost")));
             port.schemas().save(new DiscoveredSourceModel("mysql-local", "mysql", 1783998000000L, new SourceModel(List.of(
                     new SourceTable("orders", List.of(), List.of(), List.of())))));
@@ -96,6 +107,8 @@ class MongoStorePortIT {
             assertThat(port.desired().read("orders_sync")).isPresent();
             assertThat(port.observations().read("orders_sync"))
                     .hasValueSatisfying(observation -> assertThat(observation.positions()).containsEntry("orders", "w7"));
+            assertThat(port.layouts().get("orders_sync"))
+                    .hasValueSatisfying(layout -> assertThat(layout.nodes()).containsKey("source:orders"));
             assertThat(port.catalog().get("mysql-local")).isPresent();
             assertThat(port.schemas().get("mysql-local")).isPresent();
             assertThat(port.connectors().list()).hasSize(1);
@@ -111,8 +124,11 @@ class MongoStorePortIT {
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_STATE).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_DESIRED).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isEqualTo(1);
+                assertThat(database.getCollection(MongoStorePort.PIPELINE_LAYOUTS).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.CONNECTIONS).countDocuments()).isEqualTo(1);
-                assertThat(database.getCollection(MongoStorePort.SOURCE_SCHEMAS).countDocuments()).isEqualTo(1);
+                // Two, not one: a discovery is an envelope naming the generation plus a document per table it
+                // found - the single table saved above. It still says the model landed here and nowhere else.
+                assertThat(database.getCollection(MongoStorePort.SOURCE_SCHEMAS).countDocuments()).isEqualTo(2);
                 assertThat(database.getCollection(MongoStorePort.CONNECTOR_ARTIFACTS + ".files").countDocuments())
                         .isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.CONNECTOR_SPECS).countDocuments()).isEqualTo(1);
@@ -126,9 +142,8 @@ class MongoStorePortIT {
     /**
      * Operator state is the one sub-store that does not live beside the others. It is the working state of
      * a running job rather than anything an operator configured, and it is written at event rates, so it
-     * is kept out of the database holding the configuration - named here by the literal rather than by the
-     * constant, because the name is the contract: two Tapstate installs pointed at one Mongo are meant to
-     * find the same one.
+     * is kept out of the database holding the configuration. This case passes the compatible default
+     * explicitly because selecting that name belongs to the assembly root, not to the adapter.
      */
     @Test
     void nestStateLandsInItsOwnDatabaseRatherThanTheOneHoldingPipelineConfiguration() {
@@ -136,7 +151,7 @@ class MongoStorePortIT {
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection);
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
 
             port.keyedState().save("nest.orders_sync.assemble.items", "k1",
                     "held-child".getBytes(StandardCharsets.UTF_8));
@@ -144,7 +159,7 @@ class MongoStorePortIT {
             assertThat(port.keyedState().load("nest.orders_sync.assemble.items", "k1")).isPresent();
             String configured = new ConnectionString(uri).getDatabase();
             try (MongoClient raw = MongoClients.create(uri)) {
-                assertThat(raw.getDatabase("tapstate_nest")
+                assertThat(raw.getDatabase(OPERATOR_STATE_DATABASE)
                         .getCollection(MongoStorePort.OPERATOR_STATE).countDocuments()).isEqualTo(1);
                 assertThat(raw.getDatabase(configured)
                         .getCollection(MongoStorePort.OPERATOR_STATE).countDocuments()).isZero();
@@ -163,7 +178,7 @@ class MongoStorePortIT {
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection);
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
 
             port.nestDeadLetters().record(new NestDeadLetterRecord("nest.orders_sync.assemble.items",
                     "[\"items\"]#[1]~i", "mysql-a", "1:1", 0L, 9_000L, Map.of("id", 1)));
@@ -171,11 +186,65 @@ class MongoStorePortIT {
             assertThat(port.nestDeadLetters().read("nest.orders_sync.assemble.items", 10)).hasSize(1);
             String configured = new ConnectionString(uri).getDatabase();
             try (MongoClient raw = MongoClients.create(uri)) {
-                assertThat(raw.getDatabase("tapstate_nest")
+                assertThat(raw.getDatabase(OPERATOR_STATE_DATABASE)
                         .getCollection(MongoStorePort.NEST_DEAD_LETTERS).countDocuments()).isEqualTo(1);
                 assertThat(raw.getDatabase(configured)
                         .getCollection(MongoStorePort.NEST_DEAD_LETTERS).countDocuments()).isZero();
             }
+        }
+    }
+
+    @Test
+    void onePortRoutesAStateAndItsDeadLettersToTheSelectedDatabase() {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+        try (MongoConnection connection = new MongoConnection(settings)) {
+            connection.verify();
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            try (MongoClient raw = MongoClients.create(uri)) {
+                raw.getDatabase(OPERATOR_STATE_DATABASE_A).drop();
+                raw.getDatabase(OPERATOR_STATE_DATABASE_B).drop();
+            }
+
+            String namespace = "nest.orders.order_doc.$root";
+            var first = port.operatorStateStores().inDatabase(OPERATOR_STATE_DATABASE_A);
+            var second = port.operatorStateStores().inDatabase(OPERATOR_STATE_DATABASE_B);
+            first.state().save(namespace, "same-key", "first".getBytes(StandardCharsets.UTF_8));
+            first.deadLetters().record(new NestDeadLetterRecord(
+                    namespace, "same-element", "mysql-a", "1:1", 0L, 9_000L, Map.of("id", 1)));
+
+            assertThat(first.state().load(namespace, "same-key")).isPresent();
+            assertThat(first.deadLetters().read(namespace, 10)).hasSize(1);
+            assertThat(second.state().load(namespace, "same-key")).isEmpty();
+            assertThat(second.deadLetters().read(namespace, 10)).isEmpty();
+
+            second.state().save(namespace, "same-key", "second".getBytes(StandardCharsets.UTF_8));
+            second.deadLetters().record(new NestDeadLetterRecord(
+                    namespace, "same-element", "mysql-b", "1:1", 0L, 9_001L, Map.of("id", 1)));
+            assertThat(new String(first.state().load(namespace, "same-key").orElseThrow(),
+                    StandardCharsets.UTF_8)).isEqualTo("first");
+            assertThat(new String(second.state().load(namespace, "same-key").orElseThrow(),
+                    StandardCharsets.UTF_8)).isEqualTo("second");
+
+            first.state().dropNamespace(namespace);
+            first.deadLetters().dropNamespace(namespace);
+            assertThat(second.state().load(namespace, "same-key")).isPresent();
+            assertThat(second.deadLetters().read(namespace, 10)).hasSize(1);
+        }
+    }
+
+    @Test
+    void aPerNestDatabaseUsesTheSameStartupValidationAsTheDeploymentDefault() {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+        try (MongoConnection connection = new MongoConnection(settings)) {
+            connection.verify();
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+
+            assertThatThrownBy(() -> port.operatorStateStores().inDatabase("local"))
+                    .isInstanceOf(TapstateException.class)
+                    .extracting(thrown -> ((TapstateException) thrown).code().code())
+                    .isEqualTo("store.invalid-operator-state-database");
         }
     }
 
@@ -185,7 +254,7 @@ class MongoStorePortIT {
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection);
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
             // The suite shares one replica-set across tests, so the counts below only mean what they say
             // once this test owns these four collections outright.
             dropLifecycleStorage(uri);
@@ -213,8 +282,10 @@ class MongoStorePortIT {
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_STATE).countDocuments()).isZero();
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_DESIRED).countDocuments()).isZero();
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isZero();
-                // The chain is shared, so it stays — with only the departing consumer taken off it.
-                assertThat(database.getCollection(MongoStorePort.SRS_META).countDocuments()).isEqualTo(1);
+                // The chain is shared, so its root stays, as does the surviving cursor in its own storage.
+                assertThat(database.getCollection(MongoStorePort.SRS_META)
+                        .countDocuments(new Document("_id", "orders@mysql-1"))).isEqualTo(1);
+                assertThat(database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).countDocuments()).isEqualTo(1);
             }
             assertThat(port.meta().read("orders@mysql-1").orElseThrow().consumerOffsets())
                     .containsExactly(new ConsumerOffset("survivor", Map.of("orders", 9L),
@@ -230,6 +301,29 @@ class MongoStorePortIT {
             database.getCollection(MongoStorePort.PIPELINE_DESIRED).drop();
             database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).drop();
             database.getCollection(MongoStorePort.SRS_META).drop();
+            database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).drop();
+        }
+    }
+
+    /** Empties every configuration collection asserted by the aggregate-store witness. */
+    private static void dropAggregateStorage(String uri) {
+        try (MongoClient raw = MongoClients.create(uri)) {
+            MongoDatabase database = raw.getDatabase(new ConnectionString(uri).getDatabase());
+            List.of(
+                    MongoStorePort.ARTIFACTS,
+                    MongoStorePort.PIPELINE_STATE,
+                    MongoStorePort.PIPELINE_DESIRED,
+                    MongoStorePort.PIPELINE_OBSERVATION,
+                    MongoStorePort.PIPELINE_LAYOUTS,
+                    MongoStorePort.CONNECTIONS,
+                    MongoStorePort.SOURCE_SCHEMAS,
+                    MongoStorePort.CONNECTOR_ARTIFACTS + ".files",
+                    MongoStorePort.CONNECTOR_ARTIFACTS + ".chunks",
+                    MongoStorePort.CONNECTOR_SPECS,
+                    MongoStorePort.CONNECTION_TEST_RESULTS,
+                    MongoStorePort.SRS_META,
+                    MongoStorePort.SRS_CONSUMER_OFFSETS
+            ).forEach(collection -> database.getCollection(collection).drop());
         }
     }
 }

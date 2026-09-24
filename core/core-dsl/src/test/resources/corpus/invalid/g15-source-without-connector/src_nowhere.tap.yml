@@ -1,0 +1,8 @@
+# Invalid: connector: is required on every source — it names what the config configures, and no
+# other field implies it. Left out, the resource says where to connect but not what with.
+version: tapstate/v1
+kind: source
+id: src_nowhere
+config: { host: 10.0.0.1, username: reader, password: Db_2026 }
+mode: cdc
+tables: [ orders ]

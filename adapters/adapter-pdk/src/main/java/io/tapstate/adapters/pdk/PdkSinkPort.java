@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkPort;
 import io.tapstate.spi.sink.SinkWriter;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 import io.tapstate.spi.sink.TargetTable;
 import java.util.Map;
@@ -18,9 +19,16 @@ import java.util.Map;
 public final class PdkSinkPort implements SinkPort {
 
     private final ConnectorProvisioner provisioner;
+    private final KeyedStateStore stateStore;
 
+    /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkSinkPort(ConnectorProvisioner provisioner) {
+        this(provisioner, null);
+    }
+
+    public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore) {
         this.provisioner = provisioner;
+        this.stateStore = stateStore;
     }
 
     @Override
@@ -31,7 +39,8 @@ public final class PdkSinkPort implements SinkPort {
 
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
         PdkConnector connector = PdkConnector.open(
-                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
+                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
+                config.node(), stateStore);
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());
@@ -44,6 +53,9 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 return null;
             });
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore);
+            writer.prepareTargets();
+            return writer;
         } catch (TapstateException e) {
             connector.stopQuietly();
             connector.close();
@@ -53,10 +65,6 @@ public final class PdkSinkPort implements SinkPort {
             connector.close();
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         }
-        // Optional: a store that cannot create indexes simply is not asked to. The target model still
-        // states what the table should have, so nothing about the write path changes when it is absent.
-        return new PdkSinkWriter(connector, write, config.writeMode(), config.ddl(), targets,
-                connector.functions().getCreateIndexFunction());
     }
 
     private static WriteRecordFunction requireWriteFunction(WriteRecordFunction function) {

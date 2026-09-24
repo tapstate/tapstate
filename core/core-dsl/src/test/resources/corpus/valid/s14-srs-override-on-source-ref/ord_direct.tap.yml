@@ -1,0 +1,12 @@
+# Single source carrying a switch of its own: X13's scalar sugar does not apply, so canonical
+# is a one-element list of the object form rather than a map keyed by source id.
+version: tapstate/v1
+kind: pipeline
+id: ord_direct
+source:
+  - { id: src_ord, srs: false }
+view:
+  id: ord_direct
+  from: orders
+  primary_key: id
+  storage: { warm: { collection: ord_direct } }

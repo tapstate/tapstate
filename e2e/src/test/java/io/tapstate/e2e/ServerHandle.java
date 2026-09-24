@@ -19,6 +19,9 @@ interface ServerHandle extends AutoCloseable {
     /** The product setting naming where it stages the connector artifacts it resolves. */
     String PLUGINS_DIRECTORY_SETTING = "tapstate.connectors.plugins-dir";
 
+    /** The product setting naming the database that holds durable operator state. */
+    String OPERATOR_STATE_DATABASE_SETTING = "tapstate.store.mongo.operator-state-database";
+
     /**
      * The product setting naming further connector ids the register path accepts. The harness supplies
      * its own synthetic connector, which is by construction not one this release supports, so a server

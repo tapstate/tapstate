@@ -30,6 +30,8 @@ class ConnectorErrorTest {
     void codesAreTheExpectedCanonicalStrings() {
         assertThat(ConnectorError.LOAD_FAILED.code()).isEqualTo("connector.load-failed");
         assertThat(ConnectorError.CLASS_NOT_FOUND.code()).isEqualTo("connector.class-not-found");
+        assertThat(ConnectorError.LOGMINER_IDENTIFIER_TOO_LONG.code())
+                .isEqualTo("connector.logminer-identifier-too-long");
         assertThat(ConnectorError.API_LEVEL_INCOMPATIBLE.code()).isEqualTo("connector.api-level-incompatible");
         assertThat(ConnectorError.API_LEVEL_UNKNOWN.code()).isEqualTo("connector.api-level-unknown");
         assertThat(ConnectorError.PROJECTION_FAILED.code()).isEqualTo("connector.projection-failed");
@@ -43,6 +45,8 @@ class ConnectorErrorTest {
     void placeholdersAreDeclaredPerCode() {
         assertThat(ConnectorError.LOAD_FAILED.placeholders()).isEqualTo(Set.of("connector"));
         assertThat(ConnectorError.CLASS_NOT_FOUND.placeholders()).isEqualTo(Set.of("connector", "class"));
+        assertThat(ConnectorError.LOGMINER_IDENTIFIER_TOO_LONG.placeholders())
+                .isEqualTo(Set.of("connector", "kind", "identifier", "limit"));
         assertThat(ConnectorError.API_LEVEL_INCOMPATIBLE.placeholders())
                 .isEqualTo(Set.of("connector", "required", "provided"));
         assertThat(ConnectorError.API_LEVEL_UNKNOWN.placeholders()).isEqualTo(Set.of("connector", "version"));

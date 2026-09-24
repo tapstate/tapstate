@@ -6,14 +6,23 @@ import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
+import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.OperatorStateStore;
+import io.tapstate.spi.store.OperatorStateStores;
+import io.tapstate.spi.store.RateHistoryStore;
+import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
+import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * In-memory {@link StorePort} for the assembly-layer tests: it supplies real desired, state and observation
@@ -26,11 +35,30 @@ final class InMemoryStorePort implements StorePort {
     private final InMemoryDesiredStore desired = new InMemoryDesiredStore();
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final InMemoryObservationStore observations = new InMemoryObservationStore();
+    private final InMemoryRateHistoryStore rateHistory = new InMemoryRateHistoryStore();
     private final InMemoryArtifactStore artifacts;
     private final InMemorySrsMetaStore meta = new InMemorySrsMetaStore();
+    private final InMemorySrsLogStore srsLog = new InMemorySrsLogStore();
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
+    private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
     private final InMemoryKeyedStateStore keyedState = new InMemoryKeyedStateStore();
     private final InMemoryNestDeadLetterStore nestDeadLetters = new InMemoryNestDeadLetterStore();
+    private final Map<String, OperatorStateStore> operatorStateByDatabase = new LinkedHashMap<>();
+    private final OperatorStateStores operatorStateStores = new OperatorStateStores() {
+        @Override
+        public String defaultDatabase() {
+            return "default";
+        }
+
+        @Override
+        public OperatorStateStore inDatabase(String database) {
+            if (defaultDatabase().equals(database)) {
+                return new OperatorStateStore(keyedState, nestDeadLetters);
+            }
+            return operatorStateByDatabase.computeIfAbsent(database, ignored -> new OperatorStateStore(
+                    new InMemoryKeyedStateStore(), new InMemoryNestDeadLetterStore()));
+        }
+    };
 
     InMemoryStorePort() {
         this(new InMemoryArtifactStore());
@@ -56,13 +84,33 @@ final class InMemoryStorePort implements StorePort {
     }
 
     @Override
+    public RateHistoryStore rateHistory() {
+        return rateHistory;
+    }
+
+    @Override
     public ObservationStore observations() {
         return observations;
     }
 
     @Override
+    public PipelineLayoutStore layouts() {
+        throw new UnsupportedOperationException("pipeline layouts are not exercised by this assembly test");
+    }
+
+    @Override
     public SrsMetaStore meta() {
         return meta;
+    }
+
+    @Override
+    public SrsLogStore srsLog() {
+        return srsLog;
+    }
+
+    @Override
+    public DerivedSchemaStore derivedSchemas() {
+        return derivedSchemas;
     }
 
     @Override
@@ -76,12 +124,22 @@ final class InMemoryStorePort implements StorePort {
     }
 
     @Override
+    public OperatorStateStores operatorStateStores() {
+        return operatorStateStores;
+    }
+
+    @Override
     public CatalogStore catalog() {
         throw new UnsupportedOperationException("catalog is not exercised by the convergence wiring test");
     }
 
     @Override
     public SchemaStore schemas() {
+        return schemas;
+    }
+
+    /** The schema store as the double it is, for a case that counts how often a discovery is read. */
+    InMemorySchemaStore schemaStore() {
         return schemas;
     }
 

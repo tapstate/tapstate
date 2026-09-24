@@ -39,10 +39,65 @@ enum ActuationError implements TapstateErrorCode {
     SOURCE_TABLE_REGEX_INVALID("actuation.source-table-regex-invalid", Set.of("source", "regex")),
 
     /** A bare table name is selected by several sources; {@code sources} lists the conflicting source ids. */
+    UNWIND_PARENT_KEY_UNRESOLVED("actuation.unwind-parent-key-unresolved", Set.of("step", "stream", "reason")),
     SOURCE_TABLE_AMBIGUOUS("actuation.source-table-ambiguous", Set.of("table", "sources")),
 
     /** A table object carries settings the current capture path does not implement; fields lists their names. */
     SOURCE_TABLE_SPEC_UNSUPPORTED("actuation.source-table-spec-unsupported", Set.of("source", "table", "fields")),
+
+    /**
+     * A join's driving source declares no key, so nothing identifies the row a change is about;
+     * {@code step} is the join step and {@code table} the table it is driven from. Every row a join
+     * mirrors and every entry in its reverse index is filed under that key, so without one two
+     * different rows land in one entry - which is not an error anywhere, it simply builds the wide row
+     * out of whichever of them was written last.
+     */
+    JOIN_SOURCE_KEY_MISSING("actuation.join-source-key-missing", Set.of("step", "table")),
+
+    /**
+     * A join's SQL names a source by the table it stands for, where the step declared an alias for that
+     * table; {@code step} is the join step and {@code name} the spelling the SQL used. Both spellings
+     * are legal SQL here and both derive, but only a declared alias reaches the topology - the vertex
+     * wiring resolves each source through the step's own from-map - so this one has nothing behind it.
+     * Refused while the SQL is being read, because the failure it reaches otherwise is an internal one
+     * at start, naming a concept the author never wrote.
+     */
+    JOIN_SOURCE_NOT_DECLARED("actuation.join-source-not-declared", Set.of("step", "name")),
+
+    /**
+     * A join's SELECT does not publish the driving table's key, so nothing identifies a result row;
+     * {@code step} is the join step, {@code table} the driving table and {@code column} the key column
+     * missing from the projection. A target keyed on anything less collapses rows the SQL says are
+     * distinct, and the collapse is invisible: the write succeeds and the target holds fewer rows than
+     * it should with no error anywhere. A column reaching the output only through an expression does
+     * not publish it - the value is a function of the key, and a function need not be injective.
+     */
+    JOIN_OUTPUT_KEY_NOT_PUBLISHED("actuation.join-output-key-not-published",
+            Set.of("step", "table", "column")),
+
+    /**
+     * A join's output columns no longer match the ones it was recorded producing, and its sources are
+     * what moved: {@code pipeline} and {@code step} name the join, and {@code added} / {@code removed} /
+     * {@code retyped} carry the difference. Ordinary in a change-data product - a column widened, a
+     * type changed - and the operator's to rule on, which is why it is told apart from the same
+     * difference arriving for our reasons ({@link #JOIN_OUTPUT_SCHEMA_ENGINE_CHANGED}). Refused rather
+     * than written through: the target was built for the recorded shape, so the writes succeed and
+     * whatever no longer fits is truncated or rounded with nothing reporting it.
+     */
+    JOIN_OUTPUT_SCHEMA_SOURCE_CHANGED("actuation.join-output-schema-source-changed",
+            Set.of("pipeline", "step", "added", "removed", "retyped")),
+
+    /**
+     * A join's output columns no longer match the ones it was recorded producing, and neither the query
+     * nor the source columns moved - so what changed is how we work them out: {@code pipeline} and
+     * {@code step} name the join, {@code added} / {@code removed} / {@code retyped} carry the
+     * difference, and {@code recordedBy} / {@code nowBy} name the derivation on each side. This is our
+     * compatibility break rather than the operator's, and it should have been caught by the derivation
+     * goldens long before it reached anybody; reaching a user at all means one of them is missing the
+     * shape that moved.
+     */
+    JOIN_OUTPUT_SCHEMA_ENGINE_CHANGED("actuation.join-output-schema-engine-changed",
+            Set.of("pipeline", "step", "added", "removed", "retyped", "recordedBy", "nowBy")),
 
     /** A serve.from regex is invalid; {@code regex} carries the expression. */
     FROM_REGEX_INVALID("actuation.from-regex-invalid", Set.of("regex")),
@@ -77,13 +132,13 @@ enum ActuationError implements TapstateErrorCode {
     VIEW_STORE_UNREACHABLE("actuation.view-store-unreachable", Set.of("store", "reason")),
 
     /**
-     * A view's declared key is not the identity of what feeds it; {@code view} is its id, {@code key}
-     * the view's key, {@code identity} the feed's - a nest's root key, or a table's discovered key.
+     * A view's declared key is not a unique identity of what feeds it; {@code view} is its id,
+     * {@code key} the view's key, and {@code identity} an identity the feed does declare.
      * The sink upserts on the view's key and indexes it uniquely, so records that differ only on the
      * columns the view's key leaves out would silently replace each other. Refused where the pipeline
      * is built, because at write time the loss is invisible: right collection, right count on any
-     * single snapshot. A feed with no identity on record - an undiscovered table - is not held to
-     * this; there the view's key is the only identity there is.
+     * single snapshot. A discovered primary key is only a default and does not override a different
+     * explicitly selected identity when discovery records that identity as unique too.
      */
     VIEW_KEY_NOT_FEED_IDENTITY("actuation.view-key-not-feed-identity", Set.of("view", "key", "identity")),
 
@@ -101,7 +156,15 @@ enum ActuationError implements TapstateErrorCode {
      * written into: the store is resolved by its id alone, and materializing a view into a database an
      * author is capturing from writes into one the deployment does not own.
      */
-    VIEW_STORE_IS_A_CAPTURE_SOURCE("actuation.view-store-is-a-capture-source", Set.of("store"));
+    VIEW_STORE_IS_A_CAPTURE_SOURCE("actuation.view-store-is-a-capture-source", Set.of("store")),
+
+    /**
+     * A model refresh was requested before the pipeline was at rest. Both actual and desired states
+     * matter: an actual run may still be stopping, or a new run may already have been requested.
+     * A paused run also retains its assembly, which a resume with an unchanged artifact may reuse.
+     */
+    SCHEMA_SYNC_WHILE_RUNNING("actuation.schema-sync-while-running",
+            Set.of("pipeline", "state", "desired"));
 
     private final String code;
     private final Set<String> placeholders;

@@ -235,9 +235,24 @@ class EnvelopeParserTest {
 
     @Test
     void rejectsAnUnknownStepVerb() {
-        assertThatThrownBy(() -> EnvelopeParser.parse(minimal("steps:\n  - restart\n")))
+        // `rewind` rather than any other invented word: the step record says in as many words that
+        // there is deliberately no rewind step, because re-snapshotting is stop then start. A word
+        // the design has ruled out is one this case can keep. It used to be `restart`, which the
+        // harness now accepts -- and that it was the natural choice here is the whole reason the
+        // word had to be added.
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal("steps:\n  - rewind\n")))
                 .isInstanceOf(EnvelopeException.class)
-                .hasMessageContaining("restart");
+                .hasMessageContaining("rewind");
+    }
+
+    @Test
+    void acceptsTheWordsTheTerminalComposes() {
+        // The other side of the case above, and the reason it had to change: both forms parse, and
+        // they differ only in the answer their stop carries.
+        assertThat(EnvelopeParser.parse(minimal("steps:\n  - restart\n")).steps())
+                .containsExactly(new Step.Composed(ComposedVerb.RESTART));
+        assertThat(EnvelopeParser.parse(minimal("steps:\n  - restart --rerun\n")).steps())
+                .containsExactly(new Step.Composed(ComposedVerb.RESTART_RERUN));
     }
 
     @Test
@@ -571,7 +586,26 @@ class EnvelopeParserTest {
     void aDocMatcherWithoutExpectationsIsRefused() {
         assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
                 "steps:\n  - assert: { doc: { a.t: { where: { id: 1 } } } }\n")))
-                .hasMessageContaining("carry expect or size");
+                .hasMessageContaining("carry expect, size or absent");
+    }
+
+    /** Paths that must not be there are an expectation of their own: a doc may carry only those. */
+    @Test
+    void aDocMatcherCarryingOnlyAbsentPathsIsAccepted() {
+        Matcher.Doc doc = (Matcher.Doc) ((Step.Assertion) EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, absent: [secret, \"items[0].sku\"] } } }\n"))
+                .steps().get(0)).matcher();
+
+        assertThat(doc.absent()).containsExactly("secret", "items[0].sku");
+        assertThat(doc.expect()).isEmpty();
+    }
+
+    /** An absent path is a path, held to the same shape as one an author expects a value at. */
+    @Test
+    void anAbsentPathThatIsNotAPathIsRefusedWhereItIsWritten() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, absent: [\"items[0\"] } } }\n")))
+                .hasMessageContaining("doc.a.t.absent");
     }
 
     /**

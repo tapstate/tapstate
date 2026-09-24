@@ -32,7 +32,7 @@
     },
     {
       "name": "port",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Port"
       },
@@ -128,7 +128,7 @@
     },
     {
       "name": "rawLogServerPort",
-      "type": "string",
+      "type": "number",
       "label": {
         "en_US": "Raw Log Server Port"
       },
@@ -352,7 +352,7 @@
   ],
   "provenance": {
     "specPath": "connectors/oceanbase-mysql-connector/src/main/resources/oceanbase-spec.json",
-    "specContentHash": "22569c7fca980b83",
+    "specContentHash": "765f04cda41dd81a",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

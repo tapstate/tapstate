@@ -58,10 +58,10 @@ class NestMigratesSubtreeOnAncestorReparentIT {
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state.
      *
-     * <p>A nest keeps its state in a database of a fixed name, addressed by a namespace built from the
-     * pipeline and step ids - so two installs on one Mongo running a pipeline of the same id share one
-     * state, knowingly and by design. The tiers are two such installs, and giving each its own store and
-     * its own target leaves that third thing shared: the second tier starts on the state the first one
+     * <p>A nest keeps its state in the deployment's configured database, addressed by a namespace built
+     * from the pipeline and step ids. Both tiers in this witness use the same configured database, so
+     * giving each its own control store and target still leaves operator state shared, so the second tier
+     * starts on the state the first one
      * finished with. A witness that ends where its own snapshot would have put it cannot see this; one
      * that changes something can.
      *

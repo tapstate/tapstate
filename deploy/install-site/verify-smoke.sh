@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
-# Test harness for deploy/install-site/verify-published.sh. Serves the two entry points from a local
+# Test harness for deploy/install-site/verify-published.sh. Serves the three entry points from a local
 # loopback stub -- no network, no Vercel -- and drives the verifier against bodies that are correct,
-# stale on one side, stale on the other, and missing.
+# stale on one side, stale on the other, routed to the wrong file, and missing.
 #
-# The two one-sided cases are the point of the harness. A verifier that checks only the CLI entry
-# point passes case 2 and fails nothing, which is exactly the hole that let the quickstart entry point
-# sit a release behind while the one that was watched looked fine. Each case here fails a verifier
-# that drops the half it names.
+# The one-sided cases are the point of the harness. A verifier that checks only the CLI entry point
+# passes case 2 and fails nothing, which is exactly the hole that let the quickstart entry point sit a
+# release behind while the one that was watched looked fine. Each case here fails a verifier that
+# drops the route it names -- the alias included, because a rewrite is a thing a deploy can get wrong
+# on its own.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -28,19 +29,29 @@ mkdir -p "$EXPECTED"
 printf 'CLI_VERSION="9.9.9"\n# quickstart\n'    > "$EXPECTED/quickstart.sh"
 printf 'PINNED_VERSION="9.9.9"\n# installer\n'  > "$EXPECTED/install.sh"
 
-# The served side: swapped per case by rewriting these two files.
+# The served side: swapped per case by rewriting these two files. Which route serves which file is
+# read from ROUTES on every request, so a case can also swap the routing itself.
 SERVED="$TMP/served"
 mkdir -p "$SERVED"
+ROUTES="$TMP/routes"
 
 cat > "$TMP/stub.py" <<'PY'
 import http.server, socketserver, sys, os
 
-root, portfile = sys.argv[1], sys.argv[2]
-ROUTES = {"/": "quickstart.sh", "/cli": "install.sh"}
+root, portfile, routesfile = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def routes():
+    table = {}
+    with open(routesfile) as fh:
+        for line in fh:
+            if line.strip():
+                path, name = line.split()
+                table[path] = name
+    return table
 
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        name = ROUTES.get(self.path)
+        name = routes().get(self.path)
         path = os.path.join(root, name) if name else None
         if not path or not os.path.exists(path):
             self.send_response(404); self.end_headers(); return
@@ -57,7 +68,14 @@ open(portfile, "w").write(str(srv.server_address[1]))
 srv.serve_forever()
 PY
 
-python3 "$TMP/stub.py" "$SERVED" "$TMP/port" &
+# The mapping the site publishes: the root and its alias install the CLI, the demo has its own name.
+route_current() { printf '/ install.sh\n/cli install.sh\n/demo quickstart.sh\n' > "$ROUTES"; }
+# The mapping the site used to publish: the root was the demo. A deploy that ships this rewrite
+# serves every byte it was given and still hands the wrong script to whoever pipes the root.
+route_previous() { printf '/ quickstart.sh\n/cli install.sh\n/demo quickstart.sh\n' > "$ROUTES"; }
+route_current
+
+python3 "$TMP/stub.py" "$SERVED" "$TMP/port" "$ROUTES" &
 STUB_PID=$!
 for _ in $(seq 1 50); do [ -s "$TMP/port" ] && break; sleep 0.1; done
 [ -s "$TMP/port" ] || { printf 'the loopback stub never came up\n' >&2; exit 1; }
@@ -70,37 +88,54 @@ serve_stale_installer()  { printf 'PINNED_VERSION="9.9.8"\n# installer\n' > "$SE
 
 run_verify() { sh "$VERIFY" "$BASE" "$EXPECTED" 2>&1; }
 
-# --- 1. both entry points match -----------------------------------------------------------------
+# --- 1. every entry point matches ---------------------------------------------------------------
 serve_fresh_quickstart; serve_fresh_installer
 out="$(run_verify)"; rc=$?
-if [ "$rc" -eq 0 ]; then ok "matching bodies on both entry points verify clean"
+if [ "$rc" -eq 0 ]; then ok "matching bodies on every entry point verify clean"
 else bad "matching bodies were rejected (rc=$rc): $out"; fi
 
-# --- 2. the quickstart entry point is stale -------------------------------------------------------
-# Fails a verifier that watches only /cli -- the shape that actually shipped.
+# --- 2. the demo entry point is stale -------------------------------------------------------------
+# Fails a verifier that watches only the CLI routes -- the shape that actually shipped.
 serve_stale_quickstart; serve_fresh_installer
 out="$(run_verify)"; rc=$?
-if [ "$rc" -ne 0 ] && grep -q "$BASE/ is not what this tree would deploy" <<<"$out"; then
-  ok "a stale quickstart entry point is caught and named"
-else bad "a stale quickstart entry point was not caught (rc=$rc): $out"; fi
+if [ "$rc" -ne 0 ] && grep -q "$BASE/demo is not what this tree would deploy" <<<"$out"; then
+  ok "a stale demo entry point is caught and named"
+else bad "a stale demo entry point was not caught (rc=$rc): $out"; fi
 
-# --- 3. the CLI entry point is stale --------------------------------------------------------------
+# --- 3. the CLI entry point is stale, at the root and at its alias --------------------------------
+# Both routes are named. A verifier that checks the alias and infers the root -- or the reverse --
+# reports the one it looked at and stays silent about the other, and the two are separate rewrites.
 serve_fresh_quickstart; serve_stale_installer
 out="$(run_verify)"; rc=$?
-if [ "$rc" -ne 0 ] && grep -q "$BASE/cli is not what this tree would deploy" <<<"$out"; then
-  ok "a stale CLI entry point is caught and named"
-else bad "a stale CLI entry point was not caught (rc=$rc): $out"; fi
+if [ "$rc" -ne 0 ] && grep -q "$BASE/ is not what this tree would deploy" <<<"$out" \
+   && grep -q "$BASE/cli is not what this tree would deploy" <<<"$out"; then
+  ok "a stale CLI entry point is caught and named at / and at /cli"
+else bad "a stale CLI entry point was not caught on both routes (rc=$rc): $out"; fi
+
+# --- 3b. every body is current but the root is routed to the demo --------------------------------
+# The previous mapping, served by a deploy whose files are all fresh. Nothing is stale, and the root
+# still hands the demo to whoever asked for the CLI; only a check that reads each route against the
+# file it is supposed to serve sees it, and it has to name the route, not a version.
+serve_fresh_quickstart; serve_fresh_installer; route_previous
+out="$(run_verify)"; rc=$?
+if [ "$rc" -ne 0 ] && grep -q "$BASE/ is not what this tree would deploy" <<<"$out" \
+   && ! grep -q "$BASE/cli is not what" <<<"$out" && ! grep -q "$BASE/demo is not what" <<<"$out"; then
+  ok "a root routed to the wrong file is caught and named, with the other routes left clean"
+else bad "a root routed to the wrong file was not caught as such (rc=$rc): $out"; fi
+route_current
 
 # --- 4. the failure message names the two versions ------------------------------------------------
 # A digest mismatch alone does not tell anyone what to do; the pins are what identify the skew.
+serve_fresh_quickstart; serve_stale_installer
+out="$(run_verify)"; rc=$?
 if grep -q 'served  pin 9.9.8' <<<"$out" && grep -q 'tree    pin 9.9.9' <<<"$out"; then
   ok "the failure names the served pin and the tree's pin"
 else bad "the failure does not name both pins: $out"; fi
 
 # --- 5. a missing entry point is a failure, not a pass --------------------------------------------
-serve_fresh_quickstart; rm -f "$SERVED/install.sh"
+serve_fresh_installer; rm -f "$SERVED/quickstart.sh"
 out="$(run_verify)"; rc=$?
-if [ "$rc" -ne 0 ] && grep -q 'could not be fetched' <<<"$out"; then
+if [ "$rc" -ne 0 ] && grep -q "$BASE/demo could not be fetched" <<<"$out"; then
   ok "an entry point that does not answer fails loudly"
 else bad "a missing entry point did not fail (rc=$rc): $out"; fi
 

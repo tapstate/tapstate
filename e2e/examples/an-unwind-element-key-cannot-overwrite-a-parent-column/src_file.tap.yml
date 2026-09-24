@@ -1,0 +1,7 @@
+version: tapstate/v1
+kind: source
+id: src_file
+connector: e2e_file
+config: { uri: "${SRC_DIR}" }
+mode: cdc
+tables: [ orders ]

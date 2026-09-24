@@ -651,13 +651,12 @@ class DataBrowserApiTest {
                     new SourceResource(
                             "views", null, "mongodb",
                             Map.of("uri", "mongodb://db.local", "database", "shop"),
-                            null, null, null, null, null),
+                            null, null, null, null),
                     new ViewResource(
                             "v_order_state",
                             new Metadata(null, "One row per order, shipments inlined"),
                             null,
                             new Storage(null, new Storage.Warm("order_state", null), null),
-                            null,
                             null));
         }
 
@@ -714,7 +713,7 @@ class DataBrowserApiTest {
 
         @Override
         public Optional<Resource> get(String id) {
-            return source.id().equals(id) ? Optional.of(source) : Optional.empty();
+            return declared.stream().filter(resource -> resource.id().equals(id)).findFirst();
         }
 
         @Override

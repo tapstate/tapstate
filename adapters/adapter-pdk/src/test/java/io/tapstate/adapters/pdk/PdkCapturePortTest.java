@@ -6,16 +6,21 @@ import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -223,19 +228,260 @@ class PdkCapturePortTest {
 
     // ---- cdc drive: streamRead -> decodeChange ---------------------------------------------------
 
+    // ---- where the tail is told to begin ----------------------------------------------------------
+
+    /**
+     * The mark the echoing source stamps on the first row it emits: what it was asked to resolve, and so
+     * what actually reached the connector rather than what the caller believed it had said.
+     */
+    private static String startMarkFrom(Path jar, CaptureStart start) throws Exception {
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.TimestampEchoingSource", null));
+        List<Envelope> got = new CopyOnWriteArrayList<>();
+        CountDownLatch one = new CountDownLatch(1);
+        try (Subscription sub = port.cdc(config("t1"), start, (events, pos) -> {
+            got.addAll(events);
+            one.countDown();
+        })) {
+            assertThat(one.await(5, TimeUnit.SECONDS)).as("the tail delivered its first batch").isTrue();
+        }
+        return String.valueOf(got.get(0).after().get("id"));
+    }
+
+    /**
+     * A start named as an instant reaches the connector as that instant.
+     *
+     * <p>The failure this rules out is not a crash. A dropped instant leaves a tail that starts at the
+     * present, runs, reports healthy and delivers rows — so every assertion about rows arriving is green
+     * whether the instant was honoured or thrown away, and the span between the two is exactly the data
+     * the caller asked for and did not get. Only what the connector was handed tells them apart.
+     */
+    @Test
+    void cdcAtAnInstantHandsTheConnectorThatInstantRatherThanThePresent(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+
+        String mark = startMarkFrom(jar, CaptureStart.at(Instant.parse("2026-09-01T10:00:00Z")));
+
+        assertThat(mark).isEqualTo("at:1788256800000");
+    }
+
+    /**
+     * The same moment written in two zones is one start.
+     *
+     * <p>An offset is applied where the text is parsed, so nothing downstream of that ever holds a local
+     * reading — which is what keeps one pipeline from beginning at two different points depending on
+     * which machine's clock read it.
+     */
+    @Test
+    void theSameMomentWrittenInTwoZonesReachesTheConnectorAsOneInstant(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+
+        String utc = startMarkFrom(jar, CaptureStart.at(Instant.parse("2026-09-01T10:00:00Z")));
+        String shifted = startMarkFrom(jar, CaptureStart.at(Instant.parse("2026-09-01T18:00:00+08:00")));
+
+        assertThat(shifted).isEqualTo(utc).isEqualTo("at:1788256800000");
+    }
+
+    /** The oldest change a source still holds is asked for as an instant the source resolves, not guessed at. */
+    @Test
+    void cdcAtTheEarliestAsksTheSourceForTheOldestChangeItHolds(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+
+        String mark = startMarkFrom(jar, CaptureStart.earliest());
+
+        assertThat(mark).isEqualTo("at:0");
+    }
+
+    /**
+     * The control that makes the three above discriminate: asking for the present still hands the
+     * connector no instant at all.
+     *
+     * <p>Without it an implementation that resolved every start as the beginning of the source would
+     * satisfy the earliest case and quietly turn every ordinary tail into a full replay of the retained
+     * log — green on each positive assertion, and wrong on the case nobody wrote down.
+     */
+    @Test
+    void cdcAtThePresentStillHandsTheConnectorNoInstant(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+
+        String mark = startMarkFrom(jar, CaptureStart.present());
+
+        assertThat(mark).isEqualTo("present");
+    }
+
+    /**
+     * A source that cannot map an instant to one of its positions refuses the ask, with a code that names
+     * the capability it lacks.
+     *
+     * <p>The alternatives are the reason this is a refusal: starting at the present or at the beginning
+     * both produce a healthy tail reading a span the caller never asked for. The refusal is raised before
+     * the stream thread starts, so it reaches whoever asked rather than arriving later as "the source
+     * failed" on the error channel — a connector that cannot do this is not a source that broke.
+     */
+    @Test
+    void anInstantStartOnASourceThatCannotResolveOneIsACodedRefusal(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.offsetlessStreamSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.OffsetlessStream", null));
+
+        assertThatThrownBy(() -> port.cdc(config("t1"), CaptureStart.at(Instant.parse("2026-09-01T10:00:00Z")),
+                (events, pos) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> {
+                    TapstateException ce = (TapstateException) e;
+                    assertThat(ce.code()).isEqualTo(ConnectorError.CAPABILITY_MISSING);
+                    assertThat(ce.args()).containsEntry("connector", "demo")
+                            .containsEntry("capability", "timestamp-to-stream-offset");
+                });
+
+        // The same source started at the present is not refused: it never needed the missing function.
+        assertThatCode(() -> port.cdc(config("t1"), CaptureStart.present(), (events, pos) -> { }).close())
+                .doesNotThrowAnyException();
+    }
+
     @Test
     void cdcDrivesStreamReadAndDeliversDecodedChangeEnvelopes(@TempDir Path dir) throws Exception {
         Path jar = Synthetic.emittingSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
         List<Envelope> got = new CopyOnWriteArrayList<>();
         CountDownLatch three = new CountDownLatch(3);
-        try (Subscription sub = port.cdc(config("t1"), e -> {
-            got.add(e);
-            three.countDown();
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), (events, pos) -> {
+            got.addAll(events);
+            events.forEach(event -> three.countDown());
         })) {
             assertThat(three.await(5, TimeUnit.SECONDS)).as("three change events delivered").isTrue();
         }
         assertThat(got).extracting(Envelope::op).containsExactly(Op.INSERT, Op.UPDATE, Op.DELETE);
+    }
+
+    @Test
+    void oracleLogMinerRejectsAnUnsupportedSchemaIdentifierBeforeCdcStarts(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.emittingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+        String shortSchema = "S".repeat(30);
+        String longSchema = "S".repeat(63);
+
+        CountDownLatch shortNameDelivered = new CountDownLatch(1);
+        CaptureConfig shortLogMiner = new CaptureConfig(
+                "oracle", Map.of("schema", shortSchema, "autoLog", false), List.of("t1"));
+        try (Subscription ignored = port.cdc(shortLogMiner, CaptureStart.present(),
+                (events, position) -> shortNameDelivered.countDown())) {
+            assertThat(shortNameDelivered.await(5, TimeUnit.SECONDS))
+                    .as("the supported LogMiner identifier still delivers changes")
+                    .isTrue();
+        }
+
+        CountDownLatch otherModeDelivered = new CountDownLatch(1);
+        CaptureConfig longLogParser = new CaptureConfig("oracle",
+                Map.of("schema", longSchema, "autoLog", false, "logPluginName", "oracle-log-parser"),
+                List.of("t1"));
+        try (Subscription ignored = port.cdc(longLogParser, CaptureStart.present(),
+                (events, position) -> otherModeDelivered.countDown())) {
+            assertThat(otherModeDelivered.await(5, TimeUnit.SECONDS))
+                    .as("the LogMiner limit is not imposed on another Oracle capture mode")
+                    .isTrue();
+        }
+
+        CaptureConfig unsupportedLogMiner = new CaptureConfig(
+                "oracle", Map.of("schema", longSchema, "autoLog", false), List.of("t1"));
+        assertThat(port.testConnection(unsupportedLogMiner).sample())
+                .as("snapshot probing still succeeds for the unsupported LogMiner schema")
+                .isNotEmpty();
+
+        assertThatThrownBy(() -> {
+            try (Subscription ignored = port.cdc(
+                    unsupportedLogMiner, CaptureStart.present(), (events, position) -> { })) {
+                // A successful return is the defect: the source can now look healthy while LogMiner drops changes.
+            }
+        }).isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    TapstateException refusal = (TapstateException) error;
+                    assertThat(refusal.code().code()).isEqualTo("connector.logminer-identifier-too-long");
+                    assertThat(refusal.args())
+                            .containsEntry("connector", "oracle")
+                            .containsEntry("kind", "schema")
+                            .containsEntry("identifier", longSchema)
+                            .containsEntry("limit", 30);
+                });
+    }
+
+    @Test
+    void oracleLogMinerRejectsAnUnsupportedDiscoveredTableBeforeCdcStarts(@TempDir Path dir) {
+        String longTable = "T".repeat(31);
+        Path jar = Synthetic.namedStreamSource(dir, longTable, "id");
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.NamedStreamSource", null));
+        CaptureConfig config = new CaptureConfig(
+                "oracle", Map.of("schema", "SUPPORTED", "autoLog", false), List.of());
+
+        assertThatThrownBy(() -> port.cdc(config, CaptureStart.present(), (events, position) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    TapstateException refusal = (TapstateException) error;
+                    assertThat(refusal.code()).isEqualTo(ConnectorError.LOGMINER_IDENTIFIER_TOO_LONG);
+                    assertThat(refusal.args())
+                            .containsEntry("kind", "table")
+                            .containsEntry("identifier", longTable)
+                            .containsEntry("limit", 30);
+                });
+    }
+
+    @Test
+    void oracleLogMinerRejectsAnUnsupportedDiscoveredColumnBeforeCdcStarts(@TempDir Path dir) {
+        String longColumn = "C".repeat(31);
+        Path jar = Synthetic.namedStreamSource(dir, "orders", longColumn);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.NamedStreamSource", null));
+        CaptureConfig config = new CaptureConfig(
+                "oracle", Map.of("schema", "SUPPORTED", "autoLog", false), List.of());
+
+        assertThatThrownBy(() -> port.cdc(config, CaptureStart.present(), (events, position) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    TapstateException refusal = (TapstateException) error;
+                    assertThat(refusal.code()).isEqualTo(ConnectorError.LOGMINER_IDENTIFIER_TOO_LONG);
+                    assertThat(refusal.args())
+                            .containsEntry("kind", "column")
+                            .containsEntry("identifier", longColumn)
+                            .containsEntry("limit", 30);
+                });
+    }
+
+    @Test
+    void aBlockedLogMinerPreflightTimesOutAndDoesNotStarveTheNextPipeline(@TempDir Path dir) throws Exception {
+        Path blocked = Synthetic.blockingDiscoverySource(dir.resolve("blocked"));
+        Path healthy = Synthetic.emittingSource(dir.resolve("healthy"));
+        ConnectorRef blockedRef = new ConnectorRef(
+                List.of(blocked), "synthetic.BlockingDiscoverySource", "2.0.8", null);
+        ConnectorRef healthyRef = new ConnectorRef(
+                List.of(healthy), "synthetic.EmittingSource", "2.0.8", null);
+        ConnectorProvisioner provisioner = connectorId -> "oracle".equals(connectorId) ? blockedRef : healthyRef;
+        Duration timeout = Duration.ofMillis(100);
+        PdkCapturePort port = new PdkCapturePort(provisioner, null, timeout);
+        CaptureConfig blockedConfig = new CaptureConfig(
+                "oracle", Map.of("schema", "SUPPORTED", "autoLog", false), List.of());
+
+        long started = System.nanoTime();
+        assertThatThrownBy(() -> port.cdc(blockedConfig, CaptureStart.present(), (events, position) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    TapstateException timeoutFailure = (TapstateException) error;
+                    assertThat(timeoutFailure.code()).isEqualTo(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT);
+                    assertThat(timeoutFailure.args())
+                            .containsEntry("connector", "oracle")
+                            .containsEntry("timeout", "100ms");
+                });
+        assertThat(Duration.ofNanos(System.nanoTime() - started))
+                .as("the blocked preflight releases the reconciliation caller")
+                .isLessThan(Duration.ofSeconds(3));
+        assertThat(Thread.getAllStackTraces().keySet())
+                .as("the stopped connector's preflight worker was joined")
+                .noneMatch(thread -> thread.isAlive() && "tapstate-cdc-oracle".equals(thread.getName()));
+
+        CountDownLatch delivered = new CountDownLatch(1);
+        try (Subscription ignored = port.cdc(
+                new CaptureConfig("demo", Map.of(), List.of("t1")), CaptureStart.present(),
+                (events, position) -> delivered.countDown())) {
+            assertThat(delivered.await(5, TimeUnit.SECONDS))
+                    .as("the next pipeline reconciles after the first preflight times out")
+                    .isTrue();
+        }
     }
 
     /**
@@ -262,8 +508,8 @@ class PdkCapturePortTest {
         // the reading would be a timeout rather than the reason for it.
         CaptureListener listener = new CaptureListener() {
             @Override
-            public void onEvent(Envelope event) {
-                got.add(event);
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                got.addAll(events);
                 settled.countDown();
             }
 
@@ -273,7 +519,7 @@ class PdkCapturePortTest {
                 settled.countDown();
             }
         };
-        try (Subscription sub = port.cdc(config("t1"), listener)) {
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), listener)) {
             assertThat(settled.await(5, TimeUnit.SECONDS)).as("the cdc drive settled").isTrue();
         }
         assertThat(failure.get()).as("walking the table map must not fail the stream").isNull();
@@ -294,7 +540,7 @@ class PdkCapturePortTest {
         CountDownLatch failed = new CountDownLatch(1);
         CaptureListener listener = new CaptureListener() {
             @Override
-            public void onEvent(Envelope event) {
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
             }
 
             @Override
@@ -303,7 +549,7 @@ class PdkCapturePortTest {
                 failed.countDown();
             }
         };
-        try (Subscription sub = port.cdc(config("t1"), listener)) {
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), listener)) {
             assertThat(failed.await(5, TimeUnit.SECONDS))
                     .as("the cdc stream failure was reported through onError")
                     .isTrue();
@@ -334,7 +580,7 @@ class PdkCapturePortTest {
         CountDownLatch failed = new CountDownLatch(1);
         CaptureListener listener = new CaptureListener() {
             @Override
-            public void onEvent(Envelope event) {
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
             }
 
             @Override
@@ -343,7 +589,7 @@ class PdkCapturePortTest {
                 failed.countDown();
             }
         };
-        try (Subscription sub = port.cdc(config("t1"), listener)) {
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), listener)) {
             assertThat(failed.await(5, TimeUnit.SECONDS)).isTrue();
         }
 
@@ -367,10 +613,124 @@ class PdkCapturePortTest {
         // second interrupt / stop / loader close.
         Path jar = Synthetic.emittingSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
-        Subscription sub = port.cdc(config("t1"), e -> {
+        Subscription sub = port.cdc(config("t1"), CaptureStart.present(), (e, pos) -> {
         });
         sub.close();
         assertThatCode(sub::close).doesNotThrowAnyException();
+    }
+
+
+    @Test
+    void handsARecordedPositionBackToTheConnectorAsTheObjectItIssued(@TempDir Path dir) throws Exception {
+        // The whole of a resume, end to end: the connector states a position as an object of its own
+        // class, that object becomes a token, and the token becomes the object again -- resolved through
+        // the connector's own loader, which is the only place its class exists. The connector reports the
+        // position it was started from as the row it emits, so this observes the object arriving rather
+        // than merely that the call did not throw.
+        Path jar = Synthetic.positionedSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
+
+        String token;
+        try (CaptureBatch batch = port.snapshot(config("t1"))) {
+            token = batch.seam().orElseThrow().token();
+        }
+
+        List<Envelope> seen = new CopyOnWriteArrayList<>();
+        CountDownLatch two = new CountDownLatch(2);
+        try (Subscription sub = port.cdc(config("t1"),
+                CaptureStart.resume(new SourcePosition(token)), (events, position) -> {
+                    seen.addAll(events);
+                    events.forEach(event -> two.countDown());
+                })) {
+            assertThat(two.await(5, TimeUnit.SECONDS)).as("two change events delivered").isTrue();
+        }
+
+        assertThat(seen.get(0).after())
+                .as("the connector reports the position it was started from as the row it emits")
+                .containsEntry("id", "seam-1");
+    }
+
+    @Test
+    void refusesARecordedPositionThisConnectorCannotReadInsteadOfBeginningAtThePresent(@TempDir Path dir)
+            throws Exception {
+        // Starting at the present instead is the silent form of the same failure: the tail runs, the job
+        // is healthy, and every change between the recorded position and where it actually began is gone.
+        Path jar = Synthetic.positionedSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
+
+        assertThatThrownBy(() -> port.cdc(
+                config("t1"), CaptureStart.resume(new SourcePosition("not-a-position")),
+                (event, position) -> { }))
+                .isInstanceOf(TapstateException.class)
+                .extracting(e -> ((TapstateException) e).code())
+                .isEqualTo(ConnectorError.POSITION_UNREADABLE);
+    }
+
+    @Test
+    void reportsTheSeamAfterDiscoveryAndBeforeTheSnapshotRead(@TempDir Path dir) throws Exception {
+        // Sampled before the first row, so a change made while the snapshot runs falls after the seam and
+        // is re-delivered by the tail. Sampled after, it would fall before and never be delivered at all.
+        Path jar = Synthetic.positionedSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
+
+        String token;
+        try (CaptureBatch batch = port.snapshot(config("t1"))) {
+            assertThat(batch.seam()).isPresent();
+            token = batch.seam().orElseThrow().token();
+        }
+
+        // The token really is the connector's own offset object and not a rendering of whatever it
+        // prints as: read back against the host's loader it is refused, because the class it names
+        // exists only inside the connector jar. The port reads it back through the connector's loader,
+        // which the resume test drives end to end.
+        assertThatThrownBy(() -> ConnectorOffsetCodec.fromToken(
+                "demo", token, getClass().getClassLoader()))
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("PositionedSource");
+    }
+
+    @Test
+    void aSnapshotBatchReportsNoSeamWhenTheConnectorNamesNoPosition(@TempDir Path dir) throws Exception {
+        // Reporting none is the honest answer, and it is what makes a caller that needs a seam refuse.
+        // The failure it replaces is a caller inventing one, which puts the tail somewhere the source
+        // never was. This connector registers no offset function at all, so there is nothing to report.
+        Path jar = Synthetic.emittingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+
+        try (CaptureBatch batch = port.snapshot(config("t1"))) {
+            assertThat(batch.seam()).isEmpty();
+        }
+    }
+
+    @Test
+    void handsOverTheSourceBatchWholeWithTheOnePositionItNamedForIt(@TempDir Path dir)
+            throws Exception {
+        // The source reads a batch and names one position for it, meaning "everything up to here has
+        // been handed over" -- true of the batch and of no prefix of it. Taking the batch apart here
+        // would force that one position onto one of the changes and leave the others carrying none,
+        // which says of each of those that nothing had been read at it; and it would destroy the only
+        // grouping anything downstream could have used to pay a per-act cost once instead of N times.
+        Path jar = Synthetic.positionedSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
+
+        List<List<Envelope>> runs = new CopyOnWriteArrayList<>();
+        List<Optional<SourcePosition>> positions = new CopyOnWriteArrayList<>();
+        CountDownLatch delivered = new CountDownLatch(1);
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(),
+                (events, position) -> {
+                    runs.add(events);
+                    positions.add(position);
+                    delivered.countDown();
+                })) {
+            assertThat(delivered.await(5, TimeUnit.SECONDS)).as("the run was delivered").isTrue();
+        }
+
+        assertThat(runs.get(0))
+                .as("the two changes the source read together arrive together, in one call")
+                .hasSize(2);
+        assertThat(positions.get(0))
+                .as("the position the source named for that batch, carried once for the batch")
+                .isPresent();
     }
 
     // ---- testConnection / discoverSchema drive ---------------------------------------------------

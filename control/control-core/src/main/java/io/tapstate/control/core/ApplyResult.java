@@ -4,7 +4,8 @@ import java.util.List;
 
 /**
  * The result of applying a batch of drafts: one outcome per artifact, in submission order — whether
- * each was created, updated, or an unchanged no-op — and the advisory findings over the batch.
+ * each was created, updated, or an unchanged no-op — and warnings over the batch, including any
+ * skipped or incomplete model refreshes after the artifact transaction committed.
  * Producing this has already performed the upserts; the outcomes report what the store did.
  *
  * <p>The warnings are what the author should know about a batch that was applied. They are carried

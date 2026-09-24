@@ -14,6 +14,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.processor.Processors;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.Engine;
+import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -65,10 +66,16 @@ class APipelineBudgetReachesItsOwnMapsTest {
         return config;
     }
 
+    /**
+     * The pattern is added once the member is up, which is where the product adds it. Left in the static
+     * configuration it answers for every namespace and no exact configuration behind it is ever resolved -
+     * so a member arranged that way would make every case here pass while pinning nothing at all.
+     */
     @BeforeEach
     void startMember() {
-        member = Hazelcast.newHazelcastInstance(memberConfig().addMapConfig(
-                NestSettings.defaults().withEntriesHeldInMemory(DEPLOYMENT).backedStateMaps()));
+        member = Hazelcast.newHazelcastInstance(memberConfig());
+        member.getConfig().addMapConfig(
+                NestSettings.defaults().withEntriesHeldInMemory(DEPLOYMENT).backedStateMaps());
         NestStateMapStoreFactory.bindTo(member, new HeapKeyedStateStore());
     }
 
@@ -85,15 +92,20 @@ class APipelineBudgetReachesItsOwnMapsTest {
     }
 
     /**
-     * What a map of this name is actually held to: its own configuration if one was pinned for it, and
-     * otherwise the pattern it falls back to. Both are asked because the lookup by pattern does not see a
-     * configuration added while the member is running - so reading only that would report every pipeline
-     * as being on the deployment's number, whatever had been applied.
+     * What a map of this name is actually held to, asked the one way that answers it: the lookup the
+     * substrate itself makes when it builds the map.
+     *
+     * <p><b>That way and no other, and this used to be the reverse.</b> It read the exact entry out of the
+     * configuration map first and fell back to the lookup only after, with a note saying the lookup "does
+     * not see a configuration added while the member is running". The observation was right and the
+     * conclusion inverted: the lookup is not an unreliable way to read the number, it is the call that
+     * decides it. A pattern sitting in the static configuration was shadowing every exact configuration
+     * behind it, and reading around the lookup made this file green over exactly that - measured, a budget
+     * of 271 reading back as 271 while its map held all 700 entries written to it. What a map is held to
+     * is now read where it is decided; what a map actually holds has a case of its own.
      */
     private int sizeOf(String namespace) {
-        MapConfig pinned = member.getConfig().getMapConfigs().get(namespace);
-        return (pinned != null ? pinned : member.getConfig().findMapConfig(namespace))
-                .getEvictionConfig().getSize();
+        return member.getConfig().findMapConfig(namespace).getEvictionConfig().getSize();
     }
 
     @Test
@@ -138,8 +150,8 @@ class APipelineBudgetReachesItsOwnMapsTest {
         // something behind the map holds what is past it; applied to a process that has no store, pinning
         // it would declare a cold layer that does not exist and switch eviction on over it - which is not
         // capacity but silent loss. Measured as a nest that assembled nothing at all.
-        HazelcastInstance heapOnly = Hazelcast.newHazelcastInstance(memberConfig()
-                .addMapConfig(NestSettings.defaults().stateMaps()));
+        HazelcastInstance heapOnly = Hazelcast.newHazelcastInstance(memberConfig());
+        heapOnly.getConfig().addMapConfig(NestSettings.defaults().stateMaps());
         try {
             NestMemoryBudget.applyTo(heapOnly, Set.of(MINE),
                     NestSettings.defaults().withEntriesHeldInMemory(40_000L));
@@ -147,6 +159,25 @@ class APipelineBudgetReachesItsOwnMapsTest {
             assertThat(heapOnly.getConfig().getMapConfigs()).doesNotContainKey(MINE);
             assertThat(heapOnly.getConfig().findMapConfig(MINE).getEvictionConfig().getEvictionPolicy())
                     .describedAs("evicting with nothing to load the entry back from is losing it")
+                    .isEqualTo(EvictionPolicy.NONE);
+        } finally {
+            heapOnly.shutdown();
+        }
+    }
+
+    @Test
+    void aDatabasePlacementDoesNotInventAColdLayerForAnInMemoryNest() {
+        HazelcastInstance heapOnly = Hazelcast.newHazelcastInstance(memberConfig());
+        heapOnly.getConfig().addMapConfig(NestSettings.defaults().stateMaps());
+        try {
+            NestStatePlacement.applyTo(heapOnly, Map.of(MINE, "state_a"),
+                    NestSettings.defaults().withEntriesHeldInMemory(40_000L));
+
+            assertThat(heapOnly.getConfig().getMapConfigs()).doesNotContainKey(MINE);
+            assertThat(heapOnly.getConfig().findMapConfig(MINE).getMapStoreConfig().isEnabled())
+                    .isFalse();
+            assertThat(heapOnly.getConfig().findMapConfig(MINE).getEvictionConfig().getEvictionPolicy())
+                    .describedAs("database placement cannot turn heap-only capacity into silent loss")
                     .isEqualTo(EvictionPolicy.NONE);
         } finally {
             heapOnly.shutdown();
@@ -243,8 +274,8 @@ class APipelineBudgetReachesItsOwnMapsTest {
 
     @Test
     void aProcessWithNothingBehindItsMapsIsStillLeftAloneOnceTheyAreThere() {
-        HazelcastInstance heapOnly = Hazelcast.newHazelcastInstance(memberConfig()
-                .addMapConfig(NestSettings.defaults().stateMaps()));
+        HazelcastInstance heapOnly = Hazelcast.newHazelcastInstance(memberConfig());
+        heapOnly.getConfig().addMapConfig(NestSettings.defaults().stateMaps());
         try {
             heapOnly.getMap(MINE);
 

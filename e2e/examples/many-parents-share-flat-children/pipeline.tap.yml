@@ -1,0 +1,41 @@
+version: tapstate/v1
+kind: pipeline
+id: flat_customer_documents
+source: src_catalog
+settings: { read_mode: snapshot_only }
+transforms:
+  - id: region_fields
+    type: map
+    from: [ regions ]
+    fields:
+      region_key: $id
+      region_name: $name
+      id: false
+      name: false
+  - id: tier_fields
+    type: map
+    from: [ tiers ]
+    fields:
+      tier_key: $id
+      tier_name: $name
+      id: false
+      name: false
+  - id: customer_with_flat_children
+    type: nest
+    from: { customer: customers, region: region_fields, tier: tier_fields }
+    root:
+      from: customer
+      key: [ id ]
+      embed:
+        - { from: region, on: { region_key: region_id }, as: flat, key: [ region_key ] }
+        - { from: tier, on: { tier_key: tier_id }, as: flat, key: [ tier_key ] }
+  - id: public_customer_document
+    type: map
+    from: [ customer_with_flat_children ]
+    fields:
+      region_key: false
+      tier_key: false
+view:
+  id: customer_state
+  from: public_customer_document
+  primary_key: id

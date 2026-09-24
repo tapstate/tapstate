@@ -1,10 +1,13 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
@@ -188,6 +191,38 @@ class DslPipelineParserTest {
         assertThat(s.readMode()).isEqualTo(ReadMode.CDC_ONLY);
         assertThat(s.startFrom()).isEqualTo("earliest");
         assertThat(writer.write(parser.parse(writer.write(p)))).isEqualTo(writer.write(p));
+    }
+
+    @Test
+    void serveFromAcceptsLegacyScalarAndExplicitMultipleReferences() {
+        String single = """
+                version: tapstate/v1
+                kind: pipeline
+                id: single
+                source: db_src
+                serve:
+                  from: db_src.Player
+                  sync: [ { id: sync, source: db_tgt } ]
+                """;
+        String multiple = """
+                version: tapstate/v1
+                kind: pipeline
+                id: multiple
+                source: db_src
+                serve:
+                  from: [db_src.Player, db_src.BB_0727]
+                  sync: [ { id: sync, source: db_tgt } ]
+                """;
+
+        ServeBlock.Inline singleServe = (ServeBlock.Inline) ((PipelineResource) parser.parse(single)).serve();
+        ServeBlock.Inline multipleServe = (ServeBlock.Inline) ((PipelineResource) parser.parse(multiple)).serve();
+
+        assertThat(singleServe.from()).isEqualTo(FromClause.list(FromRef.literal("db_src.Player")));
+        assertThat(multipleServe.from()).isEqualTo(FromClause.list(
+                FromRef.literal("db_src.Player"), FromRef.literal("db_src.BB_0727")));
+        assertThat(writer.write(parser.parse(single))).contains("from: db_src.Player");
+        assertThat(writer.write(parser.parse(multiple))).contains(
+                "from: [db_src.Player, db_src.BB_0727]");
     }
 
     @Test

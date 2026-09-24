@@ -149,6 +149,17 @@ public final class LevelBounds {
     }
 
     /**
+     * Whether this level has already let the frontier past {@code order} on {@code chain}. A level that has
+     * may not go on to hold that change back: it has told everything downstream the change is accounted for,
+     * and holding it afterwards both lowers an answer that was already given and leaves the change where a
+     * restart resumes above it.
+     */
+    public boolean hasPassed(String chain, SourceOrder order) {
+        Long already = sent.get(chain);
+        return already != null && already >= FrontierOrders.pack(chain, order);
+    }
+
+    /**
      * What this level may promise on {@code chain} as things stand, or nothing when it may promise no more
      * than it already has. Every edge expected to carry the chain must have spoken; whatever is still held
      * on it lowers the answer to the value immediately beneath.
@@ -176,8 +187,11 @@ public final class LevelBounds {
         if (already != null) {
             if (lowest < already) {
                 throw new IllegalStateException("chain " + chain + " was promised up to " + already
-                        + " and now works out to " + lowest + "; a bound only falls when an upstream"
-                        + " lowered a position it had already reported");
+                        + " and now works out to " + lowest + "; the edges promised " + promised.get(chain)
+                        + " and this level is holding " + holding + ", so it fell because "
+                        + (holding != null && FrontierOrders.pack(chain, holding) - 1 < already
+                                ? "this level took a hold under a bound it had already passed"
+                                : "an upstream lowered a position it had already reported"));
             }
             if (lowest == already) {
                 return OptionalLong.empty();

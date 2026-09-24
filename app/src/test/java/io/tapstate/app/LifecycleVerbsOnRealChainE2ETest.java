@@ -26,6 +26,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
@@ -48,8 +49,10 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetField;
@@ -68,6 +71,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -153,25 +157,31 @@ class LifecycleVerbsOnRealChainE2ETest {
         awaitStatus(job, JobStatus.RUNNING);
         awaitKeys("1", "2", "3", "4", "5", "6");
         assertActualState(RUNNING, 1);
-        assertThat(readFaces.status(PIPELINE)).isEqualTo(new PipelineStatus(PIPELINE, RUNNING));
+        assertReadFaceReports(PIPELINE, RUNNING);
+        // The assembled path stamps when the reading was taken. Without it a run whose publisher stopped
+        // and a run whose state has not changed are the same bytes -- and nothing else in this case would
+        // notice, because every assertion here holds just as well over a reading from four minutes ago.
+        assertThat(readFaces.status(PIPELINE).observedAt())
+                .as("the converge pass records when it observed the pipeline")
+                .isNotNull();
 
         // pause: the live job suspends and the read face reports PAUSED.
         desire(PAUSED);
         awaitStatus(job, JobStatus.SUSPENDED);
         assertActualState(PAUSED, 2);
-        assertThat(readFaces.status(PIPELINE)).isEqualTo(new PipelineStatus(PIPELINE, PAUSED));
+        assertReadFaceReports(PIPELINE, PAUSED);
 
         // resume: the suspended job runs again and the read face reports RUNNING.
         desire(RUNNING);
         awaitStatus(job, JobStatus.RUNNING);
         assertActualState(RUNNING, 3);
-        assertThat(readFaces.status(PIPELINE)).isEqualTo(new PipelineStatus(PIPELINE, RUNNING));
+        assertReadFaceReports(PIPELINE, RUNNING);
 
         // stop: the job is cancelled (Jet reports a cancelled job as FAILED) and the read face reports STOPPED.
         desire(STOPPED);
         awaitStatus(job, JobStatus.FAILED);
         assertActualState(STOPPED, 4);
-        assertThat(readFaces.status(PIPELINE)).isEqualTo(new PipelineStatus(PIPELINE, STOPPED));
+        assertReadFaceReports(PIPELINE, STOPPED);
     }
 
     @Test
@@ -197,9 +207,10 @@ class LifecycleVerbsOnRealChainE2ETest {
         Observation observed = awaitObservation(obs -> obs.metrics().getOrDefault("recordCount", -1L) == 6L);
 
         assertThat(observed.metrics())
-                .as("recordCount is the number of records the live job drove to its serve sink; errorCount stays 0")
+                .as("recordCount is the number of records the live job drove to its serve sink; a run that"
+                        + " failed nothing publishes no failure metric")
                 .containsEntry("recordCount", 6L)
-                .containsEntry("errorCount", 0L);
+                .doesNotContainKey("errorCount");
     }
 
     @Test
@@ -237,7 +248,7 @@ class LifecycleVerbsOnRealChainE2ETest {
                 store, captureRunUnit::start, srsCoordinator,
                 (SnapshotBuffer) member.getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY));
         StoreBackedDagSource.SinkWriterBinder recordingSink =
-                (connectorId, settings, writeMode, ddl, target) -> (SupplierEx<SinkWriter>) () -> new RecordingSink(target);
+                (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) () -> new RecordingSink(target);
         DagSource dagSource = new StoreBackedDagSource(store, recordingSink);
         Engine engine = new Engine(member);
         EngineLifecycleActuator actuator = new EngineLifecycleActuator(
@@ -259,14 +270,14 @@ class LifecycleVerbsOnRealChainE2ETest {
     private InMemoryStorePort seedPipelineAndSchema() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(SOURCE_ID, null, "fake", Map.of("host", "h"), SourceMode.CDC,
-                List.of(TableRef.literal(TABLE)), null, null, null));
-        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null, null));
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SOURCE_ID),
+                List.of(TableRef.literal(TABLE)), null, null));
+        artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(SOURCE_ID, true)),
                 List.of(Step.inline("keep_all", FromClause.list(FromRef.literal(SOURCE_ID)),
-                        new TransformBody.Filter("true"), null, null)),
+                        new TransformBody.Filter("true"), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("keep_all"),
-                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null, null)), null, null),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
         InMemoryStorePort seeded = new InMemoryStorePort(artifacts);
         seeded.schemas().save(new DiscoveredSourceModel(SOURCE_ID, "fake", 0L, new SourceModel(List.of(
@@ -381,9 +392,9 @@ class LifecycleVerbsOnRealChainE2ETest {
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureListener listener) {
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             for (Envelope change : changes) {
-                listener.onEvent(change);
+                listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }
             return () -> { };
         }
@@ -416,6 +427,13 @@ class LifecycleVerbsOnRealChainE2ETest {
         @Override
         public Envelope next() {
             return rows.next();
+        }
+
+        @Override
+        public Optional<SourcePosition> seam() {
+            // Sampled by the source before its first row. The run refuses to start a tail without one,
+            // because a tail that begins wherever it likes loses every change made while the snapshot ran.
+            return Optional.of(new SourcePosition("seam-0"));
         }
 
         @Override
@@ -466,4 +484,20 @@ class LifecycleVerbsOnRealChainE2ETest {
         public void close() {
         }
     }
+
+    /**
+     * The state the read face reports, compared on the fields this case is about.
+     *
+     * <p>Not whole-record equality: the observation now carries when it was taken, so a record built here
+     * to compare against would have to invent a time, and would fail on whatever time it invented. What
+     * this case is about is the state the converger reached and the absence of a failure over it -- and
+     * that the reading is stamped at all is asserted once, separately, where it means something.
+     */
+    private void assertReadFaceReports(String pipelineId, PipelineState expected) {
+        assertThat(readFaces.status(pipelineId))
+                .returns(pipelineId, PipelineStatus::pipelineId)
+                .returns(expected, PipelineStatus::state)
+                .returns(null, PipelineStatus::failure);
+    }
+
 }

@@ -1,4 +1,3 @@
 rule: illegal-value
-adr: "ADR-0016 §2"
 path: id
 note: "an id carrying a newline is written as several lines and read back as names never used"
