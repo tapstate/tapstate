@@ -559,41 +559,34 @@ rm -rf "$shim"
 
 # --- the install event: what it carries, when it fires, and when it must not ------------------------
 # A local sink stands in for the endpoint, so these run with no network and no credentials. Each case
-# asserts on what actually arrived, not on what the script claims it sends.
+# asserts on what actually arrived, not on what the script claims it sends. The sink and the wait for
+# its port are in _event-sink.sh beside this file, which the quickstart smoke sources as well.
+#
+# The sink is a fixture, and a fixture that never started is one failure that says so. Reading a port it
+# never published points every case below at an endpoint with no port, and each of them then fails as
+# though the installer had sent the wrong thing: a sink that did not start, reported as defects in the
+# thing this suite exists to test.
+# shellcheck source=install/_event-sink.sh
+. "$HERE/_event-sink.sh"
+# This section's lines are bracketed in the output. install-smoke-test.sh reads the sink's verdict from
+# between the two markers alone, so a case elsewhere in this file that fails for its own reasons is not
+# reported a second time as though the sink had failed.
+printf '  ----  install event cases\n'
 if ! command -v python3 >/dev/null 2>&1; then
   bad "install event: python3 is needed for the local sink"
+elif ! start_sink; then
+  bad "install event: the local sink $SINK_FAILURE, so none of the install-event cases ran"
+  stop_sink
 else
-  BEACON_DIR="$(mktemp -d)"
-  : > "$BEACON_DIR/log"
-  python3 - "$BEACON_DIR" <<'PYEOF' &
-import http.server, os, sys
-d = sys.argv[1]
-class H(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        n = int(self.headers.get('Content-Length') or 0)
-        body = self.rfile.read(n).decode('utf-8', 'replace')
-        with open(os.path.join(d, 'log'), 'a') as fh:
-            fh.write(body + "\n")
-        self.send_response(204); self.end_headers()
-    def log_message(self, *a): pass
-srv = http.server.HTTPServer(('127.0.0.1', 0), H)
-with open(os.path.join(d, 'port'), 'w') as fh:
-    fh.write(str(srv.server_address[1]))
-srv.serve_forever()
-PYEOF
-  BEACON_PID=$!
-  for _ in $(seq 1 50); do [ -s "$BEACON_DIR/port" ] && break; sleep 0.1; done
-  BEACON_URL="http://127.0.0.1:$(cat "$BEACON_DIR/port")/e"
-
   # A second stub version, so "which version did it report" has two possible answers. With only the
   # pinned one in the tree the assertion cannot fail, and the field it guards is what makes the funnel
   # per-version at all.
   OTHER_VERSION=9.9.9
   _real_version="$VERSION"; VERSION="$OTHER_VERSION"; make_asset darwin-arm64; VERSION="$_real_version"
 
-  beacon_reset() { : > "$BEACON_DIR/log"; }
-  beacon_count() { grep -c . "$BEACON_DIR/log" 2>/dev/null | tr -d ' '; }
-  beacon_field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$BEACON_DIR/log" | head -1; }
+  beacon_reset() { : > "$SINK_DIR/log"; }
+  beacon_count() { grep -c . "$SINK_DIR/log" 2>/dev/null | tr -d ' '; }
+  beacon_field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$SINK_DIR/log" | head -1; }
 
   # run the installer with an explicit version and arbitrary args, capturing stderr separately
   # $1 install_dir  $2 version  $3 stderr_file  $4 stdout_file  rest: args to install.sh
@@ -612,7 +605,7 @@ PYEOF
       TAPSTATE_VERSION="$fver" \
       TAPSTATE_BASE_URL="file://$STUB" \
       TAPSTATE_INSTALL_DIR="$idir" \
-      TAPSTATE_TELEMETRY_URL="$BEACON_URL" \
+      TAPSTATE_TELEMETRY_URL="$SINK_URL" \
       sh "$INSTALL_SH" "$@" >"$outf" 2>"$errf"
     rm -rf "$shim"
   }
@@ -705,8 +698,9 @@ PYEOF
   else ok "the whole disclosure is on stderr, none of it on stdout"; fi
 
   rm -f "$ev_err" "$ev_out"
-  kill "$BEACON_PID" 2>/dev/null; wait "$BEACON_PID" 2>/dev/null
+  stop_sink
 fi
+printf '  ----  end of install event cases\n'
 
 # --- the harness itself must not report installs -----------------------------------------------------
 # The subject of this case is one line at the top of this file, and losing that line is silent: the
