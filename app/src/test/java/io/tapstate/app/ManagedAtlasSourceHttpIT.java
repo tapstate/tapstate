@@ -147,6 +147,24 @@ class ManagedAtlasSourceHttpIT {
                             assertThat(String.valueOf(denied).contains("invalid-plan-test-password")).isFalse();
                             assertThat(String.valueOf(denied).contains(settings.get("password").toString()))
                                     .isFalse();
+
+                            Map<String, Object> unreachableSettings = new LinkedHashMap<>(savedSource.config());
+                            unreachableSettings.put("host", "127.0.0.1:1");
+                            unreachableSettings.put("additionalString",
+                                    "authSource=admin&tls=true&serverSelectionTimeoutMS=1000&connectTimeoutMS=1000");
+                            ConnectionTestReport unreachable = client.post().uri("/api/connections:test")
+                                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .body(Map.of("id", id, "connectorId", "mongodb-atlas",
+                                            "settings", unreachableSettings))
+                                    .retrieve().body(ConnectionTestReport.class);
+                            assertThat(unreachable).isNotNull();
+                            assertThat(unreachable.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
+                            assertThat(unreachable.checks()).anyMatch(check ->
+                                    check.status() == ConnectionTestReport.Check.Status.FAILED
+                                            && check.message() != null && !check.message().isBlank());
+                            assertThat(String.valueOf(unreachable).contains(settings.get("password").toString()))
+                                    .isFalse();
                         }
 
                         ResponseEntity<Void> replaced = client.put().uri("/api/sources/" + id)
