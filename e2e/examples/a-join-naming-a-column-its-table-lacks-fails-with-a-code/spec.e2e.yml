@@ -20,12 +20,10 @@ setup:
   discover: [src_file]
 pipeline: pipeline.tap.yml
 seed:
-  src_file.customers:
-    values:
-      - { id: 1, name: ada }
-  src_file.orders:
-    values:
-      - { id: 10, customer_id: 1 }
+  # The file store holds rows of id and seq alone, so the join reads those; the missing column is the
+  # one thing wrong with the statement.
+  src_file.customers: { rows: 2 }
+  src_file.orders: { rows: 2 }
 steps:
   - start
   - await: { state: FAILED }

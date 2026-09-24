@@ -9,8 +9,8 @@ transforms:
     from: { o: orders, c: customers }
     engine: builtin
     sql: |
-      SELECT o.id AS order_id, o.no_such_column AS missing, c.name AS customer_name
-      FROM o LEFT JOIN c ON o.customer_id = c.id
+      SELECT o.id AS order_id, o.no_such_column AS missing, c.seq AS customer_seq
+      FROM o LEFT JOIN c ON o.seq = c.id
 view:
   id: order_state
   from: widen
