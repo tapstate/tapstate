@@ -1250,15 +1250,15 @@ final class Repl {
         out.println("following " + namespace + " · whole collection · streaming changes");
         out.println("note: shows changes as written to the store — not every intermediate version");
         out.flush();
-        AtomicInteger shown = new AtomicInteger();
+        AtomicInteger frames = new AtomicInteger();
         // Across members like the other two. What a change stream shows after a move is whatever the
         // connector supplies from there, which the header above has already said this view cannot
         // promise to be gapless -- but a view that stops updating with no line saying so promises less.
-        return streamAcrossMembers(shown, () -> controlPlane.tail(
+        return streamAcrossMembers(frames, () -> controlPlane.tail(
                 session.landingNode(), session.credential(),
                 live.sourceId(), live.collection(), live.filter(),
                 change -> {
-                    shown.incrementAndGet();
+                    frames.incrementAndGet();
                     TailRenderer.lines(change, screenWidth.getAsInt()).forEach(out::println);
                     out.flush();
                 },
@@ -3931,15 +3931,15 @@ final class Repl {
         // The movement outlives a move between members, because it is read from whichever member the
         // session is landed on rather than from the connection the state arrives over. One thread for the
         // whole watch, not one per attach.
-        AtomicInteger shown = new AtomicInteger();
+        AtomicInteger frames = new AtomicInteger();
         try {
             // Re-attaching re-reads the state rather than resuming a position, which is what the state is:
             // a value in the store that any member answers, not a log this member happens to hold. Saying it
             // again after a move is a re-poll, and a watcher who just saw the connection move is owed it.
-            return streamAcrossMembers(shown, () -> controlPlane.watchStatus(
+            return streamAcrossMembers(frames, () -> controlPlane.watchStatus(
                     session.landingNode(), session.credential(), id,
                     (pipelineId, state, failureCode, failureMessage) -> {
-                        shown.incrementAndGet();
+                        frames.incrementAndGet();
                         out.println(pipelineId + "  " + state.toLowerCase(Locale.ROOT));
                         if (failureCode != null) {
                             // Mirrors the one-shot `status` read: a failed state that cannot say what failed
@@ -3961,7 +3961,7 @@ final class Repl {
         }
     }
 
-    /** How many attaches in a row may show nothing before a stream stops looking for a member. */
+    /** How many attaches in a row may receive no frame at all before a stream stops looking for a member. */
     private static final int MAX_BARREN_ATTACHES = 3;
 
     /**
@@ -3970,16 +3970,22 @@ final class Repl {
      * server refuses it with a code -- which no other member would answer differently, so moving would
      * only ask the same question again -- or there is no member left to attach to.
      *
-     * <p>An attach that shows nothing counts against a small budget, so that a member answering its
-     * health probe while refusing the stream cannot hold a watch in a loop nobody can see. Anything shown
-     * gives the budget back: a quiet watch is not the same as a watch that cannot attach.
+     * <p>An attach on which no frame arrived counts against a small budget, so that a member answering its
+     * health probe while refusing the stream -- or taking the connection and never sending on it -- cannot
+     * hold a watch in a loop nobody can see. Any frame gives the budget back, whether or not it held
+     * anything new, so the caller's sink counts into {@code frames} every frame it is handed, before it
+     * decides what is worth printing. Counting what was printed instead mistakes a quiet follow for an
+     * unserved one: a follow's every attach opens by re-sending the window the member holds, and after an
+     * idle drop -- a proxy closing a quiet connection is enough -- all of that window was shown before. A
+     * healthy follow budgeted on what it printed ends after a few such drops, saying no member serves it;
+     * a quiet stream is not the same as a stream that cannot attach.
      */
     private int streamAcrossMembers(
-            AtomicInteger shown, Supplier<String> attach, ToIntFunction<String> renderRefusal) {
+            AtomicInteger frames, Supplier<String> attach, ToIntFunction<String> renderRefusal) {
         streamCancelled = false;
         int barren = 0;
         while (true) {
-            int before = shown.get();
+            int before = frames.get();
             String refusal = attach.get();
             if (refusal != null) {
                 return renderRefusal.applyAsInt(refusal);
@@ -3988,7 +3994,7 @@ final class Repl {
                 // a stream ends because the user stopped it, which is the way it is meant to end
                 return Cli.EXIT_OK;
             }
-            barren = shown.get() > before ? 0 : barren + 1;
+            barren = frames.get() > before ? 0 : barren + 1;
             if (barren >= MAX_BARREN_ATTACHES) {
                 PrintWriter err = commandLine.getErr();
                 err.println("stopped: no cluster member is serving this stream");
@@ -4046,17 +4052,19 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         PrintWriter out = commandLine.getOut();
-        AtomicInteger shown = new AtomicInteger();
+        AtomicInteger frames = new AtomicInteger();
         PrintedLogTail printed = new PrintedLogTail();
-        return streamAcrossMembers(shown, () -> {
+        return streamAcrossMembers(frames, () -> {
             printed.attaching();
             return controlPlane.followLogs(session.landingNode(), session.credential(), id,
                     (pipelineId, lines) -> {
+                        // Counted before the window is measured against what was printed: an opening
+                        // frame that only repeats lines already shown is still this member serving it.
+                        frames.incrementAndGet();
                         List<RemoteLogLine> fresh = printed.notYetPrinted(lines);
                         if (fresh.isEmpty()) {
                             return;
                         }
-                        shown.addAndGet(fresh.size());
                         fresh.forEach(line -> out.println(renderLogLine(line)));
                         out.flush();
                     },

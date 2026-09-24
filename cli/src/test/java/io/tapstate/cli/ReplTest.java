@@ -24,6 +24,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -5639,6 +5640,60 @@ class ReplTest {
         assertThat(client.watchCalls).hasSize(3);
         assertThat(h.sink().toString().substring(mark))
                 .contains("no cluster member is serving this stream");
+    }
+
+    @Test
+    void aQuietFollowWhoseConnectionKeepsDroppingKeepsFollowingUntilStopped() {
+        // Nothing new is being logged, and something between here and the member closes idle
+        // connections. Every attach opens with the window the member holds -- lines already printed --
+        // and then drops. That is a member serving the follow with nothing new to say, which is what a
+        // quiet pipeline sounds like; what tells it apart from a stream nobody serves is that a frame
+        // arrived, not that anything in it was worth printing.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.followBatches = List.of(List.of(
+                new RemoteLogLine(1_700_000_000_000L, "INFO", "submitted job"),
+                new RemoteLogLine(1_700_000_000_100L, "WARN", "slow tick")));
+        client.streamEndings.clear();
+        // Twice as many idle drops in a row as a stream nobody serves is allowed, then the user stops it.
+        client.streamEndings.addAll(Collections.nCopies(6, FakeControlPlane.StreamEnding.DROPPED));
+        client.streamEndings.add(FakeControlPlane.StreamEnding.STOPPED);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("logs pl1 --follow")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out)
+                .as("every attach was answered with the member's window, so a member is serving this "
+                        + "follow; it only had nothing new to say")
+                .doesNotContain("no cluster member is serving this stream");
+        assertThat(client.followCalls)
+                .as("it carried on across every drop until the user stopped it")
+                .hasSize(7);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
+        assertThat(occurrences(out, "submitted job")).isEqualTo(1);
+        assertThat(occurrences(out, "slow tick")).isEqualTo(1);
+    }
+
+    @Test
+    void aFollowNoMemberWillServeStillStopsRatherThanAttachingForever() {
+        // The budget still holds for a follow: a member that takes the connection and then sends nothing
+        // at all, attach after attach, has given no sign that it is serving the stream. The user stops it
+        // on the attach after the budget, so a follow that never gave up would end there, not hang.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.followBatches = List.of();
+        client.streamEndings.clear();
+        client.streamEndings.addAll(Collections.nCopies(3, FakeControlPlane.StreamEnding.DROPPED));
+        client.streamEndings.add(FakeControlPlane.StreamEnding.STOPPED);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("logs pl1 --follow")).isTrue();
+
+        assertThat(client.followCalls).hasSize(3);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("no cluster member is serving this stream");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
     }
 
     /** How many times {@code needle} appears in {@code text}; a reprint is the thing under test. */
