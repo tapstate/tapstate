@@ -80,6 +80,12 @@ fetch() {
     # A flat --max-time would do the opposite and cut off exactly the slow-but-working case that
     # needs the patience.
     #
+    # That floor is curl's. wget has no minimum-rate option, so its path is an idle timeout instead: it
+    # ends a transfer that has delivered nothing at all for the same window. A server trickling a byte
+    # at a time would keep it alive; a connection that has died would not, and a dead one is what this
+    # exists to end. Its retries are capped at curl's three, because wget's own default is twenty, and
+    # twenty read timeouts per attempt is a stall that ends long after the reader has given up on it.
+    #
     # Progress goes to stderr and only when stderr is a terminal. The quickstart drops this script's
     # stdout but shows its stderr, so a person piping the one-liner sees the bar; a log, a CI run and
     # anything reading the output stay byte-for-byte as quiet as before.
@@ -102,7 +108,7 @@ fetch() {
                  "$1" -o "$_part" && { mv -f "$_part" "$2"; return 0; }
         elif command -v wget >/dev/null 2>&1; then
             # shellcheck disable=SC2086  # same
-            wget $_wget_out -c --connect-timeout=20 --read-timeout="$_stall_secs" \
+            wget $_wget_out -c --tries=3 --connect-timeout=20 --read-timeout="$_stall_secs" \
                  "$1" -O "$_part" && { mv -f "$_part" "$2"; return 0; }
         else
             die "neither curl nor wget is available to download $1."

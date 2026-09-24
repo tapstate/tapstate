@@ -774,46 +774,71 @@ PYEOF
   # no summary, no failing case, and a caller left waiting on a pipe some background helper still
   # holds. The bound has to turn a hang into a FAILING CASE, which means waiting on the transfer
   # rather than on this script.
-  stall_start="$(date +%s)"
-  sh "$SD/fetch.sh" "http://127.0.0.1:$(cat "$SD/port")/blob" "$SD/blob" >"$SD/out" 2>"$SD/err" &
-  FETCH_PID=$!
-  stall_deadline=$(( stall_start + 120 ))
-  stall_hung=0
-  while kill -0 "$FETCH_PID" 2>/dev/null; do
-    if [ "$(date +%s)" -ge "$stall_deadline" ]; then
-      stall_hung=1
-      # The shim's children too: killing the shell leaves curl holding the transfer, and an orphan
-      # that outlives the case is what turns the next run's timing into a mystery.
-      pkill -P "$FETCH_PID" 2>/dev/null
-      kill -9 "$FETCH_PID" 2>/dev/null
-      break
+  #
+  # $1 names the tool under test in every verdict; $2 is the PATH the shim runs with -- empty for this
+  # suite's own, where curl answers first.
+  stalled_fetch() {
+    rm -f "$SD/blob" "$SD/blob.part"
+    stall_start="$(date +%s)"
+    if [ -n "$2" ]; then
+      PATH="$2" "$SH_BIN" "$SD/fetch.sh" "http://127.0.0.1:$(cat "$SD/port")/blob" "$SD/blob" \
+        >"$SD/out" 2>"$SD/err" &
+    else
+      "$SH_BIN" "$SD/fetch.sh" "http://127.0.0.1:$(cat "$SD/port")/blob" "$SD/blob" >"$SD/out" 2>"$SD/err" &
     fi
-    sleep 1
-  done
-  wait "$FETCH_PID" 2>/dev/null; fetch_rc=$?
-  stall_secs=$(( $(date +%s) - stall_start ))
+    FETCH_PID=$!
+    stall_deadline=$(( stall_start + 120 ))
+    stall_hung=0
+    while kill -0 "$FETCH_PID" 2>/dev/null; do
+      if [ "$(date +%s)" -ge "$stall_deadline" ]; then
+        stall_hung=1
+        # The shim's children too: killing the shell leaves the downloader holding the transfer, and
+        # an orphan that outlives the case is what turns the next run's timing into a mystery.
+        pkill -P "$FETCH_PID" 2>/dev/null
+        kill -9 "$FETCH_PID" 2>/dev/null
+        break
+      fi
+      sleep 1
+    done
+    wait "$FETCH_PID" 2>/dev/null; fetch_rc=$?
+    stall_secs=$(( $(date +%s) - stall_start ))
 
-  if [ "$stall_hung" = "1" ]; then
-    bad "a download that never delivered a byte was still going after ${stall_secs}s -- it does not give up"
-  elif [ "$fetch_rc" = "0" ]; then
-    bad "a download that never delivered a byte reported success"
-  else
-    ok "a stalled download fails instead of hanging"
-  fi
+    if [ "$stall_hung" = "1" ]; then
+      bad "$1: a download that never delivered a byte was still going after ${stall_secs}s -- it does not give up"
+    elif [ "$fetch_rc" = "0" ]; then
+      bad "$1: a download that never delivered a byte reported success"
+    else
+      ok "$1: a stalled download fails instead of hanging"
+    fi
 
-  if grep -q 'could not download' "$SD/err"; then
-    ok "and it names the download it gave up on"
-  else
-    bad "a failed download said nothing about what it was fetching: $(head -2 "$SD/err")"
-  fi
+    if grep -q 'could not download' "$SD/err"; then
+      ok "$1: and it names the download it gave up on"
+    else
+      bad "$1: a failed download said nothing about what it was fetching: $(head -2 "$SD/err")"
+    fi
 
-  # Nothing half-transferred sits at the real path, where a later run would take it for a finished file.
-  if [ -e "$SD/blob" ]; then
-    bad "a stalled download left something at the destination path"
+    # Nothing half-transferred sits at the real path, where a later run would take it for a finished file.
+    if [ -e "$SD/blob" ]; then
+      bad "$1: a stalled download left something at the destination path"
+    else
+      ok "$1: a stalled download leaves nothing at the destination path"
+    fi
+    printf '  note  %s: the stalled download gave up after %ss\n' "$1" "$stall_secs"
+  }
+  SH_BIN="$(command -v sh)"
+  stalled_fetch curl ""
+
+  # The wget branch is only reached where curl is absent, so nothing above touches it. It has no
+  # minimum-rate option and ends a stall on its read timeout instead -- and wget retries a timed-out
+  # read twenty times by default, so without a cap of its own each of the three attempts outlasts
+  # this case's whole bound. Forced by a PATH holding wget and what fetch() shells out to, and no curl.
+  if command -v wget >/dev/null 2>&1; then
+    mkdir -p "$SD/wget-only"
+    for t in wget rm mv; do ln -s "$(command -v "$t")" "$SD/wget-only/$t"; done
+    stalled_fetch wget "$SD/wget-only"
   else
-    ok "a stalled download leaves nothing at the destination path"
+    bad "wget: not installed, so the fallback download path went untested"
   fi
-  printf '  note  the stalled download gave up after %ss\n' "$stall_secs"
 
   kill "$SD_PID" 2>/dev/null; wait "$SD_PID" 2>/dev/null
   rm -rf "$SD"
