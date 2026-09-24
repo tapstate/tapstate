@@ -26,6 +26,7 @@ public final class MapJoinStores implements JoinStores {
     private final Map<String, Map<String, Object>> facts;
     private final Map<String, Map<String, Map<String, Object>>> dimensions = new HashMap<>();
     private final Map<String, Map<ReverseBucket.At, ReverseBucket>> indexes = new HashMap<>();
+    private final Map<String, Long> takenIn = new HashMap<>();
     private final int pageSize;
 
     public MapJoinStores() {
@@ -119,9 +120,19 @@ public final class MapJoinStores implements JoinStores {
         index(source).remove(dimensionKey, factKey);
     }
 
-    /** How many entries this is holding, over all three kinds - what a case looks at to see it settle. */
+    @Override
+    public long batchesTakenIn(String writer) {
+        return takenIn.getOrDefault(writer, 0L);
+    }
+
+    @Override
+    public void putBatchesTakenIn(String writer, long batch) {
+        takenIn.put(Objects.requireNonNull(writer, "writer"), batch);
+    }
+
+    /** How many entries this is holding, over all four kinds - what a case looks at to see it settle. */
     public int entries() {
-        int held = facts.size();
+        int held = facts.size() + takenIn.size();
         for (Map<String, Map<String, Object>> rows : dimensions.values()) {
             held += rows.size();
         }

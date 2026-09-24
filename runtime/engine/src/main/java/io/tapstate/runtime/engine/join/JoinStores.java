@@ -101,4 +101,19 @@ public interface JoinStores {
 
     /** Removes one record of {@code factKey} referencing {@code dimensionKey}. */
     void indexRemove(String source, String dimensionKey, String factKey);
+
+    /**
+     * The last batch {@code writer} recorded as taken in whole, or zero where it recorded none.
+     *
+     * <p><b>This is what a fact row mirrored by an earlier run is trusted on.</b> The mirror is written
+     * before the index, so a copy in the mirror says nothing about whether its index entries followed
+     * it; the copy names the batch that wrote it, and this says whether that batch got to its end.
+     */
+    long batchesTakenIn(String writer);
+
+    /**
+     * Records that every batch {@code writer} numbered up to {@code batch} was taken in whole. Written
+     * only by that writer, and only after the batch's last index write returned.
+     */
+    void putBatchesTakenIn(String writer, long batch);
 }

@@ -135,7 +135,8 @@ public final class PipelineDagBuilder {
 
     /**
      * Every namespace this pipeline's joins keep state in, empty for a pipeline that has none: the mirror of
-     * the driving rows, and a mirror and a reverse index for each source the step is wired to.
+     * the driving rows, the record of how far each run got, and a mirror and a reverse index for each
+     * source the step is wired to.
      *
      * <p>Named here rather than left out because the state is not a cache. The mirrors hold each dimension
      * row as it last was, so a run inheriting them widens fresh driving rows with values the source no
@@ -163,6 +164,7 @@ public final class PipelineDagBuilder {
                 continue;
             }
             namespaces.add(JoinMaps.factMirror(pipeline.id(), step.id()));
+            namespaces.add(JoinMaps.writers(pipeline.id(), step.id()));
             // A join's from: is an alias map by construction - the step model refuses any other shape for
             // one - so this is an invariant rather than a case, and a violation crashes bare.
             for (String alias : ((FromClause.Aliases) step.from()).aliases().keySet()) {

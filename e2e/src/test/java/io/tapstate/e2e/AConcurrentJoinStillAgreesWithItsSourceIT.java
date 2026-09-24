@@ -189,6 +189,10 @@ class AConcurrentJoinStillAgreesWithItsSourceIT {
             return held.indexNames(source, asked);
         }
         @Override public void indexRemove(String source, String key, String fact) { held.indexRemove(source, key, fact); }
+        @Override public long batchesTakenIn(String writer) { return held.batchesTakenIn(writer); }
+        @Override public void putBatchesTakenIn(String writer, long batch) {
+            held.putBatchesTakenIn(writer, batch);
+        }
         @Override public void indexAdd(String source, String key, String fact) {
             held.indexAdd(source, key, fact);
             if (source.equals("c") && afterCustomerIndex != null) {

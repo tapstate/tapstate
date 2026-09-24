@@ -110,13 +110,72 @@ class AReplayOverADeadRunsStateStillMatchesEveryFactRowTest {
                 .containsEntry("cve", "CVE-2020-23327");
     }
 
+    /**
+     * The same gap reached through an update rather than a load read again, which is how a pipeline
+     * whose load has finished meets it: its restart resumes the change stream and reads nothing again,
+     * so the only thing that comes back is the change the dead run was in the middle of.
+     *
+     * <p>The update moves the row's join key and its before image carries the row's own key alone, as
+     * postgres publishes it under its default replica identity. The dead run mirrored the new key and
+     * died before the index took it; delivered again, the update finds the mirror already holding the
+     * key it moves to, so an index that is only ever touched where the key changes is not touched at
+     * all - and the dimension row arriving after it has no record of the row to reach it through.
+     */
+    @Test
+    @DisplayName("an update the dead run mirrored but never indexed is matched once it is delivered again")
+    void anUpdateTheDeadRunMirroredButNeverIndexedIsMatchedWhenDeliveredAgain() {
+        MapJoinStores kept = new MapJoinStores();
+        DiesAtTheNextIndexWrite member = new DiesAtTheNextIndexWrite(kept);
+        View view = new View();
+
+        // The run that died. It loaded both rows and took row 8389's update in whole; then it was shut
+        // down while taking row 8390's update in - after the mirror had the new key, before the index.
+        JoinDriver dead = new JoinDriver(PLAN, FACT_KEY, STREAM, member);
+        view.take(dead, List.of(cve(8389L, "cve-unmapped-1"), cve(8390L, "cve-unmapped-2")));
+        view.take(dead, List.of(repointed(8389L, "cve-2020-23326")));
+        member.dieAtTheNextIndexWrite();
+        assertThatThrownBy(() -> dead.apply(List.of(repointed(8390L, "cve-2020-23327")), view))
+                .isInstanceOf(HazelcastInstanceNotActiveException.class);
+
+        // The restart resumes the change stream where it had last been confirmed, before both updates,
+        // so both are delivered again; then the dimension rows they point at arrive.
+        JoinDriver replay = new JoinDriver(PLAN, FACT_KEY, STREAM, kept);
+        view.take(replay, List.of(
+                repointed(8389L, "cve-2020-23326"),
+                repointed(8390L, "cve-2020-23327")));
+        view.take(replay, List.of(
+                crosswalk("cve-2020-23326", "CVE-2020-23326"),
+                crosswalk("cve-2020-23327", "CVE-2020-23327")));
+
+        assertThat(view.lastRowFor(8389L))
+                .as("the update the dead run took in whole is matched once its dimension row arrives")
+                .containsEntry("cve", "CVE-2020-23326");
+        assertThat(view.lastRowFor(8390L))
+                .as("and so must be the update it left in the mirror with no index entry: its dimension "
+                        + "row has arrived, so a null here is a wrong answer nothing reports")
+                .containsEntry("cve", "CVE-2020-23327");
+    }
+
     /** One row of the fact table as a snapshot reads it. */
     private static SourceChange cve(long rowId, String cveId) {
+        return new SourceChange("c", Envelope.read(1L, "cves", cveRow(rowId, cveId), null));
+    }
+
+    /**
+     * An update pointing one fact row at {@code cveId}, whose before image carries the row's own key
+     * and nothing else - what postgres publishes under its default replica identity.
+     */
+    private static SourceChange repointed(long rowId, String cveId) {
+        return new SourceChange("c",
+                Envelope.update(1L, "cves", Map.of("row_id", rowId), cveRow(rowId, cveId), null));
+    }
+
+    private static Map<String, Object> cveRow(long rowId, String cveId) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("row_id", rowId);
         row.put("cve_id", cveId);
         row.put("published", LocalDate.of(2023, 3, 14));
-        return new SourceChange("c", Envelope.read(1L, "cves", row, null));
+        return row;
     }
 
     /** One row of the key-mapping dimension as a snapshot reads it. */
@@ -252,6 +311,16 @@ class AReplayOverADeadRunsStateStillMatchesEveryFactRowTest {
         @Override
         public void indexRemove(String source, String dimensionKey, String factKey) {
             held.indexRemove(source, dimensionKey, factKey);
+        }
+
+        @Override
+        public long batchesTakenIn(String writer) {
+            return held.batchesTakenIn(writer);
+        }
+
+        @Override
+        public void putBatchesTakenIn(String writer, long batch) {
+            held.putBatchesTakenIn(writer, batch);
         }
     }
 }

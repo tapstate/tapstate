@@ -18,8 +18,8 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * A join's state on the cluster: three distributed maps, each reading through to the cold layer behind
- * it, reached the way the driver reaches any store.
+ * A join's state on the cluster: distributed maps, each reading through to the cold layer behind it,
+ * reached the way the driver reaches any store.
  *
  * <p><b>The batch read is the reason the fact mirror is asked through {@link #factsUnder} at all.</b>
  * {@code getAll} is what carries a page of keys to the members holding them in one exchange and, where
@@ -199,6 +199,21 @@ public final class ImapJoinStores implements JoinStores {
         trim(pages, dimensionKey, last);
     }
 
+    @Override
+    public long batchesTakenIn(String writer) {
+        Long batch = writers().get(writer);
+        return batch == null ? 0 : batch;
+    }
+
+    /**
+     * A plain set, as the fact mirror's is: only the writer the entry is named after ever writes it, so
+     * there is no second writer for an update to be lost to.
+     */
+    @Override
+    public void putBatchesTakenIn(String writer, long batch) {
+        writers().set(writer, batch);
+    }
+
     /**
      * Drops pages off the end that have emptied, so a bucket churned through does not leave a trail of
      * entries holding nothing - the memory budget over these maps counts entries and is blind to how
@@ -254,6 +269,10 @@ public final class ImapJoinStores implements JoinStores {
 
     private IMap<ReverseBucket.At, ReverseBucket> index(String source) {
         return member.getMap(JoinMaps.reverseIndex(pipelineId, stepId, source));
+    }
+
+    private IMap<String, Long> writers() {
+        return member.getMap(JoinMaps.writers(pipelineId, stepId));
     }
 
     /** Appends one fact key to a page, or says the page is full. Runs where the entry lives. */

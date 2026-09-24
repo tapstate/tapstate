@@ -121,6 +121,22 @@ class ImapJoinStoresTest {
                 .isGreaterThanOrEqualTo(4);
     }
 
+    /**
+     * What a restart trusts the rows of an earlier run on has to be there when that run's member is
+     * not: it comes back from the layer behind the map once memory no longer holds it, and a run that
+     * recorded nothing reads as having taken no batch in whole.
+     */
+    @Test
+    @DisplayName("the batches a run took in whole come back from the layer behind the map")
+    void theBatchesARunTookInWholeComeBackFromTheLayerBehindTheMap() {
+        stores.putBatchesTakenIn("finished", 3);
+        stores.putBatchesTakenIn("finished", 4);
+        member.getMap(JoinMaps.writers(PIPELINE, STEP)).evictAll();
+
+        assertThat(stores.batchesTakenIn("finished")).isEqualTo(4);
+        assertThat(stores.batchesTakenIn("never-recorded")).isZero();
+    }
+
     @Test
     @DisplayName("asking for no fact rows reaches neither the map nor the layer under it")
     void askingForNothingCostsNothing() {

@@ -47,7 +47,8 @@ final class CountingJoinStores implements JoinStores {
     int pagesAsked;
 
     /**
-     * How many calls changed something - either mirror, either direction, and the index with them.
+     * How many calls changed something - either mirror, either direction, the index with them, and the
+     * record of the batches a run took in whole.
      *
      * <p><b>It is here for the same reason the read counts are, one step further along.</b> The reads
      * catch an operator that went back to asking one key at a time; nothing caught an operator that
@@ -56,7 +57,7 @@ final class CountingJoinStores implements JoinStores {
      * survive an ordinary runner's noise is wider than that. As a count it is exact and the same
      * mutation is caught the moment it lands.
      *
-     * <p>One counter over all six rather than one each: what it is asked to notice is the operator
+     * <p>One counter over all seven rather than one each: what it is asked to notice is the operator
      * doing more work than it is recorded to, and which call carries it is a thing the failure message
      * can be read for.
      */
@@ -164,5 +165,16 @@ final class CountingJoinStores implements JoinStores {
     public void indexRemove(String source, String dimensionKey, String factKey) {
         writes++;
         held.indexRemove(source, dimensionKey, factKey);
+    }
+
+    @Override
+    public long batchesTakenIn(String writer) {
+        return held.batchesTakenIn(writer);
+    }
+
+    @Override
+    public void putBatchesTakenIn(String writer, long batch) {
+        writes++;
+        held.putBatchesTakenIn(writer, batch);
     }
 }

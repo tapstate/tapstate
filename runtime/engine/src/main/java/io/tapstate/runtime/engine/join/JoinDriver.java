@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.Predicate;
 
 /**
@@ -67,10 +68,13 @@ import java.util.function.Predicate;
  * entirely ordinary.
  *
  * <p><b>What the mirror holds is not evidence of what the index holds.</b> A fact row is written to the
- * mirror before the index, so a member that dies between the two leaves a row no bucket names. A row
- * that arrives again - a load read again after a restart, an insert delivered again - therefore has its
- * index entry confirmed rather than assumed; see {@link #confirmIndexed}. The index is read ahead for
- * those rows a batch at a time, as the mirror is; see {@link #primeIndex}.
+ * mirror before the index, so a member that dies between the two leaves a row no bucket names, and
+ * whatever arrives for that row next - the load read again, the same change delivered again - finds the
+ * mirror already agreeing with it. So a mirrored row carries the batch that wrote it, and a batch
+ * records that it was taken in whole once its last index write has landed. A row arriving again whose
+ * batch never recorded that has its index entries confirmed rather than assumed, whatever kind of
+ * change it arrives as; see {@link #indexedWith} and {@link #confirmIndexed}. The index is read ahead
+ * for those rows a batch at a time, as the mirror is; see {@link #primeIndex}.
  *
  * <p><b>What this does not keep is the queue itself.</b> Work outstanding when a member dies is not
  * written down; what is written down is the reverse index, from which the work is derivable. Nothing
@@ -127,6 +131,31 @@ public final class JoinDriver {
             return size() > BUCKETS_REMEMBERED;
         }
     };
+
+    /**
+     * Who is writing, as the rows this driver mirrors name it: one run of one join processor. Random
+     * rather than derived from anything a run has, because the one thing it must never do is name a run
+     * that came before - what that run recorded decides whether the rows it left can be trusted.
+     */
+    private final String writer = newWriter();
+
+    /** The batch being taken in, counted from one. */
+    private long batch;
+
+    /** The last batch this driver took in whole. */
+    private long tookIn;
+
+    /** Whether the batch being taken in has mirrored a fact row, and so has something to record. */
+    private boolean mirroredThisBatch;
+
+    /**
+     * The last batch each earlier writer recorded as taken in whole, as far as this driver has asked.
+     * One read per writer, however many of its rows arrive: a record only ever rises, so an answer read
+     * earlier is at worst lower than the record now is, which costs a row a confirmation and never
+     * trusts one it should not. Bounded by how many runs have written the rows this driver is handed.
+     */
+    private final Map<String, Long> takenIn = new HashMap<>();
+
     private final int keysPerRead;
     private final JoinGauge gauge;
     private final DimensionRowDisplacedAlert displaced;
@@ -225,12 +254,20 @@ public final class JoinDriver {
      * inside {@link #apply}, which is why the caller that needs to tell them apart is given both.
      */
     public void absorb(List<SourceChange> changes) {
+        batch++;
+        mirroredThisBatch = false;
         prime(changes);
         for (SourceChange change : changes) {
             absorb(change);
         }
         primed.clear();
         named.clear();
+        if (mirroredThisBatch) {
+            // After the batch's last index write and never before it: this is what says they all
+            // landed, and a batch that dies part way never gets here.
+            stores.putBatchesTakenIn(writer, batch);
+        }
+        tookIn = batch;
     }
 
     /**
@@ -297,15 +334,17 @@ public final class JoinDriver {
     }
 
     /**
-     * Asks the reverse index, a batch at a time, whether it names the rows of this batch that are
-     * arriving again - which is what {@link #confirmIndexed} answers from before it asks the store.
+     * Asks the reverse index, a batch at a time, whether it names the rows of this batch that
+     * {@link #confirmIndexed} is about to confirm - which is what it answers from before it asks the
+     * store.
      *
-     * <p><b>This is the read a load read again makes most of.</b> Every row of it is one the mirror
-     * already holds, so every row is confirmed, and confirmed a page read at a time that is a trip per
-     * row per dimension, on every run of a snapshot-only pipeline. Here each bucket is asked about the
+     * <p><b>This is the read a restart makes most of.</b> The rows confirmed are every row a batch that
+     * never finished had mirrored, because nothing says which of its index writes landed - and, once,
+     * every row of a load read again over rows mirrored before rows carried their batch. Confirmed a
+     * page read at a time, that is a trip per row per dimension. Here each bucket is asked about the
      * page its last row was found on and then the pages after it, for as long as they go on naming its
-     * rows, and each of those steps is one question for every bucket of the batch: a load read again
-     * arrives in the order its buckets were written, so a batch reaches no further into a bucket than
+     * rows, and each of those steps is one question for every bucket of the batch: rows arriving again
+     * arrive in the order their buckets were written, so a batch reaches no further into a bucket than
      * its own length. What comes back is the keys found, never the pages, so what this holds is
      * bounded by the batch and not by how long its buckets are.
      *
@@ -318,13 +357,20 @@ public final class JoinDriver {
         Map<Bucket, Set<String>> wanted = new LinkedHashMap<>();
         for (SourceChange change : changes) {
             Envelope event = change.event();
-            if (!change.source().equals(factSource) || event.before() != null || event.after() == null
-                    || (event.op() != Op.READ && event.op() != Op.INSERT)) {
+            // The rows absorbFact confirms: mirrored under the key they arrive with, read from the
+            // mirror rather than from a whole before image, and mirrored by a batch not known to have
+            // finished.
+            if (!change.source().equals(factSource) || event.after() == null
+                    || carriesTheWholeRow(event.before())) {
                 continue;
             }
             String key = keyOf(event.after(), factKeyColumns);
-            Map<String, Object> mirroredRow = key == null ? null : primed.get(key);
-            if (mirroredRow == null) {
+            String previousKey = event.before() == null ? null : keyOf(event.before(), factKeyColumns);
+            if (key == null || (previousKey != null && !previousKey.equals(key))) {
+                continue;
+            }
+            Map<String, Object> mirroredRow = primed.get(key);
+            if (mirroredRow == null || indexedWith(mirroredRow, event.op())) {
                 continue;
             }
             for (Dimension dimension : dimensions) {
@@ -482,13 +528,12 @@ public final class JoinDriver {
             // before image is then the only account of the row there is.
             previous = before;
         }
-        // A snapshot read or an insert says the row is new, so a mirror holding it anyway means it is
-        // arriving a second time - and the delivery before may have died between the mirror and the
-        // index. Updates are not asked the same question: one that changes nothing looks exactly like
-        // one delivered again, and confirming every such update would put a bucket search on an
-        // ordinary edit.
-        boolean arrivedBefore = mirroredRow != null && previousKey.equals(key)
-                && (event.op() == Op.READ || event.op() == Op.INSERT);
+        // The mirror already agreeing with the row is no evidence that the index does: the batch that
+        // wrote the mirror's copy may have died before the index writes that went with it. Its stamp
+        // says whether that batch finished, whatever kind of change this is - a load read again, an
+        // insert or an update delivered again, or an ordinary edit.
+        boolean unconfirmed = mirroredRow != null && previousKey.equals(key)
+                && !indexedWith(mirroredRow, event.op());
         if (previous != null && !previousKey.equals(key)) {
             // The row's own identity moved, so what was published under the old one is a different
             // row and nothing else will ever remove it.
@@ -500,12 +545,13 @@ public final class JoinDriver {
         // immediately; if the mirror still looks empty, it removes that entry as stale and later
         // dimension changes never reach the fact again.
         dropPrimed(key);
-        stores.putFact(key, after);
+        stores.putFact(key, stamped(after));
+        mirroredThisBatch = true;
         for (Dimension dimension : dimensions) {
             String was = previous == null ? null : dimensionKeyIn(previous, dimension);
             String now = dimensionKeyIn(after, dimension);
             if (Objects.equals(was, now)) {
-                if (arrivedBefore && now != null) {
+                if (unconfirmed && now != null) {
                     confirmIndexed(dimension, now, key);
                 }
                 continue;
@@ -531,15 +577,15 @@ public final class JoinDriver {
      * mirror and then the index - the order that keeps a rebuild running beside it from dropping the new
      * entry as stale - and those are two writes to two maps. A member that dies between them leaves a
      * row the mirror holds and no bucket names, and a run that dies keeps its state, so what comes back
-     * is that same row again: the load read from the start, or the insert delivered again. Taken as an
-     * unchanged key, it adds nothing and is published unmatched while its dimension row is still on its
-     * way; that dimension row finds its fact rows through the bucket that does not name it, so the row
-     * stays unmatched for good, beside rows that all matched, with nothing reporting it.
+     * is that same row again: the load read from the start, or the same change delivered again. Taken
+     * as an unchanged key, it adds nothing and is published unmatched while its dimension row is still
+     * on its way; that dimension row finds its fact rows through the bucket that does not name it, so
+     * the row stays unmatched for good, beside rows that all matched, with nothing reporting it.
      *
-     * <p><b>Why it looks before it adds.</b> Almost every row arriving again is named already - only the
-     * ones a member was part way through when it died are not - and appending regardless would add a
-     * copy of every bucket on every load read again, which for a snapshot-only pipeline is every run.
-     * The index tolerates a copy; it does not tolerate growing by one per run for ever.
+     * <p><b>Why it looks before it adds.</b> Almost every row of a batch that never finished is named
+     * already - only the one a member was part way through when it died is not - and appending
+     * regardless would add a copy of each of them. The index tolerates a copy; it does not tolerate
+     * growing by one for every row of every batch a member died in.
      *
      * <p><b>Why it starts where the last one was found.</b> A load read again arrives in the order it was
      * first taken in, which is the order its buckets were written in, so the next row of a bucket is on
@@ -581,6 +627,56 @@ public final class JoinDriver {
             }
         }
         stores.indexAdd(source, dimensionKey, factKey);
+    }
+
+    /**
+     * Whether the index writes that went with the mirror's copy of a fact row are known to have landed:
+     * whether the batch that wrote the copy recorded that it was taken in whole.
+     *
+     * <p><b>The copy decides, not the change arriving for it.</b> A batch records that it was taken in
+     * whole after its last index write, so a copy whose batch did is indexed, and one whose batch never
+     * did may be missing its entries - the row a member was part way through when it died. The change
+     * says nothing either way: a load read again, an insert or an update delivered again, and an
+     * ordinary edit all find the mirror agreeing with them, and only the edit is not arriving twice.
+     * So every row of a batch that never finished is confirmed, however it arrives, and a row of a batch
+     * that did is left as it is, however it arrives - a load read again over a run that finished
+     * searches no bucket at all.
+     *
+     * <p><b>A copy carrying no batch was mirrored before copies carried one</b>, so there is no record
+     * to ask. A snapshot read or an insert of it is confirmed, as a row arriving a second time; an
+     * update of it is taken as it stands, since confirming every such edit would put a bucket search on
+     * each first edit of every row. Rewriting the copy stamps it, so this is paid once per row.
+     */
+    private boolean indexedWith(Map<String, Object> mirroredRow, Op op) {
+        if (!(mirroredRow.get(WRITTEN_IN) instanceof String written)) {
+            return op != Op.READ && op != Op.INSERT;
+        }
+        int colon = written.lastIndexOf(':');
+        String by = written.substring(0, colon);
+        long in = Long.parseLong(written, colon + 1, written.length(), 10);
+        if (by.equals(writer)) {
+            // Earlier in this batch, whose changes finish one at a time, or in a batch this run took in
+            // whole. A batch of this run that failed part way is neither.
+            return in == batch || in <= tookIn;
+        }
+        return in <= takenIn.computeIfAbsent(by, stores::batchesTakenIn);
+    }
+
+    /** {@code row} as the mirror keeps it: carrying the batch that wrote it, which is this one. */
+    private Map<String, Object> stamped(Map<String, Object> row) {
+        Map<String, Object> stamped = new LinkedHashMap<>(row);
+        stamped.put(WRITTEN_IN, writer + ':' + batch);
+        return stamped;
+    }
+
+    /**
+     * A name no other run is going to take: sixty-four bits of a random UUID. Short on purpose, because
+     * every mirrored row carries it.
+     */
+    private static String newWriter() {
+        UUID random = UUID.randomUUID();
+        return Long.toUnsignedString(random.getMostSignificantBits() ^ random.getLeastSignificantBits(),
+                Character.MAX_RADIX);
     }
 
     /**
@@ -806,11 +902,10 @@ public final class JoinDriver {
                 // dimension row, and a first load reaches a dimension row with its fact rows still
                 // arriving. A read that was never asked for a key says nothing about whether the row is
                 // there, while the branch below reads absence as gone - and that costs the row its
-                // index entry, because the ordinary stream never adds one back: a change to a fact row
-                // already in the mirror finds its dimension key unchanged and appends nothing, and only
-                // the row arriving again, as a load read again does, confirms it. The row then keeps
-                // whatever it was last published with, and every later change to this dimension row
-                // walks past it, with the job running and nothing reported.
+                // index entry for good, because nothing ever adds one back: a fact row already in the
+                // mirror re-arriving finds its dimension key unchanged and appends nothing. The row
+                // then keeps whatever it was last published with, and every later change to this
+                // dimension row walks past it, with the job running and nothing reported.
                 factRow = stores.fact(factKey);
             }
             // The index is derived; the fact row's own foreign key is the truth. A bucket may name a
@@ -870,6 +965,14 @@ public final class JoinDriver {
      * all, so this covers a load with a thousand such keys in well under a megabyte.
      */
     static final int BUCKETS_REMEMBERED = 1_024;
+
+    /**
+     * The column a mirrored fact row carries the batch that wrote it under, as the writer and the
+     * batch's number. No source column can be called this: it begins with the null character, which no
+     * database takes in a column name, so it never meets a column of the row and no published value is
+     * ever computed from it.
+     */
+    static final String WRITTEN_IN = "\u0000writtenIn";
 
     /** Queues the published row for {@code factRow}, or its removal. */
     private void queueRow(Map<String, Object> factRow, long ts, boolean removed) {

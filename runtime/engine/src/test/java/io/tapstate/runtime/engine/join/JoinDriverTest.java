@@ -516,8 +516,8 @@ class JoinDriverTest {
      * <p>Held to both halves, because each has a way of going wrong that the other cannot see. The row
      * the index lost has to be named again or its dimension row never reaches it; the rows the index
      * kept must not be named twice, or every load read again - every run of a snapshot-only pipeline -
-     * grows the index by a copy of itself. The bucket is several pages long, so the rows are confirmed
-     * across pages rather than on the one.
+     * grows the index by a copy of itself. The bucket is several pages long, so the lost row is looked
+     * for across pages rather than on the one.
      */
     @Test
     @DisplayName("a load read again names every row once: the lost row is added, the kept ones are not")
@@ -531,24 +531,26 @@ class JoinDriverTest {
         }
         Fixture dead = new Fixture(JoinKind.LEFT, kept);
         dead.applyBatch(load.subList(0, 5));
-        // What the member left behind when it died taking row 15 in.
-        kept.putFact(dead.factKeyOf(15L), Map.of("id", 15L, "cust_id", 1L));
+        // What the member left behind when it died taking row 15 in: the row in the mirror, under a
+        // batch that never recorded it was taken in whole, and nothing in the index.
+        kept.putFact(dead.factKeyOf(15L), unfinished(Map.of("id", 15L, "cust_id", 1L)));
 
         Fixture restarted = new Fixture(JoinKind.LEFT, kept);
         restarted.applyBatch(load);
 
         assertThat(restarted.stores.writes)
-                .as("the mirror once per row, and the index only for the lost row and the four new ones")
-                .isEqualTo(load.size() + 1 + 4);
-        // Rows 10 to 14 are named on pages 0, 0, 1, 1 and 2, and the read ahead finds them there a
-        // page at a time, one question for the batch per page, stopping at the page after the last
-        // (4 questions). Only row 15 is searched for on its own: from page 2, where row 14 was found,
-        // then pages 1 and 0 (3 reads).
+                .as("the mirror once per row, the index only for the lost row and the four new ones, "
+                        + "and the batch's record")
+                .isEqualTo(load.size() + 1 + 4 + 1);
+        // Rows 10 to 14 came from a batch that recorded it was taken in whole, so nothing is asked about
+        // them. Row 15 is asked about for the batch, on page 0 and then page 1, which names none of it
+        // (2 questions), and then searched for on its own: page 0, where its bucket starts, then pages 1
+        // and 2 (3 reads).
         assertThat(restarted.stores.nameReads)
-                .as("the rows the index kept are confirmed a page at a time for the whole batch")
-                .isEqualTo(4);
+                .as("only the lost row is asked about, and the kept rows are not")
+                .isEqualTo(2);
         assertThat(restarted.stores.pageReads)
-                .as("only the lost row is looked for on its own, from where the last row was found")
+                .as("and only the lost row is looked for on its own")
                 .isEqualTo(3);
         List<String> named = new ArrayList<>();
         String bucket = restarted.dimensionKeyOf(1L);
@@ -567,15 +569,33 @@ class JoinDriverTest {
     }
 
     /**
-     * A load read again in the report's shape, one fact row under each dimension key, held to what
-     * confirming it costs. Every row is one the mirror already holds, so every row is confirmed, and
-     * confirmed a page read at a time that is a trip per row per dimension on every run of a
-     * snapshot-only pipeline - answering exactly what one read of the batch answers, so nothing but
-     * this count says which one is happening.
+     * A row an earlier version mirrored carries no batch, so nothing says whether its index entry
+     * followed it. Read again, it is confirmed as a row arriving a second time, which is what brings
+     * back the entry of one such a version left behind when it died.
      */
     @Test
-    @DisplayName("a load read again is confirmed with one question to the index for the batch, not a read per row")
-    void aLoadReadAgainIsConfirmedWithOneReadForTheBatch() {
+    @DisplayName("a row mirrored before rows carried their batch is confirmed when the load is read again")
+    void aRowMirroredBeforeRowsCarriedTheirBatchIsConfirmedWhenReadAgain() {
+        MapJoinStores kept = new MapJoinStores();
+        Fixture restarted = new Fixture(JoinKind.LEFT, kept);
+        kept.putFact(restarted.factKeyOf(7L), Map.of("id", 7L, "cust_id", 1L));
+
+        restarted.apply(fact(read(Map.of("id", 7L, "cust_id", 1L))));
+
+        assertThat(kept.indexPage("c", restarted.dimensionKeyOf(1L), 0))
+                .as("the entry the mirror's copy never had is added")
+                .containsExactly(restarted.factKeyOf(7L));
+    }
+
+    /**
+     * A load read again over a run that finished, in the report's shape: one fact row under each
+     * dimension key. Every batch of that run recorded that it was taken in whole, so every row of the
+     * load is known to be indexed and none is confirmed - which on a snapshot-only pipeline is what
+     * every run after the first reads.
+     */
+    @Test
+    @DisplayName("a load read again over a run that finished asks the index nothing")
+    void aLoadReadAgainOverARunThatFinishedAsksTheIndexNothing() {
         MapJoinStores kept = new MapJoinStores();
         List<SourceChange> load = new ArrayList<>();
         for (long id = 1; id <= 50; id++) {
@@ -586,32 +606,64 @@ class JoinDriverTest {
         Fixture restarted = new Fixture(JoinKind.LEFT, kept);
         restarted.applyBatch(load);
 
+        assertThat(restarted.stores.nameReads).as("no question to the index for the batch").isZero();
+        assertThat(restarted.stores.pageReads).as("no page read for a row").isZero();
+        assertThat(restarted.stores.pageCountReads).as("nor any bucket's length").isZero();
+        assertThat(restarted.stores.writes)
+                .as("the mirror once per row, nothing added to the index, and the batch's record")
+                .isEqualTo(load.size() + 1);
+    }
+
+    /**
+     * The same load read again over a run that died at the end of its batch - after its last index
+     * write, before it recorded the batch - held to what confirming it costs. Nothing says which of
+     * that batch's index writes landed, so every one of its rows is confirmed; confirmed a page read at
+     * a time, that is a trip per row per dimension, answering exactly what one read of the batch
+     * answers, so nothing but this count says which one is happening.
+     */
+    @Test
+    @DisplayName("the rows of a batch that never finished are confirmed with one question for the batch")
+    void theRowsOfABatchThatNeverFinishedAreConfirmedWithOneQuestion() {
+        MapJoinStores kept = new MapJoinStores();
+        List<SourceChange> load = new ArrayList<>();
+        Fixture restarted = new Fixture(JoinKind.LEFT, kept);
+        for (long id = 1; id <= 50; id++) {
+            load.add(fact(read(Map.of("id", id, "cust_id", id))));
+            kept.putFact(restarted.factKeyOf(id), unfinished(Map.of("id", id, "cust_id", id)));
+            kept.indexAdd("c", restarted.dimensionKeyOf(id), restarted.factKeyOf(id));
+        }
+
+        restarted.applyBatch(load);
+
         assertThat(restarted.stores.pageReads).as("no row asks for a page on its own").isZero();
         assertThat(restarted.stores.pageCountReads).as("nor for how long its bucket is").isZero();
         assertThat(restarted.stores.nameReads).as("one question to the index for the batch").isEqualTo(1);
         assertThat(restarted.stores.pagesAsked).as("about the page of each row's bucket")
                 .isEqualTo(load.size());
-        assertThat(restarted.stores.writes).as("the mirror once per row, and nothing added to the index")
-                .isEqualTo(load.size());
+        assertThat(restarted.stores.writes)
+                .as("the mirror once per row, nothing added to the index, and the batch's record")
+                .isEqualTo(load.size() + 1);
     }
 
     /**
-     * A bucket many pages long read again a batch at a time, which is how the vertex hands a large load
-     * over. A batch starts on the page the previous one ended on or on the one after it, and reaches no
-     * further than its own length, so it is confirmed from those pages however long the bucket is - and
-     * each is asked about once for the batch rather than read once for each of its rows.
+     * A bucket many pages long, every row of it left by a batch that never finished, read again a batch
+     * at a time, which is how the vertex hands a large load over. A batch starts on the page the
+     * previous one ended on or on the one after it, and reaches no further than its own length, so it
+     * is confirmed from those pages however long the bucket is - and each is asked about once for the
+     * batch rather than read once for each of its rows.
      */
     @Test
     @DisplayName("a long bucket read again a batch at a time asks about the pages each batch reaches, once")
     void aLongBucketReadAgainAsksAboutThePagesEachBatchReaches() {
         MapJoinStores kept = new MapJoinStores(4);
         List<SourceChange> load = new ArrayList<>();
+        Fixture restarted = new Fixture(JoinKind.LEFT, kept);
         for (long id = 10; id < 30; id++) {
             load.add(fact(read(Map.of("id", id, "cust_id", 1L))));
+            kept.putFact(restarted.factKeyOf(id), unfinished(Map.of("id", id, "cust_id", 1L)));
+            kept.indexAdd("c", restarted.dimensionKeyOf(1L), restarted.factKeyOf(id));
         }
-        new Fixture(JoinKind.LEFT, kept).applyBatch(load);
 
-        Fixture restarted = new Fixture(JoinKind.LEFT, kept);
         for (int from = 0; from < load.size(); from += 4) {
             restarted.applyBatch(load.subList(from, from + 4));
         }
@@ -624,8 +676,19 @@ class JoinDriverTest {
         assertThat(restarted.stores.nameReads).as("the pages each batch reaches, a question for each")
                 .isEqualTo(9);
         assertThat(restarted.stores.pagesAsked).isEqualTo(9);
-        assertThat(restarted.stores.writes).as("the mirror once per row, and nothing added to the index")
-                .isEqualTo(load.size());
+        assertThat(restarted.stores.writes)
+                .as("the mirror once per row, nothing added to the index, and each batch's record")
+                .isEqualTo(load.size() + 5);
+    }
+
+    /**
+     * {@code row} as a member that died part way through a batch leaves it in the mirror: under a batch
+     * of a run that never recorded that it was taken in whole.
+     */
+    private static Map<String, Object> unfinished(Map<String, Object> row) {
+        Map<String, Object> mirrored = new LinkedHashMap<>(row);
+        mirrored.put(JoinDriver.WRITTEN_IN, "a-run-that-died:1");
+        return mirrored;
     }
 
     /**
@@ -991,6 +1054,16 @@ class JoinDriverTest {
         @Override
         public void indexRemove(String source, String dimensionKey, String factKey) {
             held.indexRemove(source, dimensionKey, factKey);
+        }
+
+        @Override
+        public long batchesTakenIn(String writer) {
+            return held.batchesTakenIn(writer);
+        }
+
+        @Override
+        public void putBatchesTakenIn(String writer, long batch) {
+            held.putBatchesTakenIn(writer, batch);
         }
     }
 

@@ -77,6 +77,44 @@ class AJoinRestartedPartWayThroughItsLoadStillAgreesWithItsSourceIT {
         }
     }
 
+    /**
+     * The same gap reached through an update, which is how a pipeline whose load has finished meets
+     * it: its restart resumes the change stream and reads nothing again, so what comes back is the
+     * change the stopped run was in the middle of. The update moves the row's join key and carries a
+     * before image holding the row's key alone, as postgres publishes it under its default replica
+     * identity - so the mirror already holds the key it moves to when it is delivered again.
+     */
+    @Test
+    void anUpdateTheStoppedRunMirroredButNeverIndexedIsMatchedWhenDeliveredAgain() throws Exception {
+        try (Connection db = database("join_restart_mid_update")) {
+            Member[] member = new Member[1];
+            try (JoinConformance answer = JoinConformance.of(db, SQL, List.of("row_id"),
+                    (keys, stream) -> member[0] = new Member(keys, stream))) {
+                // The run that stops: both rows loaded and row 8389's update taken in whole, then the
+                // member stops while taking row 8390's update in - after the mirror has the key it
+                // moves to, before the reverse index does.
+                answer.upsert("cves", cve(8389, "cve-unmapped-1"));
+                answer.upsert("cves", cve(8390, "cve-unmapped-2"));
+                answer.updateWithKeyOnlyBefore("cves", cve(8389, "cve-2020-23326"));
+                member[0].stopAtTheNextIndexWrite();
+                assertThatThrownBy(() -> answer.updateWithKeyOnlyBefore("cves", cve(8390, "cve-2020-23327")))
+                        .isInstanceOf(MemberStopped.class);
+
+                // The restart resumes the change stream from before both updates, so both are delivered
+                // again; then the dimension rows they point at arrive.
+                member[0].restart();
+                answer.updateWithKeyOnlyBefore("cves", cve(8389, "cve-2020-23326"));
+                answer.updateWithKeyOnlyBefore("cves", cve(8390, "cve-2020-23327"));
+                answer.upsert("xw_cves", Map.of("surface_key", "cve-2020-23326", "cve", "CVE-2020-23326"));
+                answer.upsert("xw_cves", Map.of("surface_key", "cve-2020-23327", "cve", "CVE-2020-23327"));
+
+                assertThat(answer.differences())
+                        .as("both updated rows matched, the one the stopped run left unindexed included")
+                        .isEmpty();
+            }
+        }
+    }
+
     private static Map<String, Object> cve(int rowId, String cveId) {
         return Map.of("row_id", rowId, "cve_id", cveId, "published", Date.valueOf("2023-03-14"));
     }
@@ -198,6 +236,10 @@ class AJoinRestartedPartWayThroughItsLoadStillAgreesWithItsSourceIT {
             return held.indexNames(source, asked);
         }
         @Override public void indexRemove(String source, String key, String fact) { held.indexRemove(source, key, fact); }
+        @Override public long batchesTakenIn(String writer) { return held.batchesTakenIn(writer); }
+        @Override public void putBatchesTakenIn(String writer, long batch) {
+            held.putBatchesTakenIn(writer, batch);
+        }
         @Override public void indexAdd(String source, String key, String fact) {
             if (stopping) {
                 throw new MemberStopped();

@@ -714,12 +714,13 @@ class JoinBenchRun {
             }
         }
 
-        /** How many entries the three maps hold in memory, across this member. */
+        /** How many entries the join's maps hold in memory, across this member. */
         private long resident() {
             if (arm == Arm.HEAP) {
                 return 0;
             }
             return owned(JoinMaps.factMirror(PIPELINE, STEP))
+                    + owned(JoinMaps.writers(PIPELINE, STEP))
                     + owned(JoinMaps.dimensionMirror(PIPELINE, STEP, DIM))
                     + owned(JoinMaps.reverseIndex(PIPELINE, STEP, DIM));
         }

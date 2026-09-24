@@ -196,15 +196,7 @@ final class JoinConformance implements AutoCloseable {
      */
     void upsert(String table, Map<String, Object> row) throws SQLException {
         String name = table.toLowerCase(java.util.Locale.ROOT);
-        List<String> key = keyOf(name);
-        Map<String, Object> identity = new LinkedHashMap<>();
-        for (String column : key) {
-            if (!row.containsKey(column)) {
-                throw new IllegalArgumentException("a row written to " + name + " has to carry its key "
-                        + key + ", and this one does not: " + row.keySet());
-            }
-            identity.put(column, row.get(column));
-        }
+        Map<String, Object> identity = identityIn(name, row);
         Map<String, Object> before = read(name, identity);
         if (before == null) {
             insert(name, row);
@@ -214,6 +206,38 @@ final class JoinConformance implements AutoCloseable {
         Map<String, Object> after = read(name, identity);
         feed(name, before == null ? Envelope.insert(1L, name, after, null)
                 : Envelope.update(1L, name, before, after, null));
+    }
+
+    /**
+     * Writes one row {@code table} already holds and hands the carrier the change as postgres publishes
+     * it under its default replica identity: a before image carrying the row's key and nothing else.
+     *
+     * <p>Calling it again with the same row is the same change delivered again, as a restart that
+     * resumes the change stream from before it does: the database is left as it was and the carrier is
+     * handed what it was handed the first time.
+     */
+    void updateWithKeyOnlyBefore(String table, Map<String, Object> row) throws SQLException {
+        String name = table.toLowerCase(java.util.Locale.ROOT);
+        Map<String, Object> identity = identityIn(name, row);
+        if (read(name, identity) == null) {
+            throw new IllegalArgumentException(name + " holds no row " + identity + " to update");
+        }
+        update(name, row, identity);
+        feed(name, Envelope.update(1L, name, identity, read(name, identity), null));
+    }
+
+    /** The key columns of {@code table} and what {@code row} holds under them, in the key's order. */
+    private Map<String, Object> identityIn(String table, Map<String, Object> row) {
+        List<String> key = keyOf(table);
+        Map<String, Object> identity = new LinkedHashMap<>();
+        for (String column : key) {
+            if (!row.containsKey(column)) {
+                throw new IllegalArgumentException("a row written to " + table + " has to carry its key "
+                        + key + ", and this one does not: " + row.keySet());
+            }
+            identity.put(column, row.get(column));
+        }
+        return identity;
     }
 
     /**
