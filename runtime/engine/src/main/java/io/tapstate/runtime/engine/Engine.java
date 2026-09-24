@@ -138,10 +138,9 @@ public final class Engine {
      * be.
      */
     public void refuseIfLost(String pipelineId) {
-        Optional<TapstateException> lost = lost(pipelineId);
-        if (lost.isPresent()) {
-            throw lost.get();
-        }
+        lost(pipelineId).ifPresent(refusal -> {
+            throw refusal;
+        });
     }
 
     /** Pauses the pipeline's running job. The job is kept so it can be resumed. */
@@ -247,9 +246,9 @@ public final class Engine {
      * and the member is the one thing that can no longer be asked, so the loss is the failure.
      */
     public Optional<Throwable> failureOf(String pipelineId) {
-        Optional<TapstateException> lost = lost(pipelineId);
+        Optional<Throwable> lost = lost(pipelineId).map(Throwable.class::cast);
         if (lost.isPresent()) {
-            return Optional.of(lost.get());
+            return lost;
         }
         Job job = jobNamed(pipelineId);
         if (job == null || job.getStatus() != JobStatus.FAILED) {
