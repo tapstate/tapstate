@@ -43,3 +43,30 @@ else
     "$fails" "$status" >&2
   exit 1
 fi
+
+# The sink must start without resolving a name for the address it bound. On some macOS runners that
+# lookup stalls for about 35 seconds, past any wait for the port, and on Linux it returns at once, so
+# only a lookup that fails outright makes a server that performs it fail here as well.
+mkdir -p "$SCRATCH/site"
+cat > "$SCRATCH/site/sitecustomize.py" <<EOF
+import socket
+open("$SCRATCH/lookup-armed", "w").close()
+def getfqdn(name=""):
+    raise OSError("name lookup refused by install-smoke-test.sh")
+socket.getfqdn = getfqdn
+EOF
+status=0
+PYTHONPATH="$SCRATCH/site${PYTHONPATH:+:$PYTHONPATH}" bash "$HERE/install-smoke.sh" > "$SCRATCH/out" 2>&1 || status=$?
+if [ ! -e "$SCRATCH/lookup-armed" ]; then
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  python3 never loaded the refusing name lookup, so nothing here was tested\n' >&2
+  exit 1
+fi
+fails="$(grep -c '^  FAIL' "$SCRATCH/out" || true)"
+if [ "$status" -eq 0 ] && [ "$fails" = 0 ]; then
+  printf 'PASS  the sink starts without a name lookup, so a stalled lookup cannot keep it from binding\n'
+else
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  with name lookups refused the smoke reported %s failure(s) (smoke exit %s)\n' "$fails" "$status" >&2
+  exit 1
+fi

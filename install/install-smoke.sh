@@ -599,7 +599,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   bad "install event: python3 is needed for the local sink"
 elif ! start_sink; then
   bad "install event: the local sink never bound a port, so none of the install-event cases ran"
-  kill "$BEACON_PID" 2>/dev/null; wait "$BEACON_PID" 2>/dev/null
+  kill "$BEACON_PID" 2>/dev/null; wait "$BEACON_PID" 2>/dev/null; rm -rf "$BEACON_DIR"
 else
   BEACON_URL="http://127.0.0.1:$(cat "$BEACON_DIR/port")/e"
 
@@ -723,7 +723,7 @@ else
   else ok "the whole disclosure is on stderr, none of it on stdout"; fi
 
   rm -f "$ev_err" "$ev_out"
-  kill "$BEACON_PID" 2>/dev/null; wait "$BEACON_PID" 2>/dev/null
+  kill "$BEACON_PID" 2>/dev/null; wait "$BEACON_PID" 2>/dev/null; rm -rf "$BEACON_DIR"
 fi
 
 # --- the harness itself must not report installs -----------------------------------------------------

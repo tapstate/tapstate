@@ -1003,7 +1003,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   bad "quickstart install event: python3 is needed for the local sink"
 elif ! start_sink; then
   bad "quickstart install event: the local sink never bound a port, so none of the install-event cases ran"
-  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null
+  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null; rm -rf "$QBD"
 else
   QB_URL="http://127.0.0.1:$(cat "$QBD/port")/e"
 
@@ -1079,7 +1079,7 @@ else
   rm -rf "$QS_HOME"
 
   rm -f "$qs_out" "$qs_err"
-  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null
+  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null; rm -rf "$QBD"
 fi
 
 # --- the harness itself must not report installs -----------------------------------------------------
