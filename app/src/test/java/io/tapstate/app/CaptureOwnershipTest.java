@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -39,7 +40,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -317,7 +321,7 @@ class CaptureOwnershipTest {
         List<String> starts = new ArrayList<>();
         Member b = new Member("node-b", store, claims, Duration.ofSeconds(10), starts);
 
-        b.captures.startCapture("q");
+        startAsConvergenceDoes(b.captures, "q");
 
         assertThat(starts).containsExactly("node-b q opened the tail");
         assertThat(claims.current.owner()).isEqualTo(Member.owner("node-b"));
@@ -345,7 +349,7 @@ class CaptureOwnershipTest {
         });
         holderOpening.start();
 
-        b.captures.startCapture("q");
+        startAsConvergenceDoes(b.captures, "q");
         holderOpening.join();
 
         assertThat(starts).containsExactly("node-b q attached");
@@ -363,10 +367,128 @@ class CaptureOwnershipTest {
         List<String> starts = new ArrayList<>();
         Member b = new Member("node-b", store, claims, Duration.ofMillis(600), starts);
 
-        assertThatThrownBy(() -> b.captures.startCapture("q"))
+        assertThatThrownBy(() -> startAsConvergenceDoes(b.captures, "q"))
                 .isInstanceOfSatisfying(TapstateException.class, refused ->
                         assertThat(refused.code()).isEqualTo(CaptureError.NO_RING_TO_ATTACH));
         assertThat(starts).isEmpty();
+    }
+
+    /**
+     * Starts {@code pipelineId} the way convergence does: a start given back is started again on the next
+     * pass, until it is carried out or refused.
+     */
+    private static void startAsConvergenceDoes(
+            StoreBackedPipelineCaptureCoordinator captures, String pipelineId) {
+        long giveUp = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        while (true) {
+            try {
+                captures.startCapture(pipelineId);
+                return;
+            } catch (RingNotOpenYet notYet) {
+                if (System.nanoTime() - giveUp >= 0) {
+                    throw new AssertionError("the start was still being given back after 30 seconds", notYet);
+                }
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted between passes", interrupted);
+                }
+            }
+        }
+    }
+
+    /**
+     * A start that finds its capture held elsewhere and no ring open yet gives the pass back instead of
+     * waiting for one. The wait was a sleep of up to a whole lease inside the start, on the one thread that
+     * converges every pipeline here, holding the lock that this member's claim-loss handling, stops,
+     * takeovers and failure checks all take: a holder that died between taking the claim and opening its
+     * ring stalled all of them for that long.
+     */
+    @Test
+    void aStartThatFindsTheRingNotOpenYetHoldsNeitherItsCallerNorTheCoordinator() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("q"));
+        MemoryClaims claims = new MemoryClaims();
+        // The holder has taken the claim and is still opening its ring; it keeps its lease throughout.
+        claims.acquire(captureKey(store, "q"), Member.owner("node-a"), 7, Duration.ofMinutes(5));
+        List<String> starts = Collections.synchronizedList(new ArrayList<>());
+        Member b = new Member("node-b", store, claims, Duration.ofSeconds(5), starts);
+        CountDownLatch startReturned = new CountDownLatch(1);
+        AtomicReference<Throwable> startEndedWith = new AtomicReference<>();
+        Thread convergence = new Thread(() -> {
+            try {
+                b.captures.startCapture("q");
+            } catch (Throwable ended) {
+                startEndedWith.set(ended);
+            }
+            startReturned.countDown();
+        });
+        convergence.start();
+        Thread.sleep(100);
+
+        long asked = System.nanoTime();
+        b.captures.captureFailure("q");
+        Duration waitedBehindTheStart = Duration.ofNanos(System.nanoTime() - asked);
+
+        try {
+            assertThat(waitedBehindTheStart)
+                    .as("nothing else on this member's coordinator waits behind a start")
+                    .isLessThan(Duration.ofMillis(500));
+            assertThat(startReturned.await(1, TimeUnit.SECONDS))
+                    .as("the start returns rather than waiting the lease out")
+                    .isTrue();
+            assertThat(startEndedWith.get())
+                    .as("and is not refused: the ring may yet open, and the next pass looks again")
+                    .isNotInstanceOf(TapstateException.class);
+            assertThat(starts).isEmpty();
+        } finally {
+            convergence.join(Duration.ofSeconds(10).toMillis());
+        }
+    }
+
+    /**
+     * A start gives the pass back before opening anything, so nothing it opened has to be taken down again
+     * and opened afresh on the next pass. A pipeline over two sources whose second capture is not ready yet
+     * opened the first source's tail -- and read its load -- then closed it when the second one gave up.
+     */
+    @Test
+    void aStartGivingThePassBackHasOpenedNothingAndHoldsNoClaim() {
+        SourceResource items = new SourceResource(
+                "items-source", null, "mysql", Map.of("host", "items.internal"), SourceMode.CDC,
+                List.of(TableRef.literal("items")), null, null);
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(SOURCE);
+        artifacts.save(items);
+        artifacts.save(new PipelineResource(
+                "p", null, List.of(SourceRef.spec("orders-source", true), SourceRef.spec("items-source", true)),
+                null, null,
+                new ServeBlock.Inline(
+                        null, FromClause.list(FromRef.literal("orders-source"), FromRef.literal("items-source")),
+                        List.of(new SyncElement("sync", "target", null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        List<String> captureIds = new StoreBackedPipelineCaptures(store).captureIds("p");
+        WorkloadClaimKey orders = new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, captureIds.get(0));
+        WorkloadClaimKey itemsCapture =
+                new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, captureIds.get(1));
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        // Another member holds the items capture and has not opened its ring; the orders capture is free.
+        claims.acquire(itemsCapture, Member.owner("node-a"), 7, Duration.ofMinutes(5));
+        List<String> starts = new ArrayList<>();
+        Member b = new Member("node-b", store, claims, Duration.ofMillis(300), starts);
+
+        Throwable startEndedWith = null;
+        try {
+            b.captures.startCapture("p");
+        } catch (RuntimeException ended) {
+            startEndedWith = ended;
+        }
+
+        assertThat(startEndedWith).as("the start is given back, not carried out").isNotNull();
+        assertThat(starts).as("and nothing was opened for it").isEmpty();
+        assertThat(claims.read(orders).filter(WorkloadClaimReading::leased))
+                .as("and the capture it could have taken is not left held")
+                .isEmpty();
     }
 
     /** A read with no tail has no ring to wait for, so it attaches at once. */
@@ -518,11 +640,12 @@ class CaptureOwnershipTest {
         private final StoreBackedPipelineCaptureCoordinator captures;
         private final AtomicInteger tailsClosed = new AtomicInteger();
 
-        Member(String node, InMemoryStorePort store, MemoryClaims claims, Duration ttl, List<String> starts) {
+        Member(String node, InMemoryStorePort store, WorkloadClaimStore claims, Duration ttl,
+                List<String> starts) {
             this(node, store, claims, ttl, RENEW, starts);
         }
 
-        Member(String node, InMemoryStorePort store, MemoryClaims claims, Duration ttl, Duration renew,
+        Member(String node, InMemoryStorePort store, WorkloadClaimStore claims, Duration ttl, Duration renew,
                 List<String> starts) {
             this.node = node;
             this.starts = starts;

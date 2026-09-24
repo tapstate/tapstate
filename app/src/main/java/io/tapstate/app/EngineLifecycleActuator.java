@@ -95,9 +95,16 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // snapshot, so an apply cannot move one without the others. Said after the drop above, which is the
         // one thing entitled to clear what earlier runs said.
         stateTeardown.willKeepStateAt(pipelineId, prepared.stateLocations());
-        prepared.artifactSnapshot().ifPresentOrElse(
-                snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
-                () -> captureCoordinator.startCapture(pipelineId));
+        try {
+            prepared.artifactSnapshot().ifPresentOrElse(
+                    snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
+                    () -> captureCoordinator.startCapture(pipelineId));
+        } catch (RingNotOpenYet notYet) {
+            // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
+            // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
+            // being opened on another member, and how long that may take is bounded where it is decided.
+            return;
+        }
         // Capture opens the SRS generation that source vertices compile into the DAG. Build only now, but
         // from the same frozen artifacts used above; placement and teardown were already fixed, so any
         // shape record this writes remains named even if construction refuses the start.

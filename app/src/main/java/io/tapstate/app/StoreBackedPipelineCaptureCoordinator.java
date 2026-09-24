@@ -73,9 +73,6 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** The schema version stamped on ring items at L1 (schema evolution is a later increment). */
     private static final long MOCK_SCHEMA_VER = 0L;
 
-    /** How often a pipeline attaching where the capture is not held looks again for the ring it reads. */
-    private static final Duration RING_POLL = Duration.ofMillis(200);
-
     private final StorePort storePort;
     private final CaptureStarter captureStarter;
     private final CaptureAttacher captureAttacher;
@@ -94,6 +91,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * pipeline that happened to take the claim.
      */
     private final Map<CaptureId, JoinedCapture> joinedCaptures = new LinkedHashMap<>();
+
+    /** The captures starts here were given back over, for as long as they are still not ready. */
+    private final Map<CaptureId, RingWait> ringWaits = new LinkedHashMap<>();
 
     /** Looks for captures pipelines here read and nobody tails; started with the first capture joined. */
     private ScheduledExecutorService takeovers;
@@ -162,6 +162,11 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         long snapshotEpoch = readMode == ReadMode.SNAPSHOT_ONLY
                 ? SnapshotRunOrder.next(storePort.keyedState(), pipelineId, retainedChainGeneration(pipelineId))
                 : 1L;
+        // Every source's capture is settled before any source is opened, so a start that has to be given
+        // back is given back having opened nothing: a source opened first would otherwise read its whole
+        // load again on every pass until the last one was ready.
+        Map<CaptureId, CaptureOwnership.Permit> permits = new LinkedHashMap<>();
+        List<SourcePlan> plans = plan(pipelineId, pipeline, captured, snapshotEpoch, permits);
         List<PipelineRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
@@ -171,23 +176,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // window that had already closed.
         Instant loadBegan = Instant.now();
         try {
-            for (SourceRef ref : pipeline.sources()) {
-                String sourceId = ref.id();
-                SourceResource source = StoredArtifacts.requireSource(captured, sourceId);
-                // Read once and used twice: it decides which streams this run reads, and it carries the
-                // row count the last discovery took of each of them. Asking the store again for the second
-                // use would pay for a second read per source on every start.
-                SourceModel discovered = SourceDiscovery.model(storePort, source);
-                Optional<SourceCaptureResolution> selected =
-                        SourceCaptureResolution.forPipeline(pipeline, source, discovered);
-                if (selected.isEmpty()) {
-                    continue;
-                }
-                SourceCaptureResolution resolution = selected.orElseThrow();
-                CaptureRunSpec spec = deriveSpec(
-                        pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref),
-                        snapshotEpoch);
-                CaptureId captureId = CaptureId.of(spec);
+            for (SourcePlan plan : plans) {
+                SourceCaptureResolution resolution = plan.resolution();
+                CaptureRunSpec spec = plan.spec();
+                CaptureId captureId = plan.captureId();
                 Map<String, Long> observedSnapshotCounts = new LinkedHashMap<>();
                 CaptureRun run;
                 if (!managedOwnership) {
@@ -202,8 +194,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                                 snapshotPassthrough(pipelineId, resolution, observedSnapshotCounts), false);
                         existing.pipelines.add(pipelineId);
                     } else {
-                        CaptureOwnership.Permit permit = acquireOrAwaitTheRing(captureId, spec);
+                        CaptureOwnership.Permit permit = permits.get(captureId);
                         if (permit.acquired()) {
+                            // From here the tail, or the release below, answers for this claim.
+                            permits.remove(captureId);
                             try {
                                 run = captureAttacher.start(
                                         spec.withCaptureFence(permit.fence()),
@@ -234,7 +228,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     }
                     runs.add(PipelineRun.managed(captureId, run));
                 }
-                recordSnapshot(attributed, sourceId, spec, run, observedSnapshotCounts, discovered);
+                recordSnapshot(attributed, plan.sourceId(), spec, run, observedSnapshotCounts, plan.discovered());
                 snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
             }
         } catch (RuntimeException | Error failure) {
@@ -245,11 +239,82 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             if (cleanupFailure != null) {
                 failure.addSuppressed(cleanupFailure);
             }
+            releaseUnopened(permits, failure);
             throw failure;
         }
         runsByPipeline.put(pipelineId, runs);
         snapshotsByPipeline.put(pipelineId, reading(attributed, loadBegan));
         snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
+    }
+
+    /** One source of a start as it was settled before anything was opened: what to open and for what. */
+    private record SourcePlan(
+            String sourceId,
+            SourceModel discovered,
+            SourceCaptureResolution resolution,
+            CaptureRunSpec spec,
+            CaptureId captureId) {
+    }
+
+    /**
+     * Works out every source this start reads and settles the claim on each capture it does not already
+     * tail here, before any of them is opened -- into {@code permits}, one per capture however many sources
+     * share it. A capture held elsewhere whose ring is not open yet gives the whole start back, with the
+     * claims taken so far let go.
+     */
+    private List<SourcePlan> plan(
+            String pipelineId,
+            PipelineResource pipeline,
+            ArtifactStore captured,
+            long snapshotEpoch,
+            Map<CaptureId, CaptureOwnership.Permit> permits) {
+        List<SourcePlan> plans = new ArrayList<>();
+        try {
+            for (SourceRef ref : pipeline.sources()) {
+                String sourceId = ref.id();
+                SourceResource source = StoredArtifacts.requireSource(captured, sourceId);
+                // Read once and used twice: it decides which streams this run reads, and it carries the
+                // row count the last discovery took of each of them. Asking the store again for the second
+                // use would pay for a second read per source on every start.
+                SourceModel discovered = SourceDiscovery.model(storePort, source);
+                Optional<SourceCaptureResolution> selected =
+                        SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+                if (selected.isEmpty()) {
+                    continue;
+                }
+                SourceCaptureResolution resolution = selected.orElseThrow();
+                CaptureRunSpec spec = deriveSpec(
+                        pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref),
+                        snapshotEpoch);
+                CaptureId captureId = CaptureId.of(spec);
+                if (managedOwnership && !ownedCaptures.containsKey(captureId) && !permits.containsKey(captureId)) {
+                    permits.put(captureId, permitOrNotYet(pipelineId, captureId, spec));
+                }
+                plans.add(new SourcePlan(sourceId, discovered, resolution, spec, captureId));
+            }
+        } catch (RuntimeException | Error failure) {
+            releaseUnopened(permits, failure);
+            throw failure;
+        }
+        return plans;
+    }
+
+    /**
+     * Lets go of the claims a start took for captures it never opened. One that cannot be let go of runs
+     * out by its lease; saying so on the failure the start ends with is all that is left to do.
+     */
+    private void releaseUnopened(Map<CaptureId, CaptureOwnership.Permit> permits, Throwable failure) {
+        for (CaptureOwnership.Permit permit : permits.values()) {
+            if (!permit.acquired()) {
+                continue;
+            }
+            try {
+                ownership.release(permit.claim());
+            } catch (RuntimeException unreleased) {
+                failure.addSuppressed(unreleased);
+            }
+        }
+        permits.clear();
     }
 
     private record PipelineRun(CaptureId captureId, CaptureRun run, boolean managed) {
@@ -377,53 +442,56 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     /**
      * This member's claim on {@code captureId}, or a refusal of it once there is a ring for a pipeline
-     * attaching here to read.
+     * attaching here to read -- or, while neither is so, the start given back with {@link RingNotOpenYet}.
      *
      * <p>A member takes a capture's claim before it opens the chain's ring, so a pipeline started elsewhere
      * in between finds the claim held and nothing yet to read under. Attaching then would put its load on
-     * no generation at all; so it looks again until the ring is open, taking the claim itself should it
-     * come free meanwhile -- a holder that died before opening anything leaves it free once its lease runs
-     * out, which is why the wait lasts one lease and no longer. A read with no tail has no ring to wait for.
+     * no generation at all; so the start is given back and the next pass looks again, taking the claim
+     * itself should it have come free meanwhile -- a holder that died before opening anything leaves it free
+     * once its lease runs out. A read with no tail has no ring to wait for.
+     *
+     * <p>Given back rather than waited for here, because the start runs on the one thread that converges
+     * every pipeline on this member, holding the lock its claim-loss handling, stops and takeovers take: a
+     * wait here stalled all of them for as long as it lasted. How long a capture has been found this way is
+     * kept, and once it is longer than a lease -- the longest a claim nobody renews can stay held -- the
+     * start is refused with a code instead, rather than retried over nothing for ever. A wait nobody has
+     * looked at for that long is one a stop abandoned, and starts afresh.
      *
      * <p>An open generation is all it waits for. It may be one a previous run of the chain opened rather
      * than the one the holder is about to open, and that is harmless: a ring numbers its changes on from
      * where it had reached, so reading under the older generation orders nothing backwards, and this
      * pipeline's load only sits lower -- beneath changes it would have sat beneath anyway.
      */
-    private CaptureOwnership.Permit acquireOrAwaitTheRing(CaptureId captureId, CaptureRunSpec spec) {
+    private CaptureOwnership.Permit permitOrNotYet(String pipelineId, CaptureId captureId, CaptureRunSpec spec) {
         CaptureOwnership.Permit permit = ownership.acquire(captureId);
-        if (permit.acquired() || spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
+        if (permit.acquired() || spec.readMode() == ReadMode.SNAPSHOT_ONLY
+                || aRingIsOpen(MiningChainId.resolve(spec.config(), spec.srsKey()).value())) {
+            ringWaits.remove(captureId);
             return permit;
         }
-        String chainId = MiningChainId.resolve(spec.config(), spec.srsKey()).value();
         Duration bound = ownership.ttl();
-        long deadline = System.nanoTime() + bound.toNanos();
-        while (!aRingIsOpen(chainId)) {
-            if (System.nanoTime() - deadline >= 0) {
-                throw new TapstateException(CaptureError.NO_RING_TO_ATTACH, Map.of(
-                        "captureId", captureId.value(), "seconds", bound.toSeconds()), null);
-            }
-            pause(captureId);
-            permit = ownership.acquire(captureId);
-            if (permit.acquired()) {
-                return permit;
-            }
+        long now = System.nanoTime();
+        RingWait wait = ringWaits.get(captureId);
+        if (wait == null || now - wait.lastLooked() > bound.toNanos()) {
+            LOG.info("Capture {} is held by another member that has not opened its ring yet; pipeline {} "
+                    + "starts once it has, or once the capture comes free", captureId.value(), pipelineId);
+            wait = new RingWait(now, now);
         }
-        return permit;
+        if (now - wait.since() >= bound.toNanos()) {
+            ringWaits.remove(captureId);
+            throw new TapstateException(CaptureError.NO_RING_TO_ATTACH, Map.of(
+                    "captureId", captureId.value(), "seconds", bound.toSeconds()), null);
+        }
+        ringWaits.put(captureId, new RingWait(wait.since(), now));
+        throw new RingNotOpenYet(captureId);
+    }
+
+    /** When a capture was first found held elsewhere with no ring open, and when it was last looked at. */
+    private record RingWait(long since, long lastLooked) {
     }
 
     private boolean aRingIsOpen(String chainId) {
         return storePort.meta().read(chainId).map(SrsMeta::epoch).orElse(0L) >= 1;
-    }
-
-    private static void pause(CaptureId captureId) {
-        try {
-            Thread.sleep(RING_POLL.toMillis());
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException(
-                    "interrupted waiting for capture " + captureId.value() + " to open its ring", interrupted);
-        }
     }
 
     private synchronized void captureClaimLost(CaptureId captureId, OwnedCapture expected) {

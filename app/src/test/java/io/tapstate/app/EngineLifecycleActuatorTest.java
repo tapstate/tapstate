@@ -21,9 +21,11 @@ import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.srs.CaptureHealth;
+import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
+import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -112,6 +114,27 @@ class EngineLifecycleActuatorTest {
         assertThat(events).containsExactly(
                 "startCapture:" + PIPE, "buildDag:" + PIPE,
                 "stopCapture:" + PIPE + "[purge][jobTerminal]");
+    }
+
+    /**
+     * A start the capture side gives back submits nothing and throws nothing. The pipeline is left carrying
+     * no job, which is what the next pass starts again -- rather than a job over a ring nobody opened, or a
+     * failure recorded for a capture another member is still opening.
+     */
+    @Test
+    void aStartTheCaptureGivesBackSubmitsNothing() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        coordinator.givesTheStartBack = true;
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        LifecycleActuator actuator =
+                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly("startCapture:" + PIPE);
+        assertThat(member.getJet().getJob(PIPE)).as("no job was submitted").isNull();
+        assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
     }
 
     @Test
@@ -369,6 +392,7 @@ class EngineLifecycleActuatorTest {
         private ArtifactStore artifactSnapshot;
         private Supplier<Boolean> jobAbsentProbe = () -> true;
         private boolean jobWasAbsentAtStart;
+        private boolean givesTheStartBack;
 
         RecordingCaptureCoordinator(List<String> events) {
             this.events = events;
@@ -378,6 +402,10 @@ class EngineLifecycleActuatorTest {
         public void startCapture(String pipelineId) {
             jobWasAbsentAtStart = jobAbsentProbe.get();
             events.add("startCapture:" + pipelineId);
+            if (givesTheStartBack) {
+                throw new RingNotOpenYet(CaptureId.of(
+                        new CaptureConfig("mysql", Map.of("host", "h"), List.of("orders")), null));
+            }
         }
 
         @Override
