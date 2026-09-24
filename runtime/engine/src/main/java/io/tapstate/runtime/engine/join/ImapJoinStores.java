@@ -1,12 +1,15 @@
 package io.tapstate.runtime.engine.join;
 
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.ReadOnly;
 import com.hazelcast.map.EntryProcessor;
 import com.hazelcast.map.IMap;
 
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -128,6 +131,30 @@ public final class ImapJoinStores implements JoinStores {
     public List<String> indexPage(String source, String dimensionKey, int page) {
         ReverseBucket bucket = index(source).get(new ReverseBucket.At(dimensionKey, page));
         return bucket == null ? List.of() : bucket.factKeys();
+    }
+
+    /**
+     * Asked where the pages live rather than answered from pages fetched here. A page holds up to a
+     * page size of fact keys and the rows asking about it are often one, so fetching the pages of a
+     * batch would hold a full page for each of its rows at once; what crosses back instead is the keys
+     * found, which the batch already holds. It is one call for the whole batch, as
+     * {@link #factsUnder} is.
+     */
+    @Override
+    public Map<ReverseBucket.At, Set<String>> indexNames(String source,
+            Map<ReverseBucket.At, Set<String>> asked) {
+        if (asked.isEmpty()) {
+            return Map.of();
+        }
+        Map<ReverseBucket.At, Set<String>> wanted = new HashMap<>();
+        asked.forEach((at, factKeys) -> wanted.put(at, new HashSet<>(factKeys)));
+        Map<ReverseBucket.At, Set<String>> named = new LinkedHashMap<>();
+        index(source).executeOnKeys(wanted.keySet(), new Names(wanted)).forEach((at, found) -> {
+            if (!found.isEmpty()) {
+                named.put(at, found);
+            }
+        });
+        return named;
     }
 
     /**
@@ -257,6 +284,44 @@ public final class ImapJoinStores implements JoinStores {
             grown.add(factKey);
             entry.setValue(new ReverseBucket(grown, bucket.furtherPages()));
             return true;
+        }
+    }
+
+    /**
+     * Which of the fact keys asked of a page that page names. Changes nothing, so it runs with no
+     * backup and no write; a page that is not in memory is read from the layer beneath first, as a
+     * get would.
+     */
+    static final class Names
+            implements EntryProcessor<ReverseBucket.At, ReverseBucket, Set<String>>, ReadOnly,
+            Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final Map<ReverseBucket.At, Set<String>> asked;
+
+        Names(Map<ReverseBucket.At, Set<String>> asked) {
+            this.asked = asked;
+        }
+
+        @Override
+        public Set<String> process(Map.Entry<ReverseBucket.At, ReverseBucket> entry) {
+            ReverseBucket page = entry.getValue();
+            Set<String> wanted = asked.getOrDefault(entry.getKey(), Set.of());
+            Set<String> found = new HashSet<>();
+            if (page != null) {
+                for (String factKey : page.factKeys()) {
+                    if (wanted.contains(factKey)) {
+                        found.add(factKey);
+                    }
+                }
+            }
+            return found;
+        }
+
+        @Override
+        public EntryProcessor<ReverseBucket.At, ReverseBucket, Set<String>> getBackupProcessor() {
+            return null;
         }
     }
 

@@ -3,9 +3,11 @@ package io.tapstate.runtime.engine.join;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * A join's state over ordinary maps: what a case runs against, and the reference the distributed
@@ -86,6 +88,25 @@ public final class MapJoinStores implements JoinStores {
     @Override
     public List<String> indexPage(String source, String dimensionKey, int page) {
         return index(source).page(dimensionKey, page);
+    }
+
+    @Override
+    public Map<ReverseBucket.At, Set<String>> indexNames(String source,
+            Map<ReverseBucket.At, Set<String>> asked) {
+        ReverseIndex index = index(source);
+        Map<ReverseBucket.At, Set<String>> named = new LinkedHashMap<>();
+        asked.forEach((at, factKeys) -> {
+            Set<String> found = new LinkedHashSet<>();
+            for (String factKey : index.page(at.dimensionKey(), at.page())) {
+                if (factKeys.contains(factKey)) {
+                    found.add(factKey);
+                }
+            }
+            if (!found.isEmpty()) {
+                named.put(at, found);
+            }
+        });
+        return named;
     }
 
     @Override

@@ -69,7 +69,8 @@ import java.util.function.Predicate;
  * <p><b>What the mirror holds is not evidence of what the index holds.</b> A fact row is written to the
  * mirror before the index, so a member that dies between the two leaves a row no bucket names. A row
  * that arrives again - a load read again after a restart, an insert delivered again - therefore has its
- * index entry confirmed rather than assumed; see {@link #confirmIndexed}.
+ * index entry confirmed rather than assumed; see {@link #confirmIndexed}. The index is read ahead for
+ * those rows a batch at a time, as the mirror is; see {@link #primeIndex}.
  *
  * <p><b>What this does not keep is the queue itself.</b> Work outstanding when a member dies is not
  * written down; what is written down is the reverse index, from which the work is derivable. Nothing
@@ -100,6 +101,15 @@ public final class JoinDriver {
      * answer, and it is the answer a first load gets for every row it carries.
      */
     private final Map<String, Map<String, Object>> primed = new HashMap<>();
+
+    /**
+     * Where the read ahead of the reverse index found the rows of the batch being taken in that are
+     * arriving again: for each bucket, the page each of those fact keys is named on. Empty outside a
+     * batch. Only ever evidence that a row is named - a row it does not hold is looked for in the store,
+     * never taken to be missing - and a key is dropped from it the moment this driver removes that key
+     * from that bucket, so it never names a row this driver has since taken out.
+     */
+    private final Map<Bucket, Map<String, Integer>> named = new HashMap<>();
 
     /**
      * For each bucket longer than one page, the page this driver last found a row on while confirming
@@ -220,6 +230,7 @@ public final class JoinDriver {
             absorb(change);
         }
         primed.clear();
+        named.clear();
     }
 
     /**
@@ -243,6 +254,7 @@ public final class JoinDriver {
      */
     private void prime(List<SourceChange> changes) {
         primed.clear();
+        named.clear();
         if (changes.size() < 2) {
             return;
         }
@@ -280,6 +292,78 @@ public final class JoinDriver {
         Map<String, Map<String, Object>> rows = stores.factsUnder(asked);
         for (String key : asked) {
             primed.put(key, rows.get(key));
+        }
+        primeIndex(changes);
+    }
+
+    /**
+     * Asks the reverse index, a batch at a time, whether it names the rows of this batch that are
+     * arriving again - which is what {@link #confirmIndexed} answers from before it asks the store.
+     *
+     * <p><b>This is the read a load read again makes most of.</b> Every row of it is one the mirror
+     * already holds, so every row is confirmed, and confirmed a page read at a time that is a trip per
+     * row per dimension, on every run of a snapshot-only pipeline. Here each bucket is asked about the
+     * page its last row was found on and then the pages after it, for as long as they go on naming its
+     * rows, and each of those steps is one question for every bucket of the batch: a load read again
+     * arrives in the order its buckets were written, so a batch reaches no further into a bucket than
+     * its own length. What comes back is the keys found, never the pages, so what this holds is
+     * bounded by the batch and not by how long its buckets are.
+     *
+     * <p>It is a read ahead in the same sense as {@link #prime}: only what it finds is used, and a row
+     * it does not find is looked for in the store exactly as though nothing had been read ahead. The
+     * rows picked are the ones {@link #absorbFact} confirms; one picked wrongly costs a key in a read,
+     * and one missed costs the search it would have made anyway.
+     */
+    private void primeIndex(List<SourceChange> changes) {
+        Map<Bucket, Set<String>> wanted = new LinkedHashMap<>();
+        for (SourceChange change : changes) {
+            Envelope event = change.event();
+            if (!change.source().equals(factSource) || event.before() != null || event.after() == null
+                    || (event.op() != Op.READ && event.op() != Op.INSERT)) {
+                continue;
+            }
+            String key = keyOf(event.after(), factKeyColumns);
+            Map<String, Object> mirroredRow = key == null ? null : primed.get(key);
+            if (mirroredRow == null) {
+                continue;
+            }
+            for (Dimension dimension : dimensions) {
+                String now = dimensionKeyIn(event.after(), dimension);
+                if (now != null && now.equals(dimensionKeyIn(mirroredRow, dimension))) {
+                    wanted.computeIfAbsent(new Bucket(dimension.source(), now),
+                            ignored -> new LinkedHashSet<>()).add(key);
+                }
+            }
+        }
+        for (int ahead = 0; !wanted.isEmpty(); ahead++) {
+            Map<String, Map<ReverseBucket.At, Set<String>>> asked = new LinkedHashMap<>();
+            for (Map.Entry<Bucket, Set<String>> bucket : wanted.entrySet()) {
+                int page = confirmedOn.getOrDefault(bucket.getKey(), 0) + ahead;
+                asked.computeIfAbsent(bucket.getKey().source(), ignored -> new LinkedHashMap<>())
+                        .put(new ReverseBucket.At(bucket.getKey().dimensionKey(), page),
+                                bucket.getValue());
+            }
+            for (Map.Entry<String, Map<ReverseBucket.At, Set<String>>> source : asked.entrySet()) {
+                Map<ReverseBucket.At, Set<String>> answered =
+                        stores.indexNames(source.getKey(), source.getValue());
+                for (Map.Entry<ReverseBucket.At, Set<String>> at : source.getValue().entrySet()) {
+                    Bucket bucket = new Bucket(source.getKey(), at.getKey().dimensionKey());
+                    Set<String> found = answered.getOrDefault(at.getKey(), Set.of());
+                    for (String factKey : found) {
+                        named.computeIfAbsent(bucket, ignored -> new HashMap<>())
+                                .put(factKey, at.getKey().page());
+                    }
+                    Set<String> left = at.getValue();
+                    left.removeAll(found);
+                    // Past the remembered page, which holds none of a batch that starts where the one
+                    // before it ended a page, a page holding none of what is left ends the walk: the
+                    // rest is missing - a row a member died part way through - or not in the order it
+                    // was written, and both are the store search's to settle.
+                    if (left.isEmpty() || (found.isEmpty() && ahead > 0)) {
+                        wanted.remove(bucket);
+                    }
+                }
+            }
         }
     }
 
@@ -427,7 +511,7 @@ public final class JoinDriver {
                 continue;
             }
             if (was != null) {
-                stores.indexRemove(dimension.source(), was, key);
+                indexRemove(dimension.source(), was, key);
                 // The old bucket's row is a different published row wherever the identity carries the
                 // dimension key, so it is removed rather than overwritten.
                 queueRow(previous, event.ts(), true);
@@ -463,11 +547,22 @@ public final class JoinDriver {
      * would read a bucket up to each of its rows - half a billion page reads for a million-row bucket
      * read again. The pages nearest the remembered one are asked first, and every page is asked before
      * a row is taken to be missing, which is paid once for each row a member died part way through.
+     *
+     * <p>Almost every row is answered by {@link #primeIndex} without asking the store at all; the search
+     * is for the rows that read ahead did not find, and for a batch of one, which is not read ahead.
      */
     private void confirmIndexed(Dimension dimension, String dimensionKey, String factKey) {
         String source = dimension.source();
         Bucket bucket = new Bucket(source, dimensionKey);
         int remembered = confirmedOn.getOrDefault(bucket, 0);
+        Map<String, Integer> readAhead = named.get(bucket);
+        Integer found = readAhead == null ? null : readAhead.get(factKey);
+        if (found != null) {
+            if (found != remembered) {
+                confirmedOn.put(bucket, found);
+            }
+            return;
+        }
         if (stores.indexPage(source, dimensionKey, remembered).contains(factKey)) {
             return;
         }
@@ -753,7 +848,7 @@ public final class JoinDriver {
         // and compacting the list being walked is how a walk skips entries. Dropping them at all is
         // what keeps a bucket from growing for ever under a key nobody ever changes.
         for (String gone : stale) {
-            stores.indexRemove(dimension.source(), recompute.dimensionKey(), gone);
+            indexRemove(dimension.source(), recompute.dimensionKey(), gone);
         }
         recompute.page(recompute.page() + 1);
         recompute.at(0);
@@ -819,11 +914,25 @@ public final class JoinDriver {
         for (Dimension dimension : dimensions) {
             String key = dimensionKeyIn(factRow, dimension);
             if (key != null) {
-                stores.indexRemove(dimension.source(), key, factKey);
+                indexRemove(dimension.source(), key, factKey);
             }
         }
         dropPrimed(factKey);
         stores.removeFact(factKey);
+    }
+
+    /**
+     * Removes one record of {@code factKey} from a bucket, and what the read ahead says about it there,
+     * so a later change to that key in the same batch asks the store again. Every removal this driver
+     * makes comes through here, for the reason {@link #dropPrimed} is called wherever the mirror is
+     * written: the read ahead then never holds a row this driver has dropped.
+     */
+    private void indexRemove(String source, String dimensionKey, String factKey) {
+        Map<String, Integer> readAhead = named.get(new Bucket(source, dimensionKey));
+        if (readAhead != null) {
+            readAhead.remove(factKey);
+        }
+        stores.indexRemove(source, dimensionKey, factKey);
     }
 
     private Dimension dimensionNamed(String source) {

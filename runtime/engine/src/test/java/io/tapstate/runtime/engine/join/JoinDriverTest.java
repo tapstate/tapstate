@@ -16,6 +16,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -539,12 +540,16 @@ class JoinDriverTest {
         assertThat(restarted.stores.writes)
                 .as("the mirror once per row, and the index only for the lost row and the four new ones")
                 .isEqualTo(load.size() + 1 + 4);
-        // Rows 10 to 14 are named on pages 0, 0, 1, 1 and 2. Each is found on the page the previous
-        // one was, or on the next page after one miss (1, 1, 2, 1, 2 reads); row 15 misses page 2,
-        // then pages 1 and 0 (3 reads). A search restarted from page 0 for every row costs more.
+        // Rows 10 to 14 are named on pages 0, 0, 1, 1 and 2, and the read ahead finds them there a
+        // page at a time, one question for the batch per page, stopping at the page after the last
+        // (4 questions). Only row 15 is searched for on its own: from page 2, where row 14 was found,
+        // then pages 1 and 0 (3 reads).
+        assertThat(restarted.stores.nameReads)
+                .as("the rows the index kept are confirmed a page at a time for the whole batch")
+                .isEqualTo(4);
         assertThat(restarted.stores.pageReads)
-                .as("each row arriving again is looked for near where the previous one of its bucket was")
-                .isEqualTo(10);
+                .as("only the lost row is looked for on its own, from where the last row was found")
+                .isEqualTo(3);
         List<String> named = new ArrayList<>();
         String bucket = restarted.dimensionKeyOf(1L);
         for (int page = 0; page < kept.indexPageCount("c", bucket); page++) {
@@ -559,6 +564,68 @@ class JoinDriverTest {
                 .containsExactlyInAnyOrder(10L, 11L, 12L, 13L, 14L, 15L, 16L, 17L, 18L, 19L);
         assertThat(restarted.published()).extracting(row -> row.getValue().get("customer_name"))
                 .containsOnly("Ada");
+    }
+
+    /**
+     * A load read again in the report's shape, one fact row under each dimension key, held to what
+     * confirming it costs. Every row is one the mirror already holds, so every row is confirmed, and
+     * confirmed a page read at a time that is a trip per row per dimension on every run of a
+     * snapshot-only pipeline - answering exactly what one read of the batch answers, so nothing but
+     * this count says which one is happening.
+     */
+    @Test
+    @DisplayName("a load read again is confirmed with one question to the index for the batch, not a read per row")
+    void aLoadReadAgainIsConfirmedWithOneReadForTheBatch() {
+        MapJoinStores kept = new MapJoinStores();
+        List<SourceChange> load = new ArrayList<>();
+        for (long id = 1; id <= 50; id++) {
+            load.add(fact(read(Map.of("id", id, "cust_id", id))));
+        }
+        new Fixture(JoinKind.LEFT, kept).applyBatch(load);
+
+        Fixture restarted = new Fixture(JoinKind.LEFT, kept);
+        restarted.applyBatch(load);
+
+        assertThat(restarted.stores.pageReads).as("no row asks for a page on its own").isZero();
+        assertThat(restarted.stores.pageCountReads).as("nor for how long its bucket is").isZero();
+        assertThat(restarted.stores.nameReads).as("one question to the index for the batch").isEqualTo(1);
+        assertThat(restarted.stores.pagesAsked).as("about the page of each row's bucket")
+                .isEqualTo(load.size());
+        assertThat(restarted.stores.writes).as("the mirror once per row, and nothing added to the index")
+                .isEqualTo(load.size());
+    }
+
+    /**
+     * A bucket many pages long read again a batch at a time, which is how the vertex hands a large load
+     * over. A batch starts on the page the previous one ended on or on the one after it, and reaches no
+     * further than its own length, so it is confirmed from those pages however long the bucket is - and
+     * each is asked about once for the batch rather than read once for each of its rows.
+     */
+    @Test
+    @DisplayName("a long bucket read again a batch at a time asks about the pages each batch reaches, once")
+    void aLongBucketReadAgainAsksAboutThePagesEachBatchReaches() {
+        MapJoinStores kept = new MapJoinStores(4);
+        List<SourceChange> load = new ArrayList<>();
+        for (long id = 10; id < 30; id++) {
+            load.add(fact(read(Map.of("id", id, "cust_id", 1L))));
+        }
+        new Fixture(JoinKind.LEFT, kept).applyBatch(load);
+
+        Fixture restarted = new Fixture(JoinKind.LEFT, kept);
+        for (int from = 0; from < load.size(); from += 4) {
+            restarted.applyBatch(load.subList(from, from + 4));
+        }
+
+        assertThat(restarted.stores.pageReads).as("no row asks for a page on its own").isZero();
+        assertThat(restarted.stores.pageCountReads).as("nor for how long its bucket is").isZero();
+        // Five pages of four, read again four rows to a batch. The first batch finds its rows on page
+        // 0. Each later one asks about the page the batch before it ended on, finds none of its rows
+        // there and all of them on the next: one question, then two for each of the other four.
+        assertThat(restarted.stores.nameReads).as("the pages each batch reaches, a question for each")
+                .isEqualTo(9);
+        assertThat(restarted.stores.pagesAsked).isEqualTo(9);
+        assertThat(restarted.stores.writes).as("the mirror once per row, and nothing added to the index")
+                .isEqualTo(load.size());
     }
 
     /**
@@ -903,6 +970,12 @@ class JoinDriverTest {
         @Override
         public List<String> indexPage(String source, String dimensionKey, int page) {
             return held.indexPage(source, dimensionKey, page);
+        }
+
+        @Override
+        public Map<ReverseBucket.At, Set<String>> indexNames(String source,
+                Map<ReverseBucket.At, Set<String>> asked) {
+            return held.indexNames(source, asked);
         }
 
         @Override

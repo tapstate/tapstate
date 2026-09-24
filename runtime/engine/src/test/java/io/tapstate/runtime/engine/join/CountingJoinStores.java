@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.join;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The plain-map state, plus a count of how the fact rows were asked for.
@@ -36,6 +37,14 @@ final class CountingJoinStores implements JoinStores {
      * previous row of its bucket was found.
      */
     int pageReads;
+
+    /**
+     * How many times several pages were asked at once which fact keys they name, and how many pages
+     * those asks carried. A batch of rows arriving again is confirmed through these, so they are what
+     * shows it still being asked about a batch at a time rather than a row at a time.
+     */
+    int nameReads;
+    int pagesAsked;
 
     /**
      * How many calls changed something - either mirror, either direction, and the index with them.
@@ -77,6 +86,8 @@ final class CountingJoinStores implements JoinStores {
         singleReads = 0;
         pageCountReads = 0;
         pageReads = 0;
+        nameReads = 0;
+        pagesAsked = 0;
         writes = 0;
     }
 
@@ -133,6 +144,14 @@ final class CountingJoinStores implements JoinStores {
     public List<String> indexPage(String source, String dimensionKey, int page) {
         pageReads++;
         return held.indexPage(source, dimensionKey, page);
+    }
+
+    @Override
+    public Map<ReverseBucket.At, Set<String>> indexNames(String source,
+            Map<ReverseBucket.At, Set<String>> asked) {
+        nameReads++;
+        pagesAsked += asked.size();
+        return held.indexNames(source, asked);
     }
 
     @Override

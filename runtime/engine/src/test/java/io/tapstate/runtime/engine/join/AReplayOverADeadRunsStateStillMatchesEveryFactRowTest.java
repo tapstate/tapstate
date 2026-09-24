@@ -17,6 +17,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -232,6 +233,12 @@ class AReplayOverADeadRunsStateStillMatchesEveryFactRowTest {
         @Override
         public List<String> indexPage(String source, String dimensionKey, int page) {
             return held.indexPage(source, dimensionKey, page);
+        }
+
+        @Override
+        public Map<ReverseBucket.At, Set<String>> indexNames(String source,
+                Map<ReverseBucket.At, Set<String>> asked) {
+            return held.indexNames(source, asked);
         }
 
         @Override

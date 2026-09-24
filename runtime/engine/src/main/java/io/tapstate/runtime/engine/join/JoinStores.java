@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.join;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The three things a join keeps, reached through named operations rather than through the maps
@@ -80,6 +81,20 @@ public interface JoinStores {
      * dimension key, and not materialising all of it is what paging was for.
      */
     List<String> indexPage(String source, String dimensionKey, int page);
+
+    /**
+     * Which of the fact keys asked of each page that page names, for several pages at once; a page
+     * naming none of them, or not there at all, is simply missing from the answer.
+     *
+     * <p>The index's counterpart of {@link #factsUnder}, and for the same reason: a batch asking about
+     * each of its rows a page read at a time is a round trip per row over a network, answering exactly
+     * what one question about all of them does. <b>It answers with the keys found rather than handing
+     * the pages out</b>, because a page holds up to a page size of fact keys and the rows asking about
+     * it are often one: the pages of a whole batch would be a full page of keys held for each of its
+     * rows, all at once.
+     */
+    Map<ReverseBucket.At, Set<String>> indexNames(String source,
+            Map<ReverseBucket.At, Set<String>> asked);
 
     /** Records that {@code factKey} references {@code dimensionKey}. */
     void indexAdd(String source, String dimensionKey, String factKey);

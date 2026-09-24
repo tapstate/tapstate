@@ -8,6 +8,7 @@ import io.tapstate.runtime.engine.join.JoinProjection;
 import io.tapstate.runtime.engine.join.JoinSink;
 import io.tapstate.runtime.engine.join.JoinStores;
 import io.tapstate.runtime.engine.join.MapJoinStores;
+import io.tapstate.runtime.engine.join.ReverseBucket;
 import io.tapstate.runtime.engine.join.SourceChange;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
@@ -19,6 +20,7 @@ import java.sql.Statement;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -190,6 +192,10 @@ class AJoinRestartedPartWayThroughItsLoadStillAgreesWithItsSourceIT {
         @Override public int indexPageCount(String source, String key) { return held.indexPageCount(source, key); }
         @Override public List<String> indexPage(String source, String key, int page) {
             return held.indexPage(source, key, page);
+        }
+        @Override public Map<ReverseBucket.At, Set<String>> indexNames(String source,
+                Map<ReverseBucket.At, Set<String>> asked) {
+            return held.indexNames(source, asked);
         }
         @Override public void indexRemove(String source, String key, String fact) { held.indexRemove(source, key, fact); }
         @Override public void indexAdd(String source, String key, String fact) {
