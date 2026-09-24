@@ -48,7 +48,9 @@ import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
 import java.util.function.IntSupplier;
 import java.util.function.Predicate;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+import java.util.function.ToIntFunction;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -170,7 +172,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "token", "derived-schema", "explain");
+            "connectors", "cluster", "token", "derived-schema", "explain");
 
     private final CommandLine commandLine;
 
@@ -813,6 +815,11 @@ final class Repl {
         if (words.get(0).equals("connectors")) {
             return connectorsOnline(words);
         }
+        // `cluster` reads the topology and returns a structured list worth machine-reading, so it accepts
+        // an `-o` output flag and takes no operand -- routed here for the same reason `connectors` is.
+        if (words.get(0).equals("cluster")) {
+            return clusterOnline(words);
+        }
         if (words.get(0).equals("token")) {
             return tokenOnline(words);
         }
@@ -928,7 +935,8 @@ final class Repl {
             List<URI> seeds = namedContext == null ? session.seeds() : namedContext.definition().seeds();
             IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(seeds, null);
             session.reland(verified.seed());
-            session.authenticateMachine(machineToken, session.seeds());
+            session.authenticateMachine(machineToken, session.members());
+            adoptAdvertisedMembers(verified.issuer());
             return Cli.EXIT_OK;
         } catch (io.tapstate.core.common.TapstateException failure) {
             Diagnostics.printText(commandLine.getErr(), failure.code(), failure.args());
@@ -1242,23 +1250,24 @@ final class Repl {
         out.println("following " + namespace + " · whole collection · streaming changes");
         out.println("note: shows changes as written to the store — not every intermediate version");
         out.flush();
-        streamCancelled = false;
-        String refusal = controlPlane.tail(session.landingNode(), session.credential(),
+        AtomicInteger frames = new AtomicInteger();
+        // Across members like the other two. What a change stream shows after a move is whatever the
+        // connector supplies from there, which the header above has already said this view cannot
+        // promise to be gapless -- but a view that stops updating with no line saying so promises less.
+        return streamAcrossMembers(frames, () -> controlPlane.tail(
+                session.landingNode(), session.credential(),
                 live.sourceId(), live.collection(), live.filter(),
                 change -> {
+                    frames.incrementAndGet();
                     TailRenderer.lines(change, screenWidth.getAsInt()).forEach(out::println);
                     out.flush();
                 },
-                this::isStreamCancelled);
-        if (refusal != null) {
-            // A follow that ended by itself arrives as a code and nothing else - the close frame has
-            // room for one. Rendering it from the bundled catalog is what turns "the screen stopped
-            // updating" into a sentence; handed on as a bare code with no message, the reader is told
-            // that something has a name and not what happened.
-            return renderRejection(refusal, MessageCatalog.bundled().render(refusal, Map.of()).message());
-        }
-        // A stream ends because the user stopped it, which is the way it is meant to end.
-        return Cli.EXIT_OK;
+                this::isStreamCancelled),
+                // A follow that ended by itself arrives as a code and nothing else - the close frame has
+                // room for one. Rendering it from the bundled catalog is what turns "the screen stopped
+                // updating" into a sentence; handed on as a bare code with no message, the reader is told
+                // that something has a name and not what happened.
+                code -> renderRejection(code, MessageCatalog.bundled().render(code, Map.of()).message()));
     }
 
     /**
@@ -2836,6 +2845,193 @@ final class Repl {
     }
 
     /**
+     * {@code cluster [-o text|json|yaml]} — lists the cluster's members: each one's stable node id, the
+     * runtime identity of this boot of it, where members reach it, where a client reaches its control
+     * face, and what it is to the cluster. Takes no operand; an unknown option is a benign usage line; a
+     * coded refusal renders its code and message.
+     *
+     * <p>Every member answers this identically, so which one the session happens to be landed on does not
+     * change what is printed — the point of asking a cluster rather than a node.
+     */
+    private int clusterOnline(List<String> words) {
+        OutputFormat format = parseFormatOnly("cluster", words);
+        if (format == null) {
+            return Cli.EXIT_USAGE;
+        }
+        ClusterMembersOutcome outcome = withFailover(
+                () -> controlPlane.clusterMembers(session.landingNode(), session.credential()),
+                o -> o instanceof ClusterMembersOutcome.Unreachable);
+        return switch (outcome) {
+            case ClusterMembersOutcome.Listed listed -> {
+                renderCluster(listed, format);
+                yield Cli.EXIT_OK;
+            }
+            case ClusterMembersOutcome.Rejected rejected ->
+                    renderRejection(rejected.code(), rejected.message());
+            case ClusterMembersOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    private void renderCluster(ClusterMembersOutcome.Listed listed, OutputFormat format) {
+        PrintWriter out = commandLine.getOut();
+        switch (format) {
+            case TEXT -> {
+                if (listed.members().isEmpty()) {
+                    out.println("no members");
+                } else {
+                    for (RemoteClusterMember member : listed.members()) {
+                        out.println(memberHeadline(member));
+                    }
+                }
+                for (RemotePipeline pipeline : listed.pipelines()) {
+                    out.println();
+                    out.println(pipelineHeadline(pipeline, listed.members().size()));
+                    for (RemoteVertex vertex : pipeline.vertices()) {
+                        out.println("  " + cell(vertex.name()) + "  " + where(vertex));
+                    }
+                }
+            }
+            case JSON -> out.println(JsonOut.write(clusterMap(listed)));
+            case YAML -> out.println(YamlOut.write(clusterMap(listed)));
+        }
+        out.flush();
+    }
+
+    /** The human line: who it is, what it is to the cluster, and the address a reader can use. */
+    private static String memberHeadline(RemoteClusterMember member) {
+        return cell(member.nodeId()) + "  " + cell(member.state()) + "  " + cell(member.controlUrl());
+    }
+
+    /** The topology as an ordered tree for the machine surfaces, omitting what the server did not say. */
+    private static Map<String, Object> clusterMap(ClusterMembersOutcome.Listed listed) {
+        List<Object> rows = new ArrayList<>();
+        for (RemoteClusterMember member : listed.members()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            putIfPresent(row, "nodeId", member.nodeId());
+            putIfPresent(row, "memberUuid", member.memberUuid());
+            putIfPresent(row, "bootId", member.bootId());
+            putIfPresent(row, "hzAddress", member.hzAddress());
+            putIfPresent(row, "controlUrl", member.controlUrl());
+            putIfPresent(row, "state", member.state());
+            rows.add(row);
+        }
+        List<Object> pipelines = new ArrayList<>();
+        for (RemotePipeline pipeline : listed.pipelines()) {
+            pipelines.add(pipelineMap(pipeline));
+        }
+        Map<String, Object> map = new LinkedHashMap<>();
+        putIfPresent(map, "clusterId", listed.clusterId());
+        // Absent rather than zero: nothing committed is not a cluster at revision zero.
+        if (listed.topologyRevision() != null) {
+            map.put("topologyRevision", listed.topologyRevision());
+        }
+        map.put("members", rows);
+        map.put("pipelines", pipelines);
+        return map;
+    }
+
+    /**
+     * The human line for one pipeline: who owns it, at which generations, and whether the placement
+     * below it is the whole picture.
+     *
+     * <p>The count of members the readings came from is printed only when it is short of the cluster,
+     * because that is the one case where the vertex lines below mean less than they appear to: for the
+     * first seconds of a run the engine has reported from some members and not others, and a narrower
+     * answer then is being assembled rather than being true.
+     */
+    private static String pipelineHeadline(RemotePipeline pipeline, int members) {
+        StringBuilder line = new StringBuilder(cell(pipeline.pipelineId()));
+        RemoteClaim claim = pipeline.controllerClaim();
+        if (claim == null) {
+            line.append("  unowned");
+        } else {
+            line.append("  ").append(cell(claim.ownerNodeId()));
+            if (claim.claimGeneration() != null) {
+                line.append("  claim ").append(claim.claimGeneration());
+            }
+            if (claim.executionGeneration() != null) {
+                line.append("  execution ").append(claim.executionGeneration());
+            }
+            if (Boolean.FALSE.equals(claim.leased())) {
+                line.append("  lease expired");
+            }
+        }
+        if (!pipeline.awaitingRebalance().isEmpty()) {
+            line.append("  awaiting rebalance: ").append(String.join(", ", pipeline.awaitingRebalance()));
+        }
+        if (pipeline.vertices().isEmpty()) {
+            line.append("  (not running)");
+        } else if (pipeline.measuredFrom().size() < members) {
+            line.append("  (measured from ").append(pipeline.measuredFrom().size())
+                    .append(" of ").append(members).append(" members)");
+        }
+        return line.toString();
+    }
+
+    /** Where one vertex's work is, by the node names a reader can act on; the count when it has none. */
+    private static String where(RemoteVertex vertex) {
+        List<String> nodes = new ArrayList<>();
+        for (RemoteProcessor processor : vertex.processors()) {
+            String node = processor.nodeId() == null ? processor.memberUuid() : processor.nodeId();
+            if (node != null && !nodes.contains(node)) {
+                nodes.add(node);
+            }
+        }
+        return nodes.isEmpty()
+                ? String.valueOf(vertex.effective() == null ? "-" : vertex.effective())
+                : String.join(", ", nodes);
+    }
+
+    /** One pipeline as an ordered tree, omitting what the server did not say. */
+    private static Map<String, Object> pipelineMap(RemotePipeline pipeline) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        putIfPresent(row, "pipelineId", pipeline.pipelineId());
+        if (pipeline.controllerClaim() != null) {
+            row.put("controllerClaim", claimMap(pipeline.controllerClaim()));
+        }
+        List<Object> captures = new ArrayList<>();
+        for (RemoteClaim claim : pipeline.captureClaims()) {
+            captures.add(claimMap(claim));
+        }
+        row.put("captureClaims", captures);
+        putIfPresent(row, "measuredAt", pipeline.measuredAt());
+        row.put("measuredFrom", pipeline.measuredFrom());
+        row.put("awaitingRebalance", pipeline.awaitingRebalance());
+        List<Object> vertices = new ArrayList<>();
+        for (RemoteVertex vertex : pipeline.vertices()) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            putIfPresent(entry, "name", vertex.name());
+            putIfPresent(entry, "requested", vertex.requested());
+            putIfPresent(entry, "effective", vertex.effective());
+            putIfPresent(entry, "computedLocal", vertex.computedLocal());
+            putIfPresent(entry, "executionId", vertex.executionId());
+            List<Object> processors = new ArrayList<>();
+            for (RemoteProcessor processor : vertex.processors()) {
+                Map<String, Object> one = new LinkedHashMap<>();
+                putIfPresent(one, "index", processor.index());
+                putIfPresent(one, "memberUuid", processor.memberUuid());
+                putIfPresent(one, "nodeId", processor.nodeId());
+                processors.add(one);
+            }
+            entry.put("processors", processors);
+            vertices.add(entry);
+        }
+        row.put("vertices", vertices);
+        return row;
+    }
+
+    private static Map<String, Object> claimMap(RemoteClaim claim) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        putIfPresent(row, "resourceId", claim.resourceId());
+        putIfPresent(row, "ownerNodeId", claim.ownerNodeId());
+        putIfPresent(row, "ownerBootId", claim.ownerBootId());
+        putIfPresent(row, "claimGeneration", claim.claimGeneration());
+        putIfPresent(row, "executionGeneration", claim.executionGeneration());
+        putIfPresent(row, "leased", claim.leased());
+        return row;
+    }
+
+    /**
      * {@code connectors [-o text|json|yaml]} — lists the connectors the online catalog exposes (the bundled
      * snapshot union the connectors registered at runtime), each tagged bundled or registered. Takes no
      * operand; an unknown option is a benign usage line; a coded refusal renders its code and message.
@@ -3186,6 +3382,17 @@ final class Repl {
     /** Puts a string value under {@code key} only when it is present (non-null, non-blank). */
     private static void putIfPresent(Map<String, Object> map, String key, String value) {
         if (value != null && !value.isBlank()) {
+            map.put(key, value);
+        }
+    }
+
+    /**
+     * The same for a value that is not text. There is no blank to skip here, so the only thing omitted
+     * is what the server did not say -- and a number the server withheld must stay withheld rather than
+     * be rendered as the zero a reader would act on.
+     */
+    private static void putIfPresent(Map<String, Object> map, String key, Object value) {
+        if (value != null) {
             map.put(key, value);
         }
     }
@@ -3721,10 +3928,18 @@ final class Repl {
         Thread movement = new Thread(() -> followMovement(out, id, first, streamOver), "status-movement");
         movement.setDaemon(true);
         movement.start();
-        String refusal;
+        // The movement outlives a move between members, because it is read from whichever member the
+        // session is landed on rather than from the connection the state arrives over. One thread for the
+        // whole watch, not one per attach.
+        AtomicInteger frames = new AtomicInteger();
         try {
-            refusal = controlPlane.watchStatus(session.landingNode(), session.credential(), id,
+            // Re-attaching re-reads the state rather than resuming a position, which is what the state is:
+            // a value in the store that any member answers, not a log this member happens to hold. Saying it
+            // again after a move is a re-poll, and a watcher who just saw the connection move is owed it.
+            return streamAcrossMembers(frames, () -> controlPlane.watchStatus(
+                    session.landingNode(), session.credential(), id,
                     (pipelineId, state, failureCode, failureMessage) -> {
+                        frames.incrementAndGet();
                         out.println(pipelineId + "  " + state.toLowerCase(Locale.ROOT));
                         if (failureCode != null) {
                             // Mirrors the one-shot `status` read: a failed state that cannot say what failed
@@ -3734,7 +3949,7 @@ final class Repl {
                         }
                         out.flush();
                     },
-                    this::isStreamCancelled);
+                    this::isStreamCancelled), code -> renderStreamRefusal(code, id));
         } finally {
             streamOver.set(true);
             movement.interrupt();
@@ -3744,11 +3959,53 @@ final class Repl {
                 Thread.currentThread().interrupt();
             }
         }
-        if (refusal != null) {
-            return renderStreamRefusal(refusal, id);
+    }
+
+    /** How many attaches in a row may receive no frame at all before a stream stops looking for a member. */
+    private static final int MAX_BARREN_ATTACHES = 3;
+
+    /**
+     * Keeps a streamed read attached for as long as the user wants it, moving to another member when the
+     * one it was attached to stops serving. A stream ends in exactly three ways: the user stops it, the
+     * server refuses it with a code -- which no other member would answer differently, so moving would
+     * only ask the same question again -- or there is no member left to attach to.
+     *
+     * <p>An attach on which no frame arrived counts against a small budget, so that a member answering its
+     * health probe while refusing the stream -- or taking the connection and never sending on it -- cannot
+     * hold a watch in a loop nobody can see. Any frame gives the budget back, whether or not it held
+     * anything new, so the caller's sink counts into {@code frames} every frame it is handed, before it
+     * decides what is worth printing. Counting what was printed instead mistakes a quiet follow for an
+     * unserved one: a follow's every attach opens by re-sending the window the member holds, and after an
+     * idle drop -- a proxy closing a quiet connection is enough -- all of that window was shown before. A
+     * healthy follow budgeted on what it printed ends after a few such drops, saying no member serves it;
+     * a quiet stream is not the same as a stream that cannot attach.
+     */
+    private int streamAcrossMembers(
+            AtomicInteger frames, Supplier<String> attach, ToIntFunction<String> renderRefusal) {
+        streamCancelled = false;
+        int barren = 0;
+        while (true) {
+            int before = frames.get();
+            String refusal = attach.get();
+            if (refusal != null) {
+                return renderRefusal.applyAsInt(refusal);
+            }
+            if (isStreamCancelled()) {
+                // a stream ends because the user stopped it, which is the way it is meant to end
+                return Cli.EXIT_OK;
+            }
+            barren = frames.get() > before ? 0 : barren + 1;
+            if (barren >= MAX_BARREN_ATTACHES) {
+                PrintWriter err = commandLine.getErr();
+                err.println("stopped: no cluster member is serving this stream");
+                err.flush();
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+            if (!failover()) {
+                // failover already said the connection is lost, and took the session offline saying it
+                return Cli.EXIT_DIAGNOSTIC;
+            }
         }
-        // a stream ends because the user stopped it, which is the way it is meant to end
-        return Cli.EXIT_OK;
     }
 
     /**
@@ -3795,18 +4052,24 @@ final class Repl {
             return Cli.EXIT_USAGE;
         }
         PrintWriter out = commandLine.getOut();
-        streamCancelled = false;
-        String refusal = controlPlane.followLogs(session.landingNode(), session.credential(), id,
-                (pipelineId, lines) -> {
-                    lines.forEach(line -> out.println(renderLogLine(line)));
-                    out.flush();
-                },
-                this::isStreamCancelled);
-        if (refusal != null) {
-            return renderStreamRefusal(refusal, id);
-        }
-        // a stream ends because the user stopped it, which is the way it is meant to end
-        return Cli.EXIT_OK;
+        AtomicInteger frames = new AtomicInteger();
+        PrintedLogTail printed = new PrintedLogTail();
+        return streamAcrossMembers(frames, () -> {
+            printed.attaching();
+            return controlPlane.followLogs(session.landingNode(), session.credential(), id,
+                    (pipelineId, lines) -> {
+                        // Counted before the window is measured against what was printed: an opening
+                        // frame that only repeats lines already shown is still this member serving it.
+                        frames.incrementAndGet();
+                        List<RemoteLogLine> fresh = printed.notYetPrinted(lines);
+                        if (fresh.isEmpty()) {
+                            return;
+                        }
+                        fresh.forEach(line -> out.println(renderLogLine(line)));
+                        out.flush();
+                    },
+                    this::isStreamCancelled);
+        }, code -> renderStreamRefusal(code, id));
     }
 
     /**
@@ -5143,7 +5406,8 @@ final class Repl {
                 (node, credential) -> controlPlane.login(node, username, credential))) {
             case LoginOutcome.Success success -> {
                 session.reland(verified.seed());
-                session.authenticate(success.token(), username, null, session.seeds());
+                session.authenticate(success.token(), username, null, session.members());
+                adoptAdvertisedMembers(verified.issuer());
                 confirm("logged in as " + username);
                 yield Cli.EXIT_OK;
             }
@@ -5193,7 +5457,68 @@ final class Repl {
 
     private void activate(AuthService.ActiveSession active) {
         session.reland(active.seed());
-        session.authenticate(active.accessToken(), active.record().principal(), null, session.seeds());
+        session.authenticate(active.accessToken(), active.record().principal(), null, session.members());
+        adoptAdvertisedMembers(active.record().issuer());
+    }
+
+    /**
+     * Asks the cluster who its members are and makes them this session's candidates for failover.
+     *
+     * <p>A seed list is what somebody typed once. It is how the first connection is made and it is a
+     * poor answer to "where else can this session go": a cluster that has grown since has members the
+     * seed list has never heard of, and a cluster whose seeded node has been retired has a seed list
+     * that points at nothing. The cluster knows, and having just authenticated is the first moment it
+     * can be asked.
+     *
+     * <p>Only adopted from a cluster with the identity this session just bound to. Two clusters' members
+     * in one candidate set would make a session that silently fails over into the wrong cluster while
+     * still holding a credential the right one issued -- which is the thing the issuer gate exists to
+     * stop, and it would be undone here by accepting whatever the answer happened to say.
+     *
+     * <p>The seeds are kept, behind what the cluster advertises. A member can advertise an address this
+     * client cannot reach -- an internal name, a port published only inside the cluster -- and dropping a
+     * candidate that demonstrably worked in favour of one that might not is a trade with nothing on its
+     * side. Discovery here adds places to go; it never takes one away, and the node this session is on
+     * is among the ones it keeps: at this point that node is always one of the seeds, because the only
+     * thing that has moved the landing node so far is the issuer gate picking a seed to verify.
+     *
+     * <p>A cluster that does not answer leaves the session exactly as it was. This makes a session
+     * better informed and is not a step it depends on.
+     */
+    private void adoptAdvertisedMembers(String issuer) {
+        // Once per connection. A cached session is re-activated before every API call, so asking here
+        // each time would put a second round trip in front of every command this CLI runs.
+        if (session.membersDiscovered()
+                || !(controlPlane.clusterMembers(session.landingNode(), session.credential())
+                instanceof ClusterMembersOutcome.Listed listed)
+                || !IssuerBinding.issuedBy(issuer, listed.clusterId())) {
+            return;
+        }
+        List<URI> candidates = new ArrayList<>();
+        for (RemoteClusterMember member : listed.members()) {
+            addCandidate(candidates, member.controlUrl());
+        }
+        for (URI seed : session.seeds()) {
+            if (!candidates.contains(seed)) {
+                candidates.add(seed);
+            }
+        }
+        session.useAdvertisedMembers(candidates);
+    }
+
+    /** Adds an advertised address, ignoring one that is not an address this client could dial. */
+    private static void addCandidate(List<URI> candidates, String advertised) {
+        if (advertised == null || advertised.isBlank()) {
+            return;
+        }
+        try {
+            URI uri = URI.create(advertised);
+            if (uri.getHost() != null && !candidates.contains(uri)) {
+                candidates.add(uri);
+            }
+        } catch (IllegalArgumentException notAnAddress) {
+            // A member that advertised something unusable is not a reason to discard the ones that did.
+        }
     }
 
     /**

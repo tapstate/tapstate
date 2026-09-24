@@ -22,6 +22,7 @@ admin are the same either way and are covered by the quickstart - do those once,
 | **MongoDB, as a replica set** | The control plane stores its own state here, and it uses transactions - so a standalone `mongod` is not enough. A single-member set is fine. |
 | **Databases of its own** | Point the server at a control database that is not your data. Durable operator state uses a second database on the same MongoDB deployment. The examples below use `tapstate` and `tapstate_nest`. |
 | **MySQL with binlog** | Only if you are capturing from it. The connector reads the binlog, so `binlog_format=ROW` and a user that may read it. |
+| **At least 4 GiB of JVM heap** | Required, not advised. The limits that stop a runaway pipeline are each a share of this figure, so a smaller heap does not get smaller limits - it gets limits it never reaches, because the heap runs out first and some other part of the process reports some other failure. More is always fine. |
 
 The databases do not have to be in containers, and the server does not have to be on the same host as
 either. What matters is that the addresses you give below are reachable **from the server**, because

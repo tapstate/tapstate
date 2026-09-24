@@ -77,6 +77,11 @@ final class RecordingActuator implements LifecycleActuator {
         this.refuseStartWith = cause;
     }
 
+    /** Disarms {@link #refuseStartWith}, so a refusal a test armed can be made a passing one. */
+    void stopRefusingStart() {
+        this.refuseStartWith = null;
+    }
+
     /** Arms failure() to report this cause, as if the pipeline's job had died on its own. */
     void failWith(Throwable cause) {
         this.failure = cause;

@@ -267,6 +267,42 @@ class EngineTest {
 
         assertThat(member.getJet().getJob("orders-pipe").getConfig().getProcessingGuarantee())
                 .isEqualTo(com.hazelcast.jet.config.ProcessingGuarantee.NONE);
+        assertThat(member.getJet().getJob("orders-pipe").getConfig().isSplitBrainProtectionEnabled())
+                .isTrue();
+    }
+
+    @Test
+    void submitted_jobs_are_not_re_planned_by_the_engine_when_the_cluster_changes() {
+        Engine engine = new Engine(member);
+
+        engine.submit("orders-pipe", foreverDag());
+
+        assertThat(member.getJet().getJob("orders-pipe").getConfig().isAutoScaling())
+                .as("who re-plans a run for a changed cluster is this product's decision, not the engine's")
+                .isFalse();
+    }
+
+    @Test
+    void a_start_right_after_a_stop_runs_a_new_job_rather_than_the_one_that_was_ending() {
+        Engine engine = new Engine(member);
+        engine.submit("orders-pipe", foreverDag());
+        Job ending = member.getJet().getJob("orders-pipe");
+        awaitStatus(ending, JobStatus.RUNNING);
+        long endingId = ending.getId();
+
+        engine.cancel("orders-pipe");
+        // Straight away, with no wait of the caller's own: submitting by name is documented as
+        // absent-safe, and a job that has just been cancelled is exactly the case where "absent" and
+        // "here but finished with" look the same from the outside.
+        engine.submit("orders-pipe", foreverDag());
+
+        Job started = member.getJet().getJob("orders-pipe");
+        assertThat(started.getId())
+                .as("the engine hands back the job already under the name while it is still ending, so a "
+                        + "submission that did not wait for it would return this same dying job and run "
+                        + "nothing at all -- with nothing thrown to say so")
+                .isNotEqualTo(endingId);
+        awaitStatus(started, JobStatus.RUNNING);
     }
 
     @Test

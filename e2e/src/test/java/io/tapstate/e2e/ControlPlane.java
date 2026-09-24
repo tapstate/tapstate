@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
@@ -23,6 +24,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicReference;
@@ -258,6 +261,276 @@ final class ControlPlane {
                 .map(each -> each instanceof Map<?, ?> m ? m.get("id") : null)
                 .map(String::valueOf)
                 .toList();
+    }
+
+    /**
+     * The node ids this member says are in its cluster, in order.
+     *
+     * <p>Asked of one member rather than of the cluster, because that is the property worth having: each
+     * of them answers out of the committed membership rather than out of what it happens to have seen,
+     * so two members that have found each other answer the same list and two that have not answer two
+     * lists of one. Sorted, so that comparing two members' answers compares what they hold rather than
+     * the order they happened to write it in.
+     */
+    List<String> clusterMemberNodeIds() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read who is in the cluster");
+        return nodeIdsIn(response.body());
+    }
+
+    /**
+     * The same read, with the one refusal a healthy cluster produces told apart from an answer.
+     *
+     * <p>A member cannot always answer this. It shuts its own engine member down while it cannot renew
+     * its node session, the library restarts that member on the smaller side once a split brain heals,
+     * and this HTTP face -- which is neither -- goes on being asked throughout both. It says so with a
+     * code, and a wait that read that as a failure would end on the first one rather than waiting the
+     * cluster out, which is not a poll: the window is on the way to the state being waited for.
+     *
+     * <p>Every other non-200 still fails here and now. Tolerating those would make this wait patient
+     * about exactly the answer a partition case exists to catch.
+     */
+    Optional<List<String>> clusterMemberNodeIdsIfAnswered() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        return interpretClusterMembers(response.statusCode(), response.body());
+    }
+
+    /**
+     * Nothing when this member answered who is in its cluster; the code it refused with when it could
+     * not.
+     *
+     * <p>A refusal carrying no code at all fails here rather than being reported as one of them. An
+     * uncoded page is precisely what a caller cannot tell from the product having fallen over, so a
+     * case that folded it in with the coded refusals would be asserting the thing it means to rule out.
+     */
+    Optional<String> clusterReadRefusal() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        return interpretClusterRefusal(response.statusCode(), response.body());
+    }
+
+    /**
+     * What a membership answer is allowed to mean, read the way a status answer is: one code of the
+     * product's own reads as "not now, ask again", and every other refusal stays loud.
+     *
+     * <p>Pinned as a decision over a status and a body rather than only through a live cluster, because
+     * a running product is least willing to produce these two answers on demand -- and confusing them
+     * is what a wait over this face has to be incapable of.
+     */
+    static Optional<List<String>> interpretClusterMembers(int status, String body) {
+        if (status != 200 && ClusterError.MEMBERSHIP_UNREADABLE.code().equals(codeOf(body))) {
+            return Optional.empty();
+        }
+        if (status != 200) {
+            throw new AssertionError("could not read who is in the cluster: expected HTTP 200, got "
+                    + status + " - " + body);
+        }
+        return Optional.of(nodeIdsIn(body));
+    }
+
+    /**
+     * Nothing when this member answered who is in its cluster; the code it refused with when it could
+     * not; loud when it refused without one.
+     *
+     * <p>An uncoded page is precisely what a caller cannot tell from the product having fallen over, so
+     * a case that folded one in with the coded refusals would pass over the thing it means to rule out.
+     */
+    static Optional<String> interpretClusterRefusal(int status, String body) {
+        if (status == 200) {
+            return Optional.empty();
+        }
+        String code = codeOf(body);
+        if (code == null) {
+            throw new AssertionError("this member would not say who is in the cluster, and would not "
+                    + "say why either: HTTP " + status + " - " + body);
+        }
+        return Optional.of(code);
+    }
+
+    private static List<String> nodeIdsIn(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> topology)
+                || !(topology.get("members") instanceof List<?> members)) {
+            throw new AssertionError("the topology carried no members at all: " + body);
+        }
+        List<String> nodeIds = new ArrayList<>();
+        for (Object member : members) {
+            if (member instanceof Map<?, ?> one && one.get("nodeId") instanceof String nodeId) {
+                nodeIds.add(nodeId);
+            }
+        }
+        nodeIds.sort(String::compareTo);
+        return nodeIds;
+    }
+
+    /**
+     * Every member this node lists, in the order it listed them, with what identifies each boot.
+     *
+     * <p>A list rather than a map keyed on the stable id, because the first thing a case about a
+     * stable id wants to know is whether one id is in here twice - and a map would have answered no
+     * to that question without ever looking.
+     */
+    List<ClusterMemberFacts> clusterMembers() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read who is in the cluster");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> topology)
+                || !(topology.get("members") instanceof List<?> members)) {
+            throw new AssertionError("the topology carried no members at all: " + response.body());
+        }
+        List<ClusterMemberFacts> facts = new ArrayList<>();
+        for (Object member : members) {
+            if (member instanceof Map<?, ?> one) {
+                facts.add(new ClusterMemberFacts(
+                        asText(one.get("nodeId")), asText(one.get("memberUuid")),
+                        asText(one.get("bootId")), asText(one.get("controlUrl")),
+                        asText(one.get("state"))));
+            }
+        }
+        return facts;
+    }
+
+    private static String asText(Object value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
+    /**
+     * The captures this pipeline reads through, each named with the node holding its claim.
+     *
+     * <p>Keyed by capture id rather than listed, because what is worth reading here is the identity two
+     * pipelines do or do not share: a capture's id is derived from the stored source contract, so two
+     * pipelines reading one source name one capture and two pipelines reading two sources name two. A
+     * capture nobody has claimed is absent rather than present with no owner, which is the read face's
+     * own distinction between "not taken" and "not there".
+     */
+    Map<String, String> captureOwnersOf(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read who owns the captures of " + pipelineId);
+        Map<String, String> owners = new LinkedHashMap<>();
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (!(pipeline instanceof Map<?, ?> one) || !pipelineId.equals(one.get("pipelineId"))) {
+                continue;
+            }
+            if (!(one.get("captureClaims") instanceof List<?> claims)) {
+                continue;
+            }
+            for (Object claim : claims) {
+                if (claim instanceof Map<?, ?> filed
+                        && filed.get("resourceId") instanceof String captureId) {
+                    owners.put(captureId, String.valueOf(filed.get("ownerNodeId")));
+                }
+            }
+        }
+        return owners;
+    }
+
+    /** Who actuates this pipeline right now, or empty when nothing fences it and nobody has taken it. */
+    Optional<String> pipelineControllerOf(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read who drives " + pipelineId);
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("controllerClaim") instanceof Map<?, ?> claim
+                    && claim.get("ownerNodeId") instanceof String nodeId) {
+                return Optional.of(nodeId);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * The execution generation the pipeline's current controller holds, or empty when nothing fences it.
+     *
+     * <p>What tells one run of a pipeline from the run that replaced it. A rebuild that reused the
+     * number would leave the two indistinguishable to everything downstream, which is the whole reason
+     * the number exists.
+     */
+    Optional<Long> executionGenerationOf(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read the execution generation of " + pipelineId);
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("controllerClaim") instanceof Map<?, ?> claim
+                    && claim.get("executionGeneration") instanceof Number generation) {
+                return Optional.of(generation.longValue());
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * The members carrying any part of this pipeline's current run, by stable node id, as the cluster
+     * reports it -- empty when no run of it is being measured.
+     *
+     * <p>What a case that kills a member needs before it can say it killed one the run was on: the
+     * engine places a run's pieces for itself, so which members carry them is read, never assumed. It is
+     * assembled from the members that have reported so far; {@link #membersMeasuring} says which.
+     */
+    Set<String> membersCarryingPartOf(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read which members carry " + pipelineId);
+        Set<String> carrying = new TreeSet<>();
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (!(pipeline instanceof Map<?, ?> one) || !pipelineId.equals(one.get("pipelineId"))
+                    || !(one.get("vertices") instanceof List<?> vertices)) {
+                continue;
+            }
+            for (Object vertex : vertices) {
+                if (!(vertex instanceof Map<?, ?> placed)
+                        || !(placed.get("processors") instanceof List<?> processors)) {
+                    continue;
+                }
+                for (Object processor : processors) {
+                    if (processor instanceof Map<?, ?> running && running.get("nodeId") instanceof String nodeId) {
+                        carrying.add(nodeId);
+                    }
+                }
+            }
+        }
+        return carrying;
+    }
+
+    /**
+     * The members this pipeline's current run has been measured from, by engine identity -- empty when no
+     * run of it is being measured.
+     *
+     * <p>What makes {@link #membersCarryingPartOf} an answer rather than part of one. The cluster's
+     * readings of a run arrive from each member on that member's own schedule, seconds apart, and a piece
+     * running on a member that has not reported yet is missing from the placement rather than shown as
+     * unknown: until then a run split across two members reads as carried by one. A case that judges where
+     * a run is placed waits for this to name every member first.
+     */
+    Set<String> membersMeasuring(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read which members " + pipelineId + "'s run is measured from");
+        Set<String> measuring = new TreeSet<>();
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("measuredFrom") instanceof List<?> members) {
+                for (Object member : members) {
+                    if (member instanceof String memberUuid) {
+                        measuring.add(memberUuid);
+                    }
+                }
+            }
+        }
+        return measuring;
+    }
+
+    private static List<?> pipelinesOf(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> topology)
+                || !(topology.get("pipelines") instanceof List<?> pipelines)) {
+            throw new AssertionError("the topology carried no pipelines at all: " + body);
+        }
+        return pipelines;
+    }
+
+    /** The cluster id this member answers with, which is what a client checks a second member against. */
+    String clusterId() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read which cluster this is");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> topology)
+                || !(topology.get("clusterId") instanceof String clusterId)) {
+            throw new AssertionError("the topology named no cluster: " + response.body());
+        }
+        return clusterId;
     }
 
     /**
@@ -799,6 +1072,31 @@ final class ControlPlane {
     }
 
     /**
+     * Starts the pipeline unless it is running already, and answers whether this call is what started it.
+     *
+     * <p>Reading "not running" and then starting is a race wherever something else may bring the pipeline
+     * back first -- a restarted member's own convergence does, a moment after it comes up -- and the product
+     * then refuses the start as a transition out of RUNNING. That refusal is the outcome a caller who only
+     * wanted the pipeline running was after, so it is taken as one; any other refusal still fails.
+     */
+    boolean startUnlessRunning(String pipelineId) {
+        HttpResponse<String> response =
+                send(authed("/api/pipelines/" + pipelineId + ":" + LifecycleVerb.START.id(), ""));
+        if (response.statusCode() == 409 && refusedAsAlreadyRunning(response.body())) {
+            return false;
+        }
+        expect(response, 200, LifecycleVerb.START.id() + " " + pipelineId);
+        return true;
+    }
+
+    private static boolean refusedAsAlreadyRunning(String body) {
+        return JsonReader.parse(body) instanceof Map<?, ?> refusal
+                && "lifecycle.illegal-transition".equals(refusal.get("code"))
+                && refusal.get("params") instanceof Map<?, ?> params
+                && PipelineState.RUNNING.name().equals(params.get("from"));
+    }
+
+    /**
      * Stops the pipeline, saying whether stopping also clears what it has accumulated -- its resume
      * position and its operators' state.
      */
@@ -1309,6 +1607,29 @@ final class ControlPlane {
             return Map.of();
         }
         return Map.of("chainId", String.valueOf(chain.get("chainId")), "token", token);
+    }
+
+    /**
+     * Where in its source's change buffer the last change this pipeline's target confirmed sat, as the
+     * position face reports it for the pipeline's first chain -- empty until a change has been confirmed.
+     *
+     * <p>What a case needs before it kills a member and counts what the replacing run writes: a target
+     * showing a row says the row was written, not that the write was confirmed back, and a run is owed
+     * again whatever was written but not yet confirmed. Waiting for this to stop moving is waiting for the
+     * two to agree.
+     */
+    Optional<Long> ackedChangeSeq(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
+        expect(response, 200, "read the acknowledged position of " + pipelineId);
+        if (JsonReader.parse(response.body()) instanceof Map<?, ?> document
+                && document.get("chains") instanceof List<?> chains && !chains.isEmpty()
+                && chains.getFirst() instanceof Map<?, ?> chain
+                && chain.get("targetAcked") instanceof Map<?, ?> acked
+                && acked.get("seq") instanceof Number seq
+                && seq.longValue() >= 0) {
+            return Optional.of(seq.longValue());
+        }
+        return Optional.empty();
     }
 
     /**

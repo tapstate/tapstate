@@ -1,0 +1,3 @@
+rule: join-input-not-a-table
+path: transforms[1].from.o
+note: "a join reads source tables; alias o names the js step renamed_orders"

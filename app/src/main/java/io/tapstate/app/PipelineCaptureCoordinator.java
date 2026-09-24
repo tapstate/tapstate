@@ -14,7 +14,13 @@ import java.util.Optional;
  */
 interface PipelineCaptureCoordinator {
 
-    /** Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop. */
+    /**
+     * Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop.
+     *
+     * <p>May give the start back with {@link RingNotOpenYet} instead, having opened nothing: a capture it reads
+     * is held by another member that has not opened its ring yet. The caller submits nothing for the
+     * pipeline and starts it again on a later pass.
+     */
     void startCapture(String pipelineId);
 
     /**

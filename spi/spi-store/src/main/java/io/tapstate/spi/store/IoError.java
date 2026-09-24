@@ -54,6 +54,9 @@ public enum IoError implements TapstateErrorCode {
     /** Publication lost its writer lease or exhausted its attempts under concurrent discovery. */
     SCHEMA_WRITE_CONTENTION("io.schema-write-contention", Set.of("connectionId")),
 
+    /** A side-effect write carried an expired, replaced, or otherwise non-current workload claim. */
+    WORKLOAD_CLAIM_FENCED("io.workload-claim-fenced", Set.of()),
+
     /**
      * A document a store operation had to write is larger than the store will accept. {@code id} is
      * the document's id, or {@code unknown} where the failing call did not name one.

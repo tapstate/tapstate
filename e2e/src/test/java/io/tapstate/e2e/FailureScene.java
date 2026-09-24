@@ -38,6 +38,13 @@ final class FailureScene {
     private static final java.util.regex.Pattern ADDRESS =
             java.util.regex.Pattern.compile("[a-zA-Z][a-zA-Z0-9+.-]*://\\S*");
 
+    /**
+     * Where a clustered run's member logs are kept, under the same directory the workflow collects when
+     * a shard fails. One sub-directory per bring-up, named by the cluster id that bring-up ran under,
+     * so several cases in one shard do not write over each other.
+     */
+    private static final Path MEMBER_LOGS = Path.of("target", "failure-scenes", "members");
+
     private FailureScene() {
     }
 
@@ -139,6 +146,43 @@ final class FailureScene {
             tables.add(doc.table());
         }
         return tables;
+    }
+
+    /**
+     * Each member's own account of a clustered run, kept where the workflow collects it.
+     *
+     * <p>A member writes what it decided - which of them took the work, what killed the run that
+     * replaced one, how many rebuilds were spent - under a temporary directory the run creates and the
+     * machine throws away. None of it is in the reports a failed shard uploads, so a clustered case that
+     * goes red once in a while arrives as one assertion message with no cause attached, and the next
+     * move is to reproduce a failure that did not reproduce.
+     *
+     * <p>Written for every clustered run rather than only a failing one, because the fixture that owns
+     * these processes is not the thing that knows whether the case passed. Nothing is uploaded unless
+     * the shard fails, and a run that passed beside one that did not is worth having when the question
+     * is whether they were in each other's way.
+     *
+     * <p>Scrubbed like everything else here, so a connection string a member echoed is elided rather
+     * than published. What is left is the member addresses of the machine the run was on, which the
+     * product stamps on nearly every line; those are a runner's own ephemeral addresses and carry
+     * nothing to keep.
+     */
+    static void writeMemberLogs(String runId, Map<String, Path> logs) {
+        Path directory = MEMBER_LOGS.resolve(runId);
+        logs.forEach((nodeId, log) -> {
+            Path file = directory.resolve(nodeId + ".log");
+            try {
+                Files.createDirectories(directory);
+                List<String> scrubbed = new ArrayList<>();
+                Files.readAllLines(log).forEach(line -> scrubbed.add(scrubbed(line)));
+                Files.write(file, scrubbed);
+            } catch (IOException | RuntimeException cannotWrite) {
+                // Never thrown on, for the same reason the scene above is not: this is called while a
+                // case is already failing, or on its way out, and a collector that raises its own
+                // problem replaces the one it was there to describe.
+                System.err.println("could not keep " + nodeId + "'s log at " + file + ": " + cannotWrite);
+            }
+        });
     }
 
     private static void reading(StringBuilder scene, String what, Reading reading) {

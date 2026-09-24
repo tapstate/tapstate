@@ -6,8 +6,10 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
+import java.time.Instant;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -139,6 +141,23 @@ final class StoreDocuments implements AutoCloseable {
             return -1L;
         }
         return seq.longValue();
+    }
+
+    /**
+     * When the claim over one capture runs out as the store holds it, or null when nobody has claimed it.
+     *
+     * <p>Read here because a renewal has no read face: the cluster says whether a claim is leased, not
+     * when its lease was last carried forward, and "has it been renewed since" is the question a case
+     * about a renewal has to ask. Matched field by field rather than on the whole id, whose field order is
+     * the store's own business.
+     */
+    Instant captureLeaseUntil(String clusterId, String captureId) {
+        Document claim = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                .find(new Document("_id.clusterId", clusterId)
+                        .append("_id.resourceType", WorkloadClaimType.CAPTURE.name())
+                        .append("_id.resourceId", captureId))
+                .first();
+        return claim == null ? null : claim.getDate("leaseUntil").toInstant();
     }
 
     @Override

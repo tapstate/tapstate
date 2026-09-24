@@ -353,4 +353,73 @@ class SrsRingReaderTest {
         assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(1);
         assertThat(out).extracting(i -> i.after().get("id")).containsExactly(2);
     }
+
+    @Test
+    void aRunResumingAfterAConfirmedChangeStartsJustPastItRatherThanAtTheHead() {
+        SrsRingbuffer ring = filled("srs.resume.inside", 5);
+        SrsRingReader reader = SrsRingReader.resumingAfter(ring, 2, seq -> { });
+        List<Long> sequences = new ArrayList<>();
+
+        reader.fill((item, seq) -> sequences.add(seq), 10);
+
+        // The ring outlived the run that confirmed 0..2, so its head still holds them; a replacement that
+        // started at the head would hand the target all three again.
+        assertThat(sequences).containsExactly(3L, 4L);
+    }
+
+    @Test
+    void aConfirmedChangeTheRingNoLongerHoldsResumesAtTheHeadRatherThanPastIt() {
+        SrsRingbuffer ring = filled("srs.resume.below-head", 10);
+        assertThat(ring.headSequence())
+                .as("a ring of eight overwrote its oldest two, so the confirmed change is no longer in it")
+                .isEqualTo(2L);
+        SrsRingReader reader = SrsRingReader.resumingAfter(ring, 0, seq -> { });
+        List<Long> sequences = new ArrayList<>();
+
+        reader.fill((item, seq) -> sequences.add(seq), 20);
+
+        // Everything the ring still holds came after the confirmed change, so all of it is owed.
+        assertThat(sequences).containsExactly(2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L);
+    }
+
+    @Test
+    void aConfirmedSequenceBeyondTheTailIsNotTrustedAndTheRunStartsAtTheHead() {
+        SrsRingbuffer ring = filled("srs.resume.beyond-tail", 3);
+        SrsRingReader reader = SrsRingReader.resumingAfter(ring, 41, seq -> { });
+        List<Long> sequences = new ArrayList<>();
+
+        reader.fill((item, seq) -> sequences.add(seq), 10);
+
+        // A ring that never reached sequence 41 is not the ring it was confirmed from. Trusting it would
+        // wait for sequence 42 and pass over every change written until then.
+        assertThat(sequences).containsExactly(0L, 1L, 2L);
+    }
+
+    @Test
+    void aRunResumingAfterTheLastBufferedChangeTakesOnlyWhatComesNext() {
+        SrsRingbuffer ring = filled("srs.resume.at-tail", 3);
+        SrsRingReader reader = SrsRingReader.resumingAfter(ring, 2, seq -> { });
+        List<Long> sequences = new ArrayList<>();
+
+        assertThat(reader.fill((item, seq) -> sequences.add(seq), 10)).isZero();
+        ring.append(insert(3));
+        reader.fill((item, seq) -> sequences.add(seq), 10);
+
+        assertThat(sequences).containsExactly(3L);
+    }
+
+    @Test
+    void anArrivalMarkedOnAnEmptyRingTakesEverythingWrittenAfterIt() {
+        // The first pipeline on a chain marks where it arrives before its tail has mined anything, so the
+        // ring is empty and the mark is the empty ring's tail. Nothing written after it may be passed over.
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.resume.empty"));
+        SrsRingReader reader = SrsRingReader.resumingAfter(ring, ring.tailSequence(), seq -> { });
+        List<Long> sequences = new ArrayList<>();
+
+        ring.append(insert(0));
+        ring.append(insert(1));
+        reader.fill((item, seq) -> sequences.add(seq), 10);
+
+        assertThat(sequences).containsExactly(0L, 1L);
+    }
 }

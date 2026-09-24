@@ -54,6 +54,13 @@ import java.util.function.Function;
  */
 public final class Engine {
 
+    /**
+     * How long a submission waits for a previous run of the same pipeline to finish ending. Generous
+     * because the alternative is refusing a start that would have worked a moment later, and short
+     * enough that a processor which never shuts down is reported rather than waited on forever.
+     */
+    private static final Duration PREVIOUS_RUN_BUDGET = Duration.ofSeconds(30);
+
     private final HazelcastInstance member;
 
     /**
@@ -105,27 +112,72 @@ public final class Engine {
      */
     public void submit(String pipelineId, DAG dag, Set<String> stateNamespaces, NestSettings settings) {
         NestMemoryBudget.applyTo(member, stateNamespaces, settings);
-        JobFailureRegistry.of(member).clear(pipelineId);
-        JobConfig config = new JobConfig()
-                .setName(pipelineId)
-                .setProcessingGuarantee(ProcessingGuarantee.NONE);
-        member.getJet().newJobIfAbsent(dag, config);
+        submitJob(pipelineId, dag);
     }
 
     /** Submits after pinning every nest namespace to the database the compiled artifact resolved. */
     public void submit(String pipelineId, DAG dag, Map<String, String> stateDatabases,
             NestSettings settings) {
         configureNestState(stateDatabases, settings);
-        JobFailureRegistry.of(member).clear(pipelineId);
-        JobConfig config = new JobConfig()
-                .setName(pipelineId)
-                .setProcessingGuarantee(ProcessingGuarantee.NONE);
-        member.getJet().newJobIfAbsent(dag, config);
+        submitJob(pipelineId, dag);
     }
 
     /** Validates and pins placement before capture or graph construction performs a side effect. */
     public void configureNestState(Map<String, String> stateDatabases, NestSettings settings) {
         NestStatePlacement.applyTo(member, stateDatabases, settings);
+    }
+
+    /**
+     * Starts the pipeline's job, its state placement already fixed by the caller. One path for every
+     * submission rather than one per overload: what a clustered run is held to -- split-brain protection,
+     * no engine-side re-planning of a changed cluster, and a previous run that has to be over first -- is
+     * carried here, so an overload cannot be added that quietly starts a run without any of it.
+     */
+    private void submitJob(String pipelineId, DAG dag) {
+        JobFailureRegistry.of(member).clear(pipelineId);
+        awaitPreviousRunOver(pipelineId);
+        JobConfig config = new JobConfig()
+                .setName(pipelineId)
+                .setProcessingGuarantee(ProcessingGuarantee.NONE)
+                .setSplitBrainProtection(true)
+                // Who re-plans a run for a changed cluster is a decision this product makes, not one the
+                // engine makes underneath it. Left on, the engine would restart the job itself on whatever
+                // members remain -- with no claim taken, no execution generation allocated, and therefore
+                // nothing anywhere able to tell the new run from the old one it replaced. Off, a run whose
+                // members changed ends, and what starts in its place is submitted deliberately, once, by
+                // whoever holds the pipeline.
+                .setAutoScaling(false);
+        member.getJet().newJobIfAbsent(dag, config);
+    }
+
+    /**
+     * Waits, briefly and only when it applies, for a previous run of this pipeline to finish ending.
+     *
+     * <p>Submitting by name is absent-safe, but "absent" is not what it sounds like: asked for a job
+     * under a name whose previous job is still winding down, the engine hands that dying job back and
+     * starts nothing -- and says nothing, so the caller has a job object, no exception, and no run.
+     * Measured on 20 consecutive cancel-then-submit rounds: the same job id came back every time, its
+     * status settling at FAILED, with nothing thrown. Waiting for the old run to be over removes it just
+     * as consistently, which is why this is a wait rather than a retry.
+     *
+     * <p>Only a job that is ending is waited for. One that is running or held is the ordinary
+     * absent-safe case -- a second pass over a pipeline already carried by a job -- and waiting for that
+     * would be waiting for the pipeline to stop.
+     *
+     * <p>A wait that runs out refuses with a code instead of submitting into the silence. The previous
+     * run not ending is the caller's problem to see: submitting anyway would report a start that did not
+     * happen, which is the failure this whole method exists to stop.
+     */
+    private void awaitPreviousRunOver(String pipelineId) {
+        Job previous = member.getJet().getJob(pipelineId);
+        if (previous == null || previous.getStatus() != JobStatus.COMPLETING) {
+            return;
+        }
+        if (!awaitTerminal(pipelineId, PREVIOUS_RUN_BUDGET)) {
+            throw new TapstateException(
+                    EngineError.JOB_STILL_ENDING,
+                    Map.of("pipeline", pipelineId, "seconds", PREVIOUS_RUN_BUDGET.toSeconds()), null);
+        }
     }
 
     /** Pauses the pipeline's running job. The job is kept so it can be resumed. */

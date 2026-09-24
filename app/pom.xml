@@ -278,19 +278,32 @@
       </resource>
     </resources>
     <plugins>
-      <!-- Stamp Add-Opens into the jar manifest so the shipped boot jar opens java.base/java.lang to
-           unnamed modules under a bare `java -jar` (the spring-boot repackage below preserves the jar
-           manifest's own entries). A real PDK connector binds its configuration through cglib, which
-           reflects into ClassLoader.defineClass; JDK 17+ denies that without this open and the
-           connector fails at construction. The launcher script sets the same flag for the unpacked
-           distribution; this manifest entry covers launching the fat-jar directly. -->
+      <!-- Stamp the module openings the shipped boot jar needs into its manifest, so a bare `java -jar`
+           has them without the caller setting JAVA_OPTS (the spring-boot repackage below preserves the
+           jar manifest's own entries). Two unrelated things need them.
+
+           java.base/java.lang is for the connectors: a real PDK connector binds its configuration
+           through cglib, which reflects into ClassLoader.defineClass, and JDK 17+ denies that without
+           the open - the connector then fails at construction.
+
+           The other four are what the clustering library asks for to reach the JDK internals it uses
+           for its own memory and management access. Without them it starts anyway and says so at every
+           startup, and what it loses is performance on the paths between members - which is nothing at
+           all on one machine and a hot path as soon as there are two.
+
+           These are the five packages it actually tests for. Its message also names a java.se module
+           flag alongside them, which is not one of them: that part of the message is a fixed prefix
+           rather than something the check looks at, and a class-path application already resolves
+           java.se. No manifest attribute carries it either, so shipping it would mean carrying a
+           launcher in order to carry a flag that changes nothing. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
         <configuration>
           <archive>
             <manifestEntries>
-              <Add-Opens>java.base/java.lang</Add-Opens>
+              <Add-Opens>java.base/java.lang java.base/sun.nio.ch java.management/sun.management jdk.management/com.sun.management.internal</Add-Opens>
+              <Add-Exports>java.base/jdk.internal.ref</Add-Exports>
             </manifestEntries>
           </archive>
         </configuration>
