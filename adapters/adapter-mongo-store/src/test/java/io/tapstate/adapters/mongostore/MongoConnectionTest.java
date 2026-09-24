@@ -4,6 +4,7 @@ import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.MongoConfigurationException;
 import io.tapstate.core.common.TapstateException;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
 import javax.net.ssl.TrustManager;
@@ -18,8 +19,9 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
  * The connection substrate's fast-fail behavior and TLS wiring — no Docker required. TLS is opt-in:
  * the connection is plaintext by default and uses TLS only when the URI asks for it ({@code ssl=true}
  * / {@code tls=true}), with the URI's own settings honored as-is. Pointed at a dead port it reports
- * the store unreachable as a coded diagnostic (not a bare driver exception). The replica-set check and
- * the CAS witness against a real Mongo live in the Testcontainers integration tests.
+ * the store unreachable as a coded diagnostic (not a bare driver exception). The real replica-set
+ * and standalone checks plus the CAS witness live in the Testcontainers integration tests; the
+ * mongos hello marker is checked here until a sharded test deployment is available.
  */
 class MongoConnectionTest {
 
@@ -58,6 +60,18 @@ class MongoConnectionTest {
         assertThat(ex.code()).isEqualTo(StoreError.UNREACHABLE);
         assertThat(ex.args()).containsEntry("target", "cluster.example.net");
         assertThat(ex.getMessage()).doesNotContain("test-user", "sentinel-password");
+    }
+
+    @Test
+    void acceptsTransactionalReplicaSetAndMongosButRejectsStandaloneHello() {
+        assertThat(MongoConnection.isTransactionCapableTopology(new Document("setName", "rs0")))
+                .as("a replica-set member can host checkpoint transactions").isTrue();
+        assertThat(MongoConnection.isTransactionCapableTopology(new Document("msg", "isdbgrid")))
+                .as("a mongos router can host sharded transactions").isTrue();
+        assertThat(MongoConnection.isTransactionCapableTopology(new Document("isWritablePrimary", true)))
+                .as("a standalone server cannot host checkpoint transactions").isFalse();
+        assertThat(MongoConnection.isTransactionCapableTopology(new Document("msg", "other")))
+                .as("only the mongos hello marker is accepted without a set name").isFalse();
     }
 
     @Test

@@ -32,8 +32,8 @@ import org.bson.Document;
 
 /**
  * The store connection substrate: opens a Mongo client from the externalized settings and verifies
- * the target is reachable and is a replica-set (the checkpoint compare-and-swap runs in a
- * multi-document transaction, which requires one). It is the assembly root's driver-free handle on
+ * the target is reachable and supports multi-document transactions through a replica set or
+ * sharded router. It is the assembly root's driver-free handle on
  * the store — the public surface exposes only java types, so no driver type escapes this module
  * (rule R3). Driver failures are translated into {@code store.*} coded diagnostics.
  *
@@ -71,7 +71,7 @@ public final class MongoConnection implements AutoCloseable {
     }
 
     /**
-     * Opens the client and verifies the store is reachable and is a replica-set, and nothing further.
+     * Opens the client and verifies the store is reachable and supports transactions, and nothing further.
      * Raises a {@code store.unreachable} coded diagnostic if the target cannot be reached within the
      * configured server-selection timeout, or {@code store.not-replica-set} if it is reached but is a
      * standalone server. On success the client is held open for the process lifetime.
@@ -101,12 +101,17 @@ public final class MongoConnection implements AutoCloseable {
             }
             throw new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), e);
         }
-        // A replica-set member reports its set name in the hello response; a standalone does not.
-        if (!hello.containsKey("setName")) {
+        // A replica-set member reports setName; a sharded router reports msg=isdbgrid.
+        // A standalone server reports neither and cannot host checkpoint transactions.
+        if (!isTransactionCapableTopology(hello)) {
             opened.close();
             throw new TapstateException(StoreError.NOT_REPLICA_SET, Map.of("target", target), null);
         }
         this.client = opened;
+    }
+
+    static boolean isTransactionCapableTopology(Document hello) {
+        return hello.containsKey("setName") || "isdbgrid".equals(hello.get("msg"));
     }
 
     /** Classifies SRV/TXT DNS lookup failures before a client exists, without echoing URI userinfo. */

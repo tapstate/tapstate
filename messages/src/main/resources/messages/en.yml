@@ -343,8 +343,8 @@ store.unreachable:
   message: "Cannot reach the store at {target}."
   solution: "Check the store is running and the connection settings are correct, then restart."
 store.not-replica-set:
-  message: "The store at {target} is not a replica-set."
-  solution: "Start MongoDB as a single-node replica-set; the checkpoint transaction requires one."
+  message: "The store at {target} is not a transaction-capable replica set or sharded cluster."
+  solution: "Use a replica set or sharded cluster; standalone MongoDB cannot host checkpoint transactions."
 store.invalid-operator-state-database:
   message: "The operator-state database name is not valid for this deployment."
   solution: "Set tapstate.store.mongo.operator-state-database to a non-blank name of at most 63 UTF-8 bytes, without a null character, slash, backslash, space, double quote, dot, or dollar sign. Do not use local, config, or the control database named by tapstate.store.mongo.uri."

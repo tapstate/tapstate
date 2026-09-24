@@ -8,8 +8,8 @@ import java.util.Set;
 /**
  * The {@code store} domain's error codes: reaching the backing store at startup. These are
  * user-facing, diagnosable failures — the operator supplied an invalid store setting, pointed the
- * server at a store that is not reachable, or used a standalone server when a replica-set is required
- * (the checkpoint compare-and-swap runs inside a multi-document transaction, which needs one).
+ * server at a store that is not reachable, or used a standalone server where transactions require a
+ * replica set or sharded cluster (the checkpoint compare-and-swap uses a multi-document transaction).
  *
  * <p>Driver exceptions are translated into these coded diagnostics inside this module, so no
  * driver type escapes it (rule R3). {@code placeholders()} is the named-argument contract: every
@@ -21,7 +21,7 @@ public enum StoreError implements TapstateErrorCode {
     /** The store could not be reached: {@code target} is the connection target that failed. */
     UNREACHABLE("store.unreachable", Set.of("target")),
 
-    /** The store was reached but is not a replica-set: {@code target} is the connection target. */
+    /** The store was reached but lacks a transactional topology: {@code target} is the connection target. */
     NOT_REPLICA_SET("store.not-replica-set", Set.of("target")),
 
     /** The configured durable operator-state database name is unsafe or not valid for MongoDB. */
