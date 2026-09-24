@@ -7,6 +7,7 @@ import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.ReplaceOneModel;
 import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.WriteModel;
+import com.mongodb.client.result.UpdateResult;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.store.IoError;
@@ -41,14 +42,21 @@ import java.util.Optional;
  * (rule R3). A stored document that cannot be read back into its model is coded
  * {@code io.document-unreadable}.
  *
- * <p>A record carrying a capture fence is appended inside a transaction that first reads the matching live
- * workload claim with Mongo server time. The claim check and log write therefore commit together: replacing
- * the owner generation makes every later append from the old process fail even if that process is still alive.
+ * <p>A record carrying a capture fence is appended inside a transaction that first writes to the matching
+ * live workload claim, judged by Mongo server time. The claim write and the log write commit together, and a
+ * takeover writes that same claim, so the two are ordered: replacing the owner generation makes every later
+ * append from the old process fail even if that process is still alive.
  */
 public final class MongoSrsLogStore implements SrsLogStore {
 
     private static final String RING = "ring";
     private static final String SEQ = "seq";
+
+    /**
+     * What a fenced append writes to its claim to prove it. A counter, so that the write always changes the
+     * document: a write that changes nothing is not made at all, and would conflict with nothing.
+     */
+    private static final Document PROVE_THE_CLAIM = new Document("$inc", new Document("fencedAppends", 1L));
 
     private final MongoClient client;
     private final MongoCollection<Document> collection;
@@ -206,32 +214,34 @@ public final class MongoSrsLogStore implements SrsLogStore {
         return image == null ? null : RowImages.toRow(image);
     }
 
+    /**
+     * Commits {@code write} only together with proof that the claim {@code fence} names is still that owner's
+     * and still leased -- and the proof is a write to the claim, not a read of it.
+     *
+     * <p>Under snapshot isolation a read conflicts with no write. An owner that read its claim live just
+     * before the lease ran out went on to commit its append after a new owner had taken the claim over: the
+     * takeover wrote the claim, the append only read it, and nothing set the two against each other. Writing
+     * the claim puts both on one document, so they are ordered. An append that comes after the takeover finds
+     * the claim is no longer its own and is refused; one that comes first commits before the takeover can.
+     *
+     * <p>Run as a transaction the driver retries. The owner's own renewals write the same document, and one
+     * landing inside an append makes the append's write conflict; the retry proves the claim again, so the
+     * append lands if the claim is still this owner's and is refused if it is not.
+     */
     private void fenced(WorkloadClaimFence fence, java.util.function.Consumer<ClientSession> write) {
         if (client == null || workloadClaims == null) {
             throw new IllegalStateException("a fenced SRS log write requires the workload-claim collection");
         }
         StoreIo.run(() -> {
             try (ClientSession session = client.startSession()) {
-                session.startTransaction();
-                try {
-                    Document live = workloadClaims.find(session, liveClaim(fence))
-                            .projection(new Document("_id", 1))
-                            .first();
-                    if (live == null) {
+                session.withTransaction(() -> {
+                    UpdateResult proved = workloadClaims.updateOne(session, liveClaim(fence), PROVE_THE_CLAIM);
+                    if (proved.getMatchedCount() != 1) {
                         throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
                     }
                     write.accept(session);
-                    session.commitTransaction();
-                } catch (RuntimeException failure) {
-                    if (session.hasActiveTransaction()) {
-                        try {
-                            session.abortTransaction();
-                        } catch (RuntimeException abortFailure) {
-                            failure.addSuppressed(abortFailure);
-                        }
-                    }
-                    throw failure;
-                }
+                    return null;
+                });
             }
         });
     }

@@ -1,5 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -24,6 +26,11 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -47,8 +54,13 @@ class MongoSrsLogStoreIT {
     private static final String RING = "srs.mc-1.orders";
     private static final String OTHER = "srs.mc-1.customers";
 
+    /** The application name a case gives the client whose writes it holds on the server. */
+    private static final String HELD_CLIENT = "held-old-owner";
+
+    /** Test commands on, so a case can hold one client's write on the server and pin an interleaving. */
     @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE)
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
     @Test
     void storeThenLoadRoundTripsAChange() {
@@ -233,6 +245,93 @@ class MongoSrsLogStoreIT {
                     "p2", Op.INSERT, 2L, null, Map.of("id", 2), 0L, current)));
             assertThat(log.load(RING, 2L).orElseThrow().captureFence()).isEqualTo(current);
         }
+    }
+
+    /**
+     * A takeover committed while an old owner's append is in flight leaves that append unable to land after
+     * it -- the promise a capture fence makes.
+     *
+     * <p>The append used to prove its claim with a read, and under snapshot isolation a read conflicts with
+     * no write: the old owner read its claim while it was live, the lease ran out, the new owner took the
+     * claim over, and the old owner's append then committed after the takeover all the same. The
+     * interleaving is pinned rather than raced for: the old owner's next write is held on the server for
+     * longer than its lease has left, and the claim is taken over inside that pause.
+     */
+    @Test
+    void anAppendInFlightWhenTheClaimIsTakenOverCannotLandAfterTheTakeover() throws Exception {
+        String url = REPLICA_SET.getReplicaSetUrl();
+        try (MongoClient admin = MongoClients.create(url);
+             MongoClient oldOwner = MongoClients.create(MongoClientSettings.builder()
+                     .applyConnectionString(new ConnectionString(url))
+                     .applicationName(HELD_CLIENT)
+                     .build())) {
+            String databaseName = "tapstate_takeover_" + System.nanoTime();
+            MongoWorkloadClaimStore claims =
+                    new MongoWorkloadClaimStore(admin.getDatabase(databaseName).getCollection("workload_claims"));
+            MongoSrsLogStore oldOwnersLog = new MongoSrsLogStore(oldOwner,
+                    oldOwner.getDatabase(databaseName).getCollection("srs_log"),
+                    oldOwner.getDatabase(databaseName).getCollection("workload_claims"));
+            WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-orders");
+            long leaseTakenAt = System.nanoTime();
+            WorkloadClaim first = claims.acquire(
+                    key, new WorkloadOwner("node-a", "boot-a"), 7, Duration.ofSeconds(1)).claim();
+            WorkloadClaimFence stale = WorkloadClaimFence.from(first);
+            holdNextWrite(admin, Duration.ofSeconds(4));
+            ExecutorService threads = Executors.newFixedThreadPool(2);
+            try {
+                Future<Long> append = threads.submit(() -> {
+                    oldOwnersLog.storeAll(RING, 1L, List.of(
+                            new SrsLogRecord("p1", Op.INSERT, 1L, null, Map.of("id", 1), 0L, stale)));
+                    return System.nanoTime();
+                });
+                // Past the old lease, with the old owner's append still held on the server.
+                long pastTheLease = Duration.ofMillis(1500).toNanos() - (System.nanoTime() - leaseTakenAt);
+                Thread.sleep(Math.max(0L, Duration.ofNanos(pastTheLease).toMillis()));
+                Future<Long> takeover = threads.submit(() -> {
+                    assertThat(claims.acquire(key, new WorkloadOwner("node-b", "boot-b"), 8, Duration.ofSeconds(30))
+                            .acquired()).isTrue();
+                    return System.nanoTime();
+                });
+
+                Throwable appendFailure = null;
+                long appendReturnedAt = 0L;
+                try {
+                    appendReturnedAt = append.get(30, TimeUnit.SECONDS);
+                } catch (ExecutionException ended) {
+                    appendFailure = ended.getCause();
+                }
+                long takenOverAt = takeover.get(30, TimeUnit.SECONDS);
+
+                if (appendFailure != null) {
+                    assertThat(appendFailure).isInstanceOfSatisfying(TapstateException.class,
+                            coded -> assertThat(coded.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                    assertThat(new MongoSrsLogStore(admin.getDatabase(databaseName).getCollection("srs_log"))
+                            .load(RING, 1L)).isEmpty();
+                } else {
+                    assertThat(Duration.ofNanos(appendReturnedAt - takenOverAt))
+                            .as("an append by the superseded owner committed after the takeover had")
+                            .isLessThan(Duration.ofMillis(500));
+                }
+            } finally {
+                threads.shutdownNow();
+                releaseHeldWrites(admin);
+            }
+        }
+    }
+
+    /** Holds the held client's next write on the server for {@code hold} before it runs. */
+    private static void holdNextWrite(MongoClient admin, Duration hold) {
+        admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                .append("mode", new Document("times", 1))
+                .append("data", new Document("failCommands", List.of("update"))
+                        .append("blockConnection", true)
+                        .append("blockTimeMS", hold.toMillis())
+                        .append("appName", HELD_CLIENT)));
+    }
+
+    private static void releaseHeldWrites(MongoClient admin) {
+        admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                .append("mode", "off"));
     }
 
     private static void withStore(Consumer<MongoSrsLogStore> body) {
