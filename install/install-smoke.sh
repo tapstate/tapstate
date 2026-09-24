@@ -575,7 +575,7 @@ printf '  ----  install event cases\n'
 if ! command -v python3 >/dev/null 2>&1; then
   bad "install event: python3 is needed for the local sink"
 elif ! start_sink; then
-  bad "install event: the local sink never bound a port, so none of the install-event cases ran"
+  bad "install event: the local sink $SINK_FAILURE, so none of the install-event cases ran"
   stop_sink
 else
   # A second stub version, so "which version did it report" has two possible answers. With only the

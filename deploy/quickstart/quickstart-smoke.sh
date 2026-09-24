@@ -978,7 +978,7 @@ rm -rf "$DROP_DIR"
 if ! command -v python3 >/dev/null 2>&1; then
   bad "quickstart install event: python3 is needed for the local sink"
 elif ! start_sink; then
-  bad "quickstart install event: the local sink never bound a port, so none of the install-event cases ran"
+  bad "quickstart install event: the local sink $SINK_FAILURE, so none of the install-event cases ran"
   stop_sink
 else
   # like run_prepare, but keeps stdout and stderr apart -- the disclosure case is about which stream

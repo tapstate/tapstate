@@ -12,7 +12,8 @@
 
 # Starts the sink and succeeds once it has published the port it bound. Sets SINK_PID; SINK_DIR, whose
 # log holds each event body that arrived, one per line; and, on success, SINK_URL, the endpoint to hand
-# the script under test. Fails when the sink exits, or has bound no port after about 15 seconds.
+# the script under test. Fails when the sink exits, or has bound no port after about 15 seconds, and
+# then sets SINK_FAILURE to which of the two it was, worded to follow "the local sink".
 start_sink() {
   SINK_DIR="$(mktemp -d)"
   : > "$SINK_DIR/log"
@@ -42,9 +43,20 @@ PYEOF
       SINK_URL="http://127.0.0.1:$(cat "$SINK_DIR/port")/e"
       return 0
     fi
-    kill -0 "$SINK_PID" 2>/dev/null || return 1
+    kill -0 "$SINK_PID" 2>/dev/null || break
     sleep 0.1
   done
+  # A sink that crashed and one still stuck before it listens, as the name lookup on the macOS runners
+  # kept it, are fixed in different places, so the failure says which it was, and for a crash the status
+  # it exited with, which the wait in stop_sink would otherwise discard.
+  local status=0
+  # shellcheck disable=SC2034  # read by whoever sources this
+  if kill -0 "$SINK_PID" 2>/dev/null; then
+    SINK_FAILURE="was still running after about 15 seconds without having bound a port"
+  else
+    wait "$SINK_PID" || status=$?
+    SINK_FAILURE="exited with status $status before it bound a port"
+  fi
   return 1
 }
 

@@ -8,7 +8,9 @@
 #
 # The sink here stays alive and never binds, as one stalled before it listens does. A sink that exits at
 # once is caught by the liveness check inside the wait for its port and never reaches the end of that
-# wait, so only one that stays alive shows what the smoke reports when the wait runs out.
+# wait, so only one that stays alive shows what the smoke reports when the wait runs out. That report has
+# to say the sink was still running, because a stalled sink and a crashed one are fixed in different
+# places. The shared sink decides which it was, and the installer smoke's verdict test drives both.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -44,11 +46,12 @@ if [ ! -s "$SCRATCH/sink-pid" ]; then
   exit 1
 fi
 fails="$(grep -c '^  FAIL' "$SCRATCH/out" || true)"
-if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi '^  FAIL.*sink' "$SCRATCH/out"; then
-  printf 'PASS  a sink that never bound a port is reported as one failure, and that failure names the sink\n'
+if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi '^  FAIL.*sink' "$SCRATCH/out" \
+   && grep -q '^  FAIL.*still running' "$SCRATCH/out"; then
+  printf 'PASS  a sink that never bound a port is reported as one failure, which names the sink and says it was still running\n'
 else
   cat "$SCRATCH/out" >&2
-  printf 'FAIL  a sink that never bound a port was reported as %s failure(s) (smoke exit %s), not as one naming the sink\n' \
+  printf 'FAIL  a sink that never bound a port was reported as %s failure(s) (smoke exit %s), not as one naming the sink and saying it was still running\n' \
     "$fails" "$status" >&2
   exit 1
 fi

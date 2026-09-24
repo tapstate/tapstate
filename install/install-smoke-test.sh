@@ -9,7 +9,9 @@
 # A sink that never binds either exits, as one that failed to start does, or stays alive, as one stalled
 # before it listens does. The smoke's wait for its port catches the first with its liveness check and
 # never reaches its own end, so only the second shows what the smoke reports when the wait runs out.
-# Both are driven below.
+# Both are driven below, and each report has to say which of the two it was: a sink that crashed and
+# one still stuck before it listens are fixed in different places, and a report that reads the same for
+# both leaves whoever reads a runner's log to guess.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -44,12 +46,15 @@ read_event_section() {
 # python3 run stays real, or the cases around the sink fail too and this proves nothing about it.
 REAL_PYTHON3="$(command -v python3 || true)"
 [ -n "$REAL_PYTHON3" ] || { printf 'FAIL  python3 is needed: the smoke runs its sink with it\n' >&2; exit 1; }
+# The refused sink's exit status. Not 1, which is what a Python error and a failing kill -0 both give, so
+# a report naming this one has read it off the sink.
+SINK_STATUS=3
 mkdir -p "$SCRATCH/bin"
 cat > "$SCRATCH/bin/python3" <<EOF
 #!/bin/sh
 # Exit before binding anything, as a sink that failed to start does, and leave a mark that it did.
 for arg in "\$@"; do
-  if [ "\$arg" = - ]; then : > "$SCRATCH/sink-refused"; exit 1; fi
+  if [ "\$arg" = - ]; then : > "$SCRATCH/sink-refused"; exit $SINK_STATUS; fi
 done
 exec "$REAL_PYTHON3" "\$@"
 EOF
@@ -64,12 +69,14 @@ if [ ! -e "$SCRATCH/sink-refused" ]; then
   exit 1
 fi
 read_event_section
-if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails"; then
-  printf 'PASS  a sink that exits without binding a port is reported as one failure, and that failure names the sink\n'
+if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails" \
+   && grep -q "exited with status $SINK_STATUS" "$SCRATCH/event-fails" \
+   && ! grep -q 'still running' "$SCRATCH/event-fails"; then
+  printf 'PASS  a sink that exits without binding a port is reported as one failure, which names the sink and the status it exited with\n'
 else
   cat "$SCRATCH/out" >&2
-  printf 'FAIL  a sink that exits without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink\n' \
-    "$fails" "$status" >&2
+  printf 'FAIL  a sink that exits without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink and its exit status %s\n' \
+    "$fails" "$status" "$SINK_STATUS" >&2
   exit 1
 fi
 
@@ -95,11 +102,12 @@ if [ ! -s "$SCRATCH/sink-pid" ]; then
   exit 1
 fi
 read_event_section
-if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails"; then
-  printf 'PASS  a sink that stays alive without binding a port is reported as one failure, and that failure names the sink\n'
+if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails" \
+   && grep -q 'still running' "$SCRATCH/event-fails" && ! grep -q exited "$SCRATCH/event-fails"; then
+  printf 'PASS  a sink that stays alive without binding a port is reported as one failure, which names the sink and says it was still running\n'
 else
   cat "$SCRATCH/out" >&2
-  printf 'FAIL  a sink that stays alive without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink\n' \
+  printf 'FAIL  a sink that stays alive without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink and saying it was still running\n' \
     "$fails" "$status" >&2
   exit 1
 fi
