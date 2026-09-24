@@ -25,9 +25,11 @@ import org.springframework.web.client.RestClient;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -67,125 +69,136 @@ class ManagedAtlasSourceHttpIT {
 
         try (MongoDBContainer metadata = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))) {
             metadata.start();
-            try (MongoClient atlas = MongoClients.create(atlasUri)) {
-                try {
-                    atlas.getDatabase(database).getCollection("probe")
-                            .insertOne(new Document("_id", "http-witness").append("value", 1));
+            try (MongoClient atlas = MongoClients.create(atlasUri);
+                 Closeable cleanup = () -> dropTestDatabase(atlasUri, database)) {
+                atlas.getDatabase(database).getCollection("probe")
+                        .insertOne(new Document("_id", "http-witness").append("value", 1));
 
-                    try (ConfigurableApplicationContext context = new SpringApplicationBuilder(AssemblyApp.class)
-                            .properties(
-                                    "tapstate.store.mongo.enabled=true",
-                                    "tapstate.store.mongo.uri=" + metadata.getReplicaSetUrl("http_metadata"),
-                                    "tapstate.store.mongo.server-selection-timeout=5s",
-                                    "tapstate.connectors.seed-dir=" + seed,
-                                    "tapstate.connectors.plugins-dir=" + plugins)
-                            .run("--server.address=127.0.0.1", "--server.port=0",
-                                    "--logging.level.root=ERROR")) {
-                        assertThat(context.getBean(StorePort.class).connectors().list())
-                                .extracting(registration -> registration.connectorId())
-                                .containsExactly("mongodb-atlas");
-                        int port = ((WebServerApplicationContext) context).getWebServer().getPort();
-                        RestClient client = RestClient.create("http://127.0.0.1:" + port);
-                        String token = login(client);
-                        String id = "atlas_http_source";
+                try (ConfigurableApplicationContext context = new SpringApplicationBuilder(AssemblyApp.class)
+                        .properties(
+                                "tapstate.store.mongo.enabled=true",
+                                "tapstate.store.mongo.uri=" + metadata.getReplicaSetUrl("http_metadata"),
+                                "tapstate.store.mongo.server-selection-timeout=5s",
+                                "tapstate.connectors.seed-dir=" + seed,
+                                "tapstate.connectors.plugins-dir=" + plugins)
+                        .run("--server.address=127.0.0.1", "--server.port=0",
+                                "--logging.level.root=ERROR")) {
+                    assertThat(context.getBean(StorePort.class).connectors().list())
+                            .extracting(registration -> registration.connectorId())
+                            .containsExactly("mongodb-atlas");
+                    int port = ((WebServerApplicationContext) context).getWebServer().getPort();
+                    RestClient client = RestClient.create("http://127.0.0.1:" + port);
+                    String token = login(client);
+                    String id = "atlas_http_source";
 
-                        ResponseEntity<Void> created = client.post().uri("/api/sources")
-                                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                                .contentType(MediaType.APPLICATION_JSON)
-                                .body(sourceDraft(id, settings, "initial"))
-                                .retrieve().toBodilessEntity();
-                        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-                        assertThat(created.getHeaders().getETag()).matches("\"[0-9a-f]{64}\"");
-                        SourceView savedSource = client.get().uri("/api/sources/" + id)
-                                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                                .retrieve().body(SourceView.class);
-                        assertThat(savedSource).isNotNull();
-                        assertThat(savedSource.connector()).isEqualTo("mongodb-atlas");
-                        if (standard) {
-                            assertThat(savedSource.config()).doesNotContainKey("password");
-                            assertThat(savedSource.configuredSecrets()).contains("password");
-                        }
-
-                        Map<String, Object> connection = Map.of(
-                                "id", id,
-                                "connectorId", "mongodb-atlas",
-                                "settings", savedSource.config());
-                        ConnectionTestReport tested = client.post().uri("/api/connections:test")
-                                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                                .contentType(MediaType.APPLICATION_JSON).body(connection)
-                                .retrieve().body(ConnectionTestReport.class);
-                        assertThat(tested).isNotNull();
-                        assertThat(tested.outcome()).isEqualTo(ConnectionTestReport.Outcome.PASSED);
-                        assertThat(tested.checks()).isNotEmpty();
-
-                        SchemaReport discovered = client.post().uri("/api/connections:discover-schema")
-                                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                                .contentType(MediaType.APPLICATION_JSON).body(connection)
-                                .retrieve().body(SchemaReport.class);
-                        assertThat(discovered).isNotNull();
-                        assertThat(discovered.tables()).extracting(SchemaReport.Table::name).contains("probe");
-                        SchemaReport saved = client.get().uri("/api/sources/" + id + "/schema")
-                                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                                .retrieve().body(SchemaReport.class);
-                        assertThat(saved).isNotNull();
-                        assertThat(saved.tables()).extracting(SchemaReport.Table::name).contains("probe");
-
-                        if (standard) {
-                            Map<String, Object> badSettings = new LinkedHashMap<>(savedSource.config());
-                            badSettings.put("password", "invalid-plan-test-password");
-                            ConnectionTestReport denied = client.post().uri("/api/connections:test")
-                                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                                    .contentType(MediaType.APPLICATION_JSON)
-                                    .body(Map.of("id", id, "connectorId", "mongodb-atlas",
-                                            "settings", badSettings))
-                                    .retrieve().body(ConnectionTestReport.class);
-                            assertThat(denied).isNotNull();
-                            assertThat(denied.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
-                            assertThat(denied.checks()).anyMatch(check ->
-                                    check.status() == ConnectionTestReport.Check.Status.FAILED
-                                            && check.message() != null && !check.message().isBlank());
-                            assertThat(String.valueOf(denied).contains("invalid-plan-test-password")).isFalse();
-                            assertThat(String.valueOf(denied).contains(settings.get("password").toString()))
-                                    .isFalse();
-
-                            Map<String, Object> unreachableSettings = new LinkedHashMap<>(savedSource.config());
-                            unreachableSettings.put("host", "127.0.0.1:1");
-                            unreachableSettings.put("additionalString",
-                                    "authSource=admin&tls=true&serverSelectionTimeoutMS=1000&connectTimeoutMS=1000");
-                            ConnectionTestReport unreachable = client.post().uri("/api/connections:test")
-                                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                                    .contentType(MediaType.APPLICATION_JSON)
-                                    .body(Map.of("id", id, "connectorId", "mongodb-atlas",
-                                            "settings", unreachableSettings))
-                                    .retrieve().body(ConnectionTestReport.class);
-                            assertThat(unreachable).isNotNull();
-                            assertThat(unreachable.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
-                            assertThat(unreachable.checks()).anyMatch(check ->
-                                    check.status() == ConnectionTestReport.Check.Status.FAILED
-                                            && check.message() != null && !check.message().isBlank());
-                            assertThat(String.valueOf(unreachable).contains(settings.get("password").toString()))
-                                    .isFalse();
-                        }
-
-                        ResponseEntity<Void> replaced = client.put().uri("/api/sources/" + id)
-                                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                                .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
-                                .contentType(MediaType.APPLICATION_JSON)
-                                .body(sourceDraft(id, settings, "updated"))
-                                .retrieve().toBodilessEntity();
-                        assertThat(replaced.getStatusCode()).isEqualTo(HttpStatus.OK);
-                        assertThat(replaced.getHeaders().getETag()).isNotEqualTo(created.getHeaders().getETag());
-                        HttpStatusCode deleted = client.delete().uri("/api/sources/" + id)
-                                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                                .header(HttpHeaders.IF_MATCH, replaced.getHeaders().getETag())
-                                .exchange((request, response) -> response.getStatusCode());
-                        assertThat(deleted).isEqualTo(HttpStatus.NO_CONTENT);
+                    ResponseEntity<Void> created = client.post().uri("/api/sources")
+                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .body(sourceDraft(id, settings, "initial"))
+                            .retrieve().toBodilessEntity();
+                    assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+                    assertThat(created.getHeaders().getETag()).matches("\"[0-9a-f]{64}\"");
+                    SourceView savedSource = client.get().uri("/api/sources/" + id)
+                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                            .retrieve().body(SourceView.class);
+                    assertThat(savedSource).isNotNull();
+                    assertThat(savedSource.connector()).isEqualTo("mongodb-atlas");
+                    if (standard) {
+                        assertThat(savedSource.config()).doesNotContainKey("password");
+                        assertThat(savedSource.configuredSecrets()).contains("password");
                     }
-                } finally {
-                    atlas.getDatabase(database).drop();
+
+                    Map<String, Object> connection = Map.of(
+                            "id", id,
+                            "connectorId", "mongodb-atlas",
+                            "settings", savedSource.config());
+                    ConnectionTestReport tested = client.post().uri("/api/connections:test")
+                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                            .contentType(MediaType.APPLICATION_JSON).body(connection)
+                            .retrieve().body(ConnectionTestReport.class);
+                    assertThat(tested).isNotNull();
+                    assertThat(tested.outcome()).isEqualTo(ConnectionTestReport.Outcome.PASSED);
+                    assertThat(tested.checks()).isNotEmpty();
+
+                    SchemaReport discovered = client.post().uri("/api/connections:discover-schema")
+                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                            .contentType(MediaType.APPLICATION_JSON).body(connection)
+                            .retrieve().body(SchemaReport.class);
+                    assertThat(discovered).isNotNull();
+                    assertThat(discovered.tables()).extracting(SchemaReport.Table::name).contains("probe");
+                    SchemaReport saved = client.get().uri("/api/sources/" + id + "/schema")
+                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                            .retrieve().body(SchemaReport.class);
+                    assertThat(saved).isNotNull();
+                    assertThat(saved.tables()).extracting(SchemaReport.Table::name).contains("probe");
+
+                    if (standard) {
+                        Map<String, Object> badSettings = new LinkedHashMap<>(savedSource.config());
+                        badSettings.put("password", "invalid-plan-test-password");
+                        ConnectionTestReport denied = client.post().uri("/api/connections:test")
+                                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .body(Map.of("id", id, "connectorId", "mongodb-atlas",
+                                        "settings", badSettings))
+                                .retrieve().body(ConnectionTestReport.class);
+                        assertThat(denied).isNotNull();
+                        assertThat(denied.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
+                        assertThat(denied.checks()).anyMatch(check ->
+                                check.status() == ConnectionTestReport.Check.Status.FAILED
+                                        && check.message() != null && !check.message().isBlank());
+                        assertThat(String.valueOf(denied).contains("invalid-plan-test-password")).isFalse();
+                        assertThat(String.valueOf(denied).contains(settings.get("password").toString()))
+                                .isFalse();
+
+                        Map<String, Object> unreachableSettings = new LinkedHashMap<>(savedSource.config());
+                        unreachableSettings.put("host", "127.0.0.1:1");
+                        unreachableSettings.put("additionalString",
+                                "authSource=admin&tls=true&serverSelectionTimeoutMS=1000&connectTimeoutMS=1000");
+                        ConnectionTestReport unreachable = client.post().uri("/api/connections:test")
+                                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .body(Map.of("id", id, "connectorId", "mongodb-atlas",
+                                        "settings", unreachableSettings))
+                                .retrieve().body(ConnectionTestReport.class);
+                        assertThat(unreachable).isNotNull();
+                        assertThat(unreachable.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
+                        assertThat(unreachable.checks()).anyMatch(check ->
+                                check.status() == ConnectionTestReport.Check.Status.FAILED
+                                        && check.message() != null && !check.message().isBlank());
+                        assertThat(String.valueOf(unreachable).contains(settings.get("password").toString()))
+                                .isFalse();
+                    }
+
+                    ResponseEntity<Void> replaced = client.put().uri("/api/sources/" + id)
+                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                            .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .body(sourceDraft(id, settings, "updated"))
+                            .retrieve().toBodilessEntity();
+                    assertThat(replaced.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    assertThat(replaced.getHeaders().getETag()).isNotEqualTo(created.getHeaders().getETag());
+                    HttpStatusCode deleted = client.delete().uri("/api/sources/" + id)
+                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                            .header(HttpHeaders.IF_MATCH, replaced.getHeaders().getETag())
+                            .exchange((request, response) -> response.getStatusCode());
+                    assertThat(deleted).isEqualTo(HttpStatus.NO_CONTENT);
                 }
             }
         }
+    }
+
+    private static void dropTestDatabase(String uri, String database) {
+        RuntimeException lastFailure = null;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try (MongoClient cleanup = MongoClients.create(uri)) {
+                cleanup.getDatabase(database).drop();
+                assertThat(cleanup.listDatabaseNames().into(new ArrayList<>())).doesNotContain(database);
+                return;
+            } catch (RuntimeException failure) {
+                lastFailure = failure;
+            }
+        }
+        throw lastFailure;
     }
 
     private static String login(RestClient client) {
