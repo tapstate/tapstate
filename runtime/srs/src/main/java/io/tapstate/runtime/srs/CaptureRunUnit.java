@@ -499,13 +499,6 @@ public final class CaptureRunUnit {
     }
 
     /**
-     * The read-cursor publisher factory for one consumer's reader over one table's ring: carried onto the
-     * Jet source, it resolves the coordination store from the member's user context and binds a sink that
-     * advances that consumer's durable {@code perTableSeq} as the reader drains, without clobbering its
-     * sink-ack. It closes over only the chain, pipeline and table coordinates — never the store — so it
-     * stays serializable; a member with no store bound resolves to a no-op sink.
-     */
-    /**
      * Marks, for each of the pipeline's tables, where it starts in that table's ring: just past what the ring
      * already holds. Read from the ring itself, which numbers on across rebuilds, so the mark names the same
      * place for every member that reads it. A refusal while the cluster is still forming surfaces as an
@@ -518,6 +511,13 @@ public final class CaptureRunUnit {
         }
     }
 
+    /**
+     * The read-cursor publisher factory for one consumer's reader over one table's ring: carried onto the
+     * Jet source, it resolves the coordination store from the member's user context and binds a sink that
+     * advances that consumer's durable {@code perTableSeq} as the reader drains, without clobbering its
+     * sink-ack. It closes over only the chain, pipeline and table coordinates — never the store — so it
+     * stays serializable; a member with no store bound resolves to a no-op sink.
+     */
     public static SrsReadCursorPublisherFactory readCursorPublisher(
             String miningChainId, String pipelineId, String table) {
         return member -> {

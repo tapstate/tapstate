@@ -355,6 +355,21 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * order it never reached. Cleared, the position reads back as ordered and tokenless, which that advance
      * already declines to write down, leaving the offset where it stands.
      */
+    static Document sinkAckedUpdate(String pipelineId, ChainPosition position) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        Document fields = new Document("sinkAckedEpoch", position.order().epoch())
+                .append("sinkAckedSeq", position.order().seq());
+        Document update = new Document("$set", fields);
+        if (position.token() != null) {
+            fields.append("sinkAckedSrcpos", position.token());
+        } else {
+            update.append("$unset", new Document("sinkAckedSrcpos", ""));
+        }
+        return update;
+    }
+
     /**
      * The same update, raising {@code perTableRingDone.<table>} to the ring sequence the order carries in
      * the same write, so the per-table record can never run ahead of the chain position it came with. A
@@ -367,21 +382,6 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Document update = sinkAckedUpdate(pipelineId, position);
         if (position.order().seq() >= 0) {
             update.append("$max", new Document(PER_TABLE_RING_DONE + "." + table, position.order().seq()));
-        }
-        return update;
-    }
-
-    static Document sinkAckedUpdate(String pipelineId, ChainPosition position) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
-        Objects.requireNonNull(position, "position");
-        Objects.requireNonNull(position.order(), "position order");
-        Document fields = new Document("sinkAckedEpoch", position.order().epoch())
-                .append("sinkAckedSeq", position.order().seq());
-        Document update = new Document("$set", fields);
-        if (position.token() != null) {
-            fields.append("sinkAckedSrcpos", position.token());
-        } else {
-            update.append("$unset", new Document("sinkAckedSrcpos", ""));
         }
         return update;
     }

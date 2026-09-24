@@ -353,13 +353,6 @@ class HazelcastConfiguration {
     }
 
     /**
-     * Starts the member, translating a Hazelcast startup failure — typically the loopback member
-     * port being already in use — into a coded diagnostic so the operator sees a clean message
-     * instead of a bare stack trace. Anything that is not a {@link HazelcastException} (a programmer
-     * error while assembling the config) propagates unchanged: it must crash bare, not be laundered
-     * into a code that hides the defect. The factory is a seam so the translation is unit-testable.
-     */
-    /**
      * Writes this node's Tapstate identity onto the member before it joins, as member attributes.
      *
      * <p>Attributes rather than a lookup: they travel with membership itself, so every member holds every
@@ -379,6 +372,13 @@ class HazelcastConfiguration {
         return config;
     }
 
+    /**
+     * Starts the member, translating a Hazelcast startup failure — typically the loopback member
+     * port being already in use — into a coded diagnostic so the operator sees a clean message
+     * instead of a bare stack trace. Anything that is not a {@link HazelcastException} (a programmer
+     * error while assembling the config) propagates unchanged: it must crash bare, not be laundered
+     * into a code that hides the defect. The factory is a seam so the translation is unit-testable.
+     */
     static HazelcastInstance startMember(Supplier<HazelcastInstance> factory) {
         try {
             return factory.get();

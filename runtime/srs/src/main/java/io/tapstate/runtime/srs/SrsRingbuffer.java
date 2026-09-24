@@ -19,10 +19,10 @@ import java.util.concurrent.CompletionException;
  *
  * <p>One thing is translated rather than passed on: the cluster's own refusal of an operation. Every ring
  * is guarded by the cluster's split brain protection, and this is the class that holds the library, so
- * this is where its exception type ends — the write path raises {@link RingWriteRefusedException} instead,
- * which says the one thing a caller can act on: nothing was written, and the refusal clears on its own.
- * Only the write path: a read refused the same way has no caller waiting on it, so renaming its failure
- * would disguise it rather than handle it.
+ * this is where its exception type ends — every operation here raises {@link RingWriteRefusedException}
+ * instead: the writes, and the reads a reader is positioned by and a writer measures its headroom against.
+ * It says the one thing a caller can act on: the operation did not happen, and the refusal clears on its
+ * own.
  */
 public final class SrsRingbuffer {
 
