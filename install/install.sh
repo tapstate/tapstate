@@ -149,8 +149,15 @@ fetch() {
     # Progress goes to stderr and only when stderr is a terminal. The quickstart drops this script's
     # stdout but shows its stderr, so a person piping the one-liner sees the bar; a log, a CI run and
     # anything reading the output stay byte-for-byte as quiet as before.
+    #
+    # wget's bar is --show-progress, which GNU wget only grew in 1.16; an older one (RHEL/CentOS 7
+    # ships 1.14) rejects the flag and fails every attempt. It is asked for only when wget lists it,
+    # so a wget that cannot draw the bar still downloads, quietly, as it did before.
     if [ -t 2 ]; then
-        _curl_out="--progress-bar"; _wget_out="-q --show-progress"
+        _curl_out="--progress-bar"; _wget_out="-q"
+        if wget --help 2>&1 | grep -q -- '--show-progress'; then
+            _wget_out="-q --show-progress"
+        fi
     else
         _curl_out="-sS"; _wget_out="-q"
     fi

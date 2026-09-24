@@ -899,6 +899,43 @@ elif grep -q -- '--progress-bar' "$PD/tty.args"; then
 else
   bad "a terminal run did not ask for progress: $(head -1 "$PD/tty.args")"
 fi
+
+# The wget branch, on a terminal, against a wget that can draw the bar and one that cannot. GNU wget
+# before 1.16 rejects --show-progress outright, so asking an old one for it fails every attempt on a
+# host where the quiet download used to work. A stub stands in for each, with no curl on the PATH.
+mkdir -p "$PD/wget-bin"
+cat > "$PD/wget-bin/wget" <<'STUB'
+#!/bin/sh
+if [ "$1" = "--help" ]; then
+  printf '  -q,  --quiet                     quiet (no output)\n'
+  [ "${WGET_NEW:-}" != 1 ] || printf '       --show-progress             display the progress bar in any verbosity mode\n'
+  exit 0
+fi
+printf '%s\n' "$*" >> "${ARGLOG:?}"
+exit 1
+STUB
+chmod +x "$PD/wget-bin/wget"
+for t in grep rm mv; do ln -s "$(command -v "$t")" "$PD/wget-bin/$t"; done
+PY_BIN="$(command -v python3)"
+SH_BIN="$(command -v sh)"
+ARGLOG="$PD/wget-new.args" WGET_NEW=1 PATH="$PD/wget-bin" \
+  "$PY_BIN" "$PD/onpty.py" "$SH_BIN" "$PD/probe.sh" http://127.0.0.1:1/x "$PD/out3" >/dev/null 2>&1 || true
+ARGLOG="$PD/wget-old.args" PATH="$PD/wget-bin" \
+  "$PY_BIN" "$PD/onpty.py" "$SH_BIN" "$PD/probe.sh" http://127.0.0.1:1/x "$PD/out4" >/dev/null 2>&1 || true
+if [ ! -s "$PD/wget-new.args" ] || [ ! -s "$PD/wget-old.args" ]; then
+  bad "the wget terminal cases never ran -- nothing here says what wget is asked for"
+else
+  if grep -q -- '--show-progress' "$PD/wget-new.args"; then
+    ok "on a terminal a wget that can draw the bar is asked for it"
+  else
+    bad "a wget with --show-progress was not asked for progress: $(head -1 "$PD/wget-new.args")"
+  fi
+  if grep -q -- '--show-progress' "$PD/wget-old.args"; then
+    bad "a wget without --show-progress was handed it anyway, and would fail every attempt"
+  else
+    ok "a wget too old for --show-progress is not handed it, so it still downloads"
+  fi
+fi
 rm -rf "$PD"
 
 # The behaviour above is proved with a two-second window, so the shipped one is pinned here. Without
