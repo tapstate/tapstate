@@ -120,8 +120,15 @@ final class NodeSessionLease implements AutoCloseable {
         } else {
             LOG.error("Node session lost: {}. Shutting down the Hazelcast member.", reason, cause);
         }
-        renewer.shutdownNow();
-        lost.run();
+        try {
+            lost.run();
+        } finally {
+            // After the stop, not before. This runs on a renewer thread and shutting the renewer down
+            // interrupts it, while a graceful stop waits -- on the partitions it hands over, on its own
+            // services -- and would return at the first wait. What is still worth interrupting is the other
+            // renewer thread, which a renewal the store never answered may be holding.
+            renewer.shutdownNow();
+        }
     }
 
     @Override

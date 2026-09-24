@@ -62,12 +62,21 @@ final class CaptureClaimLease implements AutoCloseable {
         }
     }
 
+    /**
+     * Stops the capture, and only then the renewer. This runs on the renewer's own thread, and shutting the
+     * renewer down interrupts it: the stop has to be able to wait -- on the capture's thread, the connector,
+     * the store -- and with the flag already set the first of those waits returned at once, leaving a
+     * fenced-out tail half stopped. Nothing is renewed in between, since {@code closed} is already set.
+     */
     private void lose() {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
-        renewer.shutdownNow();
-        lost.run();
+        try {
+            lost.run();
+        } finally {
+            renewer.shutdownNow();
+        }
     }
 
     @Override

@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -76,6 +78,41 @@ class CaptureClaimLeaseTest {
                 assertThat(reading.claim().claimGeneration()).isEqualTo(permit.claim().claimGeneration());
                 assertThat(reading.leased()).as("renewed rather than left to lapse").isTrue();
             });
+        } finally {
+            lease.close();
+        }
+    }
+
+    /**
+     * The capture is stopped from the renewer's own thread, and the stop has to be able to wait: for the
+     * capture's thread, the connector, the store. Shutting the renewer down before running the stop
+     * interrupted the very thread about to run it, so the first wait on the way out returned at once and a
+     * fenced-out tail was left half stopped.
+     */
+    @Test
+    void theCaptureIsStoppedFromARenewerThreadThatCanStillWait() throws InterruptedException {
+        RefusingRenewals raw = new RefusingRenewals();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate,
+                new ClusterWorkloadClaims(raw, gate), Duration.ofSeconds(30));
+        CaptureOwnership.Permit permit = ownership.acquire(CAPTURE);
+        CountDownLatch stopped = new CountDownLatch(1);
+        AtomicBoolean waitedThroughTheStop = new AtomicBoolean();
+        CaptureClaimLease lease = new CaptureClaimLease(ownership, permit.claim(), Duration.ofMillis(10), () -> {
+            try {
+                Thread.sleep(20);
+                waitedThroughTheStop.set(true);
+            } catch (InterruptedException cutShort) {
+                Thread.currentThread().interrupt();
+            }
+            stopped.countDown();
+        });
+        try {
+            assertThat(stopped.await(5, TimeUnit.SECONDS)).as("the refused renewal stops the capture").isTrue();
+            assertThat(waitedThroughTheStop)
+                    .as("a wait on the way out of the stop runs to its end rather than being interrupted")
+                    .isTrue();
         } finally {
             lease.close();
         }

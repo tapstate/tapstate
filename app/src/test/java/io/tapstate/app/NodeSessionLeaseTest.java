@@ -51,6 +51,36 @@ class NodeSessionLeaseTest {
     }
 
     /**
+     * The member is stopped from a renewer thread, and stopping it gracefully waits -- on the partitions it
+     * hands over, on its own services. Shutting the renewer down before running the stop interrupted the
+     * very thread about to run it, so the first of those waits returned at once.
+     */
+    @Test
+    void theMemberIsStoppedFromARenewerThreadThatCanStillWait() throws Exception {
+        RecordingStore store = new RecordingStore(false);
+        CountDownLatch memberStopped = new CountDownLatch(1);
+        AtomicBoolean waitedThroughTheStop = new AtomicBoolean();
+        NodeSessionLease lease = new NodeSessionLease(
+                store, CLAIM, System.nanoTime(), Duration.ofSeconds(1), Duration.ofMillis(10), () -> {
+                    try {
+                        Thread.sleep(20);
+                        waitedThroughTheStop.set(true);
+                    } catch (InterruptedException cutShort) {
+                        Thread.currentThread().interrupt();
+                    }
+                    memberStopped.countDown();
+                });
+        try {
+            assertThat(memberStopped.await(5, TimeUnit.SECONDS)).as("the refused renewal stops the member").isTrue();
+            assertThat(waitedThroughTheStop)
+                    .as("a wait on the way out of the stop runs to its end rather than being interrupted")
+                    .isTrue();
+        } finally {
+            lease.close();
+        }
+    }
+
+    /**
      * A renewal the store never answers loses the session once the lease the last accepted renewal bought
      * has run out -- not before, and not only when the store finally answers.
      *
