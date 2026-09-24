@@ -76,7 +76,7 @@ STUB
 }
 
 # Pretend this host needs the pinned x86_64 protoc but cannot execute it. The
-# Atlas-only reactor has no protobuf module, so it should not probe curl at all.
+# Atlas and AWS RDS MySQL reactors have no protobuf module, so neither probes curl.
 make_arm_no_protoc_shim() {
   local shim
   shim="$(make_shim)"
@@ -234,8 +234,8 @@ expect "a named list is built instead of the default" 0 "Connector jars staged" 
   --modules "redis=connectors/redis-connector" --checkout "$scratch/checkout" "$scratch/dest"
 expect_modules "only what was named" "connectors/redis-connector"
 
-# A build-wide protoc preflight used to demand Rosetta even for Atlas, whose
-# selected Maven reactor contains no protobuf compiler module. Keep the default
+# A build-wide protoc preflight used to demand Rosetta even for Atlas and AWS RDS
+# MySQL, whose selected Maven reactors contain no protobuf compiler module. Keep the default
 # witness lane as the control: it still includes PostgreSQL and must probe.
 fresh_checkout
 mkdir -p "$scratch/checkout/connectors/mongodb-atlas-connector"
@@ -252,6 +252,48 @@ if [ "$code" = 0 ] && [ ! -s "$scratch/curl-seen" ] \
 else
   printf '  FAIL  %s: exit %s, curl calls %s\n' \
       "Atlas-only build needs no protoc or Rosetta" "$code" "$(wc -l < "$scratch/curl-seen" | tr -d ' ')"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  failed=$((failed + 1))
+fi
+
+fresh_checkout
+mkdir -p "$scratch/checkout/connectors/aws-rds-mysql-connector"
+shim="$(make_arm_no_protoc_shim)"
+: > "$scratch/curl-seen"
+out="$(env PATH="$shim:$PATH" SMOKE_MODULES_SEEN="$scratch/modules-seen" \
+    SMOKE_JAVA_HOME_SEEN="$scratch/java-home-seen" SMOKE_CURL_SEEN="$scratch/curl-seen" \
+    bash "$builder" --modules "aws-rds-mysql=connectors/aws-rds-mysql-connector" \
+    --checkout "$scratch/checkout" "$scratch/dest" 2>&1)"; code=$?
+if [ "$code" = 0 ] && [ ! -s "$scratch/curl-seen" ] \
+    && [ -f "$scratch/dest/aws-rds-mysql-connector-v1.0.0.jar" ]; then
+  printf '  ok    %s\n' "AWS RDS MySQL-only build needs no protoc or Rosetta"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s: exit %s, curl calls %s\n' \
+      "AWS RDS MySQL-only build needs no protoc or Rosetta" "$code" "$(wc -l < "$scratch/curl-seen" | tr -d ' ')"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  failed=$((failed + 1))
+fi
+
+fresh_checkout
+mkdir -p "$scratch/checkout/connectors/mongodb-atlas-connector"
+mkdir -p "$scratch/checkout/connectors/aws-rds-mysql-connector"
+shim="$(make_arm_no_protoc_shim)"
+: > "$scratch/curl-seen"
+out="$(env PATH="$shim:$PATH" SMOKE_MODULES_SEEN="$scratch/modules-seen" \
+    SMOKE_JAVA_HOME_SEEN="$scratch/java-home-seen" SMOKE_CURL_SEEN="$scratch/curl-seen" \
+    bash "$builder" --modules \
+    "mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector" \
+    --checkout "$scratch/checkout" "$scratch/dest" 2>&1)"; code=$?
+if [ "$code" = 0 ] && [ ! -s "$scratch/curl-seen" ] \
+    && [ -f "$scratch/dest/mongodb-atlas-connector-v1.0.0.jar" ] \
+    && [ -f "$scratch/dest/aws-rds-mysql-connector-v1.0.0.jar" ]; then
+  printf '  ok    %s\n' "Atlas and AWS RDS MySQL pair needs no protoc or Rosetta"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s: exit %s, curl calls %s\n' \
+      "Atlas and AWS RDS MySQL pair needs no protoc or Rosetta" "$code" \
+      "$(wc -l < "$scratch/curl-seen" | tr -d ' ')"
   printf '%s\n' "$out" | sed 's/^/        /'
   failed=$((failed + 1))
 fi

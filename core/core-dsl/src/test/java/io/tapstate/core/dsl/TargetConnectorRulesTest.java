@@ -154,6 +154,22 @@ class TargetConnectorRulesTest {
     }
 
     @Test
+    void awsRdsMysqlMayBeReadButNotUsedAsASyncTarget() {
+        String awsSource = READ_SOURCE.replace("connector: mysql", "connector: aws-rds-mysql");
+        assertThatCode(() -> validate(
+                awsSource, target("tgt_mg", "mongodb-atlas"), pipelineWritingTo("tgt_mg")))
+                .doesNotThrowAnyException();
+
+        Throwable failure = catchThrowable(() -> validate(
+                awsSource, target("tgt_aws", "aws-rds-mysql"), pipelineWritingTo("tgt_aws")));
+        assertThat(failure).isInstanceOf(DslException.class);
+        DslException refusal = (DslException) failure;
+        assertThat(refusal.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+        assertThat(refusal.path()).isEqualTo("serve.sync[0].source");
+        assertThat(refusal.args()).containsEntry("connector", "aws-rds-mysql");
+    }
+
+    @Test
     void defersOnAConnectorThisReleaseDoesNotSupportAtAll() {
         // Not a verdict of "allowed": a connector outside the supported set is one no shipped
         // deployment can register, so only a deployment that widened its own accepted set can write

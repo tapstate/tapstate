@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import io.tapstate.testsupport.DockerGate;
+import io.tapstate.testsupport.RequiresDocker;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -28,6 +29,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * definition rather than inline. Both of those are ordinary, and each one on its own is enough to
  * make a narrower rule pass the pipeline through.
  */
+@RequiresDocker
 class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
 
     private static final String UNSUPPORTED_TARGET_CONNECTOR = "dsl.unsupported-target-connector";
@@ -64,6 +66,14 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
             id: tgt_out
             connector: mongodb-atlas
             config: { isUri: true, uri: "mongodb://10.30.0.11:27017/ods" }
+            """;
+
+    private static final String AWS_RDS_TARGET = """
+            version: tapstate/v1
+            kind: source
+            id: tgt_out
+            connector: aws-rds-mysql
+            config: { host: 10.30.0.6, database: dw, username: w, password: p }
             """;
 
     private static final String SERVE_DEFINITION = """
@@ -168,6 +178,30 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
                     .as("the same batch installs once the target is a connector of the write kind — "
                             + "a managed variant of it, which is what a deployment on one registers")
                     .contains("orders_out", "out", "tgt_out", "src_orders");
+        }
+    }
+
+    @Test
+    void awsRdsMysqlIsAcceptedAsAReadSourceButRefusedAsAWriteTarget() {
+        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_aws_rds_target_gate"))) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
+            String awsSource = SOURCE.replace("connector: mysql", "connector: aws-rds-mysql");
+
+            ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
+                    "src_orders.tap.yml", awsSource,
+                    "tgt_out.tap.yml", AWS_RDS_TARGET,
+                    "orders_out.tap.yml", PIPELINE));
+            assertThat(refusal.code()).isEqualTo(UNSUPPORTED_TARGET_CONNECTOR);
+            assertThat(refusal.params()).containsEntry("connector", "aws-rds-mysql")
+                    .containsEntry("source", "tgt_out");
+            assertThat(control.artifactIds()).doesNotContain("orders_out", "tgt_out", "src_orders");
+
+            control.apply(Map.of(
+                    "src_orders.tap.yml", awsSource,
+                    "tgt_out.tap.yml", ATLAS_TARGET,
+                    "orders_out.tap.yml", PIPELINE));
+            assertThat(control.artifactIds()).contains("orders_out", "tgt_out", "src_orders");
         }
     }
 }
