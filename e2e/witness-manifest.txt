@@ -26,6 +26,8 @@ a-deleted-customer-takes-its-orders-out-of-the-target on IN_PROCESS
 a-deleted-customer-takes-its-orders-out-of-the-target on REAL_PROCESS
 a-dimension-change-reaches-the-orders-already-written on IN_PROCESS
 a-dimension-change-reaches-the-orders-already-written on REAL_PROCESS
+a-join-naming-a-column-its-table-lacks-fails-with-a-code on IN_PROCESS
+a-join-naming-a-column-its-table-lacks-fails-with-a-code on REAL_PROCESS
 a-large-recompute-finishes-after-the-input-stops on IN_PROCESS
 a-large-recompute-finishes-after-the-input-stops on REAL_PROCESS
 a-mongo-collection-lands-in-the-managed-store on IN_PROCESS
