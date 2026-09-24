@@ -16,7 +16,6 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -1183,14 +1182,13 @@ class JoinDriverTest {
      * batch read, which is where a run's own race would land it, so the case has one outcome rather
      * than a likely one.
      */
-    private static final class ArrivesMidWalk implements JoinStores {
+    private static final class ArrivesMidWalk extends ForwardingJoinStores {
 
-        private final JoinStores held;
         private Runnable arrival;
         private Runnable afterIndexAdd;
 
         ArrivesMidWalk(JoinStores held) {
-            this.held = held;
+            super(held);
         }
 
         /** Runs {@code arrival} once, as the next batch read is answered. */
@@ -1200,7 +1198,7 @@ class JoinDriverTest {
 
         @Override
         public Map<String, Map<String, Object>> factsUnder(Collection<String> factKeys) {
-            Map<String, Map<String, Object>> rows = held.factsUnder(factKeys);
+            Map<String, Map<String, Object>> rows = super.factsUnder(factKeys);
             Runnable arriving = arrival;
             arrival = null;
             if (arriving != null) {
@@ -1210,75 +1208,13 @@ class JoinDriverTest {
         }
 
         @Override
-        public Map<String, Object> fact(String factKey) {
-            return held.fact(factKey);
-        }
-
-        @Override
-        public void putFact(String factKey, Map<String, Object> row) {
-            held.putFact(factKey, row);
-        }
-
-        @Override
-        public void removeFact(String factKey) {
-            held.removeFact(factKey);
-        }
-
-        @Override
-        public Map<String, Object> dimensionRow(String source, String dimensionKey) {
-            return held.dimensionRow(source, dimensionKey);
-        }
-
-        @Override
-        public Map<String, Object> putDimensionRow(String source, String dimensionKey,
-                Map<String, Object> row) {
-            return held.putDimensionRow(source, dimensionKey, row);
-        }
-
-        @Override
-        public void removeDimensionRow(String source, String dimensionKey) {
-            held.removeDimensionRow(source, dimensionKey);
-        }
-
-        @Override
-        public int indexPageCount(String source, String dimensionKey) {
-            return held.indexPageCount(source, dimensionKey);
-        }
-
-        @Override
-        public List<String> indexPage(String source, String dimensionKey, int page) {
-            return held.indexPage(source, dimensionKey, page);
-        }
-
-        @Override
-        public Map<ReverseBucket.At, Set<String>> indexNames(String source,
-                Map<ReverseBucket.At, Set<String>> asked) {
-            return held.indexNames(source, asked);
-        }
-
-        @Override
         public void indexAdd(String source, String dimensionKey, String factKey) {
-            held.indexAdd(source, dimensionKey, factKey);
+            super.indexAdd(source, dimensionKey, factKey);
             Runnable interleaved = afterIndexAdd;
             afterIndexAdd = null;
             if (interleaved != null) {
                 interleaved.run();
             }
-        }
-
-        @Override
-        public void indexRemove(String source, String dimensionKey, String factKey) {
-            held.indexRemove(source, dimensionKey, factKey);
-        }
-
-        @Override
-        public long batchesTakenIn(String writer) {
-            return held.batchesTakenIn(writer);
-        }
-
-        @Override
-        public void putBatchesTakenIn(String writer, long batch) {
-            held.putBatchesTakenIn(writer, batch);
         }
     }
 

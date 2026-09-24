@@ -117,6 +117,17 @@
       <version>${revision}</version>
       <scope>test</scope>
     </dependency>
+    <!-- The engine's test classes, for the forwarding join state alone: a join case here that needs
+         one call to the state to behave differently overrides that call and inherits the rest, the
+         same way the engine's own cases do. Test scope and a test-jar, so nothing from it reaches the
+         shipped artifact. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>engine</artifactId>
+      <version>${revision}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>core-sql</artifactId>

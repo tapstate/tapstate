@@ -16,6 +16,11 @@ import java.util.Set;
  *
  * <p>It sits in its own file rather than inside one case class because the vertex and the driver
  * under it both have to be held to this, and they are two case classes.
+ *
+ * <p><b>It spells out every call rather than extending {@link ForwardingJoinStores}, deliberately.</b>
+ * Each call here is a decision about whether it is counted, and {@link #writes} is exact only while no
+ * write reaches the store uncounted - so a call added to {@link JoinStores} has to fail to compile here,
+ * where that decision is made, rather than arrive forwarded and uncounted.
  */
 final class CountingJoinStores implements JoinStores {
 

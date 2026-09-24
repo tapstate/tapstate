@@ -2,13 +2,13 @@ package io.tapstate.e2e;
 
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.sql.JoinPlan;
+import io.tapstate.runtime.engine.join.ForwardingJoinStores;
 import io.tapstate.runtime.engine.join.JoinDriver;
 import io.tapstate.runtime.engine.join.JoinExecutor;
 import io.tapstate.runtime.engine.join.JoinProjection;
 import io.tapstate.runtime.engine.join.JoinSink;
 import io.tapstate.runtime.engine.join.JoinStores;
 import io.tapstate.runtime.engine.join.MapJoinStores;
-import io.tapstate.runtime.engine.join.ReverseBucket;
 import io.tapstate.runtime.engine.join.SourceChange;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
@@ -17,10 +17,8 @@ import java.sql.Connection;
 import java.sql.Date;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -205,46 +203,18 @@ class AJoinRestartedPartWayThroughItsLoadStillAgreesWithItsSourceIT {
     }
 
     /** The state, and the point at which the member stops: the next reverse-index write never lands. */
-    private static final class StopsAtTheNextIndexWrite implements JoinStores {
-        private final JoinStores held;
+    private static final class StopsAtTheNextIndexWrite extends ForwardingJoinStores {
         private boolean stopping;
 
         private StopsAtTheNextIndexWrite(JoinStores held) {
-            this.held = held;
+            super(held);
         }
 
-        @Override public Map<String, Object> fact(String key) { return held.fact(key); }
-        @Override public Map<String, Map<String, Object>> factsUnder(Collection<String> keys) {
-            return held.factsUnder(keys);
-        }
-        @Override public void putFact(String key, Map<String, Object> row) { held.putFact(key, row); }
-        @Override public void removeFact(String key) { held.removeFact(key); }
-        @Override public Map<String, Object> dimensionRow(String source, String key) {
-            return held.dimensionRow(source, key);
-        }
-        @Override public Map<String, Object> putDimensionRow(String source, String key,
-                Map<String, Object> row) {
-            return held.putDimensionRow(source, key, row);
-        }
-        @Override public void removeDimensionRow(String source, String key) { held.removeDimensionRow(source, key); }
-        @Override public int indexPageCount(String source, String key) { return held.indexPageCount(source, key); }
-        @Override public List<String> indexPage(String source, String key, int page) {
-            return held.indexPage(source, key, page);
-        }
-        @Override public Map<ReverseBucket.At, Set<String>> indexNames(String source,
-                Map<ReverseBucket.At, Set<String>> asked) {
-            return held.indexNames(source, asked);
-        }
-        @Override public void indexRemove(String source, String key, String fact) { held.indexRemove(source, key, fact); }
-        @Override public long batchesTakenIn(String writer) { return held.batchesTakenIn(writer); }
-        @Override public void putBatchesTakenIn(String writer, long batch) {
-            held.putBatchesTakenIn(writer, batch);
-        }
         @Override public void indexAdd(String source, String key, String fact) {
             if (stopping) {
                 throw new MemberStopped();
             }
-            held.indexAdd(source, key, fact);
+            super.indexAdd(source, key, fact);
         }
     }
 }

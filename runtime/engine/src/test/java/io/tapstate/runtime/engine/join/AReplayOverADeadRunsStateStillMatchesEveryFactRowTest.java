@@ -13,11 +13,9 @@ import org.junit.jupiter.api.Test;
 
 import java.time.LocalDate;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -235,13 +233,12 @@ class AReplayOverADeadRunsStateStillMatchesEveryFactRowTest {
      * index fails the way every call does once the member has been shut down, and never lands. What was
      * written before it stays written, which is what a restarted run finds.
      */
-    private static final class DiesAtTheNextIndexWrite implements JoinStores {
+    private static final class DiesAtTheNextIndexWrite extends ForwardingJoinStores {
 
-        private final JoinStores held;
         private boolean dying;
 
         DiesAtTheNextIndexWrite(JoinStores held) {
-            this.held = held;
+            super(held);
         }
 
         void dieAtTheNextIndexWrite() {
@@ -249,78 +246,11 @@ class AReplayOverADeadRunsStateStillMatchesEveryFactRowTest {
         }
 
         @Override
-        public Map<String, Object> fact(String factKey) {
-            return held.fact(factKey);
-        }
-
-        @Override
-        public Map<String, Map<String, Object>> factsUnder(Collection<String> factKeys) {
-            return held.factsUnder(factKeys);
-        }
-
-        @Override
-        public void putFact(String factKey, Map<String, Object> row) {
-            held.putFact(factKey, row);
-        }
-
-        @Override
-        public void removeFact(String factKey) {
-            held.removeFact(factKey);
-        }
-
-        @Override
-        public Map<String, Object> dimensionRow(String source, String dimensionKey) {
-            return held.dimensionRow(source, dimensionKey);
-        }
-
-        @Override
-        public Map<String, Object> putDimensionRow(String source, String dimensionKey,
-                Map<String, Object> row) {
-            return held.putDimensionRow(source, dimensionKey, row);
-        }
-
-        @Override
-        public void removeDimensionRow(String source, String dimensionKey) {
-            held.removeDimensionRow(source, dimensionKey);
-        }
-
-        @Override
-        public int indexPageCount(String source, String dimensionKey) {
-            return held.indexPageCount(source, dimensionKey);
-        }
-
-        @Override
-        public List<String> indexPage(String source, String dimensionKey, int page) {
-            return held.indexPage(source, dimensionKey, page);
-        }
-
-        @Override
-        public Map<ReverseBucket.At, Set<String>> indexNames(String source,
-                Map<ReverseBucket.At, Set<String>> asked) {
-            return held.indexNames(source, asked);
-        }
-
-        @Override
         public void indexAdd(String source, String dimensionKey, String factKey) {
             if (dying) {
                 throw new HazelcastInstanceNotActiveException();
             }
-            held.indexAdd(source, dimensionKey, factKey);
-        }
-
-        @Override
-        public void indexRemove(String source, String dimensionKey, String factKey) {
-            held.indexRemove(source, dimensionKey, factKey);
-        }
-
-        @Override
-        public long batchesTakenIn(String writer) {
-            return held.batchesTakenIn(writer);
-        }
-
-        @Override
-        public void putBatchesTakenIn(String writer, long batch) {
-            held.putBatchesTakenIn(writer, batch);
+            super.indexAdd(source, dimensionKey, factKey);
         }
     }
 }
