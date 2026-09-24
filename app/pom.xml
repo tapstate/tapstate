@@ -30,6 +30,7 @@
 
   <properties>
     <mainClass>io.tapstate.app.Bootstrap</mainClass>
+    <tapstate.it.jvmArgs></tapstate.it.jvmArgs>
   </properties>
 
   <dependencyManagement>
@@ -302,6 +303,10 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
         <configuration>
+          <!-- The PDK runtime uses cglib to bind real connector configuration. Mirror the Boot JAR's
+               manifest opening in the integration-test fork while retaining JaCoCo's argLine. Extra
+               JVM arguments are reserved for local live-test environment requirements. -->
+          <argLine>@{argLine} --add-opens java.base/java.lang=ALL-UNNAMED ${tapstate.it.jvmArgs}</argLine>
           <!-- The packaged boot jar, handed to the boot-jar guard IT so it can assert the PDK runtime is
                bundled into the shipped artifact (repackage runs in package, before integration-test). -->
           <systemPropertyVariables>
