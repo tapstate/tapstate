@@ -694,6 +694,133 @@ class CaptureRunUnitTest {
     }
 
     @Test
+    void anAttachedPipelineDoesNotOpenASecondTailForTheCaptureOwner() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = new CaptureRunUnit(port, new SrsCoordinator(meta), meta, hz);
+
+        CaptureRun owner = unit.start(specFor("pipe-a", ReadMode.CDC_ONLY, "chain-owned"), e -> { }, true);
+        CaptureRun attached = unit.start(specFor("pipe-b", ReadMode.CDC_ONLY, "chain-owned"), e -> { }, false);
+
+        assertThat(port.cdcStarts).isEqualTo(1);
+        assertThat(owner.cdcSubscription()).isPresent();
+        assertThat(attached.cdcSubscription()).isEmpty();
+        assertThat(attached.chainId()).isEqualTo(owner.chainId());
+    }
+
+    /**
+     * A pipeline attaching on a member that does not hold the capture reads under the generation the
+     * member holding it opened.
+     *
+     * <p>The member holding a capture opens the chain's ring generation as it starts the tail, and every
+     * change that tail writes is ordered under it. A pipeline driven by another member attaches to the same
+     * ring with no tail of its own, and the rows of its own load are ordered by the generation stamped on
+     * them: beneath every change of that generation, above every change of an older one. An attaching
+     * member that opened a generation of its own would put its load above the changes the holder goes on
+     * writing, so a row the source changed after the load read it would keep the value the load saw; and
+     * every run assembled afterwards would read a generation no tail writes under.
+     */
+    @Test
+    void aPipelineAttachingOnAMemberThatDidNotOpenTheChainReadsUnderTheGenerationAlreadyRunning() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = MiningChainId.resolve(config(), "chain-held-elsewhere").value();
+        CaptureRun held = new CaptureRunUnit(
+                new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-held-elsewhere"), e -> { }, true);
+        long running = meta.read(chain).orElseThrow().epoch();
+
+        // Another member: a coordinator of its own, over the same durable record and the same ring.
+        List<Envelope> loaded = new ArrayList<>();
+        CaptureRun attached = new CaptureRunUnit(
+                new FakeSource(List.of(row(1), row(2)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-held-elsewhere"), loaded::add, false);
+
+        assertThat(meta.read(chain).orElseThrow().epoch())
+                .as("attaching opened no generation of its own")
+                .isEqualTo(running);
+        assertThat(loaded)
+                .as("it ran a load of its own")
+                .hasSize(2);
+        assertThat(loaded).extracting(e -> e.position().order())
+                .as("and that load is ordered beneath every change of the generation the holder writes under")
+                .containsOnly(SourceOrder.snapshotRow(running));
+        assertThat(attached.cdcSubscription()).as("it opened no tail").isEmpty();
+        assertThat(held.cdcSubscription()).as("the holder's tail is the one tail").isPresent();
+    }
+
+    /**
+     * Where a pipeline arriving on a chain starts reading the ring is marked as it arrives, before its own
+     * load reads anything: just past what the ring already holds. Everything under the mark is history from
+     * before the pipeline existed, or a change its own load covers; left unmarked, the pipeline's run reads
+     * the ring from its head and hands its target every change the ring has ever kept.
+     */
+    @Test
+    void aPipelineArrivingOnARingThatAlreadyHoldsChangesStartsPastThem() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = MiningChainId.resolve(config(), "chain-arrival").value();
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-arrival"), e -> { }, true);
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
+        ring.append(buffered(1));
+        long heldAtArrival = ring.append(buffered(2));
+
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-arrival"), e -> { }, false);
+
+        assertThat(meta.ringDoneThrough(chain, "pipe-b"))
+                .as("the pipeline starts just past the two changes the ring held when it arrived")
+                .containsExactly(Map.entry("orders", heldAtArrival));
+    }
+
+    @Test
+    void aPipelineComingBackKeepsThePlaceItHadInTheRingRatherThanTheOneTheRingHasReached() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = MiningChainId.resolve(config(), "chain-return").value();
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-return"), e -> { }, true);
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
+        long hadReached = ring.append(buffered(1));
+        meta.startRingAfter(chain, "pipe-b", "orders", hadReached);
+        ring.append(buffered(2));
+        ring.append(buffered(3));
+
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-return"), e -> { }, false);
+
+        assertThat(meta.ringDoneThrough(chain, "pipe-b"))
+                .as("the two changes written while it was away are still owed to it")
+                .containsExactly(Map.entry("orders", hadReached));
+    }
+
+    @Test
+    void aCdcOnlyReadFromThePresentIsMarkedAndOneFromTheEarliestChangeIsLeftToItsStart() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = MiningChainId.resolve(config(), "chain-cdc-start").value();
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-cdc-start"), e -> { }, true);
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
+        long held = ring.append(buffered(1));
+
+        new CaptureRunUnit(new FakeSource(List.of(), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-cdc-start", true, "src-1",
+                        "pipe-present", StartFrom.latest(), null, 0L), e -> { }, false);
+        new CaptureRunUnit(new FakeSource(List.of(), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-cdc-start", true, "src-1",
+                        "pipe-earliest", StartFrom.earliest(), null, 0L), e -> { }, false);
+
+        assertThat(meta.ringDoneThrough(chain, "pipe-present"))
+                .as("a read from the present owes nothing the ring held before it arrived")
+                .containsExactly(Map.entry("orders", held));
+        assertThat(meta.ringDoneThrough(chain, "pipe-earliest"))
+                .as("a read from the earliest change is owed everything the ring holds, so nothing is marked")
+                .isEmpty();
+    }
+
+    private static SrsItem buffered(int id) {
+        return new SrsItem(new SourcePosition("b" + id), Op.INSERT, 1L, null, Map.of("id", id), 0L);
+    }
+
+    @Test
     void routesAMultiTableSharedRingRunToOneSubscriptionAndTwoRings() throws Exception {
         InMemoryMeta meta = new InMemoryMeta();
         CaptureConfig multi = new CaptureConfig("mysql", Map.of(), List.of("orders", "customers"));
@@ -879,6 +1006,7 @@ class CaptureRunUnitTest {
         private final String seam;
         private Throwable cdcError;
         boolean cdcStarted;
+        int cdcStarts;
         /** Where the run asked this source to begin -- the whole of what a resume is observable as. */
         CaptureStart cdcStart;
         boolean cdcClosed;
@@ -913,6 +1041,7 @@ class CaptureRunUnitTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             cdcStarted = true;
+            cdcStarts++;
             cdcStart = start;
             if (cdcError != null) {
                 listener.onError(cdcError);
@@ -975,6 +1104,20 @@ class CaptureRunUnitTest {
      * wiring without a store backend.
      */
     private static final class InMemoryMeta implements SrsMetaStore {
+        /** Per chain and pipeline, how far each table's ring is done with -- kept once, never raised here. */
+        final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
+
+        @Override
+        public void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
+            ringDone.computeIfAbsent(miningChainId + "/" + pipelineId, key -> new LinkedHashMap<>())
+                    .putIfAbsent(table, seq);
+        }
+
+        @Override
+        public Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
+            return Map.copyOf(ringDone.getOrDefault(miningChainId + "/" + pipelineId, Map.of()));
+        }
+
         @Override
         public java.util.List<String> miningChainIdsWithConsumer(String pipelineId) {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");

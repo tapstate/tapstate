@@ -12,11 +12,42 @@ import java.util.Set;
  *
  * <p>{@code placeholders()} is the named-argument contract: every throw site supplies a value for each
  * name, and the build-time placeholder gate checks the message catalog templates against it. Bounded
- * control flow (a refused headroom write, a frontier that cannot yet advance) and connector read faults
- * (already coded {@code connector.*} by the pdk bridge) are deliberately not here — only genuine
- * capture-configuration errors are.
+ * control flow (a refused headroom write, a ring operation the cluster refuses while its members'
+ * verdicts converge, a frontier that cannot yet advance) and connector read faults (already coded
+ * {@code connector.*} by the pdk bridge) are deliberately not here — only genuine capture-configuration
+ * errors are. Where such a wait carries a bound, reaching that bound is a fault and is coded; being
+ * inside it is not.
  */
 public enum CaptureError implements TapstateErrorCode {
+
+    /** A live capture could no longer renew the cluster ownership generation that fences its writes. */
+    CLAIM_LOST("capture.claim-lost", Set.of("captureId")),
+
+    /**
+     * A pipeline driven by a member that does not hold its capture found no change ring open to read for
+     * the whole stretch that takes a capture's claim to move, and could not take the capture over itself.
+     * The member holding a capture opens the ring just after it takes the claim, so a pipeline attaching in
+     * between waits; this is the wait that never ended. {@code captureId} names the capture, {@code seconds}
+     * how long it waited.
+     */
+    NO_RING_TO_ATTACH("capture.no-ring-to-attach", Set.of("captureId", "seconds")),
+
+    /**
+     * The cluster refused this member's writes into a change ring for the whole stretch the capture waits
+     * such a refusal out. A refusal while members' verdicts converge is transient and is waited out rather
+     * than coded; this is the one that never cleared, which says this member is not in a cluster that
+     * qualifies to hold the work. {@code table} names the ring's table, {@code seconds} how long it waited.
+     */
+    CLUSTER_REFUSED_WRITES("capture.cluster-refused-writes", Set.of("table", "seconds")),
+
+    /**
+     * The cluster refused this member's reads of a change ring for the whole stretch a source waits such a
+     * refusal out. The mirror of the one above, on the path a source takes to work out where it starts:
+     * that reading is guarded like every other ring operation, and a forming cluster refuses it. Waiting is
+     * the answer while the verdicts converge; this is the one that never cleared. {@code ring} names the
+     * ring, {@code seconds} how long it waited.
+     */
+    CLUSTER_REFUSED_THE_READ("capture.cluster-refused-the-read", Set.of("ring", "seconds")),
 
     /** A {@code start_from} value that is neither the {@code earliest} / {@code latest} keyword nor a
      *  parseable ISO-8601 instant; {@code value} carries the offending token. */

@@ -22,6 +22,8 @@ import java.util.Optional;
 final class InMemorySrsMetaStore implements SrsMetaStore {
 
     private final Map<String, SrsMeta> records = new LinkedHashMap<>();
+    /** Per chain, per pipeline: the ring sequence of the last change each table's sink confirmed. */
+    private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
 
     @Override
     public synchronized Optional<SrsMeta> read(String miningChainId) {
@@ -55,6 +57,8 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
         SrsMeta m = require(miningChainId);
+        // A rewritten record carries no per-table acks, as the real store's replacement carries none.
+        forgetRingSeqs(miningChainId, offset.pipelineId());
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
         next.add(offset);
@@ -218,6 +222,38 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     public synchronized void dropChain(String miningChainId) {
         // Idempotent for the same reason the detach below is: an absent chain already satisfies it.
         records.remove(miningChainId);
+        ringDone.remove(miningChainId);
+    }
+
+    @Override
+    public synchronized void advanceSinkAcked(
+            String miningChainId, String pipelineId, String table, ChainPosition position) {
+        advanceSinkAcked(miningChainId, pipelineId, position);
+        if (position.order().seq() >= 0) {
+            ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
+                    .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
+                    .merge(table, position.order().seq(), Math::max);
+        }
+    }
+
+    @Override
+    public synchronized void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
+        require(miningChainId);
+        ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
+                .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
+                .putIfAbsent(table, seq);
+    }
+
+    @Override
+    public synchronized Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
+        return Map.copyOf(ringDone.getOrDefault(miningChainId, Map.of()).getOrDefault(pipelineId, Map.of()));
+    }
+
+    private void forgetRingSeqs(String miningChainId, String pipelineId) {
+        Map<String, Map<String, Long>> byPipeline = ringDone.get(miningChainId);
+        if (byPipeline != null) {
+            byPipeline.remove(pipelineId);
+        }
     }
 
     @Override
@@ -229,6 +265,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         }
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(pipelineId));
+        forgetRingSeqs(miningChainId, pipelineId);
         // Every field but the departing consumer is carried across. The chain generation and every
         // staying consumer's snapshot state remain unchanged.
         records.put(miningChainId, new SrsMeta(

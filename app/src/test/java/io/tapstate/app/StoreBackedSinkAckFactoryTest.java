@@ -133,6 +133,42 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     @Test
+    void aChangeAckRecordsWhereInItsOwnTablesRingTheChangeSat() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-shop", null);
+        HazelcastInstance member = memberWith(store);
+        SinkAck ack = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-shop", "items", "mc-shop"), "pipe-1").resolve(member);
+
+        ack.advance("orders", at(7, "w7"));
+        ack.advance("items", at(3, "w3"));
+
+        // One chain, two tables, two rings. The chain's acked position is one pair for both and cannot say
+        // where in either ring a run replacing this one carries on, so each table's own sequence is kept
+        // apart and neither ring is positioned by the other's.
+        assertThat(store.ringDoneThrough("mc-shop", "pipe-1"))
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 7L, "items", 3L));
+    }
+
+    @Test
+    void aSnapshotRowSaysNothingAboutHowFarARingWasReached() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
+        HazelcastInstance member = memberWith(store);
+        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+
+        ack.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
+
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .as("a snapshot row is ordered beneath every change and sits in no ring at all")
+                .isEmpty();
+        assertThat(ackedPosition(store, "mc-orders", "pipe-1"))
+                .as("while the chain's own acked position still moves, as it always has")
+                .isEqualTo("w0");
+    }
+
+    @Test
     void aTokenlessPositionOnAChainWithNoRecordIsAnInvariantViolation() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         HazelcastInstance member = memberWith(store);

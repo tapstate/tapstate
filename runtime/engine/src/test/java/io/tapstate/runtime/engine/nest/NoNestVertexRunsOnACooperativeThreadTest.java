@@ -26,23 +26,37 @@ import org.junit.jupiter.api.Test;
  */
 class NoNestVertexRunsOnACooperativeThreadTest {
 
-    private static final TransformBody.Nest TREE = nest("customer", List.of("customer_id"),
-            embed("policy", "customer_id", "customer_id", EmbedAs.ARRAY, "policies", List.of("policy_no"),
-                    embed("claim", "policy_id", "policy_id", EmbedAs.ARRAY, "claims", List.of("claim_id"))),
-            embed("order", "customer_id", "customer_id", EmbedAs.ARRAY, "orders", List.of("order_id"),
-                    embed("item", "order_id", "order_id", EmbedAs.ARRAY, "items", List.of("item_id"))));
+    private static final TransformBody.Nest TREE = nest("order", List.of("order_id"),
+            embed("item", "order_id", "order_id", EmbedAs.ARRAY, "items", List.of("item_id"),
+                    embed("claim", "item_id", "item_id", EmbedAs.ARRAY, "claims", List.of("claim_id"))),
+            // Pointed at rather than gathered - the column the root joins on is what identifies a
+            // customer - so this compiles to the third kind of vertex.
+            embed("customer", "customer_id", "customer_id", EmbedAs.OBJECT, "customer", null));
 
     @Test
     void everyVertexOfACompiledTreeRefusesTheCooperativePool() {
         NestTopology topology = NestTopology.compile("p", "doc", TREE, tables());
 
         assertThat(topology.vertices())
-                .describedAs("both kinds are present - a resolver per non-leaf embed and one assembler - "
-                        + "so that neither is checked by an assertion that had nothing to walk")
-                .hasSize(3)
+                .describedAs("both assembling kinds are present - a resolver per non-leaf embed and one "
+                        + "assembler - so that neither is checked by an assertion that had nothing to walk")
+                .hasSize(2)
                 .allSatisfy(vertex -> assertThat(processorFor(topology, vertex).isCooperative())
                         .describedAs("%s must not share a cooperative thread", vertex.name())
                         .isFalse());
+        assertThat(topology.lookups())
+                .describedAs("and the kind that files the rows a level points at, which reaches the same "
+                        + "state layer as the other two and arrived long after them. It is walked here "
+                        + "rather than left to inherit whatever the engine defaults to, which is the "
+                        + "cooperative pool it must not be in")
+                .isNotEmpty()
+                .allSatisfy(lookup -> assertThat(processorFor(lookup).isCooperative())
+                        .describedAs("%s must not share a cooperative thread", lookup.name())
+                        .isFalse());
+    }
+
+    private static Processor processorFor(NestLookup lookup) {
+        return new LookupProcessor(lookup, new HeapNestStore<>(), new HeapNestStore<>(), 1L, null);
     }
 
     private static Processor processorFor(NestTopology topology, NestVertex vertex) {

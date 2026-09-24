@@ -137,6 +137,17 @@ final class IssuerBinding {
                 Map.of("expected", expected, "actual", actual, "seed", seed.toString()));
     }
 
+    /**
+     * Whether {@code issuer} is the issuer of the cluster calling itself {@code clusterId}.
+     *
+     * <p>Here rather than at the caller, so how an issuer is built out of a cluster id is read in one
+     * place. A second copy of the prefix would keep agreeing with this one until somebody changed one.
+     */
+    static boolean issuedBy(String issuer, String clusterId) {
+        return issuer != null && clusterId != null && !clusterId.isBlank()
+                && issuer.equals(ISSUER_PREFIX + clusterId);
+    }
+
     private static TapstateException failure(CliError code, Map<String, Object> args) {
         return new TapstateException(code, args, null);
     }

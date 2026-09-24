@@ -33,6 +33,29 @@ public enum EngineError implements TapstateErrorCode {
             Set.of("chain", "epoch", "seq")),
 
     /**
+     * A member was asked to act for a run it can no longer prove is the current one: {@code pipeline} is
+     * the pipeline whose run it was carrying. Either the pipeline changed hands, or a newer run of it was
+     * submitted, or this member could not reach the coordination store to check within its local window.
+     *
+     * <p>Not a defect and not the pipeline's fault — it is this member standing down. Refusing is the
+     * whole point: the batch that provoked it is not written, so nothing outside the cluster is touched
+     * twice by two runs of the same pipeline.
+     */
+    EXECUTION_NOT_AUTHORIZED("engine.execution-not-authorized", Set.of("pipeline")),
+
+    /**
+     * A run could not be started because the previous run of the same pipeline was still ending:
+     * {@code pipeline} is the pipeline, {@code seconds} how long the wait for the old job to be over
+     * lasted before giving up.
+     *
+     * <p>Coded rather than silent because the engine's own answer here is silence: asked for a job under
+     * a name whose previous job has not finished ending, it hands that dying job back and starts nothing,
+     * without throwing. A caller taking that as a start would leave the pipeline reporting a run it does
+     * not have.
+     */
+    JOB_STILL_ENDING("engine.job-still-ending", Set.of("pipeline", "seconds")),
+
+    /**
      * Running: a view selected a discovered alternate identity, but an update or delete reached its
      * sink without that key in the earlier row. {@code view} and {@code key} name the materialization
      * and selected identity, while {@code operation} names the change that cannot be applied safely.

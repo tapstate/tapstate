@@ -66,6 +66,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     private static final String CONSUMER_WRITE_REVISION = "consumerWriteRevision";
 
     /**
+     * Per table, the ring sequence up to which this consumer has nothing left to receive -- the last change
+     * its sink confirmed there, or where the ring stood when it arrived. What a run of it carries on from.
+     * Raised with the chain's acked position and dropped with the rest of the consumer when its record is
+     * rewritten, as a write-back that lets the acks go does.
+     */
+    static final String PER_TABLE_RING_DONE = "perTableRingDone";
+
+    /**
      * How much of a chain's schema history the record retains, in bytes of stored entries.
      *
      * <p>The record is one document, and the endpoint refuses a write whose result passes its 16 MiB
@@ -280,6 +288,42 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, position));
     }
 
+    @Override
+    public void advanceSinkAcked(
+            String miningChainId, String pipelineId, String table, ChainPosition position) {
+        updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, table, position));
+    }
+
+    @Override
+    public void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
+        Objects.requireNonNull(table, "table");
+        // Read, then write only when there is nothing: a pipeline arrives on a ring from one member at a
+        // time, so nothing races this, and a raise here over a place the pipeline already has would carry it
+        // past changes it has not received.
+        if (ringDoneThrough(miningChainId, pipelineId).containsKey(table)) {
+            return;
+        }
+        updateConsumer(miningChainId, pipelineId,
+                new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)));
+    }
+
+    @Override
+    public Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Document consumer = StoreIo.call(() -> consumers.find(consumerKey(miningChainId, pipelineId))
+                .projection(Projections.include(PER_TABLE_RING_DONE)).first());
+        Map<String, Long> seqs = new LinkedHashMap<>();
+        if (consumer != null && consumer.get(PER_TABLE_RING_DONE) instanceof Document perTable) {
+            for (Map.Entry<String, Object> entry : perTable.entrySet()) {
+                if (entry.getValue() instanceof Number seq) {
+                    seqs.put(entry.getKey(), seq.longValue());
+                }
+            }
+        }
+        return Map.copyOf(seqs);
+    }
+
     /**
      * The path-scoped update advancing one consumer document's read cursor for one table. It sets only
      * {@code perTableSeq.<table>}, so the sink-acked position in that document is left untouched. The L1
@@ -322,6 +366,22 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             fields.append("sinkAckedSrcpos", position.token());
         } else {
             update.append("$unset", new Document("sinkAckedSrcpos", ""));
+        }
+        return update;
+    }
+
+    /**
+     * The same update, raising {@code perTableRingDone.<table>} to the ring sequence the order carries in
+     * the same write, so the per-table record can never run ahead of the chain position it came with. A
+     * {@code $max} rather than a set: two members confirming at once both write, and the record only ever
+     * moves forward. A snapshot row sits at a reserved sequence below every change and is no place in any
+     * ring, so it raises nothing.
+     */
+    static Document sinkAckedUpdate(String pipelineId, String table, ChainPosition position) {
+        Objects.requireNonNull(table, "table");
+        Document update = sinkAckedUpdate(pipelineId, position);
+        if (position.order().seq() >= 0) {
+            update.append("$max", new Document(PER_TABLE_RING_DONE + "." + table, position.order().seq()));
         }
         return update;
     }

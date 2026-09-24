@@ -31,6 +31,10 @@ import java.util.Set;
  */
 public final class NestMemoryBudget {
 
+    /** User-context slot naming the split-brain protection every exact state-map config must inherit. */
+    public static final String SPLIT_BRAIN_PROTECTION_CONTEXT_KEY =
+            "tapstate.cluster.split-brain-protection";
+
     private NestMemoryBudget() {
     }
 
@@ -50,6 +54,10 @@ public final class NestMemoryBudget {
         Set<String> alreadyMade = mapsAlreadyOn(member);
         for (String namespace : namespaces) {
             MapConfig wanted = settings.backedStateMaps(namespace);
+            Object protection = member.getUserContext().get(SPLIT_BRAIN_PROTECTION_CONTEXT_KEY);
+            if (protection instanceof String name && !name.isBlank()) {
+                wanted.setSplitBrainProtectionName(name);
+            }
             int asked = wanted.getEvictionConfig().getSize();
             MapConfig pinned = member.getConfig().getMapConfigs().get(namespace);
             if (pinned != null) {

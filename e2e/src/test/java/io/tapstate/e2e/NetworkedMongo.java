@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import io.tapstate.testsupport.DockerGate;
+import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.utility.DockerImageName;
@@ -37,6 +38,8 @@ final class NetworkedMongo implements AutoCloseable {
 
     private final Network network;
     private final GenericContainer<?> container;
+
+    private boolean frozen;
 
     private NetworkedMongo(Network network, GenericContainer<?> container) {
         this.network = network;
@@ -100,8 +103,34 @@ final class NetworkedMongo implements AutoCloseable {
                 + "?directConnection=true";
     }
 
+    /**
+     * Freezes the store: every process in it stops, while its ports stay open and its connections stay
+     * up.
+     *
+     * <p>What a client sees is what a coordination store going away actually looks like from a member
+     * -- operations that never come back, rather than a refusal it could tell apart from a slow one.
+     * Nothing else on the machine is touched, which is the whole point: the members still see each
+     * other, their sources and targets still answer, and the only thing gone is the store.
+     */
+    void freeze() {
+        DockerClientFactory.instance().client().pauseContainerCmd(container.getContainerId()).exec();
+        frozen = true;
+    }
+
+    /** Lets the store run again, for the half of a case that asks what happens once it comes back. */
+    void thaw() {
+        if (!frozen) {
+            return;
+        }
+        DockerClientFactory.instance().client().unpauseContainerCmd(container.getContainerId()).exec();
+        frozen = false;
+    }
+
     @Override
     public void close() {
+        // A frozen container cannot be stopped, and leaving one paused on a shared machine is leaving
+        // it running: it holds its memory and nothing reaps it.
+        thaw();
         container.stop();
         network.close();
     }

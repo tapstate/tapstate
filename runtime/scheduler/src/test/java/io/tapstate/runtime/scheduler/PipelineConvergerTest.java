@@ -165,6 +165,51 @@ class PipelineConvergerTest {
     }
 
     @Test
+    @DisplayName("a dead job is not recorded as failed over a stop another writer has already landed")
+    void failedIsNotDrivenOverACompetingStop() {
+        // Two writers of one pipeline's actual state is what a handover looks like from in here: the
+        // member letting go of it is mid-pass while the member taking it over is already driving. This
+        // pass has read a dead job and concluded FAILED; by the time it writes, the pipeline has been
+        // stopped. Recording FAILED anyway states something nobody found -- and actuates a second stop
+        // for it -- before the next pass undoes it, which is a tick of a pipeline reading failed that no
+        // reader can tell from one that did.
+        state.create("p1", StateJson.of(RUNNING), T0);
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        actuator.failWith(new IllegalStateException("the job died"));
+        AtomicBoolean fired = new AtomicBoolean(false);
+        state.onBeforeSwap(() -> {
+            if (fired.compareAndSet(false, true)) {
+                state.applySwap("p1", 0L, StateJson.of(STOPPED), T0);
+            }
+        });
+
+        converger.converge("p1");
+
+        assertThat(state.read("p1").orElseThrow().stateJson())
+                .as("nobody failed this pipeline; it was stopped").isEqualTo(StateJson.of(STOPPED));
+        assertThat(actuator.calls())
+                .as("and the stop the other writer drove is not driven a second time").isEmpty();
+    }
+
+    @Test
+    @DisplayName("a run that reached the end of its source is not started again by the next pass")
+    void completedIsNotDraggedBackTowardARunningIntent() {
+        // Nobody writes an intent to say a bounded run has finished -- the desired state still says
+        // RUNNING, because that is what was asked for and it was carried out. So the pass that follows
+        // the completion is looking at a terminal actual state under a live intent, and driving it would
+        // start the whole run again, on that tick and on every tick after it.
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        converger.converge("p1");
+        converger.markCompleted("p1");
+        actuator.reset();
+
+        converger.converge("p1");
+
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+        assertThat(actuator.calls()).as("a completed run is over; it is not re-run").isEmpty();
+    }
+
+    @Test
     @DisplayName("markCompleted drives a running pipeline to the terminal COMPLETED state")
     void markCompletedDrivesToCompleted() {
         converge(RUNNING); // actual now RUNNING
@@ -192,6 +237,80 @@ class PipelineConvergerTest {
         converger.converge("p1");
 
         assertThat(actuator.calls()).containsExactly("start:p1");
+    }
+
+    @Test
+    @DisplayName("a failed run the admission allows is replaced; the state is recorded failed first")
+    void anAdmittedFailedRunIsRebuiltRatherThanLeftFailed() {
+        RecordingAdmission admission = new RecordingAdmission();
+        PipelineConverger rebuilding = new PipelineConverger(
+                desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC), admission);
+        converge(RUNNING);
+        actuator.failWith(new IllegalStateException("its member left"));
+        rebuilding.converge("p1");
+        assertThat(StateJson.parse(state.read("p1").orElseThrow().stateJson()))
+                .as("the death is recorded and publishable before anything is decided about replacing it")
+                .isEqualTo(FAILED);
+        actuator.reset();
+
+        admission.answer(true);
+        ConvergeResult rebuilt = rebuilding.converge("p1");
+
+        assertThat(actuator.calls())
+                .as("the dead run is ended and a fresh one begun -- one stop, one start, nothing repeated")
+                .containsExactly("stop:p1:keep", "start:p1");
+        assertThat(rebuilt.status()).isEqualTo(CONVERGED);
+        assertThat(StateJson.parse(state.read("p1").orElseThrow().stateJson())).isEqualTo(RUNNING);
+        assertThat(admission.asked())
+                .as("asked once, on the pass that found it failed -- not on the pass that failed it")
+                .containsExactly("p1");
+    }
+
+    @Test
+    @DisplayName("a failed run the admission refuses stays failed and is not re-driven every tick")
+    void aRefusedFailedRunStaysFailed() {
+        RecordingAdmission admission = new RecordingAdmission();
+        PipelineConverger rebuilding = new PipelineConverger(
+                desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC), admission);
+        converge(RUNNING);
+        actuator.failWith(new IllegalStateException("the connector gave up"));
+        rebuilding.converge("p1");
+        actuator.reset();
+
+        rebuilding.converge("p1");
+        rebuilding.converge("p1");
+
+        assertThat(actuator.calls())
+                .as("nothing is actuated for a death this loop is not allowed to answer")
+                .isEmpty();
+        assertThat(StateJson.parse(state.read("p1").orElseThrow().stateJson())).isEqualTo(FAILED);
+    }
+
+    @Test
+    @DisplayName("a start that threw is driven again next pass, not left as RUNNING over no job")
+    void aStartThatThrewOnOnePassIsDrivenAgainOnTheNext() {
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        actuator.carryingNothing();
+        actuator.refuseStartWith(new IllegalStateException("the engine could not submit this job"));
+
+        assertThatThrownBy(() -> converger.converge("p1"))
+                .as("an uncoded throw from the job side is a defect of this process, not a state of "
+                        + "this pipeline, so it is not laundered into FAILED")
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(StateJson.parse(state.read("p1").orElseThrow().stateJson()))
+                .as("the state is recorded before the job side is driven, which is where the drift starts")
+                .isEqualTo(RUNNING);
+
+        actuator.reset();
+        actuator.stopRefusingStart();
+        ConvergeResult second = converger.converge("p1");
+
+        assertThat(actuator.calls())
+                .as("the next pass reads RUNNING with nothing carrying it and puts a job behind it, "
+                        + "rather than reading the matching state as converged and actuating nothing")
+                .containsExactly("start:p1");
+        assertThat(second.status()).isEqualTo(CONVERGED);
+        assertThat(actuator.isCarryingAJob("p1")).isTrue();
     }
 
     @Test
@@ -598,4 +717,24 @@ class PipelineConvergerTest {
         }
     }
 
+    /** An admission a test drives, recording what it was asked about so the loop's own half is visible. */
+    private static final class RecordingAdmission implements RebuildAdmission {
+
+        private final java.util.List<String> asked = new java.util.ArrayList<>();
+        private boolean answer;
+
+        @Override
+        public boolean admits(String pipelineId) {
+            asked.add(pipelineId);
+            return answer;
+        }
+
+        void answer(boolean admits) {
+            this.answer = admits;
+        }
+
+        java.util.List<String> asked() {
+            return java.util.List.copyOf(asked);
+        }
+    }
 }

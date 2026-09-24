@@ -138,6 +138,19 @@ lives in the boot jar's manifest (`Add-Opens: java.base/java.lang`), and only Sp
 go through `JarLauncher`, so the argument is simply absent. Docker is fine, `java -jar` is fine, the
 IDE is not: this one belongs to running from an IDE and nowhere else.
 
+The manifest carries four more openings beside it, for the clustering library's own access to JDK
+internals. Those are not in the table above because nothing fails without them: the server starts, says
+once at startup that it could not reach them, and runs with less throughput on the paths between
+members - which is no difference at all on the single member an IDE run is. Add them if you want the IDE
+run to behave exactly like the shipped jar:
+
+```
+--add-exports java.base/jdk.internal.ref=ALL-UNNAMED
+--add-opens java.base/sun.nio.ch=ALL-UNNAMED
+--add-opens java.management/sun.management=ALL-UNNAMED
+--add-opens jdk.management/com.sun.management.internal=ALL-UNNAMED
+```
+
 ### Why the working directory matters
 
 Two settings default to paths *relative to it*: `tapstate.connectors.seed-dir` (`connectors`, swept

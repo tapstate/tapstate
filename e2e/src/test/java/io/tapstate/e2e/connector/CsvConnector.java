@@ -23,8 +23,10 @@ import io.tapdata.pdk.apis.entity.WriteListResult;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
 import io.tapdata.pdk.apis.functions.connection.TableInfo;
 
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -103,6 +105,24 @@ public class CsvConnector implements TapConnector {
     /** A test affordance for a saved-source witness: discovery fails when persistence loses this secret. */
     private static final String REQUIRE_PASSWORD = "require_password";
 
+    /**
+     * A test affordance naming a directory this connector notes every batch of rows it hands over into.
+     *
+     * <p>It exists because how often a source is read is a fact about the source, and every other way of
+     * asking is a fact about the product: a count taken from the product's own metrics, its logs or its
+     * ring is the reading of the component whose behaviour is in question. This is the far end saying
+     * how many times it was asked, and it is the only witness a second reader cannot hide from - a
+     * second one reads through a connector of its own and writes its own line.
+     *
+     * <p>One file per process, named by process id, so that two members reading one directory neither
+     * interleave a line nor need a lock across processes to avoid it - and so a reader of the ledger can
+     * see whether one process read twice or two processes read once, which are different defects.
+     *
+     * <p>A batch handed over is the unit, not a poll: an idle poll of a tail delivers nothing and is a
+     * read of nothing, and counting polls would make the ledger a measure of how long the case ran.
+     */
+    private static final String READ_WITNESS = "read_witness";
+
     /** What this connector says when it is driven without the password its settings declare it needs. */
     private static final String CANNOT_AUTHENTICATE = "password authentication failed: no password was given";
 
@@ -157,8 +177,11 @@ public class CsvConnector implements TapConnector {
     @Override
     public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
         functions
-                .supportBatchRead((context, table, offset, size, consumer) ->
-                        consumer.accept(snapshot(context, table.getId()), null))
+                .supportBatchRead((context, table, offset, size, consumer) -> {
+                    List<TapEvent> rows = snapshot(context, table.getId());
+                    noteRead(context, "snapshot", table.getId(), rows.size());
+                    consumer.accept(rows, null);
+                })
                 .supportStreamRead((context, tables, offset, size, consumer) -> {
                     mintTheIdentityOnce(context);
                     tail(context, tables, consumer);
@@ -310,6 +333,7 @@ public class CsvConnector implements TapConnector {
                     }
                 }
                 if (!fresh.isEmpty()) {
+                    noteRead(context, "tail", table, fresh.size());
                     consumer.accept(fresh, null);
                 }
             }
@@ -748,6 +772,34 @@ public class CsvConnector implements TapConnector {
                 ? null
                 : context.getConnectionConfig().getObject("password");
         return password != null && !String.valueOf(password).isBlank();
+    }
+
+    /**
+     * Notes one batch of rows this connector handed over, when the connection asks to be witnessed.
+     *
+     * <p>Appended with a single write to a file of this process's own, which is what makes the ledger
+     * safe to keep while more than one process reads the same directory: nothing is shared to race over.
+     * A connection that named no witness directory notes nothing, so every other specification driving
+     * this connector is untouched.
+     */
+    private static void noteRead(TapConnectionContext context, String phase, String table, int rows) {
+        Object configured = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(READ_WITNESS);
+        if (configured == null || String.valueOf(configured).isBlank()) {
+            return;
+        }
+        long pid = ProcessHandle.current().pid();
+        Path ledger = Path.of(String.valueOf(configured)).resolve("reads-" + pid + ".tsv");
+        String line = pid + "\t" + phase + "\t" + table + "\t" + rows + System.lineSeparator();
+        try {
+            Files.createDirectories(ledger.getParent());
+            try (FileOutputStream out = new FileOutputStream(ledger.toFile(), true)) {
+                out.write(line.getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
+        }
     }
 
     private static Path directory(TapConnectionContext context) {

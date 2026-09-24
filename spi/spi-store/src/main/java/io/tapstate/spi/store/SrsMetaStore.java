@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.event.ChainPosition;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -122,6 +123,51 @@ public interface SrsMetaStore {
      * sink.
      */
     void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position);
+
+    /**
+     * Advances the sink-acked position as {@link #advanceSinkAcked(String, String, ChainPosition)} does, and
+     * records with it where in {@code table}'s own change ring that change sat: the ring sequence the order
+     * carries. A run that replaces this pipeline's run carries on from just past it, rather than from the
+     * head of the ring.
+     *
+     * <p>Kept per table because the chain's acked position is one pair for every table a source has, while
+     * each table has a ring -- and a sequence space -- of its own. The chain position says how far the source
+     * has been confirmed; it cannot say where in any one ring that was, and positioning a table's ring by
+     * another table's sequence would skip changes nobody confirmed. Only ever raised, never lowered.
+     *
+     * <p>The default records the chain position alone, which leaves a replacing run starting at the head of
+     * each ring as runs always have: more replayed than needed, nothing missed.
+     */
+    default void advanceSinkAcked(
+            String miningChainId, String pipelineId, String table, ChainPosition position) {
+        advanceSinkAcked(miningChainId, pipelineId, position);
+    }
+
+    /**
+     * Per table, the ring sequence up to which this pipeline has nothing left to receive from that table's
+     * change ring: the last change its sink confirmed there, or where the ring stood when the pipeline
+     * arrived on it, whichever {@link #advanceSinkAcked(String, String, String, ChainPosition)} and
+     * {@link #startRingAfter(String, String, String, long)} left higher. A run of this pipeline carries on
+     * just past it. A table with neither is absent, and so is everything once the pipeline's record is
+     * rewritten or dropped. Empty where nothing is recorded, which is also what the default answers.
+     */
+    default Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
+        return Map.of();
+    }
+
+    /**
+     * Records that a pipeline arriving on {@code table}'s change ring starts just past {@code seq} -- where
+     * the ring stood as it arrived -- unless the pipeline already has a place in that ring, which it keeps:
+     * a run coming back carries on from where it was, not from wherever the ring has got to since.
+     *
+     * <p>The mark is taken before the pipeline's own load reads anything and before any tail this run opens
+     * has mined anything, so every change the pipeline is owed lands above it, and everything below it is
+     * either history from before the pipeline existed or a change its own load already read.
+     *
+     * <p>The default records nothing, which leaves an arriving run starting where its read mode puts it.
+     */
+    default void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
+    }
 
     /**
      * Records one pipeline's snapshot-to-cdc seam: the opaque position its cdc tail starts from, together

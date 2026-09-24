@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ArtifactError;
+import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.TapstateErrorCode;
@@ -244,6 +245,26 @@ class ApiExceptionHandlerTest {
 
         // the wire identity is the canonical code string (ApiError.code is a String); the enum never crosses
         assertThat(body.code()).isEqualTo("dsl.malformed-yaml");
+    }
+
+    @Test
+    void aMemberThatCannotReadTheClusterIsUnavailableRatherThanBroken() {
+        // The three answers this has to be told apart from are a 500 (the server broke), a 200 with an
+        // empty member list (the cluster is empty), and a 200 listing this member alone (it is in a
+        // cluster of one). All three are readings nobody took; 503 with a code is the member saying so.
+        TapstateException e =
+                new TapstateException(ClusterError.MEMBERSHIP_UNREADABLE, Map.of(), null);
+
+        ResponseEntity<ApiError> response = handler.handle(e);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        ApiError body = response.getBody();
+        assertThat(body.code()).isEqualTo("cluster.membership-unreadable");
+        assertThat(body.message())
+                .describedAs("rendered from the catalog, not left as the bare code -- a person reading "
+                        + "a failing run's output is the first caller this reaches")
+                .isNotEqualTo("cluster.membership-unreadable")
+                .contains("cannot read who is in the cluster");
     }
 
     /** A coded error whose only relevant facet is its canonical code string — enough to exercise statusFor. */

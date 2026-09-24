@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
 import java.util.ArrayList;
@@ -14,8 +15,8 @@ import java.util.Set;
  * The single-node coordinator for SRS mining chains: it force-merges cdc sources onto shared chains and
  * enforces the SRS lifecycle boundary. It holds the coordination truth for one node — which sources and
  * consumer pipelines each chain carries, and each chain's unioned table set — over a durable
- * {@link SrsMetaStore} that outlives it. Distributed shared mining (cross-node chain ownership) is out of
- * scope here.
+ * {@link SrsMetaStore} that outlives it. Which member mines a chain is decided outside it; what it records
+ * is which of two things this member does with one: mine it, or read it while another member does.
  *
  * <p>The boundary is structural, one method per lifecycle act:
  * <ul>
@@ -58,6 +59,11 @@ public final class SrsCoordinator {
      * or a re-mine arrives here with no chain state and takes a new one, while a source merging onto a
      * running chain reads under the generation already in flight. Taking one per source instead would make
      * two sources of one chain order their changes against each other by which arrived first.
+     *
+     * <p>A chain this member has only {@linkplain #joinSource joined} is the one merge that takes a
+     * generation. Provisioning is what the member about to mine a chain does, and a tail taking a ring over
+     * starts a generation of its own for the reason a restart does. What the join attached stays attached,
+     * and a start that fails after this leaves it attached too, which is why it still answers as a merge.
      */
     public synchronized ProvisionOutcome provisionSource(
             String sourceId, MiningChainId chainId, List<String> streams, String retention) {
@@ -66,7 +72,9 @@ public final class SrsCoordinator {
         Objects.requireNonNull(streams, "streams");
         ChainState state = chains.get(chainId.value());
         boolean merged = state != null;
-        if (state == null) {
+        if (state != null && !state.minedHere) {
+            state.mineHere(meta.openEpoch(chainId.value()));
+        } else if (state == null) {
             // Seed only a chain that has none, and open regardless. The durable record outlives this
             // process, so after a restart the chain is opened again with its record already there; seeding
             // is insert-only precisely so an accumulated offset / cursor / schema truth is never discarded,
@@ -82,12 +90,47 @@ public final class SrsCoordinator {
             if (meta.read(chainId.value()).isEmpty()) {
                 meta.create(chainId.value(), retention);
             }
-            state = new ChainState(chainId, meta.openEpoch(chainId.value()));
+            state = new ChainState(chainId, meta.openEpoch(chainId.value()), true);
             chains.put(chainId.value(), state);
         }
         state.sources.add(sourceId);
         state.tables.addAll(streams);
         return new ProvisionOutcome(chainId, merged, List.copyOf(state.tables), state.epoch);
+    }
+
+    /**
+     * Joins a chain for a source read here while this member does not mine it: another member runs the
+     * tail, and pipelines driven here read the ring that tail writes. Returns the chain's table set after
+     * this source and the generation to read under, and always answers as a merge -- the chain was open
+     * before this member arrived.
+     *
+     * <p>It reads under the generation already running and never opens one. Every change the tail writes is
+     * ordered under the generation its member opened, and a load read here is ordered beneath every change
+     * of the generation stamped on it: taking a new one here would put this member's load above changes
+     * the tail goes on writing, and leave every run assembled afterwards reading a generation no tail
+     * writes under. Where this member already has the chain -- mined or joined -- this is the merge
+     * {@link #provisionSource} does.
+     *
+     * <p>A chain with no generation open is one nobody has started mining, and joining it is an ordering
+     * error of the caller's rather than something to answer with a generation made up here.
+     */
+    public synchronized ProvisionOutcome joinSource(String sourceId, MiningChainId chainId, List<String> streams) {
+        Objects.requireNonNull(sourceId, "sourceId");
+        Objects.requireNonNull(chainId, "chainId");
+        Objects.requireNonNull(streams, "streams");
+        ChainState state = chains.get(chainId.value());
+        if (state == null) {
+            long running = meta.read(chainId.value()).map(SrsMeta::epoch).orElse(0L);
+            if (running < 1) {
+                throw new IllegalStateException(
+                        "mining chain has no ring generation open to join: " + chainId.value());
+            }
+            state = new ChainState(chainId, running, false);
+            chains.put(chainId.value(), state);
+        }
+        state.sources.add(sourceId);
+        state.tables.addAll(streams);
+        return new ProvisionOutcome(chainId, true, List.copyOf(state.tables), state.epoch);
     }
 
     /** Whether the chain has been opened by a source. */
@@ -200,19 +243,28 @@ public final class SrsCoordinator {
 
     /**
      * One mining chain's single-node coordination state: its member sources, unioned tables, consumers, and
-     * the ring generation opened when the chain was. The generation is held here so every source that
-     * merges onto the chain reads under the one already running rather than taking its own.
+     * the ring generation this member reads under -- the one it opened where it mines the chain, the one
+     * already running where it joined a chain another member mines. The generation is held here so every
+     * source that merges onto the chain reads under the one already running rather than taking its own.
      */
     private static final class ChainState {
         private final MiningChainId chainId;
-        private final long epoch;
+        private long epoch;
+        private boolean minedHere;
         private final Set<String> sources = new LinkedHashSet<>();
         private final Set<String> tables = new LinkedHashSet<>();
         private final Set<String> consumers = new LinkedHashSet<>();
 
-        ChainState(MiningChainId chainId, long epoch) {
+        ChainState(MiningChainId chainId, long epoch, boolean minedHere) {
             this.chainId = chainId;
             this.epoch = epoch;
+            this.minedHere = minedHere;
+        }
+
+        /** This member starts mining a chain it had joined, under the generation it has just opened. */
+        void mineHere(long opened) {
+            this.epoch = opened;
+            this.minedHere = true;
         }
     }
 }

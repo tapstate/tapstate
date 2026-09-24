@@ -998,16 +998,17 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     @Test
     void startFailureClosesRunsStartedForEarlierSources() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
-        SourceResource first = cdcSource("src_a", "orders", null);
-        SourceResource second = new SourceResource("src_b", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null);
-        artifacts.save(first);
-        artifacts.save(second);
+        artifacts.save(cdcSource("src_a", "orders", null));
+        artifacts.save(cdcSource("src_b", "items", null));
         artifacts.save(twoSourcePipeline("p", "src_a", "src_b"));
         SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
         AtomicBoolean firstSubscriptionClosed = new AtomicBoolean(false);
         AtomicReference<CaptureRunSpec> firstSpec = new AtomicReference<>();
+        RuntimeException wouldNotOpen = new IllegalStateException("the second source would not open");
         CaptureStarter starter = (spec, passthrough) -> {
+            if (firstSpec.get() != null) {
+                throw wouldNotOpen;
+            }
             firstSpec.set(spec);
             MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
@@ -1018,12 +1019,40 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
                 artifactsOnly(artifacts), starter, srsCoordinator, new SnapshotBuffer());
 
-        assertThatThrownBy(() -> coordinator.startCapture("p"))
-                .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        assertThatThrownBy(() -> coordinator.startCapture("p")).isSameAs(wouldNotOpen);
 
         MiningChainId firstChain = MiningChainId.resolve(firstSpec.get().config(), firstSpec.get().srsKey());
         assertThat(firstSubscriptionClosed).isTrue();
         assertThat(srsCoordinator.isProvisioned(firstChain)).isFalse();
+        assertThat(coordinator.isActive("p")).isFalse();
+    }
+
+    /**
+     * A source that cannot be worked out fails the start before any source is opened. Every source of a
+     * start is settled first, so an unusable later source costs the earlier ones nothing -- no load read
+     * only to be thrown away with the start.
+     */
+    @Test
+    void aSourceThatCannotBeWorkedOutFailsTheStartBeforeAnySourceIsOpened() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("src_a", "orders", null));
+        artifacts.save(new SourceResource("src_b", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, null, null, null));
+        artifacts.save(twoSourcePipeline("p", "src_a", "src_b"));
+        List<String> opened = new ArrayList<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            opened.add(spec.sourceId());
+            return new CaptureRun(Optional.empty(), false, 0L, Optional.empty(), Optional.empty(),
+                    new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()),
+                new SnapshotBuffer());
+
+        assertThatThrownBy(() -> coordinator.startCapture("p"))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> assertThat(refused.code().code())
+                        .isEqualTo("actuation.source-schema-not-discovered"));
+        assertThat(opened).isEmpty();
         assertThat(coordinator.isActive("p")).isFalse();
     }
 
@@ -1032,18 +1061,22 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("src_a", "orders", null));
         artifacts.save(cdcSource("src_b", "customers", null));
-        artifacts.save(new SourceResource("src_c", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, null, null, null));
+        artifacts.save(cdcSource("src_c", "items", null));
         artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true), SourceRef.spec("src_c", true)), null, null,
-                new ServeBlock.Inline(null, FromClause.list(FromRef.literal("src_a"), FromRef.literal("src_b")),
+                new ServeBlock.Inline(null,
+                        FromClause.list(FromRef.literal("src_a"), FromRef.literal("src_b"), FromRef.literal("src_c")),
                         List.of(new SyncElement("sync_1", "src_a", null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
         SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
         AtomicBoolean secondClosed = new AtomicBoolean(false);
         AtomicReference<CaptureRunSpec> firstSpec = new AtomicReference<>();
+        RuntimeException wouldNotOpen = new IllegalStateException("the third source would not open");
         int[] starts = {0};
         CaptureStarter starter = (spec, passthrough) -> {
             starts[0]++;
+            if (starts[0] == 3) {
+                throw wouldNotOpen;
+            }
             MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
             srsCoordinator.attachConsumer(chainId, spec.pipelineId());
@@ -1059,10 +1092,8 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 artifactsOnly(artifacts), starter, srsCoordinator, new SnapshotBuffer());
 
         assertThatThrownBy(() -> coordinator.startCapture("p"))
-                .isInstanceOfSatisfying(TapstateException.class, exception -> {
-                    assertThat(exception.code().code()).isEqualTo("actuation.source-schema-not-discovered");
-                    assertThat(exception.getSuppressed()).hasSize(1);
-                });
+                .isSameAs(wouldNotOpen)
+                .satisfies(failure -> assertThat(failure.getSuppressed()).hasSize(1));
         assertThat(secondClosed).isTrue();
         assertThat(srsCoordinator.isProvisioned(MiningChainId.resolve(
                 firstSpec.get().config(), firstSpec.get().srsKey()))).isFalse();

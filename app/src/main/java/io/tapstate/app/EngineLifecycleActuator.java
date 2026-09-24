@@ -48,13 +48,20 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final DagSource dagSource;
     private final PipelineCaptureCoordinator captureCoordinator;
     private final NestStateTeardown stateTeardown;
+    private final PipelineActuationOwnership actuation;
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown) {
+        this(engine, dagSource, captureCoordinator, stateTeardown, PipelineActuationOwnership.single());
+    }
+
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            NestStateTeardown stateTeardown, PipelineActuationOwnership actuation) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
         this.stateTeardown = Objects.requireNonNull(stateTeardown, "stateTeardown");
+        this.actuation = Objects.requireNonNull(actuation, "actuation");
     }
 
     @Override
@@ -67,6 +74,16 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         engine.refuseIfLost(pipelineId);
         DagSource.StartPreparation prepared = dagSource.prepareStart(
                 pipelineId, stateTeardown.defaultDatabase());
+        // The run's own generation, taken before the first side effect for the same reason: a run this
+        // member cannot fence is one nothing could later stop from writing, so it must not be half built.
+        // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any
+        // more (or cannot prove it is), and the member that is will put a run behind it.
+        PipelineActuationOwnership.Execution execution = actuation.beginExecution(pipelineId);
+        if (!execution.allowed()) {
+            LOG.warn("Not starting pipeline {} on this member: its run could not be fenced to a new "
+                    + "execution generation", pipelineId);
+            return;
+        }
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
         // what leaves a run that died without a stop with its state - and so with a shape to be held to.
@@ -82,18 +99,24 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // snapshot, so an apply cannot move one without the others. Said after the drop above, which is the
         // one thing entitled to clear what earlier runs said.
         stateTeardown.willKeepStateAt(pipelineId, prepared.stateLocations());
-        prepared.artifactSnapshot().ifPresentOrElse(
-                snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
-                () -> captureCoordinator.startCapture(pipelineId));
+        try {
+            prepared.artifactSnapshot().ifPresentOrElse(
+                    snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
+                    () -> captureCoordinator.startCapture(pipelineId));
+        } catch (RingNotOpenYet notYet) {
+            // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
+            // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
+            // being opened on another member, and how long that may take is bounded where it is decided.
+            return;
+        }
         // Capture opens the SRS generation that source vertices compile into the DAG. Build only now, but
         // from the same frozen artifacts used above; placement and teardown were already fixed, so any
         // shape record this writes remains named even if construction refuses the start.
-        DagSource.StartPlan plan = prepared.build();
+        DagSource.StartPlan plan = prepared.build(execution.fence());
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
-        engine.submit(pipelineId, plan.dag(),
-                capacity.mapDatabases(), capacity.settings());
+        engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
     }
 
     @Override

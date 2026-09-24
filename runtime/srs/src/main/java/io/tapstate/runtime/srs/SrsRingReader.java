@@ -80,6 +80,28 @@ public final class SrsRingReader {
         return new SrsRingReader(ring, resolveStartSeq(ring, start, retention), onAdvance);
     }
 
+    /**
+     * A reader that carries on just past {@code ackedSeq}: the ring sequence of the last change this
+     * consumer's sink confirmed from this ring. This is where a run replacing one that died picks up, and
+     * it is not the head: a ring outlives the runs that read it, so its head can sit far below what this
+     * consumer already landed, and starting there hands the target every change it has again.
+     *
+     * <p>A ring numbers on across rebuilds rather than reusing sequences, so an acknowledged sequence still
+     * names the change it named. Two readings fall back to the head, and both replay rather than skip: a
+     * sequence below the head, because the ring was rebuilt past it and what it holds was mined again from
+     * the chain's durable read offset -- which no confirmation outruns; and a sequence beyond the tail,
+     * because a ring that never reached it is not the ring it was confirmed from, and trusting it there
+     * would pass over changes nobody confirmed.
+     */
+    public static SrsRingReader resumingAfter(SrsRingbuffer ring, long ackedSeq, LongConsumer onAdvance) {
+        Objects.requireNonNull(ring, "ring");
+        long head = ring.headSequence();
+        long tail = ring.tailSequence();
+        long next = ackedSeq + 1;
+        long start = next < head || next > tail + 1 ? head : next;
+        return new SrsRingReader(ring, start, onAdvance);
+    }
+
     private static long resolveStartSeq(SrsRingbuffer ring, StartFrom start, String retention) {
         return switch (start) {
             case StartFrom.Earliest ignored -> ring.headSequence();

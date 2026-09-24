@@ -112,6 +112,13 @@ class RestartKeepsThePositionIT {
             control.stop(fixture.pipelineId(), false);
             control.lifecycle(fixture.pipelineId(), LifecycleVerb.START);
 
+            // Both words are answered once they are recorded, so the run before this one can still be going
+            // when they return. A document written in that gap is that run's to carry: it carries it and
+            // confirms it, and the run replacing it then rightly carries on past it with nothing left to
+            // drive -- which reads as nought below, the reading kept for documents that went some other way.
+            // So the liveness document waits for the new run to be up.
+            awaitTheRunThatReplacedTheOneBefore(control, fixture.pipelineId(), droveBefore);
+
             // Liveness before the reading. A run that has not begun its full load has read nought too,
             // so without a document that actually crosses after the restart the assertion is vacuous.
             fixture.add(source, LIVENESS_ID, LIVENESS_ROW);
@@ -315,6 +322,18 @@ class RestartKeepsThePositionIT {
                         + "count of nought is documents that reached the target by some other route",
                         pipelineId, droveBefore)
                 .isStrictlyBetween(0L, droveBefore);
+    }
+
+    /**
+     * Waits until the live run is a new one: its record count reads below what the run before it reached.
+     * That run's count only climbs, and a run replacing it begins again at nought, so no reading of the old
+     * run passes this, and neither does a pipeline with no run at all, which reads nothing.
+     */
+    private static void awaitTheRunThatReplacedTheOneBefore(
+            ControlPlane control, String pipelineId, long droveBefore) {
+        Await.until("a run of %s replacing the one that drove %d".formatted(pipelineId, droveBefore), TIMEOUT,
+                () -> control.recordCount(pipelineId).filter(count -> count < droveBefore).isPresent(),
+                () -> String.valueOf(control.recordCount(pipelineId)));
     }
 
     /**
