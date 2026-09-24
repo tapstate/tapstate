@@ -1,0 +1,3 @@
+rule: join-input-is-a-pattern
+path: transforms[0].from.o
+note: "a join reads one table per alias; o is bound to the pattern /orders/"
