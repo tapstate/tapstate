@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>This keeps the substrate's own handling, decision and all: whether a member is taken down, and how, stays
  * the substrate's call. It is wrapped rather than rewritten because that decision tells a heap that is really
  * exhausted from a single allocation too large to fit, and only the first is a reason to lose the engine. What
- * is added is the one thing the handling lacks. Once it has taken a member down, the error is written on that
+ * is added is the one thing the handling lacks. For every member it takes down, the error is written on that
  * member, where {@link Engine} reads it, and so does anything else that must know, such as the process's
  * liveness.
  *
@@ -54,7 +54,12 @@ public final class MemberOutOfMemory {
     }
 
     /**
-     * The error {@code member} was shut down over, or empty while it has not been.
+     * The error {@code member} is being or has been shut down over, or empty while it runs.
+     *
+     * <p>It reads so from the moment the out-of-memory handling starts to shut the member down, and the member
+     * starts refusing what it is asked only later in that shutdown. The shutdown then waits for every job on the
+     * member to end, which one slow to let go can drag out for minutes, and every refusal in all that time must
+     * find its reason here already.
      *
      * <p>Empty too for a member shut down any other way, and the server shutting it down on purpose is the
      * everyday case of that. A member shut down through its lifecycle lets go of everything it held, this
@@ -68,10 +73,15 @@ public final class MemberOutOfMemory {
         } catch (HazelcastInstanceNotActiveException letGo) {
             return Optional.empty();
         }
-        return watched instanceof MemberOutOfMemory record ? Optional.ofNullable(record.error.get()) : Optional.empty();
+        // Whether it runs is asked first. The handling writes the error before it stops the member, so a member
+        // seen to have stopped already shows the error it was stopped over.
+        if (!(watched instanceof MemberOutOfMemory record) || member.getLifecycleService().isRunning()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(record.error.get());
     }
 
-    /** The substrate's handling, followed by what is written down about each member it took down. */
+    /** The substrate's handling, with what is written down about each member it takes down. */
     private static final class Recording extends OutOfMemoryHandler {
 
         private final OutOfMemoryHandler substrate;
@@ -86,23 +96,41 @@ public final class MemberOutOfMemory {
         }
 
         /**
-         * Written down only for a member that has actually stopped. The handling swallows a shutdown that
-         * fails, and a member it could not stop is still carrying its pipelines, so it must not be reported
-         * as lost.
+         * Written down before the substrate takes the members down, and read as lost only once a member has
+         * stopped running, which it does as its shutdown starts, before it refuses anything. Written any later,
+         * it would say nothing for as long as the shutdown takes, and every refusal in between would go out
+         * with no reason.
+         *
+         * <p>Taken back for a member still running once the substrate is done. The handling swallows a shutdown
+         * that fails, and a member it could not stop is still carrying its pipelines, so it must not be
+         * reported as lost.
          *
          * <p>Nothing else is run here. The substrate hands the members over once and never again, so anything
-         * thrown for one of them would leave every member after it unwritten for good. The slots it hands over
-         * may be empty; an empty one is passed over like a member nobody watches.
+         * thrown for one of them would leave every member after it unwritten for good, and the substrate runs
+         * whatever becomes of the writing, since whether a member is taken down is its call alone. The slots it
+         * hands over may be empty; an empty one is passed over like a member nobody watches.
          */
         @Override
         public void onOutOfMemory(OutOfMemoryError error, HazelcastInstance[] members) {
-            substrate.onOutOfMemory(error, members);
+            try {
+                for (HazelcastInstance member : members) {
+                    if (watched(member) instanceof MemberOutOfMemory record) {
+                        record.error.set(error);
+                    }
+                }
+            } finally {
+                substrate.onOutOfMemory(error, members);
+            }
             for (HazelcastInstance member : members) {
-                if (member != null && !member.getLifecycleService().isRunning()
-                        && member.getUserContext().get(USER_CONTEXT_KEY) instanceof MemberOutOfMemory record) {
-                    record.error.set(error);
+                if (watched(member) instanceof MemberOutOfMemory record && member.getLifecycleService().isRunning()) {
+                    record.error.set(null);
                 }
             }
+        }
+
+        /** What is kept on {@code member} under this class's key, or null for an empty slot. */
+        private static Object watched(HazelcastInstance member) {
+            return member == null ? null : member.getUserContext().get(USER_CONTEXT_KEY);
         }
     }
 }

@@ -33,20 +33,42 @@ final class OutOfMemoryOnAMemberThread {
 
     /** The error that escaped the thread, returned once the out-of-memory handling has finished with it. */
     static OutOfMemoryError raise() {
+        return escape().handled();
+    }
+
+    /**
+     * The error escaping the thread, returned at once. The handling runs on that thread and may still be at work,
+     * for as long as a member it is taking down takes to stop.
+     */
+    static Escaping escape() {
         OutOfMemoryError error = new OutOfMemoryError(THE_COLLECTOR_GAVE_UP);
         Thread memberThread = new HazelcastManagedThread(() -> {
             throw error;
         }, "test-member-out-of-memory");
         memberThread.start();
-        try {
-            if (!memberThread.join(HANDED_OVER_WITHIN)) {
-                throw new AssertionError("the member thread did not hand its out-of-memory error over within "
-                        + HANDED_OVER_WITHIN + "; it is still " + memberThread.getState());
-            }
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted while the out-of-memory handling ran", interrupted);
+        return new Escaping(error, memberThread);
+    }
+
+    /** An error escaping a member thread, and that thread, on which the handling runs. */
+    record Escaping(OutOfMemoryError error, Thread memberThread) {
+
+        /** Whether the handling is still at work on the error. */
+        boolean stillHandling() {
+            return memberThread.isAlive();
         }
-        return error;
+
+        /** The error, once the handling has finished with it. */
+        OutOfMemoryError handled() {
+            try {
+                if (!memberThread.join(HANDED_OVER_WITHIN)) {
+                    throw new AssertionError("the member thread did not hand its out-of-memory error over within "
+                            + HANDED_OVER_WITHIN + "; it is still " + memberThread.getState());
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted while the out-of-memory handling ran", interrupted);
+            }
+            return error;
+        }
     }
 }

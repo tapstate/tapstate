@@ -32,6 +32,8 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -238,6 +240,44 @@ class EngineTest {
         assertThat(engine.awaitTerminal("orders-pipe", Duration.ofSeconds(15)))
                 .describedAs("and nothing is left running to wait for")
                 .isTrue();
+    }
+
+    @Test
+    void a_member_its_out_of_memory_handling_is_still_shutting_down_already_reads_as_lost()
+            throws InterruptedException {
+        // Partway through its shutdown a member stops answering, and the shutdown then waits for every job on it
+        // to end, which one slow to let go, like a connector stuck in a read, can drag out for minutes. All that
+        // time the member refuses every question with an error that says nothing about why, so the engine has to
+        // be answering with the reason already, not once the shutdown is over.
+        Engine engine = new Engine(member);
+        SlowToEndSource.ready();
+        engine.submit("orders-pipe", slowToEndDag());
+        awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
+        MemberOutOfMemory.watch(member);
+
+        OutOfMemoryOnAMemberThread.Escaping escaping = OutOfMemoryOnAMemberThread.escape();
+        try {
+            SlowToEndSource.awaitToldToEnd();
+            assertThatThrownBy(() -> member.getJet().getJob("orders-pipe"))
+                    .describedAs("the shutdown has got as far as refusing questions")
+                    .isInstanceOf(HazelcastInstanceNotActiveException.class);
+
+            assertThat(engine.failureOf("orders-pipe"))
+                    .get()
+                    .isInstanceOfSatisfying(TapstateException.class, coded -> {
+                        assertThat(coded.code().code()).isEqualTo("engine.out-of-memory");
+                        assertThat(coded.getCause()).isSameAs(escaping.error());
+                    });
+            assertThat(engine.hasLiveJob("orders-pipe")).isFalse();
+            assertThat(engine.recordCount("orders-pipe")).isEmpty();
+            refusedForWantOfMemory(() -> engine.refuseIfLost("orders-pipe"));
+            assertThat(escaping.stillHandling())
+                    .describedAs("every answer above was given while the shutdown was still held open")
+                    .isTrue();
+        } finally {
+            SlowToEndSource.letGo();
+        }
+        escaping.handled();
     }
 
     @Test
@@ -739,6 +779,74 @@ class EngineTest {
                 return true;
             }
             return false;
+        }
+    }
+
+    /** A one-vertex streaming DAG whose only processor, once told to end, goes on until the case lets it go. */
+    private static DAG slowToEndDag() {
+        DAG dag = new DAG();
+        dag.newVertex("slow-to-end", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of((SupplierEx<Processor>) SlowToEndSource::new)));
+        return dag;
+    }
+
+    /**
+     * Emits nothing and runs until it is told to end, then goes on until the case lets it go, as a connector stuck
+     * in a read that an interrupt does not reach does. A member shutting down waits for every job on it to end, so
+     * this holds the shutdown open for as long as the case needs it open.
+     *
+     * <p>It runs on the case's own member in this JVM, so what it shares with the case is static, set afresh by
+     * {@link #ready()} before a job over it is submitted.
+     */
+    private static final class SlowToEndSource extends AbstractProcessor {
+
+        /** How long it goes on once told to end if the case never lets it go, so a failed case cannot hang. */
+        private static final Duration HELD_AT_MOST = Duration.ofSeconds(60);
+
+        private static volatile CountDownLatch toldToEnd;
+        private static volatile CountDownLatch letGo;
+
+        static void ready() {
+            toldToEnd = new CountDownLatch(1);
+            letGo = new CountDownLatch(1);
+        }
+
+        /** Returns once the job has been told to end, failing if it is not within the budget. */
+        static void awaitToldToEnd() throws InterruptedException {
+            if (!toldToEnd.await(15, TimeUnit.SECONDS)) {
+                throw new AssertionError("the job was not told to end within budget");
+            }
+        }
+
+        static void letGo() {
+            letGo.countDown();
+        }
+
+        @Override
+        public boolean isCooperative() {
+            return false;
+        }
+
+        @Override
+        public boolean complete() {
+            try {
+                letGo.await();
+                return true;
+            } catch (InterruptedException told) {
+                toldToEnd.countDown();
+            }
+            long deadline = System.nanoTime() + HELD_AT_MOST.toNanos();
+            for (long left = HELD_AT_MOST.toNanos(); left > 0; left = deadline - System.nanoTime()) {
+                try {
+                    if (letGo.await(left, TimeUnit.NANOSECONDS)) {
+                        break;
+                    }
+                } catch (InterruptedException toldAgain) {
+                    // The member's executors are told to stop too, which tells this again. It goes on all the same.
+                }
+            }
+            Thread.currentThread().interrupt();
+            return true;
         }
     }
 
