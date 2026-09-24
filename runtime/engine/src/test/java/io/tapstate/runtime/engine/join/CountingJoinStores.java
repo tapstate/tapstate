@@ -31,6 +31,13 @@ final class CountingJoinStores implements JoinStores {
     int pageCountReads;
 
     /**
+     * How many times one page of an index bucket was read. A fact row arriving again confirms its
+     * index entry page by page, so this is what shows a confirmation that stopped starting where the
+     * previous row of its bucket was found.
+     */
+    int pageReads;
+
+    /**
      * How many calls changed something - either mirror, either direction, and the index with them.
      *
      * <p><b>It is here for the same reason the read counts are, one step further along.</b> The reads
@@ -69,6 +76,7 @@ final class CountingJoinStores implements JoinStores {
         keysRead = 0;
         singleReads = 0;
         pageCountReads = 0;
+        pageReads = 0;
         writes = 0;
     }
 
@@ -123,6 +131,7 @@ final class CountingJoinStores implements JoinStores {
 
     @Override
     public List<String> indexPage(String source, String dimensionKey, int page) {
+        pageReads++;
         return held.indexPage(source, dimensionKey, page);
     }
 

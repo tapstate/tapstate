@@ -539,6 +539,12 @@ class JoinDriverTest {
         assertThat(restarted.stores.writes)
                 .as("the mirror once per row, and the index only for the lost row and the four new ones")
                 .isEqualTo(load.size() + 1 + 4);
+        // Rows 10 to 14 are named on pages 0, 0, 1, 1 and 2. Each is found on the page the previous
+        // one was, or on the next page after one miss (1, 1, 2, 1, 2 reads); row 15 misses page 2,
+        // then pages 1 and 0 (3 reads). A search restarted from page 0 for every row costs more.
+        assertThat(restarted.stores.pageReads)
+                .as("each row arriving again is looked for near where the previous one of its bucket was")
+                .isEqualTo(10);
         List<String> named = new ArrayList<>();
         String bucket = restarted.dimensionKeyOf(1L);
         for (int page = 0; page < kept.indexPageCount("c", bucket); page++) {

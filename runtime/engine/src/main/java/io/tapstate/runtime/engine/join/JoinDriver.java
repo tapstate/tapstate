@@ -103,11 +103,20 @@ public final class JoinDriver {
 
     /**
      * For each bucket longer than one page, the page this driver last found a row on while confirming
-     * it - where the next row of that bucket arriving again is almost always found. Bounded by being
-     * forgotten whole once it holds {@link #BUCKETS_REMEMBERED}: what is forgotten costs a search from
-     * the first page, never an answer.
+     * it - where the next row of that bucket arriving again is almost always found. Bounded at
+     * {@link #BUCKETS_REMEMBERED} by forgetting the bucket least recently confirmed, not all of them:
+     * a load whose fact keys interleave more long buckets than that would otherwise send every bucket
+     * back to its first page each time the bound is reached. What is forgotten costs a search from the
+     * first page, never an answer.
      */
-    private final Map<Bucket, Integer> confirmedOn = new HashMap<>();
+    private final Map<Bucket, Integer> confirmedOn = new LinkedHashMap<>(16, 0.75f, true) {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Bucket, Integer> eldest) {
+            return size() > BUCKETS_REMEMBERED;
+        }
+    };
     private final int keysPerRead;
     private final JoinGauge gauge;
     private final DimensionRowDisplacedAlert displaced;
@@ -472,9 +481,6 @@ public final class JoinDriver {
                 continue;
             }
             if (stores.indexPage(source, dimensionKey, page).contains(factKey)) {
-                if (confirmedOn.size() >= BUCKETS_REMEMBERED) {
-                    confirmedOn.clear();
-                }
                 confirmedOn.put(bucket, page);
                 return;
             }

@@ -230,13 +230,8 @@ final class JoinConformance implements AutoCloseable {
         List<Map<String, Object>> rows = new ArrayList<>();
         try (Statement query = db.createStatement();
                 ResultSet result = query.executeQuery(statement.toString())) {
-            ResultSetMetaData columns = result.getMetaData();
             while (result.next()) {
-                Map<String, Object> row = new LinkedHashMap<>();
-                for (int column = 1; column <= columns.getColumnCount(); column++) {
-                    row.put(columns.getColumnLabel(column), result.getObject(column));
-                }
-                rows.add(row);
+                rows.add(rowOf(result));
             }
         }
         for (Map<String, Object> row : rows) {
@@ -269,12 +264,8 @@ final class JoinConformance implements AutoCloseable {
         Map<List<Object>, Map<String, Object>> reference = new LinkedHashMap<>();
         List<String> found = new ArrayList<>();
         try (Statement query = db.createStatement(); ResultSet rows = query.executeQuery(sql)) {
-            ResultSetMetaData columns = rows.getMetaData();
             while (rows.next()) {
-                Map<String, Object> row = new LinkedHashMap<>();
-                for (int column = 1; column <= columns.getColumnCount(); column++) {
-                    row.put(columns.getColumnLabel(column), rows.getObject(column));
-                }
+                Map<String, Object> row = rowOf(rows);
                 List<Object> identity = identityOf(row);
                 if (reference.put(identity, row) != null) {
                     // Two source rows under one identity: the fold cannot hold both, so saying so is
@@ -354,17 +345,19 @@ final class JoinConformance implements AutoCloseable {
         try (PreparedStatement select = db.prepareStatement(statement.toString())) {
             bind(select, 1, identity.values());
             try (ResultSet rows = select.executeQuery()) {
-                if (!rows.next()) {
-                    return null;
-                }
-                ResultSetMetaData columns = rows.getMetaData();
-                Map<String, Object> row = new LinkedHashMap<>();
-                for (int column = 1; column <= columns.getColumnCount(); column++) {
-                    row.put(columns.getColumnLabel(column), rows.getObject(column));
-                }
-                return row;
+                return rows.next() ? rowOf(rows) : null;
             }
         }
+    }
+
+    /** The row {@code rows} is on, by column label, in the order the query named its columns. */
+    private static Map<String, Object> rowOf(ResultSet rows) throws SQLException {
+        ResultSetMetaData columns = rows.getMetaData();
+        Map<String, Object> row = new LinkedHashMap<>();
+        for (int column = 1; column <= columns.getColumnCount(); column++) {
+            row.put(columns.getColumnLabel(column), rows.getObject(column));
+        }
+        return row;
     }
 
     private void insert(String table, Map<String, Object> row) throws SQLException {
