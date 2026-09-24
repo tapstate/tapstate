@@ -109,8 +109,8 @@ class APositionSaysWhichPositionItIsIT {
                     () -> String.valueOf(control.durablePosition(PIPELINE_ID, COLLECTION)));
             String acked = control.durablePosition(PIPELINE_ID, COLLECTION).orElseThrow();
 
-            CliOnce.Run run = CliOnce.runSession(PASSWORD, "metrics " + PIPELINE_ID + "\nexit\n",
-                    "-c", server.baseUrl().toString(), "-u", USER);
+            CliOnce.Run run = CliOnce.runWithPassword(PASSWORD,
+                    "-c", server.baseUrl().toString(), "-u", USER, "metrics", PIPELINE_ID);
 
             assertThat(run.exitCode())
                     .as("the session must have run; stdout was:%n%s%nstderr was:%n%s", run.stdout(), run.stderr())

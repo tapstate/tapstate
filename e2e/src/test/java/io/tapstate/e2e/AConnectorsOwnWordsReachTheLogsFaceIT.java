@@ -112,8 +112,8 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
                             && control.logs(REFUSED_PIPELINE).contains(ON_THE_SHARED_CHANNEL),
                     () -> control.logs(REFUSED_PIPELINE));
 
-            CliOnce.Run refused = CliOnce.runSession(PASSWORD, "logs " + REFUSED_PIPELINE + "\nexit\n",
-                    "-c", server.baseUrl().toString(), "-u", USER);
+            CliOnce.Run refused = CliOnce.runWithPassword(PASSWORD,
+                    "-c", server.baseUrl().toString(), "-u", USER, "logs", REFUSED_PIPELINE);
             assertThat(refused.exitCode())
                     .as("the session must have run; stdout was:%n%s%nstderr was:%n%s",
                             refused.stdout(), refused.stderr())
@@ -135,8 +135,8 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
                             && control.logs(TAIL_PIPELINE).contains(FROM_THE_TAIL_ALOUD),
                     () -> control.logs(TAIL_PIPELINE));
 
-            CliOnce.Run tail = CliOnce.runSession(PASSWORD, "logs " + TAIL_PIPELINE + "\nexit\n",
-                    "-c", server.baseUrl().toString(), "-u", USER);
+            CliOnce.Run tail = CliOnce.runWithPassword(PASSWORD,
+                    "-c", server.baseUrl().toString(), "-u", USER, "logs", TAIL_PIPELINE);
             assertThat(tail.stdout())
                     .as("what a connector says from the thread its tail runs on")
                     .contains(FROM_THE_TAIL)
