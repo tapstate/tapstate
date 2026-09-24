@@ -63,13 +63,54 @@ class ClusterWorkloadClaimsTest {
         gate.canCommit(Set.of("a", "b"));
         RecordingClaims raw = new RecordingClaims();
         ClusterWorkloadClaims claims = new ClusterWorkloadClaims(raw, gate);
-        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-a");
+        WorkloadClaimKey key =
+                new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
         WorkloadClaim revisionOne = raw.claim(key);
 
         gate.install(new ClusterMembership("cluster-a", 2, Set.of("a", "b", "c")));
         gate.canCommit(Set.of("a", "b"));
 
         assertThat(claims.renew(revisionOne, TTL)).isEmpty();
+        assertThat(raw.calls).hasValue(0);
+    }
+
+    /**
+     * A member joining moves the committed revision on and takes nothing from a source already being
+     * tailed, so the capture claims held across it go on renewing. Fencing them on the revision stopped
+     * every tail in the cluster within one renewal of a member joining, and the pipelines reading those
+     * tails were left failed: a holder has no way to take a capture claim again short of stopping the
+     * tail it guards.
+     */
+    @Test
+    void aMemberJoiningLeavesTheCaptureClaimsAlreadyHeldRenewable() {
+        ClusterMembershipGate gate = productionGate();
+        gate.install(new ClusterMembership("cluster-a", 1, Set.of("a", "b", "c")));
+        gate.canCommit(Set.of("a", "b", "c"));
+        RecordingClaims raw = new RecordingClaims();
+        ClusterWorkloadClaims claims = new ClusterWorkloadClaims(raw, gate);
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-a");
+        WorkloadClaim heldAtRevisionOne = raw.claim(key);
+
+        gate.install(new ClusterMembership("cluster-a", 2, Set.of("a", "b", "c", "d")));
+        gate.canCommit(Set.of("a", "b", "c", "d"));
+
+        assertThat(claims.renew(heldAtRevisionOne, TTL))
+                .as("a capture claim held before the join is renewed after it")
+                .isPresent();
+        assertThat(raw.calls).hasValue(1);
+    }
+
+    /** The exemption is from the revision only: a capture claim still needs the committed majority. */
+    @Test
+    void aCaptureClaimIsNotRenewedWithoutTheCommittedMajority() {
+        ClusterMembershipGate gate = productionGate();
+        gate.install(new ClusterMembership("cluster-a", 1, Set.of("a", "b", "c")));
+        gate.canCommit(Set.of("a"));
+        RecordingClaims raw = new RecordingClaims();
+        ClusterWorkloadClaims claims = new ClusterWorkloadClaims(raw, gate);
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-a");
+
+        assertThat(claims.renew(raw.claim(key), TTL)).isEmpty();
         assertThat(raw.calls).hasValue(0);
     }
 

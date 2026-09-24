@@ -43,6 +43,47 @@ class CaptureClaimLeaseTest {
         assertThat(raw.releases).as("a fenced holder must not release a claim it no longer owns").isZero();
     }
 
+    /**
+     * A member joining the cluster moves the committed topology on and takes nothing from a capture already
+     * being tailed, so its holder goes on holding it -- the lease is carried past the one it had when the
+     * member joined, under the same owner and generation. Refusing the renewal instead stopped every tail
+     * in the cluster within one renewal of any member joining.
+     */
+    @Test
+    void aMemberJoiningTheClusterLeavesTheCaptureItsHolderTailsRunning() {
+        InMemoryWorkloadClaimStore store = new InMemoryWorkloadClaimStore();
+        ClusterMembershipGate gate = eligibleGate();
+        WorkloadOwner owner = new WorkloadOwner("node-a", "boot-a");
+        CaptureOwnership ownership = new CaptureOwnership(
+                "cluster-a", owner, gate, new ClusterWorkloadClaims(store, gate), Duration.ofSeconds(30));
+        CaptureOwnership.Permit permit = ownership.acquire(CAPTURE);
+        AtomicBoolean lost = new AtomicBoolean();
+        CaptureClaimLease lease = new CaptureClaimLease(
+                ownership, permit.claim(), Duration.ofHours(1), () -> lost.set(true));
+        try {
+            gate.install(new ClusterMembership(
+                    "cluster-a", 4, Set.of("node-a", "node-b", "node-c", "node-d")));
+            gate.canCommit(Set.of("node-a", "node-b", "node-c", "node-d"));
+            store.elapse(Duration.ofSeconds(20));
+
+            lease.renew();
+            // Past the lease the claim had when the member joined: only a renewal that happened keeps it.
+            store.elapse(Duration.ofSeconds(20));
+
+            assertThat(lost).as("the capture keeps running across the join").isFalse();
+            assertThat(store.read(permit.claim().key())).hasValueSatisfying(reading -> {
+                assertThat(reading.claim().owner()).isEqualTo(owner);
+                assertThat(reading.claim().claimGeneration()).isEqualTo(permit.claim().claimGeneration());
+                assertThat(reading.leased()).as("renewed rather than left to lapse").isTrue();
+            });
+        } finally {
+            lease.close();
+        }
+    }
+
+    private static final CaptureId CAPTURE = CaptureId.of(
+            new CaptureConfig("mysql", Map.of("host", "db.internal"), List.of("orders")), null);
+
     private static ClusterMembershipGate eligibleGate() {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
