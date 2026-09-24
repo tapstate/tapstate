@@ -8,20 +8,19 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * What is written down about a member its own out-of-memory handling shuts down, and who is told.
+ * What is written down about a member its own out-of-memory handling shuts down.
  *
  * <p>Every member here is taken down, or left up, by the substrate's own handling: the error escapes one of its
  * threads and nothing in these cases shuts a member down directly, except the one case that is about a member
  * shut down on purpose. Whether a member is taken down stays the substrate's call. What is under test is only
- * what is written about it afterwards, and who hears.
+ * what is written about it afterwards.
  */
-@DisplayName("what is written down about a member lost to out-of-memory, and who is told")
+@DisplayName("what is written down about a member lost to out-of-memory")
 class MemberOutOfMemoryTest {
 
     private final List<HazelcastInstance> members = new ArrayList<>();
@@ -32,10 +31,9 @@ class MemberOutOfMemoryTest {
     }
 
     @Test
-    void aWatchedMemberTheHandlingShutsDownIsWrittenDownAndItsWatcherIsToldOnce() {
+    void aWatchedMemberTheHandlingShutsDownIsWrittenDown() {
         HazelcastInstance member = startMember();
-        AtomicInteger told = new AtomicInteger();
-        MemberOutOfMemory.watch(member, told::incrementAndGet);
+        MemberOutOfMemory.watch(member);
         assertThat(MemberOutOfMemory.of(member)).as("a member that is still running has lost nothing").isEmpty();
 
         OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise();
@@ -44,45 +42,57 @@ class MemberOutOfMemoryTest {
                 .as("the substrate's own handling took the member down")
                 .isFalse();
         assertThat(MemberOutOfMemory.of(member)).as("the error it was taken down over").containsSame(error);
-        assertThat(told).as("its watcher hears of it once").hasValue(1);
+    }
+
+    /**
+     * The handling is handed every member the process runs, once, and what is written is per member: no member's
+     * record stands in for another's, and none keeps another's from being written.
+     */
+    @Test
+    void everyWatchedMemberTheHandlingShutsDownIsWrittenDown() {
+        HazelcastInstance first = startMember();
+        HazelcastInstance second = startMember();
+        MemberOutOfMemory.watch(first);
+        MemberOutOfMemory.watch(second);
+
+        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise();
+
+        assertThat(MemberOutOfMemory.of(first)).containsSame(error);
+        assertThat(MemberOutOfMemory.of(second)).containsSame(error);
     }
 
     /**
      * The handling is handed every member the process runs, and it takes down the ones nobody watches exactly
-     * as it did before anything watched it. Only the watched member has anything written about it, and only its
-     * watcher is told.
+     * as it did before anything watched it. Only the watched member has anything written about it.
      */
     @Test
     void aMemberNobodyWatchesIsTakenDownAsBeforeAndNothingIsWrittenAboutIt() {
         HazelcastInstance watched = startMember();
         HazelcastInstance unwatched = startMember();
-        AtomicInteger told = new AtomicInteger();
-        MemberOutOfMemory.watch(watched, told::incrementAndGet);
+        MemberOutOfMemory.watch(watched);
 
         OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise();
 
         assertThat(unwatched.getLifecycleService().isRunning())
-                .as("whether a member is taken down is not up to its watcher")
+                .as("whether a member is taken down is not up to whoever watches it")
                 .isFalse();
         assertThat(MemberOutOfMemory.of(unwatched)).as("nothing is written about a member nobody watches").isEmpty();
         assertThat(MemberOutOfMemory.of(watched)).containsSame(error);
-        assertThat(told).as("one watcher, told about its own member only").hasValue(1);
     }
 
     /**
      * The server shutting its member down on purpose is the everyday way a member stops, and it must not read as
-     * one lost to memory: the engine fails every pipeline such a member carried.
+     * one lost to memory: the engine fails every pipeline such a member carried, and the process reports itself
+     * broken.
      */
     @Test
     void aMemberShutDownOnPurposeWasNotLostToOutOfMemory() {
         HazelcastInstance member = startMember();
-        AtomicInteger told = new AtomicInteger();
-        MemberOutOfMemory.watch(member, told::incrementAndGet);
+        MemberOutOfMemory.watch(member);
 
         member.shutdown();
 
         assertThat(MemberOutOfMemory.of(member)).isEmpty();
-        assertThat(told).as("nobody is told about a shutdown that was asked for").hasValue(0);
     }
 
     private HazelcastInstance startMember() {

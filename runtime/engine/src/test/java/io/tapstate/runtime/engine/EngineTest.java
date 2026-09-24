@@ -221,7 +221,7 @@ class EngineTest {
         Engine engine = new Engine(member);
         engine.submit("orders-pipe", foreverDag());
         awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
-        MemberOutOfMemory.watch(member, () -> { });
+        MemberOutOfMemory.watch(member);
 
         OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise();
 
@@ -245,7 +245,7 @@ class EngineTest {
         Engine engine = new Engine(member);
         engine.submit("orders-pipe", foreverDag());
         awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
-        MemberOutOfMemory.watch(member, () -> { });
+        MemberOutOfMemory.watch(member);
 
         OutOfMemoryOnAMemberThread.raise();
 
@@ -266,7 +266,7 @@ class EngineTest {
         Engine engine = new Engine(member);
         engine.submit("orders-pipe", foreverDag());
         awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
-        MemberOutOfMemory.watch(member, () -> { });
+        MemberOutOfMemory.watch(member);
 
         member.shutdown();
 

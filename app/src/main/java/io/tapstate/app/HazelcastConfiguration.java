@@ -29,10 +29,7 @@ import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
-import org.springframework.boot.availability.AvailabilityChangeEvent;
-import org.springframework.boot.availability.LivenessState;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
-import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.lang.Nullable;
@@ -69,16 +66,13 @@ class HazelcastConfiguration {
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
             @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
             @Nullable NestDeadLetterStore nestDeadLetterStore,
-            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
-            ApplicationEventPublisher events) {
+            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore) {
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         HazelcastInstance member = startMember(() -> Hazelcast.newHazelcastInstance(config));
         // A member its own out-of-memory handling shuts down leaves this process up and serving HTTP over an
-        // engine that no longer exists, and nothing short of a restart brings the engine back. So the process
-        // says it is broken, in the liveness its health check reports, where whatever decides on a restart
-        // looks. The engine reads the same record to fail the pipelines the member carried.
-        MemberOutOfMemory.watch(member,
-                () -> AvailabilityChangeEvent.publish(events, member, LivenessState.BROKEN));
+        // engine that no longer exists. Have that written down on the member: the engine reads it to fail the
+        // pipelines the member carried, and the process's liveness reads it to report the process broken.
+        MemberOutOfMemory.watch(member);
         // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
         // Jet source and resolved member-side -- can reach it through the user context and publish durable
         // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
@@ -160,8 +154,17 @@ class HazelcastConfiguration {
             KeyedStateStore nestStateStore, NestSettings nestSettings,
             NestDeadLetterStore nestDeadLetterStore, SrsLogStore srsLogStore) {
         return hazelcastMember(properties, srsMetaStore, connectorProvisioner, snapshotBuffer,
-                nestStateStore, nestSettings, nestDeadLetterStore, null, srsLogStore, event -> {
-                });
+                nestStateStore, nestSettings, nestDeadLetterStore, null, srsLogStore);
+    }
+
+    /**
+     * The application's availability, in place of the one Spring Boot would keep, which learns of a change only
+     * when the change is announced to it. This one also reads, whenever its liveness is asked for, whether
+     * {@code member} has been shut down for want of memory, and is broken once it has.
+     */
+    @Bean
+    EngineAvailability applicationAvailability(HazelcastInstance member) {
+        return new EngineAvailability(member);
     }
 
     /**

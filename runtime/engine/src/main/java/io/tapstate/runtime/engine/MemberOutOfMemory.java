@@ -6,12 +6,11 @@ import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.core.OutOfMemoryHandler;
 import com.hazelcast.instance.impl.DefaultOutOfMemoryHandler;
 
-import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Remembers that a member was shut down by its own out-of-memory handling, and tells whoever asked to be told.
+ * Remembers that a member was shut down by its own out-of-memory handling, for whoever asks afterwards.
  *
  * <p>When the heap runs out on one of a member's own threads, the substrate's out-of-memory handling decides
  * whether the member can go on, and when it cannot, shuts it down on the spot. It tells nobody. The member
@@ -24,11 +23,18 @@ import java.util.concurrent.atomic.AtomicReference;
  * the substrate's call. It is wrapped rather than rewritten because that decision tells a heap that is really
  * exhausted from a single allocation too large to fit, and only the first is a reason to lose the engine. What
  * is added is the one thing the handling lacks. Once it has taken a member down, the error is written on that
- * member, where {@link Engine} reads it, and the member's watcher is told.
+ * member, where {@link Engine} reads it, and so does anything else that must know, such as the process's
+ * liveness.
+ *
+ * <p>It is written down and nobody is told. The handling runs on the thread the error reached, on a heap that
+ * has just run out, and the substrate swallows whatever is thrown from it without a trace. Telling anyone from
+ * there can fail in exactly that way, and whoever was waiting to be told would then never learn it, while the
+ * record, which is set without allocating anything, already said the member was gone. So every reader asks the
+ * record, at the time it needs the answer.
  *
  * <p>The handling belongs to the process rather than to a member: there is one, and it is handed every member
- * the process runs. What is written, and who is told, is per member, so a member nobody watches is handled
- * exactly as before and nothing is written about it.
+ * the process runs. What is written is per member, so a member nobody watches is handled exactly as before and
+ * nothing is written about it.
  */
 public final class MemberOutOfMemory {
 
@@ -36,20 +42,14 @@ public final class MemberOutOfMemory {
 
     private static final OutOfMemoryHandler HANDLING = new Recording(new DefaultOutOfMemoryHandler());
 
-    private final Runnable whenShutDown;
-
     private final AtomicReference<OutOfMemoryError> error = new AtomicReference<>();
 
-    private MemberOutOfMemory(Runnable whenShutDown) {
-        this.whenShutDown = whenShutDown;
+    private MemberOutOfMemory() {
     }
 
-    /**
-     * Has the process's out-of-memory handling write down that it shut {@code member} down, and run
-     * {@code whenShutDown} once it has, on the thread the error reached.
-     */
-    public static void watch(HazelcastInstance member, Runnable whenShutDown) {
-        member.getUserContext().put(USER_CONTEXT_KEY, new MemberOutOfMemory(Objects.requireNonNull(whenShutDown)));
+    /** Has the process's out-of-memory handling write down that it shut {@code member} down, should it ever. */
+    public static void watch(HazelcastInstance member) {
+        member.getUserContext().put(USER_CONTEXT_KEY, new MemberOutOfMemory());
         Hazelcast.setOutOfMemoryHandler(HANDLING);
     }
 
@@ -89,15 +89,18 @@ public final class MemberOutOfMemory {
          * Written down only for a member that has actually stopped. The handling swallows a shutdown that
          * fails, and a member it could not stop is still carrying its pipelines, so it must not be reported
          * as lost.
+         *
+         * <p>Nothing else is run here. The substrate hands the members over once and never again, so anything
+         * thrown for one of them would leave every member after it unwritten for good. The slots it hands over
+         * may be empty; an empty one is passed over like a member nobody watches.
          */
         @Override
         public void onOutOfMemory(OutOfMemoryError error, HazelcastInstance[] members) {
             substrate.onOutOfMemory(error, members);
             for (HazelcastInstance member : members) {
-                if (!member.getLifecycleService().isRunning()
+                if (member != null && !member.getLifecycleService().isRunning()
                         && member.getUserContext().get(USER_CONTEXT_KEY) instanceof MemberOutOfMemory record) {
                     record.error.set(error);
-                    record.whenShutDown.run();
                 }
             }
         }
