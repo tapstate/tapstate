@@ -213,9 +213,7 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
                     nodes.forEach(cluster::restart);
                     cluster.awaitMembers("node-a", nodes.size());
                     ControlPlane back = cluster.member("node-a");
-                    if (back.state(PIPELINE).filter(PipelineState.RUNNING::equals).isEmpty()) {
-                        back.lifecycle(PIPELINE, LifecycleVerb.START);
-                    }
+                    back.startUnlessRunning(PIPELINE);
                     Await.until("the changes made during the outage to cross once the members are back",
                             RECOVERY,
                             () -> files.count(targetAddress, TABLE)

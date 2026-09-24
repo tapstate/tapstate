@@ -1044,6 +1044,31 @@ final class ControlPlane {
     }
 
     /**
+     * Starts the pipeline unless it is running already, and answers whether this call is what started it.
+     *
+     * <p>Reading "not running" and then starting is a race wherever something else may bring the pipeline
+     * back first -- a restarted member's own convergence does, a moment after it comes up -- and the product
+     * then refuses the start as a transition out of RUNNING. That refusal is the outcome a caller who only
+     * wanted the pipeline running was after, so it is taken as one; any other refusal still fails.
+     */
+    boolean startUnlessRunning(String pipelineId) {
+        HttpResponse<String> response =
+                send(authed("/api/pipelines/" + pipelineId + ":" + LifecycleVerb.START.id(), ""));
+        if (response.statusCode() == 409 && refusedAsAlreadyRunning(response.body())) {
+            return false;
+        }
+        expect(response, 200, LifecycleVerb.START.id() + " " + pipelineId);
+        return true;
+    }
+
+    private static boolean refusedAsAlreadyRunning(String body) {
+        return JsonReader.parse(body) instanceof Map<?, ?> refusal
+                && "lifecycle.illegal-transition".equals(refusal.get("code"))
+                && refusal.get("params") instanceof Map<?, ?> params
+                && PipelineState.RUNNING.name().equals(params.get("from"));
+    }
+
+    /**
      * Stops the pipeline, saying whether stopping also clears what it has accumulated -- its resume
      * position and its operators' state.
      */
