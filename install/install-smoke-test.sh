@@ -12,6 +12,11 @@
 # Both are driven below, and each report has to say which of the two it was: a sink that crashed and
 # one still stuck before it listens are fixed in different places, and a report that reads the same for
 # both leaves whoever reads a runner's log to guess.
+#
+# A sink can also bind, publish its port and then exit, as one whose server fails once it is up does.
+# Its port is on disk, but every case pointed at it is refused and fails as though the installer had
+# sent nothing, so it has not started either. That sink is driven below too, and its report has to say
+# it exited after it bound: what failed in it is not what fails in a sink that never bound.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -46,8 +51,8 @@ read_event_section() {
 # python3 run stays real, or the cases around the sink fail too and this proves nothing about it.
 REAL_PYTHON3="$(command -v python3 || true)"
 [ -n "$REAL_PYTHON3" ] || { printf 'FAIL  python3 is needed: the smoke runs its sink with it\n' >&2; exit 1; }
-# The refused sink's exit status. Not 1, which is what a Python error and a failing kill -0 both give, so
-# a report naming this one has read it off the sink.
+# The exit status of each sink below that exits. Not 1, which is what a Python error and a failing kill -0
+# both give, so a report naming this one has read it off the sink.
 SINK_STATUS=3
 mkdir -p "$SCRATCH/bin"
 cat > "$SCRATCH/bin/python3" <<EOF
@@ -70,12 +75,58 @@ if [ ! -e "$SCRATCH/sink-refused" ]; then
 fi
 read_event_section
 if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails" \
-   && grep -q "exited with status $SINK_STATUS" "$SCRATCH/event-fails" \
+   && grep -q "exited with status $SINK_STATUS before it bound" "$SCRATCH/event-fails" \
    && ! grep -q 'still running' "$SCRATCH/event-fails"; then
-  printf 'PASS  a sink that exits without binding a port is reported as one failure, which names the sink and the status it exited with\n'
+  printf 'PASS  a sink that exits without binding a port is reported as one failure, which names the sink and the status it exited with before it bound\n'
 else
   cat "$SCRATCH/out" >&2
-  printf 'FAIL  a sink that exits without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink and its exit status %s\n' \
+  printf 'FAIL  a sink that exits without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink and its exit status %s before it bound\n' \
+    "$fails" "$status" "$SINK_STATUS" >&2
+  exit 1
+fi
+
+# The same sink exiting later instead: the real sink runs, binds and publishes its port, and only then
+# exits, where it would start to serve. A wait that trusts the port alone takes it as started and hands
+# every case an endpoint that refuses them. Only the sink's own run has its serve_forever replaced, and
+# the replacement exits at once, with no interpreter teardown, so the sink is gone before the wait looks
+# at it again. A sink still dying when the wait looks cannot be told from one about to serve.
+mkdir -p "$SCRATCH/bound/site"
+cat > "$SCRATCH/bound/site/sitecustomize.py" <<EOF
+import os, socketserver
+def serve_forever(self, *args, **kwargs):
+    os._exit($SINK_STATUS)
+socketserver.BaseServer.serve_forever = serve_forever
+EOF
+cat > "$SCRATCH/bound/python3" <<EOF
+#!/bin/sh
+# Run the real sink with a server that exits once it is bound, and leave a mark that the sink ran.
+for arg in "\$@"; do
+  if [ "\$arg" = - ]; then
+    : > "$SCRATCH/sink-bound"
+    PYTHONPATH="$SCRATCH/bound/site\${PYTHONPATH:+:\$PYTHONPATH}"
+    export PYTHONPATH
+    exec "$REAL_PYTHON3" "\$@"
+  fi
+done
+exec "$REAL_PYTHON3" "\$@"
+EOF
+chmod +x "$SCRATCH/bound/python3"
+
+status=0
+PATH="$SCRATCH/bound:$PATH" bash "$HERE/install-smoke.sh" > "$SCRATCH/out" 2>&1 || status=$?
+
+if [ ! -e "$SCRATCH/sink-bound" ]; then
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  the smoke never started its sink from a python3 program on stdin, so nothing here was tested\n' >&2
+  exit 1
+fi
+read_event_section
+if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails" \
+   && grep -q "exited with status $SINK_STATUS after it bound" "$SCRATCH/event-fails"; then
+  printf 'PASS  a sink that exits after it binds a port is reported as one failure, which names the sink and the status it exited with after it bound\n'
+else
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  a sink that exits after it binds a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink and its exit status %s after it bound\n' \
     "$fails" "$status" "$SINK_STATUS" >&2
   exit 1
 fi

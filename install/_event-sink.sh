@@ -10,10 +10,11 @@
 # The program stays on python3's stdin rather than in a file of its own, because each smoke's verdict
 # test recognises the sink as the one program the smoke hands python3 on stdin.
 
-# Starts the sink and succeeds once it has published the port it bound. Sets SINK_PID; SINK_DIR, whose
-# log holds each event body that arrived, one per line; and, on success, SINK_URL, the endpoint to hand
-# the script under test. Fails when the sink exits, or has bound no port after about 15 seconds, and
-# then sets SINK_FAILURE to which of the two it was, worded to follow "the local sink".
+# Starts the sink and succeeds once it has published the port it bound and is still alive after that.
+# Sets SINK_PID; SINK_DIR, whose log holds each event body that arrived, one per line; and, on success,
+# SINK_URL, the endpoint to hand the script under test. Fails when the sink exits, before or after it
+# bound a port, or has bound no port after about 15 seconds, and then sets SINK_FAILURE to which of these
+# it was, worded to follow "the local sink".
 start_sink() {
   SINK_DIR="$(mktemp -d)"
   : > "$SINK_DIR/log"
@@ -38,24 +39,38 @@ PYEOF
   SINK_PID=$!
   # About 15s for a slow machine, and never longer than the sink lives: one that died is not waited on.
   for _ in $(seq 1 150); do
-    if [ -s "$SINK_DIR/port" ]; then
-      # shellcheck disable=SC2034  # read by whoever sources this
-      SINK_URL="http://127.0.0.1:$(cat "$SINK_DIR/port")/e"
-      return 0
-    fi
+    [ -s "$SINK_DIR/port" ] && break
     kill -0 "$SINK_PID" 2>/dev/null || break
     sleep 0.1
   done
+  # A published port is not yet a started sink. One that died once it had bound, as it does when its
+  # server fails on the way up, leaves its port behind, and every case pointed at that port is refused
+  # and fails as though the script under test had sent nothing. So the sink counts as started only if it
+  # is still alive once its port has been read.
+  if [ -s "$SINK_DIR/port" ]; then
+    local port
+    port="$(cat "$SINK_DIR/port")"
+    if kill -0 "$SINK_PID" 2>/dev/null; then
+      # shellcheck disable=SC2034  # read by whoever sources this
+      SINK_URL="http://127.0.0.1:$port/e"
+      return 0
+    fi
+  fi
   # A sink that crashed and one still stuck before it listens, as the name lookup on the macOS runners
-  # kept it, are fixed in different places, so the failure says which it was, and for a crash the status
-  # it exited with, which the wait in stop_sink would otherwise discard.
+  # kept it, are fixed in different places, and so are a crash before the sink bound and one after. The
+  # failure says which it was, and for a crash the status it exited with, which the wait in stop_sink
+  # would otherwise discard. A dead sink's port file no longer changes, so it tells the two crashes apart.
   local status=0
   # shellcheck disable=SC2034  # read by whoever sources this
   if kill -0 "$SINK_PID" 2>/dev/null; then
     SINK_FAILURE="was still running after about 15 seconds without having bound a port"
   else
     wait "$SINK_PID" || status=$?
-    SINK_FAILURE="exited with status $status before it bound a port"
+    if [ -s "$SINK_DIR/port" ]; then
+      SINK_FAILURE="exited with status $status after it bound a port"
+    else
+      SINK_FAILURE="exited with status $status before it bound a port"
+    fi
   fi
   return 1
 }
