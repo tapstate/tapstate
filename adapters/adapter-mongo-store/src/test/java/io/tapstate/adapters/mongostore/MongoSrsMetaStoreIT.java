@@ -312,6 +312,57 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void aChangeAckRaisesItsOwnTablesRingPlaceAndNeverLowersIt() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 9), "t9"));
+            store.advanceSinkAcked(CHAIN, "p1", "items", new ChainPosition(new SourceOrder(1, 4), "t4"));
+            // Two members confirming at once can land out of order; the place in the ring only moves forward.
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 7), "t7"));
+            // A snapshot row sits beneath every change and is no place in any ring.
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(SourceOrder.snapshotRow(1), "s"));
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1"))
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 9L, "items", 4L));
+            assertThat(onlyConsumer(store).sinkAckedSrcpos())
+                    .as("the chain's acked position is written in the same update, as it always was")
+                    .isEqualTo("s");
+        });
+    }
+
+    @Test
+    void anArrivalIsMarkedOnceAndNeverMovesAPlaceThePipelineAlreadyHas() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 3), "t3"));
+
+            // A run coming back arrives on a ring that has moved on; its place is where its target got to.
+            store.startRingAfter(CHAIN, "p1", "orders", 20);
+            // A table it never had a place in is marked where the ring stands.
+            store.startRingAfter(CHAIN, "p1", "items", 20);
+            store.startRingAfter(CHAIN, "p1", "items", 30);
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1"))
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 3L, "items", 20L));
+        });
+    }
+
+    @Test
+    void aRewrittenConsumerRecordCarriesNoRingPlaces() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 5), "t5"));
+
+            // What a write-back that lets the acks go does: the record is rewritten without them, and the
+            // next run starts where its read mode puts it rather than past a place nothing now stands behind.
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("p1", Map.of(), null));
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1")).isEmpty();
+        });
+    }
+
+    @Test
     void setCdcStartPersistsEachPipelinesSeamPositionAndGenerationIndependently() {
         withStore(store -> {
             store.create(CHAIN, null);

@@ -1,5 +1,11 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.ClusterClaimView;
+import io.tapstate.control.core.ClusterMemberView;
+import io.tapstate.control.core.ClusterPipelineView;
+import io.tapstate.control.core.ClusterProcessorView;
+import io.tapstate.control.core.ClusterTopologyView;
+import io.tapstate.control.core.ClusterVertexView;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.ApplyResult;
 import io.tapstate.core.common.TapstateException;
@@ -699,13 +705,90 @@ class ControlApiTest {
     }
 
     @Test
-    void clusterMembersIsRoutedButNotYetImplemented() {
-        // Topology must never leak anonymously: until the authentication interceptor and the member
-        // listing land, the endpoint is reserved and answers 501 — it exposes nothing.
-        HttpStatusCode status = client().get().uri("/api/cluster/members")
-                .exchange((request, response) -> response.getStatusCode());
+    void clusterMembersAnswersEachMembersStableAndRuntimeIdentityAndItsControlUrl() {
+        // The two identities are both there on purpose: the stable one is what a claim names as an owner,
+        // and the runtime pair is how a node that restarted is told from the one it replaced. The control
+        // URL is what a client does with the answer -- it is the address a reader can actually reach.
+        ClusterTopologyView topology = client().get().uri("/api/cluster/members")
+                .retrieve().body(ClusterTopologyView.class);
 
-        assertThat(status).isEqualTo(HttpStatus.NOT_IMPLEMENTED);
+        assertThat(topology.members())
+                .extracting(ClusterMemberView::nodeId, ClusterMemberView::memberUuid,
+                        ClusterMemberView::bootId, ClusterMemberView::hzAddress,
+                        ClusterMemberView::controlUrl)
+                .as("both members, and each of them said who it is and where to reach it")
+                .containsExactly(
+                        tuple("node-a", "8b0a1e6e-0000-4000-8000-00000000000a", "boot-a1",
+                                "[127.0.0.1]:5701", "https://node-a.example:8443"),
+                        tuple("node-b", "8b0a1e6e-0000-4000-8000-00000000000b", "boot-b1",
+                                "[127.0.0.1]:5702", "https://node-b.example:8443"));
+    }
+
+    @Test
+    void clusterMembersAlsoAnswersWhoOwnsEachPipelineAndWhereItsWorkIsRunning() {
+        // Ownership and placement are one answer with the members, not a second read: the work is
+        // reported against members, and a reader who had to take two readings to join them would be
+        // joining two different moments of the cluster.
+        ClusterTopologyView topology = client().get().uri("/api/cluster/members")
+                .retrieve().body(ClusterTopologyView.class);
+
+        assertThat(topology.pipelines()).hasSize(1);
+        ClusterPipelineView pipeline = topology.pipelines().get(0);
+        assertThat(pipeline.pipelineId()).isEqualTo(ClusterTopologyTestConfiguration.PIPELINE);
+        assertThat(pipeline.controllerClaim())
+                .as("who actuates it, and under which generations -- the pair is what tells one run of "
+                        + "a pipeline from the next")
+                .isEqualTo(new ClusterClaimView(
+                        ClusterTopologyTestConfiguration.PIPELINE, "node-b", "boot-b1", 3, 7, 4, true));
+        assertThat(pipeline.captureClaims())
+                .as("and who reads its sources, which is a separate ownership with its own generations")
+                .containsExactly(new ClusterClaimView(
+                        ClusterTopologyTestConfiguration.CAPTURE, "node-a", "boot-a1", 1, 1, 4, true));
+        assertThat(pipeline.measuredFrom())
+                .as("which members this picture was assembled from; against the member list it says "
+                        + "whether the picture is complete")
+                .containsExactly(
+                        ClusterTopologyTestConfiguration.FIRST.memberUuid(),
+                        ClusterTopologyTestConfiguration.SECOND.memberUuid());
+        assertThat(pipeline.vertices())
+                .extracting(ClusterVertexView::name, ClusterVertexView::effective,
+                        ClusterVertexView::executionId)
+                .as("a vertex pinned to one member runs one processor, not one per member: the engine "
+                        + "puts a placeholder on the others, and publishing those would report a pinned "
+                        + "vertex as running everywhere")
+                .containsExactly(
+                        tuple("source", 1, "1002-8287-ca81-0001"),
+                        tuple("serve-orders", 2, "1002-8287-ca81-0001"));
+        assertThat(pipeline.vertices().get(0).processors())
+                .as("and the processor names the stable node as well as the engine's identity for this "
+                        + "run of it, because a claim names the stable one")
+                .containsExactly(new ClusterProcessorView(
+                        0, ClusterTopologyTestConfiguration.SECOND.memberUuid(), "node-b"));
+        assertThat(pipeline.awaitingRebalance())
+                .as("both members were planned into this run -- one doing the pinned vertex's work and "
+                        + "one holding the instance that stands in for it -- so neither is waiting on "
+                        + "anything, and a member holding only a placeholder must not read as idle")
+                .isEmpty();
+        assertThat(pipeline.vertices().get(0).requested())
+                .as("nothing in the plan pins a vertex's parallelism yet, and absent is not the same as "
+                        + "the one processor that happened to run")
+                .isNull();
+    }
+
+    @Test
+    void theTopologyCrossesTheWireUnderTheNamesAndTypesItsReadersLookFor() {
+        // This is the seam. On the other side of it the CLI looks these fields up by name and reads the
+        // moment as text; a field renamed here, or a time written as an epoch number, decodes there into
+        // an answer with a hole in it, and every case on either side of the seam stays green.
+        String body = client().get().uri("/api/cluster/members").retrieve().body(String.class);
+
+        assertThat(body).contains("\"measuredAt\":\""
+                + ClusterTopologyTestConfiguration.MEASURED_AT.toString() + "\"");
+        assertThat(body).contains(
+                "\"controllerClaim\"", "\"captureClaims\"", "\"claimGeneration\"",
+                "\"executionGeneration\"", "\"leased\"", "\"measuredFrom\"",
+                "\"awaitingRebalance\"", "\"vertices\"", "\"effective\"", "\"executionId\"",
+                "\"processors\"", "\"memberUuid\"");
     }
 
     // ---- the endpoint table is a derivation of the registry ----
@@ -772,7 +855,8 @@ class ControlApiTest {
      */
     @SpringBootConfiguration
     @EnableAutoConfiguration
-    @Import({RestApiConfiguration.class, SourceDraftTestConfiguration.class, ArtifactController.class,
+    @Import({RestApiConfiguration.class, SourceDraftTestConfiguration.class,
+            ClusterTopologyTestConfiguration.class, ArtifactController.class,
             SourceDraftController.class, ConnectionController.class,
             ClusterController.class, HealthController.class, VersionController.class,
             ApiExceptionHandler.class, FaultController.class})

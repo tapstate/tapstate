@@ -1,6 +1,9 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.MongoCollection;
+import com.mongodb.ReadConcern;
+import com.mongodb.ReadPreference;
+import com.mongodb.WriteConcern;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.model.Updates;
@@ -21,7 +24,10 @@ public final class MongoClusterIdentityStore implements ClusterIdentityStore {
     private final MongoCollection<Document> collection;
 
     public MongoClusterIdentityStore(MongoCollection<Document> collection) {
-        this.collection = Objects.requireNonNull(collection, "collection");
+        this.collection = Objects.requireNonNull(collection, "collection")
+                .withReadPreference(ReadPreference.primary())
+                .withReadConcern(ReadConcern.MAJORITY)
+                .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
     }
 
     @Override

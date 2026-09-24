@@ -12,6 +12,7 @@ import io.tapstate.runtime.scheduler.NestColdLayerWatch;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.adapters.otel.OtelMetricsExport;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.StorePort;
@@ -55,8 +56,11 @@ class RuntimeConvergenceConfiguration {
     }
 
     @Bean
-    PipelineConverger pipelineConverger(StorePort storePort, LifecycleActuator lifecycleActuator, Clock clock) {
-        return new PipelineConverger(storePort.desired(), storePort.state(), lifecycleActuator, clock);
+    PipelineConverger pipelineConverger(
+            StorePort storePort, LifecycleActuator lifecycleActuator, Clock clock,
+            RebuildAdmission rebuildAdmission) {
+        return new PipelineConverger(
+                storePort.desired(), storePort.state(), lifecycleActuator, clock, rebuildAdmission);
     }
 
     @Bean
@@ -132,9 +136,12 @@ class RuntimeConvergenceConfiguration {
     }
 
     @Bean
-    ConvergenceDriver convergenceDriver(PipelineConverger pipelineConverger, StorePort storePort,
-            ObservationPublisher observationPublisher, RateSampler rateSampler, MetricsExport metricsExport) {
-        return new ConvergenceDriver(pipelineConverger, storePort.desired(), observationPublisher, rateSampler,
-                metricsExport);
+    ConvergenceDriver convergenceDriver(
+            PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
+            RateSampler rateSampler, MetricsExport metricsExport,
+            ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership) {
+        return new ConvergenceDriver(
+                pipelineConverger, storePort.desired(), observationPublisher, rateSampler, metricsExport,
+                membershipGate::businessEligible, pipelineActuationOwnership);
     }
 }

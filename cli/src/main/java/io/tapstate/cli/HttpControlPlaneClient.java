@@ -767,6 +767,133 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
     }
 
+    @Override
+    public ClusterMembersOutcome clusterMembers(URI baseUrl, String credential) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/cluster/members", credential).GET().build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                return topology(response.body());
+            }
+            Rejection r = rejection(response.body(), "The server refused the read.");
+            return new ClusterMembersOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new ClusterMembersOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new ClusterMembersOutcome.Unreachable();
+        }
+    }
+
+    /** The topology decoded from a 200 body; a field the server did not send stays null, never a default. */
+    private static ClusterMembersOutcome.Listed topology(String body) {
+        List<RemoteClusterMember> members = new ArrayList<>();
+        List<RemotePipeline> pipelines = new ArrayList<>();
+        String clusterId = null;
+        Long revision = null;
+        if (JsonReader.parse(body) instanceof Map<?, ?> map) {
+            clusterId = stringOrNull(map.get("clusterId"));
+            revision = map.get("topologyRevision") instanceof Number n ? n.longValue() : null;
+            if (map.get("members") instanceof List<?> list) {
+                for (Object o : list) {
+                    if (o instanceof Map<?, ?> m) {
+                        members.add(new RemoteClusterMember(
+                                stringOrNull(m.get("nodeId")),
+                                stringOrNull(m.get("memberUuid")),
+                                stringOrNull(m.get("bootId")),
+                                stringOrNull(m.get("hzAddress")),
+                                stringOrNull(m.get("controlUrl")),
+                                stringOrNull(m.get("state"))));
+                    }
+                }
+            }
+            pipelines.addAll(pipelines(map));
+        }
+        return new ClusterMembersOutcome.Listed(clusterId, revision, members, pipelines);
+    }
+
+    /** The pipeline half of a topology body; a field the server did not send stays null. */
+    private static List<RemotePipeline> pipelines(Map<?, ?> map) {
+        List<RemotePipeline> pipelines = new ArrayList<>();
+        if (!(map.get("pipelines") instanceof List<?> list)) {
+            return pipelines;
+        }
+        for (Object entry : list) {
+            if (!(entry instanceof Map<?, ?> m)) {
+                continue;
+            }
+            List<RemoteClaim> captures = new ArrayList<>();
+            if (m.get("captureClaims") instanceof List<?> claims) {
+                for (Object claim : claims) {
+                    if (claim instanceof Map<?, ?> c) {
+                        captures.add(claim(c));
+                    }
+                }
+            }
+            List<String> measuredFrom = new ArrayList<>();
+            if (m.get("measuredFrom") instanceof List<?> from) {
+                for (Object member : from) {
+                    measuredFrom.add(stringOrNull(member));
+                }
+            }
+            List<String> awaiting = new ArrayList<>();
+            if (m.get("awaitingRebalance") instanceof List<?> waiting) {
+                for (Object member : waiting) {
+                    awaiting.add(stringOrNull(member));
+                }
+            }
+            List<RemoteVertex> vertices = new ArrayList<>();
+            if (m.get("vertices") instanceof List<?> list2) {
+                for (Object vertex : list2) {
+                    if (vertex instanceof Map<?, ?> v) {
+                        vertices.add(vertex(v));
+                    }
+                }
+            }
+            pipelines.add(new RemotePipeline(
+                    stringOrNull(m.get("pipelineId")),
+                    m.get("controllerClaim") instanceof Map<?, ?> c ? claim(c) : null,
+                    captures,
+                    stringOrNull(m.get("measuredAt")),
+                    measuredFrom,
+                    awaiting,
+                    vertices));
+        }
+        return pipelines;
+    }
+
+    private static RemoteClaim claim(Map<?, ?> claim) {
+        return new RemoteClaim(
+                stringOrNull(claim.get("resourceId")),
+                stringOrNull(claim.get("ownerNodeId")),
+                stringOrNull(claim.get("ownerBootId")),
+                claim.get("claimGeneration") instanceof Number n ? n.longValue() : null,
+                claim.get("executionGeneration") instanceof Number n ? n.longValue() : null,
+                claim.get("leased") instanceof Boolean b ? b : null);
+    }
+
+    private static RemoteVertex vertex(Map<?, ?> vertex) {
+        List<RemoteProcessor> processors = new ArrayList<>();
+        if (vertex.get("processors") instanceof List<?> list) {
+            for (Object processor : list) {
+                if (processor instanceof Map<?, ?> p) {
+                    processors.add(new RemoteProcessor(
+                            p.get("index") instanceof Number n ? n.intValue() : null,
+                            stringOrNull(p.get("memberUuid")),
+                            stringOrNull(p.get("nodeId"))));
+                }
+            }
+        }
+        return new RemoteVertex(
+                stringOrNull(vertex.get("name")),
+                vertex.get("requested") instanceof Number n ? n.intValue() : null,
+                vertex.get("effective") instanceof Number n ? n.intValue() : null,
+                vertex.get("computedLocal") instanceof Number n ? n.intValue() : null,
+                stringOrNull(vertex.get("executionId")),
+                processors);
+    }
+
     /** The connectors decoded from a 200 body's {@code connectors} array; empty if the shape is unexpected. */
     private static List<CatalogConnector> catalogConnectors(String body) {
         List<CatalogConnector> connectors = new ArrayList<>();
@@ -1615,7 +1742,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     // --- streaming reads over a websocket (status --watch / logs --follow) -----------------------
 
-    /** How long to wait after a live connection drops before re-attaching (same landing node in L1). */
+    /** How long to wait after a live connection drops before the caller may attach anywhere again. */
     private static final Duration RECONNECT_BACKOFF = Duration.ofSeconds(1);
 
     /** How often the blocking stream loop wakes to check the stop signal while waiting. */
@@ -1690,40 +1817,43 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     /**
      * Opens a websocket to {@code wsUri}, delivering each decoded text frame to {@code onFrame}, and blocks
-     * until {@code stop} signals. A refused or unreachable handshake ends the stream; a live connection that
-     * later drops is re-attached after a short backoff until stopped. One close is terminal rather than a
-     * drop: the server closing with {@code 1008} whose reason names a coded refusal — the stream can never
-     * be served (e.g. a pipeline id that will never resolve), so re-attaching would be refused identically
-     * forever, churning the connection while the caller waits on something that cannot come. That refusal's
-     * code is returned; every other ending returns {@code null}. Never throws.
+     * until {@code stop} signals or the connection ends. One close is terminal rather than a drop: the
+     * server closing with {@code 1008} whose reason names a coded refusal — the stream can never be served
+     * (e.g. a pipeline id that will never resolve), so attaching again would be refused identically
+     * forever, churning the connection while the caller waits on something that cannot come. That
+     * refusal's code is returned; every other ending returns {@code null}. Never throws.
+     *
+     * <p>A dropped connection ends this call rather than being re-attached here. The node behind
+     * {@code wsUri} may be the one that went away, and this layer knows of no other: which member to
+     * attach to next is the session's question, and answering it here by retrying the same address is how
+     * a stream stays pointed at a member that is gone. The short pace before returning stays here,
+     * though, so that every caller gets it without having to remember to.
      */
     private String stream(URI wsUri, String credential, BooleanSupplier stop, Consumer<String> onFrame) {
-        while (!stop.getAsBoolean()) {
-            CountDownLatch closed = new CountDownLatch(1);
-            AtomicReference<String> refusal = new AtomicReference<>();
-            WebSocket ws;
-            try {
-                ws = client().newWebSocketBuilder()
-                        .header("Authorization", "Bearer " + credential)
-                        .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal))
-                        .join();
-            } catch (RuntimeException handshakeFailed) {
-                // join() wraps a refused (401/403) or unreachable handshake in a CompletionException (a
-                // RuntimeException); either way it cannot be streamed, so end the stream.
-                return null;
-            }
-            awaitClosedOrStop(closed, stop);
-            ws.abort();
-            if (refusal.get() != null) {
-                return refusal.get();
-            }
-            if (stop.getAsBoolean()) {
-                return null;
-            }
-            // A live connection dropped (not a stop): re-attach after a short backoff.
-            if (!sleepUnlessStopped(RECONNECT_BACKOFF, stop)) {
-                return null;
-            }
+        if (stop.getAsBoolean()) {
+            return null;
+        }
+        CountDownLatch closed = new CountDownLatch(1);
+        AtomicReference<String> refusal = new AtomicReference<>();
+        WebSocket ws;
+        try {
+            ws = client().newWebSocketBuilder()
+                    .header("Authorization", "Bearer " + credential)
+                    .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal))
+                    .join();
+        } catch (RuntimeException handshakeFailed) {
+            // join() wraps a refused (401/403) or unreachable handshake in a CompletionException (a
+            // RuntimeException); either way this node is not serving the stream right now.
+            sleepUnlessStopped(RECONNECT_BACKOFF, stop);
+            return null;
+        }
+        awaitClosedOrStop(closed, stop);
+        ws.abort();
+        if (refusal.get() != null) {
+            return refusal.get();
+        }
+        if (!stop.getAsBoolean()) {
+            sleepUnlessStopped(RECONNECT_BACKOFF, stop);
         }
         return null;
     }

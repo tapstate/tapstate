@@ -8,6 +8,9 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+cluster.membership-unreadable:
+  message: "This member cannot read who is in the cluster right now."
+  solution: "Its engine cannot answer for the cluster yet, which is what a member looks like while it is starting, while it is stopping, while the cluster is putting itself back together after a partition healed, and while it settles after another member has left. Ask another member, or read again in a moment."
 actuation.pipeline-not-found:
   message: "No pipeline artifact `{pipeline}` is stored to run."
   solution: "Apply the pipeline before starting it, and check the id for typos."
@@ -84,9 +87,54 @@ actuation.from-regex-invalid:
 actuation.from-regex-empty:
   message: "The pipeline `from` regex `{regex}` matches no upstream vertex."
   solution: "Use a regex matching a selected source table or an earlier transform step."
+boot.cluster-id-required:
+  message: "Cluster discovery requires an explicit stable cluster id."
+  solution: "Set tapstate.cluster.id to the same stable value on every member."
+boot.cluster-id-invalid:
+  message: "The configured cluster id is not a valid stable identity."
+  solution: "Use a non-blank cluster id that contains no colon."
+boot.cluster-id-mismatch:
+  message: "Configured cluster id `{configured}` does not match stored cluster id `{stored}`."
+  solution: "Point every member at the intended control store and configure its stored cluster id."
+boot.cluster-profile-invalid:
+  message: "The selected cluster profile and bootstrap member count are not a supported combination."
+  solution: "Use single with discovery none, process-failure-only with 2 members, or production-ha with at least 3 members."
+boot.coordination-store-required:
+  message: "Cluster discovery requires the Mongo-backed coordination store."
+  solution: "Enable the Mongo store and configure it as a replica set before starting a cluster member."
+boot.control-advertise-url-invalid:
+  message: "Cluster discovery requires an absolute HTTP(S) control advertise URL naming a host other machines can reach."
+  solution: "Set tapstate.control.advertise-url to the URL other members and clients can reach."
+boot.discovery-config-invalid:
+  message: "The cluster discovery configuration is invalid: {detail}."
+  solution: "Choose one explicit discovery mode and provide all inputs required by that mode."
 boot.hazelcast-unavailable:
   message: "The embedded Hazelcast member could not start."
-  solution: "Another process may already be using the member port on loopback; stop it or set a different port, then restart."
+  solution: "Another process may already be using the member port; free it, or set tapstate.hz.member-port to one that is free, then restart."
+boot.heartbeat-config-invalid:
+  message: "The member heartbeat settings cannot detect failure safely."
+  solution: "Use whole-second positive durations and set maximum-no-heartbeat longer than heartbeat-interval."
+boot.member-bind-address-invalid:
+  message: "The Hazelcast member bind address is not valid for the selected discovery mode."
+  solution: "Keep 127.0.0.1 with discovery mode none, or set a routable IP address of this host for cluster mode; a host name is not accepted."
+boot.node-id-required:
+  message: "Cluster discovery requires an explicit stable node id."
+  solution: "Set tapstate.cluster.node-id to a value that remains stable across restarts and is unique in the cluster."
+boot.node-id-in-use:
+  message: "Stable node id `{nodeId}` is already held by another live process."
+  solution: "Use a unique node id or wait for the previous node-session lease to expire."
+boot.node-session-renew-interval-invalid:
+  message: "The node-session renewal interval must be positive and shorter than its lease lifetime."
+  solution: "Set tapstate.cluster.node-session-renew-interval below tapstate.cluster.node-session-ttl."
+boot.node-session-ttl-invalid:
+  message: "The node-session lease lifetime must be positive."
+  solution: "Set tapstate.cluster.node-session-ttl to a positive duration."
+boot.workload-claim-renew-interval-invalid:
+  message: "The workload-claim renewal interval must be positive and shorter than its lease."
+  solution: "Set tapstate.cluster.workload-claim-renew-interval below tapstate.cluster.workload-claim-ttl."
+boot.workload-claim-ttl-invalid:
+  message: "The workload-claim lease must be positive."
+  solution: "Set tapstate.cluster.workload-claim-ttl to a positive duration."
 capture.start-from-unparsable:
   message: "Cannot start consuming from `{value}`; expected `earliest`, `latest`, or an ISO-8601 timestamp."
   solution: "Set start_from to earliest, latest, or an ISO-8601 timestamp like 2026-07-11T00:00:00Z."
@@ -96,6 +144,18 @@ capture.start-from-outside-window:
 capture.event-table-not-selected:
   message: "The capture stream emitted table `{table}`, which this pipeline did not select."
   solution: "Update the source table selection or verify the connector emits the configured table names."
+capture.claim-lost:
+  message: "Capture `{captureId}` lost its cluster ownership claim."
+  solution: "Let the current owner continue from the durable position; do not restart the fenced process."
+capture.no-ring-to-attach:
+  message: "Capture `{captureId}` had no change ring open after {seconds}s and this member could not take it over, so the pipeline had nothing to attach to."
+  solution: "Check that the member holding the capture is running and that every member can reach the coordination store, then start the pipeline again."
+capture.cluster-refused-the-read:
+  message: "The cluster refused reads of change ring `{ring}` for {seconds}s, so the source stopped."
+  solution: "Check that every member can reach the coordination store and see the others; start the pipeline again once the cluster reports its full membership."
+capture.cluster-refused-writes:
+  message: "The cluster refused writes for table `{table}` for {seconds}s, so the capture stopped."
+  solution: "Check that every member can reach the coordination store and see the others; start the pipeline again once the cluster reports its full membership."
 capture.snapshot-reports-no-seam:
   message: "The snapshot of chain `{chain}` reported no position for the change tail to resume from."
   solution: "This source cannot hand its full load over to an incremental tail; read it as snapshot only, or use a connector build that reports a stream position."
@@ -381,6 +441,9 @@ io.store-unavailable:
 io.store-unauthorized:
   message: "The store rejected the credentials for the operation."
   solution: "Check the store username and password in the connection settings."
+io.workload-claim-fenced:
+  message: "The store rejected a write from an expired or superseded workload owner."
+  solution: "Let the current cluster owner continue the workload; do not retry from the fenced generation."
 io.document-unreadable:
   message: "A stored document with id '{id}' could not be read back; the fault is in '{field}'."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."
@@ -546,6 +609,12 @@ mcp.invalid-server-response:
 mcp.server-rejected:
   message: "The Tapstate Server rejected the request with HTTP status {status} without a structured error code."
   solution: "Inspect the Server logs and verify that the MCP sidecar and Server use compatible control contracts."
+engine.execution-not-authorized:
+  message: "This member may no longer act for pipeline `{pipeline}`: its run is not the current one."
+  solution: "Let the member that holds the pipeline's claim run it; check cluster connectivity to the coordination store if no member is running it."
+engine.job-still-ending:
+  message: "Pipeline {pipeline} could not be started: its previous run was still ending after {seconds}s."
+  solution: "Wait for the previous run to finish stopping and start the pipeline again; if it never does, check the member's logs for a processor that is not shutting down."
 engine.job-failed:
   message: "Pipeline {pipeline} stopped because its job failed: {cause}."
   solution: "Check the pipeline's logs for the failure, fix what it reports, then start the pipeline again."

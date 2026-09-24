@@ -13,8 +13,11 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.core.common.TapstateException;
 import java.util.ArrayDeque;
+import java.util.Map;
 import java.util.Objects;
+import java.util.function.LongConsumer;
 
 /**
  * The core-API self-built source for one table: a Jet processor with no inbound edge that drains this
@@ -58,7 +61,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final RingTail ringTail;
     private final ArrayDeque<Envelope> pending = new ArrayDeque<>();
     private SnapshotBuffer buffered;
+    private SrsRingbuffer ring;
+    private LongConsumer cursor;
     private SrsRingReader reader;
+    // When this run of refusals began, so the bound below measures the stretch the cluster has been
+    // saying no rather than one attempt. Armed on the first refusal; an answer clears it, because a
+    // later refusal is a new stretch and not a continuation of one the cluster already came back from.
+    private boolean refused;
+    private long refusedSinceNanos;
     private SourceOrder read;
     private Watermark unannounced;
     private long announced;
@@ -99,10 +109,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         buffered = bound instanceof SnapshotBuffer resolved ? resolved : null;
         drainBuffered();
         if (ringTail != null) {
+            // Both of these are local lookups. Where the reader starts is not -- it is a guarded operation on
+            // the ring -- and it is deliberately left to the first pass below. Asking for it here would put
+            // the ring's first refusable operation on the initialisation path, which has nowhere to wait: the
+            // refusal a forming cluster answers with would end the run before it had read anything, and
+            // nothing submits another.
             Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
-            SrsRingbuffer ring = new SrsRingbuffer(rb);
-            reader = SrsRingReader.from(
-                    ring, ringTail.start(), ringTail.publisherFactory().resolve(context.hazelcastInstance()));
+            ring = new SrsRingbuffer(rb);
+            cursor = ringTail.publisherFactory().resolve(context.hazelcastInstance());
         }
     }
 
@@ -141,12 +155,19 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // The ring's sequence pairs with the generation this reader runs under to give each change its
         // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
         // again, so a change of the new ring would otherwise read as older than one of the ring before it.
-        if (ringTail != null) {
-            reader.fill((item, seq) -> {
-                SourceOrder order = orderOf(seq);
-                pending.add(SrsProjection.toEnvelope(item, src, order));
-                read = order;
-            }, FILL_BATCH);
+        if (ringTail != null && openReader()) {
+            try {
+                reader.fill((item, seq) -> {
+                    SourceOrder order = orderOf(seq);
+                    pending.add(SrsProjection.toEnvelope(item, src, order));
+                    read = order;
+                }, FILL_BATCH);
+                refused = false;
+            } catch (RingWriteRefusedException refusal) {
+                // Whatever this pass read before the refusal is already pending, and the reader stands at
+                // the first change it did not read, so the next pass carries on from there.
+                waitOut(refusal);
+            }
         }
         if (pending.size() > pendingBefore) {
             timer.end(started);
@@ -159,6 +180,66 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // being non-cooperative, its worker backs off before the next call rather than spinning. Keeping a
         // buffer-only source live also keeps Jet from advancing the downstream frontier past its last bound.
         return false;
+    }
+
+    /**
+     * Positions the ring reader, on the first pass the cluster lets it, and answers whether it is open.
+     *
+     * <p>Where a fresh reader starts is a guarded operation on the ring, so it can be refused -- and just
+     * after a cluster forms it is, for as long as the members' verdicts take to agree. Asking for it here
+     * rather than while the processor is being initialised is the whole of what makes that refusal
+     * survivable: this runs on the source's own thread, inside a loop whose job is to come back, so a
+     * refused pass reads nothing from the ring and the next pass asks again. It is the same answer the
+     * write side gives the same refusal, in the place that path already waits.
+     *
+     * <p>A refused pass is not an idle one: the member-local buffer is still drained around it, because a
+     * tail running with the shared ring switched off reaches the sink through that buffer alone and has no
+     * reason to be held up by a ring it never reads.
+     *
+     * <p>Bounded, as every refused read is: {@link #waitOut}.
+     */
+    private boolean openReader() {
+        if (reader != null) {
+            return true;
+        }
+        try {
+            reader = ringTail.resumeAfter() != null
+                    ? SrsRingReader.resumingAfter(ring, ringTail.resumeAfter(), cursor)
+                    : SrsRingReader.from(ring, ringTail.start(), cursor);
+            refused = false;
+            return true;
+        } catch (RingWriteRefusedException refusal) {
+            waitOut(refusal);
+            return false;
+        }
+    }
+
+    /**
+     * Counts one refused pass against the stretch the cluster has been saying no, and ends the run with a
+     * code once that stretch has lasted as long as the write side waits.
+     *
+     * <p>A refusal can meet any read of the ring, not only the one that positions a reader. A ring lives
+     * in one partition, and a member joining moves partitions to itself: every read of a ring it now owns
+     * runs there, answered by a verdict that has only just begun to be computed, and until it agrees every
+     * read is refused. A reader already under way meets that refusal as surely as a fresh one does, and
+     * ending the run on it stops a running pipeline because a member joined.
+     *
+     * <p>Bounded, and by the stretch the write side waits rather than one of its own. A source that waited
+     * forever would leave the run healthy, quiet and delivering nothing -- which reads exactly like a
+     * source with nothing to read, and is the state this whole path exists to stop being silent.
+     */
+    private void waitOut(RingWriteRefusedException refusal) {
+        long now = System.nanoTime();
+        if (!refused) {
+            refused = true;
+            refusedSinceNanos = now;
+        }
+        if (now - (refusedSinceNanos + CdcPhase.REFUSAL_BOUND_NANOS) >= 0) {
+            throw new TapstateException(
+                    CaptureError.CLUSTER_REFUSED_THE_READ,
+                    Map.of("ring", ringName, "seconds", CdcPhase.REFUSAL_BOUND_NANOS / 1_000_000_000L),
+                    refusal);
+        }
     }
 
     /**
@@ -270,7 +351,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * A meta-supplier for pipeline {@code pipelineId}'s source vertex tailing {@code ringName} from
      * {@code start}, tagging every change with the logical stream name {@code src} and the generation
      * {@code epoch} the ring was opened under, and reporting its read cursor through {@code publisherFactory}.
-     * The vertex is pinned to total parallelism one: one reader per ring keeps the change stream in order.
+     * The vertex is pinned to total parallelism one: one reader per ring keeps the change stream in order. That
+     * one reader runs where {@code placement} says, which has to be the member whose capture fills the hand-off
+     * it drains -- see {@link SourcePlacement}.
      *
      * <p>The generation is resolved when the job is assembled, not read per change: the ring is opened
      * before the job is submitted and does not change generation while it runs, so carrying it here keeps
@@ -278,8 +361,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * capture was started, and a change found under it is rejected rather than ordered.
      */
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
-            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory) {
-        return metaSupplier(pipelineId, ringName, src, start, epoch, publisherFactory, null);
+            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory,
+            SourcePlacement placement) {
+        return metaSupplier(pipelineId, ringName, src, start, epoch, publisherFactory, null, placement);
     }
 
     /**
@@ -288,40 +372,57 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * is the frontier standing still rather than running ahead.
      */
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
-            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp) {
+            StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory, SourceBoundStamp stamp,
+            SourcePlacement placement) {
+        return metaSupplier(pipelineId, ringName, src, start, null, epoch, publisherFactory, stamp, placement);
+    }
+
+    /**
+     * The same source vertex, carrying on just past {@code resumeAfter} when it is given: the ring sequence
+     * of the last change this pipeline's sink confirmed from this ring. A run that replaces one that died
+     * starts there rather than at {@code start}, because the ring outlived the run and still holds what the
+     * run had already landed; with nothing confirmed, {@code start} decides as it always has.
+     */
+    public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
+            StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
+            SourceBoundStamp stamp, SourcePlacement placement) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
         Objects.requireNonNull(start, "start");
         Objects.requireNonNull(publisherFactory, "publisherFactory");
+        Objects.requireNonNull(placement, "placement");
         if (epoch < 0) {
             throw new IllegalArgumentException("a ring generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(
-                pipelineId, ringName, src, epoch, stamp, new RingTail(start, publisherFactory));
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+                pipelineId, ringName, src, epoch, stamp, new RingTail(start, resumeAfter, publisherFactory));
+        return placement.place(ProcessorSupplier.of(supplier));
     }
 
     /**
      * A source for a bounded snapshot with no incremental tail. It drains only this pipeline's member-local
      * hand-off, stamps its rows with {@code epoch}, and stays live so the downstream frontier remains sound.
      * It deliberately accepts neither a start point nor a cursor publisher: {@code ringName} is only the
-     * buffer key, and another pipeline may be filling the shared ring behind that name.
+     * buffer key, and another pipeline may be filling the shared ring behind that name. Everything it emits
+     * comes from that hand-off, so where {@code placement} puts it decides whether it reads anything at all.
      */
     public static ProcessorMetaSupplier snapshotOnlyMetaSupplier(
-            String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp) {
+            String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
+            SourcePlacement placement) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
+        Objects.requireNonNull(placement, "placement");
         if (epoch < 0) {
             throw new IllegalArgumentException("a snapshot generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier =
                 () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null);
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier));
+        return placement.place(ProcessorSupplier.of(supplier));
     }
 
     /** Present only on the source shape that follows a shared ring and publishes its read cursor. */
-    private record RingTail(StartFrom start, SrsReadCursorPublisherFactory publisherFactory) {
+    private record RingTail(StartFrom start, Long resumeAfter, SrsReadCursorPublisherFactory publisherFactory) {
     }
 }

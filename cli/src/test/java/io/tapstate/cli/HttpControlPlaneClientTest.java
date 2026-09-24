@@ -54,6 +54,70 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void theTopologyBodyDecodesBothItsHalves() throws Exception {
+        // The only place the server's JSON becomes the client's records. Every case above this seam
+        // hands the REPL an outcome that was built in Java, so a field spelled differently here, or a
+        // number the server sends where text is read, shows up as an answer with a hole in it and
+        // nothing else notices.
+        HttpServer server = serverReplying("/api/cluster/members", 200, """
+                {"clusterId":"cluster-a","topologyRevision":7,
+                 "members":[{"nodeId":"node-a","memberUuid":"uuid-a","bootId":"boot-a",
+                             "hzAddress":"[127.0.0.1]:5701","controlUrl":"https://a.example:8443",
+                             "state":"ACTIVE"}],
+                 "pipelines":[{"pipelineId":"orders",
+                   "controllerClaim":{"resourceId":"orders","ownerNodeId":"node-b",
+                     "ownerBootId":"boot-b","claimGeneration":3,"executionGeneration":7,
+                     "topologyRevision":4,"leased":true},
+                   "captureClaims":[{"resourceId":"capture-f00d","ownerNodeId":"node-a",
+                     "ownerBootId":"boot-a","claimGeneration":1,"executionGeneration":1,
+                     "topologyRevision":4,"leased":false}],
+                   "measuredAt":"2026-09-19T08:30:00Z","measuredFrom":["uuid-a","uuid-b"],
+                   "awaitingRebalance":["node-c"],
+                   "vertices":[{"name":"serve-orders","requested":null,"effective":2,
+                     "computedLocal":null,"executionId":"exec-1",
+                     "processors":[{"index":0,"memberUuid":"uuid-a","nodeId":"node-a"},
+                                   {"index":1,"memberUuid":"uuid-b","nodeId":"node-b"}]}]}]}
+                """);
+        try {
+            ClusterMembersOutcome outcome =
+                    new HttpControlPlaneClient().clusterMembers(baseOf(server), "tok");
+
+            assertThat(outcome).isInstanceOf(ClusterMembersOutcome.Listed.class);
+            ClusterMembersOutcome.Listed listed = (ClusterMembersOutcome.Listed) outcome;
+            assertThat(listed.members()).extracting(RemoteClusterMember::nodeId)
+                    .containsExactly("node-a");
+            assertThat(listed.pipelines()).hasSize(1);
+            RemotePipeline pipeline = listed.pipelines().get(0);
+            assertThat(pipeline.controllerClaim())
+                    .isEqualTo(new RemoteClaim("orders", "node-b", "boot-b", 3L, 7L, true));
+            assertThat(pipeline.captureClaims())
+                    .as("a capture's ownership is its own, with its own generations and its own lease")
+                    .containsExactly(
+                            new RemoteClaim("capture-f00d", "node-a", "boot-a", 1L, 1L, false));
+            assertThat(pipeline.measuredAt())
+                    .as("read as a time, so a server that sent a number instead would be caught here "
+                            + "rather than by a reader wondering why a placement has no moment")
+                    .isEqualTo("2026-09-19T08:30:00Z");
+            assertThat(pipeline.measuredFrom()).containsExactly("uuid-a", "uuid-b");
+            assertThat(pipeline.awaitingRebalance()).containsExactly("node-c");
+            assertThat(pipeline.vertices()).hasSize(1);
+            RemoteVertex vertex = pipeline.vertices().get(0);
+            assertThat(vertex.name()).isEqualTo("serve-orders");
+            assertThat(vertex.effective()).isEqualTo(2);
+            assertThat(vertex.requested())
+                    .as("null is what the server said, and it must not arrive as a zero a reader would "
+                            + "take for a parallelism somebody asked for")
+                    .isNull();
+            assertThat(vertex.processors())
+                    .containsExactly(
+                            new RemoteProcessor(0, "uuid-a", "node-a"),
+                            new RemoteProcessor(1, "uuid-b", "node-b"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void healthyWhenHealthzReturns200() throws Exception {
         HttpServer server = serverReplying(200, "ok");
         try {

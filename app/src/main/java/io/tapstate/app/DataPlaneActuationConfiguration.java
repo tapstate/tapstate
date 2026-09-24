@@ -6,8 +6,10 @@ import io.tapstate.adapters.pdk.PdkCapturePort;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
+import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.store.ConnectionTester;
@@ -15,6 +17,8 @@ import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimStore;
 import java.time.Duration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -47,10 +51,17 @@ class DataPlaneActuationConfiguration {
      */
     private static final Duration STORE_PROBE_TIMEOUT = Duration.ofSeconds(10);
 
+    /**
+     * The topology builder, with every source vertex it builds held to this member. A start runs its capture
+     * here before it builds, so this member's hand-off is the one the sources have to drain; left to the
+     * engine, a source lands on another member as often as not on a cluster and reads nothing, healthily.
+     */
     @Bean
-    DagSource dagSource(StorePort storePort, NestSettings nestSettings, ConnectionTester connectionTester) {
+    DagSource dagSource(StorePort storePort, NestSettings nestSettings, ConnectionTester connectionTester,
+            HazelcastInstance hazelcastMember) {
         return new StoreBackedDagSource(storePort, nestSettings,
-                StoreReachability.probing(connectionTester, STORE_PROBE_TIMEOUT));
+                StoreReachability.probing(connectionTester, STORE_PROBE_TIMEOUT),
+                SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()));
     }
 
     @Bean
@@ -81,11 +92,105 @@ class DataPlaneActuationConfiguration {
     }
 
     @Bean
+    CaptureOwnership captureOwnership(
+            HazelcastInstance hazelcastMember,
+            ClusterProperties clusterProperties,
+            ClusterMembershipGate membershipGate,
+            ClusterWorkloadClaims workloadClaims) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return CaptureOwnership.single();
+        }
+        Object stored = hazelcastMember.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
+        if (!(stored instanceof WorkloadClaim nodeSession)) {
+            throw new IllegalStateException("cluster member started without its node-session identity");
+        }
+        return new CaptureOwnership(
+                clusterProperties.getId(), nodeSession.owner(), membershipGate,
+                workloadClaims, clusterProperties.getWorkloadClaimTtl());
+    }
+
+    /**
+     * This member's own answer to whether a run may still touch anything outside the cluster, bound onto
+     * the member so a sink vertex that lands here -- carrying the generations of the run that submitted
+     * it -- can ask without a store round trip per batch. A bean rather than something the member factory
+     * makes, because it keeps a refresh thread and the container is what knows when to stop it.
+     *
+     * <p>A single-node run has one member and one run of anything, so it binds nothing and every resolve
+     * answers with a guard that allows everything -- which leaves that path exactly as it was.
+     */
+    @Bean(destroyMethod = "close")
+    ExecutionAuthorization executionAuthorization(
+            HazelcastInstance hazelcastMember,
+            ClusterProperties clusterProperties,
+            WorkloadClaimStore workloadClaimStore) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return ExecutionAuthorization.unfenced();
+        }
+        ExecutionAuthorization authorization = new ExecutionAuthorization(
+                clusterProperties.getId(), workloadClaimStore,
+                clusterProperties.getWorkloadClaimRenewInterval());
+        hazelcastMember.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
+        return authorization;
+    }
+
+    /**
+     * The one way a failed run is replaced with nobody asking. It is here rather than beside the converge
+     * loop because the question it answers is about members and claims, which is what this configuration
+     * knows: the loop is only told yes or no.
+     *
+     * <p>A single-node run never rebuilds anything. There is no member whose leaving could have ended the
+     * run, so every death there is the pipeline's own and stays recorded as one.
+     *
+     * <p>The spacing between attempts is one claim lease. That is already this cluster's own answer to
+     * "how long before ownership has settled", so a rebuild that waits it out is rebuilding into a
+     * membership that has stopped moving rather than into the middle of a handover.
+     */
+    @Bean
+    RebuildAdmission rebuildAdmission(
+            ClusterProperties clusterProperties, PipelineActuationOwnership pipelineActuationOwnership) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return RebuildAdmission.never();
+        }
+        return new ClusterRebuildAdmission(
+                pipelineActuationOwnership, clusterProperties.getWorkloadClaimTtl());
+    }
+
+    /**
+     * Who drives a pipeline's lifecycle. Wired beside the capture owner because the two are the same
+     * mechanism over two different resources, and both need the same three things: this member's durable
+     * identity, the membership gate that decides whether it may hold business claims at all, and the claim
+     * facade that enforces it. A single-node run has one member, so nothing is fenced there.
+     */
+    @Bean
+    PipelineActuationOwnership pipelineActuationOwnership(
+            HazelcastInstance hazelcastMember,
+            ClusterProperties clusterProperties,
+            ClusterMembershipGate membershipGate,
+            ClusterWorkloadClaims workloadClaims) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return PipelineActuationOwnership.single();
+        }
+        Object stored = hazelcastMember.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
+        if (!(stored instanceof WorkloadClaim nodeSession)) {
+            throw new IllegalStateException("cluster member started without its node-session identity");
+        }
+        return new PipelineActuationOwnership(
+                clusterProperties.getId(), nodeSession.owner(), membershipGate, workloadClaims,
+                clusterProperties.getWorkloadClaimTtl(), clusterProperties.getWorkloadClaimRenewInterval());
+    }
+
+    @Bean
     PipelineCaptureCoordinator pipelineCaptureCoordinator(
             StorePort storePort, CaptureRunUnit captureRunUnit, SrsCoordinator srsCoordinator,
-            SnapshotBuffer snapshotBuffer) {
+            SnapshotBuffer snapshotBuffer, CaptureOwnership captureOwnership,
+            ClusterProperties clusterProperties) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return new StoreBackedPipelineCaptureCoordinator(
+                    storePort, captureRunUnit::start, srsCoordinator, snapshotBuffer);
+        }
         return new StoreBackedPipelineCaptureCoordinator(
-                storePort, captureRunUnit::start, srsCoordinator, snapshotBuffer);
+                storePort, captureRunUnit::start, srsCoordinator, snapshotBuffer,
+                captureOwnership, clusterProperties.getWorkloadClaimRenewInterval());
     }
 
     @Bean
@@ -96,7 +201,9 @@ class DataPlaneActuationConfiguration {
 
     @Bean
     LifecycleActuator lifecycleActuator(Engine engine, DagSource dagSource,
-            PipelineCaptureCoordinator pipelineCaptureCoordinator, NestStateTeardown nestStateTeardown) {
-        return new EngineLifecycleActuator(engine, dagSource, pipelineCaptureCoordinator, nestStateTeardown);
+            PipelineCaptureCoordinator pipelineCaptureCoordinator, NestStateTeardown nestStateTeardown,
+            PipelineActuationOwnership pipelineActuationOwnership) {
+        return new EngineLifecycleActuator(engine, dagSource, pipelineCaptureCoordinator, nestStateTeardown,
+                pipelineActuationOwnership);
     }
 }
