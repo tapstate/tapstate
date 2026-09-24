@@ -146,10 +146,12 @@ done
 green "  store ready (primary elected)"
 
 bold "1. container boots against the store, HEALTHCHECK reaches healthy, runs as the unprivileged uid"
-host_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}' || true)"
-if [[ -z "$host_ip" ]] && command -v ipconfig >/dev/null 2>&1; then
-  host_interface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
-  host_ip="$(ipconfig getifaddr "${host_interface:-en0}" 2>/dev/null || true)"
+host_ip=""
+if command -v ipconfig >/dev/null 2>&1; then
+  host_ip="$(ipconfig getifaddr en0 2>/dev/null || true)"
+fi
+if [[ -z "$host_ip" ]]; then
+  host_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}' || true)"
 fi
 if [[ -z "$host_ip" ]]; then
   red "  FAIL: could not determine a host IP address for the published-port check"
@@ -157,7 +159,7 @@ if [[ -z "$host_ip" ]]; then
 fi
 if docker run -d --name "$SERVER" --network "$NET" \
      -e TAPSTATE_STORE_MONGO_URI="mongodb://$MONGO:27017/tapstate?directConnection=true" \
-     -p 0.0.0.0::8080 \
+     -p "$host_ip::8080" \
      "$IMAGE" --role=all >/dev/null; then
   # Poll the container's own health -- the signal a dependent's service_healthy waits on. Break early
   # if the container exits before turning healthy: the embedded member + engine are the keep-alive
