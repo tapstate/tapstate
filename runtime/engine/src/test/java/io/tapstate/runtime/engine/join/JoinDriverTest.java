@@ -785,6 +785,54 @@ class JoinDriverTest {
     }
 
     /**
+     * A load read again whose fact keys interleave more long buckets than a driver remembers a page for,
+     * as they do wherever the fact table's key has nothing to do with the join key, with one bucket
+     * among them that has a row in every batch. Forgetting every bucket at once when the bound filled
+     * sent that bucket back to its first page, and on to a question about the rest of it, although the
+     * batch before had just confirmed it. Only the bucket confirmed least recently is forgotten, so the
+     * one in use keeps its page however many others pass through.
+     */
+    @Test
+    @DisplayName("a bucket in use keeps its page while more long buckets than are remembered pass through")
+    void aBucketInUseKeepsItsPageWhileMoreLongBucketsThanAreRememberedPassThrough() {
+        MapJoinStores kept = new MapJoinStores(1);
+        Fixture restarted = new Fixture(JoinKind.LEFT, kept);
+        int batches = 8;
+        int othersPerBatch = 2 * JoinDriver.BUCKETS_REMEMBERED / batches;
+        // Customer 1's bucket: rows 100 to 107, a page each, and one of them read again in every batch.
+        leaveUnfinished(kept, restarted, batches);
+        List<List<SourceChange>> load = new ArrayList<>();
+        long customer = 1;
+        for (int batch = 0; batch < batches; batch++) {
+            List<SourceChange> changes = new ArrayList<>(readAgain(100L + batch));
+            for (int other = 0; other < othersPerBatch; other++) {
+                customer++;
+                // Two pages under each other customer: a row that is not read again, then one that is.
+                String bucket = restarted.dimensionKeyOf(customer);
+                long id = 1_000_000 + 2 * customer;
+                kept.indexAdd("c", bucket, restarted.factKeyOf(id));
+                Map<String, Object> row = Map.of("id", id + 1, "cust_id", customer);
+                kept.putFact(restarted.factKeyOf(id + 1), unfinished(row));
+                kept.indexAdd("c", bucket, restarted.factKeyOf(id + 1));
+                changes.add(fact(read(row)));
+            }
+            load.add(changes);
+        }
+
+        load.forEach(restarted::applyBatch);
+
+        // Each batch asks about the page every bucket's walk starts on and the page after it, where each
+        // of its rows is found: customer 1's on the page after the one its row in the last batch was on.
+        assertThat(restarted.stores.pageCountReads)
+                .as("no bucket is asked about past its walk, customer 1's included")
+                .isZero();
+        assertThat(restarted.stores.nameReads).as("two questions a batch").isEqualTo(2 * batches);
+        assertThat(restarted.stores.writes)
+                .as("the mirror once per row, nothing added to the index, and each batch's record")
+                .isEqualTo(batches * (1 + othersPerBatch) + batches);
+    }
+
+    /**
      * {@code row} as a member that died part way through a batch leaves it in the mirror: under a batch
      * of a run that never recorded that it was taken in whole.
      */
