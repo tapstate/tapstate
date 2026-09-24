@@ -8,10 +8,15 @@ import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.StorePort;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -43,7 +48,27 @@ final class StoreBackedPipelineCaptures implements PipelineCaptures {
 
     @Override
     public List<String> captureIds(String pipelineId) {
-        Optional<Resource> stored = storePort.artifacts().get(pipelineId);
+        return captureIds(pipelineId, new Reads());
+    }
+
+    /**
+     * Every pipeline's captures from one set of reads: a source several of them read, and its discovery,
+     * is read once for all of them rather than once for each pipeline naming it. The read face asks this
+     * for every pipeline in the cluster whenever anybody looks, and a handful of sources shared by many
+     * pipelines is the ordinary shape of a cluster.
+     */
+    @Override
+    public Map<String, List<String>> captureIdsByPipeline(Collection<String> pipelineIds) {
+        Reads reads = new Reads();
+        Map<String, List<String>> byPipeline = new LinkedHashMap<>();
+        for (String pipelineId : pipelineIds) {
+            byPipeline.put(pipelineId, captureIds(pipelineId, reads));
+        }
+        return byPipeline;
+    }
+
+    private List<String> captureIds(String pipelineId, Reads reads) {
+        Optional<Resource> stored = reads.artifact(pipelineId);
         if (stored.isEmpty() || !(stored.get() instanceof PipelineResource pipeline)) {
             return List.of();
         }
@@ -54,7 +79,7 @@ final class StoreBackedPipelineCaptures implements PipelineCaptures {
                 // capture it would read through is not decided yet.
                 continue;
             }
-            Optional<Resource> source = storePort.artifacts().get(ref.id());
+            Optional<Resource> source = reads.artifact(ref.id());
             if (source.isEmpty() || !(source.get() instanceof SourceResource resolved)) {
                 continue;
             }
@@ -62,8 +87,7 @@ final class StoreBackedPipelineCaptures implements PipelineCaptures {
             // streams a capture reads, so the whole source's tables would name a claim nobody took.
             Optional<SourceCaptureResolution> selected;
             try {
-                selected = SourceCaptureResolution.forPipeline(
-                        pipeline, resolved, SourceDiscovery.model(storePort, resolved));
+                selected = SourceCaptureResolution.forPipeline(pipeline, resolved, reads.discovery(resolved));
             } catch (TapstateException unresolvable) {
                 // The start is refused with this same code, so no capture of it exists; and this face
                 // answers for every pipeline at once, which one that cannot resolve must not take down.
@@ -78,5 +102,35 @@ final class StoreBackedPipelineCaptures implements PipelineCaptures {
             ids.add(CaptureId.of(runSpec).value());
         }
         return List.copyOf(ids);
+    }
+
+    /**
+     * What one answer has read from the store, so that it reads each artifact and each discovery once
+     * however many of the pipelines it answers for name them.
+     *
+     * <p>Held for one answer and dropped with it. Kept any longer it would be a copy of the store that
+     * nothing tells when the store changes, and the face would go on naming captures from a source somebody
+     * has since edited. A read that fails is not kept either: the next pipeline naming that source asks
+     * again, so one failed read is not made every pipeline's answer.
+     */
+    private final class Reads {
+
+        private final Map<String, Optional<Resource>> artifacts = new HashMap<>();
+        private final Map<String, Optional<SourceModel>> discoveries = new HashMap<>();
+
+        Optional<Resource> artifact(String id) {
+            return artifacts.computeIfAbsent(id, storePort.artifacts()::get);
+        }
+
+        /**
+         * The source's discovery as {@link SourceDiscovery#model} answers it, null when there is none of its
+         * current connector. Kept by source id, which is safe because the source itself is read once per
+         * answer: the connector its discovery is matched against is the same for every pipeline naming it.
+         */
+        SourceModel discovery(SourceResource source) {
+            Optional<SourceModel> model = discoveries.computeIfAbsent(
+                    source.id(), ignored -> Optional.ofNullable(SourceDiscovery.model(storePort, source)));
+            return model.orElse(null);
+        }
     }
 }

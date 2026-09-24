@@ -18,8 +18,12 @@ import io.tapstate.spi.store.WorkloadOwner;
 import org.bson.Document;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -111,10 +115,47 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         // ever subtracted from a deadline of theirs.
         List<Document> pipeline = List.of(
                 new Document("$match", new Document("_id", id(key))),
-                new Document("$set", new Document(LEASE_REMAINING,
-                        new Document("$subtract", List.of("$leaseUntil", "$$NOW")))));
+                leaseRemaining());
         Document found = StoreIo.call(() -> collection.aggregate(pipeline).first());
         return Optional.ofNullable(found).map(MongoWorkloadClaimStore::reading);
+    }
+
+    /**
+     * One aggregation for every key: the same match on the whole id and the same lease arithmetic as
+     * {@link #read}, so each claim comes back as its own read would answer it, and every lease in the
+     * answer is measured against the one {@code $$NOW} the server evaluated the aggregation at.
+     *
+     * <p>The ids are built by {@link #id}, which is not a tidiness: BSON compares sub-documents field by
+     * field in order, so an id assembled in any other order matches nothing -- and matching nothing is also
+     * what a key nobody has claimed answers, so every claim would read as unowned. Each document is filed
+     * back under the key whose id it matched, which is the key it was asked for.
+     */
+    @Override
+    public Map<WorkloadClaimKey, WorkloadClaimReading> readAll(Collection<WorkloadClaimKey> keys) {
+        Objects.requireNonNull(keys, "keys");
+        Map<Document, WorkloadClaimKey> asked = new LinkedHashMap<>();
+        for (WorkloadClaimKey key : keys) {
+            asked.put(id(Objects.requireNonNull(key, "key")), key);
+        }
+        Map<WorkloadClaimKey, WorkloadClaimReading> readings = new LinkedHashMap<>();
+        if (asked.isEmpty()) {
+            return readings;
+        }
+        List<Document> pipeline = List.of(
+                new Document("$match", new Document("_id",
+                        new Document("$in", new ArrayList<>(asked.keySet())))),
+                leaseRemaining());
+        List<Document> found = StoreIo.call(() -> collection.aggregate(pipeline).into(new ArrayList<>()));
+        for (Document document : found) {
+            readings.put(asked.get(document.get("_id", Document.class)), reading(document));
+        }
+        return readings;
+    }
+
+    /** How long a lease still has to run, worked out on the server, where {@code $$NOW} is. */
+    private static Document leaseRemaining() {
+        return new Document("$set", new Document(LEASE_REMAINING,
+                new Document("$subtract", List.of("$leaseUntil", "$$NOW"))));
     }
 
     private Document findOneAndUpdate(Document filter, List<Document> update, boolean upsert) {

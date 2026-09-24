@@ -1,6 +1,9 @@
 package io.tapstate.spi.store;
 
 import java.time.Duration;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Optional;
 
 /** Persistence port for Mongo-time owner leases and their monotonic fencing generations. */
@@ -26,4 +29,24 @@ public interface WorkloadClaimStore {
      * owner that is still there from one whose record simply outlived it.
      */
     Optional<WorkloadClaimReading> read(WorkloadClaimKey key);
+
+    /**
+     * Reads every one of these claims, each together with how much of its lease the store's own clock says
+     * is left: what {@link #read} answers for one, under the key it was asked for, with a key nobody has
+     * ever claimed simply absent. Order is not part of the answer.
+     *
+     * <p>For a caller that needs many claims at once -- a read face answering for every pipeline in the
+     * cluster needs all of theirs. Asked one at a time that is a round trip per claim, in sequence, against
+     * the store every renewal in the cluster also goes through: a cost that grows with the cluster while
+     * nothing reports it but the clock. The default loops over {@link #read} openly, so a store that cannot
+     * do better inherits the honest version, and a store that overrides it is saying it did better. An
+     * empty {@code keys} reaches the store not at all.
+     */
+    default Map<WorkloadClaimKey, WorkloadClaimReading> readAll(Collection<WorkloadClaimKey> keys) {
+        Map<WorkloadClaimKey, WorkloadClaimReading> readings = new LinkedHashMap<>();
+        for (WorkloadClaimKey key : keys) {
+            read(key).ifPresent(reading -> readings.put(key, reading));
+        }
+        return readings;
+    }
 }

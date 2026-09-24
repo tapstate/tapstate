@@ -11,6 +11,8 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
@@ -18,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.tuple;
@@ -187,6 +190,74 @@ class ClusterPipelineTopologyServiceTest {
         assertThat(pipeline.captureClaims()).isEmpty();
     }
 
+    /**
+     * The face answers for every pipeline in the cluster at once, and the store it reads the claims from is
+     * the one carrying every renewal in the cluster. Asked a claim at a time, that is a round trip per
+     * pipeline and per capture, one after the other: a cost that grows with the cluster, which nothing
+     * reports but the clock and which every answer on a small cluster hides.
+     */
+    @Test
+    void aReadPutsOneQuestionToEachPortHoweverManyPipelinesAndCapturesItReports() {
+        for (String pipelineId : List.of("invoices", "orders", "shipments")) {
+            claims.put(WorkloadClaimType.PIPELINE_ACTUATION, pipelineId, "node-b", "boot-b1", 3, 7, true);
+            claims.put(WorkloadClaimType.CAPTURE, "capture-" + pipelineId, "node-a", "boot-a1", 1, 1, true);
+        }
+        claims.put(WorkloadClaimType.CAPTURE, "capture-shared", "node-a", "boot-a1", 1, 1, true);
+        AtomicInteger claimQuestions = new AtomicInteger();
+        AtomicInteger captureQuestions = new AtomicInteger();
+        ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
+                LivePipelineRuns.none(),
+                counting(PipelineCaptures.class,
+                        pipelineId -> List.of("capture-" + pipelineId, "capture-shared"), captureQuestions),
+                counting(WorkloadClaimStore.class, claims, claimQuestions),
+                desired("orders", "shipments", "invoices"), CLUSTER);
+
+        List<ClusterPipelineView> pipelines = topology.pipelines(MEMBERS);
+
+        // It really did report every claim: a read that looked nothing up would ask nothing either, and
+        // the count below would be the count this is looking for.
+        assertThat(pipelines)
+                .extracting(pipeline -> pipeline.controllerClaim().resourceId())
+                .containsExactly("invoices", "orders", "shipments");
+        assertThat(pipelines)
+                .extracting(pipeline -> pipeline.captureClaims().stream()
+                        .map(ClusterClaimView::resourceId).toList())
+                .containsExactly(
+                        List.of("capture-invoices", "capture-shared"),
+                        List.of("capture-orders", "capture-shared"),
+                        List.of("capture-shared", "capture-shipments"));
+        assertThat(new Questions(claimQuestions.get(), captureQuestions.get()))
+                .as("one question to the claim store for every claim the answer reports, and one to the "
+                        + "captures for every pipeline, so that what the pipelines share is read once")
+                .isEqualTo(new Questions(1, 1));
+    }
+
+    @Test
+    void withNothingToLookAClaimUpInNeitherTheClaimsNorTheCapturesAreAskedAnything() {
+        AtomicInteger claimQuestions = new AtomicInteger();
+        AtomicInteger captureQuestions = new AtomicInteger();
+        PipelineCaptures captures = counting(
+                PipelineCaptures.class, pipelineId -> List.of("capture-1"), captureQuestions);
+        ClusterPipelineTopologyService unfenced = new ClusterPipelineTopologyService(
+                LivePipelineRuns.none(), captures, null, desired("orders", "shipments"), CLUSTER);
+        ClusterPipelineTopologyService unnamed = new ClusterPipelineTopologyService(
+                LivePipelineRuns.none(), captures, counting(WorkloadClaimStore.class, claims, claimQuestions),
+                desired("orders", "shipments"), null);
+
+        assertThat(unfenced.pipelines(MEMBERS))
+                .extracting(ClusterPipelineView::pipelineId, ClusterPipelineView::controllerClaim,
+                        ClusterPipelineView::captureClaims)
+                .containsExactly(tuple("orders", null, List.of()), tuple("shipments", null, List.of()));
+        assertThat(unnamed.pipelines(MEMBERS))
+                .extracting(ClusterPipelineView::pipelineId, ClusterPipelineView::controllerClaim,
+                        ClusterPipelineView::captureClaims)
+                .containsExactly(tuple("orders", null, List.of()), tuple("shipments", null, List.of()));
+        assertThat(new Questions(claimQuestions.get(), captureQuestions.get()))
+                .as("a capture is reported by its claim; with no claim store, or no cluster to name a claim "
+                        + "in, every capture worked out would be read off the store only to be dropped")
+                .isEqualTo(new Questions(0, 0));
+    }
+
     @Test
     void aMemberThatJoinedAfterTheRunStartedIsAwaitingRebalance() {
         ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
@@ -278,6 +349,29 @@ class ClusterPipelineTopologyServiceTest {
                 throw new UnsupportedOperationException("a read face writes nothing");
             }
         };
+    }
+
+    /**
+     * {@code port}, answering as {@code answering} does and counting every question put to it, whichever of
+     * the port's methods asked it: what is measured is how often the caller goes to the store, not which
+     * door it goes through.
+     */
+    private static <T> T counting(Class<T> port, T answering, AtomicInteger questions) {
+        return port.cast(Proxy.newProxyInstance(
+                port.getClassLoader(), new Class<?>[] {port}, (proxy, method, arguments) -> {
+                    if (method.getDeclaringClass() != Object.class) {
+                        questions.incrementAndGet();
+                    }
+                    try {
+                        return method.invoke(answering, arguments);
+                    } catch (InvocationTargetException thrown) {
+                        throw thrown.getCause();
+                    }
+                }));
+    }
+
+    /** How many questions one read put to the claim store and to the captures. */
+    private record Questions(int claimStore, int captures) {
     }
 
     /** Claims by key, with the lease already decided, because what is under test is the join. */

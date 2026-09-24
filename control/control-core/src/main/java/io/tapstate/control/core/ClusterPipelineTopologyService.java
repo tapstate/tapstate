@@ -11,11 +11,11 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.TreeSet;
 
 /**
@@ -79,15 +79,18 @@ public final class ClusterPipelineTopologyService {
         for (LivePipelineRun run : runs.runs()) {
             runById.put(run.pipelineId(), run);
         }
-        List<ClusterPipelineView> views = new ArrayList<>();
         // Sorted, for the same reason the members are: a list that reshuffles between reads cannot be
         // diffed by anybody.
-        for (String pipelineId : new TreeSet<>(desired.pipelineIds())) {
+        Set<String> pipelineIds = new TreeSet<>(desired.pipelineIds());
+        Map<String, Set<String>> captureIds = captureIds(pipelineIds);
+        Map<WorkloadClaimKey, WorkloadClaimReading> readings = readings(pipelineIds, captureIds);
+        List<ClusterPipelineView> views = new ArrayList<>();
+        for (String pipelineId : pipelineIds) {
             LivePipelineRun run = runById.get(pipelineId);
             views.add(new ClusterPipelineView(
                     pipelineId,
-                    claimOver(WorkloadClaimType.PIPELINE_ACTUATION, pipelineId),
-                    captureClaims(pipelineId),
+                    claimOver(readings, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId),
+                    captureClaims(readings, captureIds.getOrDefault(pipelineId, Set.of())),
                     run == null ? null : run.measuredAt(),
                     run == null ? List.of() : List.copyOf(new TreeSet<>(run.measuredFrom())),
                     run == null ? List.of() : awaitingRebalance(run, members),
@@ -131,10 +134,56 @@ public final class ClusterPipelineTopologyService {
         return List.copyOf(awaiting);
     }
 
-    private List<ClusterClaimView> captureClaims(String pipelineId) {
+    /** Whether there is anything to look a claim up in: a claim store, and a cluster to name claims in. */
+    private boolean fenced() {
+        return claims != null && clusterId != null;
+    }
+
+    /**
+     * The captures of every pipeline listed, sorted, asked of the port as one question so that the sources
+     * the pipelines share are read once rather than once for every pipeline naming them.
+     *
+     * <p>Not worked out at all when nothing fences them. A capture is reported by its claim, so with no
+     * claim to look up every one of them would be read off the store only to be dropped.
+     */
+    private Map<String, Set<String>> captureIds(Set<String> pipelineIds) {
+        if (!fenced()) {
+            return Map.of();
+        }
+        Map<String, Set<String>> sorted = new HashMap<>();
+        captures.captureIdsByPipeline(pipelineIds)
+                .forEach((pipelineId, ids) -> sorted.put(pipelineId, new TreeSet<>(ids)));
+        return sorted;
+    }
+
+    /**
+     * Every claim this answer reports -- each pipeline's controller and each of its captures -- asked of the
+     * store as one question. The face answers for the whole cluster, from a store that is also carrying
+     * every renewal in it: a round trip per claim, one after the other, is a cost that grows with the
+     * cluster and that nothing would report but the clock.
+     */
+    private Map<WorkloadClaimKey, WorkloadClaimReading> readings(
+            Set<String> pipelineIds, Map<String, Set<String>> captureIds) {
+        if (!fenced()) {
+            return Map.of();
+        }
+        Set<WorkloadClaimKey> keys = new LinkedHashSet<>();
+        for (String pipelineId : pipelineIds) {
+            keys.add(new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId));
+        }
+        for (Set<String> ids : captureIds.values()) {
+            for (String captureId : ids) {
+                keys.add(new WorkloadClaimKey(clusterId, WorkloadClaimType.CAPTURE, captureId));
+            }
+        }
+        return claims.readAll(keys);
+    }
+
+    private List<ClusterClaimView> captureClaims(
+            Map<WorkloadClaimKey, WorkloadClaimReading> readings, Set<String> captureIds) {
         List<ClusterClaimView> views = new ArrayList<>();
-        for (String captureId : new TreeSet<>(captures.captureIds(pipelineId))) {
-            ClusterClaimView claim = claimOver(WorkloadClaimType.CAPTURE, captureId);
+        for (String captureId : captureIds) {
+            ClusterClaimView claim = claimOver(readings, WorkloadClaimType.CAPTURE, captureId);
             if (claim != null) {
                 views.add(claim);
             }
@@ -143,16 +192,16 @@ public final class ClusterPipelineTopologyService {
     }
 
     /** The claim over one resource, or null when nothing fences it and when nobody has taken it. */
-    private ClusterClaimView claimOver(WorkloadClaimType type, String resourceId) {
-        if (claims == null || clusterId == null) {
+    private ClusterClaimView claimOver(
+            Map<WorkloadClaimKey, WorkloadClaimReading> readings, WorkloadClaimType type, String resourceId) {
+        if (!fenced()) {
             return null;
         }
-        Optional<WorkloadClaimReading> reading =
-                claims.read(new WorkloadClaimKey(clusterId, type, resourceId));
-        if (reading.isEmpty()) {
+        WorkloadClaimReading reading = readings.get(new WorkloadClaimKey(clusterId, type, resourceId));
+        if (reading == null) {
             return null;
         }
-        WorkloadClaim claim = reading.get().claim();
+        WorkloadClaim claim = reading.claim();
         return new ClusterClaimView(
                 claim.key().resourceId(),
                 claim.owner().nodeId(),
@@ -160,7 +209,7 @@ public final class ClusterPipelineTopologyService {
                 claim.claimGeneration(),
                 claim.executionGeneration(),
                 claim.topologyRevision(),
-                reading.get().leased());
+                reading.leased());
     }
 
     private static List<ClusterVertexView> vertices(
