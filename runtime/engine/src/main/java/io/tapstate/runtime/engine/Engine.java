@@ -28,8 +28,10 @@ import io.tapstate.spi.store.OperatorStateStores;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -251,13 +253,18 @@ public final class Engine {
      * a job that failed for a reason no processor recorded — a fault inside Jet itself, for one — falls
      * through to asking Jet, which after that same teardown can answer with the degraded mock instead.
      *
-     * <p>A member shut down for want of memory is answered before any of that: every job it ran died with it,
-     * and the member is the one thing that can no longer be asked, so the loss is the failure.
+     * <p>A member shut down for want of memory cannot be asked about its jobs at all: every job it ran died with
+     * it, so the loss is the failure. The one exception is a cause the registry already holds, which is still
+     * readable: a job that had died of it before the member went down died of that, not of the loss, and it is
+     * the cause that names what an operator has to change. A recorded cause that is itself the heap running out,
+     * anywhere down its chain, is the loss as a processor caught it, and is answered as the loss.
      */
     public Optional<Throwable> failureOf(String pipelineId) {
-        Optional<Throwable> lost = lost(pipelineId).map(Throwable.class::cast);
+        Optional<TapstateException> lost = lost(pipelineId);
         if (lost.isPresent()) {
-            return lost;
+            Optional<Throwable> recorded = JobFailureRegistry.of(member).get(pipelineId)
+                    .filter(cause -> !ranOutOfMemory(cause));
+            return recorded.isPresent() ? recorded : lost.map(Throwable.class::cast);
         }
         Job job = jobNamed(pipelineId);
         if (job == null || job.getStatus() != JobStatus.FAILED) {
@@ -781,6 +788,17 @@ public final class Engine {
     public Optional<TapstateException> lost(String pipelineId) {
         return MemberOutOfMemory.of(member).map(error ->
                 new TapstateException(EngineError.OUT_OF_MEMORY, Map.of("pipeline", pipelineId), error));
+    }
+
+    /** Whether {@code failure}, or anything down its chain of causes, is the heap running out. */
+    private static boolean ranOutOfMemory(Throwable failure) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable cause = failure; cause != null && seen.add(cause); cause = cause.getCause()) {
+            if (cause instanceof OutOfMemoryError) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

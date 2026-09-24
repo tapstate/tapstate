@@ -127,6 +127,11 @@ class AnEngineOutOfMemoryFailsTheHealthCheckAndItsPipelinesIT {
                     .as("while its engine is up, the server passes its own health check: %s", whileTheEngineRuns)
                     .isTrue();
 
+            // The out-of-memory handling is handed every member this JVM runs, not just this server's. A member
+            // some other case left running would be taken down along with it, breaking that case instead.
+            assertThat(runningMembers())
+                    .as("this server's member is the only one running in this JVM when the heap runs out")
+                    .containsExactly(engine);
             runOutOfMemoryOnAnEngineThread();
             Await.until("the engine's own out-of-memory handling to shut its member down; nothing after this "
                             + "measures anything while the member is still up",
@@ -177,6 +182,12 @@ class AnEngineOutOfMemoryFailsTheHealthCheckAndItsPipelinesIT {
         Await.until("the engine thread to hand its out-of-memory error over and end",
                 () -> !engineThread.isAlive(),
                 () -> "the thread is still " + engineThread.getState());
+    }
+
+    private static List<HazelcastInstance> runningMembers() {
+        return Hazelcast.getAllHazelcastInstances().stream()
+                .filter(AnEngineOutOfMemoryFailsTheHealthCheckAndItsPipelinesIT::isRunning)
+                .toList();
     }
 
     private static boolean isRunning(HazelcastInstance member) {

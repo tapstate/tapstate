@@ -225,7 +225,7 @@ class EngineTest {
         awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
         MemberOutOfMemory.watch(member);
 
-        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise();
+        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise(member);
 
         assertThat(engine.failureOf("orders-pipe"))
                 .get()
@@ -243,6 +243,45 @@ class EngineTest {
     }
 
     @Test
+    void failureOf_keeps_the_cause_a_job_died_of_before_its_member_was_lost_to_out_of_memory() {
+        // The job had already died of a cause its sink recorded, and the member went down before anyone asked why.
+        // The loss of the member came after that death, so it is not what the pipeline failed of, and answering
+        // with it would throw away the one cause that names what an operator has to change.
+        Engine engine = new Engine(member);
+        engine.submit("orders-pipe", failingSinkDag());
+        awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.FAILED);
+        MemberOutOfMemory.watch(member);
+
+        OutOfMemoryOnAMemberThread.raise(member);
+
+        assertThat(engine.isLost()).isTrue();
+        assertThat(engine.failureOf("orders-pipe"))
+                .get()
+                .isInstanceOfSatisfying(TapstateException.class, coded ->
+                        assertThat(coded.code().code()).isEqualTo("test.sink-write-failed"));
+    }
+
+    @Test
+    void failureOf_reports_the_loss_when_what_a_job_recorded_was_the_heap_running_out() {
+        // The heap running out on a processor's own thread is caught and recorded like any other cause on its
+        // way out, and it is also what takes the member down. What was recorded then is the loss itself, and the
+        // loss is reported by its code, rather than as the bare error that says nothing about the member.
+        Engine engine = new Engine(member);
+        engine.submit("orders-pipe", foreverDag());
+        awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
+        JobFailureRegistry.of(member).record("orders-pipe",
+                new IllegalStateException("the write did not finish", new OutOfMemoryError("Java heap space")));
+        MemberOutOfMemory.watch(member);
+
+        OutOfMemoryOnAMemberThread.raise(member);
+
+        assertThat(engine.failureOf("orders-pipe"))
+                .get()
+                .isInstanceOfSatisfying(TapstateException.class, coded ->
+                        assertThat(coded.code().code()).isEqualTo("engine.out-of-memory"));
+    }
+
+    @Test
     void a_member_its_out_of_memory_handling_is_still_shutting_down_already_reads_as_lost()
             throws InterruptedException {
         // Partway through its shutdown a member stops answering, and the shutdown then waits for every job on it
@@ -255,7 +294,7 @@ class EngineTest {
         awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
         MemberOutOfMemory.watch(member);
 
-        OutOfMemoryOnAMemberThread.Escaping escaping = OutOfMemoryOnAMemberThread.escape();
+        OutOfMemoryOnAMemberThread.Escaping escaping = OutOfMemoryOnAMemberThread.escape(member);
         try {
             SlowToEndSource.awaitToldToEnd();
             assertThatThrownBy(() -> member.getJet().getJob("orders-pipe"))
@@ -290,7 +329,7 @@ class EngineTest {
         awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
         MemberOutOfMemory.watch(member);
 
-        OutOfMemoryOnAMemberThread.raise();
+        OutOfMemoryOnAMemberThread.raise(member);
 
         DAG again = foreverDag();
         refusedForWantOfMemory(() -> engine.refuseIfLost("orders-pipe"));

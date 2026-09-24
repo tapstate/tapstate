@@ -36,7 +36,7 @@ class MemberOutOfMemoryTest {
         MemberOutOfMemory.watch(member);
         assertThat(MemberOutOfMemory.of(member)).as("a member that is still running has lost nothing").isEmpty();
 
-        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise();
+        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise(member);
 
         assertThat(member.getLifecycleService().isRunning())
                 .as("the substrate's own handling took the member down")
@@ -55,7 +55,7 @@ class MemberOutOfMemoryTest {
         MemberOutOfMemory.watch(first);
         MemberOutOfMemory.watch(second);
 
-        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise();
+        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise(first, second);
 
         assertThat(MemberOutOfMemory.of(first)).containsSame(error);
         assertThat(MemberOutOfMemory.of(second)).containsSame(error);
@@ -71,7 +71,7 @@ class MemberOutOfMemoryTest {
         HazelcastInstance unwatched = startMember();
         MemberOutOfMemory.watch(watched);
 
-        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise();
+        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise(watched, unwatched);
 
         assertThat(unwatched.getLifecycleService().isRunning())
                 .as("whether a member is taken down is not up to whoever watches it")
