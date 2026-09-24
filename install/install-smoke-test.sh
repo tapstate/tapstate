@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# The installer smoke's own verdict when its install-event sink never starts. The sink is a fixture, a
+# local stand-in for the event endpoint that the install-event cases read to see what an install sent.
+# When it never binds a port those cases have nothing to read, and the only true report is that the
+# sink failed: one failure, naming it. Reading the absent port file anyway hands the installer an
+# endpoint with no port, every case that reads the sink then fails as though the installer had sent the
+# wrong thing, and a fixture that never started is reported as several defects in the installer.
+#
+# A sink that never binds either exits, as one that failed to start does, or stays alive, as one stalled
+# before it listens does. The smoke's wait for its port catches the first with its liveness check and
+# never reaches its own end, so only the second shows what the smoke reports when the wait runs out.
+# Both are driven below, and each report has to say which of the two it was: a sink that crashed and
+# one still stuck before it listens are fixed in different places, and a report that reads the same for
+# both leaves whoever reads a runner's log to guess.
+#
+# A sink can also bind, publish its port and then exit, as one whose server fails once it is up does.
+# Its port is on disk, but every case pointed at it is refused and fails as though the installer had
+# sent nothing, so it has not started either. That sink is driven below too, and its report has to say
+# it exited after it bound: what failed in it is not what fails in a sink that never bound.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCRATCH="$(mktemp -d)"
+# If the smoke fails to stop a sink that stays alive, stop it here, so a failing run leaves no process
+# behind.
+finish() {
+  if [ -s "$SCRATCH/sink-pid" ]; then kill "$(cat "$SCRATCH/sink-pid")" 2>/dev/null || true; fi
+  rm -rf "$SCRATCH"
+}
+trap finish EXIT
+
+# The sink's verdicts are read from the smoke's install-event section alone: the lines it prints between
+# its two markers, which hold the sink's own failure or the cases that read the sink, and nothing else.
+# The smoke's own run already reports a case elsewhere that fails for its own reasons, and counting it
+# here would report it a second time as though the sink had failed. A section that never closed means
+# the smoke stopped inside it, which fails here rather than being counted. Sets fails, and leaves the
+# section's FAIL lines in $SCRATCH/event-fails.
+read_event_section() {
+  if ! awk '$0 == "  ----  install event cases" { inside = 1; next }
+            $0 == "  ----  end of install event cases" && inside { closed = 1; inside = 0; next }
+            inside && /^  FAIL/ { print }
+            END { exit !closed }' "$SCRATCH/out" > "$SCRATCH/event-fails"; then
+    cat "$SCRATCH/out" >&2
+    printf 'FAIL  the smoke printed no complete install-event section, so there is no sink verdict to read\n' >&2
+    exit 1
+  fi
+  fails="$(grep -c . "$SCRATCH/event-fails" || true)"
+}
+
+# The sink is the one program the smoke hands python3 on stdin. Only that run is refused; every other
+# python3 run stays real, or the cases around the sink fail too and this proves nothing about it.
+REAL_PYTHON3="$(command -v python3 || true)"
+[ -n "$REAL_PYTHON3" ] || { printf 'FAIL  python3 is needed: the smoke runs its sink with it\n' >&2; exit 1; }
+# The exit status of each sink below that exits. Not 1, which is what a Python error and a failing kill -0
+# both give, so a report naming this one has read it off the sink.
+SINK_STATUS=3
+mkdir -p "$SCRATCH/bin"
+cat > "$SCRATCH/bin/python3" <<EOF
+#!/bin/sh
+# Exit before binding anything, as a sink that failed to start does, and leave a mark that it did.
+for arg in "\$@"; do
+  if [ "\$arg" = - ]; then : > "$SCRATCH/sink-refused"; exit $SINK_STATUS; fi
+done
+exec "$REAL_PYTHON3" "\$@"
+EOF
+chmod +x "$SCRATCH/bin/python3"
+
+status=0
+PATH="$SCRATCH/bin:$PATH" bash "$HERE/install-smoke.sh" > "$SCRATCH/out" 2>&1 || status=$?
+
+if [ ! -e "$SCRATCH/sink-refused" ]; then
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  the smoke never started its sink from a python3 program on stdin, so nothing here was tested\n' >&2
+  exit 1
+fi
+read_event_section
+if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails" \
+   && grep -q "exited with status $SINK_STATUS before it bound" "$SCRATCH/event-fails" \
+   && ! grep -q 'still running' "$SCRATCH/event-fails"; then
+  printf 'PASS  a sink that exits without binding a port is reported as one failure, which names the sink and the status it exited with before it bound\n'
+else
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  a sink that exits without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink and its exit status %s before it bound\n' \
+    "$fails" "$status" "$SINK_STATUS" >&2
+  exit 1
+fi
+
+# The same sink exiting later instead: the real sink runs, binds and publishes its port, and only then
+# exits, where it would start to serve. A wait that trusts the port alone takes it as started and hands
+# every case an endpoint that refuses them. Only the sink's own run has its serve_forever replaced, and
+# the replacement exits at once, with no interpreter teardown, so the sink is gone before the wait looks
+# at it again. A sink still dying when the wait looks cannot be told from one about to serve.
+mkdir -p "$SCRATCH/bound/site"
+cat > "$SCRATCH/bound/site/sitecustomize.py" <<EOF
+import os, socketserver
+def serve_forever(self, *args, **kwargs):
+    os._exit($SINK_STATUS)
+socketserver.BaseServer.serve_forever = serve_forever
+EOF
+cat > "$SCRATCH/bound/python3" <<EOF
+#!/bin/sh
+# Run the real sink with a server that exits once it is bound, and leave a mark that the sink ran.
+for arg in "\$@"; do
+  if [ "\$arg" = - ]; then
+    : > "$SCRATCH/sink-bound"
+    PYTHONPATH="$SCRATCH/bound/site\${PYTHONPATH:+:\$PYTHONPATH}"
+    export PYTHONPATH
+    exec "$REAL_PYTHON3" "\$@"
+  fi
+done
+exec "$REAL_PYTHON3" "\$@"
+EOF
+chmod +x "$SCRATCH/bound/python3"
+
+status=0
+PATH="$SCRATCH/bound:$PATH" bash "$HERE/install-smoke.sh" > "$SCRATCH/out" 2>&1 || status=$?
+
+if [ ! -e "$SCRATCH/sink-bound" ]; then
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  the smoke never started its sink from a python3 program on stdin, so nothing here was tested\n' >&2
+  exit 1
+fi
+read_event_section
+if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails" \
+   && grep -q "exited with status $SINK_STATUS after it bound" "$SCRATCH/event-fails"; then
+  printf 'PASS  a sink that exits after it binds a port is reported as one failure, which names the sink and the status it exited with after it bound\n'
+else
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  a sink that exits after it binds a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink and its exit status %s after it bound\n' \
+    "$fails" "$status" "$SINK_STATUS" >&2
+  exit 1
+fi
+
+# The same sink stalled instead: it never binds and never exits, so the liveness check inside the wait
+# passes on every round and only the failure the wait returns when it runs out can report it.
+mkdir -p "$SCRATCH/stall"
+cat > "$SCRATCH/stall/python3" <<EOF
+#!/bin/sh
+# Stay alive without binding anything, under the pid the smoke holds for its sink, and record that pid.
+for arg in "\$@"; do
+  if [ "\$arg" = - ]; then echo "\$\$" > "$SCRATCH/sink-pid"; exec sleep 300; fi
+done
+exec "$REAL_PYTHON3" "\$@"
+EOF
+chmod +x "$SCRATCH/stall/python3"
+
+status=0
+PATH="$SCRATCH/stall:$PATH" bash "$HERE/install-smoke.sh" > "$SCRATCH/out" 2>&1 || status=$?
+
+if [ ! -s "$SCRATCH/sink-pid" ]; then
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  the smoke never started its sink from a python3 program on stdin, so nothing here was tested\n' >&2
+  exit 1
+fi
+read_event_section
+if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails" \
+   && grep -q 'still running' "$SCRATCH/event-fails" && ! grep -q exited "$SCRATCH/event-fails"; then
+  printf 'PASS  a sink that stays alive without binding a port is reported as one failure, which names the sink and says it was still running\n'
+else
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  a sink that stays alive without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink and saying it was still running\n' \
+    "$fails" "$status" >&2
+  exit 1
+fi
+
+# A sink the smoke gave up on must not outlive the smoke. Once it is known to be gone its pid is
+# forgotten, so the exit trap cannot signal whatever process is given that pid later.
+if kill -0 "$(cat "$SCRATCH/sink-pid")" 2>/dev/null; then
+  printf 'FAIL  the smoke exited and left its sink that never bound a port still running\n' >&2
+  exit 1
+fi
+rm -f "$SCRATCH/sink-pid"
+printf 'PASS  the smoke stops a sink that never bound a port before it exits\n'
+
+# The sink must start without resolving a name for the address it bound. On some macOS runners that
+# lookup stalls for about 35 seconds, past any wait for the port, and on Linux it returns at once, so
+# only a lookup that fails outright makes a server that performs it fail here as well.
+mkdir -p "$SCRATCH/site"
+cat > "$SCRATCH/site/sitecustomize.py" <<EOF
+import socket
+open("$SCRATCH/lookup-armed", "w").close()
+def getfqdn(name=""):
+    raise OSError("name lookup refused by install-smoke-test.sh")
+socket.getfqdn = getfqdn
+EOF
+status=0
+PYTHONPATH="$SCRATCH/site${PYTHONPATH:+:$PYTHONPATH}" bash "$HERE/install-smoke.sh" > "$SCRATCH/out" 2>&1 || status=$?
+if [ ! -e "$SCRATCH/lookup-armed" ]; then
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  python3 never loaded the refusing name lookup, so nothing here was tested\n' >&2
+  exit 1
+fi
+read_event_section
+if [ "$fails" = 0 ]; then
+  printf 'PASS  the sink starts without a name lookup, so a stalled lookup cannot keep it from binding\n'
+else
+  cat "$SCRATCH/out" >&2
+  printf 'FAIL  with name lookups refused the install-event cases reported %s failure(s) (smoke exit %s)\n' "$fails" "$status" >&2
+  exit 1
+fi
