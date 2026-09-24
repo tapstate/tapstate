@@ -54,6 +54,11 @@ class CaptureOwnershipTest {
             "orders-source", null, "mysql", Map.of("host", "db.internal"), SourceMode.CDC,
             List.of(TableRef.literal("orders")), null, null);
 
+    /** The same source declaring a second table, for the cases where a pipeline reads only one of them. */
+    private static final SourceResource TWO_TABLE_SOURCE = new SourceResource(
+            "orders-source", null, "mysql", Map.of("host", "db.internal"), SourceMode.CDC,
+            List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null);
+
     /** The chain every pipeline here reads, whichever member drives it. */
     private static final String CHAIN = SourceCaptureResolution.of(SOURCE).chainId().value();
 
@@ -165,6 +170,43 @@ class CaptureOwnershipTest {
         } finally {
             owner.stopCapture("p", false);
         }
+    }
+
+    @Test
+    void theReadFaceNamesTheCaptureOfOnlyTheTablesThePipelineReads() {
+        // A capture's identity covers the streams it reads, and a start reads only the tables the pipeline
+        // addresses, not every table its source declares. The read face has to narrow the same way: over a
+        // source of two tables and a pipeline reading one, the whole source's id is a claim nobody took.
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("p", "orders-source.orders"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        MemoryClaims raw = new MemoryClaims();
+        StoreBackedPipelineCaptureCoordinator owner = managed(
+                store, (spec, passthrough, startTail) -> run(() -> { }), eligibleGate(), raw,
+                new WorkloadOwner("node-a", "boot-a"));
+        owner.startCapture("p");
+
+        try {
+            assertThat(new StoreBackedPipelineCaptures(store).captureIds("p"))
+                    .as("the id the claim was filed under, for the one table the pipeline reads")
+                    .containsExactly(raw.current.key().resourceId());
+        } finally {
+            owner.stopCapture("p", false);
+        }
+    }
+
+    @Test
+    void aPipelineAddressingATableItsSourceNeverDiscoveredNamesNoCaptureRatherThanFailingTheRead() {
+        // Such a pipeline is refused at its start, so it holds no capture on that source. The read face
+        // answers for every pipeline at once, and one that cannot resolve must not take that answer down.
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("p", "orders-source.invoices"));
+
+        assertThat(new StoreBackedPipelineCaptures(new InMemoryStorePort(artifacts)).captureIds("p"))
+                .as("no capture can exist for a reference its source cannot resolve")
+                .isEmpty();
     }
 
     @Test
@@ -432,6 +474,16 @@ class CaptureOwnershipTest {
                     new Settings(null, null, null, null, readMode, "earliest"), null));
         }
         return artifacts;
+    }
+
+    /** A cdc-only pipeline over the orders source that serves only what {@code from} addresses. */
+    private static PipelineResource pipelineServing(String pipelineId, String from) {
+        return new PipelineResource(
+                pipelineId, null, List.of(SourceRef.spec("orders-source", true)), null, null,
+                new ServeBlock.Inline(
+                        null, FromRef.literal(from),
+                        List.of(new SyncElement("sync", "target", null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null);
     }
 
     /** What the member starting a tail does to the store before anybody can read its ring. */

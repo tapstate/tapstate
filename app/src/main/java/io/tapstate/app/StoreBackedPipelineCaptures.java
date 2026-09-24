@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.control.core.PipelineCaptures;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceRef;
@@ -18,9 +19,9 @@ import java.util.Optional;
  * The capture identities a pipeline reads through, worked out from what is stored.
  *
  * <p>Derived rather than asked of whoever is running the pipeline, and that is the point of it. A
- * capture's identity is a function of the source contract -- connector settings, selected streams, the
- * read axis -- so every member computes the same ids from the same artifacts, and the read face answers
- * the same on a member that is running nothing. Asking the running member instead would give an answer
+ * capture's identity is a function of the source contract -- connector settings, the streams the pipeline
+ * reads, the read axis -- so every member computes the same ids from the same artifacts, and the read face
+ * answers the same on a member that is running nothing. Asking the running member instead would give an answer
  * only that member could give, over a face whose whole promise is that any node answers.
  *
  * <p>It is derived through the same function the runtime derives it through, so the ids here are the ids
@@ -57,12 +58,23 @@ final class StoreBackedPipelineCaptures implements PipelineCaptures {
             if (source.isEmpty() || !(source.get() instanceof SourceResource resolved)) {
                 continue;
             }
+            // Narrowed to the tables the pipeline addresses, as its start narrows them: the id covers the
+            // streams a capture reads, so the whole source's tables would name a claim nobody took.
+            Optional<SourceCaptureResolution> selected;
+            try {
+                selected = SourceCaptureResolution.forPipeline(
+                        pipeline, resolved, SourceDiscovery.model(storePort, resolved));
+            } catch (TapstateException unresolvable) {
+                // The start is refused with this same code, so no capture of it exists; and this face
+                // answers for every pipeline at once, which one that cannot resolve must not take down.
+                continue;
+            }
+            if (selected.isEmpty()) {
+                // It reads none of this source's tables, and its start opens no capture on it.
+                continue;
+            }
             CaptureRunSpec runSpec = StoreBackedPipelineCaptureCoordinator.deriveSpec(
-                    pipelineId,
-                    pipeline.settings(),
-                    resolved,
-                    SourceCaptureResolution.of(resolved, SourceDiscovery.model(storePort, resolved)),
-                    spec.srs());
+                    pipelineId, pipeline.settings(), resolved, selected.orElseThrow(), spec.srs());
             ids.add(CaptureId.of(runSpec).value());
         }
         return List.copyOf(ids);
