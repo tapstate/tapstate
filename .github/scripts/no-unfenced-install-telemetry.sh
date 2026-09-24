@@ -89,10 +89,15 @@ installs() { # <file>
 # finds them in that workflow and calls it clean.
 #
 # So each workflow is read as YAML and cut into places: every step; every job outside its steps, where
-# a matrix value or a reusable workflow's input can carry a command; and the workflow outside its jobs.
-# A place's own strings, and none from any other place, are what `installs` reads, and the place is
-# fenced only if the env resolved for it carries both. YAML comments reach neither half, so a fence
-# that exists only in a comment is no fence.
+# a reusable workflow's input can carry a command; and the workflow outside its jobs. A place's own
+# strings, and none from any other place, are what `installs` reads, and the place is fenced only if
+# the env resolved for it carries both. YAML comments reach neither half, so a fence that exists only
+# in a comment is no fence.
+#
+# A matrix value is read where it runs, not where it is written. The runner puts it in place of each
+# expression that reads it, so it runs with that place's env rather than its job's: a step that sets a
+# channel of its own over a fenced job sends a person's install, and a job fenced only on that step
+# installs fenced. So a value joins the strings of each place whose expressions read it, and no other.
 #
 # The reader is python3 with PyYAML. On the runner that is the system Python's own copy, there because
 # cloud-init, which the runner image boots with, depends on it. A machine without it fails the
@@ -109,6 +114,7 @@ installs() { # <file>
 scopes() { # <dir for the text files> <workflow>...
   python3 - "$FENCE_URL" "$FENCE_CHANNEL" "$FENCE_VALUE" "$@" <<'PY'
 import os
+import re
 import sys
 
 try:
@@ -120,6 +126,12 @@ except ImportError:
 Loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
 url, channel, value, out = sys.argv[1:5]
 count = 0
+# An expression; a string literal inside it may hold `}}` without ending it.
+EXPRESSION = re.compile(r"\$\{\{((?:'[^']*'|[^'}]|\}(?!\}))*)\}\}")
+# The matrix context in an expression -- not a property of that name, as in `needs.plan.outputs.matrix`
+# -- with the key it is read at when the expression names one.
+MATRIX = re.compile(r"(?<![\w.-])matrix(?![\w-])(?:\s*\.\s*([A-Za-z_][\w-]*)|\s*\[\s*'([^']*)'\s*\])?",
+                    re.IGNORECASE)
 
 
 def strings(node):
@@ -153,6 +165,39 @@ def fenced(env):
             and env.get(channel) == value)
 
 
+def matrix_of(job):
+    # Every value the job's matrix can hand a place, under the key it is read at -- lowercased, since
+    # an expression reads a key without regard to case. An `include` entry adds its keys beside the
+    # matrix's own; `exclude` only removes combinations. A matrix or entry given as an expression is
+    # decided at run time, so what it holds goes under None, to every place that reads the matrix.
+    strategy = job.get('strategy')
+    matrix = strategy.get('matrix') if isinstance(strategy, dict) else None
+    rows = [matrix]
+    if isinstance(matrix, dict):
+        include = matrix.get('include')
+        rows += include if isinstance(include, list) else [include]
+    values = {}
+    for row in rows:
+        if isinstance(row, dict):
+            for key, node in row.items():
+                if row is not matrix or key not in ('include', 'exclude'):
+                    values.setdefault(str(key).lower(), []).extend(strings(node))
+        else:
+            values.setdefault(None, []).extend(strings(row))
+    return values
+
+
+def read(node, matrix):
+    # A place's own strings, then the matrix values its expressions read. One that reads the matrix
+    # without naming a key -- `toJSON(matrix)`, an index decided at run time -- reads all of them.
+    own = list(strings(node))
+    keys = {(m.group(1) or m.group(2) or '').lower()
+            for text in own for body in EXPRESSION.findall(text) for m in MATRIX.finditer(body)}
+    taken = [v for key, values in matrix.items()
+             if keys and (key is None or key in keys or '' in keys) for v in values]
+    return '\n'.join(own + taken) + '\n#\n'
+
+
 def written(text):
     global count
     count += 1
@@ -169,17 +214,20 @@ for path in sys.argv[5:]:
     except yaml.YAMLError as e:
         sys.exit(f'{path} is not readable as YAML: {e}')
     top = inherit({}, workflow)
-    places = [(top, 'outside its jobs', {k: v for k, v in workflow.items() if k != 'jobs'})]
+    places = [(top, 'outside its jobs', {k: v for k, v in workflow.items() if k != 'jobs'}, {})]
     for job_id, job in (workflow.get('jobs') or {}).items():
         # A job that calls a reusable workflow hands its inputs to a run whose env is the called
         # workflow's alone; the caller's env reaches none of it.
         env = {} if 'uses' in job else inherit(top, job)
-        places.append((env, f'job {job_id}, outside its steps', {k: v for k, v in job.items() if k != 'steps'}))
+        matrix = matrix_of(job)
+        # The strategy runs nothing of its own: its matrix values are read where they are named.
+        places.append((env, f'job {job_id}, outside its steps',
+                       {k: v for k, v in job.items() if k not in ('steps', 'strategy')}, matrix))
         for number, step in enumerate(job.get('steps') or [], 1):
             name = ' '.join(str(step.get('name') or '').split())
-            places.append((inherit(env, step), f'job {job_id}, step {number}' + (f' ({name})' if name else ''), step))
-    unfenced = [(where, '\n'.join(strings(node)) + '\n#\n') for env, where, node in places
-                if not fenced(env)]
+            places.append((inherit(env, step), f'job {job_id}, step {number}' + (f' ({name})' if name else ''),
+                           step, matrix))
+    unfenced = [(where, read(node, matrix)) for env, where, node, matrix in places if not fenced(env)]
     if unfenced:
         together = written(''.join(text for _, text in unfenced))
         for where, text in unfenced:
@@ -355,7 +403,7 @@ detector_alive() {
     printf '%s\n' '      - run: ./install/install.sh'
   } > "$d/dangling.yml"
   # The command comes from the matrix, and the step only names it. A scan that read `run:` values
-  # alone would find nothing here; the job's own place carries it.
+  # alone would find nothing here; the value is read with the step that names it.
   {
     printf '%s\n' 'jobs:'
     printf '%s\n' '  install:'
@@ -366,6 +414,52 @@ detector_alive() {
     # shellcheck disable=SC2016  # the workflow's own expression, left for the runner to expand
     printf '%s\n' '      - run: ${{ matrix.how }}'
   } > "$d/matrix.yml"
+  # Fenced for the whole workflow, and the step that runs the matrix value sets a channel of its own.
+  # The value runs with that step's env, so checking it against the job's passes an install that
+  # arrives as a person's.
+  {
+    printf '%s\n' 'env:'
+    printf '%s\n' '  TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e'
+    printf '%s\n' '  TAPSTATE_TELEMETRY_CHANNEL: internal'
+    printf '%s\n' 'jobs:'
+    printf '%s\n' '  install:'
+    printf '%s\n' '    strategy:'
+    printf '%s\n' '      matrix:'
+    printf '%s\n' "        how: ['curl -sSL https://install.tapstate.dev/cli | sh']"
+    printf '%s\n' '    steps:'
+    # shellcheck disable=SC2016  # the workflow's own expression, left for the runner to expand
+    printf '%s\n' '      - run: ${{ matrix.how }}'
+    printf '%s\n' '        env:'
+    printf '%s\n' '          TAPSTATE_TELEMETRY_CHANNEL: community'
+  } > "$d/matrix-overridden.yml"
+  # The fence only on the step that runs the matrix value, beside a step that reads another key and
+  # installs nothing. The install runs fenced, so neither the job nor that step may be refused.
+  # shellcheck disable=SC2016  # the workflow's own expressions, left for the runner to expand
+  {
+    printf '%s\n' 'jobs:'
+    printf '%s\n' '  install:'
+    printf '%s\n' '    strategy:'
+    printf '%s\n' '      matrix:'
+    printf '%s\n' '        os: [linux]'
+    printf '%s\n' "        how: ['curl -sSL https://install.tapstate.dev/cli | sh']"
+    printf '%s\n' '    steps:'
+    printf '%s\n' '      - run: echo ${{ matrix.os }}'
+    printf '%s\n' '      - run: ${{ matrix.how }}'
+    printf '%s\n' '        env:'
+    printf '%s\n' '          TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e'
+    printf '%s\n' '          TAPSTATE_TELEMETRY_CHANNEL: internal'
+  } > "$d/matrix-step-fence.yml"
+  # The value comes from an `include` entry, and the step reads the matrix whole rather than by key.
+  {
+    printf '%s\n' 'jobs:'
+    printf '%s\n' '  install:'
+    printf '%s\n' '    strategy:'
+    printf '%s\n' '      matrix:'
+    printf '%s\n' '        include:'
+    printf '%s\n' "          - how: 'curl -sSL https://install.tapstate.dev/cli | sh'"
+    printf '%s\n' '    steps:'
+    printf '%s\n' "      - run: echo '\${{ toJSON(matrix) }}' | jq -r .how | sh"
+  } > "$d/matrix-whole.yml"
 
   installs "$d/unfenced.yml" || die_detector "the scan did not recognise a published one-liner piped into a shell."
   installs "$d/fenced.yml"   || die_detector "the scan did not recognise the one-liner in the fenced control."
@@ -379,7 +473,8 @@ detector_alive() {
 
   report="$(unfenced_installs "$d/unfenced.yml" "$d/fenced.yml" "$d/suffix-fence.yml" "$d/channel-only.yml" \
     "$d/commented-fence.yml" "$d/wrong-job.yml" "$d/job-fence.yml" "$d/step-fence.yml" "$d/overridden.yml" \
-    "$d/blank-url.yml" "$d/reusable.yml" "$d/dangling.yml" "$d/matrix.yml")" \
+    "$d/blank-url.yml" "$d/reusable.yml" "$d/dangling.yml" "$d/matrix.yml" "$d/matrix-overridden.yml" \
+    "$d/matrix-step-fence.yml" "$d/matrix-whole.yml")" \
     || die_detector "the scan could not read its own controls as workflows; it needs python3 with PyYAML."
   names "$report" "$d/unfenced.yml"        || die_detector "the scan called an unfenced control fenced."
   names "$report" "$d/fenced.yml"          && die_detector "the scan did not accept a control carrying both variables."
@@ -394,6 +489,9 @@ detector_alive() {
   names "$report" "$d/reusable.yml"        || die_detector "the scan let a caller's env fence a reusable workflow it calls."
   names "$report" "$d/dangling.yml"        || die_detector "the scan joined one step's trailing continuation onto the next step's install."
   names "$report" "$d/matrix.yml"          || die_detector "the scan lost an install carried by a matrix value rather than a run: line."
+  names "$report" "$d/matrix-overridden.yml" || die_detector "the scan checked a matrix value against the job's env, not the step that runs it."
+  names "$report" "$d/matrix-step-fence.yml" && die_detector "the scan refused a matrix value that the step running it fences."
+  names "$report" "$d/matrix-whole.yml"    || die_detector "the scan lost a matrix value from an include entry, read with the whole matrix."
   rm -rf "$d"
 }
 
