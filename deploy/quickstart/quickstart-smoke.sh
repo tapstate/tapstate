@@ -967,12 +967,14 @@ rm -rf "$DROP_DIR"
 # install-smoke.sh covers the installer in isolation. These three cover what only the composed flow can
 # show: the quickstart calls install.sh TWICE (the platform gate, then the real install) and it drops
 # the installer's stdout. Both facts are invisible from install.sh alone.
-if ! command -v python3 >/dev/null 2>&1; then
-  bad "quickstart install event: python3 is needed for the local sink"
-else
+#
+# The sink is a fixture, and a fixture that never started is one failure that says so. Reading a port it
+# never published points every case below at an endpoint with no port, and each of them then fails as
+# though the quickstart had sent the wrong thing.
+start_sink() {   # succeeds once the sink has published the port it bound
   QBD="$(mktemp -d)"; : > "$QBD/log"
   python3 - "$QBD" <<'PYEOF' &
-import http.server, os, sys
+import http.server, os, socketserver, sys
 d = sys.argv[1]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -981,13 +983,28 @@ class H(http.server.BaseHTTPRequestHandler):
             fh.write(self.rfile.read(n).decode('utf-8', 'replace') + "\n")
         self.send_response(204); self.end_headers()
     def log_message(self, *a): pass
-srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+# TCPServer and not http.server.HTTPServer, which looks up a name for the address it bound before it
+# listens: on the macOS runners that lookup stalls for about 35 seconds, far past any wait for the port.
+srv = socketserver.TCPServer(('127.0.0.1', 0), H)
 with open(os.path.join(d, 'port'), 'w') as fh:
     fh.write(str(srv.server_address[1]))
 srv.serve_forever()
 PYEOF
   QB_PID=$!
-  for _ in $(seq 1 50); do [ -s "$QBD/port" ] && break; sleep 0.1; done
+  # About 15s for a slow machine, and never longer than the sink lives: one that died is not waited on.
+  for _ in $(seq 1 150); do
+    [ -s "$QBD/port" ] && return 0
+    kill -0 "$QB_PID" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  return 1
+}
+if ! command -v python3 >/dev/null 2>&1; then
+  bad "quickstart install event: python3 is needed for the local sink"
+elif ! start_sink; then
+  bad "quickstart install event: the local sink never bound a port, so none of the install-event cases ran"
+  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null
+else
   QB_URL="http://127.0.0.1:$(cat "$QBD/port")/e"
 
   # like run_prepare, but keeps stdout and stderr apart -- the disclosure case is about which stream

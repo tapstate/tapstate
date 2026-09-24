@@ -353,6 +353,7 @@ jobs:
         run: |
           shellcheck -s sh install/install.sh
           shellcheck install/install-smoke.sh
+          shellcheck install/install-smoke-test.sh
           shellcheck -s sh deploy/quickstart/quickstart.sh
           shellcheck deploy/quickstart/quickstart-smoke.sh
           shellcheck deploy/docker/image-smoke.sh
@@ -369,6 +370,8 @@ jobs:
           shellcheck -s sh scripts/funnel-capture-smoke.sh
       - name: installer smoke
         run: bash install/install-smoke.sh
+      - name: installer smoke verdict tests
+        run: bash install/install-smoke-test.sh
       - name: quickstart smoke
         run: bash deploy/quickstart/quickstart-smoke.sh
       - name: Dockerfile smoke verdict tests

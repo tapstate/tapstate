@@ -560,13 +560,16 @@ rm -rf "$shim"
 # --- the install event: what it carries, when it fires, and when it must not ------------------------
 # A local sink stands in for the endpoint, so these run with no network and no credentials. Each case
 # asserts on what actually arrived, not on what the script claims it sends.
-if ! command -v python3 >/dev/null 2>&1; then
-  bad "install event: python3 is needed for the local sink"
-else
+#
+# The sink is a fixture, and a fixture that never started is one failure that says so. Reading a port it
+# never published points every case below at an endpoint with no port, and each of them then fails as
+# though the installer had sent the wrong thing: a sink that did not start, reported as defects in the
+# thing this suite exists to test.
+start_sink() {   # succeeds once the sink has published the port it bound
   BEACON_DIR="$(mktemp -d)"
   : > "$BEACON_DIR/log"
   python3 - "$BEACON_DIR" <<'PYEOF' &
-import http.server, os, sys
+import http.server, os, socketserver, sys
 d = sys.argv[1]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -576,13 +579,28 @@ class H(http.server.BaseHTTPRequestHandler):
             fh.write(body + "\n")
         self.send_response(204); self.end_headers()
     def log_message(self, *a): pass
-srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+# TCPServer and not http.server.HTTPServer, which looks up a name for the address it bound before it
+# listens: on the macOS runners that lookup stalls for about 35 seconds, far past any wait for the port.
+srv = socketserver.TCPServer(('127.0.0.1', 0), H)
 with open(os.path.join(d, 'port'), 'w') as fh:
     fh.write(str(srv.server_address[1]))
 srv.serve_forever()
 PYEOF
   BEACON_PID=$!
-  for _ in $(seq 1 50); do [ -s "$BEACON_DIR/port" ] && break; sleep 0.1; done
+  # About 15s for a slow machine, and never longer than the sink lives: one that died is not waited on.
+  for _ in $(seq 1 150); do
+    [ -s "$BEACON_DIR/port" ] && return 0
+    kill -0 "$BEACON_PID" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  return 1
+}
+if ! command -v python3 >/dev/null 2>&1; then
+  bad "install event: python3 is needed for the local sink"
+elif ! start_sink; then
+  bad "install event: the local sink never bound a port, so none of the install-event cases ran"
+  kill "$BEACON_PID" 2>/dev/null; wait "$BEACON_PID" 2>/dev/null
+else
   BEACON_URL="http://127.0.0.1:$(cat "$BEACON_DIR/port")/e"
 
   # A second stub version, so "which version did it report" has two possible answers. With only the
