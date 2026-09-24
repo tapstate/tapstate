@@ -312,6 +312,15 @@ class ImapJoinStoresTest {
         assertThat(named).containsOnly(
                 Map.entry(new ReverseBucket.At("d1", 1), Set.of("f4", "f5")),
                 Map.entry(new ReverseBucket.At("d2", 0), Set.of("g1")));
+        // One set asked of several pages, as the rest of a bucket is asked about, is copied once and
+        // still answered page by page.
+        Set<String> shared = Set.of("f4", "f5", "g1");
+        assertThat(stores.indexNames(DIMENSION, Map.of(
+                new ReverseBucket.At("d1", 0), shared,
+                new ReverseBucket.At("d1", 1), shared,
+                new ReverseBucket.At("d2", 0), shared))).containsOnly(
+                        Map.entry(new ReverseBucket.At("d1", 1), Set.of("f4", "f5")),
+                        Map.entry(new ReverseBucket.At("d2", 0), Set.of("g1")));
         assertThat(stores.indexNames(DIMENSION, Map.of())).isEmpty();
         assertThat(member.getMap(JoinMaps.reverseIndex(PIPELINE, STEP, DIMENSION)).size())
                 .as("asking about a page that is not there leaves nothing behind").isEqualTo(3);

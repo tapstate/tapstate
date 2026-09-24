@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -139,6 +140,9 @@ public final class ImapJoinStores implements JoinStores {
      * batch would hold a full page for each of its rows at once; what crosses back instead is the keys
      * found, which the batch already holds. It is one call for the whole batch, as
      * {@link #factsUnder} is.
+     *
+     * <p>Each set of keys asked is copied once however many pages it is asked of, so a question about
+     * every page of a long bucket carries its keys once rather than once a page.
      */
     @Override
     public Map<ReverseBucket.At, Set<String>> indexNames(String source,
@@ -147,7 +151,8 @@ public final class ImapJoinStores implements JoinStores {
             return Map.of();
         }
         Map<ReverseBucket.At, Set<String>> wanted = new HashMap<>();
-        asked.forEach((at, factKeys) -> wanted.put(at, new HashSet<>(factKeys)));
+        Map<Set<String>, Set<String>> copies = new IdentityHashMap<>();
+        asked.forEach((at, factKeys) -> wanted.put(at, copies.computeIfAbsent(factKeys, HashSet::new)));
         Map<ReverseBucket.At, Set<String>> named = new LinkedHashMap<>();
         index(source).executeOnKeys(wanted.keySet(), new Names(wanted)).forEach((at, found) -> {
             if (!found.isEmpty()) {

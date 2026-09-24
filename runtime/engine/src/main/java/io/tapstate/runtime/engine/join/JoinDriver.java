@@ -13,6 +13,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -109,19 +110,27 @@ public final class JoinDriver {
     /**
      * Where the read ahead of the reverse index found the rows of the batch being taken in that are
      * arriving again: for each bucket, the page each of those fact keys is named on. Empty outside a
-     * batch. Only ever evidence that a row is named - a row it does not hold is looked for in the store,
-     * never taken to be missing - and a key is dropped from it the moment this driver removes that key
-     * from that bucket, so it never names a row this driver has since taken out.
+     * batch. A key is dropped from it the moment this driver removes that key from that bucket, so it
+     * never names a row this driver has since taken out.
      */
     private final Map<Bucket, Map<String, Integer>> named = new HashMap<>();
 
     /**
-     * For each bucket longer than one page, the page this driver last found a row on while confirming
-     * it - where the next row of that bucket arriving again is almost always found. Bounded at
-     * {@link #BUCKETS_REMEMBERED} by forgetting the bucket least recently confirmed, not all of them:
-     * a load whose fact keys interleave more long buckets than that would otherwise send every bucket
-     * back to its first page each time the bound is reached. What is forgotten costs a search from the
-     * first page, never an answer.
+     * The rows of the batch being taken in that every page of their bucket was asked about and none
+     * named: the rows a member died part way through. Empty outside a batch. Only the driver a fact key
+     * is routed to ever adds that key to a bucket, and that is this one, so a row no page named when it
+     * was asked about is still named by none when it is reached, and it is added without being looked
+     * for again. A key is dropped from it as it is from {@link #named}.
+     */
+    private final Map<Bucket, Set<String>> unnamed = new HashMap<>();
+
+    /**
+     * For each bucket longer than one page, the page the rows last confirmed in it were found on in the
+     * order they arrived - where the next rows of that bucket arriving again are almost always found.
+     * Bounded at {@link #BUCKETS_REMEMBERED} by forgetting the bucket least recently confirmed, not all
+     * of them: a load whose fact keys interleave more long buckets than that would otherwise send every
+     * bucket back to its first page each time the bound is reached. What is forgotten costs a question
+     * about the whole bucket, never an answer.
      */
     private final Map<Bucket, Integer> confirmedOn = new LinkedHashMap<>(16, 0.75f, true) {
         private static final long serialVersionUID = 1L;
@@ -262,6 +271,7 @@ public final class JoinDriver {
         }
         primed.clear();
         named.clear();
+        unnamed.clear();
         if (mirroredThisBatch) {
             // After the batch's last index write and never before it: this is what says they all
             // landed, and a batch that dies part way never gets here.
@@ -292,6 +302,7 @@ public final class JoinDriver {
     private void prime(List<SourceChange> changes) {
         primed.clear();
         named.clear();
+        unnamed.clear();
         if (changes.size() < 2) {
             return;
         }
@@ -341,17 +352,14 @@ public final class JoinDriver {
      * <p><b>This is the read a restart makes most of.</b> The rows confirmed are every row a batch that
      * never finished had mirrored, because nothing says which of its index writes landed - and, once,
      * every row of a load read again over rows mirrored before rows carried their batch. Confirmed a
-     * page read at a time, that is a trip per row per dimension. Here each bucket is asked about the
-     * page its last row was found on and then the pages after it, for as long as they go on naming its
-     * rows, and each of those steps is one question for every bucket of the batch: rows arriving again
-     * arrive in the order their buckets were written, so a batch reaches no further into a bucket than
-     * its own length. What comes back is the keys found, never the pages, so what this holds is
+     * page read at a time, that is a trip per row per dimension; looked up here it is a few questions
+     * for the whole batch, each of them one store call for every bucket the batch reaches - see
+     * {@link #lookUp}. What comes back is the keys found, never the pages, so what this holds is
      * bounded by the batch and not by how long its buckets are.
      *
-     * <p>It is a read ahead in the same sense as {@link #prime}: only what it finds is used, and a row
-     * it does not find is looked for in the store exactly as though nothing had been read ahead. The
-     * rows picked are the ones {@link #absorbFact} confirms; one picked wrongly costs a key in a read,
-     * and one missed costs the search it would have made anyway.
+     * <p>It is a read ahead in the same sense as {@link #prime}: it answers what looking each row up as
+     * it is reached would. The rows picked are the ones {@link #absorbFact} confirms; one picked wrongly
+     * costs a key in a read, and one missed is looked up on its own when it is reached.
      */
     private void primeIndex(List<SourceChange> changes) {
         Map<Bucket, Set<String>> wanted = new LinkedHashMap<>();
@@ -381,36 +389,125 @@ public final class JoinDriver {
                 }
             }
         }
-        for (int ahead = 0; !wanted.isEmpty(); ahead++) {
-            Map<String, Map<ReverseBucket.At, Set<String>>> asked = new LinkedHashMap<>();
-            for (Map.Entry<Bucket, Set<String>> bucket : wanted.entrySet()) {
-                int page = confirmedOn.getOrDefault(bucket.getKey(), 0) + ahead;
-                asked.computeIfAbsent(bucket.getKey().source(), ignored -> new LinkedHashMap<>())
-                        .put(new ReverseBucket.At(bucket.getKey().dimensionKey(), page),
-                                bucket.getValue());
+        lookUp(wanted);
+    }
+
+    /**
+     * Finds the page each bucket of {@code wanted} names each of its fact keys on - the keys of a bucket
+     * in the order their rows arrived - and writes the answer down: the page in {@link #named}, and in
+     * {@link #unnamed} each key no page of its bucket names. Each question asked is one store call per
+     * dimension, about every bucket still being looked in.
+     *
+     * <p><b>First in the order the rows arrived.</b> A load read again mostly arrives in the order it was
+     * first taken in, which is the order its buckets were written in. So each bucket is asked about the
+     * page its last rows were found on and then the pages after it, a question a page, for as long as
+     * each page goes on naming its rows in the order they arrived. The first page may name none of them,
+     * since a batch may start where the one before it ended a page; after it, a page naming none ends
+     * the walk. A batch arriving in that order reaches no further into a bucket than its own length;
+     * walked from the first page instead, every batch whose rows lie further in would come to ask about
+     * the whole bucket.
+     *
+     * <p><b>Then the rest of each bucket, at once, for what that did not find.</b> Rows arriving again
+     * need not arrive in that order: a row an update moved into a bucket was written at its end, and a
+     * table read in no particular order - postgres without ORDER BY, or in chunks or in parallel - brings
+     * a bucket's rows back in any order. Looked for a page at a time outwards from where the row before
+     * it was found, each such row cost up to two page reads for every page between the two and moved
+     * where the next row was looked for, so the row after it paid the same distance back: a long bucket
+     * read again out of order came close to a read of the bucket per row. Here every page the walk did
+     * not reach is asked about in one question, after one read of how long the bucket is. So a batch
+     * asks about each page of a bucket at most once whatever order its rows arrive in, and beyond a
+     * question for each page it finds rows on in order it asks at most three. For the same reason the
+     * walk ends at a page naming its rows out of the order they arrived: past it, going on a page at a
+     * time would ask in many questions what the one about the rest of the bucket asks at once.
+     *
+     * <p><b>The next batch starts where this one found rows in order</b>: on the last page the walk found
+     * one on or, where it found none, the page the last of its rows to arrive was found on. A row found
+     * out of order says nothing about where the next ones are, so it does not move that page.
+     */
+    private void lookUp(Map<Bucket, Set<String>> wanted) {
+        Map<Bucket, Search> searches = new LinkedHashMap<>();
+        for (Map.Entry<Bucket, Set<String>> bucket : wanted.entrySet()) {
+            searches.put(bucket.getKey(),
+                    new Search(bucket.getValue(), confirmedOn.getOrDefault(bucket.getKey(), 0)));
+        }
+        for (int ahead = 0; ; ahead++) {
+            Map<String, Map<ReverseBucket.At, Set<String>>> question = new LinkedHashMap<>();
+            for (Map.Entry<Bucket, Search> bucket : searches.entrySet()) {
+                Search search = bucket.getValue();
+                if (search.walking) {
+                    search.reached = search.from + ahead;
+                    include(question, bucket.getKey(), search.reached, Set.copyOf(search.left));
+                }
             }
-            for (Map.Entry<String, Map<ReverseBucket.At, Set<String>>> source : asked.entrySet()) {
-                Map<ReverseBucket.At, Set<String>> answered =
-                        stores.indexNames(source.getKey(), source.getValue());
-                for (Map.Entry<ReverseBucket.At, Set<String>> at : source.getValue().entrySet()) {
-                    Bucket bucket = new Bucket(source.getKey(), at.getKey().dimensionKey());
-                    Set<String> found = answered.getOrDefault(at.getKey(), Set.of());
-                    for (String factKey : found) {
-                        named.computeIfAbsent(bucket, ignored -> new HashMap<>())
-                                .put(factKey, at.getKey().page());
-                    }
-                    Set<String> left = at.getValue();
-                    left.removeAll(found);
-                    // Past the remembered page, which holds none of a batch that starts where the one
-                    // before it ended a page, a page holding none of what is left ends the walk: the
-                    // rest is missing - a row a member died part way through - or not in the order it
-                    // was written, and both are the store search's to settle.
-                    if (left.isEmpty() || (found.isEmpty() && ahead > 0)) {
-                        wanted.remove(bucket);
-                    }
+            if (question.isEmpty()) {
+                break;
+            }
+            Map<Bucket, Set<String>> found = ask(question);
+            for (Map.Entry<Bucket, Search> bucket : searches.entrySet()) {
+                if (bucket.getValue().walking) {
+                    bucket.getValue().walked(found.getOrDefault(bucket.getKey(), Set.of()), ahead > 0);
                 }
             }
         }
+        Map<String, Map<ReverseBucket.At, Set<String>>> rest = new LinkedHashMap<>();
+        for (Map.Entry<Bucket, Search> bucket : searches.entrySet()) {
+            Search search = bucket.getValue();
+            if (search.left.isEmpty()) {
+                continue;
+            }
+            int pages = stores.indexPageCount(bucket.getKey().source(), bucket.getKey().dimensionKey());
+            // One set for every page of the bucket, so that a question can carry it once.
+            Set<String> left = Set.copyOf(search.left);
+            for (int page = 0; page < pages; page++) {
+                if (page < search.from || page > search.reached) {
+                    include(rest, bucket.getKey(), page, left);
+                }
+            }
+        }
+        Map<Bucket, Set<String>> found = ask(rest);
+        for (Map.Entry<Bucket, Search> bucket : searches.entrySet()) {
+            Search search = bucket.getValue();
+            search.left.removeAll(found.getOrDefault(bucket.getKey(), Set.of()));
+            if (!search.left.isEmpty()) {
+                unnamed.computeIfAbsent(bucket.getKey(), ignored -> new HashSet<>()).addAll(search.left);
+            }
+            int next = search.inOrder;
+            if (next < 0) {
+                Map<String, Integer> pages = named.getOrDefault(bucket.getKey(), Map.of());
+                for (String factKey : search.arrived.keySet()) {
+                    next = pages.getOrDefault(factKey, next);
+                }
+            }
+            if (next >= 0 && next != search.from) {
+                confirmedOn.put(bucket.getKey(), next);
+            }
+        }
+    }
+
+    /** Adds asking page {@code page} of {@code bucket} which of {@code factKeys} it names. */
+    private static void include(Map<String, Map<ReverseBucket.At, Set<String>>> question,
+            Bucket bucket, int page, Set<String> factKeys) {
+        question.computeIfAbsent(bucket.source(), ignored -> new LinkedHashMap<>())
+                .put(new ReverseBucket.At(bucket.dimensionKey(), page), factKeys);
+    }
+
+    /**
+     * Asks {@code question}, one store call for each source it is about, writes down in {@link #named}
+     * the page each key was found on, and answers with the keys found in each bucket.
+     */
+    private Map<Bucket, Set<String>> ask(Map<String, Map<ReverseBucket.At, Set<String>>> question) {
+        Map<Bucket, Set<String>> found = new HashMap<>();
+        for (Map.Entry<String, Map<ReverseBucket.At, Set<String>>> source : question.entrySet()) {
+            stores.indexNames(source.getKey(), source.getValue()).forEach((at, factKeys) -> {
+                Bucket bucket = new Bucket(source.getKey(), at.dimensionKey());
+                Map<String, Integer> pages = named.computeIfAbsent(bucket, ignored -> new HashMap<>());
+                for (String factKey : factKeys) {
+                    pages.put(factKey, at.page());
+                }
+                found.computeIfAbsent(bucket, ignored -> new HashSet<>()).addAll(factKeys);
+            });
+        }
+        return found;
     }
 
     /**
@@ -587,46 +684,32 @@ public final class JoinDriver {
      * regardless would add a copy of each of them. The index tolerates a copy; it does not tolerate
      * growing by one for every row of every batch a member died in.
      *
-     * <p><b>Why it starts where the last one was found.</b> A load read again arrives in the order it was
-     * first taken in, which is the order its buckets were written in, so the next row of a bucket is on
-     * the page the last one was found on or the one after. Searching from the first page every time
-     * would read a bucket up to each of its rows - half a billion page reads for a million-row bucket
-     * read again. The pages nearest the remembered one are asked first, and every page is asked before
+     * <p><b>Where it looks is {@link #lookUp}'s to say.</b> The read ahead has almost always looked
+     * already, for the whole batch at once. A row it did not look for - one arriving in a batch of its
+     * own - is looked up alone in the same way, which asks about each page of its bucket at most once,
+     * in at most three questions and a read of how long the bucket is. Every page is asked about before
      * a row is taken to be missing, which is paid once for each row a member died part way through.
-     *
-     * <p>Almost every row is answered by {@link #primeIndex} without asking the store at all; the search
-     * is for the rows that read ahead did not find, and for a batch of one, which is not read ahead.
      */
     private void confirmIndexed(Dimension dimension, String dimensionKey, String factKey) {
-        String source = dimension.source();
-        Bucket bucket = new Bucket(source, dimensionKey);
-        int remembered = confirmedOn.getOrDefault(bucket, 0);
-        Map<String, Integer> readAhead = named.get(bucket);
-        Integer found = readAhead == null ? null : readAhead.get(factKey);
-        if (found != null) {
-            if (found != remembered) {
-                confirmedOn.put(bucket, found);
-            }
-            return;
+        Bucket bucket = new Bucket(dimension.source(), dimensionKey);
+        if (!lookedUp(bucket, factKey)) {
+            lookUp(Map.of(bucket, Set.of(factKey)));
         }
-        if (stores.indexPage(source, dimensionKey, remembered).contains(factKey)) {
-            return;
+        Set<String> nowhere = unnamed.get(bucket);
+        if (nowhere != null && nowhere.remove(factKey)) {
+            stores.indexAdd(dimension.source(), dimensionKey, factKey);
         }
-        int pages = stores.indexPageCount(source, dimensionKey);
-        // The bucket may have lost pages off its end since the page was remembered.
-        int from = Math.min(remembered, Math.max(0, pages - 1));
-        for (int step = 0; step < 2 * pages; step++) {
-            // from, from + 1, from - 1, from + 2, from - 2 ... - forwards first, as the rows arrive.
-            int page = step % 2 == 1 ? from + (step + 1) / 2 : from - step / 2;
-            if (page < 0 || page >= pages || page == remembered) {
-                continue;
-            }
-            if (stores.indexPage(source, dimensionKey, page).contains(factKey)) {
-                confirmedOn.put(bucket, page);
-                return;
-            }
-        }
-        stores.indexAdd(source, dimensionKey, factKey);
+    }
+
+    /**
+     * Whether this batch has already found the page {@code bucket} names {@code factKey} on, or found
+     * that none does.
+     */
+    private boolean lookedUp(Bucket bucket, String factKey) {
+        Map<String, Integer> pages = named.get(bucket);
+        Set<String> nowhere = unnamed.get(bucket);
+        return pages != null && pages.containsKey(factKey)
+                || nowhere != null && nowhere.contains(factKey);
     }
 
     /**
@@ -1031,9 +1114,14 @@ public final class JoinDriver {
      * written: the read ahead then never holds a row this driver has dropped.
      */
     private void indexRemove(String source, String dimensionKey, String factKey) {
-        Map<String, Integer> readAhead = named.get(new Bucket(source, dimensionKey));
+        Bucket bucket = new Bucket(source, dimensionKey);
+        Map<String, Integer> readAhead = named.get(bucket);
         if (readAhead != null) {
             readAhead.remove(factKey);
+        }
+        Set<String> nowhere = unnamed.get(bucket);
+        if (nowhere != null) {
+            nowhere.remove(factKey);
         }
         stores.indexRemove(source, dimensionKey, factKey);
     }
@@ -1149,6 +1237,74 @@ public final class JoinDriver {
 
     /** One bucket of the reverse index: a dimension source and one of its keys. */
     private record Bucket(String source, String dimensionKey) {
+    }
+
+    /**
+     * How far looking up rows in one bucket has got: which of them no page has named yet, and how far
+     * the walk in the order they arrived has gone.
+     */
+    private static final class Search {
+
+        /** Each fact key looked up, in the order its row arrived, with its place in that order. */
+        private final Map<String, Integer> arrived = new LinkedHashMap<>();
+
+        /** The keys no page has been found naming yet. */
+        private final Set<String> left;
+
+        /** The page the walk starts on: the one the bucket's last rows were found on. */
+        private final int from;
+
+        /** The last page the walk asked about. */
+        private int reached;
+
+        /** Whether the walk goes on to the page after the one it reached. */
+        private boolean walking = true;
+
+        /** The last page the walk found rows on in the order they arrived, or -1 where it found none. */
+        private int inOrder = -1;
+
+        /** The latest place in the order of arrival among the rows the walk found in order. */
+        private int latest = -1;
+
+        private Search(Set<String> factKeys, int from) {
+            for (String factKey : factKeys) {
+                arrived.put(factKey, arrived.size());
+            }
+            this.left = new LinkedHashSet<>(factKeys);
+            this.from = from;
+            this.reached = from;
+        }
+
+        /**
+         * Takes in what the page the walk just asked about named, and settles whether the walk goes on:
+         * while rows are left and the page named some of them, each arriving after every row a page
+         * before it named. The first page may name none, because a batch may start where the one before
+         * it ended a page.
+         */
+        private void walked(Set<String> found, boolean pastTheFirst) {
+            left.removeAll(found);
+            if (found.isEmpty()) {
+                walking = !pastTheFirst;
+                return;
+            }
+            int earliest = Integer.MAX_VALUE;
+            int last = -1;
+            for (String factKey : found) {
+                int place = arrived.get(factKey);
+                earliest = Math.min(earliest, place);
+                last = Math.max(last, place);
+            }
+            if (earliest < latest) {
+                // A row this page names arrived before one a page before it named: the rows are not
+                // arriving in the order they were written, so this page says nothing about where the
+                // rest are, or where the next batch's rows will be.
+                walking = false;
+                return;
+            }
+            latest = last;
+            inOrder = reached;
+            walking = !left.isEmpty();
+        }
     }
 
     private sealed interface Work permits Row, Recompute {
