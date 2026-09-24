@@ -156,11 +156,18 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
         // again, so a change of the new ring would otherwise read as older than one of the ring before it.
         if (ringTail != null && openReader()) {
-            reader.fill((item, seq) -> {
-                SourceOrder order = orderOf(seq);
-                pending.add(SrsProjection.toEnvelope(item, src, order));
-                read = order;
-            }, FILL_BATCH);
+            try {
+                reader.fill((item, seq) -> {
+                    SourceOrder order = orderOf(seq);
+                    pending.add(SrsProjection.toEnvelope(item, src, order));
+                    read = order;
+                }, FILL_BATCH);
+                refused = false;
+            } catch (RingWriteRefusedException refusal) {
+                // Whatever this pass read before the refusal is already pending, and the reader stands at
+                // the first change it did not read, so the next pass carries on from there.
+                waitOut(refusal);
+            }
         }
         if (pending.size() > pendingBefore) {
             timer.end(started);
@@ -189,9 +196,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * tail running with the shared ring switched off reaches the sink through that buffer alone and has no
      * reason to be held up by a ring it never reads.
      *
-     * <p>Bounded, and by the stretch the write side waits rather than one of its own. A source that waited
-     * forever would leave the run healthy, quiet and delivering nothing -- which reads exactly like a
-     * source with nothing to read, and is the state this whole path exists to stop being silent.
+     * <p>Bounded, as every refused read is: {@link #waitOut}.
      */
     private boolean openReader() {
         if (reader != null) {
@@ -204,18 +209,36 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             refused = false;
             return true;
         } catch (RingWriteRefusedException refusal) {
-            long now = System.nanoTime();
-            if (!refused) {
-                refused = true;
-                refusedSinceNanos = now;
-            }
-            if (now - (refusedSinceNanos + CdcPhase.REFUSAL_BOUND_NANOS) >= 0) {
-                throw new TapstateException(
-                        CaptureError.CLUSTER_REFUSED_THE_READ,
-                        Map.of("ring", ringName, "seconds", CdcPhase.REFUSAL_BOUND_NANOS / 1_000_000_000L),
-                        refusal);
-            }
+            waitOut(refusal);
             return false;
+        }
+    }
+
+    /**
+     * Counts one refused pass against the stretch the cluster has been saying no, and ends the run with a
+     * code once that stretch has lasted as long as the write side waits.
+     *
+     * <p>A refusal can meet any read of the ring, not only the one that positions a reader. A ring lives
+     * in one partition, and a member joining moves partitions to itself: every read of a ring it now owns
+     * runs there, answered by a verdict that has only just begun to be computed, and until it agrees every
+     * read is refused. A reader already under way meets that refusal as surely as a fresh one does, and
+     * ending the run on it stops a running pipeline because a member joined.
+     *
+     * <p>Bounded, and by the stretch the write side waits rather than one of its own. A source that waited
+     * forever would leave the run healthy, quiet and delivering nothing -- which reads exactly like a
+     * source with nothing to read, and is the state this whole path exists to stop being silent.
+     */
+    private void waitOut(RingWriteRefusedException refusal) {
+        long now = System.nanoTime();
+        if (!refused) {
+            refused = true;
+            refusedSinceNanos = now;
+        }
+        if (now - (refusedSinceNanos + CdcPhase.REFUSAL_BOUND_NANOS) >= 0) {
+            throw new TapstateException(
+                    CaptureError.CLUSTER_REFUSED_THE_READ,
+                    Map.of("ring", ringName, "seconds", CdcPhase.REFUSAL_BOUND_NANOS / 1_000_000_000L),
+                    refusal);
         }
     }
 
