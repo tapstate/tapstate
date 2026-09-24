@@ -98,7 +98,8 @@ class RestApiSecurityConfiguration {
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers("/healthz", "/version", AuthWire.DISCOVERY_PATH, AuthWire.LOGIN_PATH,
                                 AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, "/auth/bootstrap", "/connector-icons/*",
-                                "/error").permitAll()
+                                "/", "/index.html", "/assets/**", "/login", "/pipelines/**", "/sources/**",
+                                "/explorations/**", "/error").permitAll()
                         .anyRequest().denyAll());
         return http.build();
     }
