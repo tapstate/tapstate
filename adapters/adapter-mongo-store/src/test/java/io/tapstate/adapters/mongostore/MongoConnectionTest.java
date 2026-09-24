@@ -2,6 +2,7 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoConfigurationException;
 import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
 
@@ -43,6 +44,20 @@ class MongoConnectionTest {
             assertThat(ex).as("verify() with a malformed URI raises a coded diagnostic, not a bare IAE").isNotNull();
             assertThat(ex.code()).isEqualTo(StoreError.INVALID_URI);
         }
+    }
+
+    @Test
+    void srvDnsFailureIsCodedWithoutEchoingUriCredentials() {
+        String uri = "mongodb+srv://test-user:sentinel-password@cluster.example.net/metadata";
+        TapstateException ex = catchThrowableOfType(
+                () -> MongoConnection.parseConnectionString(uri,
+                        ignored -> { throw new MongoConfigurationException("TXT lookup timed out"); }),
+                TapstateException.class);
+
+        assertThat(ex).isNotNull();
+        assertThat(ex.code()).isEqualTo(StoreError.UNREACHABLE);
+        assertThat(ex.args()).containsEntry("target", "cluster.example.net");
+        assertThat(ex.getMessage()).doesNotContain("test-user", "sentinel-password");
     }
 
     @Test

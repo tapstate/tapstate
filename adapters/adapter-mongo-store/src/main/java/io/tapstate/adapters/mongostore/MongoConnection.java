@@ -11,6 +11,7 @@ import io.tapstate.core.common.TapstateException;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
@@ -21,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
@@ -81,26 +83,22 @@ public final class MongoConnection implements AutoCloseable {
         // A repeated verify() must not orphan a previously opened client (its pool and monitor threads).
         close();
 
-        ConnectionString connectionString;
-        try {
-            connectionString = new ConnectionString(settings.uri());
-        } catch (IllegalArgumentException e) {
-            // The URI is operator-supplied config; a malformed one is a diagnosable misconfiguration.
-            // Carry no detail — the raw URI could embed a credential.
-            throw new TapstateException(StoreError.INVALID_URI, Map.of(), e);
-        }
+        ConnectionString connectionString = parseConnectionString(settings.uri(), ConnectionString::new);
         // The store database is the one named in the URI, falling back to the default when it names
         // none. Resolved here from the same URI the client uses, so database() reflects the target.
         this.databaseName = resolveDatabaseName(connectionString);
         String target = String.join(",", connectionString.getHosts());
         MongoClientSettings clientSettings = buildClientSettings(connectionString);
 
-        MongoClient opened = MongoClients.create(clientSettings);
+        MongoClient opened = null;
         Document hello;
         try {
+            opened = MongoClients.create(clientSettings);
             hello = opened.getDatabase("admin").runCommand(new Document("hello", 1));
         } catch (MongoException e) {
-            opened.close();
+            if (opened != null) {
+                opened.close();
+            }
             throw new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), e);
         }
         // A replica-set member reports its set name in the hello response; a standalone does not.
@@ -109,6 +107,27 @@ public final class MongoConnection implements AutoCloseable {
             throw new TapstateException(StoreError.NOT_REPLICA_SET, Map.of("target", target), null);
         }
         this.client = opened;
+    }
+
+    /** Classifies SRV/TXT DNS lookup failures before a client exists, without echoing URI userinfo. */
+    static ConnectionString parseConnectionString(String uri, Function<String, ConnectionString> parser) {
+        try {
+            return parser.apply(uri);
+        } catch (MongoException dnsOrConfigurationFailure) {
+            throw new TapstateException(StoreError.UNREACHABLE,
+                    Map.of("target", safeHost(uri)), dnsOrConfigurationFailure);
+        } catch (IllegalArgumentException malformedUri) {
+            throw new TapstateException(StoreError.INVALID_URI, Map.of(), malformedUri);
+        }
+    }
+
+    private static String safeHost(String uri) {
+        try {
+            String host = URI.create(uri).getHost();
+            return host == null ? "<unresolved>" : host;
+        } catch (IllegalArgumentException malformed) {
+            return "<unresolved>";
+        }
     }
 
     /**
