@@ -8,6 +8,7 @@ import com.hazelcast.instance.impl.DefaultOutOfMemoryHandler;
 
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Remembers that a member was shut down by its own out-of-memory handling, and tells whoever asked to be told.
@@ -37,7 +38,7 @@ public final class MemberOutOfMemory {
 
     private final Runnable whenShutDown;
 
-    private volatile OutOfMemoryError error;
+    private final AtomicReference<OutOfMemoryError> error = new AtomicReference<>();
 
     private MemberOutOfMemory(Runnable whenShutDown) {
         this.whenShutDown = whenShutDown;
@@ -67,7 +68,7 @@ public final class MemberOutOfMemory {
         } catch (HazelcastInstanceNotActiveException letGo) {
             return Optional.empty();
         }
-        return watched instanceof MemberOutOfMemory record ? Optional.ofNullable(record.error) : Optional.empty();
+        return watched instanceof MemberOutOfMemory record ? Optional.ofNullable(record.error.get()) : Optional.empty();
     }
 
     /** The substrate's handling, followed by what is written down about each member it took down. */
@@ -95,7 +96,7 @@ public final class MemberOutOfMemory {
             for (HazelcastInstance member : members) {
                 if (!member.getLifecycleService().isRunning()
                         && member.getUserContext().get(USER_CONTEXT_KEY) instanceof MemberOutOfMemory record) {
-                    record.error = error;
+                    record.error.set(error);
                     record.whenShutDown.run();
                 }
             }

@@ -1,12 +1,14 @@
 package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -30,6 +32,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -208,6 +211,68 @@ class EngineTest {
 
         assertThat(engine.failureOf("orders-pipe")).isEmpty();
         assertThat(engine.failureOf("ghost")).isEmpty();
+    }
+
+    @Test
+    void failureOf_reports_a_member_lost_to_out_of_memory_as_the_failure_of_the_pipeline_it_ran() {
+        // The member's own out-of-memory handling takes it down, and every job it ran with it. From then on the
+        // member refuses every question with an error that says nothing about why, so a pipeline that was
+        // running over it has to be told why it stopped here, or it goes on reading as running.
+        Engine engine = new Engine(member);
+        engine.submit("orders-pipe", foreverDag());
+        awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
+        MemberOutOfMemory.watch(member, () -> { });
+
+        OutOfMemoryError error = OutOfMemoryOnAMemberThread.raise();
+
+        assertThat(engine.failureOf("orders-pipe"))
+                .get()
+                .isInstanceOfSatisfying(TapstateException.class, coded -> {
+                    assertThat(coded.code().code()).isEqualTo("engine.out-of-memory");
+                    assertThat(coded.args()).containsEntry("pipeline", "orders-pipe");
+                    assertThat(coded.getCause()).isSameAs(error);
+                });
+        assertThat(engine.hasLiveJob("orders-pipe"))
+                .describedAs("the job went with the member, so there is no live job to answer for")
+                .isFalse();
+        assertThat(engine.awaitTerminal("orders-pipe", Duration.ofSeconds(15)))
+                .describedAs("and nothing is left running to wait for")
+                .isTrue();
+    }
+
+    @Test
+    void a_member_lost_to_out_of_memory_refuses_every_job_operation_with_that_cause_but_lets_a_stop_through() {
+        Engine engine = new Engine(member);
+        engine.submit("orders-pipe", foreverDag());
+        awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
+        MemberOutOfMemory.watch(member, () -> { });
+
+        OutOfMemoryOnAMemberThread.raise();
+
+        DAG again = foreverDag();
+        refusedForWantOfMemory(() -> engine.refuseIfLost("orders-pipe"));
+        refusedForWantOfMemory(() -> engine.submit("orders-pipe", again));
+        refusedForWantOfMemory(() -> engine.suspend("orders-pipe"));
+        refusedForWantOfMemory(() -> engine.resume("orders-pipe"));
+        // A stop is how the pipeline is let go of, and there is nothing left for it to stop.
+        assertThatCode(() -> engine.cancel("orders-pipe")).doesNotThrowAnyException();
+    }
+
+    @Test
+    void a_member_shut_down_on_purpose_is_not_mistaken_for_one_lost_to_out_of_memory() {
+        // Stopping the server shuts its member down too, and a pipeline failed then would stay failed across
+        // the restart. So a member shut down any other way than by its out-of-memory handling is reported as
+        // the failure of nothing: it refuses to be asked, as it always has.
+        Engine engine = new Engine(member);
+        engine.submit("orders-pipe", foreverDag());
+        awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
+        MemberOutOfMemory.watch(member, () -> { });
+
+        member.shutdown();
+
+        assertThatCode(() -> engine.refuseIfLost("orders-pipe")).doesNotThrowAnyException();
+        assertThatThrownBy(() -> engine.failureOf("orders-pipe"))
+                .isInstanceOf(HazelcastInstanceNotActiveException.class);
     }
 
     @Test
@@ -675,6 +740,15 @@ class EngineTest {
             }
             return false;
         }
+    }
+
+    /** Asserts the operation is refused with the coded out-of-memory reason, for the pipeline it was asked for. */
+    private static void refusedForWantOfMemory(ThrowingCallable operation) {
+        assertThatThrownBy(operation)
+                .isInstanceOfSatisfying(TapstateException.class, coded -> {
+                    assertThat(coded.code().code()).isEqualTo("engine.out-of-memory");
+                    assertThat(coded.args()).containsEntry("pipeline", "orders-pipe");
+                });
     }
 
     /** Polls the job until it reaches the expected status, failing if it does not within the budget. */
