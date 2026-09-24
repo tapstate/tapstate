@@ -1,11 +1,13 @@
 package io.tapstate.app;
 
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SrsRingbuffer;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.SourceModel;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * How a pipeline-referenced source resolves into its capture/read ring identity: the connector config, the
@@ -35,7 +37,16 @@ record SourceCaptureResolution(
     }
 
     static SourceCaptureResolution of(SourceResource source, SourceModel discovered) {
-        List<String> tables = SourceTableSelection.resolve(source, discovered);
+        return withTables(source, SourceTableSelection.resolve(source, discovered));
+    }
+
+    static Optional<SourceCaptureResolution> forPipeline(
+            PipelineResource pipeline, SourceResource source, SourceModel discovered) {
+        List<String> tables = PipelineTableSelection.resolve(pipeline, source, discovered);
+        return tables.isEmpty() ? Optional.empty() : Optional.of(withTables(source, tables));
+    }
+
+    private static SourceCaptureResolution withTables(SourceResource source, List<String> tables) {
         CaptureConfig config = new CaptureConfig(source.connector(), source.config(), tables);
         String srsKey = source.srs() != null ? source.srs().key() : null;
         return new SourceCaptureResolution(

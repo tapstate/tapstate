@@ -26,11 +26,15 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -84,6 +88,9 @@ final class Repl {
 
     /** What a position nobody records reads as, printed beside its name rather than left out entirely. */
     private static final String NOT_COLLECTED = "not collected";
+
+    /** An opaque connector position can be confirmed without pretending its bytes are a coordinate. */
+    private static final String OPAQUE_POSITION = "opaque position recorded (source coordinate unavailable)";
 
     /** REPL-only words handled here rather than by the command table; completed alongside the verbs. */
     static final List<String> BUILTINS =
@@ -3513,9 +3520,11 @@ final class Repl {
 
     /**
      * {@code metrics <pipeline-id>} — reads the pipeline's open map of run statistics and the one source
-     * position it records, and prints one {@code <name>  <value>} line each in name order (a per-table
-     * position under a {@code targetAckedPosition.<table>} key), or a benign {@code no metrics} line when
-     * nothing is wired yet (unavailable, never faked). A coded refusal renders its code and message.
+     * position it records, and prints one {@code <name>  <value>} line each in name order. Readable
+     * positions appear under {@code targetAckedPosition.<table>}; Java-serialized positions get a stable
+     * fingerprint because their connector-private bytes cannot be presented as source coordinates. A benign
+     * {@code no metrics} line appears when nothing is wired yet (unavailable, never faked). A coded
+     * refusal renders its code and message.
      *
      * <p>Once there is anything to print, the positions the server says it does not record are printed too,
      * by name, reading {@code not collected}. Leaving them out is what makes a stalled run unreadable: with
@@ -3543,8 +3552,25 @@ final class Repl {
             case MetricsOutcome.Found found -> {
                 Map<String, String> lines = new TreeMap<>();
                 found.metrics().forEach((name, value) -> lines.put(name, String.valueOf(value)));
-                found.targetAckedPosition().forEach(
-                        (table, position) -> lines.put(TARGET_ACKED_POSITION + "." + table, position));
+                List<String> serializedPositions = new ArrayList<>();
+                found.targetAckedPosition().forEach((table, position) -> {
+                    if (isSerializedJavaPosition(position)) {
+                        serializedPositions.add(position);
+                        lines.put(TARGET_ACKED_POSITION + "." + table,
+                                "opaque position fingerprint " + opaquePositionFingerprint(position)
+                                        + " (source coordinate unavailable)");
+                    } else {
+                        lines.put(TARGET_ACKED_POSITION + "." + table, position);
+                    }
+                });
+                if (!serializedPositions.isEmpty()) {
+                    long distinct = serializedPositions.stream().distinct().count();
+                    int tables = serializedPositions.size();
+                    lines.put(TARGET_ACKED_POSITION, "recorded on " + tables
+                            + (tables == 1 ? " table; " : " tables; ") + distinct
+                            + (distinct == 1 ? " distinct opaque position" : " distinct opaque positions")
+                            + " (source coordinate unavailable)");
+                }
                 if (lines.isEmpty()) {
                     out.println("no metrics");
                 } else {
@@ -3567,6 +3593,26 @@ final class Repl {
             case MetricsOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case MetricsOutcome.Unreachable ignored -> reportRequestFailed();
         };
+    }
+
+    private static boolean isSerializedJavaPosition(String position) {
+        // AC ED 00 05 is the Java serialization header (rO0AB in base64). The CLI has no connector
+        // class or safe source-coordinate decoder for these opaque tokens.
+        return position != null && position.startsWith("rO0AB");
+    }
+
+    private static String opaquePositionFingerprint(String position) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(position.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest, 0, 8);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
+    }
+
+    private static String positionForText(String position) {
+        return isSerializedJavaPosition(position) ? OPAQUE_POSITION : position;
     }
 
     private int historyOnline(String id, List<String> options) {
@@ -3783,7 +3829,7 @@ final class Repl {
                     // whose else those chains are. A write-back moves a chain for every pipeline on it,
                     // and this is the last moment anybody is told which ones those were.
                     found.chains().forEach(chain -> out.println("  " + chain.chainId() + "  ->  "
-                            + (chain.token() == null ? "(nothing recorded)" : chain.token())
+                            + (chain.token() == null ? "(nothing recorded)" : positionForText(chain.token()))
                             + (chain.sharedWith().isEmpty()
                                     ? "" : "   also read by: " + String.join(", ", chain.sharedWith()))));
                 }
