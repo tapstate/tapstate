@@ -159,7 +159,14 @@ public enum DslError implements TapstateErrorCode {
      *  names it as SQL spells it ({@code FULL OUTER JOIN}, {@code GROUP BY}, {@code COUNT}), and
      *  {@code line} / {@code column} locate it within the SQL text itself, not within the YAML. */
     JOIN_SQL_UNSUPPORTED(
-            "dsl.join-sql-unsupported", Set.of("shape", "line", "column", "path"));
+            "dsl.join-sql-unsupported", Set.of("shape", "line", "column", "path")),
+    /** A join's {@code from:} map names another step of the pipeline rather than a source table.
+     *  {@code step} is the join, {@code alias} the alias whose value it is and {@code ref} the step
+     *  it names. A join resolves its SQL against the discovered columns of each input and keys its
+     *  state on the driving table's primary key; a step's output has neither, so the join could
+     *  only fail at every start. */
+    JOIN_INPUT_NOT_A_TABLE(
+            "dsl.join-input-not-a-table", Set.of("step", "alias", "ref", "path"));
 
     private final String code;
     private final Set<String> placeholders;

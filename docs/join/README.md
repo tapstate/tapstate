@@ -21,6 +21,12 @@ FROM orders o
 LEFT JOIN customers c ON o.customer_id = c.id
 ```
 
+Every alias in the join step's `from:` map must name a source table. A join cannot read the
+output of another step, such as a `js`, `map` or another `join` step: its SQL is resolved against
+the discovered columns of each input, and its rows are keyed on the driving table's primary key,
+and a step's output has neither. Validation refuses such an alias with
+`dsl.join-input-not-a-table`; do that step's work after the join instead.
+
 Each dimension must be unique on the **complete join key**, which is not necessarily its
 primary key. One fact row produces at most one output row. One-to-many and many-to-many
 SQL fan-out are not supported: duplicate dimension keys replace the stored match with the
@@ -52,7 +58,9 @@ dimension key can still cause substantial recomputation and target writes.
 Unsupported SQL constructs are rejected during validation; additional runtime shape
 restrictions can fail when the job initializes. Run `tapstate validate` and `tapstate explain` before
 applying a pipeline; successful SQL parsing alone does not establish that the runtime shape
-is supported. MERGE statements are outside the Join SELECT surface.
+is supported. Column names are checked against the discovered source schemas when the pipeline
+starts: a column no input table has fails the start with `actuation.join-sql-invalid`, and the
+pipeline stays failed until the SQL or the source is corrected and it is started again. MERGE statements are outside the Join SELECT surface.
 
 Any NULL component makes a join key unmatchable, including when the opposite side also has
 NULL. A LEFT JOIN can publish an unmatched fact row with NULL dimension fields; a dimension

@@ -816,7 +816,7 @@ final class StoreBackedDagSource implements DagSource {
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join join
                     && inputsOf(refsOf(inline.from()), vertices, keysByTable, keysBySource, steps,
                             Map.of(), vertex -> copiedColumns(pipelineId, vertex), incomplete) != null) {
-                compiled.put(step.id(), compileJoin(inline, join, sourceIdByTable(vertices)));
+                compiled.put(step.id(), compileJoin(inline, join, sourceIdByTable(vertices), steps));
             }
         }
         recordStepSchemas(pipelineId, deriveSteps(pipeline, vertices, keysByTable, keysBySource,
@@ -1935,10 +1935,11 @@ final class StoreBackedDagSource implements DagSource {
             PipelineResource pipeline, Map<String, String> sourceIdByTable) {
         Map<String, CompiledJoin> byStep = new LinkedHashMap<>();
         if (pipeline.transforms() != null) {
+            Set<String> stepIds = stepIds(pipeline);
             for (Step step : pipeline.transforms()) {
                 if (step instanceof Step.Inline inline
                         && inline.body() instanceof TransformBody.Join join) {
-                    byStep.put(step.id(), compileJoin(inline, join, sourceIdByTable));
+                    byStep.put(step.id(), compileJoin(inline, join, sourceIdByTable, stepIds));
                 }
             }
         }
@@ -1966,12 +1967,20 @@ final class StoreBackedDagSource implements DagSource {
      * NULL for a column that turns out to hold one is the direction that produces a wrong promise.
      */
     private CompiledJoin compileJoin(Step.Inline step, TransformBody.Join join,
-            Map<String, String> sourceIdByTable) {
+            Map<String, String> sourceIdByTable, Set<String> stepIds) {
         Map<String, List<String>> keyByTable = new LinkedHashMap<>();
         Map<String, String> tableByName = new LinkedHashMap<>();
         List<io.tapstate.core.sql.SourceTable> tables = new ArrayList<>();
         if (step.from() instanceof FromClause.Aliases aliases) {
             aliases.aliases().forEach((alias, ref) -> {
+                // A step's output has no discovered columns and no key, so the SQL could resolve none of
+                // its columns and the refusal would arrive as a column-resolution error on every start.
+                // Validation refuses this shape; a pipeline stored before it did is refused here, coded,
+                // so the start fails with the reason rather than being retried for ever.
+                if (ref instanceof FromRef.Literal literal && stepIds.contains(literal.ref())) {
+                    throw new TapstateException(ActuationError.JOIN_INPUT_NOT_A_TABLE,
+                            Map.of("step", step.id(), "alias", alias, "ref", literal.ref()), null);
+                }
                 NestTable resolved = nestTable(ref, sourceIdByTable);
                 List<io.tapstate.core.sql.SourceColumn> columns =
                         columnsOf(resolved.name(), sourceIdByTable);
@@ -1988,8 +1997,17 @@ final class StoreBackedDagSource implements DagSource {
             });
         }
         List<io.tapstate.core.sql.SourceTable> derivedFrom = List.copyOf(tables);
-        io.tapstate.core.sql.JoinPlan plan =
-                io.tapstate.core.sql.SqlFrontEnd.derive(join.sql(), derivedFrom);
+        io.tapstate.core.sql.JoinPlan plan;
+        try {
+            plan = io.tapstate.core.sql.SqlFrontEnd.derive(join.sql(), derivedFrom);
+        } catch (io.tapstate.core.sql.SqlFrontEndException invalid) {
+            // Validation only parses the SQL: the columns it resolves against are the discovered ones,
+            // which only exist here. A statement that does not resolve against them fails the same way
+            // on every start, so it is refused with a code - which is what lets the pipeline end up
+            // failed with the reason instead of retried for ever.
+            throw new TapstateException(ActuationError.JOIN_SQL_INVALID,
+                    Map.of("step", step.id(), "detail", diagnosis(invalid)), invalid);
+        }
         // Every source the plan carries has to be one the step declared, because the alias is what the
         // wiring resolves an upstream through. The SQL may spell a source either way - the alias, or the
         // table it stands for, both of which were registered above so that the front end accepts what an
@@ -2021,6 +2039,21 @@ final class StoreBackedDagSource implements DagSource {
         }
         return new CompiledJoin(plan, key, Map.copyOf(dimensionRowKeyColumns),
                 Map.copyOf(tableByName), join, derivedFrom);
+    }
+
+    /**
+     * The front end's diagnosis as a person reads it: the underlying parser's or validator's own message
+     * where there is one, since the wrapper's repeats it behind a class name, and only its first line,
+     * which is the part that names the fault and its position.
+     */
+    private static String diagnosis(io.tapstate.core.sql.SqlFrontEndException invalid) {
+        Throwable cause = invalid.getCause();
+        String message = cause != null && cause.getMessage() != null ? cause.getMessage() : invalid.getMessage();
+        if (message == null) {
+            return "";
+        }
+        int end = message.indexOf('\n');
+        return (end < 0 ? message : message.substring(0, end)).trim();
     }
 
     /** The columns of one table, in the shared type vocabulary the plan is derived against. */

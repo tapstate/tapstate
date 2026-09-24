@@ -64,7 +64,10 @@ class DslErrorTest {
                 // the join SQL gate: both are raised while reading the artifact, so both are
                 // witnessed by an ordinary corpus case
                 "dsl.join-sql-not-parsable",
-                "dsl.join-sql-unsupported");
+                "dsl.join-sql-unsupported",
+                // a join reading another step: the wiring is written in the document, so an ordinary
+                // corpus case witnesses it
+                "dsl.join-input-not-a-table");
     }
 
     @Test
