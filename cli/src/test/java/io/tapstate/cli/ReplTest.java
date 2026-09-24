@@ -2966,7 +2966,7 @@ class ReplTest {
     }
 
     @Test
-    void registerDownloadsBothPublishedEnterpriseConnectorsById(@TempDir Path workdir) {
+    void registerDownloadsPublishedAtlasAndEnterpriseConnectorsById(@TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Registered(
                 new RegisteredConnector("enterprise", "hash-abc", "2.0.9", true));
@@ -2979,20 +2979,26 @@ class ReplTest {
         });
         int mark = h.sink().toString().length();
 
+        assertThat(h.repl().dispatch("register mongodb-atlas")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
         assertThat(h.repl().dispatch("register oracle")).isTrue();
         assertThat(h.repl().lastExitCode()).isZero();
         assertThat(h.repl().dispatch("register sqlserver")).isTrue();
         assertThat(h.repl().lastExitCode()).isZero();
 
         assertThat(fetched).containsExactly(
+                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/mongodb-atlas-connector.jar"),
                 URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/oracle-connector.jar"),
                 URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/sqlserver-connector.jar"));
         assertThat(client.registerCalls).containsExactly(
                 "jwt-tok@http://node1:7900 x" + jar.length,
+                "jwt-tok@http://node1:7900 x" + jar.length,
                 "jwt-tok@http://node1:7900 x" + jar.length);
         assertThat(h.sink().toString().substring(mark))
+                .contains("downloading mongodb-atlas-connector.jar from github.com")
                 .contains("downloading oracle-connector.jar from github.com")
                 .contains("downloading sqlserver-connector.jar from github.com")
+                .contains("uploading mongodb-atlas-connector.jar (" + jar.length + " B)")
                 .contains("uploading oracle-connector.jar (" + jar.length + " B)")
                 .contains("uploading sqlserver-connector.jar (" + jar.length + " B)");
     }

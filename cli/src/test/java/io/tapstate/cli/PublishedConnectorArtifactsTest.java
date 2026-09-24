@@ -27,6 +27,21 @@ class PublishedConnectorArtifactsTest {
     }
 
     @Test
+    void atlasDownloadIsPinnedToTheTestedShadedArtifact() throws Exception {
+        URI source = PublishedConnectorArtifacts.artifact("mongodb-atlas", ignored -> null);
+        assertThat(source).isEqualTo(URI.create("https://github.com/tapstate/tapstate/releases/download/"
+                + "connectors-preview/mongodb-atlas-connector.jar"));
+        byte[] bytes = {1, 2, 3};
+        assertThat(PublishedConnectorArtifacts.download("mongodb-atlas", source, (from, expected) -> {
+            assertThat(from).isEqualTo(source);
+            assertThat(expected.bytes()).isEqualTo(19_764_088);
+            assertThat(expected.sha256()).isEqualTo(
+                    "2f70bfe42baafcadb0c2d88042e173156c714f508d5089ce7eb8eab7edaa8e18");
+            return PublishedConnectorArtifacts.Fetched.verified(bytes);
+        })).isEqualTo(bytes);
+    }
+
+    @Test
     void theHttpFetcherReturnsACompleteSuccessfulBody() throws Exception {
         byte[] jar = completeJar();
         HttpServer server = server(200, jar);

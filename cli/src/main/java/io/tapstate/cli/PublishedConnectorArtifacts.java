@@ -35,6 +35,8 @@ final class PublishedConnectorArtifacts {
                     "34def7fca33fdf80f9d7e5561b2a2d9b7a2733fd06da9974359bbb77066ca0e2"),
             "mongodb", new Artifact(20_400_364,
                     "7fbdbf1ef2965053c9c5e6d28c0c21c3aa2818938ab758b965cc278d61e0c7b4"),
+            "mongodb-atlas", new Artifact(19_764_088,
+                    "2f70bfe42baafcadb0c2d88042e173156c714f508d5089ce7eb8eab7edaa8e18"),
             "postgres", new Artifact(52_771_466,
                     "535aaaed34594dcc9e2dd1937efc4b91865911f11de624aca555b59a609053ee"),
             "oracle", new Artifact(36_837_471,
