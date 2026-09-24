@@ -216,6 +216,34 @@ final class JoinConformance implements AutoCloseable {
                 : Envelope.update(1L, name, before, after, null));
     }
 
+    /**
+     * Hands the carrier every row {@code table} holds as a snapshot read, in key order, and writes
+     * nothing: what a load read again from the start delivers when a run is restarted.
+     */
+    void reread(String table) throws SQLException {
+        String name = table.toLowerCase(java.util.Locale.ROOT);
+        StringBuilder statement = new StringBuilder("SELECT * FROM `").append(name).append("` ORDER BY ");
+        List<String> key = keyOf(name);
+        for (int column = 0; column < key.size(); column++) {
+            statement.append(column == 0 ? "" : ", ").append('`').append(key.get(column)).append('`');
+        }
+        List<Map<String, Object>> rows = new ArrayList<>();
+        try (Statement query = db.createStatement();
+                ResultSet result = query.executeQuery(statement.toString())) {
+            ResultSetMetaData columns = result.getMetaData();
+            while (result.next()) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                for (int column = 1; column <= columns.getColumnCount(); column++) {
+                    row.put(columns.getColumnLabel(column), result.getObject(column));
+                }
+                rows.add(row);
+            }
+        }
+        for (Map<String, Object> row : rows) {
+            feed(name, Envelope.read(1L, name, row, null));
+        }
+    }
+
     /** Removes one row from {@code table} and hands the carrier the same change. */
     void delete(String table, Map<String, Object> identity) throws SQLException {
         String name = table.toLowerCase(java.util.Locale.ROOT);

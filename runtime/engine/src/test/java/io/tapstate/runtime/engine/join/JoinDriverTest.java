@@ -508,6 +508,54 @@ class JoinDriverTest {
     }
 
     /**
+     * A load read again over the state its run left, which is what a restart does after a run died
+     * part way through its load. That run took five rows in whole and died taking the sixth in, after
+     * the mirror had it and before the index did; four more it never reached.
+     *
+     * <p>Held to both halves, because each has a way of going wrong that the other cannot see. The row
+     * the index lost has to be named again or its dimension row never reaches it; the rows the index
+     * kept must not be named twice, or every load read again - every run of a snapshot-only pipeline -
+     * grows the index by a copy of itself. The bucket is several pages long, so the rows are confirmed
+     * across pages rather than on the one.
+     */
+    @Test
+    @DisplayName("a load read again names every row once: the lost row is added, the kept ones are not")
+    void aLoadReadAgainNamesEveryRowOnce() {
+        MapJoinStores kept = new MapJoinStores(2);
+        List<SourceChange> load = new ArrayList<>();
+        List<String> factKeys = new ArrayList<>();
+        for (long id = 10; id < 20; id++) {
+            load.add(fact(read(Map.of("id", id, "cust_id", 1L))));
+            factKeys.add(io.tapstate.core.sql.JoinKey.of(List.of(id)).name());
+        }
+        Fixture dead = new Fixture(JoinKind.LEFT, kept);
+        dead.applyBatch(load.subList(0, 5));
+        // What the member left behind when it died taking row 15 in.
+        kept.putFact(dead.factKeyOf(15L), Map.of("id", 15L, "cust_id", 1L));
+
+        Fixture restarted = new Fixture(JoinKind.LEFT, kept);
+        restarted.applyBatch(load);
+
+        assertThat(restarted.stores.writes)
+                .as("the mirror once per row, and the index only for the lost row and the four new ones")
+                .isEqualTo(load.size() + 1 + 4);
+        List<String> named = new ArrayList<>();
+        String bucket = restarted.dimensionKeyOf(1L);
+        for (int page = 0; page < kept.indexPageCount("c", bucket); page++) {
+            named.addAll(kept.indexPage("c", bucket, page));
+        }
+        assertThat(named).as("every row named exactly once").containsExactlyInAnyOrderElementsOf(factKeys);
+
+        restarted.clear();
+        restarted.apply(dimension("c", read(Map.of("id", 1L, "name", "Ada"))));
+        assertThat(restarted.published()).as("the dimension row reaches all ten rows, row 15 included")
+                .extracting(row -> row.getValue().get("order_id"))
+                .containsExactlyInAnyOrder(10L, 11L, 12L, 13L, 14L, 15L, 16L, 17L, 18L, 19L);
+        assertThat(restarted.published()).extracting(row -> row.getValue().get("customer_name"))
+                .containsOnly("Ada");
+    }
+
+    /**
      * The one number that makes this structure's worst shapes visible before they hurt. A bucket
      * approaching what one stored entry may hold, an initial load quadratic in what one dimension key
      * holds, a fan-out that takes minutes to recompute - none of them shows up in queue depth or in

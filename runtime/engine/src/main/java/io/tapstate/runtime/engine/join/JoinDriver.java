@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.join;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
 import io.tapstate.core.sql.Expressions;
 import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinKind;
@@ -65,6 +66,11 @@ import java.util.function.Predicate;
  * entry re-publishes a row against a dimension row it has nothing to do with, and the row looks
  * entirely ordinary.
  *
+ * <p><b>What the mirror holds is not evidence of what the index holds.</b> A fact row is written to the
+ * mirror before the index, so a member that dies between the two leaves a row no bucket names. A row
+ * that arrives again - a load read again after a restart, an insert delivered again - therefore has its
+ * index entry confirmed rather than assumed; see {@link #confirmIndexed}.
+ *
  * <p><b>What this does not keep is the queue itself.</b> Work outstanding when a member dies is not
  * written down; what is written down is the reverse index, from which the work is derivable. Nothing
  * here rebuilds it on the way back up, so a member lost mid-recompute leaves the rows it had not
@@ -94,6 +100,14 @@ public final class JoinDriver {
      * answer, and it is the answer a first load gets for every row it carries.
      */
     private final Map<String, Map<String, Object>> primed = new HashMap<>();
+
+    /**
+     * For each bucket longer than one page, the page this driver last found a row on while confirming
+     * it - where the next row of that bucket arriving again is almost always found. Bounded by being
+     * forgotten whole once it holds {@link #BUCKETS_REMEMBERED}: what is forgotten costs a search from
+     * the first page, never an answer.
+     */
+    private final Map<Bucket, Integer> confirmedOn = new HashMap<>();
     private final int keysPerRead;
     private final JoinGauge gauge;
     private final DimensionRowDisplacedAlert displaced;
@@ -367,12 +381,21 @@ public final class JoinDriver {
         }
         // The mirror only where the image does not already hold the row: a source that publishes all
         // of it costs nothing here, which is what keeps this off the reads a full image never needed.
-        Map<String, Object> previous = carriesTheWholeRow(before) ? before : mirrored(previousKey);
+        boolean whole = carriesTheWholeRow(before);
+        Map<String, Object> mirroredRow = whole ? null : mirrored(previousKey);
+        Map<String, Object> previous = whole ? before : mirroredRow;
         if (previous == null) {
             // Nothing mirrored: either this key has not been seen or the mirror lost it, and the
             // before image is then the only account of the row there is.
             previous = before;
         }
+        // A snapshot read or an insert says the row is new, so a mirror holding it anyway means it is
+        // arriving a second time - and the delivery before may have died between the mirror and the
+        // index. Updates are not asked the same question: one that changes nothing looks exactly like
+        // one delivered again, and confirming every such update would put a bucket search on an
+        // ordinary edit.
+        boolean arrivedBefore = mirroredRow != null && previousKey.equals(key)
+                && (event.op() == Op.READ || event.op() == Op.INSERT);
         if (previous != null && !previousKey.equals(key)) {
             // The row's own identity moved, so what was published under the old one is a different
             // row and nothing else will ever remove it.
@@ -389,6 +412,9 @@ public final class JoinDriver {
             String was = previous == null ? null : dimensionKeyIn(previous, dimension);
             String now = dimensionKeyIn(after, dimension);
             if (Objects.equals(was, now)) {
+                if (arrivedBefore && now != null) {
+                    confirmIndexed(dimension, now, key);
+                }
                 continue;
             }
             if (was != null) {
@@ -402,6 +428,58 @@ public final class JoinDriver {
             }
         }
         queueRow(after, event.ts(), false);
+    }
+
+    /**
+     * Makes sure the bucket under {@code dimensionKey} names {@code factKey}, adding it only where no
+     * page of that bucket does.
+     *
+     * <p><b>Why a row the mirror already holds is confirmed at all.</b> Taking a fact row in writes the
+     * mirror and then the index - the order that keeps a rebuild running beside it from dropping the new
+     * entry as stale - and those are two writes to two maps. A member that dies between them leaves a
+     * row the mirror holds and no bucket names, and a run that dies keeps its state, so what comes back
+     * is that same row again: the load read from the start, or the insert delivered again. Taken as an
+     * unchanged key, it adds nothing and is published unmatched while its dimension row is still on its
+     * way; that dimension row finds its fact rows through the bucket that does not name it, so the row
+     * stays unmatched for good, beside rows that all matched, with nothing reporting it.
+     *
+     * <p><b>Why it looks before it adds.</b> Almost every row arriving again is named already - only the
+     * ones a member was part way through when it died are not - and appending regardless would add a
+     * copy of every bucket on every load read again, which for a snapshot-only pipeline is every run.
+     * The index tolerates a copy; it does not tolerate growing by one per run for ever.
+     *
+     * <p><b>Why it starts where the last one was found.</b> A load read again arrives in the order it was
+     * first taken in, which is the order its buckets were written in, so the next row of a bucket is on
+     * the page the last one was found on or the one after. Searching from the first page every time
+     * would read a bucket up to each of its rows - half a billion page reads for a million-row bucket
+     * read again. The pages nearest the remembered one are asked first, and every page is asked before
+     * a row is taken to be missing, which is paid once for each row a member died part way through.
+     */
+    private void confirmIndexed(Dimension dimension, String dimensionKey, String factKey) {
+        String source = dimension.source();
+        Bucket bucket = new Bucket(source, dimensionKey);
+        int remembered = confirmedOn.getOrDefault(bucket, 0);
+        if (stores.indexPage(source, dimensionKey, remembered).contains(factKey)) {
+            return;
+        }
+        int pages = stores.indexPageCount(source, dimensionKey);
+        // The bucket may have lost pages off its end since the page was remembered.
+        int from = Math.min(remembered, Math.max(0, pages - 1));
+        for (int step = 0; step < 2 * pages; step++) {
+            // from, from + 1, from - 1, from + 2, from - 2 ... - forwards first, as the rows arrive.
+            int page = step % 2 == 1 ? from + (step + 1) / 2 : from - step / 2;
+            if (page < 0 || page >= pages || page == remembered) {
+                continue;
+            }
+            if (stores.indexPage(source, dimensionKey, page).contains(factKey)) {
+                if (confirmedOn.size() >= BUCKETS_REMEMBERED) {
+                    confirmedOn.clear();
+                }
+                confirmedOn.put(bucket, page);
+                return;
+            }
+        }
+        stores.indexAdd(source, dimensionKey, factKey);
     }
 
     /**
@@ -627,10 +705,11 @@ public final class JoinDriver {
                 // dimension row, and a first load reaches a dimension row with its fact rows still
                 // arriving. A read that was never asked for a key says nothing about whether the row is
                 // there, while the branch below reads absence as gone - and that costs the row its
-                // index entry for good, because nothing ever adds one back: a fact row already in the
-                // mirror re-arriving finds its dimension key unchanged and appends nothing. The row
-                // then keeps whatever it was last published with, and every later change to this
-                // dimension row walks past it, with the job running and nothing reported.
+                // index entry, because the ordinary stream never adds one back: a change to a fact row
+                // already in the mirror finds its dimension key unchanged and appends nothing, and only
+                // the row arriving again, as a load read again does, confirms it. The row then keeps
+                // whatever it was last published with, and every later change to this dimension row
+                // walks past it, with the job running and nothing reported.
                 factRow = stores.fact(factKey);
             }
             // The index is derived; the fact row's own foreign key is the truth. A bucket may name a
@@ -683,6 +762,13 @@ public final class JoinDriver {
      * numbers rather than one.
      */
     static final int DEFAULT_KEYS_PER_READ = 8_000;
+
+    /**
+     * How many long buckets a driver remembers a page for. Only a bucket of more than one page - more
+     * than a thousand fact rows under one dimension key, at the default page size - is remembered at
+     * all, so this covers a load with a thousand such keys in well under a megabyte.
+     */
+    static final int BUCKETS_REMEMBERED = 1_024;
 
     /** Queues the published row for {@code factRow}, or its removal. */
     private void queueRow(Map<String, Object> factRow, long ts, boolean removed) {
@@ -841,6 +927,10 @@ public final class JoinDriver {
     private record Dimension(String source, JoinKind kind, List<String> factColumns,
             List<String> dimensionColumns, List<String> rowKeyColumns,
             java.util.Set<String> outputColumns) {
+    }
+
+    /** One bucket of the reverse index: a dimension source and one of its keys. */
+    private record Bucket(String source, String dimensionKey) {
     }
 
     private sealed interface Work permits Row, Recompute {
