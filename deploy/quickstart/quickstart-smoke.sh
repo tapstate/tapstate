@@ -971,42 +971,16 @@ rm -rf "$DROP_DIR"
 # The sink is a fixture, and a fixture that never started is one failure that says so. Reading a port it
 # never published points every case below at an endpoint with no port, and each of them then fails as
 # though the quickstart had sent the wrong thing.
-start_sink() {   # succeeds once the sink has published the port it bound
-  QBD="$(mktemp -d)"; : > "$QBD/log"
-  python3 - "$QBD" <<'PYEOF' &
-import http.server, os, socketserver, sys
-d = sys.argv[1]
-class H(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        n = int(self.headers.get('Content-Length') or 0)
-        with open(os.path.join(d, 'log'), 'a') as fh:
-            fh.write(self.rfile.read(n).decode('utf-8', 'replace') + "\n")
-        self.send_response(204); self.end_headers()
-    def log_message(self, *a): pass
-# TCPServer and not http.server.HTTPServer, which looks up a name for the address it bound before it
-# listens: on the macOS runners that lookup stalls for about 35 seconds, far past any wait for the port.
-srv = socketserver.TCPServer(('127.0.0.1', 0), H)
-with open(os.path.join(d, 'port'), 'w') as fh:
-    fh.write(str(srv.server_address[1]))
-srv.serve_forever()
-PYEOF
-  QB_PID=$!
-  # About 15s for a slow machine, and never longer than the sink lives: one that died is not waited on.
-  for _ in $(seq 1 150); do
-    [ -s "$QBD/port" ] && return 0
-    kill -0 "$QB_PID" 2>/dev/null || return 1
-    sleep 0.1
-  done
-  return 1
-}
+#
+# The sink and the wait for its port are the installer smoke's, sourced from install/ so a fix lands once.
+# shellcheck source=install/_event-sink.sh
+. "$REPO/install/_event-sink.sh"
 if ! command -v python3 >/dev/null 2>&1; then
   bad "quickstart install event: python3 is needed for the local sink"
 elif ! start_sink; then
   bad "quickstart install event: the local sink never bound a port, so none of the install-event cases ran"
-  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null; rm -rf "$QBD"
+  stop_sink
 else
-  QB_URL="http://127.0.0.1:$(cat "$QBD/port")/e"
-
   # like run_prepare, but keeps stdout and stderr apart -- the disclosure case is about which stream
   # a message lands on, so merging them would make that case unable to fail.
   qs_run() {   # $1 stdout file  $2 stderr file
@@ -1028,15 +1002,15 @@ else
       TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" \
       TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
       TAPSTATE_QUICKSTART_PREPARE_ONLY=1 \
-      TAPSTATE_TELEMETRY_URL="$QB_URL" \
+      TAPSTATE_TELEMETRY_URL="$SINK_URL" \
       sh "$DEMO/quickstart.sh" >"$outf" 2>"$errf" )
     rm -rf "$shim"
   }
 
   qs_out="$(mktemp)"; qs_err="$(mktemp)"
-  : > "$QBD/log"
+  : > "$SINK_DIR/log"
   qs_run "$qs_out" "$qs_err"
-  n_events="$(grep -c . "$QBD/log" 2>/dev/null | tr -d ' ')"
+  n_events="$(grep -c . "$SINK_DIR/log" 2>/dev/null | tr -d ' ')"
 
   # exactly one. The platform gate runs install.sh before the install does, so an event fired from
   # anywhere but the completed-install path doubles every quickstart install ever measured -- and the
@@ -1045,8 +1019,8 @@ else
   else bad "quickstart produced $n_events install event(s), expected exactly 1"; fi
 
   # the entry point must be distinguishable, or the two front doors cannot be compared at all
-  if grep -q '"entrypoint":"quickstart"' "$QBD/log"; then ok "the event is tagged entrypoint=quickstart"
-  else bad "event not tagged as quickstart: $(cat "$QBD/log")"; fi
+  if grep -q '"entrypoint":"quickstart"' "$SINK_DIR/log"; then ok "the event is tagged entrypoint=quickstart"
+  else bad "event not tagged as quickstart: $(cat "$SINK_DIR/log")"; fi
 
   # the disclosure has to survive quickstart.sh dropping the installer's stdout. A disclosure written
   # to stdout disappears exactly here, on the path most first-time users take, while install-smoke's
@@ -1079,7 +1053,7 @@ else
   rm -rf "$QS_HOME"
 
   rm -f "$qs_out" "$qs_err"
-  kill "$QB_PID" 2>/dev/null; wait "$QB_PID" 2>/dev/null; rm -rf "$QBD"
+  stop_sink
 fi
 
 # --- the harness itself must not report installs -----------------------------------------------------

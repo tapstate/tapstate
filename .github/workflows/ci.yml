@@ -352,10 +352,10 @@ jobs:
       - name: shellcheck the shell scripts
         run: |
           shellcheck -s sh install/install.sh
-          shellcheck install/install-smoke.sh
+          shellcheck install/install-smoke.sh install/_event-sink.sh
           shellcheck install/install-smoke-test.sh
           shellcheck -s sh deploy/quickstart/quickstart.sh
-          shellcheck deploy/quickstart/quickstart-smoke.sh
+          shellcheck deploy/quickstart/quickstart-smoke.sh install/_event-sink.sh
           shellcheck deploy/quickstart/quickstart-smoke-test.sh
           shellcheck deploy/docker/image-smoke.sh
           shellcheck deploy/docker/dockerfile-smoke.sh
