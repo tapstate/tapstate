@@ -22,6 +22,24 @@ finish() {
 }
 trap finish EXIT
 
+# The sink's verdicts are read from the smoke's install-event section alone: the lines it prints between
+# its two markers, which hold the sink's own failure or the cases that read the sink, and nothing else.
+# The smoke's own run already reports a case elsewhere that fails for its own reasons, and counting it
+# here would report it a second time as though the sink had failed. A section that never closed means
+# the smoke stopped inside it, which fails here rather than being counted. Sets fails, and leaves the
+# section's FAIL lines in $SCRATCH/event-fails.
+read_event_section() {
+  if ! awk '$0 == "  ----  install event cases" { inside = 1; next }
+            $0 == "  ----  end of install event cases" && inside { closed = 1; inside = 0; next }
+            inside && /^  FAIL/ { print }
+            END { exit !closed }' "$SCRATCH/out" > "$SCRATCH/event-fails"; then
+    cat "$SCRATCH/out" >&2
+    printf 'FAIL  the smoke printed no complete install-event section, so there is no sink verdict to read\n' >&2
+    exit 1
+  fi
+  fails="$(grep -c . "$SCRATCH/event-fails" || true)"
+}
+
 # The sink is the one program the smoke hands python3 on stdin. Only that run is refused; every other
 # python3 run stays real, or the cases around the sink fail too and this proves nothing about it.
 REAL_PYTHON3="$(command -v python3 || true)"
@@ -45,12 +63,12 @@ if [ ! -e "$SCRATCH/sink-refused" ]; then
   printf 'FAIL  the smoke never started its sink from a python3 program on stdin, so nothing here was tested\n' >&2
   exit 1
 fi
-fails="$(grep -c '^  FAIL' "$SCRATCH/out" || true)"
-if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi '^  FAIL.*sink' "$SCRATCH/out"; then
+read_event_section
+if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails"; then
   printf 'PASS  a sink that exits without binding a port is reported as one failure, and that failure names the sink\n'
 else
   cat "$SCRATCH/out" >&2
-  printf 'FAIL  a sink that exits without binding a port was reported as %s failure(s) (smoke exit %s), not as one naming the sink\n' \
+  printf 'FAIL  a sink that exits without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink\n' \
     "$fails" "$status" >&2
   exit 1
 fi
@@ -76,12 +94,12 @@ if [ ! -s "$SCRATCH/sink-pid" ]; then
   printf 'FAIL  the smoke never started its sink from a python3 program on stdin, so nothing here was tested\n' >&2
   exit 1
 fi
-fails="$(grep -c '^  FAIL' "$SCRATCH/out" || true)"
-if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi '^  FAIL.*sink' "$SCRATCH/out"; then
+read_event_section
+if [ "$status" -ne 0 ] && [ "$fails" = 1 ] && grep -qi sink "$SCRATCH/event-fails"; then
   printf 'PASS  a sink that stays alive without binding a port is reported as one failure, and that failure names the sink\n'
 else
   cat "$SCRATCH/out" >&2
-  printf 'FAIL  a sink that stays alive without binding a port was reported as %s failure(s) (smoke exit %s), not as one naming the sink\n' \
+  printf 'FAIL  a sink that stays alive without binding a port was reported as %s install-event failure(s) (smoke exit %s), not as one naming the sink\n' \
     "$fails" "$status" >&2
   exit 1
 fi
@@ -113,11 +131,11 @@ if [ ! -e "$SCRATCH/lookup-armed" ]; then
   printf 'FAIL  python3 never loaded the refusing name lookup, so nothing here was tested\n' >&2
   exit 1
 fi
-fails="$(grep -c '^  FAIL' "$SCRATCH/out" || true)"
-if [ "$status" -eq 0 ] && [ "$fails" = 0 ]; then
+read_event_section
+if [ "$fails" = 0 ]; then
   printf 'PASS  the sink starts without a name lookup, so a stalled lookup cannot keep it from binding\n'
 else
   cat "$SCRATCH/out" >&2
-  printf 'FAIL  with name lookups refused the smoke reported %s failure(s) (smoke exit %s)\n' "$fails" "$status" >&2
+  printf 'FAIL  with name lookups refused the install-event cases reported %s failure(s) (smoke exit %s)\n' "$fails" "$status" >&2
   exit 1
 fi

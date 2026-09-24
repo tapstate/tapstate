@@ -595,6 +595,10 @@ PYEOF
   done
   return 1
 }
+# This section's lines are bracketed in the output. install-smoke-test.sh reads the sink's verdict from
+# between the two markers alone, so a case elsewhere in this file that fails for its own reasons is not
+# reported a second time as though the sink had failed.
+printf '  ----  install event cases\n'
 if ! command -v python3 >/dev/null 2>&1; then
   bad "install event: python3 is needed for the local sink"
 elif ! start_sink; then
@@ -725,6 +729,7 @@ else
   rm -f "$ev_err" "$ev_out"
   kill "$BEACON_PID" 2>/dev/null; wait "$BEACON_PID" 2>/dev/null; rm -rf "$BEACON_DIR"
 fi
+printf '  ----  end of install event cases\n'
 
 # --- the harness itself must not report installs -----------------------------------------------------
 # The subject of this case is one line at the top of this file, and losing that line is silent: the
