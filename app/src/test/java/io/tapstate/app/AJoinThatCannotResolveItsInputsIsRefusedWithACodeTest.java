@@ -144,7 +144,10 @@ class AJoinThatCannotResolveItsInputsIsRefusedWithACodeTest {
         TapstateException refused = (TapstateException) thrown;
         assertThat(refused.code().code()).isEqualTo("actuation.join-sql-invalid");
         assertThat(refused.args()).containsEntry("step", "widen");
-        assertThat(String.valueOf(refused.args().get("detail"))).containsIgnoringCase("no_such_column");
+        assertThat(String.valueOf(refused.args().get("detail")))
+                .containsIgnoringCase("no_such_column")
+                // The diagnosis is the validator's own words, not the exception classes that carried it.
+                .doesNotContain("Exception");
     }
 
     // ---- fixtures ----------------------------------------------------------------------

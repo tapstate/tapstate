@@ -1,0 +1,7 @@
+version: tapstate/v1
+kind: source
+id: src_erp
+connector: postgres
+config: { host: 10.10.0.8, database: erp, username: cdc_user, password: Erp_2026 }
+mode: cdc
+tables: [ orders ]

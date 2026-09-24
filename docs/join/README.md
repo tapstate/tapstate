@@ -25,7 +25,9 @@ Every alias in the join step's `from:` map must name a source table. A join cann
 output of another step, such as a `js`, `map` or another `join` step: its SQL is resolved against
 the discovered columns of each input, and its rows are keyed on the driving table's primary key,
 and a step's output has neither. Validation refuses such an alias with
-`dsl.join-input-not-a-table`; do that step's work after the join instead.
+`dsl.join-input-not-a-table`; do that step's work after the join instead. An alias bound to a
+`/…/` pattern is refused as well, with `dsl.join-input-is-a-pattern`, even when the pattern matches a
+single table: write the table's name.
 
 Each dimension must be unique on the **complete join key**, which is not necessarily its
 primary key. One fact row produces at most one output row. One-to-many and many-to-many

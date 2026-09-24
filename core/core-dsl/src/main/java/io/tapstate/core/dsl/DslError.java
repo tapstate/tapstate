@@ -166,7 +166,14 @@ public enum DslError implements TapstateErrorCode {
      *  state on the driving table's primary key; a step's output has neither, so the join could
      *  only fail at every start. */
     JOIN_INPUT_NOT_A_TABLE(
-            "dsl.join-input-not-a-table", Set.of("step", "alias", "ref", "path"));
+            "dsl.join-input-not-a-table", Set.of("step", "alias", "ref", "path")),
+    /** A join's {@code from:} map binds an alias to a {@code /…/} pattern. {@code step} is the join,
+     *  {@code alias} the alias and {@code pattern} the expression. A join reads one table per alias -
+     *  its SQL names that table's columns and its state is keyed on that table's primary key - and a
+     *  pattern names a set whose members can change, so it is refused even where it matches exactly
+     *  one table today. */
+    JOIN_INPUT_IS_A_PATTERN(
+            "dsl.join-input-is-a-pattern", Set.of("step", "alias", "pattern", "path"));
 
     private final String code;
     private final Set<String> placeholders;

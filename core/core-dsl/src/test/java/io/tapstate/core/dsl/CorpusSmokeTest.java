@@ -60,6 +60,7 @@ class CorpusSmokeTest {
             "join-sql-not-parsable", // a join's sql: is not SQL at all (SS2)
             "join-sql-unsupported",// a join's sql: uses a construct this release does not run (SS2)
             "join-input-not-a-table", // a join's from: map names another step rather than a source table
+            "join-input-is-a-pattern", // a join's from: map binds an alias to a /.../ pattern
             // an unwind naming nothing that varies per element, so every row it makes carries the
             // key of the row it came from
             "unwind-needs-an-element-key",

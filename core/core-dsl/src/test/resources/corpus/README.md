@@ -77,6 +77,7 @@ together):
 | `unwind-needs-an-element-key` | an unwind naming nothing that varies per element, so every row it expands carries the parent's key | unwind |
 | `unwind-needs-an-upsert-target` | an unwind whose rows reach a sync that appends, where a delete is written as another row | unwind |
 | `join-input-not-a-table` | a join's `from:` map names another step of the pipeline rather than a source table | §5 |
+| `join-input-is-a-pattern` | a join's `from:` map binds an alias to a `/…/` pattern rather than one table | §5 |
 
 Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general grammar rule):
 
@@ -91,6 +92,7 @@ Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general gramma
 | `s07-pipeline-no-output` | composition | pipeline with neither view nor serve |
 | `s08-ambiguous-table-ref` | ambiguous-reference | bare table name present in two sources |
 | `s08-join-over-a-step` | join-input-not-a-table | join alias names a `js` step instead of the table it reads |
+| `s08-join-over-a-pattern` | join-input-is-a-pattern | join alias bound to `/orders/` instead of the table name |
 | `s09-schedule-on-unbounded` | mode-mismatch | `settings.schedule` with a cdc source |
 | `s10-illegal-ddl-enum` | illegal-value | `ddl: skip` outside {apply, ignore, fail} |
 | `s11-definition-body-with-from` | forbidden-field | `from:` on a `kind: transform` definition body |

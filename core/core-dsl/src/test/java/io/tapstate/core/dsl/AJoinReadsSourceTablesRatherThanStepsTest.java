@@ -8,8 +8,8 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 
 /**
- * A join reads source tables. An alias naming another step of the pipeline is refused while the
- * workspace is validated, rather than accepted and left to fail at every start.
+ * A join reads source tables. An alias naming another step of the pipeline, or bound to a pattern, is
+ * refused while the workspace is validated, rather than accepted and left to fail at every start.
  *
  * <p>The shape that motivated this: a {@code js} step renaming a column, joined afterwards. It passed
  * validate and apply, and then every start threw the same column-resolution error, because the join
@@ -85,6 +85,36 @@ class AJoinReadsSourceTablesRatherThanStepsTest {
                 .containsEntry("step", "resolve")
                 .containsEntry("alias", "t")
                 .containsEntry("ref", "t_track");
+    }
+
+    @Test
+    void aJoinAliasBoundToAPatternMatchingTheStepIsRefusedAsAPattern() {
+        Throwable thrown = catchThrowable(() -> batch(SOURCES, TARGET, pipeline("/t_track/")));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        DslException ex = (DslException) thrown;
+        assertThat(ex.code().code()).isEqualTo("dsl.join-input-is-a-pattern");
+        assertThat(ex.path()).isEqualTo("transforms[1].from.t");
+        assertThat(ex.args())
+                .containsEntry("step", "resolve")
+                .containsEntry("alias", "t")
+                .containsEntry("pattern", "t_track");
+    }
+
+    /**
+     * The one a narrower rule would let through: the pattern matches a source table and nothing else.
+     * The join still never expands it - it looks the pattern up as a table name and finds no columns
+     * under it - so it could only fail at every start, exactly like the step case.
+     */
+    @Test
+    void aJoinAliasBoundToAPatternMatchingOnlyASourceTableIsRefusedToo() {
+        Throwable thrown = catchThrowable(() -> batch(SOURCES, TARGET, pipeline("/tracks/")));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        DslException ex = (DslException) thrown;
+        assertThat(ex.code().code()).isEqualTo("dsl.join-input-is-a-pattern");
+        assertThat(ex.path()).isEqualTo("transforms[1].from.t");
+        assertThat(ex.args()).containsEntry("pattern", "tracks");
     }
 
     @Test

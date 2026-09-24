@@ -148,6 +148,7 @@ dsl.forbidden-field
 dsl.illegal-expression
 dsl.illegal-value
 dsl.invalid-config-value
+dsl.join-input-is-a-pattern
 dsl.join-input-not-a-table
 dsl.join-sql-not-parsable
 dsl.join-sql-unsupported

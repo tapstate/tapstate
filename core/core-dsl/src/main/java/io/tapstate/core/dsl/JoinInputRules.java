@@ -14,7 +14,8 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Every input a join's alias map names has to be a source table, never another step of the pipeline.
+ * Every input a join's alias map names has to be one source table: never another step of the pipeline,
+ * and never a {@code /…/} pattern.
  *
  * <p>A join resolves the columns its SQL names against the discovered model of each input table, and
  * files every row it holds under the driving table's primary key. A step's output has neither: its
@@ -24,6 +25,11 @@ import java.util.Set;
  *
  * <p>A reference resolves the way the closure resolves it: a bare token that is a step id of the
  * pipeline names that step. A step id cannot shadow a table name, so the two never compete.
+ *
+ * <p>A pattern is refused whatever it matches. A join reads one table per alias, and a pattern names a
+ * set: one that matches a single table today can match two tomorrow, or a step. The join would never
+ * expand it either way - it looks the pattern up as a table name, finds no columns under it, and the
+ * start fails on the first column the SQL reads.
  */
 final class JoinInputRules {
 
@@ -55,10 +61,16 @@ final class JoinInputRules {
                 continue;
             }
             for (Map.Entry<String, FromRef> alias : wiring.aliases().entrySet()) {
-                if (alias.getValue() instanceof FromRef.Literal literal && stepIds.contains(literal.ref())) {
-                    throw new DslException(DslError.JOIN_INPUT_NOT_A_TABLE,
-                            "transforms[" + i + "].from." + alias.getKey(), 0, 0, null,
-                            Map.of("step", step.id(), "alias", alias.getKey(), "ref", literal.ref()));
+                String path = "transforms[" + i + "].from." + alias.getKey();
+                switch (alias.getValue()) {
+                    case FromRef.Literal literal when stepIds.contains(literal.ref()) ->
+                            throw new DslException(DslError.JOIN_INPUT_NOT_A_TABLE, path, 0, 0, null,
+                                    Map.of("step", step.id(), "alias", alias.getKey(), "ref", literal.ref()));
+                    case FromRef.Regex regex ->
+                            throw new DslException(DslError.JOIN_INPUT_IS_A_PATTERN, path, 0, 0, null,
+                                    Map.of("step", step.id(), "alias", alias.getKey(), "pattern", regex.pattern()));
+                    case FromRef.Literal literal -> {
+                    }
                 }
             }
         }

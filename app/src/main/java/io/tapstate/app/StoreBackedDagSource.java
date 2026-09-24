@@ -2050,19 +2050,29 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * The front end's diagnosis as a person reads it: the underlying parser's or validator's own message
-     * where there is one, since the wrapper's repeats it behind a class name, and only its first line,
-     * which is the part that names the fault and its position.
+     * The front end's diagnosis as a person reads it: its first line, which names the fault and its
+     * position, without the class names the wrapping exceptions prefix it with. Calcite's validator
+     * reports through exceptions that each put the next one's class name in front of its message, so
+     * the text arrives as {@code org.apache.calcite.runtime.CalciteContextException: From line 1, ...}
+     * however far down the cause chain it is read.
      */
     private static String diagnosis(io.tapstate.core.sql.SqlFrontEndException invalid) {
-        Throwable cause = invalid.getCause();
-        String message = cause != null && cause.getMessage() != null ? cause.getMessage() : invalid.getMessage();
+        String message = invalid.getMessage();
         if (message == null) {
             return "";
         }
         int end = message.indexOf('\n');
-        return (end < 0 ? message : message.substring(0, end)).trim();
+        String line = (end < 0 ? message : message.substring(0, end)).trim();
+        String stripped;
+        while (!(stripped = EXCEPTION_CLASS_PREFIX.matcher(line).replaceFirst("")).equals(line)) {
+            line = stripped;
+        }
+        return line;
     }
+
+    /** A leading {@code some.package.SomeException: } that a wrapping exception put before a message. */
+    private static final Pattern EXCEPTION_CLASS_PREFIX =
+            Pattern.compile("^(?:[A-Za-z_$][\\w$]*\\.)+[A-Za-z_$][\\w$]*(?:Exception|Error):\\s*");
 
     /** The columns of one table, in the shared type vocabulary the plan is derived against. */
     private List<io.tapstate.core.sql.SourceColumn> columnsOf(String table,
