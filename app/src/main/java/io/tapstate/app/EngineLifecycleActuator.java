@@ -61,6 +61,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     public void start(String pipelineId) {
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
+        // An engine whose member was shut down for want of memory is the first such refusal. Everything
+        // below would otherwise run up to the member and be thrown back uncoded, a capture left reading for
+        // a job that cannot exist.
+        engine.refuseIfLost(pipelineId);
         DagSource.StartPreparation prepared = dagSource.prepareStart(
                 pipelineId, stateTeardown.defaultDatabase());
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this

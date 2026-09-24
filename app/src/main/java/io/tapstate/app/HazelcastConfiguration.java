@@ -13,6 +13,7 @@ import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.EnvelopeSerializer;
+import io.tapstate.runtime.engine.MemberOutOfMemory;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.join.JoinStateMapStoreFactory;
@@ -28,7 +29,10 @@ import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
+import org.springframework.boot.availability.AvailabilityChangeEvent;
+import org.springframework.boot.availability.LivenessState;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.lang.Nullable;
@@ -65,9 +69,16 @@ class HazelcastConfiguration {
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
             @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
             @Nullable NestDeadLetterStore nestDeadLetterStore,
-            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore) {
+            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
+            ApplicationEventPublisher events) {
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         HazelcastInstance member = startMember(() -> Hazelcast.newHazelcastInstance(config));
+        // A member its own out-of-memory handling shuts down leaves this process up and serving HTTP over an
+        // engine that no longer exists, and nothing short of a restart brings the engine back. So the process
+        // says it is broken, in the liveness its health check reports, where whatever decides on a restart
+        // looks. The engine reads the same record to fail the pipelines the member carried.
+        MemberOutOfMemory.watch(member,
+                () -> AvailabilityChangeEvent.publish(events, member, LivenessState.BROKEN));
         // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
         // Jet source and resolved member-side -- can reach it through the user context and publish durable
         // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
@@ -149,7 +160,8 @@ class HazelcastConfiguration {
             KeyedStateStore nestStateStore, NestSettings nestSettings,
             NestDeadLetterStore nestDeadLetterStore, SrsLogStore srsLogStore) {
         return hazelcastMember(properties, srsMetaStore, connectorProvisioner, snapshotBuffer,
-                nestStateStore, nestSettings, nestDeadLetterStore, null, srsLogStore);
+                nestStateStore, nestSettings, nestDeadLetterStore, null, srsLogStore, event -> {
+                });
     }
 
     /**

@@ -171,6 +171,7 @@ engine.frontier-pinned
 engine.job-failed
 engine.join-dimension-row-displaced
 engine.no-such-job
+engine.out-of-memory
 engine.view-key-missing-from-before-image
 io.document-too-large
 io.document-unreadable
