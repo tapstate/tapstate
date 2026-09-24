@@ -66,6 +66,16 @@ RUN mkdir -p /var/lib/tapstate/plugins /var/lib/tapstate/logs /var/lib/tapstate/
 # Already resolved to exactly one file by the stage above, so this names it outright.
 COPY --from=boot-jar --chown=tapstate:tapstate /jars/tapstate.jar /opt/tapstate/tapstate.jar
 
+# Keep per-build metadata out of the earlier installation layers so source changes can reuse them.
+ARG TAPSTATE_RELEASE_VERSION=development
+ARG TAPSTATE_REVISION=unknown
+ARG TAPSTATE_WEB_REVISION=unknown
+ARG TAPSTATE_WEB_FILES_SHA256=unknown
+LABEL org.opencontainers.image.version="$TAPSTATE_RELEASE_VERSION" \
+      org.opencontainers.image.revision="$TAPSTATE_REVISION" \
+      io.tapstate.web.revision="$TAPSTATE_WEB_REVISION" \
+      io.tapstate.web.files.sha256="$TAPSTATE_WEB_FILES_SHA256"
+
 USER tapstate
 
 EXPOSE 8080
