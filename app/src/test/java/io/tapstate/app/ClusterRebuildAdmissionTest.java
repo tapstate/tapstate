@@ -57,6 +57,46 @@ class ClusterRebuildAdmissionTest {
                 .isFalse();
     }
 
+    /**
+     * How a member actually leaves a running cluster: the committed set keeps naming it, because that
+     * set only ever grows, and what changes is who this member can see. Asked of the committed set, the
+     * departure never shows -- and a run whose driver survived the loss of another member it was running
+     * on stays failed for a person, which is what a two-machine run found.
+     */
+    @Test
+    void aMemberThatGoesOutOfSightHasLeftTheRunThoughTheCommittedSetStillNamesIt() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(membership.committed().activeNodeIds())
+                .as("the committed set is not what moved -- it never drops a member")
+                .contains("node-c");
+        assertThat(admission.admits("orders"))
+                .as("node-c carried part of this run and is gone, so this death is the cluster's and the "
+                        + "run is replaced, whatever the committed set still says")
+                .isTrue();
+    }
+
+    /**
+     * The other half of reading departures off who is in sight: a run is planned over the members in
+     * sight when it is submitted, so a committed member that was already gone then was never part of it.
+     * Counting it would make every death of the run read as the cluster's for as long as that member
+     * stays away, which is a restart loop with a budget.
+     */
+    @Test
+    void aCommittedMemberAlreadyOutOfSightWhenTheRunWasPlannedWasNeverPartOfIt() {
+        committed(7, "node-a", "node-b", "node-c");
+        membership.canCommit(Set.of("node-a", "node-b"));
+        submitRunUnder(7);
+
+        assertThat(admission.admits("orders"))
+                .as("nothing this run was planned over has gone anywhere, so this death is the "
+                        + "pipeline's own")
+                .isFalse();
+    }
+
     @Test
     void aMemberThatLeftAndCameBackBeforeAnybodyLookedStillCountsAsHavingLeft() {
         committed(7, "node-a", "node-b");

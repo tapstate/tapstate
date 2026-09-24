@@ -24,6 +24,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicReference;
@@ -451,6 +453,37 @@ final class ControlPlane {
             }
         }
         return Optional.empty();
+    }
+
+    /**
+     * The members carrying any part of this pipeline's current run, by stable node id, as the cluster
+     * reports it -- empty when no run of it is being measured.
+     *
+     * <p>What a case that kills a member needs before it can say it killed one the run was on: the
+     * engine places a run's pieces for itself, so which members carry them is read, never assumed.
+     */
+    Set<String> membersCarryingPartOf(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read which members carry " + pipelineId);
+        Set<String> carrying = new TreeSet<>();
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (!(pipeline instanceof Map<?, ?> one) || !pipelineId.equals(one.get("pipelineId"))
+                    || !(one.get("vertices") instanceof List<?> vertices)) {
+                continue;
+            }
+            for (Object vertex : vertices) {
+                if (!(vertex instanceof Map<?, ?> placed)
+                        || !(placed.get("processors") instanceof List<?> processors)) {
+                    continue;
+                }
+                for (Object processor : processors) {
+                    if (processor instanceof Map<?, ?> running && running.get("nodeId") instanceof String nodeId) {
+                        carrying.add(nodeId);
+                    }
+                }
+            }
+        }
+        return carrying;
     }
 
     private static List<?> pipelinesOf(String body) {

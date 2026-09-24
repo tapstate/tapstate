@@ -13,7 +13,7 @@ import org.slf4j.LoggerFactory;
 /**
  * The one way a failed run is replaced without anybody asking for it, and the only thing that decides
  * so. A run is admitted when a member it was planned over has gone away -- the pipeline's driver
- * answers that from this cluster's own committed membership -- and refused for every other death, so a
+ * answers that from the members this cluster can see -- and refused for every other death, so a
  * connector that keeps failing keeps the pipeline failed rather than restarting it forever. A member
  * <em>joining</em> is not one of these: it takes nothing away from a run already planned, and the run
  * is left alone until somebody asks for a rebalance.

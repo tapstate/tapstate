@@ -69,17 +69,18 @@ final class PipelineActuationOwnership {
         private long nextContactNanos;
         private boolean contacted;
         /**
-         * The committed members the run this member last submitted was planned over, or null while it
-         * has submitted none. Kept apart from the claim, whose own revision moves forward the moment
-         * this member re-acquires under a changed cluster -- which is exactly when the difference
-         * between what the run was planned over and what is here now becomes the thing worth knowing.
+         * The members the run this member last submitted was planned over -- the ones in sight when it
+         * was submitted -- or null while it has submitted none. Kept apart from the claim, whose own
+         * revision moves forward the moment this member re-acquires under a changed cluster -- which is
+         * exactly when the difference between what the run was planned over and what is here now becomes
+         * the thing worth knowing.
          */
         private Set<String> runMembers;
         /**
-         * The last moment any of those members was missing from the committed set while this member
-         * looked, or {@link #NEVER}. Remembered rather than recomputed, because a member that leaves and
+         * The last moment any of those members was out of sight while this member looked, or
+         * {@link #NEVER}. Remembered rather than recomputed, because a member that leaves and
          * comes back is a member that left: the run it was carrying pieces of died either way, and by
-         * the time anybody asks, a comparison against the set committed now cannot see that it was ever
+         * the time anybody asks, a comparison against who is in sight now cannot see that it was ever
          * gone.
          *
          * <p>A moment rather than a flag, and it outlives the run it was taken under, because what it
@@ -215,7 +216,7 @@ final class PipelineActuationOwnership {
         // eligibility gate above makes unreachable -- because an empty set would read as "planned over
         // nobody", and nobody can never go missing.
         ClusterMembership planned = membership.committed();
-        state.runMembers = planned == null ? null : planned.activeNodeIds();
+        state.runMembers = planned == null ? null : plannedOver(planned);
         // The departure is deliberately not forgotten here. This run is planned over members that are
         // all present, so the comparison below will find nothing missing from it -- and the run is being
         // submitted because a member went away, into a cluster that is still settling from it. Clearing
@@ -243,7 +244,10 @@ final class PipelineActuationOwnership {
      * <p>This is the product's own answer to "did a member leave", and it is its own rather than the
      * engine's for a measured reason: a run ended by a member leaving and a run ended by a connector
      * giving up reach this process as the same exception class with the same absent cause, differing
-     * only in text inside a message. The committed member set is one this cluster keeps for itself.
+     * only in text inside a message. Who is in sight is read off the membership gate, which this
+     * cluster keeps for itself -- and it is read there rather than off the committed set because the
+     * committed set only ever grows: a member that goes away keeps its place in it, so an absence could
+     * never show.
      *
      * <p>It asks who is <em>gone</em>, not whether the membership moved. A member joining moves the
      * committed revision too, and it takes nothing away from a run already planned: treating that as a
@@ -343,10 +347,24 @@ final class PipelineActuationOwnership {
         if (state.runMembers == null) {
             return;
         }
-        ClusterMembership current = membership.committed();
-        if (current != null && !current.activeNodeIds().containsAll(state.runMembers)) {
+        // Against the members in sight, not the committed set: that set only ever grows, so a member
+        // killed under a run this member is still driving never leaves it, and a comparison against it
+        // would call every such death the pipeline's own. Only a run somebody else left behind was ever
+        // picked up that way, which is why a cluster losing its driver recovered and one losing any
+        // other member of the run stayed failed.
+        if (!membership.visibleNodeIds().containsAll(state.runMembers)) {
             state.lostAMemberAtNanos = nanoTime.getAsLong();
         }
+    }
+
+    /**
+     * The members a run submitted now is planned over: the ones in sight. The engine plans a run over
+     * the members it can see, and a committed member that is out of sight is not one of them. The
+     * committed set stands in only before this member has looked at all.
+     */
+    private Set<String> plannedOver(ClusterMembership committed) {
+        Set<String> inSight = membership.visibleNodeIds();
+        return inSight.isEmpty() ? committed.activeNodeIds() : inSight;
     }
 
     /**

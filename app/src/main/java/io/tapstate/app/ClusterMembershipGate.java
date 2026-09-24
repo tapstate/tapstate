@@ -98,6 +98,17 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
         return committed.get();
     }
 
+    /**
+     * The members this one last saw in the cluster, by stable node id, whether committed or not.
+     *
+     * <p>This is where a member that goes away shows. The committed set only ever grows -- a member that
+     * stops answering keeps its place in it, so that the majority it counts toward cannot shrink behind a
+     * minority's back -- and so an absence is never visible there. Empty until the first look.
+     */
+    Set<String> visibleNodeIds() {
+        return visible.get();
+    }
+
     static boolean strictMajority(int committedSize, int visibleCommittedMembers) {
         if (committedSize < 1 || visibleCommittedMembers < 0) {
             throw new IllegalArgumentException("membership counts are out of range");
