@@ -662,10 +662,13 @@ pagination, REST and MCP forms, and the difference between an empty retained win
   that all is well — it prints every reading it went through and names the questions these faces
   cannot answer, so you go and look at the thing the product genuinely cannot see instead of
   trusting a silence. `--watch` is unchanged: it streams the state only, and says nothing more.
-- **The position it prints is `targetAckedPosition`: how far the target has confirmed writes.**
-  It is not how far the source could be read to and not how far the pipeline has processed. Those
-  two are printed by name as `not collected`, because a position that is simply missing reads the
-  same as one this product has no concept of — and only one of those is an answer. A target that
+- **The position it reports is `targetAckedPosition`: how far the target has confirmed writes.**
+  When a connector supplies a Java-serialized token, `metrics` summarizes how many tables have
+  an acknowledged position and how many distinct positions they share; it cannot infer a source
+  coordinate or lag from those opaque bytes. The REST metrics response retains the raw token for
+  machine use. This is not how far the source could be read to or how far the pipeline has processed.
+  Those two are printed by name as `not collected`, because a position that is simply missing reads
+  the same as one this product has no concept of — and only one of those is an answer. A target that
   has stopped accepting writes freezes this position while the other two would still be moving, so
   reading it as either of them turns a stalled target into a quiet source.
 - **`logs` carries what the connector itself said, not only what the host could tell from outside.**

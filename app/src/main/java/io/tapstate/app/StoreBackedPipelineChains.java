@@ -32,9 +32,9 @@ final class StoreBackedPipelineChains implements PipelineChains {
         List<Chain> chains = new ArrayList<>();
         for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-            SourceCaptureResolution resolution =
-                    SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
-            chains.add(new Chain(resolution.chainId().value(), sourceId, resolution.tables()));
+            SourceCaptureResolution.forPipeline(pipeline, source, SourceDiscovery.model(storePort, source))
+                    .ifPresent(resolution -> chains.add(
+                            new Chain(resolution.chainId().value(), sourceId, resolution.tables())));
         }
         return List.copyOf(chains);
     }

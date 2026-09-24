@@ -121,7 +121,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // row count the last discovery took of each of them. Asking the store again for the second
                 // use would pay for a second read per source on every start.
                 SourceModel discovered = SourceDiscovery.model(storePort, source);
-                SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discovered);
+                Optional<SourceCaptureResolution> selected =
+                        SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+                if (selected.isEmpty()) {
+                    continue;
+                }
+                SourceCaptureResolution resolution = selected.orElseThrow();
                 CaptureRunSpec spec = deriveSpec(
                         pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref),
                         snapshotEpoch);
