@@ -15,6 +15,7 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.runtime.engine.join.JoinDag;
+import io.tapstate.runtime.engine.join.JoinFrontier;
 import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.nest.NestDag;
 import io.tapstate.runtime.engine.nest.NestFrontier;
@@ -352,7 +353,10 @@ public final class PipelineDagBuilder {
                             bindings.join().dimensionRowKeyColumns().apply(step),
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
-                            bindings.join().stores(), bindings.join().displaced()));
+                            bindings.join().stores(), bindings.join().displaced(),
+                            chains == null ? null : new JoinFrontier(axes,
+                                    alias -> chains.perProducer(
+                                            aliasUpstream(inline.from(), alias, bindings)))));
                     if (chains != null) {
                         chains.derived(step.id(), nestUpstream(inline.from(), bindings));
                     }

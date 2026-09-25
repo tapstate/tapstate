@@ -4,9 +4,13 @@ import com.hazelcast.jet.core.Processor;
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
+import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.LevelBounds;
+import io.tapstate.runtime.engine.SettledPositions;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -47,6 +51,7 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
 
     private final JoinDriver driver;
     private final Map<Integer, String> sourceByOrdinal;
+    private final LevelBounds bounds;
 
     /**
      * @param sourceByOrdinal which source arrives on which inbound edge. It comes from whoever drew the
@@ -55,8 +60,17 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
      *                        under two aliases, and then one stream is two sources
      */
     public JoinProcessor(JoinDriver driver, Map<Integer, String> sourceByOrdinal) {
+        this(driver, sourceByOrdinal, null, null);
+    }
+
+    /** The same join with per-edge source chains and a bound on its pending fan-out. */
+    public JoinProcessor(JoinDriver driver, Map<Integer, String> sourceByOrdinal,
+            ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal) {
         this.driver = Objects.requireNonNull(driver, "driver");
         this.sourceByOrdinal = Map.copyOf(Objects.requireNonNull(sourceByOrdinal, "sourceByOrdinal"));
+        this.bounds = axes == null ? null : new LevelBounds(
+                Objects.requireNonNull(chainsByOrdinal, "chainsByOrdinal"), axes,
+                driver::lowestPendingOn);
     }
 
     /** Whether what is currently being offered has already been taken into the state. */
@@ -99,12 +113,23 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
             // Reading rather than draining: what is not sent yet has to still be there to be offered
             // again, and it is the sending that decides, not this.
             for (Object item : inbox) {
-                changes.add(new SourceChange(source, (Envelope) item));
+                if (item instanceof SettledPositions word) {
+                    if (!changes.isEmpty()) {
+                        driver.absorb(changes);
+                        changes.clear();
+                    }
+                    driver.absorbWord(word);
+                } else {
+                    changes.add(new SourceChange(source, (Envelope) item));
+                }
             }
-            driver.absorb(changes);
+            if (!changes.isEmpty()) {
+                driver.absorb(changes);
+            }
             taken = true;
         }
-        if (driver.drainUpdates(this::tryEmit)) {
+        if (driver.drainItems(this::tryEmit)
+                && (bounds == null || bounds.release(this::tryEmit))) {
             inbox.clear();
             taken = false;
         }
@@ -117,7 +142,8 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
      */
     @Override
     public boolean tryProcess() {
-        return driver.drainUpdates(this::tryEmit);
+        return driver.drainItems(this::tryEmit)
+                && (bounds == null || bounds.release(this::tryEmit));
     }
 
     /**
@@ -126,6 +152,17 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
      */
     @Override
     public boolean complete() {
-        return driver.drainUpdates(this::tryEmit);
+        return driver.drainItems(this::tryEmit)
+                && (bounds == null || bounds.release(this::tryEmit));
+    }
+
+    @Override
+    public boolean tryProcessWatermark(int ordinal, Watermark watermark) {
+        return bounds == null || bounds.advance(ordinal, watermark, this::tryEmit);
+    }
+
+    @Override
+    public boolean tryProcessWatermark(Watermark watermark) {
+        return true;
     }
 }

@@ -3,14 +3,20 @@ package io.tapstate.runtime.engine.join;
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
+import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.sql.Expr;
 import io.tapstate.core.sql.JoinKind;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
 import io.tapstate.core.sql.OutputField;
+import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.FrontierOrders;
+import io.tapstate.runtime.engine.SettledPositions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -43,6 +49,7 @@ class JoinProcessorTest {
     private static final String STREAM = "order_state";
     private static final int FACT = 0;
     private static final int DIMENSION = 1;
+    private static final ChainAxes AXES = ChainAxes.assign(List.of("orders", "customers"));
 
     private CountingJoinStores stores;
     private JoinDriver driver;
@@ -53,7 +60,8 @@ class JoinProcessorTest {
     void buildVertex() throws Exception {
         stores = new CountingJoinStores(2);
         driver = new JoinDriver(plan(), List.of("id"), STREAM, stores, 4);
-        processor = new JoinProcessor(driver, Map.of(FACT, "o", DIMENSION, "c"));
+        processor = new JoinProcessor(driver, Map.of(FACT, "o", DIMENSION, "c"),
+                AXES, Map.of(FACT, List.of("orders"), DIMENSION, List.of("customers")));
         outbox = new TestOutbox(new int[] {2}, 2);
         processor.init(outbox, new TestProcessorContext());
     }
@@ -155,6 +163,47 @@ class JoinProcessorTest {
     }
 
     @Test
+    void aBlockedFanOutKeepsItsDimensionPositionBehindTheLastRow() {
+        ChainAxes axes = ChainAxes.assign(List.of("orders", "customers"));
+        offer(DIMENSION, insert(Map.of("id", 1L, "name", "Ada")));
+        for (long id = 0; id < 5; id++) {
+            offerUntilTaken(FACT, insert(Map.of("id", id, "cust_id", 1L)));
+        }
+        forgetWhatWasPublished();
+        SourceOrder at = new SourceOrder(1, 20);
+        ChainPosition position = new ChainPosition(at, "customer-20");
+        Envelope changed = update(Map.of("id", 1L, "name", "Ada"),
+                Map.of("id", 1L, "name", "Grace"))
+                .withPositions(Map.of("customers", position));
+        driver.absorb(List.of(new SourceChange("c", changed)));
+        assertThat(driver.hasPending()).isTrue();
+        processor.tryProcessWatermark(DIMENSION,
+                new Watermark(FrontierOrders.pack("customers", at), axes.axisOf("customers")));
+        assertThat(drainRaw()).noneMatch(item -> item instanceof Watermark watermark
+                && watermark.key() == axes.axisOf("customers")
+                && watermark.timestamp() >= FrontierOrders.pack("customers", at));
+
+        List<Object> afterTail = new ArrayList<>();
+        for (int attempts = 0; attempts < 20; attempts++) {
+            boolean drained = processor.tryProcess();
+            afterTail.addAll(drainRaw());
+            if (drained) {
+                break;
+            }
+        }
+        assertThat(driver.hasPending()).isFalse();
+        processor.tryProcessWatermark(DIMENSION,
+                new Watermark(FrontierOrders.pack("customers", new SourceOrder(1, 21)),
+                        axes.axisOf("customers")));
+        afterTail.addAll(drainRaw());
+        assertThat(afterTail).anyMatch(item -> item instanceof SettledPositions settled
+                && position.equals(settled.positions().get("customers")));
+        assertThat(afterTail).anyMatch(item -> item instanceof Watermark watermark
+                && watermark.key() == axes.axisOf("customers")
+                && watermark.timestamp() >= FrontierOrders.pack("customers", at));
+    }
+
+    @Test
     @DisplayName("an edge on an ordinal naming no source is a wiring mistake and says so")
     void anUnknownOrdinalIsRefused() {
         org.assertj.core.api.Assertions
@@ -199,12 +248,18 @@ class JoinProcessorTest {
     }
 
     private void drainOutbox() {
+        for (Object item : drainRaw()) {
+            if (item instanceof JoinUpdate update) {
+                Envelope event = update.event();
+                collected.add(event.op() == Op.DELETE ? event.before() : event.after());
+            }
+        }
+    }
+
+    private List<Object> drainRaw() {
         List<Object> taken = new ArrayList<>();
         outbox.drainQueueAndReset(0, taken, false);
-        for (Object item : taken) {
-            Envelope event = ((JoinUpdate) item).event();
-            collected.add(event.op() == Op.DELETE ? event.before() : event.after());
-        }
+        return taken;
     }
 
     private List<Map<String, Object>> published() {

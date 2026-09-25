@@ -32,11 +32,13 @@ public final class JoinProjection {
             Map<String, Object> fact = facts.get(keys.get(i));
             if (fact == null) {
                 Map<String, Object> old = arrival.after() != null ? arrival.after() : arrival.before();
-                result.add(Envelope.delete(arrival.ts(), arrival.src(), old, null));
+                result.add(Envelope.delete(arrival.ts(), arrival.src(), old, null)
+                        .withPositions(arrival.positions()));
                 continue;
             }
             Envelope current = projector.rowEvent(fact, arrival.ts(), false);
-            result.add(current != null ? current : projector.rowEvent(fact, arrival.ts(), true));
+            result.add((current != null ? current : projector.rowEvent(fact, arrival.ts(), true))
+                    .withPositions(arrival.positions()));
         }
         return result;
     }

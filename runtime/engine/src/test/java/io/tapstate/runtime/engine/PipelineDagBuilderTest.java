@@ -320,7 +320,9 @@ class PipelineDagBuilderTest {
         DAG dag = PipelineDagBuilder.build(pipeline, bindings(Map.of(
                 FromRef.literal("orders_src"), List.of("orders_src"),
                 FromRef.literal("customers_src"), List.of("customers_src"),
-                FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()));
+                FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()),
+                SinkAckFactory.NONE,
+                new FrontierBinding(Map.of("orders_src", "orders", "customers_src", "customers")));
 
         assertThat(vertexNames(dag))
                 .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "j:project", "serve.sync_1");
@@ -348,6 +350,22 @@ class PipelineDagBuilderTest {
                 io.tapstate.core.sql.JoinKey.of(List.of(10L)).name(),
                 Envelope.delete(1, "j", Map.of("customer", "old"), null)), 17);
         assertThat(routed.get()).isEqualTo(io.tapstate.core.sql.JoinKey.of(List.of(10L)).name());
+        SettledPositions word = new SettledPositions(Map.of("customers",
+                new io.tapstate.core.event.ChainPosition(new io.tapstate.core.event.SourceOrder(1, 9), "w9")));
+        partitioner.getPartition(word, 17);
+        assertThat(routed.get()).isNotNull();
+
+        Edge dimension = dag.getInboundEdges("j").stream()
+                .filter(edge -> edge.getDestOrdinal() == 1).findFirst().orElseThrow();
+        @SuppressWarnings("unchecked")
+        com.hazelcast.jet.core.Partitioner<Object> sourcePartitioner =
+                (com.hazelcast.jet.core.Partitioner<Object>) dimension.getPartitioner();
+        sourcePartitioner.init(key -> {
+            routed.set(key);
+            return 0;
+        });
+        sourcePartitioner.getPartition(word, 17);
+        assertThat(routed.get()).isNotNull();
     }
 
     /**

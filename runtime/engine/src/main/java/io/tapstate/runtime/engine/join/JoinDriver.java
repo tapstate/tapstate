@@ -1,6 +1,9 @@
 package io.tapstate.runtime.engine.join;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
+import io.tapstate.runtime.engine.SettledPositions;
 import io.tapstate.core.sql.Expressions;
 import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinKind;
@@ -195,8 +198,35 @@ public final class JoinDriver {
         prime(changes);
         for (SourceChange change : changes) {
             absorb(change);
+            appendSettlement(change.event().positions());
         }
         primed.clear();
+    }
+
+    /** A position with no row of its own still follows all rows already queued before it. */
+    public void absorbWord(SettledPositions word) {
+        appendSettlement(word.positions());
+    }
+
+    private void appendSettlement(Map<String, ChainPosition> positions) {
+        if (!positions.isEmpty()) {
+            pending.add(new Settlement(positions));
+        }
+    }
+
+    /** The lowest source position whose affected output has not all left this processor yet. */
+    public SourceOrder lowestPendingOn(String chain) {
+        SourceOrder lowest = null;
+        for (Work work : pending) {
+            if (work instanceof Settlement settlement) {
+                ChainPosition position = settlement.positions().get(chain);
+                if (position != null && position.order() != null
+                        && (lowest == null || position.order().compareTo(lowest) < 0)) {
+                    lowest = position.order();
+                }
+            }
+        }
+        return lowest;
     }
 
     /**
@@ -347,7 +377,7 @@ public final class JoinDriver {
             // The mirror where there is one: a connector's before image may hold the key columns
             // alone, and the published row is built from the whole row.
             Map<String, Object> row = mirrored != null ? mirrored : before;
-            queueRow(row, event.ts(), true);
+            queueRow(row, event.ts(), true, event.positions());
             forget(key, row);
             return;
         }
@@ -376,7 +406,7 @@ public final class JoinDriver {
         if (previous != null && !previousKey.equals(key)) {
             // The row's own identity moved, so what was published under the old one is a different
             // row and nothing else will ever remove it.
-            queueRow(previous, event.ts(), true);
+            queueRow(previous, event.ts(), true, event.positions());
             forget(previousKey, previous);
             previous = null;
         }
@@ -395,13 +425,13 @@ public final class JoinDriver {
                 stores.indexRemove(dimension.source(), was, key);
                 // The old bucket's row is a different published row wherever the identity carries the
                 // dimension key, so it is removed rather than overwritten.
-                queueRow(previous, event.ts(), true);
+                queueRow(previous, event.ts(), true, event.positions());
             }
             if (now != null) {
                 stores.indexAdd(dimension.source(), now, key);
             }
         }
-        queueRow(after, event.ts(), false);
+        queueRow(after, event.ts(), false, event.positions());
     }
 
     /**
@@ -423,7 +453,7 @@ public final class JoinDriver {
 
         if (was != null && keyMoved) {
             stores.removeDimensionRow(dimension.source(), was);
-            queueRecompute(dimension, was, event.ts());
+            queueRecompute(dimension, was, event.ts(), event.positions());
         }
         if (after == null || now == null) {
             // A dimension row whose join key holds a null matches nothing, by the same rule that makes
@@ -449,7 +479,7 @@ public final class JoinDriver {
             displaced.displaced(dimension.source(), now);
         }
         if (keyMoved || publishedValuesDiffer(dimension, before, after)) {
-            queueRecompute(dimension, now, event.ts());
+            queueRecompute(dimension, now, event.ts(), event.positions());
         }
     }
 
@@ -492,12 +522,14 @@ public final class JoinDriver {
      * and every one of those rows would otherwise queue a walk of a bucket that does not exist. The
      * check is one look at the index, against a walk that is skipped.
      */
-    private void queueRecompute(Dimension dimension, String dimensionKey, long ts) {
+    private void queueRecompute(
+            Dimension dimension, String dimensionKey, long ts,
+            Map<String, ChainPosition> positions) {
         int pages = stores.indexPageCount(dimension.source(), dimensionKey);
         if (pages == 0) {
             return;
         }
-        pending.add(new Recompute(dimension, dimensionKey, 0, 0, ts,
+        pending.add(new Recompute(dimension, dimensionKey, 0, 0, ts, positions,
                 estimateRows(dimension.source(), dimensionKey, pages)));
     }
 
@@ -525,10 +557,22 @@ public final class JoinDriver {
 
     /** Carries the fact identity to final projection without adding a column to the user's row. */
     public boolean drainUpdates(Predicate<JoinUpdate> sink) {
+        return drainItems(item -> item instanceof JoinUpdate update ? sink.test(update) : true);
+    }
+
+    /** Emits both target updates and position-only words in their source order. */
+    public boolean drainItems(Predicate<Object> sink) {
         while (!pending.isEmpty()) {
             Work work = pending.peek();
             if (work instanceof Row row) {
                 if (!sink.test(row.update())) {
+                    return false;
+                }
+                pending.poll();
+                continue;
+            }
+            if (work instanceof Settlement settlement) {
+                if (!sink.test(new SettledPositions(settlement.positions()))) {
                     return false;
                 }
                 pending.poll();
@@ -548,7 +592,7 @@ public final class JoinDriver {
      * Returns false when the sink refused, having written down where to carry on from - the page and
      * the position within it, so nothing is sent twice and nothing is skipped.
      */
-    private boolean advance(Recompute recompute, Predicate<JoinUpdate> sink) {
+    private boolean advance(Recompute recompute, Predicate<Object> sink) {
         Dimension dimension = recompute.dimension();
         String source = dimension.source();
         String dimensionKey = recompute.dimensionKey();
@@ -613,7 +657,7 @@ public final class JoinDriver {
      * never primed.
      */
     private boolean emit(Recompute recompute, Dimension dimension,
-            Map<String, Map<String, Object>> rows, Set<String> asked, Predicate<JoinUpdate> sink) {
+            Map<String, Map<String, Object>> rows, Set<String> asked, Predicate<Object> sink) {
         List<String> factKeys =
                 stores.indexPage(dimension.source(), recompute.dimensionKey(), recompute.page());
         List<String> stale = new ArrayList<>();
@@ -653,7 +697,7 @@ public final class JoinDriver {
                 // idempotent sink, against a row that otherwise stays for ever.
                 event = rowEvent(factRow, recompute.ts(), true);
             }
-            if (!sink.test(new JoinUpdate(factKey, event))) {
+            if (!sink.test(new JoinUpdate(factKey, event.withPositions(recompute.positions())))) {
                 // Nothing has been removed yet, so the entries found stale on this pass are simply
                 // found again on the next one. Removing them mid-walk would move the positions the
                 // bookmark below is written in.
@@ -685,13 +729,15 @@ public final class JoinDriver {
     static final int DEFAULT_KEYS_PER_READ = 8_000;
 
     /** Queues the published row for {@code factRow}, or its removal. */
-    private void queueRow(Map<String, Object> factRow, long ts, boolean removed) {
+    private void queueRow(
+            Map<String, Object> factRow, long ts, boolean removed,
+            Map<String, ChainPosition> positions) {
         if (factRow == null) {
             return;
         }
         Envelope event = rowEvent(factRow, ts, removed);
         if (event != null) {
-            pending.add(new Row(new JoinUpdate(factKeyOf(factRow), event)));
+            pending.add(new Row(new JoinUpdate(factKeyOf(factRow), event.withPositions(positions))));
         }
     }
 
@@ -843,11 +889,18 @@ public final class JoinDriver {
             java.util.Set<String> outputColumns) {
     }
 
-    private sealed interface Work permits Row, Recompute {
+    private sealed interface Work permits Row, Recompute, Settlement {
     }
 
     /** One published row waiting for the sink to take it. */
     private record Row(JoinUpdate update) implements Work {
+    }
+
+    /** The source position that follows every target update this input caused. */
+    private record Settlement(Map<String, ChainPosition> positions) implements Work {
+        private Settlement {
+            positions = Map.copyOf(positions);
+        }
     }
 
     /**
@@ -860,24 +913,31 @@ public final class JoinDriver {
         private final Dimension dimension;
         private final String dimensionKey;
         private final long ts;
+        private final Map<String, ChainPosition> positions;
         private final long expected;
         private int page;
         private int at;
         private long done;
 
         private Recompute(Dimension dimension, String dimensionKey, int page, int at, long ts,
+                Map<String, ChainPosition> positions,
                 long expected) {
             this.dimension = dimension;
             this.dimensionKey = dimensionKey;
             this.page = page;
             this.at = at;
             this.ts = ts;
+            this.positions = Map.copyOf(positions);
             this.expected = expected;
         }
 
         /** About how many rows this rebuild has to send - an estimate, never a count. */
         private long expected() {
             return expected;
+        }
+
+        private Map<String, ChainPosition> positions() {
+            return positions;
         }
 
         /** How many it has sent. Rows dropped as stale are not sent, so they are not counted. */
