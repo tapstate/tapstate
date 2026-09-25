@@ -1,0 +1,12 @@
+{
+  "pipelineId": "orders",
+  "from": "2026-09-20T10:00:00Z",
+  "to": "2026-09-20T11:00:00Z",
+  "effectiveFrom": "2026-09-20T10:00:00Z",
+  "effectiveTo": "2026-09-20T11:00:00Z",
+  "retentionCutoff": "2026-09-05T11:00:00Z",
+  "completeness": "BEST_EFFORT",
+  "events": [],
+  "knownGaps": [],
+  "nextCursor": null
+}

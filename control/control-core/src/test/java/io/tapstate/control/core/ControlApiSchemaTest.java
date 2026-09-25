@@ -119,6 +119,55 @@ class ControlApiSchemaTest {
                 .containsExactly("source", "field", "value");
     }
 
+    @Test
+    void eventContractIsTypedButNotYetExposed() {
+        Map<?, ?> definitions = (Map<?, ?>) ControlApiSchema.document().get("$defs");
+        Map<?, ?> request = (Map<?, ?>) definitions.get("PipelineEventsRequest");
+        Map<?, ?> requestProperties = (Map<?, ?>) request.get("properties");
+        assertThat(request.get("additionalProperties")).isEqualTo(false);
+        assertThat(request.get("required")).isEqualTo(List.of("id", "from", "to"));
+        assertThat(requestProperties.keySet().stream().map(String::valueOf).toList())
+                .containsExactlyInAnyOrder("id", "from", "to", "limit", "cursor");
+        Map<?, ?> limit = (Map<?, ?>) requestProperties.get("limit");
+        assertThat(limit.get("minimum")).isEqualTo(1);
+        assertThat(limit.get("maximum")).isEqualTo(500);
+        assertThat(limit.get("default")).isEqualTo(100);
+
+        Map<?, ?> result = (Map<?, ?>) definitions.get("PipelineEventsResult");
+        Map<?, ?> resultProperties = (Map<?, ?>) result.get("properties");
+        assertThat(result.get("additionalProperties")).isEqualTo(false);
+        assertThat(result.get("required")).isEqualTo(List.of(
+                "pipelineId", "from", "to", "effectiveFrom", "effectiveTo", "retentionCutoff",
+                "completeness", "events", "knownGaps", "nextCursor"));
+        assertThat(resultProperties.keySet().stream().map(String::valueOf).toList())
+                .doesNotContain("pipelineIncarnationId", "executionGeneration");
+        assertThat(((Map<?, ?>) resultProperties.get("completeness")).get("enum"))
+                .isEqualTo(List.of("BEST_EFFORT"));
+        assertThat(((Map<?, ?>) resultProperties.get("nextCursor")).get("oneOf"))
+                .isEqualTo(List.of(
+                        Map.of("type", "string", "minLength", 1, "description", "Opaque continuation token"),
+                        Map.of("type", "null")));
+
+        Map<?, ?> event = (Map<?, ?>) ((Map<?, ?>) resultProperties.get("events")).get("items");
+        Map<?, ?> eventProperties = (Map<?, ?>) event.get("properties");
+        assertThat(event.get("additionalProperties")).isEqualTo(false);
+        assertThat(event.get("required")).isEqualTo(List.of("id", "occurredAt", "kind", "message"));
+        assertThat(eventProperties.keySet().stream().map(String::valueOf).toList())
+                .doesNotContain("pipelineIncarnationId", "executionGeneration");
+        assertThat(((Map<?, ?>) eventProperties.get("kind")).get("enum"))
+                .isEqualTo(List.of("STATE_CHANGED", "FAILURE", "EXECUTION_RESTARTED", "EXECUTION_RECOVERED",
+                        "TELEMETRY_DEGRADED", "TELEMETRY_RESTORED", "CLEANUP_INCOMPLETE", "TELEMETRY_GAP"));
+
+        Map<?, ?> gap = (Map<?, ?>) ((Map<?, ?>) resultProperties.get("knownGaps")).get("items");
+        Map<?, ?> reasons = (Map<?, ?>) ((Map<?, ?>) gap.get("properties")).get("reasons");
+        assertThat(gap.get("required")).isEqualTo(List.of("eventId", "from", "to", "reasons"));
+        assertThat(reasons.get("uniqueItems")).isEqualTo(true);
+        assertThat(reasons.get("maxItems")).isEqualTo(3);
+        assertThat(((Map<?, ?>) reasons.get("items")).get("enum"))
+                .isEqualTo(List.of("QUEUE_FULL", "WRITE_FAILURE", "SHUTDOWN"));
+        assertThat(ControlOperations.registry().isRegistered("pipeline.events")).isFalse();
+    }
+
     /**
      * The delete tool's argument names are published the moment the tool is, and a remote model calls it
      * by those names alone. Both are required: an id with no precondition would let a caller discard a

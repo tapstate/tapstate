@@ -231,6 +231,8 @@ public final class ControlApiSchema {
         pair(defs, "PipelineLogs", logsRequest, opaque);
         pair(defs, "PipelineMetricsHistory", historyRequest(id), historyResult());
         pair(defs, "PipelineExplain", pipelineId, explanationResult());
+        // The event contract is prepared here before the operation is exposed by a protocol face.
+        pair(defs, "PipelineEvents", eventsRequest(id), eventsResult());
 
         Map<String, Object> sourceId = string("Declared Source whose own database is read");
         Map<String, Object> collection = string("Collection in that source's database");
@@ -280,6 +282,73 @@ public final class ControlApiSchema {
         properties.put("table", immutableMap(table));
         properties.put("cursor", string("Opaque continuation token; repeat every other query argument unchanged"));
         return object(List.of("id", "from", "to"), properties, false);
+    }
+
+    private static Map<String, Object> eventsRequest(Map<String, Object> id) {
+        Map<String, Object> limit = new LinkedHashMap<>(integer(1, 500,
+                "Maximum events in this response page; defaults to 100"));
+        limit.put("default", 100);
+        return object(List.of("id", "from", "to"), Map.of(
+                "id", id,
+                "from", instant("Inclusive beginning of the requested retained window"),
+                "to", instant("Exclusive end of the requested retained window"),
+                "limit", immutableMap(limit),
+                "cursor", string("Opaque continuation token; repeat every other query argument unchanged")),
+                false);
+    }
+
+    private static Map<String, Object> eventsResult() {
+        Map<String, Object> state = enumString("NEW", "RUNNING", "PAUSED", "STOPPED", "COMPLETED", "FAILED");
+        Map<String, Object> failure = object(
+                List.of("code", "params", "message"),
+                Map.of(
+                        "code", string("Canonical error code"),
+                        "params", Map.of("type", "object", "additionalProperties", Map.of()),
+                        "message", string("Catalog-rendered failure message")),
+                false);
+        Map<String, Object> event = object(
+                List.of("id", "occurredAt", "kind", "message"),
+                Map.of(
+                        "id", string("Opaque event identifier used for ordering and deduplication"),
+                        "occurredAt", utcInstant("Event time in UTC"),
+                        "kind", enumString("STATE_CHANGED", "FAILURE", "EXECUTION_RESTARTED",
+                                "EXECUTION_RECOVERED", "TELEMETRY_DEGRADED", "TELEMETRY_RESTORED",
+                                "CLEANUP_INCOMPLETE", "TELEMETRY_GAP"),
+                        "message", string("Catalog-rendered event message"),
+                        "beforeState", state,
+                        "afterState", state,
+                        "failure", failure,
+                        "reason", string("Optional display explanation, not a machine state")),
+                false);
+        Map<String, Object> reasons = new LinkedHashMap<>(array(enumString(
+                "QUEUE_FULL", "WRITE_FAILURE", "SHUTDOWN")));
+        reasons.put("uniqueItems", true);
+        reasons.put("maxItems", 3);
+        Map<String, Object> gap = object(
+                List.of("eventId", "from", "to", "reasons"),
+                Map.of(
+                        "eventId", string("Identifier of a TELEMETRY_GAP event on this page"),
+                        "from", utcInstant("Actual beginning of the known loss interval"),
+                        "to", utcInstant("Actual end of the known loss interval"),
+                        "reasons", immutableMap(reasons)),
+                false);
+        Map<String, Object> events = new LinkedHashMap<>(array(event));
+        events.put("maxItems", 500);
+        Map<String, Object> knownGaps = new LinkedHashMap<>(array(gap));
+        knownGaps.put("maxItems", 500);
+        return object(List.of(
+                "pipelineId", "from", "to", "effectiveFrom", "effectiveTo", "retentionCutoff",
+                "completeness", "events", "knownGaps", "nextCursor"), Map.of(
+                "pipelineId", string("Pipeline identifier"),
+                "from", utcInstant("Normalized requested beginning"),
+                "to", utcInstant("Normalized requested end"),
+                "effectiveFrom", utcInstant("Retention-clipped beginning used by this cursor walk"),
+                "effectiveTo", utcInstant("Server-now-clipped end used by this cursor walk"),
+                "retentionCutoff", utcInstant("Events before this instant are not readable"),
+                "completeness", enumString("BEST_EFFORT"),
+                "events", immutableMap(events),
+                "knownGaps", immutableMap(knownGaps),
+                "nextCursor", nullable(string("Opaque continuation token"))), false);
     }
 
     private static Map<String, Object> historyResult() {
@@ -490,6 +559,12 @@ public final class ControlApiSchema {
 
     private static Map<String, Object> instant(String description) {
         return Map.of("type", "string", "format", "date-time", "description", description);
+    }
+
+    private static Map<String, Object> utcInstant(String description) {
+        Map<String, Object> schema = new LinkedHashMap<>(instant(description));
+        schema.put("pattern", "Z$");
+        return immutableMap(schema);
     }
 
     private static Map<String, Object> nonNegativeNumber() {

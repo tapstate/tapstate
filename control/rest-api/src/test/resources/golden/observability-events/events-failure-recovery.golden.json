@@ -1,0 +1,34 @@
+{
+  "pipelineId": "orders",
+  "from": "2026-09-20T10:00:00Z",
+  "to": "2026-09-20T11:00:00Z",
+  "effectiveFrom": "2026-09-20T10:00:00Z",
+  "effectiveTo": "2026-09-20T11:00:00Z",
+  "retentionCutoff": "2026-09-05T11:00:00Z",
+  "completeness": "BEST_EFFORT",
+  "events": [
+    {
+      "id": "ev-a7",
+      "occurredAt": "2026-09-20T10:10:00Z",
+      "kind": "FAILURE",
+      "message": "Pipeline orders stopped because its job failed: sink refused the batch.",
+      "beforeState": "RUNNING",
+      "afterState": "FAILED",
+      "failure": {
+        "code": "engine.job-failed",
+        "params": {"pipeline": "orders", "cause": "sink refused the batch"},
+        "message": "Pipeline orders stopped because its job failed: sink refused the batch."
+      }
+    },
+    {
+      "id": "ev-b2",
+      "occurredAt": "2026-09-20T10:12:00Z",
+      "kind": "EXECUTION_RECOVERED",
+      "message": "Pipeline execution recovered.",
+      "beforeState": "FAILED",
+      "afterState": "RUNNING"
+    }
+  ],
+  "knownGaps": [],
+  "nextCursor": null
+}
