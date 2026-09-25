@@ -248,6 +248,92 @@ class ControlPlaneTest {
                 .hasMessageContaining("got 500");
     }
 
+    @Test
+    void resolvesEachBenchmarkAckByPipelineSourceAndSelectedTable() {
+        String join = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
+                Map.of("chainId", "physical-orders", "sourceId", "src_orders", "tables", List.of("orders"),
+                        "targetAcked", Map.of("token", "join-orders-ack")),
+                Map.of("chainId", "physical-customers", "sourceId", "src_customers",
+                        "tables", List.of("customers"), "targetAcked", Map.of("token", "join-customers-ack")))));
+        String nest = JsonWriter.write(Map.of("pipelineId", "bench_nest", "chains", List.of(
+                Map.of("chainId", "physical-orders", "sourceId", "src_nest_orders",
+                        "tables", List.of("orders"), "targetAcked", Map.of("token", "nest-orders-ack")),
+                Map.of("chainId", "physical-items", "sourceId", "src_items",
+                        "tables", List.of("items"), "targetAcked", Map.of("token", "nest-items-ack")))));
+        ControlPlane.PositionRead joinRead = ControlPlane.interpretPositionRead(200, join, "bench_join");
+        ControlPlane.PositionRead nestRead = ControlPlane.interpretPositionRead(200, nest, "bench_nest");
+
+        assertThat(joinRead.chains()).containsExactly(
+                new ControlPlane.PositionChain("physical-orders", "src_orders", List.of("orders"),
+                        "join-orders-ack"),
+                new ControlPlane.PositionChain("physical-customers", "src_customers", List.of("customers"),
+                        "join-customers-ack"));
+        assertThat(ControlPlane.resolveTargetAck(joinRead,
+                chain("bench_join", "src_orders", "orders"))).isEqualTo("join-orders-ack");
+        assertThat(ControlPlane.resolveTargetAck(joinRead,
+                chain("bench_join", "src_customers", "customers"))).isEqualTo("join-customers-ack");
+        assertThat(ControlPlane.resolveTargetAck(nestRead,
+                chain("bench_nest", "src_nest_orders", "orders"))).isEqualTo("nest-orders-ack");
+        assertThat(ControlPlane.resolveTargetAck(nestRead,
+                chain("bench_nest", "src_items", "items"))).isEqualTo("nest-items-ack");
+        assertThatThrownBy(() -> ControlPlane.resolveTargetAck(joinRead,
+                        chain("bench_nest", "src_nest_orders", "orders")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("different pipelines");
+    }
+
+    @Test
+    void benchmarkAckRejectsPendingMissingOrAmbiguousChainLineage() {
+        String pending = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
+                Map.of("chainId", "orders-chain", "sourceId", "src_orders", "tables", List.of("orders")))));
+        ControlPlane.PositionRead read = ControlPlane.interpretPositionRead(200, pending, "bench_join");
+        assertThatThrownBy(() -> ControlPlane.resolveTargetAck(read,
+                        chain("bench_join", "src_orders", "orders")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("no authoritative target ACK");
+        assertThatThrownBy(() -> ControlPlane.resolveTargetAck(read,
+                        chain("bench_join", "src_customers", "customers")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("found 0");
+
+        String ambiguous = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
+                Map.of("chainId", "first", "sourceId", "src_orders", "tables", List.of("orders"),
+                        "targetAcked", Map.of("token", "first-ack")),
+                Map.of("chainId", "second", "sourceId", "src_orders", "tables", List.of("orders"),
+                        "targetAcked", Map.of("token", "second-ack")))));
+        assertThatThrownBy(() -> ControlPlane.resolveTargetAck(
+                        ControlPlane.interpretPositionRead(200, ambiguous, "bench_join"),
+                        chain("bench_join", "src_orders", "orders")))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("found 2");
+    }
+
+    @Test
+    void benchmarkPositionReadRejectsDuplicateIdsWrongPipelineAndMalformedTables() {
+        String duplicateIds = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
+                Map.of("chainId", "same", "sourceId", "src_orders", "tables", List.of("orders")),
+                Map.of("chainId", "same", "sourceId", "src_customers", "tables", List.of("customers")))));
+        assertThatThrownBy(() -> ControlPlane.interpretPositionRead(200, duplicateIds, "bench_join"))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("duplicate chain lineage");
+        assertThatThrownBy(() -> ControlPlane.interpretPositionRead(200, duplicateIds, "bench_nest"))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("no matching pipeline");
+        String duplicateTables = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
+                Map.of("chainId", "first", "sourceId", "src_orders", "tables", List.of("orders", "orders")))));
+        assertThatThrownBy(() -> ControlPlane.interpretPositionRead(200, duplicateTables, "bench_join"))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("duplicate selected tables");
+        assertThatThrownBy(() -> ControlPlane.interpretPositionRead(500, "boom", "bench_join"))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("got 500");
+    }
+
+    private static BenchmarkWorkloadDefinitions.SourceChain chain(String pipeline, String source, String table) {
+        return new BenchmarkWorkloadDefinitions.SourceChain(pipeline + "/" + source, pipeline, source, table,
+                "terminal-" + source, 900_001);
+    }
+
     /**
      * A table with nothing acked yet reads as absent rather than as a crash, and so does a whole answer
      * carrying no positions at all. Both are real readings: positions appear only once something is acked,

@@ -1638,6 +1638,97 @@ final class ControlPlane {
         return interpretTargetAckedTokens(response.statusCode(), response.body(), pipelineId);
     }
 
+    /** The ACK for exactly one declared source/table chain in this pipeline. */
+    String targetAckFor(BenchmarkWorkloadDefinitions.SourceChain sourceChain) {
+        if (sourceChain == null) {
+            throw new IllegalArgumentException("a benchmark source chain is required");
+        }
+        String pipelineId = sourceChain.pipelineId();
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
+        return resolveTargetAck(interpretPositionRead(response.statusCode(), response.body(), pipelineId), sourceChain);
+    }
+
+    record PositionChain(String chainId, String sourceId, List<String> tables, String targetAckedToken) {
+        PositionChain {
+            tables = List.copyOf(tables);
+        }
+    }
+
+    record PositionRead(String pipelineId, List<PositionChain> chains) {
+        PositionRead {
+            chains = List.copyOf(chains);
+        }
+    }
+
+    /** Retains the product's source/table lineage alongside each chain's authoritative ACK. */
+    static PositionRead interpretPositionRead(int status, String body, String pipelineId) {
+        if (status != 200) {
+            throw new AssertionError("could not read acknowledged positions of " + pipelineId
+                    + ": expected HTTP 200, got " + status + " - " + body);
+        }
+        Object parsed;
+        try {
+            parsed = JsonReader.parse(body);
+        } catch (RuntimeException invalid) {
+            throw new AssertionError("position answer is not valid JSON for " + pipelineId, invalid);
+        }
+        if (!(parsed instanceof Map<?, ?> document)
+                || !pipelineId.equals(document.get("pipelineId"))
+                || !(document.get("chains") instanceof List<?> values)) {
+            throw new AssertionError("position answer carried no matching pipeline and chains: " + body);
+        }
+        List<PositionChain> chains = new ArrayList<>();
+        Set<String> seenChains = new TreeSet<>();
+        for (Object value : values) {
+            if (!(value instanceof Map<?, ?> chain)
+                    || !(chain.get("chainId") instanceof String chainId) || chainId.isBlank()
+                    || !seenChains.add(chainId)
+                    || !(chain.get("sourceId") instanceof String sourceId) || sourceId.isBlank()
+                    || !(chain.get("tables") instanceof List<?> selected) || selected.isEmpty()) {
+                throw new AssertionError("position answer carried invalid or duplicate chain lineage: " + body);
+            }
+            List<String> tables = new ArrayList<>();
+            Set<String> seenTables = new TreeSet<>();
+            for (Object table : selected) {
+                if (!(table instanceof String name) || name.isBlank() || !seenTables.add(name)) {
+                    throw new AssertionError("position answer carried invalid or duplicate selected tables: " + body);
+                }
+                tables.add(name);
+            }
+            String token = null;
+            Object targetAcked = chain.get("targetAcked");
+            if (targetAcked != null) {
+                if (!(targetAcked instanceof Map<?, ?> point)
+                        || !(point.get("token") instanceof String ack) || ack.isBlank()) {
+                    throw new AssertionError("position answer carried an invalid target ACK: " + body);
+                }
+                token = ack;
+            }
+            chains.add(new PositionChain(chainId, sourceId, tables, token));
+        }
+        return new PositionRead(pipelineId, chains);
+    }
+
+    /** Refuses to attribute a different source's ACK to this benchmark chain. */
+    static String resolveTargetAck(PositionRead read, BenchmarkWorkloadDefinitions.SourceChain sourceChain) {
+        if (read == null || sourceChain == null || !read.pipelineId().equals(sourceChain.pipelineId())) {
+            throw new AssertionError("benchmark chain and position answer name different pipelines");
+        }
+        List<PositionChain> matches = read.chains().stream()
+                .filter(chain -> chain.sourceId().equals(sourceChain.sourceId())
+                        && chain.tables().contains(sourceChain.table()))
+                .toList();
+        if (matches.size() != 1) {
+            throw new AssertionError("expected exactly one position chain for " + sourceChain.id()
+                    + ", found " + matches.size());
+        }
+        PositionChain match = matches.getFirst();
+        if (match.targetAckedToken() == null) {
+            throw new AssertionError("source chain " + sourceChain.id() + " has no authoritative target ACK");
+        }
+        return match.targetAckedToken();
+    }
+
     static Map<String, String> interpretTargetAckedTokens(int status, String body, String pipelineId) {
         if (status != 200) {
             throw new AssertionError("could not read acknowledged positions of " + pipelineId
