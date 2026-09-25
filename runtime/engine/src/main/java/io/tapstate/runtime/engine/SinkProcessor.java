@@ -126,6 +126,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // open for the life of the run, and on a snapshot that is a table nothing records as loaded and every
     // resume reads again in full.
     private final Map<Byte, Watermark> heldBounds = new LinkedHashMap<>();
+    // Combines the bounds that arrive edge by edge, each chain over the edges that carry it; null where the
+    // engine's combination across every edge is taken instead. See tryProcessWatermark.
+    private final LevelBounds edges;
     private boolean closed;
 
     // Resolved at init from the running job, so a failed write can be recorded against this pipeline's id
@@ -175,6 +178,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
             int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock,
             String writerOf, boolean totalOne) {
+        this(writer, sinkAck, frontier, maxInFlight, maxBatchSize, gauge, delivery, clock, writerOf, totalOne,
+                null);
+    }
+
+    /**
+     * As above, combining the bounds it takes in edge by edge through {@code edges}, which knows which chains
+     * each inbound edge carries: a chain is then held down only by the edges that carry it. Null leaves the
+     * combining to the engine, which holds every chain down by every edge - right only where every edge
+     * carries every chain.
+     */
+    SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
+            int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock,
+            String writerOf, boolean totalOne, LevelBounds edges) {
+        this.edges = edges;
         this.writerOf = writerOf;
         this.totalOne = totalOne;
         this.writer = Objects.requireNonNull(writer, "writer");
@@ -234,17 +251,30 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      *
      * <p>{@code frontierFactory} settles which shape that is, and it is settled here rather than run-time:
      * how far a sink may say a chain has landed depends on whether what reaches it is one chain in order or
-     * an assembly of several, and that is a property of the graph that was compiled, not of any event.
+     * an assembly of several, and that is a property of the graph that was compiled, not of any event. The
+     * bounds are combined by the engine, across every inbound edge.
      */
     static ProcessorMetaSupplier metaSupplier(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory) {
+        return metaSupplier(vertexName, writerFactory, sinkAckFactory, frontierFactory, null);
+    }
+
+    /**
+     * As above, with the bounds combined edge by edge by what {@code edgesFactory} makes - over the chains
+     * each inbound edge carries - where it is not null, and by the engine where it is.
+     */
+    static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
+            SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
+            SupplierEx<LevelBounds> edgesFactory) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         Objects.requireNonNull(sinkAckFactory, "sinkAckFactory");
         Objects.requireNonNull(frontierFactory, "frontierFactory");
         return ProcessorMetaSupplier.forceTotalParallelismOne(
-                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory, vertexName, true), vertexName);
+                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory, edgesFactory, vertexName, true),
+                vertexName);
     }
 
     /**
@@ -353,10 +383,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     }
 
     /**
-     * Takes in a bound that arrived with no edge attached to it, and never passes it on. This variant is
-     * the one a sink wants: the engine calls it with the value combined across every input queue, which is
-     * the guarantee the frontier rests on - a queue that has said nothing still holds it down. The
-     * per-edge variant would answer with one edge's promise while data covered by it sits on another.
+     * Takes in a bound that arrived with no edge attached to it, and never passes it on. The engine calls
+     * this with the value combined across every input queue, which is the guarantee the frontier rests on
+     * - a queue that has said nothing still holds it down - wherever every edge carries every chain.
+     *
+     * <p>Where an edge carries only some of the chains, that same combination never arrives at all for a
+     * chain another edge does not carry, since that edge never says anything about it. A sink compiled with
+     * the chains each edge carries therefore takes its bounds edge by edge instead, below, and passes over
+     * this one.
      *
      * <p>Nothing is emitted from here. This is the end of the line for a bound, and anything emitted would
      * be offered to the target as a record. The engine forwards it by default, silently, which is why
@@ -364,14 +398,19 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      */
     @Override
     public boolean tryProcessWatermark(Watermark watermark) {
-        if (frontier != null) {
-            // The newest bound on an axis subsumes any older one held for that axis, so only the newest of
-            // each is kept. Across axes nothing subsumes anything.
-            heldBounds.put(watermark.key(), watermark);
-            releaseHeldBounds();
-            reportTrailing();
+        if (frontier != null && edges == null) {
+            take(watermark);
         }
         return true;
+    }
+
+    /** Holds {@code bound} until nothing is in flight, then hands it over; see releaseHeldBounds. */
+    private void take(Watermark bound) {
+        // The newest bound on an axis subsumes any older one held for that axis, so only the newest of each is
+        // kept. Across axes nothing subsumes anything.
+        heldBounds.put(bound.key(), bound);
+        releaseHeldBounds();
+        reportTrailing();
     }
 
     /**
@@ -401,13 +440,19 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     }
 
     /**
-     * Takes no notice of a bound that arrived on one edge. Answering true is what lets the engine combine
-     * it with the other edges and deliver the combined value to the variant above; acting on it here would
-     * be acting on one edge's promise alone. Written out rather than left to the interface default, which
-     * is the same answer for a different reason.
+     * Takes in a bound that arrived on one edge, already combined across the queues of that edge. A sink
+     * compiled with the chains each edge carries combines it here with what the other edges carrying the
+     * same chain have promised, and takes the result once every one of them has spoken - the per-edge
+     * counterpart of what the engine does across every edge, without waiting on an edge that never carries
+     * the chain. Any other sink takes no notice: answering true is what lets the engine combine it and
+     * deliver the combined value to the variant above.
      */
     @Override
     public boolean tryProcessWatermark(int ordinal, Watermark watermark) {
+        if (frontier != null && edges != null) {
+            edges.observe(ordinal, watermark.key(), watermark.timestamp())
+                    .ifPresent(combined -> take(new Watermark(combined, watermark.key())));
+        }
         return true;
     }
 
@@ -651,16 +696,18 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         private final SupplierEx<? extends SinkWriter> writerFactory;
         private final SinkAckFactory sinkAckFactory;
         private final SupplierEx<SinkFrontier> frontierFactory;
+        private final SupplierEx<LevelBounds> edgesFactory;
         private final String vertexName;
         private final boolean totalOne;
         private transient SinkAck sinkAck;
 
         AckSinkSupplier(SupplierEx<? extends SinkWriter> writerFactory,
                 SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
-                String vertexName, boolean totalOne) {
+                SupplierEx<LevelBounds> edgesFactory, String vertexName, boolean totalOne) {
             this.writerFactory = writerFactory;
             this.sinkAckFactory = sinkAckFactory;
             this.frontierFactory = frontierFactory;
+            this.edgesFactory = edgesFactory;
             this.vertexName = vertexName;
             this.totalOne = totalOne;
         }
@@ -678,7 +725,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 // the reading, and a shared one would have each sink's readings land under the other's.
                 processors.add(new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
                         DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, new JetFrontierGauge(),
-                        new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne));
+                        new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
+                        edgesFactory == null ? null : edgesFactory.get()));
             }
             return processors;
         }

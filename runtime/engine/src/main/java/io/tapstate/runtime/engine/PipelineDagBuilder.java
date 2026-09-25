@@ -397,8 +397,8 @@ public final class PipelineDagBuilder {
             // A chain reaching the sink over several paths arrives in whatever order they drain in, which is
             // the reading an assembly needs, for the same reason.
             boolean severalPaths = chains != null && chains.anyOverSeveralPaths(sink.upstream());
-            ProcessorMetaSupplier supplier =
-                    sinkVertex(sink.name(), sink.writers(), sinkAck, axes, assembled || severalPaths);
+            ProcessorMetaSupplier supplier = sinkVertex(sink.name(), sink.writers(), sinkAck, axes,
+                    assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream()));
             if (startsTheRun) {
                 supplier = WriterRunStart.of(supplier, sinkAck, writersByChain);
                 startsTheRun = false;
@@ -478,24 +478,33 @@ public final class PipelineDagBuilder {
      * <p>{@code assembled} picks the shape of frontier the ack-bearing sink runs. Where the graph gathers
      * several chains into one stream, splits one over several processors, or brings one to the sink over
      * several paths, what arrives can no longer say by itself how far a chain has travelled, and the sink
-     * goes by the bound the engine combines across its input queues instead. Where it does none of these,
+     * goes by the bound combined across its input queues instead. Where it does none of these,
      * the events of one chain arrive in their own order, so a later position settling closes every earlier
      * one and a bound closes the last.
      *
      * <p>An assembling graph built without a chain numbering gets the same shape with nothing to attribute
      * a bound to, so its frontier stands still. That is the direction to fail in: reading a stream of
      * several chains as though it were one would ack positions whose changes are still in flight.
+     *
+     * <p>{@code chainsByOrdinal} names the chains each inbound edge carries, and where it is known the sink
+     * combines its bounds edge by edge rather than taking the engine's combination. The engine holds every
+     * chain down by every edge, so on a sink fed one table over one edge and another over a second, neither
+     * table's bound ever arrives: the other edge never speaks for it, and in a running pipeline no edge ever
+     * ends either.
      */
     private static ProcessorMetaSupplier sinkVertex(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory,
-            SinkAckFactory sinkAck, ChainAxes axes, boolean assembled) {
+            SinkAckFactory sinkAck, ChainAxes axes, boolean assembled, Map<Integer, List<String>> chainsByOrdinal) {
         if (sinkAck == null) {
             return SinkProcessor.metaSupplier(vertexName, writerFactory);
         }
         SupplierEx<SinkFrontier> frontier = assembled
                 ? () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)
                 : () -> new ContiguousPrefix(axes);
-        return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier);
+        SupplierEx<LevelBounds> edges = axes == null || chainsByOrdinal == null
+                ? null
+                : () -> new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING);
+        return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier, edges);
     }
 
     /**
