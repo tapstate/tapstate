@@ -1,0 +1,344 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Pipeline events prepared contract",
+    "version": "prepared-v1",
+    "description": "This operation is planned and is not exposed by the server yet."
+  },
+  "x-tapstate-availability": "planned-unexposed",
+  "paths": {
+    "/api/pipelines/{id}/events": {
+      "get": {
+        "operationId": "pipeline.events",
+        "summary": "Read a bounded page of pipeline run events",
+        "description": "Planned, unexposed READ operation. Events are best effort, ordered by occurredAt and opaque id. The requested window is half open and at most 15 days; a cursor is bound to the original query and expires after 10 minutes.",
+        "x-tapstate-availability": "planned-unexposed",
+        "x-tapstate-required-scope": "READ",
+        "security": [
+          {"bearerAuth": []}
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Tapstate resource identifier"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": true,
+            "description": "Inclusive beginning of the requested retained window; RFC3339 with an offset.",
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "description": "Inclusive beginning of the requested retained window"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": true,
+            "description": "Exclusive end of the requested retained window; RFC3339 with an offset.",
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "description": "Exclusive end of the requested retained window"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100,
+              "description": "Maximum events in this response page; defaults to 100"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Opaque continuation token; repeat every other query argument unchanged"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A best-effort page of events, including an empty page.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Observability reads are not cached by HTTP intermediaries.",
+                "schema": {"type": "string", "const": "no-store"}
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/PipelineEventsResult"}
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed query, invalid cursor, or query budget exceeded.",
+            "x-tapstate-error-codes": [
+              "control.malformed-request",
+              "monitor.invalid-cursor",
+              "monitor.query-budget-exceeded"
+            ],
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+              }
+            }
+          },
+          "401": {
+            "description": "A Bearer credential is absent or invalid.",
+            "x-tapstate-error-codes": ["control.unauthenticated"],
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+              }
+            }
+          },
+          "403": {
+            "description": "The authenticated caller lacks READ permission.",
+            "x-tapstate-error-codes": ["control.forbidden"],
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+              }
+            }
+          },
+          "404": {
+            "description": "The pipeline does not exist.",
+            "x-tapstate-error-codes": ["lifecycle.unknown-pipeline"],
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+              }
+            }
+          },
+          "410": {
+            "description": "The query-bound cursor has expired.",
+            "x-tapstate-error-codes": ["monitor.cursor-expired"],
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Requires a valid Bearer credential with READ permission."
+      }
+    },
+    "schemas": {
+      "PipelineEventsResult": {
+        "type": "object",
+        "properties": {
+          "pipelineId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Pipeline identifier"
+          },
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Normalized requested beginning",
+            "pattern": "Z$"
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Normalized requested end",
+            "pattern": "Z$"
+          },
+          "effectiveFrom": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Retention-clipped beginning used by this cursor walk",
+            "pattern": "Z$"
+          },
+          "effectiveTo": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server-now-clipped end used by this cursor walk",
+            "pattern": "Z$"
+          },
+          "retentionCutoff": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Events before this instant are not readable",
+            "pattern": "Z$"
+          },
+          "completeness": {
+            "type": "string",
+            "enum": ["BEST_EFFORT"]
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Opaque event identifier used for ordering and deduplication"
+                },
+                "occurredAt": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "Event time in UTC",
+                  "pattern": "Z$"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "STATE_CHANGED",
+                    "FAILURE",
+                    "EXECUTION_RESTARTED",
+                    "EXECUTION_RECOVERED",
+                    "TELEMETRY_DEGRADED",
+                    "TELEMETRY_RESTORED",
+                    "CLEANUP_INCOMPLETE",
+                    "TELEMETRY_GAP"
+                  ]
+                },
+                "message": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Catalog-rendered event message"
+                },
+                "beforeState": {
+                  "type": "string",
+                  "enum": ["NEW", "RUNNING", "PAUSED", "STOPPED", "COMPLETED", "FAILED"]
+                },
+                "afterState": {
+                  "type": "string",
+                  "enum": ["NEW", "RUNNING", "PAUSED", "STOPPED", "COMPLETED", "FAILED"]
+                },
+                "failure": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Canonical error code"
+                    },
+                    "params": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Catalog-rendered failure message"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": ["code", "params", "message"]
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Optional display explanation, not a machine state"
+                }
+              },
+              "additionalProperties": false,
+              "required": ["id", "occurredAt", "kind", "message"]
+            },
+            "maxItems": 500
+          },
+          "knownGaps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "eventId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of a TELEMETRY_GAP event on this page"
+                },
+                "from": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "Actual beginning of the known loss interval",
+                  "pattern": "Z$"
+                },
+                "to": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "Actual end of the known loss interval",
+                  "pattern": "Z$"
+                },
+                "reasons": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": ["QUEUE_FULL", "WRITE_FAILURE", "SHUTDOWN"]
+                  },
+                  "uniqueItems": true,
+                  "maxItems": 3
+                }
+              },
+              "additionalProperties": false,
+              "required": ["eventId", "from", "to", "reasons"]
+            },
+            "maxItems": 500
+          },
+          "nextCursor": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "description": "Opaque continuation token"
+              },
+              {"type": "null"}
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "pipelineId",
+          "from",
+          "to",
+          "effectiveFrom",
+          "effectiveTo",
+          "retentionCutoff",
+          "completeness",
+          "events",
+          "knownGaps",
+          "nextCursor"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "code": {"type": "string", "minLength": 1},
+          "params": {"type": "object", "additionalProperties": {}},
+          "message": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false,
+        "required": ["code", "params", "message"]
+      }
+    }
+  }
+}
