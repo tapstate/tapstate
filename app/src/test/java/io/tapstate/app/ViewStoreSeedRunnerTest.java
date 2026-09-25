@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -93,6 +95,23 @@ class ViewStoreSeedRunnerTest {
         assertThat(ViewStoreSeedRunner.viewsUri("mongodb://user:pw@mongo:27017?replicaSet=rs0"))
                 .as("no database, but options")
                 .isEqualTo("mongodb://user:pw@mongo:27017/views?replicaSet=rs0&authSource=admin");
+    }
+
+    @Test
+    void a_seeded_views_connection_is_registered_with_the_pipeline_log_redactor() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        SecretRedactor redactor = new SecretRedactor();
+        SecretTrackingArtifactStore tracked = new SecretTrackingArtifactStore(
+                store.artifacts(), TapstateCatalog::load, redactor);
+        new ViewStoreSeedRunner(tracked,
+                "mongodb+srv://state:pa%40ss@cluster.example/metadata?retryWrites=true", null).seed();
+
+        SourceResource seeded = (SourceResource) store.artifacts()
+                .get(ViewTargetResolver.STATE_STORE_SOURCE_ID).orElseThrow();
+        String derivedUri = (String) seeded.config().get("uri");
+        assertThat(redactor.redact(derivedUri + " decoded=pa@ss"))
+                .isEqualTo("mongodb+srv://********@cluster.example/views"
+                        + "?retryWrites=true&authSource=metadata decoded=********");
     }
 
     @Test

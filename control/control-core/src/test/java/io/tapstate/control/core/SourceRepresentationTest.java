@@ -196,6 +196,30 @@ class SourceRepresentationTest {
     }
 
     @Test
+    void redactsOrdinaryMongoUriUserInfoAndPreservesItOnlyForTheSameLocation() {
+        String original = "mongodb://state:pa%40ss@db.example/metadata?replicaSet=rs0";
+        SourceResource existing = source("mongodb", Map.of("isUri", true, "uri", original));
+        String display = "mongodb://<redacted>@db.example/metadata?replicaSet=rs0";
+
+        SourceView view = representation.toView(existing, hash(existing));
+        assertThat(view.config()).containsEntry("uri", display);
+        assertThat(view.config().toString()).doesNotContain("state", "pa%40ss");
+
+        SourceResource kept = representation.toModel(
+                draft("mongodb", Map.of("isUri", true, "uri", display), List.of()), existing);
+        assertThat(kept.config()).containsEntry("uri", original);
+        assertThatThrownBy(() -> representation.toModel(
+                draft("mongodb", Map.of("isUri", true,
+                        "uri", "mongodb://<redacted>@other.example/metadata"), List.of()), existing))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThatThrownBy(() -> representation.toModel(
+                draft("mongodb", Map.of("isUri", true, "uri", display), List.of()), null))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+    }
+
+    @Test
     void preservesAnUnchangedRedactedAtlasUriButRequiresFullCredentialsForAChangedLocation() {
         String original = "mongodb+srv://alice:pa%40ss@cluster.example/test";
         SourceResource existing = source("mongodb-atlas", Map.of("isUri", true, "uri", original));

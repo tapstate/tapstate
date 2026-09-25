@@ -191,6 +191,34 @@ class SourceApiTest {
     }
 
     @Test
+    void managedViewsMongoUriDoesNotExposeStoreCredentialsAndCanBeResubmitted() throws Exception {
+        String uri = "mongodb://state:managed-secret@db.example/metadata?replicaSet=rs0";
+        String display = "mongodb://<redacted>@db.example/metadata?replicaSet=rs0";
+        context.getBean(InMemoryArtifactStore.class).save(new SourceResource(
+                "views", null, "mongodb", Map.of("isUri", true, "uri", uri),
+                null, null, null, null));
+
+        ResponseEntity<String> got = request("reader").get().uri("/api/sources/views")
+                .retrieve().toEntity(String.class);
+        assertThat(got.getBody()).contains(display).doesNotContain("state:managed-secret");
+        assertThat(request("reader").get().uri("/api/sources").retrieve().body(String.class))
+                .contains(display).doesNotContain("state:managed-secret");
+
+        Map<String, Object> redactedConfig = JSON.convertValue(
+                JSON.readTree(got.getBody()).path("config"), Map.class);
+        ResponseEntity<String> replaced = request("writer").put().uri("/api/sources/views")
+                .header(HttpHeaders.IF_MATCH, got.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "views", "connector", "mongodb", "config", redactedConfig,
+                        "metadata", Map.of("description", "updated")))
+                .retrieve().toEntity(String.class);
+        assertThat(replaced.getBody()).contains(display).doesNotContain("state:managed-secret");
+        SourceResource persisted = (SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("views").orElseThrow();
+        assertThat(persisted.config()).containsEntry("uri", uri);
+    }
+
+    @Test
     void typedSourceWritesCannotPersistASecretDisplayMarker() {
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON)

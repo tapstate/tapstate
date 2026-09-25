@@ -72,7 +72,7 @@ public final class SourceRepresentation {
                 }
             }
         }
-        if ("mongodb-atlas".equals(draft.connector()) && config.get("uri") instanceof String uri
+        if (isMongoConnector(draft.connector()) && config.get("uri") instanceof String uri
                 && MongoUriUserInfo.isRedactedDisplay(uri)) {
             Object saved = existing != null && existing.connector().equals(draft.connector())
                     ? existing.config().get("uri") : null;
@@ -106,7 +106,7 @@ public final class SourceRepresentation {
         Map<String, ConfigField> secrets = secretFields(connector(source.connector()));
         Map<String, Object> redactedConfig = new LinkedHashMap<>(source.config());
         secrets.keySet().forEach(redactedConfig::remove);
-        if ("mongodb-atlas".equals(source.connector())) {
+        if (isMongoConnector(source.connector())) {
             Object uri = redactedConfig.get("uri");
             if (uri instanceof String value) {
                 redactedConfig.put("uri", MongoUriUserInfo.redact(value));
@@ -143,6 +143,10 @@ public final class SourceRepresentation {
         } catch (IllegalArgumentException error) {
             throw malformed("unknown connector: " + connector);
         }
+    }
+
+    private static boolean isMongoConnector(String connector) {
+        return "mongodb".equals(connector) || "mongodb-atlas".equals(connector);
     }
 
     private static Map<String, ConfigField> secretFields(ConnectorCatalogEntry connector) {
