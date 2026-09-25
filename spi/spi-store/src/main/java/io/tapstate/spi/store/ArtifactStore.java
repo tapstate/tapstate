@@ -34,7 +34,11 @@ public interface ArtifactStore {
         }
         if (writes.stream().allMatch(write -> write.intent() == ArtifactWrite.Intent.UPSERT)) {
             Map<String, String> preconditions = new java.util.LinkedHashMap<>();
+            Map<String, String> incarnationCandidates = new java.util.LinkedHashMap<>();
             for (ArtifactWrite write : writes) {
+                if (write.pipelineIncarnationCandidate() != null) {
+                    incarnationCandidates.put(write.resource().id(), write.pipelineIncarnationCandidate());
+                }
                 for (Map.Entry<String, String> precondition : write.readPreconditions().entrySet()) {
                     String previous = preconditions.putIfAbsent(precondition.getKey(), precondition.getValue());
                     if (previous != null && !previous.equals(precondition.getValue())) {
@@ -44,14 +48,19 @@ public interface ArtifactStore {
                 }
             }
             Optional<String> refused = saveAll(
-                    writes.stream().map(ArtifactWrite::resource).toList(), preconditions);
+                    writes.stream().map(ArtifactWrite::resource).toList(), preconditions,
+                    incarnationCandidates);
             return refused.map(id -> ArtifactBatchWrite.refused(id, ArtifactMutation.VERSION_CONFLICT))
                     .orElseGet(ArtifactBatchWrite::applied);
         }
         if (writes.stream().noneMatch(write -> write.intent() == ArtifactWrite.Intent.CREATE_ONLY)
                 && (writes.size() > 1 || writes.stream().anyMatch(write -> !write.readPreconditions().isEmpty()))) {
             Map<String, String> preconditions = new java.util.LinkedHashMap<>();
+            Map<String, String> incarnationCandidates = new java.util.LinkedHashMap<>();
             for (ArtifactWrite write : writes) {
+                if (write.pipelineIncarnationCandidate() != null) {
+                    incarnationCandidates.put(write.resource().id(), write.pipelineIncarnationCandidate());
+                }
                 if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
                     preconditions.put(write.resource().id(), write.expectedContentHash());
                 }
@@ -64,7 +73,8 @@ public interface ArtifactStore {
                 }
             }
             Optional<String> refused = saveAll(
-                    writes.stream().map(ArtifactWrite::resource).toList(), preconditions);
+                    writes.stream().map(ArtifactWrite::resource).toList(), preconditions,
+                    incarnationCandidates);
             return refused.map(id -> ArtifactBatchWrite.refused(id, ArtifactMutation.VERSION_CONFLICT))
                     .orElseGet(ArtifactBatchWrite::applied);
         }
@@ -151,6 +161,16 @@ public interface ArtifactStore {
         throw new UnsupportedOperationException("conditional artifact batch upsert is not implemented");
     }
 
+    /**
+     * The same atomic batch, with candidate identities for pipelines inserted by this write. A store
+     * with a system metadata sibling overrides this; legacy in-memory stores retain their ordinary
+     * canonical-resource behavior.
+     */
+    default Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes,
+            Map<String, String> pipelineIncarnationCandidates) {
+        return saveAll(artifacts, expectedContentHashes);
+    }
+
     /** Upserts a single resource by its top-level id — the single-artifact case of {@link #saveAll}. */
     default void save(Resource artifact) {
         saveAll(List.of(artifact));
@@ -180,5 +200,18 @@ public interface ArtifactStore {
     default List<StoredArtifactRecord> listStored(String kind) {
         Objects.requireNonNull(kind, "kind");
         return listStored().stream().filter(row -> kind.equals(row.kind())).toList();
+    }
+
+    /** Returns the system-owned identity of an existing pipeline, if one has been assigned. */
+    default Optional<String> pipelineIncarnationId(String pipelineId) {
+        throw new UnsupportedOperationException("pipeline incarnation reads are not implemented");
+    }
+
+    /**
+     * Assigns the candidate identity only if this pipeline predates identities and still has none.
+     * Concurrent callers receive the identity that won; an absent or non-pipeline id returns empty.
+     */
+    default Optional<String> ensurePipelineIncarnationId(String pipelineId, String candidate) {
+        throw new UnsupportedOperationException("pipeline incarnation initialization is not implemented");
     }
 }

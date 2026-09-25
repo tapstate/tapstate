@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -47,6 +48,25 @@ class SecretTrackingArtifactStoreTest {
                 .isEqualTo("db.internal 3306 ********");
     }
 
+    @Test
+    void pipelineIncarnationCandidatesAndReadsPassThroughTheProcessDecorator() {
+        RecordingStore delegate = new RecordingStore();
+        SecretTrackingArtifactStore store = tracking(delegate, new SecretRedactor());
+        Resource pipeline = new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: orders
+                source: upstream
+                """);
+
+        assertThat(store.saveAll(List.of(pipeline), Map.of(), Map.of("orders", "created-identity")))
+                .isEmpty();
+        assertThat(store.pipelineIncarnationId("orders")).contains("created-identity");
+        assertThat(store.ensurePipelineIncarnationId("orders", "retry-identity"))
+                .contains("created-identity");
+        assertThat(delegate.incarnations).containsEntry("orders", "created-identity");
+    }
+
     private static SecretTrackingArtifactStore tracking(ArtifactStore delegate, SecretRedactor redactor) {
         return new SecretTrackingArtifactStore(delegate, TapstateCatalog::load, redactor);
     }
@@ -60,10 +80,32 @@ class SecretTrackingArtifactStoreTest {
     private static final class RecordingStore implements ArtifactStore {
 
         private final Map<String, Resource> resources = new LinkedHashMap<>();
+        private final Map<String, String> incarnations = new LinkedHashMap<>();
 
         @Override
         public void saveAll(List<Resource> artifacts) {
             artifacts.forEach(artifact -> resources.put(artifact.id(), artifact));
+        }
+
+        @Override
+        public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes,
+                Map<String, String> pipelineIncarnationCandidates) {
+            pipelineIncarnationCandidates.forEach(incarnations::putIfAbsent);
+            saveAll(artifacts);
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<String> pipelineIncarnationId(String pipelineId) {
+            return Optional.ofNullable(incarnations.get(pipelineId));
+        }
+
+        @Override
+        public Optional<String> ensurePipelineIncarnationId(String pipelineId, String candidate) {
+            if (!resources.containsKey(pipelineId)) {
+                return Optional.empty();
+            }
+            return Optional.of(incarnations.computeIfAbsent(pipelineId, ignored -> candidate));
         }
 
         @Override

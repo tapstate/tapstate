@@ -7,11 +7,14 @@ import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
-import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.FindOneAndUpdateOptions;
+import com.mongodb.client.model.ReturnDocument;
+import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
@@ -21,12 +24,14 @@ import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StoredArtifactRecord;
 import org.bson.Document;
+import org.bson.conversions.Bson;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * The MongoDB artifact truth layer: stores each applied resource as one document keyed by the
@@ -35,7 +40,8 @@ import java.util.Optional;
  * form is something the store renders on request rather than something it keeps.
  *
  * <p>The document carries the id (as {@code _id}), the kind, the structure (as {@code body}), and the
- * content hash. Kind is kept beside the body rather than only inside it because it is what a read by
+ * content hash. Pipeline documents also carry a system-owned incarnation sibling outside the body;
+ * canonical reads and hashes never include it. Kind is kept beside the body because it is what a read by
  * kind filters on, and an index cannot be asked to reach into a body a query never looks at. A batch
  * is written in one multi-document transaction, so a mid-batch write failure aborts the whole
  * transaction and leaves no partial batch behind; the transaction is why the store binds a
@@ -61,10 +67,14 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     @Override
     public ArtifactMutation create(Resource artifact) {
+        return create(artifact, null);
+    }
+
+    private ArtifactMutation create(Resource artifact, String pipelineIncarnationCandidate) {
         Objects.requireNonNull(artifact, "artifact");
         return StoreIo.call(() -> {
             try {
-                collection.insertOne(toDocument(artifact));
+                collection.insertOne(toInsertDocument(artifact, pipelineIncarnationCandidate));
                 return ArtifactMutation.CREATED;
             } catch (MongoException e) {
                 if (ErrorCategory.fromErrorCode(e.getCode()) == ErrorCategory.DUPLICATE_KEY) {
@@ -77,6 +87,11 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     @Override
     public ArtifactMutation replace(String id, String expectedContentHash, Resource replacement) {
+        return replace(id, expectedContentHash, replacement, null);
+    }
+
+    private ArtifactMutation replace(String id, String expectedContentHash, Resource replacement,
+            String pipelineIncarnationCandidate) {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(expectedContentHash, "expectedContentHash");
         Objects.requireNonNull(replacement, "replacement");
@@ -85,7 +100,8 @@ public final class MongoArtifactStore implements ArtifactStore {
         }
         return StoreIo.call(() -> {
             Document filter = new Document("_id", id).append("contentHash", expectedContentHash);
-            if (collection.replaceOne(filter, toDocument(replacement)).getMatchedCount() == 1) {
+            if (collection.updateOne(filter,
+                    canonicalUpdate(replacement, pipelineIncarnationCandidate)).getMatchedCount() == 1) {
                 return ArtifactMutation.REPLACED;
             }
             return collection.find(new Document("_id", id)).first() == null
@@ -123,10 +139,13 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private ArtifactBatchWrite singleWrite(ArtifactWrite write) {
         ArtifactMutation outcome = switch (write.intent()) {
-            case CREATE_ONLY -> create(write.resource());
-            case REPLACE_ONLY -> replace(write.resource().id(), write.expectedContentHash(), write.resource());
+            case CREATE_ONLY -> create(write.resource(), write.pipelineIncarnationCandidate());
+            case REPLACE_ONLY -> replace(write.resource().id(), write.expectedContentHash(), write.resource(),
+                    write.pipelineIncarnationCandidate());
             case UPSERT -> {
-                save(write.resource());
+                Map<String, String> candidates = write.pipelineIncarnationCandidate() == null
+                        ? Map.of() : Map.of(write.resource().id(), write.pipelineIncarnationCandidate());
+                saveAll(List.of(write.resource()), Map.of(), candidates);
                 yield ArtifactMutation.REPLACED;
             }
         };
@@ -174,8 +193,9 @@ public final class MongoArtifactStore implements ArtifactStore {
             case CREATE_ONLY -> insertOnly(session, write);
             case REPLACE_ONLY -> replaceOnly(session, write);
             case UPSERT -> {
-                collection.replaceOne(session, new Document("_id", write.resource().id()), toDocument(write.resource()),
-                        new ReplaceOptions().upsert(true));
+                collection.updateOne(session, new Document("_id", write.resource().id()),
+                        canonicalUpdate(write.resource(), write.pipelineIncarnationCandidate()),
+                        new UpdateOptions().upsert(true));
                 yield ArtifactBatchWrite.applied();
             }
         };
@@ -183,7 +203,7 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private ArtifactBatchWrite insertOnly(ClientSession session, ArtifactWrite write) {
         try {
-            collection.insertOne(session, toDocument(write.resource()));
+            collection.insertOne(session, toInsertDocument(write.resource(), write.pipelineIncarnationCandidate()));
             return ArtifactBatchWrite.applied();
         } catch (MongoException error) {
             if (ErrorCategory.fromErrorCode(error.getCode()) == ErrorCategory.DUPLICATE_KEY) {
@@ -196,7 +216,8 @@ public final class MongoArtifactStore implements ArtifactStore {
     private ArtifactBatchWrite replaceOnly(ClientSession session, ArtifactWrite write) {
         Document filter = new Document("_id", write.resource().id())
                 .append("contentHash", write.expectedContentHash());
-        if (collection.replaceOne(session, filter, toDocument(write.resource())).getMatchedCount() == 1) {
+        if (collection.updateOne(session, filter,
+                canonicalUpdate(write.resource(), write.pipelineIncarnationCandidate())).getMatchedCount() == 1) {
             return ArtifactBatchWrite.applied();
         }
         return collection.find(session, new Document("_id", write.resource().id())).first() == null
@@ -211,8 +232,15 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     @Override
     public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+        return saveAll(artifacts, expectedContentHashes, Map.of());
+    }
+
+    @Override
+    public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes,
+            Map<String, String> pipelineIncarnationCandidates) {
         Objects.requireNonNull(artifacts, "artifacts");
         Objects.requireNonNull(expectedContentHashes, "expectedContentHashes");
+        Objects.requireNonNull(pipelineIncarnationCandidates, "pipelineIncarnationCandidates");
         if (artifacts.isEmpty()) {
             // An empty batch writes nothing, and opens no transaction. A precondition declared against a
             // batch that writes nothing has nothing to guard, so it is not read either.
@@ -220,8 +248,8 @@ public final class MongoArtifactStore implements ArtifactStore {
         }
         // The batch is one atomic unit: every upsert runs inside a single multi-document transaction, so
         // a failure on any one write aborts the whole transaction and no partial batch is stored. Each
-        // upsert is by the top-level id (the document _id) — a full replacement that overwrites in place
-        // rather than accumulating documents.
+        // upsert is by the top-level id (the document _id), updating canonical fields in place so
+        // system siblings are retained rather than accumulating documents.
         //
         // The declared versions are compared inside that same transaction, ahead of the writes. Reading
         // them here rather than before it is the whole point: a comparison outside the transaction is a
@@ -240,8 +268,9 @@ public final class MongoArtifactStore implements ArtifactStore {
                         return;
                     }
                     for (Resource artifact : artifacts) {
-                        collection.replaceOne(session, new Document("_id", artifact.id()), toDocument(artifact),
-                                new ReplaceOptions().upsert(true));
+                        collection.updateOne(session, new Document("_id", artifact.id()),
+                                canonicalUpdate(artifact, pipelineIncarnationCandidates.get(artifact.id())),
+                                new UpdateOptions().upsert(true));
                     }
                 } catch (RuntimeException e) {
                     // A write failed before commit: roll the whole batch back and surface the write failure
@@ -289,6 +318,35 @@ public final class MongoArtifactStore implements ArtifactStore {
         Objects.requireNonNull(id, "id");
         Document document = StoreIo.call(() -> collection.find(new Document("_id", id)).first());
         return document == null ? Optional.empty() : Optional.of(toResource(document));
+    }
+
+    @Override
+    public Optional<String> pipelineIncarnationId(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return StoreIo.call(() -> incarnationFrom(collection.find(pipelineFilter(pipelineId))
+                .projection(new Document("pipelineIncarnationId", 1)).first(), pipelineId));
+    }
+
+    @Override
+    public Optional<String> ensurePipelineIncarnationId(String pipelineId, String candidate) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(candidate, "candidate");
+        if (candidate.isBlank()) {
+            throw new IllegalArgumentException("pipeline incarnation candidate cannot be blank");
+        }
+        return StoreIo.call(() -> {
+            Document missing = pipelineFilter(pipelineId)
+                    .append("pipelineIncarnationId", new Document("$exists", false));
+            Document inserted = collection.findOneAndUpdate(missing,
+                    new Document("$set", new Document("pipelineIncarnationId", candidate)),
+                    new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)
+                            .projection(new Document("pipelineIncarnationId", 1)));
+            if (inserted != null) {
+                return incarnationFrom(inserted, pipelineId);
+            }
+            return incarnationFrom(collection.find(pipelineFilter(pipelineId))
+                    .projection(new Document("pipelineIncarnationId", 1)).first(), pipelineId);
+        });
     }
 
     @Override
@@ -343,6 +401,59 @@ public final class MongoArtifactStore implements ArtifactStore {
                 .append("kind", artifact.kind())
                 .append("body", new Document(WRITER.tree(artifact)))
                 .append("contentHash", CanonicalHash.of(artifact));
+    }
+
+    private static Document toInsertDocument(Resource artifact, String suppliedCandidate) {
+        Document document = toDocument(artifact);
+        String candidate = candidateFor(artifact, suppliedCandidate);
+        if (candidate != null) {
+            document.append("pipelineIncarnationId", candidate);
+        }
+        return document;
+    }
+
+    private static List<Bson> canonicalUpdate(Resource artifact, String suppliedCandidate) {
+        String candidate = candidateFor(artifact, suppliedCandidate);
+        Document fields = new Document("kind", artifact.kind())
+                .append("body", new Document("$literal", new Document(WRITER.tree(artifact))))
+                .append("contentHash", CanonicalHash.of(artifact));
+        if (candidate == null) {
+            return List.of(new Document("$set", fields), new Document("$unset", "pipelineIncarnationId"));
+        }
+        // Existing pipelines retain their sibling, including its absence on pre-identity documents.
+        // Inserts and kind changes assign the candidate in the same atomic document write.
+        Document samePipeline = new Document("$eq", List.of("$kind", "pipeline"));
+        fields.append("pipelineIncarnationId", new Document("$cond", List.of(
+                samePipeline, "$pipelineIncarnationId", candidate)));
+        return List.of(new Document("$set", fields));
+    }
+
+    private static String candidateFor(Resource artifact, String suppliedCandidate) {
+        if (!(artifact instanceof PipelineResource)) {
+            if (suppliedCandidate != null) {
+                throw new IllegalArgumentException("only pipeline artifacts may carry an incarnation candidate");
+            }
+            return null;
+        }
+        if (suppliedCandidate != null && suppliedCandidate.isBlank()) {
+            throw new IllegalArgumentException("pipeline incarnation candidate cannot be blank");
+        }
+        return suppliedCandidate == null ? UUID.randomUUID().toString() : suppliedCandidate;
+    }
+
+    private static Document pipelineFilter(String pipelineId) {
+        return new Document("_id", pipelineId).append("kind", "pipeline");
+    }
+
+    private static Optional<String> incarnationFrom(Document document, String pipelineId) {
+        if (document == null || !document.containsKey("pipelineIncarnationId")) {
+            return Optional.empty();
+        }
+        Object value = document.get("pipelineIncarnationId");
+        if (!(value instanceof String incarnation) || incarnation.isBlank()) {
+            throw unreadable(pipelineId, "pipelineIncarnationId", null);
+        }
+        return Optional.of(incarnation);
     }
 
     /** Binds a resource back out of its stored document's structure, parsing no text. */

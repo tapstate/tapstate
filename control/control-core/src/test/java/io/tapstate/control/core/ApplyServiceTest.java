@@ -710,6 +710,24 @@ class ApplyServiceTest {
     }
 
     @Test
+    void controlWritesGiveOnlyPipelinesAnIdentityCandidateOutsideTheirCanonicalForm() {
+        service.apply("alice", List.of(draft(SRC_ORA), draft(PIPELINE), draft(TGT_MG)));
+        String batchCandidate = store.lastIncarnationCandidates.get("ora2my_ods");
+        assertThat(batchCandidate).isNotBlank();
+        assertThat(store.lastIncarnationCandidates).containsOnlyKeys("ora2my_ods");
+        assertThat(stored("ora2my_ods")).doesNotContain(batchCandidate);
+
+        Resource anotherPipeline = new DslParser().parse(
+                PIPELINE.replace("ora2my_ods", "another_pipeline"));
+        ArtifactWriteResult typed = service.create("bob", anotherPipeline);
+        assertThat(typed.write().appliedSuccessfully()).isTrue();
+        assertThat(store.lastWrite.pipelineIncarnationCandidate()).isNotBlank();
+        assertThat(store.lastWrite.pipelineIncarnationCandidate()).isNotEqualTo(batchCandidate);
+        assertThat(typed.artifact().canonicalForm())
+                .doesNotContain(store.lastWrite.pipelineIncarnationCandidate());
+    }
+
+    @Test
     void aMixedBatchWritesOnlyTheChangedAndNewResources() {
         // Seed tgt_mg. Then apply a batch of [tgt_mg unchanged, src_ora new]: only the new resource is
         // written — the no-op is decided per artifact, not per batch.
@@ -1240,6 +1258,8 @@ class ApplyServiceTest {
         private final Map<String, String> byId = new LinkedHashMap<>();
         private final List<String> unreadable = new ArrayList<>();
         private final List<List<String>> saveAllBatches = new ArrayList<>();
+        private Map<String, String> lastIncarnationCandidates = Map.of();
+        private ArtifactWrite lastWrite;
         private int saveCount = 0;
         private String failOnId = null;
         /** A writer that commits between the plan's comparison and this store's write. */
@@ -1266,6 +1286,7 @@ class ApplyServiceTest {
                 }
             }
             ArtifactWrite write = writes.getFirst();
+            lastWrite = write;
             if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && byId.containsKey(write.resource().id())) {
                 return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
             }
@@ -1317,6 +1338,13 @@ class ApplyServiceTest {
             saveCount += artifacts.size();
             saveAllBatches.add(artifacts.stream().map(Resource::id).toList());
             return Optional.empty();
+        }
+
+        @Override
+        public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes,
+                Map<String, String> pipelineIncarnationCandidates) {
+            lastIncarnationCandidates = Map.copyOf(pipelineIncarnationCandidates);
+            return saveAll(artifacts, expectedContentHashes);
         }
 
         /**

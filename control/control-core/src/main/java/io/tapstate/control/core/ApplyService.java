@@ -368,10 +368,14 @@ public final class ApplyService {
             case REPLACE_ONLY -> ArtifactWrite.replaceOnly(prepared.resource(), expectedContentHash);
             case UPSERT -> throw new IllegalArgumentException("typed writes must be conditional");
         }).guardedBy(plan.workspacePreconditions());
+        if (prepared.resource() instanceof PipelineResource) {
+            write = write.withPipelineIncarnationCandidate(PipelineIncarnationService.newId());
+        }
+        ArtifactWrite submittedWrite = write;
         ArtifactBatchWrite outcome = auditGate.dispatchAll(
                 operation,
                 List.of(new AuditContext(principal, prepared.id(), expectedContentHash)),
-                () -> store.writeAll(List.of(write)));
+                () -> store.writeAll(List.of(submittedWrite)));
         return new ArtifactWriteResult(prepared, outcome);
     }
 
@@ -413,6 +417,7 @@ public final class ApplyService {
         ApplyPlan plan = plan(drafts);
         List<ArtifactOutcome> outcomes = new ArrayList<>();
         List<Resource> toWrite = new ArrayList<>();
+        Map<String, String> incarnationCandidates = new LinkedHashMap<>();
         List<AuditContext> audited = new ArrayList<>();
         Map<String, String> enforced = new LinkedHashMap<>();
         // Read once for the refusal below, and only when there is a reading to judge against.
@@ -434,6 +439,9 @@ public final class ApplyService {
                             storedPipeline(stored, replacement.id()), replacement);
                 }
                 toWrite.add(prepared.resource());
+                if (prepared.resource() instanceof PipelineResource) {
+                    incarnationCandidates.put(prepared.id(), PipelineIncarnationService.newId());
+                }
                 String declared = plan.precondition(prepared.id());
                 audited.add(new AuditContext(principal, prepared.id(), declared));
                 if (declared != null) {
@@ -452,7 +460,7 @@ public final class ApplyService {
         // comparison and the write one store operation, which is the only form of the check that
         // survives a concurrent writer.
         ApplyResult result = auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
-            String conflicted = store.saveAll(toWrite, enforced).orElse(null);
+            String conflicted = store.saveAll(toWrite, enforced, incarnationCandidates).orElse(null);
             if (conflicted != null) {
                 throw new TapstateException(ArtifactError.VERSION_CONFLICT, Map.of("id", conflicted), null);
             }

@@ -74,6 +74,182 @@ class MongoArtifactStoreIT {
             """;
 
     @Test
+    void pipelineIncarnationSharesTheArtifactDocumentButNeverChangesItsCanonicalProjection() {
+        withStore((store, collection) -> {
+            Resource pipeline = PARSER.parse(ORDERS_SYNC);
+            Resource source = PARSER.parse(ORDERS);
+            String canonical = WRITER.write(pipeline);
+            String hash = CanonicalHash.of(pipeline);
+
+            assertThat(store.create(pipeline)).isEqualTo(ArtifactMutation.CREATED);
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.CREATED);
+            Document pipelineRow = collection.find(new Document("_id", pipeline.id())).first();
+            Document sourceRow = collection.find(new Document("_id", source.id())).first();
+            String incarnation = pipelineRow.getString("pipelineIncarnationId");
+
+            assertThat(incarnation).isNotBlank();
+            assertThat(sourceRow.containsKey("pipelineIncarnationId")).isFalse();
+            assertThat(pipelineRow.get("body", Document.class).containsKey("pipelineIncarnationId")).isFalse();
+            assertThat(pipelineRow.getString("contentHash")).isEqualTo(hash);
+            assertThat(WRITER.write(store.get(pipeline.id()).orElseThrow())).isEqualTo(canonical);
+            assertThat(store.listStored("pipeline")).singleElement()
+                    .satisfies(row -> {
+                        assertThat(row.canonicalForm()).isEqualTo(canonical);
+                        assertThat(row.contentHash()).isEqualTo(hash);
+                    });
+            assertThat(store.pipelineIncarnationId(pipeline.id())).contains(incarnation);
+            assertThat(store.ensurePipelineIncarnationId(source.id(), "unused")).isEmpty();
+        });
+    }
+
+    @Test
+    void pipelineCreationUsesTheSuppliedCandidateAcrossTypedAndBatchWrites() {
+        withStore((store, collection) -> {
+            Resource typed = PARSER.parse(ORDERS_SYNC);
+            Resource batched = PARSER.parse(ORDERS_SYNC.replace("orders_sync", "batch_pipeline"));
+
+            assertThat(store.writeAll(List.of(ArtifactWrite.createOnly(typed)
+                    .withPipelineIncarnationCandidate("typed-candidate"))))
+                    .isEqualTo(ArtifactBatchWrite.applied());
+            assertThat(store.saveAll(List.of(batched), Map.of(),
+                    Map.of(batched.id(), "batch-candidate"))).isEmpty();
+
+            assertThat(storedIncarnation(collection, typed.id())).isEqualTo("typed-candidate");
+            assertThat(storedIncarnation(collection, batched.id())).isEqualTo("batch-candidate");
+        });
+    }
+
+    @Test
+    void pipelineIncarnationSurvivesEveryReplacementPathAndChangesAfterDeleteAndRecreate() {
+        withStore((store, collection) -> {
+            Resource first = PARSER.parse(ORDERS_SYNC);
+            Resource second = PARSER.parse(ORDERS_SYNC.replace("source: orders", "source: second"));
+            Resource third = PARSER.parse(ORDERS_SYNC.replace("source: orders", "source: third"));
+            Resource fourth = PARSER.parse(ORDERS_SYNC.replace("source: orders", "source: fourth"));
+            Resource fifth = PARSER.parse(ORDERS_SYNC.replace("source: orders", "source: fifth"));
+
+            assertThat(store.create(first)).isEqualTo(ArtifactMutation.CREATED);
+            collection.updateOne(new Document("_id", first.id()),
+                    new Document("$set", new Document("pipelineIncarnationId", "preexisting-incarnation")));
+            String incarnation = storedIncarnation(collection, first.id());
+            assertThat(store.replace(first.id(), CanonicalHash.of(first), second))
+                    .isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(storedIncarnation(collection, first.id())).isEqualTo(incarnation);
+            assertThat(store.writeAll(List.of(ArtifactWrite.replaceOnly(third, CanonicalHash.of(second)))))
+                    .isEqualTo(ArtifactBatchWrite.applied());
+            assertThat(storedIncarnation(collection, first.id())).isEqualTo(incarnation);
+            assertThat(store.writeAll(List.of(ArtifactWrite.upsert(fourth), ArtifactWrite.upsert(PARSER.parse(ORDERS)))))
+                    .isEqualTo(ArtifactBatchWrite.applied());
+            assertThat(storedIncarnation(collection, first.id())).isEqualTo(incarnation);
+            assertThat(store.saveAll(List.of(fifth), Map.of(fourth.id(), CanonicalHash.of(fourth))))
+                    .isEmpty();
+            assertThat(storedIncarnation(collection, first.id())).isEqualTo(incarnation);
+            store.save(first);
+
+            assertThat(storedIncarnation(collection, first.id())).isEqualTo(incarnation);
+            assertThat(store.get(first.id())).contains(first);
+            assertThat(store.delete(first.id(), CanonicalHash.of(first))).isEqualTo(ArtifactMutation.DELETED);
+            assertThat(store.pipelineIncarnationId(first.id())).isEmpty();
+            assertThat(store.create(first)).isEqualTo(ArtifactMutation.CREATED);
+            assertThat(storedIncarnation(collection, first.id())).isNotEqualTo(incarnation);
+        });
+    }
+
+    @Test
+    void legacyPipelineIncarnationInitializationIsAtomicAndConcurrentCallersShareTheWinner() {
+        withStore((store, collection) -> {
+            Resource pipeline = PARSER.parse(ORDERS_SYNC);
+            collection.insertOne(MongoArtifactStore.toDocument(pipeline));
+            assertThat(store.pipelineIncarnationId(pipeline.id())).isEmpty();
+            assertThat(store.replace(pipeline.id(), CanonicalHash.of(pipeline), pipeline))
+                    .isEqualTo(ArtifactMutation.REPLACED);
+            store.save(pipeline);
+            assertThat(store.pipelineIncarnationId(pipeline.id()))
+                    .as("ordinary edits of legacy artifacts do not eagerly initialize identity")
+                    .isEmpty();
+            CountDownLatch ready = new CountDownLatch(2);
+            CountDownLatch start = new CountDownLatch(1);
+            try (ExecutorService callers = Executors.newFixedThreadPool(2)) {
+                Future<Optional<String>> alpha = callers.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return store.ensurePipelineIncarnationId(pipeline.id(), "candidate-alpha");
+                });
+                Future<Optional<String>> beta = callers.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return store.ensurePipelineIncarnationId(pipeline.id(), "candidate-beta");
+                });
+                ready.await();
+                start.countDown();
+
+                Optional<String> alphaResult = alpha.get();
+                Optional<String> betaResult = beta.get();
+                String winner = storedIncarnation(collection, pipeline.id());
+                assertThat(alphaResult).contains(winner);
+                assertThat(betaResult).contains(winner);
+                assertThat(store.ensurePipelineIncarnationId(pipeline.id(), "candidate-retry"))
+                        .contains(winner);
+                assertThat(store.get(pipeline.id())).contains(pipeline);
+            } catch (Exception error) {
+                throw new AssertionError("concurrent incarnation initialization failed", error);
+            }
+        });
+    }
+
+    @Test
+    void changingArtifactKindNeverLeavesPipelineIdentityOnANonPipeline() {
+        withStore((store, collection) -> {
+            Resource pipeline = PARSER.parse(ORDERS_SYNC);
+            Resource sourceWithSameId = PARSER.parse(ORDERS.replace("id: orders", "id: orders_sync"));
+            assertThat(store.create(pipeline)).isEqualTo(ArtifactMutation.CREATED);
+            String previous = storedIncarnation(collection, pipeline.id());
+
+            assertThat(store.replace(pipeline.id(), CanonicalHash.of(pipeline), sourceWithSameId))
+                    .isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(collection.find(new Document("_id", pipeline.id())).first()
+                    .containsKey("pipelineIncarnationId")).isFalse();
+            assertThat(store.pipelineIncarnationId(pipeline.id())).isEmpty();
+
+            assertThat(store.replace(pipeline.id(), CanonicalHash.of(sourceWithSameId), pipeline))
+                    .isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(storedIncarnation(collection, pipeline.id())).isNotEqualTo(previous);
+        });
+    }
+
+    @Test
+    void malformedIncarnationIsReportedAndAnEditDoesNotSilentlyReplaceIt() {
+        withStore((store, collection) -> {
+            Resource pipeline = PARSER.parse(ORDERS_SYNC);
+            Resource changed = PARSER.parse(ORDERS_SYNC.replace("source: orders", "source: changed"));
+            store.create(pipeline);
+            collection.updateOne(new Document("_id", pipeline.id()),
+                    new Document("$set", new Document("pipelineIncarnationId", null)));
+
+            assertThat(store.replace(pipeline.id(), CanonicalHash.of(pipeline), changed))
+                    .isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(collection.find(new Document("_id", pipeline.id())).first()
+                    .containsKey("pipelineIncarnationId")).isTrue();
+            assertThatThrownBy(() -> store.pipelineIncarnationId(pipeline.id()))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> {
+                        assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                        assertThat(error.args()).containsEntry("field", "pipelineIncarnationId");
+                    });
+            assertThatThrownBy(() -> store.ensurePipelineIncarnationId(pipeline.id(), "unused"))
+                    .isInstanceOfSatisfying(TapstateException.class, error ->
+                            assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        });
+    }
+
+    private static String storedIncarnation(MongoCollection<Document> collection, String id) {
+        Document row = collection.find(new Document("_id", id)).first();
+        assertThat(row).isNotNull();
+        String incarnation = row.getString("pipelineIncarnationId");
+        assertThat(incarnation).isNotBlank();
+        return incarnation;
+    }
+
+    @Test
     void writtenArtifactReadsBackAsTheSameCanonicalForm() {
         withStore((store, collection) -> {
             Resource source = PARSER.parse(ORDERS);

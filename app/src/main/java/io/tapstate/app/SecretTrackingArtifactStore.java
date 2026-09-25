@@ -99,7 +99,15 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     @Override
     public synchronized Optional<String> saveAll(
             List<Resource> artifacts, Map<String, String> expectedContentHashes) {
-        Optional<String> conflicted = delegate.saveAll(artifacts, expectedContentHashes);
+        return saveAll(artifacts, expectedContentHashes, Map.of());
+    }
+
+    @Override
+    public synchronized Optional<String> saveAll(
+            List<Resource> artifacts, Map<String, String> expectedContentHashes,
+            Map<String, String> pipelineIncarnationCandidates) {
+        Optional<String> conflicted = delegate.saveAll(
+                artifacts, expectedContentHashes, pipelineIncarnationCandidates);
         // A refused batch wrote nothing, so nothing it named is in the store to track — tracking it
         // would teach the redactor secrets that were never stored.
         if (conflicted.isEmpty()) {
@@ -129,6 +137,16 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         // the delegate had already read and returned, which is the read this decorator has no reason to
         // make more expensive than the store it wraps.
         return delegate.listStored(kind);
+    }
+
+    @Override
+    public Optional<String> pipelineIncarnationId(String pipelineId) {
+        return delegate.pipelineIncarnationId(pipelineId);
+    }
+
+    @Override
+    public Optional<String> ensurePipelineIncarnationId(String pipelineId, String candidate) {
+        return delegate.ensurePipelineIncarnationId(pipelineId, candidate);
     }
 
     private void track(Resource resource) {
