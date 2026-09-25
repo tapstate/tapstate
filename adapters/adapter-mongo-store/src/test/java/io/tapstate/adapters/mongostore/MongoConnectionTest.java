@@ -9,6 +9,8 @@ import org.junit.jupiter.api.Test;
 
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.file.Path;
 import java.time.Duration;
 
@@ -60,6 +62,23 @@ class MongoConnectionTest {
         assertThat(ex.code()).isEqualTo(StoreError.UNREACHABLE);
         assertThat(ex.args()).containsEntry("target", "cluster.example.net");
         assertThat(ex.getMessage()).doesNotContain("test-user", "sentinel-password");
+    }
+
+    @Test
+    void invalidConnectionOptionsDoNotExposeDriverEchoedPasswordsInStackTraces() {
+        String uri = "mongodb://state:metadata-secret@localhost:27017/metadata"
+                + "?proxyHost=proxy.example&proxyPort=1080&proxyUsername=proxy"
+                + "&proxyPassword=first-sentinel&proxyPassword=second-sentinel";
+        TapstateException ex = catchThrowableOfType(
+                () -> MongoConnection.parseConnectionString(uri, ConnectionString::new),
+                TapstateException.class);
+
+        assertThat(ex).isNotNull();
+        assertThat(ex.code()).isEqualTo(StoreError.INVALID_URI);
+        StringWriter stack = new StringWriter();
+        ex.printStackTrace(new PrintWriter(stack));
+        assertThat(stack.toString()).doesNotContain(
+                "metadata-secret", "first-sentinel", "second-sentinel");
     }
 
     @Test

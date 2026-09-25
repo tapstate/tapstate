@@ -18,9 +18,10 @@ import java.util.function.Supplier;
  * {@code io.store-unauthorized}; a document the store will not take for its size maps to
  * {@code io.document-too-large}, whether the driver refused it or the endpoint did; any other driver
  * failure maps to {@code io.store-unavailable}
- * carrying the driver's detail. A non-driver throwable — a coded reconstruction failure
- * ({@code io.document-unreadable}) or a bare invariant crash — passes straight through, never
- * relabelled as a driver failure.
+ * carrying only a safe driver type and numeric code. Driver messages and causes may contain
+ * connection credentials or document values and never cross this boundary. A non-driver throwable
+ * — a coded reconstruction failure ({@code io.document-unreadable}) or a bare invariant crash —
+ * passes straight through, never relabelled as a driver failure.
  */
 final class StoreIo {
 
@@ -52,10 +53,10 @@ final class StoreIo {
         try {
             return operation.get();
         } catch (BsonMaximumSizeExceededException e) {
-            throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), e);
+            throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
         } catch (MongoException e) {
             if (DOCUMENT_TOO_LARGE_CODES.contains(errorCode(e))) {
-                throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), e);
+                throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
             }
             throw coded(e);
         }
@@ -77,9 +78,9 @@ final class StoreIo {
     /** Translates a driver failure into its coded io diagnostic (without throwing it). */
     static TapstateException coded(MongoException e) {
         if (e instanceof MongoSecurityException) {
-            return new TapstateException(IoError.STORE_UNAUTHORIZED, Map.of(), e);
+            return new TapstateException(IoError.STORE_UNAUTHORIZED, Map.of(), null);
         }
-        return new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", detail(e)), e);
+        return new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", detail(e)), null);
     }
 
     /**
@@ -91,9 +92,10 @@ final class StoreIo {
         return e instanceof MongoWriteException write ? write.getError().getCode() : e.getCode();
     }
 
-    /** The driver's failure detail — its message, or its type when it carries none (never a credential). */
+    /** Stable diagnostic metadata from the driver, without untrusted message or cause content. */
     private static String detail(MongoException e) {
-        String message = e.getMessage();
-        return message == null ? e.getClass().getSimpleName() : message;
+        String type = e.getClass().getSimpleName();
+        int code = errorCode(e);
+        return code <= 0 ? type : type + " code=" + code;
     }
 }

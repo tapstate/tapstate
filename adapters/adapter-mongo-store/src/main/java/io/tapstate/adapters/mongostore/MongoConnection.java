@@ -99,7 +99,9 @@ public final class MongoConnection implements AutoCloseable {
             if (opened != null) {
                 opened.close();
             }
-            throw new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), e);
+            // Driver failures may quote connection options, including credentials, in their messages.
+            // The safe host and coded error are enough for the public and application-log boundary.
+            throw new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), null);
         }
         // A replica-set member reports setName; a sharded router reports msg=isdbgrid.
         // A standalone server reports neither and cannot host checkpoint transactions.
@@ -120,9 +122,9 @@ public final class MongoConnection implements AutoCloseable {
             return parser.apply(uri);
         } catch (MongoException dnsOrConfigurationFailure) {
             throw new TapstateException(StoreError.UNREACHABLE,
-                    Map.of("target", safeHost(uri)), dnsOrConfigurationFailure);
+                    Map.of("target", safeHost(uri)), null);
         } catch (IllegalArgumentException malformedUri) {
-            throw new TapstateException(StoreError.INVALID_URI, Map.of(), malformedUri);
+            throw new TapstateException(StoreError.INVALID_URI, Map.of(), null);
         }
     }
 
