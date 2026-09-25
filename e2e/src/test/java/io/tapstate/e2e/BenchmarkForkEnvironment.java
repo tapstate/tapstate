@@ -26,7 +26,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     private static final Duration PIPELINE_WAIT = Duration.ofMinutes(3);
     private static final Duration TARGET_WAIT = Duration.ofMinutes(5);
-    private static final Duration TARGET_POLL = Duration.ofMillis(300);
+    private static final Duration TARGET_POLL = Duration.ofSeconds(2);
 
     @FunctionalInterface
     interface BatchHook {
@@ -35,6 +35,13 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     }
 
     record BatchResult(int index, long issuedAtNanos, long completedAtNanos) {}
+
+    record PhaseIssue(BenchmarkWorkloadDefinitions.Phase phase, long startedAtNanos,
+                      long sourceCompletedAtNanos, List<BatchResult> batches) {
+        PhaseIssue {
+            batches = List.copyOf(batches);
+        }
+    }
 
     record TargetResult(BenchmarkWorkloadDefinitions.TargetExpectation expectation,
                         long rows, String checksum) {
@@ -65,6 +72,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     private final MongoClient mongo;
 
     private int nextPhase;
+    private BenchmarkWorkloadDefinitions.Phase pendingPhase;
     private boolean closed;
 
     private BenchmarkForkEnvironment(BenchmarkWorkloadDefinitions.Workload workload, String forkId,
@@ -228,13 +236,14 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         return awaitTargets(phase);
     }
 
-    /** Runs the next declared phase; the hook can register target expectations before SQL begins. */
-    PhaseResult runPhase(BenchmarkWorkloadDefinitions.Phase phase, boolean paced,
+    /** Issues the next phase without charging target-oracle scans to its ACK timing window. */
+    PhaseIssue issuePhase(BenchmarkWorkloadDefinitions.Phase phase, boolean paced,
             BatchHook beforeBatch) throws Exception {
         requireOpen();
         Objects.requireNonNull(phase, "phase");
         Objects.requireNonNull(beforeBatch, "beforeBatch");
-        if (nextPhase >= workload.phases().size() || !workload.phases().get(nextPhase).equals(phase)) {
+        if (pendingPhase != null || nextPhase >= workload.phases().size()
+                || !workload.phases().get(nextPhase).equals(phase)) {
             throw new IllegalArgumentException("benchmark phases must run in declared order");
         }
         long started = System.nanoTime();
@@ -256,9 +265,28 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             nextBatchStart = issuedAt + phase.batchInterval().toNanos();
             batchIndex++;
         }
+        pendingPhase = phase;
+        return new PhaseIssue(phase, started, System.nanoTime(), batches);
+    }
+
+    /** Verifies final target content after the external ACK window has ended. */
+    List<TargetResult> completePhase(BenchmarkWorkloadDefinitions.Phase phase) throws Exception {
+        requireOpen();
+        if (pendingPhase == null || !pendingPhase.equals(phase)) {
+            throw new IllegalArgumentException("benchmark phase was not issued");
+        }
         List<TargetResult> targets = awaitTargets(phase);
+        pendingPhase = null;
         nextPhase++;
-        return new PhaseResult(phase, started, System.nanoTime(), batches, targets);
+        return targets;
+    }
+
+    /** Runs a correctness phase and waits for its frozen target answer. */
+    PhaseResult runPhase(BenchmarkWorkloadDefinitions.Phase phase, boolean paced,
+            BatchHook beforeBatch) throws Exception {
+        PhaseIssue issued = issuePhase(phase, paced, beforeBatch);
+        List<TargetResult> targets = completePhase(phase);
+        return new PhaseResult(phase, issued.startedAtNanos(), System.nanoTime(), issued.batches(), targets);
     }
 
     PhaseResult runPhase(BenchmarkWorkloadDefinitions.Phase phase, boolean paced) throws Exception {
