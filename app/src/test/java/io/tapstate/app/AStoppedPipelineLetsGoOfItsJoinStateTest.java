@@ -46,6 +46,9 @@ class AStoppedPipelineLetsGoOfItsJoinStateTest {
     /** The mirror of the driving rows, which one join step keeps whatever its sources are. */
     private static final String FACT_NAMESPACE = "join." + PIPELINE + "." + STEP + ".fact";
 
+    /** How far each run of the step got, which says whether the fact rows it mirrored were indexed. */
+    private static final String WRITERS_NAMESPACE = "join." + PIPELINE + "." + STEP + ".writers";
+
     /** The dimension mirror and the reverse index of the one dimension this join reads. */
     private static final String DIM_NAMESPACE = "join." + PIPELINE + "." + STEP + ".dim.c";
     private static final String INDEX_NAMESPACE = "join." + PIPELINE + "." + STEP + ".index.c";
@@ -93,8 +96,8 @@ class AStoppedPipelineLetsGoOfItsJoinStateTest {
 
         Set<String> namespaces = namespacesHeldBy(store);
 
-        assertThat(namespaces).containsExactlyInAnyOrder(FACT_NAMESPACE, DIM_NAMESPACE, INDEX_NAMESPACE,
-                FACT_ALIAS_DIM_NAMESPACE, FACT_ALIAS_INDEX_NAMESPACE);
+        assertThat(namespaces).containsExactlyInAnyOrder(FACT_NAMESPACE, WRITERS_NAMESPACE, DIM_NAMESPACE,
+                INDEX_NAMESPACE, FACT_ALIAS_DIM_NAMESPACE, FACT_ALIAS_INDEX_NAMESPACE);
     }
 
     /**
