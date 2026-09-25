@@ -37,17 +37,22 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.StorePort;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -813,6 +818,161 @@ class StoreBackedPipelineCaptureCoordinatorTest {
             if (!workers.awaitTermination(5, TimeUnit.SECONDS)) {
                 workers.shutdownNow();
             }
+        }
+    }
+
+    @Test
+    void stopCancelsAnInFlightSnapshotAndClosesTheRunItReturned() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        CountDownLatch snapshotEntered = new CountDownLatch(1);
+        AtomicBoolean interrupted = new AtomicBoolean();
+        AtomicInteger closed = new AtomicInteger();
+        CaptureStarter starter = (spec, passthrough) -> {
+            passthrough.accept(Envelope.read(1L, "orders", Map.of("id", 1L), Map.of()));
+            snapshotEntered.countDown();
+            try {
+                new CountDownLatch(1).await(30, TimeUnit.SECONDS);
+            } catch (InterruptedException cancelled) {
+                interrupted.set(true);
+            }
+            // A connector may finish opening just as cancellation arrives. Its returned handle is still
+            // this abandoned start's responsibility and must never be published as the active capture.
+            return new CaptureRun(Optional.empty(), false, 1L, Optional.empty(),
+                    Optional.of(closed::incrementAndGet), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()),
+                new SnapshotBuffer());
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> start = workers.submit(() -> coordinator.startCapture("p"));
+            assertThat(snapshotEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            Future<?> stop = workers.submit(() -> coordinator.stopCapture("p", false));
+
+            stop.get(5, TimeUnit.SECONDS);
+            assertThatThrownBy(() -> start.get(5, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class).hasCauseInstanceOf(CancellationException.class);
+            assertThat(interrupted).isTrue();
+            assertThat(closed).hasValue(1);
+            assertThat(coordinator.isActive("p")).isFalse();
+            assertThat(coordinator.snapshotProgress("p").byTable()).isEmpty();
+        } finally {
+            workers.shutdownNow();
+            assertThat(workers.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void concurrentStartsOfOnePipelineOpenOneCapture() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src"));
+        CountDownLatch firstEntered = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        AtomicInteger opened = new AtomicInteger();
+        CaptureStarter starter = (spec, passthrough) -> {
+            if (opened.incrementAndGet() == 1) {
+                firstEntered.countDown();
+                try {
+                    if (!releaseFirst.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("first capture was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("first capture was interrupted", interrupted);
+                }
+            }
+            return new CaptureRun(Optional.empty(), false, 0L,
+                    Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()),
+                new SnapshotBuffer());
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> first = workers.submit(() -> coordinator.startCapture("p"));
+            assertThat(firstEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            CountDownLatch secondAttempted = new CountDownLatch(1);
+            Future<?> second = workers.submit(() -> {
+                secondAttempted.countDown();
+                coordinator.startCapture("p");
+            });
+            assertThat(secondAttempted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> second.get(200, TimeUnit.MILLISECONDS))
+                    .as("a duplicate start waits for the first source open")
+                    .isInstanceOf(TimeoutException.class);
+            releaseFirst.countDown();
+            first.get(5, TimeUnit.SECONDS);
+            second.get(5, TimeUnit.SECONDS);
+            assertThat(opened).hasValue(1);
+        } finally {
+            releaseFirst.countDown();
+            workers.shutdownNow();
+            assertThat(workers.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void concurrentPipelinesSharingACaptureOpenOnlyOneTail() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src"));
+        artifacts.save(pipeline("q", "orders_src"));
+        CountDownLatch tailEntered = new CountDownLatch(1);
+        CountDownLatch releaseTail = new CountDownLatch(1);
+        AtomicInteger tails = new AtomicInteger();
+        AtomicInteger attachments = new AtomicInteger();
+        AtomicInteger closed = new AtomicInteger();
+        CaptureAttacher attacher = (spec, passthrough, startTail) -> {
+            if (startTail) {
+                tails.incrementAndGet();
+                tailEntered.countDown();
+                try {
+                    if (!releaseTail.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("shared tail was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("shared tail was interrupted", interrupted);
+                }
+            } else {
+                attachments.incrementAndGet();
+            }
+            return new CaptureRun(Optional.empty(), false, 0L, Optional.empty(),
+                    startTail ? Optional.of(closed::incrementAndGet) : Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), attacher, new SrsCoordinator(new InMemorySrsMetaStore()),
+                new SnapshotBuffer(), CaptureOwnership.single(), Duration.ZERO);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> first = workers.submit(() -> coordinator.startCapture("p"));
+            assertThat(tailEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            CountDownLatch secondAttempted = new CountDownLatch(1);
+            Future<?> second = workers.submit(() -> {
+                secondAttempted.countDown();
+                coordinator.startCapture("q");
+            });
+            assertThat(secondAttempted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> second.get(200, TimeUnit.MILLISECONDS))
+                    .as("an attachment waits for its shared tail to finish opening")
+                    .isInstanceOf(TimeoutException.class);
+            assertThat(tails).hasValue(1);
+            releaseTail.countDown();
+            first.get(5, TimeUnit.SECONDS);
+            second.get(5, TimeUnit.SECONDS);
+            assertThat(tails).hasValue(1);
+            assertThat(attachments).hasValue(1);
+            coordinator.stopCapture("p", false);
+            assertThat(closed).hasValue(0);
+            coordinator.stopCapture("q", false);
+            assertThat(closed).hasValue(1);
+        } finally {
+            releaseTail.countDown();
+            workers.shutdownNow();
+            assertThat(workers.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
         }
     }
 

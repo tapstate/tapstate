@@ -154,6 +154,55 @@ class CaptureOwnershipTest {
     }
 
     @Test
+    void aJoinedPipelineSeesClaimLossWhileItsSharedTailIsStillClosing() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q"));
+        MemoryClaims claims = new MemoryClaims();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate,
+                new ClusterWorkloadClaims(claims, gate), TTL);
+        CountDownLatch tailCloseEntered = new CountDownLatch(1);
+        CountDownLatch releaseTailClose = new CountDownLatch(1);
+        CaptureAttacher attacher = (spec, passthrough, startTail) -> run(() -> {
+            if (!startTail) {
+                return;
+            }
+            tailCloseEntered.countDown();
+            try {
+                if (!releaseTailClose.await(5, TimeUnit.SECONDS)) {
+                    throw new AssertionError("tail close was not released");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("tail close was interrupted", interrupted);
+            }
+        });
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer(),
+                ownership, Duration.ofMillis(20));
+        try {
+            coordinator.startCapture("p");
+            coordinator.startCapture("q");
+            synchronized (claims) {
+                claims.release(claims.current);
+            }
+
+            assertThat(tailCloseEntered.await(5, TimeUnit.SECONDS))
+                    .as("the renewal must detect claim loss and enter the slow tail close").isTrue();
+            assertThat(coordinator.captureFailure("q"))
+                    .as("the joined pipeline must see claim loss before tail close returns")
+                    .hasValueSatisfying(failure -> assertThat(failure)
+                            .isInstanceOfSatisfying(TapstateException.class,
+                                    coded -> assertThat(coded.code()).isEqualTo(CaptureError.CLAIM_LOST)));
+        } finally {
+            releaseTailClose.countDown();
+            coordinator.stopCapture("p", false);
+            coordinator.stopCapture("q", false);
+            coordinator.close();
+        }
+    }
+
+    @Test
     void theReadFaceNamesTheSameCaptureTheRunningCoordinatorClaimed() {
         // The topology says who owns a pipeline's captures, and it works the identities out from the
         // stored contract rather than asking whoever is running them -- so that every member answers the

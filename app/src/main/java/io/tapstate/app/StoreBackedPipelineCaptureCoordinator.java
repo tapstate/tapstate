@@ -32,7 +32,7 @@ import java.time.Instant;
 
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Iterator;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -41,10 +41,12 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -83,7 +85,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private final SrsCoordinator srsCoordinator;
     private final SnapshotBuffer snapshotBuffer;
     private final Map<String, List<PipelineRun>> runsByPipeline = new ConcurrentHashMap<>();
-    private final Map<CaptureId, OwnedCapture> ownedCaptures = new LinkedHashMap<>();
+    private final Map<CaptureId, OwnedCapture> ownedCaptures = new ConcurrentHashMap<>();
+    private final KeyedLocks<String> pipelineLocks = new KeyedLocks<>();
+    private final KeyedLocks<CaptureId> captureLocks = new KeyedLocks<>();
+    private final Map<String, PendingStart> pendingStarts = new ConcurrentHashMap<>();
 
     /**
      * The pipelines here reading a capture another member holds, by capture. Kept for the moment this
@@ -91,13 +96,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * tail then runs for these pipelines as well, and has to outlast the last of them rather than the
      * pipeline that happened to take the claim.
      */
-    private final Map<CaptureId, JoinedCapture> joinedCaptures = new LinkedHashMap<>();
+    private final Map<CaptureId, JoinedCapture> joinedCaptures = new ConcurrentHashMap<>();
 
     /** The captures starts here were given back over, for as long as they are still not ready. */
-    private final Map<CaptureId, RingWait> ringWaits = new LinkedHashMap<>();
+    private final Map<CaptureId, RingWait> ringWaits = new ConcurrentHashMap<>();
 
     /** Looks for captures pipelines here read and nobody tails; started with the first capture joined. */
-    private ScheduledExecutorService takeovers;
+    private volatile ScheduledExecutorService takeovers;
 
     /** What each running pipeline's load read, keyed by pipeline; dropped when it stops. */
     private final Map<String, SnapshotReading> snapshotsByPipeline = new ConcurrentHashMap<>();
@@ -143,23 +148,160 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     @Override
-    public synchronized void startCapture(String pipelineId) {
+    public void startCapture(String pipelineId) {
         startCapture(pipelineId, artifacts());
     }
 
     @Override
-    public synchronized void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
+    public void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
         startCapture(pipelineId, artifactSnapshot, UUID.randomUUID().toString());
     }
 
     @Override
-    public synchronized void startCapture(
+    public void startCapture(
             String pipelineId, ArtifactStore artifactSnapshot, String cursorWriterToken) {
-        // Idempotent: a pipeline whose capture is already running is left running, so a repeated start does not
-        // open a second capture behind the one already filling the ring.
-        if (runsByPipeline.containsKey(pipelineId)) {
-            return;
+        try (KeyedLocks.Hold<String> ignored = pipelineLocks.acquireInterruptibly(pipelineId)) {
+            // A duplicate start observes the first one's published handles rather than opening its sources.
+            if (runsByPipeline.containsKey(pipelineId)) {
+                return;
+            }
+            PendingStart pending = new PendingStart(Thread.currentThread());
+            pendingStarts.put(pipelineId, pending);
+            try {
+                startCaptureLocked(pipelineId, artifactSnapshot, cursorWriterToken, pending);
+            } finally {
+                pending.finish();
+                pendingStarts.remove(pipelineId, pending);
+            }
         }
+    }
+
+    private static final class PendingStart {
+        private final Thread thread;
+        private boolean cancelled;
+        private boolean finished;
+
+        private PendingStart(Thread thread) {
+            this.thread = thread;
+        }
+
+        synchronized void cancel() {
+            if (!finished) {
+                cancelled = true;
+                thread.interrupt();
+            }
+        }
+
+        synchronized void finish() {
+            finished = true;
+        }
+
+        synchronized void check() {
+            if (cancelled || thread.isInterrupted()) {
+                throw new CancellationException("capture start cancelled");
+            }
+        }
+    }
+
+    private List<KeyedLocks.Hold<CaptureId>> lockCaptures(
+            Collection<CaptureId> captureIds, boolean interruptibly) {
+        List<KeyedLocks.Hold<CaptureId>> holds = new ArrayList<>();
+        try {
+            captureIds.stream().distinct().sorted(Comparator.comparing(CaptureId::value))
+                    .forEach(captureId -> holds.add(interruptibly
+                            ? captureLocks.acquireInterruptibly(captureId) : captureLocks.acquire(captureId)));
+            return holds;
+        } catch (RuntimeException | Error failure) {
+            releaseCaptures(holds);
+            throw failure;
+        }
+    }
+
+    private static void releaseCaptures(List<KeyedLocks.Hold<CaptureId>> holds) {
+        for (int i = holds.size() - 1; i >= 0; i--) {
+            holds.get(i).close();
+        }
+    }
+
+    /** A short-lived lock per live key, without retaining every pipeline or capture ever encountered. */
+    private static final class KeyedLocks<K> {
+        private final ConcurrentHashMap<K, Cell> cells = new ConcurrentHashMap<>();
+
+        private static final class Cell {
+            private final ReentrantLock lock = new ReentrantLock();
+            private int users;
+        }
+
+        private Cell retain(K key) {
+            return cells.compute(key, (ignored, current) -> {
+                Cell cell = current == null ? new Cell() : current;
+                cell.users++;
+                return cell;
+            });
+        }
+
+        private void release(K key, Cell expected) {
+            cells.compute(key, (ignored, current) -> {
+                if (current != expected || current.users <= 0) {
+                    throw new IllegalStateException("keyed lock reference changed while held");
+                }
+                return --current.users == 0 ? null : current;
+            });
+        }
+
+        Hold<K> acquire(K key) {
+            Cell cell = retain(key);
+            cell.lock.lock();
+            return new Hold<>(this, key, cell);
+        }
+
+        Hold<K> acquireInterruptibly(K key) {
+            Cell cell = retain(key);
+            try {
+                cell.lock.lockInterruptibly();
+            } catch (InterruptedException interrupted) {
+                release(key, cell);
+                Thread.currentThread().interrupt();
+                throw new CancellationException("capture start interrupted while waiting for a lock");
+            }
+            return new Hold<>(this, key, cell);
+        }
+
+        Hold<K> tryAcquire(K key) {
+            Cell cell = retain(key);
+            if (!cell.lock.tryLock()) {
+                release(key, cell);
+                return null;
+            }
+            return new Hold<>(this, key, cell);
+        }
+
+        private static final class Hold<K> implements AutoCloseable {
+            private final KeyedLocks<K> owner;
+            private final K key;
+            private final Cell cell;
+            private boolean closed;
+
+            private Hold(KeyedLocks<K> owner, K key, Cell cell) {
+                this.owner = owner;
+                this.key = key;
+                this.cell = cell;
+            }
+
+            @Override
+            public void close() {
+                if (!closed) {
+                    closed = true;
+                    cell.lock.unlock();
+                    owner.release(key, cell);
+                }
+            }
+        }
+    }
+
+    private void startCaptureLocked(
+            String pipelineId, ArtifactStore artifactSnapshot, String cursorWriterToken, PendingStart pending) {
+        pending.check();
         ArtifactStore captured = Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
         PipelineResource pipeline = StoredArtifacts.requirePipeline(captured, pipelineId);
         ReadMode readMode = readModeOf(pipeline.settings());
@@ -172,10 +314,22 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // Every source's capture is settled before any source is opened, so a start that has to be given
         // back is given back having opened nothing: a source opened first would otherwise read its whole
         // load again on every pass until the last one was ready.
-        Map<CaptureId, CaptureOwnership.Permit> permits = new LinkedHashMap<>();
         List<SourcePlan> plans = withCompleteChainSelections(
-                plan(pipelineId, pipeline, captured, snapshotEpoch, permits),
+                plan(pipelineId, pipeline, captured, snapshotEpoch),
                 Objects.requireNonNull(cursorWriterToken, "cursorWriterToken"));
+        // Capture locks are sorted so multi-source starts cannot deadlock. Holding one only blocks other
+        // pipelines that actually share that capture; an unrelated snapshot never holds the whole member.
+        List<KeyedLocks.Hold<CaptureId>> captureHolds = lockCaptures(plans.stream()
+                .map(SourcePlan::captureId).distinct().toList(), true);
+        try {
+            startPlannedCapture(pipelineId, plans, pending);
+        } finally {
+            releaseCaptures(captureHolds);
+        }
+    }
+
+    private void startPlannedCapture(String pipelineId, List<SourcePlan> plans, PendingStart pending) {
+        Map<CaptureId, CaptureOwnership.Permit> permits = new LinkedHashMap<>();
         List<PipelineRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
@@ -185,7 +339,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // window that had already closed.
         Instant loadBegan = Instant.now();
         try {
+            settlePermits(pipelineId, plans, permits, pending);
             for (SourcePlan plan : plans) {
+                pending.check();
                 SourceCaptureResolution resolution = plan.resolution();
                 CaptureRunSpec spec = plan.spec();
                 CaptureId captureId = plan.captureId();
@@ -212,7 +368,16 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                                         spec.withCaptureFence(permit.fence()),
                                         snapshotPassthrough(pipelineId, resolution, observedSnapshotCounts), true);
                             } catch (RuntimeException | Error failure) {
-                                ownership.release(permit.claim());
+                                boolean interrupted = Thread.interrupted();
+                                try {
+                                    ownership.release(permit.claim());
+                                } catch (RuntimeException unreleased) {
+                                    failure.addSuppressed(unreleased);
+                                } finally {
+                                    if (interrupted) {
+                                        Thread.currentThread().interrupt();
+                                    }
+                                }
                                 throw failure;
                             }
                             // Pipelines here that joined this capture while another member held it read the
@@ -237,18 +402,29 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     }
                     runs.add(PipelineRun.managed(captureId, run));
                 }
+                pending.check();
                 recordSnapshot(attributed, plan.sourceId(), spec, run, observedSnapshotCounts, plan.discovered());
                 snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
             }
+            pending.check();
         } catch (RuntimeException | Error failure) {
             // A start that fell over releases what it took and nothing else. It is an abandoned attempt,
             // not somebody asking for the pipeline's position to be thrown away, and the sources that did
             // start may have advanced it before the one that failed.
-            RuntimeException cleanupFailure = closeRuns(runs, pipelineId, false);
-            if (cleanupFailure != null) {
-                failure.addSuppressed(cleanupFailure);
+            // Cancellation reaches this path with the worker's interrupt flag set. Let teardown finish
+            // even when a connector or store uses interruptible waits, then restore the signal to its caller.
+            boolean interrupted = Thread.interrupted();
+            try {
+                RuntimeException cleanupFailure = closeRuns(runs, pipelineId, false);
+                if (cleanupFailure != null) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+                releaseUnopened(permits, failure);
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
-            releaseUnopened(permits, failure);
             throw failure;
         }
         runsByPipeline.put(pipelineId, runs);
@@ -256,7 +432,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
     }
 
-    /** One source of a start as it was settled before anything was opened: what to open and for what. */
+    /** One source of a start as resolved before any claim or source is opened. */
     private record SourcePlan(
             String sourceId,
             SourceModel discovered,
@@ -266,46 +442,47 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /**
-     * Works out every source this start reads and settles the claim on each capture it does not already
-     * tail here, before any of them is opened -- into {@code permits}, one per capture however many sources
-     * share it. A capture held elsewhere whose ring is not open yet gives the whole start back, with the
-     * claims taken so far let go.
+     * Works out every source this start reads before taking any claim. The capture identities then choose
+     * the locks under which every claim is settled before any source is opened.
      */
     private List<SourcePlan> plan(
             String pipelineId,
             PipelineResource pipeline,
             ArtifactStore captured,
-            long snapshotEpoch,
-            Map<CaptureId, CaptureOwnership.Permit> permits) {
+            long snapshotEpoch) {
         List<SourcePlan> plans = new ArrayList<>();
-        try {
-            for (SourceRef ref : pipeline.sources()) {
-                String sourceId = ref.id();
-                SourceResource source = StoredArtifacts.requireSource(captured, sourceId);
-                // Read once and used twice: it decides which streams this run reads, and it carries the
-                // row count the last discovery took of each of them. Asking the store again for the second
-                // use would pay for a second read per source on every start.
-                SourceModel discovered = SourceDiscovery.model(storePort, source);
-                Optional<SourceCaptureResolution> selected =
-                        SourceCaptureResolution.forPipeline(pipeline, source, discovered);
-                if (selected.isEmpty()) {
-                    continue;
-                }
-                SourceCaptureResolution resolution = selected.orElseThrow();
-                CaptureRunSpec spec = deriveSpec(
-                        pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref),
-                        snapshotEpoch);
-                CaptureId captureId = CaptureId.of(spec);
-                if (managedOwnership && !ownedCaptures.containsKey(captureId) && !permits.containsKey(captureId)) {
-                    permits.put(captureId, permitOrNotYet(pipelineId, captureId, spec));
-                }
-                plans.add(new SourcePlan(sourceId, discovered, resolution, spec, captureId));
+        for (SourceRef ref : pipeline.sources()) {
+            String sourceId = ref.id();
+            SourceResource source = StoredArtifacts.requireSource(captured, sourceId);
+            // Read once and used twice: it decides which streams this run reads, and it carries the
+            // row count the last discovery took of each of them. Asking the store again for the second
+            // use would pay for a second read per source on every start.
+            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            Optional<SourceCaptureResolution> selected =
+                    SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+            if (selected.isEmpty()) {
+                continue;
             }
-        } catch (RuntimeException | Error failure) {
-            releaseUnopened(permits, failure);
-            throw failure;
+            SourceCaptureResolution resolution = selected.orElseThrow();
+            CaptureRunSpec spec = deriveSpec(
+                    pipelineId, pipeline.settings(), source, resolution, srsSwitchOf(pipelineId, ref),
+                    snapshotEpoch);
+            CaptureId captureId = CaptureId.of(spec);
+            plans.add(new SourcePlan(sourceId, discovered, resolution, spec, captureId));
         }
         return plans;
+    }
+
+    private void settlePermits(
+            String pipelineId, List<SourcePlan> plans,
+            Map<CaptureId, CaptureOwnership.Permit> permits, PendingStart pending) {
+        for (SourcePlan plan : plans) {
+            pending.check();
+            CaptureId captureId = plan.captureId();
+            if (managedOwnership && !ownedCaptures.containsKey(captureId) && !permits.containsKey(captureId)) {
+                permits.put(captureId, permitOrNotYet(pipelineId, captureId, plan.spec()));
+            }
+        }
     }
 
     /** Every source of one pipeline on a mining chain publishes the same complete table selection. */
@@ -416,36 +593,41 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * where the durable record says the last one had got to. A holder that died leaves the claim to be
      * taken the same way once its lease has run out.
      */
-    synchronized void tailWhatNobodyTails() {
-        Iterator<Map.Entry<CaptureId, JoinedCapture>> joined = joinedCaptures.entrySet().iterator();
-        while (joined.hasNext()) {
-            Map.Entry<CaptureId, JoinedCapture> entry = joined.next();
-            JoinedCapture capture = entry.getValue();
-            if (!capture.tails) {
+    void tailWhatNobodyTails() {
+        for (CaptureId captureId : List.copyOf(joinedCaptures.keySet())) {
+            // A slow start on one capture cannot hold the takeover pass or another capture behind it.
+            KeyedLocks.Hold<CaptureId> hold = captureLocks.tryAcquire(captureId);
+            if (hold == null) {
                 continue;
             }
-            CaptureOwnership.Permit permit = ownership.acquire(entry.getKey());
-            if (!permit.acquired()) {
-                continue;
+            try (hold) {
+                JoinedCapture capture = joinedCaptures.get(captureId);
+                if (capture == null || !capture.tails) {
+                    continue;
+                }
+                CaptureOwnership.Permit permit = ownership.acquire(captureId);
+                if (!permit.acquired()) {
+                    continue;
+                }
+                CaptureRun tail;
+                try {
+                    tail = captureAttacher.start(
+                            capture.tailSpec.withCaptureFence(permit.fence()), capture.tailPassthrough, true);
+                } catch (RuntimeException failure) {
+                    ownership.release(permit.claim());
+                    LOG.warn("Could not open the tail of capture {} for pipelines {} here; asking again later",
+                            captureId.value(), capture.pipelines, failure);
+                    continue;
+                }
+                joinedCaptures.remove(captureId, capture);
+                own(captureId, tail, permit, capture.pipelines);
+                LOG.info("Took over the tail of capture {} for pipelines {} here", captureId.value(),
+                        capture.pipelines);
             }
-            CaptureRun tail;
-            try {
-                tail = captureAttacher.start(
-                        capture.tailSpec.withCaptureFence(permit.fence()), capture.tailPassthrough, true);
-            } catch (RuntimeException failure) {
-                ownership.release(permit.claim());
-                LOG.warn("Could not open the tail of capture {} for pipelines {} here; asking again later",
-                        entry.getKey().value(), capture.pipelines, failure);
-                continue;
-            }
-            joined.remove();
-            own(entry.getKey(), tail, permit, capture.pipelines);
-            LOG.info("Took over the tail of capture {} for pipelines {} here", entry.getKey().value(),
-                    capture.pipelines);
         }
     }
 
-    private void lookForCapturesNobodyTails() {
+    private synchronized void lookForCapturesNobodyTails() {
         if (takeovers != null || claimRenewInterval.isZero()) {
             return;
         }
@@ -482,12 +664,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * itself should it have come free meanwhile -- a holder that died before opening anything leaves it free
      * once its lease runs out. A read with no tail has no ring to wait for.
      *
-     * <p>Given back rather than waited for here, because the start runs on the one thread that converges
-     * every pipeline on this member, holding the lock its claim-loss handling, stops and takeovers take: a
-     * wait here stalled all of them for as long as it lasted. How long a capture has been found this way is
-     * kept, and once it is longer than a lease -- the longest a claim nobody renews can stay held -- the
-     * start is refused with a code instead, rather than retried over nothing for ever. A wait nobody has
-     * looked at for that long is one a stop abandoned, and starts afresh.
+     * <p>Given back rather than waited for here because a held claim with no ring may outlive this pass.
+     * How long a capture has been found this way is kept; once it exceeds a lease, the start is refused
+     * with a code rather than retried over nothing forever. A wait not revisited for a lease starts afresh.
      *
      * <p>An open generation is all it waits for. It may be one a previous run of the chain opened rather
      * than the one the holder is about to open, and that is harmless: a ring numbers its changes on from
@@ -526,19 +705,24 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         return storePort.meta().read(chainId).map(SrsMeta::epoch).orElse(0L) >= 1;
     }
 
-    private synchronized void captureClaimLost(CaptureId captureId, OwnedCapture expected) {
-        if (ownedCaptures.get(captureId) != expected) {
-            return;
+    private void captureClaimLost(CaptureId captureId, OwnedCapture expected) {
+        try (KeyedLocks.Hold<CaptureId> ignored = captureLocks.acquire(captureId)) {
+            if (ownedCaptures.get(captureId) != expected) {
+                return;
+            }
+            TapstateException fenced = new TapstateException(
+                    CaptureError.CLAIM_LOST, Map.of("captureId", captureId.value()), null);
+            expected.run.health().fail(fenced);
+            runsByPipeline.values().stream()
+                    .flatMap(List::stream)
+                    .filter(run -> run.managed && captureId.equals(run.captureId))
+                    .forEach(run -> run.run.health().fail(fenced));
+            // Readers no longer take the coordinator's global monitor. Publish failure to every local
+            // attachment before removing the shared owner, so a read during a slow tail close cannot
+            // mistake a lost claim for a healthy joined capture.
+            ownedCaptures.remove(captureId);
+            expected.run.close();
         }
-        ownedCaptures.remove(captureId);
-        TapstateException fenced = new TapstateException(
-                CaptureError.CLAIM_LOST, Map.of("captureId", captureId.value()), null);
-        expected.run.health().fail(fenced);
-        expected.run.close();
-        runsByPipeline.values().stream()
-                .flatMap(List::stream)
-                .filter(run -> run.managed && captureId.equals(run.captureId))
-                .forEach(run -> run.run.health().fail(fenced));
     }
 
     /**
@@ -753,7 +937,17 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     @Override
-    public synchronized void stopCapture(String pipelineId, boolean purgeState) {
+    public void stopCapture(String pipelineId, boolean purgeState) {
+        PendingStart pending = pendingStarts.get(pipelineId);
+        if (pending != null) {
+            pending.cancel();
+        }
+        try (KeyedLocks.Hold<String> ignored = pipelineLocks.acquire(pipelineId)) {
+            stopCaptureLocked(pipelineId, purgeState);
+        }
+    }
+
+    private void stopCaptureLocked(String pipelineId, boolean purgeState) {
         // The load belongs to the run being torn down: a stopped pipeline reports no snapshot rather than the
         // rows its previous run happened to load.
         snapshotsByPipeline.remove(pipelineId);
@@ -764,9 +958,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // absent handle is what made the verb report success and take nothing, in the one state a caller
         // reaches for it most: after a run has died.
         List<PipelineRun> runs = Objects.requireNonNullElse(runsByPipeline.remove(pipelineId), List.of());
-        RuntimeException cleanupFailure = closeRuns(runs, pipelineId, purgeState);
-        if (cleanupFailure != null) {
-            throw cleanupFailure;
+        List<KeyedLocks.Hold<CaptureId>> captureHolds = lockCaptures(runs.stream()
+                .filter(PipelineRun::managed).map(PipelineRun::captureId).toList(), false);
+        try {
+            RuntimeException cleanupFailure = closeRuns(runs, pipelineId, purgeState);
+            if (cleanupFailure != null) {
+                throw cleanupFailure;
+            }
+        } finally {
+            releaseCaptures(captureHolds);
         }
     }
 
@@ -1047,7 +1247,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     @Override
-    public synchronized Optional<Throwable> captureFailure(String pipelineId) {
+    public Optional<Throwable> captureFailure(String pipelineId) {
         List<PipelineRun> runs = runsByPipeline.get(pipelineId);
         if (runs == null) {
             return Optional.empty();
@@ -1056,21 +1256,22 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // dead tail becomes a failure the converge loop drives to the observable FAILED state rather than an
         // engine job that stays running over a ring gone quiet.
         return runs.stream()
-                .map(run -> run.managed && ownedCaptures.containsKey(run.captureId)
-                        ? ownedCaptures.get(run.captureId).run.failure()
-                        : run.run.failure())
+                .map(run -> {
+                    OwnedCapture owned = run.managed ? ownedCaptures.get(run.captureId) : null;
+                    return owned == null ? run.run.failure() : owned.run.failure();
+                })
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .findFirst();
     }
 
     /** Whether this pipeline currently has a live capture -- a test-visible view of the retained handles. */
-    synchronized boolean isActive(String pipelineId) {
+    boolean isActive(String pipelineId) {
         return runsByPipeline.containsKey(pipelineId);
     }
 
     @Override
-    public synchronized boolean hasActiveCapture(String pipelineId) {
+    public boolean hasActiveCapture(String pipelineId) {
         return isActive(pipelineId);
     }
 
