@@ -106,6 +106,14 @@
       <version>${revision}</version>
       <scope>test</scope>
     </dependency>
+    <!-- The benchmark decodes connector-issued positions under their isolated loader. A direct test
+         dependency keeps that compile surface explicit rather than relying on app's transitive edge. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>adapter-pdk</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
     <!-- The carrier seam and the plan it is opened on. Reached transitively through the assembly
          root as well, but named here because this module imports them directly: a dependency that
          arrives only along a path can be taken away by an exclusion anywhere on that path, and what
