@@ -397,9 +397,6 @@ public final class SnapshotPhase {
                 }
                 batch.close();
             }
-            // A batch closed under the read may simply have stopped handing rows over, and then what came out
-            // of it is a prefix of the table rather than the table.
-            requireOpen();
             return count;
         }
 
@@ -407,6 +404,10 @@ public final class SnapshotPhase {
          * Opens the read of a table after the first. Its seam is required as the first one was -- a source
          * that reports none for one table reports none it can be trusted for -- but it is not recorded: one
          * seam covers the whole round, and the first read took it.
+         *
+         * <p>A load abandoned already opens nothing more. Asked first, because opening a read is a connection
+         * to the source; the check after it is the one that decides, and this only spares a load that is
+         * over the cost of a read it would close again at once.
          */
         private void openBatchOf(String table) {
             requireOpen();
@@ -427,6 +428,11 @@ public final class SnapshotPhase {
             throw abandoned();
         }
 
+        /**
+         * Tells {@code loaded} that {@code table} is through -- unless the load was abandoned. A batch closed
+         * under the read may simply have stopped handing rows over, and then what came out of it is a prefix
+         * of the table rather than the table.
+         */
         private void report(String table, Consumer<String> loaded, Set<String> reported) {
             requireOpen();
             loaded.accept(table);

@@ -646,6 +646,22 @@ class SnapshotPhaseTest {
         assertThat(customers.closed).isTrue();
     }
 
+    /** Abandoned once a table is through, the load opens no read of the next one: a read is a connection. */
+    @Test
+    void aLoadAbandonedBetweenTablesOpensNoFurtherRead() {
+        FakePort port = new FakePort(Map.of(
+                "orders", new FakeBatch(List.of(row("orders", 1)), "seam-0"),
+                "customers", new FakeBatch(List.of(row("customers", 2)), "seam-1")));
+        SnapshotPhase.Load load = SnapshotPhase.open(
+                port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+
+        assertThatThrownBy(() -> load.read(e -> { }, table -> load.close()))
+                .isInstanceOf(CancellationException.class);
+
+        assertThat(port.asked).containsExactly(List.of("orders"));
+    }
+
     @Test
     void aLaterTableReportingNoSeamStopsTheLoadAfterTheTablesBeforeIt() {
         FakeBatch customers = new FakeBatch(List.of(row("customers", 2)));
