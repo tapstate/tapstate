@@ -39,10 +39,13 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     PipelineBenchmarkComparison.Arm arm, Path applicationJar,
                     List<MeasuredPhase> phases, BenchmarkResourceSampler.Summary resources,
                     BenchmarkMongoCommandSampler.Summary mongoCommands,
-                    Map<String, Long> logicalCoverage, String checksum, long errorTotal) {
+                    Map<String, Long> declaredSourceCoverage,
+                    Map<String, Long> observedTargetCoverage,
+                    String checksum, long errorTotal) {
         Evidence {
             phases = List.copyOf(phases);
-            logicalCoverage = Map.copyOf(logicalCoverage);
+            declaredSourceCoverage = Map.copyOf(declaredSourceCoverage);
+            observedTargetCoverage = Map.copyOf(observedTargetCoverage);
         }
     }
 
@@ -93,54 +96,76 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 List<Long> allDurations = new ArrayList<>();
                 List<BenchmarkResourceSampler.Summary> resourceWindows = new ArrayList<>();
                 List<BenchmarkMongoCommandSampler.Summary> commandWindows = new ArrayList<>();
-                Map<String, Long> coverage = new LinkedHashMap<>(snapshot.expectedLogicalCoverage());
+                Map<String, Long> declaredSourceCoverage =
+                        new LinkedHashMap<>(snapshot.expectedLogicalCoverage());
                 BenchmarkForkEnvironment.PhaseResult terminal = null;
+                List<BenchmarkAckOracle.SourceChain> chains = null;
+                Map<String, Long> observedTargetCoverage;
                 BenchmarkWorkloadDefinitions.Phase previousPhase = snapshot;
-                boolean boundaryEstablished = false;
-                for (BenchmarkWorkloadDefinitions.Phase phase : workload.phases().subList(1,
-                        workload.phases().size())) {
-                    if (phase.measured()) {
-                        if (!boundaryEstablished) {
-                            // The restored source event fences every unmeasured write in its
-                            // chain before any measured source SQL can be issued.
-                            captures.awaitMeasurementBoundary(workload, fork, previousPhase,
-                                    positionCoverage);
-                            awaitFreshObservationAfterBoundary(workload, fork.control());
-                            awaitQuiescentRecordsOut(workload, fork.control());
-                            boundaryEstablished = true;
-                        }
-                        PhaseWindow window = runMeasuredPhase(workload, fork, phase,
-                                captures, positionCoverage);
-                        measured.add(window.measurement());
-                        allDurations.addAll(window.deliveryDurations());
-                        resourceWindows.add(window.resources());
-                        commandWindows.add(window.mongoCommands());
-                    } else if (phase.stage() == BenchmarkWorkloadDefinitions.Stage.TERMINAL) {
-                        if (measured.isEmpty()) {
-                            throw new AssertionError("terminal arrived before any measured delivery");
-                        }
-                        terminal = fork.runPhase(phase, true);
-                    } else {
-                        fork.runPhase(phase, true);
+                int phaseIndex = 1;
+                while (phaseIndex < workload.phases().size()
+                        && !workload.phases().get(phaseIndex).measured()) {
+                    BenchmarkWorkloadDefinitions.Phase phase = workload.phases().get(phaseIndex++);
+                    if (phase.stage() == BenchmarkWorkloadDefinitions.Stage.TERMINAL) {
+                        throw new AssertionError("terminal arrived before any measured delivery");
                     }
-                    mergeCoverage(coverage, phase.expectedLogicalCoverage());
+                    fork.runPhase(phase, true);
+                    mergeCoverage(declaredSourceCoverage, phase.expectedLogicalCoverage());
                     previousPhase = phase;
                 }
-                if (terminal == null || resourceWindows.isEmpty() || commandWindows.isEmpty()) {
+                if (phaseIndex >= workload.phases().size()) {
+                    throw new AssertionError("benchmark has no measured phase");
+                }
+                captures.awaitMeasurementBoundary(workload, fork, previousPhase, positionCoverage);
+                awaitFreshObservationAfterBoundary(workload, fork.control());
+                awaitQuiescentRecordsOut(workload, fork.control());
+                try (TargetWatchSet targets = TargetWatchSet.open(
+                        workload, workload.phases().get(phaseIndex), fork)) {
+                    for (BenchmarkWorkloadDefinitions.Phase phase : workload.phases().subList(phaseIndex,
+                            workload.phases().size())) {
+                        if (phase.measured()) {
+                            PhaseWindow window = runMeasuredPhase(workload, fork, phase,
+                                    captures, positionCoverage, targets);
+                            measured.add(window.measurement());
+                            allDurations.addAll(window.deliveryDurations());
+                            resourceWindows.add(window.resources());
+                            commandWindows.add(window.mongoCommands());
+                        } else if (phase.stage() == BenchmarkWorkloadDefinitions.Stage.TERMINAL) {
+                            if (measured.isEmpty()) {
+                                throw new AssertionError("terminal arrived before any measured delivery");
+                            }
+                            targets.expectTerminal(workload, phase);
+                            terminal = fork.runPhase(phase, true);
+                            chains = captures.awaitTerminalAcks(workload, fork, positionCoverage);
+                            targets.checkpoint(phase);
+                        } else {
+                            throw new AssertionError("unmeasured setup followed measured SQL: " + phase.id());
+                        }
+                        mergeCoverage(declaredSourceCoverage, phase.expectedLogicalCoverage());
+                    }
+                    observedTargetCoverage = targets.observedCoverage();
+                }
+                if (terminal == null || chains == null
+                        || resourceWindows.isEmpty() || commandWindows.isEmpty()) {
                     throw new AssertionError("benchmark fork ended without terminal or resource evidence");
                 }
                 BenchmarkResourceSampler.Summary resources = summarizeResources(resourceWindows);
                 BenchmarkMongoCommandSampler.Summary mongoCommands = summarizeCommands(commandWindows);
-                List<BenchmarkAckOracle.SourceChain> chains = captures.awaitTerminalAcks(
-                        workload, fork, positionCoverage);
                 BenchmarkSourceLineage.verifyAfterTerminalAck(lineage, fork.sourceSettings());
                 String checksum = checksum(terminal.targets());
                 long errorTotal = errorTotal(workload, fork.control());
                 if (errorTotal != 0) {
                     throw new AssertionError("benchmark fork published " + errorTotal + " pipeline errors");
                 }
+                Map<String, Long> logicalCoverage = new LinkedHashMap<>(observedTargetCoverage);
+                for (BenchmarkAckOracle.SourceChain chain : chains) {
+                    String terminalId = chain.sourceTerminals().getFirst().logicalId();
+                    if (logicalCoverage.putIfAbsent(terminalId, 1L) != null) {
+                        throw new AssertionError("terminal event overlaps observed target coverage");
+                    }
+                }
                 BenchmarkAckOracle.Fork correctness = new BenchmarkAckOracle.Fork(
-                        forkId, chains, coverage, checksum, errorTotal);
+                        forkId, chains, logicalCoverage, checksum, errorTotal);
                 BenchmarkAckOracle.verify(List.of(correctness));
                 long completed = measured.stream().mapToLong(MeasuredPhase::acknowledgedOutputs).sum();
                 long duration = measured.stream().mapToLong(phase ->
@@ -154,7 +179,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         arm, throughput, latencies, resources.peakHeapBytes(), resources.peakRssBytes());
                 Evidence run = new Evidence(forkId, workload, arm, applicationJar,
                         measured, resources, mongoCommands,
-                        coverage, checksum, errorTotal);
+                        declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal);
                 evidence.add(run);
                 return new PipelineBenchmarkHarness.ForkResult(performance, correctness);
             }
@@ -163,63 +188,47 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
 
     private static PhaseWindow runMeasuredPhase(BenchmarkWorkloadDefinitions.Workload workload,
             BenchmarkForkEnvironment fork, BenchmarkWorkloadDefinitions.Phase phase,
-            CaptureSet captures, BenchmarkConnectorPositionCoverage positionCoverage) throws Exception {
-        List<BenchmarkExpectedChanges.TargetPlan> plans = BenchmarkExpectedChanges.forPhase(workload, phase)
-                .stream().filter(plan -> plan.totalChanges() > 0).toList();
-        List<BenchmarkMongoDeliveryObserver> observers = new ArrayList<>();
-        try {
-            for (BenchmarkExpectedChanges.TargetPlan plan : plans) {
-                observers.add(BenchmarkMongoDeliveryObserver.open(plan.target(), fork.externalTargetUri(),
-                        fork.managedViewsUri(), plan.keyOf()));
-            }
-            long initialAcknowledged = recordsOut(workload, fork.control());
-            BenchmarkForkEnvironment.PhaseIssue issued;
-            long completedAckAt;
-            BenchmarkResourceSampler.Summary resources;
-            BenchmarkMongoCommandSampler.Summary commands;
-            try (BenchmarkResourceSampler resourceSampler = BenchmarkResourceSampler.open(
-                    fork.server().pid(), RESOURCE_INTERVAL);
-                 BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri())) {
-                resourceSampler.start();
-                commandSampler.start();
-                issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
-                    for (int target = 0; target < plans.size(); target++) {
-                        List<BenchmarkMongoDeliveryObserver.ExpectedChange> changes =
-                                plans.get(target).forBatch(batchIndex);
-                        if (!changes.isEmpty()) {
-                            observers.get(target).expectBatch(issuedAt, changes);
-                        }
+            CaptureSet captures, BenchmarkConnectorPositionCoverage positionCoverage,
+            TargetWatchSet targets) throws Exception {
+        List<BenchmarkExpectedChanges.TargetPlan> plans = BenchmarkExpectedChanges.forPhase(workload, phase);
+        long initialAcknowledged = recordsOut(workload, fork.control());
+        BenchmarkForkEnvironment.PhaseIssue issued;
+        long completedAckAt;
+        BenchmarkResourceSampler.Summary resources;
+        BenchmarkMongoCommandSampler.Summary commands;
+        try (BenchmarkResourceSampler resourceSampler = BenchmarkResourceSampler.open(
+                fork.server().pid(), RESOURCE_INTERVAL);
+             BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri())) {
+            resourceSampler.start();
+            commandSampler.start();
+            issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
+                for (BenchmarkExpectedChanges.TargetPlan plan : plans) {
+                    List<BenchmarkMongoDeliveryObserver.ExpectedChange> changes = plan.forBatch(batchIndex);
+                    if (!changes.isEmpty()) {
+                        targets.expectBatch(plan.target(), phase.id(), issuedAt, changes);
                     }
-                });
-                if (issued.batches().isEmpty()) {
-                    throw new AssertionError("measured phase has no source batches: " + phase.id());
                 }
-                completedAckAt = captures.awaitMeasuredAcks(workload, phase, fork, positionCoverage);
-                resources = resourceSampler.finish();
-                commands = commandSampler.finish();
+            });
+            if (issued.batches().isEmpty()) {
+                throw new AssertionError("measured phase has no source batches: " + phase.id());
             }
-            List<Long> durations = new ArrayList<>();
-            for (BenchmarkMongoDeliveryObserver observer : observers) {
-                for (BenchmarkMongoDeliveryObserver.Delivery delivery : observer.finish(DELIVERY_WAIT)) {
-                    durations.add(delivery.durationNanos());
-                }
-            }
-            if (durations.size() != phase.expectedLogicalOutputChanges()) {
-                throw new AssertionError("observed " + durations.size() + " deliveries for " + phase.id()
-                        + ", expected " + phase.expectedLogicalOutputChanges());
-            }
-            fork.completePhase(phase);
-            awaitRecordsOut(workload, fork.control(), initialAcknowledged,
-                    phase.expectedLogicalOutputChanges());
-            long firstIssued = issued.batches().getFirst().issuedAtNanos();
-            return new PhaseWindow(new MeasuredPhase(phase.id(), phase.expectedLogicalOutputChanges(),
-                    firstIssued, completedAckAt, durations.size()), List.copyOf(durations),
-                    resources, commands);
-        } finally {
-            for (BenchmarkMongoDeliveryObserver observer : observers) {
-                observer.close();
-            }
+            completedAckAt = captures.awaitMeasuredAcks(workload, phase, fork, positionCoverage);
+            resources = resourceSampler.finish();
+            commands = commandSampler.finish();
         }
+        List<BenchmarkMongoDeliveryObserver.Delivery> deliveries = targets.checkpoint(phase);
+        if (deliveries.size() != phase.expectedLogicalOutputChanges()) {
+            throw new AssertionError("observed " + deliveries.size() + " deliveries for " + phase.id()
+                    + ", expected " + phase.expectedLogicalOutputChanges());
+        }
+        fork.completePhase(phase);
+        awaitRecordsOut(workload, fork.control(), initialAcknowledged,
+                phase.expectedLogicalOutputChanges());
+        long firstIssued = issued.batches().getFirst().issuedAtNanos();
+        return new PhaseWindow(new MeasuredPhase(phase.id(), phase.expectedLogicalOutputChanges(),
+                firstIssued, completedAckAt, deliveries.size()),
+                deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList(),
+                resources, commands);
     }
 
     private static void awaitRecordsOut(BenchmarkWorkloadDefinitions.Workload workload,
@@ -345,6 +354,114 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             elapsed = Math.addExact(elapsed, window.elapsedMillis());
         }
         return new BenchmarkMongoCommandSampler.Summary(commands, families, elapsed);
+    }
+
+    /** One change stream per target collection stays live from first measured SQL through terminal ACK. */
+    private static final class TargetWatchSet implements AutoCloseable {
+        private final Map<String, BenchmarkMongoDeliveryObserver> byTarget;
+
+        private TargetWatchSet(Map<String, BenchmarkMongoDeliveryObserver> byTarget) {
+            this.byTarget = byTarget;
+        }
+
+        static TargetWatchSet open(BenchmarkWorkloadDefinitions.Workload workload,
+                BenchmarkWorkloadDefinitions.Phase firstMeasured, BenchmarkForkEnvironment fork) {
+            Map<String, BenchmarkMongoDeliveryObserver> opened = new LinkedHashMap<>();
+            try {
+                for (BenchmarkExpectedChanges.TargetPlan plan
+                        : BenchmarkExpectedChanges.forPhase(workload, firstMeasured)) {
+                    String id = targetId(plan.target());
+                    BenchmarkMongoDeliveryObserver observer = BenchmarkMongoDeliveryObserver.open(
+                            plan.target(), fork.externalTargetUri(), fork.managedViewsUri(), plan.keyOf());
+                    if (opened.putIfAbsent(id, observer) != null) {
+                        observer.close();
+                        throw new AssertionError("duplicate benchmark target " + id);
+                    }
+                }
+                return new TargetWatchSet(opened);
+            } catch (RuntimeException | Error failure) {
+                for (BenchmarkMongoDeliveryObserver observer : opened.values()) {
+                    try {
+                        observer.close();
+                    } catch (RuntimeException | Error cleanupFailure) {
+                        failure.addSuppressed(cleanupFailure);
+                    }
+                }
+                throw failure;
+            }
+        }
+
+        void expectBatch(BenchmarkWorkloadDefinitions.TargetExpectation target, String phaseId,
+                long issuedAt, List<BenchmarkMongoDeliveryObserver.ExpectedChange> changes) {
+            observer(target).expectBatch(phaseId, issuedAt, changes);
+        }
+
+        void expectTerminal(BenchmarkWorkloadDefinitions.Workload workload,
+                BenchmarkWorkloadDefinitions.Phase terminal) {
+            if (terminal.stage() != BenchmarkWorkloadDefinitions.Stage.TERMINAL) {
+                throw new IllegalArgumentException("only the terminal phase may register final target changes");
+            }
+            for (BenchmarkWorkloadDefinitions.TargetExpectation target : terminal.targets()) {
+                observer(target).expectUnmeasured(terminal.id(),
+                        BenchmarkTerminalTargetChanges.forTarget(workload, target));
+            }
+        }
+
+        List<BenchmarkMongoDeliveryObserver.Delivery> checkpoint(BenchmarkWorkloadDefinitions.Phase phase) {
+            List<BenchmarkMongoDeliveryObserver.Delivery> delivered = new ArrayList<>();
+            for (BenchmarkWorkloadDefinitions.TargetExpectation target : phase.targets()) {
+                delivered.addAll(observer(target).checkpoint(phase.id(), DELIVERY_WAIT));
+            }
+            return List.copyOf(delivered);
+        }
+
+        Map<String, Long> observedCoverage() {
+            Map<String, Long> result = new LinkedHashMap<>();
+            for (BenchmarkMongoDeliveryObserver observer : byTarget.values()) {
+                observer.observedCoverage().forEach((key, count) -> {
+                    String label = "target/" + key.phaseId() + "/" + key.targetId()
+                            + "/" + key.kind() + "/" + key.key();
+                    result.merge(label, count, Math::addExact);
+                });
+            }
+            return Map.copyOf(result);
+        }
+
+        private BenchmarkMongoDeliveryObserver observer(
+                BenchmarkWorkloadDefinitions.TargetExpectation target) {
+            BenchmarkMongoDeliveryObserver found = byTarget.get(targetId(target));
+            if (found == null) {
+                throw new AssertionError("benchmark target was not watched from the first measured phase: "
+                        + target);
+            }
+            return found;
+        }
+
+        private static String targetId(BenchmarkWorkloadDefinitions.TargetExpectation target) {
+            return target.pipelineId() + "/" + target.location() + "/" + target.table();
+        }
+
+        @Override
+        public void close() {
+            Throwable failure = null;
+            for (BenchmarkMongoDeliveryObserver observer : byTarget.values()) {
+                try {
+                    observer.close();
+                } catch (RuntimeException | Error closeFailure) {
+                    if (failure == null) {
+                        failure = closeFailure;
+                    } else {
+                        failure.addSuppressed(closeFailure);
+                    }
+                }
+            }
+            if (failure instanceof Error error) {
+                throw error;
+            }
+            if (failure instanceof RuntimeException error) {
+                throw error;
+            }
+        }
     }
 
     private static final class CaptureSet implements AutoCloseable {

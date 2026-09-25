@@ -50,12 +50,15 @@ class RealBenchmarkForkDriverIT {
             assertThat(evidence.phases()).hasSize(1);
             assertThat(evidence.resources().sampleCount()).isGreaterThan(1);
             assertThat(evidence.mongoCommands().totalCommands()).isPositive();
+            assertThat(evidence.observedTargetCoverage())
+                    .hasSize(workloadId.equals("copy") ? 12_001 : 12_002);
+            assertThat(evidence.observedTargetCoverage().values()).containsOnly(1L);
             System.out.printf("benchmark-real-fork id=%s jar=%s throughput=%s"
-                            + " acked=%s samples=%s mongoCommands=%s checksum=%s%n",
+                            + " acked=%s samples=%s mongoCommands=%s observedKeys=%s checksum=%s%n",
                     evidence.forkId(), evidence.applicationJar(), result.measurement().recordsOutPerSecond(),
                     evidence.phases().getFirst().acknowledgedOutputs(),
                     evidence.resources().sampleCount(), evidence.mongoCommands().totalCommands(),
-                    evidence.checksum());
+                    evidence.observedTargetCoverage().size(), evidence.checksum());
         });
     }
 }
