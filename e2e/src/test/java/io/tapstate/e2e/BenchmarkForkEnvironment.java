@@ -207,6 +207,27 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         execute(source, List.of(sql));
     }
 
+    /** A guarded benchmark boundary write must affect its one chosen source row. */
+    void executeOneSourceUpdate(String sql) throws Exception {
+        requireOpen();
+        Objects.requireNonNull(sql, "sql");
+        try (Statement statement = source.createStatement()) {
+            int affected = statement.executeUpdate(sql);
+            if (affected != 1) {
+                throw new AssertionError("benchmark boundary update affected " + affected + " rows");
+            }
+        }
+    }
+
+    /** Recheck the last completed phase after the unmeasured source boundary has been ACKed. */
+    List<TargetResult> verifyCurrentTargets(BenchmarkWorkloadDefinitions.Phase phase) throws Exception {
+        requireOpen();
+        if (nextPhase == 0 || !workload.phases().get(nextPhase - 1).equals(phase)) {
+            throw new IllegalArgumentException("target verification requires the last completed phase");
+        }
+        return awaitTargets(phase);
+    }
+
     /** Runs the next declared phase; the hook can register target expectations before SQL begins. */
     PhaseResult runPhase(BenchmarkWorkloadDefinitions.Phase phase, boolean paced,
             BatchHook beforeBatch) throws Exception {

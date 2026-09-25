@@ -137,10 +137,10 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     }
 
     /**
-     * Call only after authoritative target ACK says the source terminal is covered. The barrier is an
-     * acknowledged write in the same database stream as the target changes, so seeing it proves all
-     * earlier target writes in that stream have been inspected. Final target count/checksum are checked
-     * separately with the workload definition after this method returns.
+     * Call only after the target-ACK counter covers every expected output in this measured phase. The
+     * barrier is an acknowledged write in the same database stream as the target changes, so seeing it
+     * proves all earlier target writes in that stream have been inspected. The source terminal ACK and
+     * final target count/checksum are checked separately after the measured phases.
      */
     List<Delivery> finish(Duration timeout) {
         Objects.requireNonNull(timeout, "finish timeout");

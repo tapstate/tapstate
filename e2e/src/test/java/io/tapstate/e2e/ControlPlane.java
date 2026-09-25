@@ -17,6 +17,7 @@ import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -1122,6 +1123,23 @@ final class ControlPlane {
     Optional<PipelineState> state(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/status"));
         return interpretState(response.statusCode(), response.body(), pipelineId);
+    }
+
+    /** The persisted observation timestamp, used to reject a stale pre-window metrics baseline. */
+    Instant statusObservedAt(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/status"));
+        expect(response, 200, "read the observation time of " + pipelineId);
+        Object parsed = JsonReader.parse(response.body());
+        if (!(parsed instanceof Map<?, ?> status)
+                || !pipelineId.equals(status.get("pipelineId"))
+                || !(status.get("observedAt") instanceof String observedAt)) {
+            throw new AssertionError("status has no matching observation time: " + response.body());
+        }
+        try {
+            return Instant.parse(observedAt);
+        } catch (RuntimeException invalid) {
+            throw new AssertionError("status has an invalid observation time: " + response.body(), invalid);
+        }
     }
 
     /**

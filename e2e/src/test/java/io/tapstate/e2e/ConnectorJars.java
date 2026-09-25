@@ -48,13 +48,17 @@ final class ConnectorJars {
 
     /** The bytes of the jar whose file name begins with the connector id. */
     static byte[] bytesFor(String connectorId) {
-        Path directory = directory();
-        Path jar = find(directory, connectorId);
+        Path jar = pathFor(connectorId);
         try {
             return Files.readAllBytes(jar);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot read the " + connectorId + " connector at " + jar, e);
         }
+    }
+
+    /** The same uniquely resolved jar used for registration, for an independent source reader. */
+    static Path pathFor(String connectorId) {
+        return find(directory(), connectorId);
     }
 
     private static Path directory() {
