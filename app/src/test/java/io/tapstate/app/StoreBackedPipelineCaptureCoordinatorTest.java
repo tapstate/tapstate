@@ -42,6 +42,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -723,6 +728,67 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 .containsOnly(entry("orders", new TableSnapshot(500L, null, null)));
         // A total without what it accumulates from cannot be read, so the load says when it opened.
         assertThat(coordinator.snapshotProgress("p").start()).isPresent();
+    }
+
+    @Test
+    void aSlowSnapshotDoesNotBlockAnotherPipelinesCaptureStart() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("slow_src", "orders", null));
+        artifacts.save(cdcSource("fast_src", "customers", null));
+        artifacts.save(pipelineWithReadMode("slow", "slow_src", ReadMode.SNAPSHOT_AND_CDC));
+        artifacts.save(pipelineWithReadMode("fast", "fast_src", ReadMode.CDC_ONLY));
+        CountDownLatch slowSnapshotEntered = new CountDownLatch(1);
+        CountDownLatch releaseSlowSnapshot = new CountDownLatch(1);
+        CountDownLatch fastStartAttempted = new CountDownLatch(1);
+        CountDownLatch fastCaptureEntered = new CountDownLatch(1);
+        CaptureStarter starter = (spec, passthrough) -> {
+            if (spec.pipelineId().equals("slow")) {
+                passthrough.accept(Envelope.read(1L, "orders", Map.of("id", 1L), Map.of()));
+                slowSnapshotEntered.countDown();
+                try {
+                    if (!releaseSlowSnapshot.await(30, TimeUnit.SECONDS)) {
+                        throw new AssertionError("slow snapshot was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("slow snapshot was interrupted", interrupted);
+                }
+            } else {
+                fastCaptureEntered.countDown();
+            }
+            return new CaptureRun(Optional.empty(), false, 1L, Optional.empty(), Optional.empty(),
+                    new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()),
+                new SnapshotBuffer());
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> slowStart = workers.submit(() -> coordinator.startCapture("slow"));
+            assertThat(slowSnapshotEntered.await(5, TimeUnit.SECONDS))
+                    .as("the slow snapshot must enter the capture starter").isTrue();
+            Future<?> fastStart = workers.submit(() -> {
+                fastStartAttempted.countDown();
+                coordinator.startCapture("fast");
+            });
+            assertThat(fastStartAttempted.await(5, TimeUnit.SECONDS))
+                    .as("the fast pipeline must attempt its independent start").isTrue();
+            assertThat(releaseSlowSnapshot.getCount())
+                    .as("the slow snapshot must not have been released").isEqualTo(1);
+            assertThat(fastCaptureEntered.await(5, TimeUnit.SECONDS))
+                    .as("the fast capture must start while the slow snapshot is blocked").isTrue();
+            fastStart.get(5, TimeUnit.SECONDS);
+            assertThat(releaseSlowSnapshot.getCount())
+                    .as("the fast capture must finish before releasing the slow snapshot").isEqualTo(1);
+            releaseSlowSnapshot.countDown();
+            slowStart.get(5, TimeUnit.SECONDS);
+        } finally {
+            releaseSlowSnapshot.countDown();
+            workers.shutdown();
+            if (!workers.awaitTermination(5, TimeUnit.SECONDS)) {
+                workers.shutdownNow();
+            }
+        }
     }
 
     @Test
