@@ -542,8 +542,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             }
             long deadline = System.nanoTime() + ACK_WAIT.toNanos();
             while (true) {
-                pending.entrySet().removeIf(entry -> positionCoverage.covers(
-                        fork.control().targetAckFor(entry.getKey()), entry.getValue()));
+                pending.entrySet().removeIf(entry -> fork.control()
+                        .targetAckForIfPresent(entry.getKey())
+                        .filter(ack -> positionCoverage.covers(ack, entry.getValue()))
+                        .isPresent());
                 if (pending.isEmpty()) {
                     return System.nanoTime();
                 }
@@ -583,13 +585,17 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 BenchmarkWorkloadDefinitions.SourceChain chain, String sourceToken,
                 BenchmarkConnectorPositionCoverage positionCoverage) throws InterruptedException {
             long deadline = System.nanoTime() + ACK_WAIT.toNanos();
+            Optional<String> lastAck = Optional.empty();
             while (true) {
-                String ack = control.targetAckFor(chain);
-                if (positionCoverage.covers(ack, sourceToken)) {
-                    return ack;
+                Optional<String> ack = control.targetAckForIfPresent(chain);
+                lastAck = ack;
+                if (ack.isPresent() && positionCoverage.covers(ack.get(), sourceToken)) {
+                    return ack.get();
                 }
                 if (System.nanoTime() >= deadline) {
-                    throw new AssertionError("target ACK did not cover the source event for " + chain.id());
+                    throw new AssertionError("target ACK did not cover the source event for " + chain.id()
+                            + "; source=" + positionCoverage.describe(sourceToken)
+                            + "; lastAck=" + lastAck.map(positionCoverage::describe).orElse("ABSENT"));
                 }
                 TimeUnit.NANOSECONDS.sleep(COUNTER_POLL.toNanos());
             }

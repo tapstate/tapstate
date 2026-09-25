@@ -253,12 +253,12 @@ class ControlPlaneTest {
         String join = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
                 Map.of("chainId", "physical-orders", "sourceId", "src_orders", "tables", List.of("orders"),
                         "targetAcked", Map.of("token", "join-orders-ack")),
-                Map.of("chainId", "physical-customers", "sourceId", "src_customers",
+                Map.of("chainId", "physical-orders", "sourceId", "src_customers",
                         "tables", List.of("customers"), "targetAcked", Map.of("token", "join-customers-ack")))));
         String nest = JsonWriter.write(Map.of("pipelineId", "bench_nest", "chains", List.of(
                 Map.of("chainId", "physical-orders", "sourceId", "src_nest_orders",
                         "tables", List.of("orders"), "targetAcked", Map.of("token", "nest-orders-ack")),
-                Map.of("chainId", "physical-items", "sourceId", "src_items",
+                Map.of("chainId", "physical-orders", "sourceId", "src_items",
                         "tables", List.of("items"), "targetAcked", Map.of("token", "nest-items-ack")))));
         ControlPlane.PositionRead joinRead = ControlPlane.interpretPositionRead(200, join, "bench_join");
         ControlPlane.PositionRead nestRead = ControlPlane.interpretPositionRead(200, nest, "bench_nest");
@@ -266,7 +266,7 @@ class ControlPlaneTest {
         assertThat(joinRead.chains()).containsExactly(
                 new ControlPlane.PositionChain("physical-orders", "src_orders", List.of("orders"),
                         "join-orders-ack"),
-                new ControlPlane.PositionChain("physical-customers", "src_customers", List.of("customers"),
+                new ControlPlane.PositionChain("physical-orders", "src_customers", List.of("customers"),
                         "join-customers-ack"));
         assertThat(ControlPlane.resolveTargetAck(joinRead,
                 chain("bench_join", "src_orders", "orders"))).isEqualTo("join-orders-ack");
@@ -287,6 +287,8 @@ class ControlPlaneTest {
         String pending = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
                 Map.of("chainId", "orders-chain", "sourceId", "src_orders", "tables", List.of("orders")))));
         ControlPlane.PositionRead read = ControlPlane.interpretPositionRead(200, pending, "bench_join");
+        assertThat(ControlPlane.resolveTargetAckIfPresent(read,
+                chain("bench_join", "src_orders", "orders"))).isEmpty();
         assertThatThrownBy(() -> ControlPlane.resolveTargetAck(read,
                         chain("bench_join", "src_orders", "orders")))
                 .isInstanceOf(AssertionError.class)
@@ -305,18 +307,23 @@ class ControlPlaneTest {
                         ControlPlane.interpretPositionRead(200, ambiguous, "bench_join"),
                         chain("bench_join", "src_orders", "orders")))
                 .isInstanceOf(AssertionError.class)
-                .hasMessageContaining("found 2");
+                .hasMessageContaining("duplicate source/table lineage");
     }
 
     @Test
-    void benchmarkPositionReadRejectsDuplicateIdsWrongPipelineAndMalformedTables() {
-        String duplicateIds = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
+    void benchmarkPositionReadAllowsSharedPhysicalChainButRejectsDuplicateRoutes() {
+        String sharedChain = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
                 Map.of("chainId", "same", "sourceId", "src_orders", "tables", List.of("orders")),
                 Map.of("chainId", "same", "sourceId", "src_customers", "tables", List.of("customers")))));
-        assertThatThrownBy(() -> ControlPlane.interpretPositionRead(200, duplicateIds, "bench_join"))
+        assertThat(ControlPlane.interpretPositionRead(200, sharedChain, "bench_join").chains())
+                .hasSize(2);
+        String duplicateRoute = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(
+                Map.of("chainId", "first", "sourceId", "src_orders", "tables", List.of("orders")),
+                Map.of("chainId", "second", "sourceId", "src_orders", "tables", List.of("orders")))));
+        assertThatThrownBy(() -> ControlPlane.interpretPositionRead(200, duplicateRoute, "bench_join"))
                 .isInstanceOf(AssertionError.class)
-                .hasMessageContaining("duplicate chain lineage");
-        assertThatThrownBy(() -> ControlPlane.interpretPositionRead(200, duplicateIds, "bench_nest"))
+                .hasMessageContaining("duplicate source/table lineage");
+        assertThatThrownBy(() -> ControlPlane.interpretPositionRead(200, sharedChain, "bench_nest"))
                 .isInstanceOf(AssertionError.class)
                 .hasMessageContaining("no matching pipeline");
         String duplicateTables = JsonWriter.write(Map.of("pipelineId", "bench_join", "chains", List.of(

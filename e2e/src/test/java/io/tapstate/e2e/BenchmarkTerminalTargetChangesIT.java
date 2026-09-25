@@ -228,6 +228,11 @@ class BenchmarkTerminalTargetChangesIT {
                     assertThat(nestOps).as("nest terminal physical writes")
                             .containsExactly(OperationType.INSERT, OperationType.UPDATE);
                     System.out.printf("benchmark-terminal-shape join=%s nest=%s%n", joinOps, nestOps);
+                    Await.until("terminal ACKs for every stateful source", Duration.ofSeconds(45),
+                            () -> workload.sourceChains().stream()
+                                    .allMatch(chain -> control.targetAckForIfPresent(chain).isPresent()),
+                            () -> workload.sourceChains().stream().map(chain -> chain.id() + "="
+                                    + control.targetAckForIfPresent(chain).isPresent()).toList().toString());
                 }
             }
         }

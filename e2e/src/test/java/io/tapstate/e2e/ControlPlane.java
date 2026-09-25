@@ -1658,12 +1658,19 @@ final class ControlPlane {
 
     /** The ACK for exactly one declared source/table chain in this pipeline. */
     String targetAckFor(BenchmarkWorkloadDefinitions.SourceChain sourceChain) {
+        return targetAckForIfPresent(sourceChain).orElseThrow(() ->
+                new AssertionError("source chain " + sourceChain.id() + " has no authoritative target ACK"));
+    }
+
+    /** A pending chain has no ACK yet; its source/table lineage still must match exactly once. */
+    Optional<String> targetAckForIfPresent(BenchmarkWorkloadDefinitions.SourceChain sourceChain) {
         if (sourceChain == null) {
             throw new IllegalArgumentException("a benchmark source chain is required");
         }
         String pipelineId = sourceChain.pipelineId();
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
-        return resolveTargetAck(interpretPositionRead(response.statusCode(), response.body(), pipelineId), sourceChain);
+        return resolveTargetAckIfPresent(
+                interpretPositionRead(response.statusCode(), response.body(), pipelineId), sourceChain);
     }
 
     record PositionChain(String chainId, String sourceId, List<String> tables, String targetAckedToken) {
@@ -1696,20 +1703,22 @@ final class ControlPlane {
             throw new AssertionError("position answer carried no matching pipeline and chains: " + body);
         }
         List<PositionChain> chains = new ArrayList<>();
-        Set<String> seenChains = new TreeSet<>();
+        Set<String> seenSourceTables = new TreeSet<>();
         for (Object value : values) {
             if (!(value instanceof Map<?, ?> chain)
                     || !(chain.get("chainId") instanceof String chainId) || chainId.isBlank()
-                    || !seenChains.add(chainId)
                     || !(chain.get("sourceId") instanceof String sourceId) || sourceId.isBlank()
                     || !(chain.get("tables") instanceof List<?> selected) || selected.isEmpty()) {
-                throw new AssertionError("position answer carried invalid or duplicate chain lineage: " + body);
+                throw new AssertionError("position answer carried invalid source/table lineage: " + body);
             }
             List<String> tables = new ArrayList<>();
             Set<String> seenTables = new TreeSet<>();
             for (Object table : selected) {
                 if (!(table instanceof String name) || name.isBlank() || !seenTables.add(name)) {
                     throw new AssertionError("position answer carried invalid or duplicate selected tables: " + body);
+                }
+                if (!seenSourceTables.add(sourceId + "\u0000" + name)) {
+                    throw new AssertionError("position answer carried duplicate source/table lineage: " + body);
                 }
                 tables.add(name);
             }
@@ -1729,6 +1738,13 @@ final class ControlPlane {
 
     /** Refuses to attribute a different source's ACK to this benchmark chain. */
     static String resolveTargetAck(PositionRead read, BenchmarkWorkloadDefinitions.SourceChain sourceChain) {
+        return resolveTargetAckIfPresent(read, sourceChain).orElseThrow(() ->
+                new AssertionError("source chain " + sourceChain.id() + " has no authoritative target ACK"));
+    }
+
+    /** Keeps a pending ACK distinct from invalid or ambiguous source/table lineage. */
+    static Optional<String> resolveTargetAckIfPresent(
+            PositionRead read, BenchmarkWorkloadDefinitions.SourceChain sourceChain) {
         if (read == null || sourceChain == null || !read.pipelineId().equals(sourceChain.pipelineId())) {
             throw new AssertionError("benchmark chain and position answer name different pipelines");
         }
@@ -1740,11 +1756,7 @@ final class ControlPlane {
             throw new AssertionError("expected exactly one position chain for " + sourceChain.id()
                     + ", found " + matches.size());
         }
-        PositionChain match = matches.getFirst();
-        if (match.targetAckedToken() == null) {
-            throw new AssertionError("source chain " + sourceChain.id() + " has no authoritative target ACK");
-        }
-        return match.targetAckedToken();
+        return Optional.ofNullable(matches.getFirst().targetAckedToken());
     }
 
     static Map<String, String> interpretTargetAckedTokens(int status, String body, String pipelineId) {

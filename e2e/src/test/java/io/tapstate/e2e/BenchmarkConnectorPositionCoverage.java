@@ -113,6 +113,28 @@ final class BenchmarkConnectorPositionCoverage implements BenchmarkAckOracle.Pos
         }
     }
 
+    /** A bounded numeric diagnostic for an opaque connector token, without printing the token itself. */
+    String describe(String token) {
+        if (closed || token == null) {
+            return "ABSENT";
+        }
+        try {
+            Object decoded = decode(token);
+            return switch (mode) {
+                case MYSQL_DEFAULT -> {
+                    MysqlCoordinate coordinate = mysqlCoordinate(decoded);
+                    yield "file=" + coordinate.filePrefix + "." + coordinate.fileNumber
+                            + ",pos=" + coordinate.position + ",event=" + coordinate.event
+                            + ",row=" + coordinate.row + ",serverId=" + coordinate.serverId;
+                }
+                case POSTGRES_PGOUTPUT -> "lsn=" + Long.toUnsignedString(postgresLsn(decoded));
+            };
+        } catch (IOException | ReflectiveOperationException
+                 | IllegalArgumentException | ClassCastException invalid) {
+            return "UNDECODABLE(" + invalid.getClass().getSimpleName() + ")";
+        }
+    }
+
     private Object decode(String token) throws IOException, ClassNotFoundException {
         if (token.isBlank() || token.length() > MAX_TOKEN_LENGTH) {
             throw new IllegalArgumentException("missing or oversized position token");
