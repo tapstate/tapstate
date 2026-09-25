@@ -58,6 +58,45 @@ class ClusterRebuildAdmissionTest {
     }
 
     /**
+     * A run refused before it started because a member joined between its plan and its start ran nothing,
+     * so its death is not the pipeline's own - and a joining member is exactly what the departure reading
+     * above rightly ignores. Without its own answer such a run stays failed for a person over the moment it
+     * happened to be submitted in; with it, the run is rebuilt against the members present, and only within
+     * the same budget every rebuild is held to.
+     */
+    @Test
+    void aRunRefusedForAChangedMembershipBeforeItStartedIsRebuiltWithinTheBudget() {
+        ClusterRebuildAdmission afterARefusedStart = new ClusterRebuildAdmission(
+                ownership, pipelineId -> true, BACKOFF, nanos::get);
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a", "node-b", "node-c");
+
+        assertThat(afterARefusedStart.admits("orders")).isTrue();
+        for (int attempt = 1; attempt < ClusterRebuildAdmission.MAX_ATTEMPTS; attempt++) {
+            nanos.addAndGet(BACKOFF.toNanos());
+            assertThat(afterARefusedStart.admits("orders")).as("attempt %s", attempt + 1).isTrue();
+        }
+        nanos.addAndGet(BACKOFF.toNanos());
+        assertThat(afterARefusedStart.admits("orders"))
+                .as("the budget is spent: a start refused over and over is left for a person")
+                .isFalse();
+    }
+
+    @Test
+    void theRefusalIsReadOffItsCodeWhetherTheCauseOrOnlyItsRenderingSurvived() {
+        io.tapstate.core.common.TapstateException refused = new io.tapstate.core.common.TapstateException(
+                io.tapstate.runtime.engine.EngineError.MEMBERSHIP_CHANGED_BEFORE_START,
+                java.util.Map.of("pipeline", "orders", "planned", 2, "actual", 3), null);
+
+        assertThat(ClusterRebuildAdmission.isMembershipChangedBeforeStart(refused)).isTrue();
+        assertThat(ClusterRebuildAdmission.isMembershipChangedBeforeStart(
+                new RuntimeException("com.hazelcast.jet.JetException: " + refused))).isTrue();
+        assertThat(ClusterRebuildAdmission.isMembershipChangedBeforeStart(
+                new RuntimeException("connector refused the write"))).isFalse();
+    }
+
+    /**
      * How a member actually leaves a running cluster: the committed set keeps naming it, because that
      * set only ever grows, and what changes is who this member can see. Asked of the committed set, the
      * departure never shows -- and a run whose driver survived the loss of another member it was running

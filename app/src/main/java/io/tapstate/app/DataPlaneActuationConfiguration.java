@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkCapturePort;
+import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
@@ -58,10 +59,33 @@ class DataPlaneActuationConfiguration {
      */
     @Bean
     DagSource dagSource(StorePort storePort, NestSettings nestSettings, ConnectionTester connectionTester,
-            HazelcastInstance hazelcastMember) {
+            HazelcastInstance hazelcastMember, ParallelismBudget parallelismBudget) {
         return new StoreBackedDagSource(storePort, nestSettings,
                 StoreReachability.probing(connectionTester, STORE_PROBE_TIMEOUT),
-                SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()));
+                SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()),
+                () -> dataMembers(hazelcastMember), parallelismBudget);
+    }
+
+    /**
+     * How many members a run submitted now would take part on: every member that holds data, which in this
+     * product is every member - none joins as a lite member.
+     */
+    private static int dataMembers(HazelcastInstance member) {
+        return (int) member.getCluster().getMembers().stream().filter(m -> !m.isLiteMember()).count();
+    }
+
+    /**
+     * The limits a node's per-member width is held to. Every one is countable before anything is opened, so
+     * the same configuration is judged the same way on every connector version.
+     */
+    @Bean
+    ParallelismBudget parallelismBudget(
+            @Value("${tapstate.execution.max-local-parallelism:16}") int maxLocalParallelism,
+            @Value("${tapstate.execution.max-connector-instances-per-member:8}") int maxConnectorInstances,
+            @Value("${tapstate.execution.max-buffered-records-per-member:262144}") long maxBufferedRecords,
+            @Value("${tapstate.execution.max-blocking-processors-per-member:128}") int maxBlockingProcessors) {
+        return new ParallelismBudget(maxLocalParallelism, maxConnectorInstances, maxBufferedRecords,
+                maxBlockingProcessors);
     }
 
     @Bean
@@ -147,12 +171,16 @@ class DataPlaneActuationConfiguration {
      */
     @Bean
     RebuildAdmission rebuildAdmission(
-            ClusterProperties clusterProperties, PipelineActuationOwnership pipelineActuationOwnership) {
+            ClusterProperties clusterProperties, PipelineActuationOwnership pipelineActuationOwnership,
+            Engine engine) {
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return RebuildAdmission.never();
         }
         return new ClusterRebuildAdmission(
-                pipelineActuationOwnership, clusterProperties.getWorkloadClaimTtl());
+                pipelineActuationOwnership,
+                pipelineId -> engine.failureOf(pipelineId)
+                        .map(ClusterRebuildAdmission::isMembershipChangedBeforeStart).orElse(false),
+                clusterProperties.getWorkloadClaimTtl());
     }
 
     /**

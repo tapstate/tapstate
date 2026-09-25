@@ -29,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -272,12 +273,28 @@ public final class PipelineDagBuilder {
      */
     public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
             FrontierBinding frontier) {
+        return build(pipeline, bindings, sinkAck, frontier, ExecutionShape.totalOne());
+    }
+
+    /**
+     * Builds the Jet DAG for a validated pipeline with each node as wide as {@code shape} says. A node the
+     * shape runs natively runs its per-member count on every member, and every edge into it routes by the key
+     * of the rows it carries; every other node is one processor for the whole cluster, reached over edges
+     * that deliver everything to it. The shape travels into each native node, which refuses an execution
+     * that starts on a member count other than the one its width was worked out for.
+     */
+    public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
+            FrontierBinding frontier, ExecutionShape shape) {
+        Objects.requireNonNull(shape, "shape");
         DAG dag = new DAG();
         Map<String, Vertex> byKey = new HashMap<>();
-        // Whether anything in this graph gathers several chains into one stream. It settles which shape of
-        // frontier the sinks are given, and it is a property of the graph rather than of what flows through
-        // it, so it is answered here and never re-judged while running.
-        boolean assembled = false;
+        // Whether anything in this graph gathers several chains into one stream, or splits one chain over
+        // several processors. It settles which shape of frontier the sinks are given, and it is a property of
+        // the graph rather than of what flows through it, so it is answered here and never re-judged while
+        // running. A chain split over several processors reaches whatever reads it over several queues that
+        // drain independently, so a later position can land before an earlier one - the same reading an
+        // assembly needs, and for the same reason.
+        boolean assembled = shape.anyNative();
         // Jet rejects two edges that share a source or destination ordinal, so every edge takes the
         // next free ordinal on each of its endpoints; a fan-in (union) and a fan-out (multi-sink)
         // then wire without collision.
@@ -361,12 +378,12 @@ public final class PipelineDagBuilder {
                 }
                 List<String> upstream = resolveClause(step.from(), bindings);
                 Vertex vertex = transformVertex(dag, step, bindings, axes,
-                        chains == null ? null : chains.perOrdinal(upstream));
+                        chains == null ? null : chains.perOrdinal(upstream), shape);
                 byKey.put(step.id(), vertex);
                 if (chains != null) {
                     chains.derived(step.id(), upstream);
                 }
-                connect(dag, verticesOf(upstream, byKey), vertex, outboundOrdinal, inboundOrdinal);
+                connect(dag, verticesOf(upstream, byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
             }
         }
 
@@ -386,7 +403,7 @@ public final class PipelineDagBuilder {
             String viewName = VIEW_VERTEX_PREFIX + view.id();
             Vertex vertex = dag.newVertex(viewName,
                     sinkVertex(viewName, bindings.viewSinks().apply(view), sinkAck, axes, assembled));
-            connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
+            connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal, shape);
             readsAs.put(view.id(), upstream);
         }
 
@@ -402,7 +419,7 @@ public final class PipelineDagBuilder {
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
                 Vertex vertex = dag.newVertex(name,
                         sinkVertex(name, bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
-                connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
+                connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal, shape);
             }
         }
 
@@ -447,21 +464,29 @@ public final class PipelineDagBuilder {
      * this builder's scope and is refused.
      */
     private static Vertex transformVertex(DAG dag, Step step, DagBindings bindings, ChainAxes axes,
-            Map<Integer, List<String>> chainsByOrdinal) {
+            Map<Integer, List<String>> chainsByOrdinal, ExecutionShape shape) {
         if (!(step instanceof Step.Inline inline)) {
             throw new IllegalArgumentException(
                     "transform step '" + step.id() + "' is a use-reference; resolve it to an inline step first");
         }
         TransformBody body = inline.body();
+        boolean wide = shape.isNative(step.id());
         if (body instanceof TransformBody.Union) {
             // The merge is the topology, so nothing is transformed here - but the frontier still has to be
             // worked out per edge. The combined bound the engine would forward is never delivered at all
             // for a chain only one of the merged streams carries, which is the whole shape a union is.
-            return dag.newVertex(step.id(),
-                    PassthroughProcessor.metaSupplier(step.id(), axes, chainsByOrdinal));
+            return wide
+                    ? dag.newVertex(step.id(), PassthroughProcessor.nativeMetaSupplier(
+                            step.id(), axes, chainsByOrdinal, shape.plannedMembers()))
+                            .localParallelism(shape.localOf(step.id()))
+                    : dag.newVertex(step.id(), PassthroughProcessor.metaSupplier(step.id(), axes, chainsByOrdinal));
         }
-        return dag.newVertex(step.id(), TransformProcessor.metaSupplier(step.id(),
-                bindings.transformPorts().apply(step), axes, chainsByOrdinal));
+        return wide
+                ? dag.newVertex(step.id(), TransformProcessor.nativeMetaSupplier(step.id(),
+                        bindings.transformPorts().apply(step), axes, chainsByOrdinal, shape.plannedMembers()))
+                        .localParallelism(shape.localOf(step.id()))
+                : dag.newVertex(step.id(), TransformProcessor.metaSupplier(step.id(),
+                        bindings.transformPorts().apply(step), axes, chainsByOrdinal));
     }
 
     /**
@@ -578,12 +603,21 @@ public final class PipelineDagBuilder {
      * place input can come from, so a mis-keyed edge and a correct one are the same graph.
      */
     private static void connect(DAG dag, List<Vertex> upstream, Vertex destination,
-            Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal) {
+            Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal, ExecutionShape shape) {
+        String node = destination.getName();
+        // A node running on every member takes each row where its key belongs, so that one row's changes
+        // are applied on one processor in the order they were read. The routing is worked out once per node
+        // rather than per edge: the key is a property of the rows, not of which upstream sent them.
+        com.hazelcast.function.FunctionEx<Object, Object> byKey = shape.isNative(node)
+                ? RoutingKeys.forNode(node, shape.inputKeysOf(node))
+                : null;
         for (Vertex source : upstream) {
             int from = outboundOrdinal.merge(source, 1, Integer::sum) - 1;
             int to = inboundOrdinal.merge(destination, 1, Integer::sum) - 1;
-            dag.edge(Edge.from(source, from).to(destination, to)
-                    .distributed().allToOne(destination.getName()));
+            Edge edge = Edge.from(source, from).to(destination, to);
+            dag.edge(byKey != null
+                    ? edge.partitioned(byKey).distributed()
+                    : edge.distributed().allToOne(node));
         }
     }
 }

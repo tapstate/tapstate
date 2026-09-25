@@ -182,7 +182,26 @@ enum ActuationError implements TapstateErrorCode {
      * A paused run also retains its assembly, which a resume with an unchanged artifact may reuse.
      */
     SCHEMA_SYNC_WHILE_RUNNING("actuation.schema-sync-while-running",
-            Set.of("pipeline", "state", "desired"));
+            Set.of("pipeline", "state", "desired")),
+
+    /**
+     * A node's cluster-wide target has no width the members of this run can take within every budget:
+     * {@code node} is the node, {@code requested} the target, {@code members} the members taking part and
+     * {@code candidates} each per-member count tried with the first budget it broke. Refused before anything
+     * starts, because running over a budget and running at a width nobody asked for are both worse than not
+     * running.
+     */
+    NO_SAFE_PARALLELISM("actuation.no-safe-parallelism",
+            Set.of("pipeline", "node", "requested", "members", "candidates")),
+
+    /**
+     * A node was explicitly asked to run wider than one processor, and it can only run as one: {@code node}
+     * is the node, {@code requested} the target and {@code reason} why - a stream reaching it carries no key
+     * to route it by, or every row it writes lands in one target table that has none. With no key, two
+     * processors would apply one row's changes in an order nobody decides.
+     */
+    PARALLELISM_NEEDS_A_KEY("actuation.parallelism-needs-a-key",
+            Set.of("pipeline", "node", "requested", "reason"));
 
     private final String code;
     private final Set<String> placeholders;

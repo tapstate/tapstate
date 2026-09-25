@@ -12,7 +12,9 @@ actuation.join-output-schema-source-changed
 actuation.join-source-key-missing
 actuation.join-source-not-declared
 actuation.join-sql-invalid
+actuation.no-safe-parallelism
 actuation.not-a-pipeline
+actuation.parallelism-needs-a-key
 actuation.pipeline-not-found
 actuation.schema-sync-while-running
 actuation.source-schema-not-discovered
@@ -198,7 +200,10 @@ engine.frontier-pinned
 engine.job-failed
 engine.job-still-ending
 engine.join-dimension-row-displaced
+engine.key-change-on-parallel-node
+engine.membership-changed-before-start
 engine.no-such-job
+engine.routing-key-missing
 engine.view-key-missing-from-before-image
 io.document-too-large
 io.document-unreadable

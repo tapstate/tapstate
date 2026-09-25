@@ -10,6 +10,7 @@ import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.adapters.transform.UnwindSpec;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.UnwindWriteKeys;
+import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.FromClause;
@@ -21,18 +22,19 @@ import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
-import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.DagBindings;
+import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.FrontierBinding;
 import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.engine.PipelineDagBuilder;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.engine.ViewSinkWriters;
-import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinBinding;
 import io.tapstate.runtime.engine.join.JoinStoresBinding;
+import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.nest.NestBinding;
 import io.tapstate.runtime.engine.nest.NestClock;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -45,9 +47,9 @@ import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.sink.SinkPreparationNamespace;
 import io.tapstate.spi.sink.SinkWriter;
-import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetIndex;
+import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
@@ -58,8 +60,8 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.transform.TransformPort;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -67,6 +69,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.IntSupplier;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -101,6 +104,10 @@ final class StoreBackedDagSource implements DagSource {
     private final SourceSchemaCopy sourceSchemaCopy;
     private final StepSchemaRecord stepSchemaRecord;
     private final SourcePlacement sourcePlacement;
+    // How many members a run built now takes part on, read at the moment it is built: the widths of its nodes
+    // are worked out for exactly that many.
+    private final IntSupplier memberCount;
+    private final ParallelismBudget parallelismBudget;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -129,6 +136,17 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
+     * The assembled source for a cluster: as above, with each run's node widths worked out for the members
+     * {@code memberCount} reports when the run is built, within {@code parallelismBudget}.
+     */
+    StoreBackedDagSource(
+            StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability,
+            SourcePlacement sourcePlacement, IntSupplier memberCount, ParallelismBudget parallelismBudget) {
+        this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement,
+                Objects.requireNonNull(storePort, "storePort").artifacts(), memberCount, parallelismBudget);
+    }
+
+    /**
      * The binder the product is assembled with, named rather than written inline at each construction.
      *
      * <p>It has to be this one and not a method reference to the factory. A method reference binds to the
@@ -149,7 +167,8 @@ final class StoreBackedDagSource implements DagSource {
     public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
         ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
         StoreBackedDagSource captured = new StoreBackedDagSource(
-                storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot);
+                storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
+                memberCount, parallelismBudget);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
@@ -207,12 +226,13 @@ final class StoreBackedDagSource implements DagSource {
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement) {
         this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
-                Objects.requireNonNull(storePort, "storePort").artifacts());
+                Objects.requireNonNull(storePort, "storePort").artifacts(), () -> 1, ParallelismBudget.DEFAULTS);
     }
 
     private StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
-            StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore) {
+            StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore,
+            IntSupplier memberCount, ParallelismBudget parallelismBudget) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
@@ -223,6 +243,8 @@ final class StoreBackedDagSource implements DagSource {
         this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
         this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
         this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
+        this.memberCount = Objects.requireNonNull(memberCount, "memberCount");
+        this.parallelismBudget = Objects.requireNonNull(parallelismBudget, "parallelismBudget");
     }
 
     @Override
@@ -316,11 +338,32 @@ final class StoreBackedDagSource implements DagSource {
                 pipeline.id(), pipeline.metadata(),
                 pipeline.sources().stream().filter(ref -> sourceKeysById.containsKey(ref.id())).toList(),
                 pipeline.transforms(), pipeline.view(), pipeline.serve(), pipeline.settings(), pipeline.experimental());
+        ExecutionShape shape = ExecutionShapes.of(pipelineId, pipeline, memberCount.getAsInt(), parallelismBudget,
+                new ExecutionShapes.Graph(
+                        ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
+                        streamOfSourceVertex(sourceVertices),
+                        keyColumnsOf(bySourceTable),
+                        keyColumnsOf(assembled)));
         return PipelineDagBuilder.build(
                 builtPipeline,
                 bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
-                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId), fence), frontier);
+                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId), fence), frontier, shape);
+    }
+
+    /** The stream each source vertex emits: the table it reads, which is what its rows name as their stream. */
+    private static Map<String, String> streamOfSourceVertex(Map<String, SourceVertex> sourceVertices) {
+        Map<String, String> streams = new LinkedHashMap<>();
+        sourceVertices.forEach((key, vertex) -> streams.put(key, vertex.table()));
+        return streams;
+    }
+
+    /** The key columns of each target model, in key order; empty for a model with no key. */
+    private static Map<String, List<String>> keyColumnsOf(Map<String, TargetTable> models) {
+        Map<String, List<String>> keys = new LinkedHashMap<>();
+        models.forEach((name, model) -> keys.put(name, model == null ? List.of()
+                : model.fields().stream().filter(TargetField::primaryKey).map(TargetField::name).toList()));
+        return keys;
     }
 
     /**

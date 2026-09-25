@@ -103,7 +103,32 @@ public enum EngineError implements TapstateErrorCode {
      * moment of replacement is the only place anything can observe it.
      */
     JOIN_DIMENSION_ROW_DISPLACED("engine.join-dimension-row-displaced",
-            Set.of("source", "key"), Severity.WARNING);
+            Set.of("source", "key"), Severity.WARNING),
+
+    /**
+     * A change reached a node running on several processors without the key it is routed by: a key column
+     * is absent from the image the change carries, or holds nothing. {@code node} is the node, {@code stream}
+     * the stream the change travelled on and {@code columns} the key it was expected to carry. There is no
+     * processor such a change could be sent to that keeps it in order with the other changes of its row.
+     */
+    ROUTING_KEY_MISSING("engine.routing-key-missing", Set.of("node", "stream", "columns")),
+
+    /**
+     * An update moved a row from one key to another at a node running on several processors. {@code node} is
+     * the node and {@code stream} the stream. The change belongs to two keys, and the two keys are processed
+     * on different processors, so no single place to send it keeps it in order with both - and applying it
+     * out of order leaves a row behind under the old key or overwrites a newer value under the new one.
+     */
+    KEY_CHANGE_ON_PARALLEL_NODE("engine.key-change-on-parallel-node", Set.of("node", "stream")),
+
+    /**
+     * A run started on a different number of members than it was planned for: a member joined or left
+     * between the plan and the start. {@code pipeline} is the pipeline, {@code planned} the members the widths
+     * were worked out for and {@code actual} the members the run started on. Stopped before any processor
+     * ran, because every processor count and every set of writers worked out for the plan would be wrong.
+     */
+    MEMBERSHIP_CHANGED_BEFORE_START("engine.membership-changed-before-start",
+            Set.of("pipeline", "planned", "actual"));
 
     private final String code;
     private final Set<String> placeholders;

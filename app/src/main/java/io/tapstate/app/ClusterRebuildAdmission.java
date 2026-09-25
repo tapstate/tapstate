@@ -1,12 +1,14 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
-
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,6 +49,7 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     static final int MAX_ATTEMPTS = 3;
 
     private final PipelineActuationOwnership actuation;
+    private final Predicate<String> refusedForAChangedMembership;
     private final long backoffNanos;
     private final LongSupplier nanoTime;
     private final Map<String, Attempts> attempts = new HashMap<>();
@@ -63,7 +66,26 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     }
 
     ClusterRebuildAdmission(PipelineActuationOwnership actuation, Duration backoff, LongSupplier nanoTime) {
+        this(actuation, pipelineId -> false, backoff, nanoTime);
+    }
+
+    /**
+     * As above, and also admitting a run that was refused before it started because the members it started
+     * on were not the ones its widths were worked out for. {@code refusedForAChangedMembership} answers that
+     * from the run's recorded failure. Such a run never ran anything, and the membership change that refused
+     * it may be a member joining - which no departure reading sees - so without this it would stay failed
+     * for a person over nothing but the moment it happened to be submitted in.
+     */
+    ClusterRebuildAdmission(PipelineActuationOwnership actuation,
+            Predicate<String> refusedForAChangedMembership, Duration backoff) {
+        this(actuation, refusedForAChangedMembership, backoff, System::nanoTime);
+    }
+
+    ClusterRebuildAdmission(PipelineActuationOwnership actuation,
+            Predicate<String> refusedForAChangedMembership, Duration backoff, LongSupplier nanoTime) {
         this.actuation = Objects.requireNonNull(actuation, "actuation");
+        this.refusedForAChangedMembership =
+                Objects.requireNonNull(refusedForAChangedMembership, "refusedForAChangedMembership");
         this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
         Objects.requireNonNull(backoff, "backoff");
         if (backoff.isNegative()) {
@@ -75,7 +97,8 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     @Override
     public boolean admits(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        if (!actuation.aMemberLeftUnderTheRun(pipelineId, MAX_ATTEMPTS * backoffNanos)) {
+        if (!actuation.aMemberLeftUnderTheRun(pipelineId, MAX_ATTEMPTS * backoffNanos)
+                && !refusedForAChangedMembership.test(pipelineId)) {
             // Either no member it was planned over is gone, and none went recently enough to still be
             // answering for this death -- so it is the pipeline's own and stays its own -- or this member
             // is not the one driving it. Both give the budget back.
@@ -108,6 +131,25 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         LOG.warn("Rebuilding pipeline {} after a member it was running on left (attempt {} of {})",
                 pipelineId, spent.made, MAX_ATTEMPTS);
         return true;
+    }
+
+    /**
+     * Whether {@code failure} is a run refused before it started because its members changed between the plan
+     * and the start. The engine hands back the exact cause where the member that refused the run recorded it,
+     * and otherwise only a rendering of it, so the canonical code is looked for in both: the code is a stable
+     * contract, locked with every other, rather than the wording of a message.
+     */
+    static boolean isMembershipChangedBeforeStart(Throwable failure) {
+        String code = EngineError.MEMBERSHIP_CHANGED_BEFORE_START.code();
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof TapstateException coded && coded.code() == EngineError.MEMBERSHIP_CHANGED_BEFORE_START) {
+                return true;
+            }
+            if (cause.getMessage() != null && cause.getMessage().contains(code)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Releases what pipelines no longer desired have spent, so a deleted one leaks no counter. */

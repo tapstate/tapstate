@@ -41,6 +41,12 @@ actuation.join-output-schema-source-changed:
 actuation.join-output-schema-engine-changed:
   message: "Join `{step}` of pipeline `{pipeline}` no longer produces the columns it was recorded producing, and neither the query nor the source columns changed - what changed is how we work them out ({recordedBy} -> {nowBy}). Columns appeared: {added}. Columns went: {removed}. Columns changed type: {retyped}."
   solution: "Please report this - it is a compatibility break on our side that our own release checks should have caught before you ever saw it. To carry on, run `derived-schema {pipeline}` to see what moved, rebuild the target table for the new column types, then `derived-schema {pipeline} --accept`. Read the difference first: a type that narrowed loses data on the next write, which is a deliberate decision and not a formality. Staying on the version you were running is the other way out."
+actuation.no-safe-parallelism:
+  message: "Pipeline {pipeline} cannot start: node {node} asks for {requested} processors across {members} members, and no width within the budgets is available ({candidates})."
+  solution: "Lower execution.parallelism on {node}, or raise the budget named for each candidate in the server's tapstate.execution settings."
+actuation.parallelism-needs-a-key:
+  message: "Pipeline {pipeline} cannot start: node {node} asks for {requested} processors but can only run as one ({reason})."
+  solution: "Set execution.parallelism to 1 on {node}, or leave it out; the node then runs as one processor and keeps every change in order."
 actuation.schema-sync-while-running:
   message: "Pipeline `{pipeline}` is {state} and has been asked to be {desired}, so the recorded model of what it produces cannot be re-copied from its sources right now."
   solution: "Stop the pipeline and wait until it is at rest, then retry the schema refresh. Pausing is not enough: a paused run retains its assembled model, and resuming an unchanged pipeline may reuse it."
@@ -621,6 +627,15 @@ engine.execution-not-authorized:
 engine.job-still-ending:
   message: "Pipeline {pipeline} could not be started: its previous run was still ending after {seconds}s."
   solution: "Wait for the previous run to finish stopping and start the pipeline again; if it never does, check the member's logs for a processor that is not shutting down."
+engine.routing-key-missing:
+  message: "A change on stream {stream} reached node {node} without its key ({columns}), so it cannot be routed to the processor that holds the other changes of its row."
+  solution: "Make sure every change on {stream} carries {columns} - in the later image, or in the earlier one for a removal - or set execution.parallelism to 1 on {node}."
+engine.key-change-on-parallel-node:
+  message: "An update on stream {stream} changed its row's key at node {node}, which runs on several processors; the change cannot be kept in order with both keys."
+  solution: "Set execution.parallelism to 1 on {node} if rows on {stream} change their key; one processor applies such changes in order."
+engine.membership-changed-before-start:
+  message: "Pipeline {pipeline} was planned for {planned} members but started on {actual}; it was stopped before any processor ran."
+  solution: "Nothing to do: the next start works the plan out again for the members present then."
 engine.job-failed:
   message: "Pipeline {pipeline} stopped because its job failed: {cause}."
   solution: "Check the pipeline's logs for the failure, fix what it reports, then start the pipeline again."
