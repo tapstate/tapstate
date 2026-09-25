@@ -3,6 +3,7 @@
 # Sorted, one <domain>.<symbol> per line. The ErrorCodeGatesTest diffs the scanned codes
 # against this file. Adding a code = append it here in the same change set; renaming or
 # removing one = a breaking change to an external contract (review + major version).
+actuation.execution-generation-unavailable
 actuation.from-regex-empty
 actuation.from-regex-invalid
 actuation.join-input-not-a-table
@@ -12,6 +13,7 @@ actuation.join-output-schema-source-changed
 actuation.join-source-key-missing
 actuation.join-source-not-declared
 actuation.join-sql-invalid
+actuation.lifecycle-dispatcher-invalid-capacity
 actuation.not-a-pipeline
 actuation.pipeline-not-found
 actuation.schema-sync-while-running

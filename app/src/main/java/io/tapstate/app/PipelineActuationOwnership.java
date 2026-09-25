@@ -1,6 +1,9 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.ExecutionGenerationStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -9,13 +12,14 @@ import io.tapstate.spi.store.WorkloadOwner;
 
 import java.time.Duration;
 import java.util.Collection;
-import java.util.HashMap;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 
 /**
@@ -36,20 +40,50 @@ import java.util.function.LongSupplier;
  * shorter than the lease, so the window closes before the lease it was cut from could expire. The
  * interval is measured on the monotonic clock, so moving the node's wall clock cannot widen it.
  *
- * <p>Not synchronized: one convergence pass at a time drives this, on a single scheduler thread with a
- * fixed delay, so passes never overlap.
+ * <p>The scheduler checks permits while lifecycle workers begin runs. Each pipeline's held state is
+ * guarded by its own lock. A busy lock makes the scheduler retry that pipeline on its next pass, so a
+ * slow allocation cannot hold up checks for another pipeline.
  */
 final class PipelineActuationOwnership {
 
-    /** Whether this member may drive the pipeline, and the claim that says so ({@code null} on a single node). */
-    record Permit(boolean granted, WorkloadClaim claim) {
+    /** Whether this member may drive a pipeline, has lost it, or must retry after an in-flight advance. */
+    record Permit(Decision decision, WorkloadClaim claim) {
+
+        enum Decision {
+            GRANTED,
+            DENIED,
+            RETRY
+        }
+
+        Permit {
+            Objects.requireNonNull(decision, "decision");
+            if (decision != Decision.GRANTED && claim != null) {
+                throw new IllegalArgumentException("a non-granted permit cannot carry a claim");
+            }
+        }
+
+        boolean granted() {
+            return decision == Decision.GRANTED;
+        }
+
+        boolean retry() {
+            return decision == Decision.RETRY;
+        }
 
         static Permit unfenced() {
-            return new Permit(true, null);
+            return new Permit(Decision.GRANTED, null);
+        }
+
+        static Permit granted(WorkloadClaim claim) {
+            return new Permit(Decision.GRANTED, Objects.requireNonNull(claim, "claim"));
         }
 
         static Permit denied() {
-            return new Permit(false, null);
+            return new Permit(Decision.DENIED, null);
+        }
+
+        static Permit busy() {
+            return new Permit(Decision.RETRY, null);
         }
     }
 
@@ -57,14 +91,16 @@ final class PipelineActuationOwnership {
     private final WorkloadOwner owner;
     private final ClusterMembershipGate membership;
     private final ClusterWorkloadClaims claims;
+    private final ExecutionGenerationStore generations;
     private final Duration ttl;
     private final long renewIntervalNanos;
     private final LongSupplier nanoTime;
     private final boolean fenced;
-    private final Map<String, Held> held = new HashMap<>();
+    private final Map<String, Held> held = new ConcurrentHashMap<>();
 
     /** One pipeline's local view: the claim this member proved, and when the next round trip is due. */
     private static final class Held {
+        private final ReentrantLock lock = new ReentrantLock();
         private WorkloadClaim claim;
         private long nextContactNanos;
         private boolean contacted;
@@ -99,15 +135,33 @@ final class PipelineActuationOwnership {
         this.owner = null;
         this.membership = null;
         this.claims = null;
+        this.generations = null;
         this.ttl = Duration.ZERO;
         this.renewIntervalNanos = 0;
         this.nanoTime = System::nanoTime;
         this.fenced = false;
     }
 
-    /** A single-node run has one member, so nothing is fenced and every pipeline is this member's to drive. */
+    /** For convergence tests with a stand-in actuator; submission refuses without a durable store. */
     static PipelineActuationOwnership single() {
         return new PipelineActuationOwnership();
+    }
+
+    /** Single-node ownership needs no lease, but every submitted run still needs a durable generation. */
+    static PipelineActuationOwnership single(String clusterId, ExecutionGenerationStore generations) {
+        return new PipelineActuationOwnership(clusterId, generations);
+    }
+
+    private PipelineActuationOwnership(String clusterId, ExecutionGenerationStore generations) {
+        this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
+        this.owner = null;
+        this.membership = null;
+        this.claims = null;
+        this.generations = Objects.requireNonNull(generations, "generations");
+        this.ttl = Duration.ZERO;
+        this.renewIntervalNanos = 0;
+        this.nanoTime = System::nanoTime;
+        this.fenced = false;
     }
 
     PipelineActuationOwnership(
@@ -132,6 +186,7 @@ final class PipelineActuationOwnership {
         this.owner = Objects.requireNonNull(owner, "owner");
         this.membership = Objects.requireNonNull(membership, "membership");
         this.claims = Objects.requireNonNull(claims, "claims");
+        this.generations = null;
         this.ttl = Objects.requireNonNull(ttl, "ttl");
         this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
         Objects.requireNonNull(renewInterval, "renewInterval");
@@ -149,6 +204,20 @@ final class PipelineActuationOwnership {
             return Permit.unfenced();
         }
         Held state = held.computeIfAbsent(pipelineId, id -> new Held());
+        if (!state.lock.tryLock()) {
+            return Permit.busy();
+        }
+        try {
+            if (held.get(pipelineId) != state) {
+                return Permit.denied();
+            }
+            return permitHeld(pipelineId, state);
+        } finally {
+            state.lock.unlock();
+        }
+    }
+
+    private Permit permitHeld(String pipelineId, Held state) {
         // Every pass, not every round trip: this reads a local reference the membership reconciler
         // publishes into, so it costs nothing, and the shorter the interval between looks the shorter
         // the absence that can pass unseen between two of them.
@@ -156,7 +225,7 @@ final class PipelineActuationOwnership {
         long now = nanoTime.getAsLong();
         boolean due = !state.contacted || now - state.nextContactNanos >= 0;
         if (state.claim != null && !due) {
-            return new Permit(true, state.claim);
+            return Permit.granted(state.claim);
         }
         if (state.claim != null) {
             return renew(state, now);
@@ -167,11 +236,13 @@ final class PipelineActuationOwnership {
         return due ? acquire(pipelineId, state, now) : Permit.denied();
     }
 
-    /** Whether a run may be submitted, and the generations that fence it (none on a single node). */
+    /** Whether a run may be submitted, and its durable generation identity. */
     record Execution(boolean allowed, ExecutionFence fence) {
 
-        static Execution unfenced() {
-            return new Execution(true, null);
+        Execution {
+            if (allowed && fence == null) {
+                throw new IllegalArgumentException("an allowed execution requires a fence");
+            }
         }
 
         static Execution refused() {
@@ -193,19 +264,48 @@ final class PipelineActuationOwnership {
     Execution beginExecution(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (!fenced) {
-            return Execution.unfenced();
+            if (generations == null) {
+                throw new IllegalStateException("standalone execution has no durable generation store");
+            }
+            OptionalLong advanced;
+            try {
+                advanced = generations.advanceStandalone(clusterId, pipelineId);
+            } catch (TapstateException failure) {
+                throw codeUnavailableStore(pipelineId, failure);
+            }
+            if (advanced.isEmpty()) {
+                throw generationUnavailable(pipelineId, null);
+            }
+            long generation = advanced.getAsLong();
+            if (generation < 1) {
+                throw new IllegalStateException("the execution store returned a nonpositive generation");
+            }
+            return new Execution(true, new ExecutionFence(pipelineId, 0, generation));
         }
         Held state = held.get(pipelineId);
-        if (state == null || state.claim == null) {
+        if (state == null) {
             return Execution.refused();
         }
+        state.lock.lock();
+        try {
+            if (held.get(pipelineId) != state || state.claim == null) {
+                return Execution.refused();
+            }
+            return beginUnderClaim(pipelineId, state);
+        } finally {
+            state.lock.unlock();
+        }
+    }
+
+    private Execution beginUnderClaim(String pipelineId, Held state) {
         Optional<WorkloadClaim> advanced;
         try {
             // At the claim's own topology revision, which is the committed one: a revision change refuses
             // the renew above, so a claim still held is a claim granted under the current topology.
-            advanced = claims.advanceExecution(state.claim, state.claim.topologyRevision());
-        } catch (RuntimeException unreachable) {
-            advanced = Optional.empty();
+            advanced = claims.advanceUnderClaim(state.claim, state.claim.topologyRevision());
+        } catch (TapstateException unreachable) {
+            state.claim = null;
+            throw codeUnavailableStore(pipelineId, unreachable);
         }
         if (advanced.isEmpty()) {
             state.claim = null;
@@ -223,6 +323,18 @@ final class PipelineActuationOwnership {
         // the moment here would make the very next death of this run read as the pipeline's own.
         return new Execution(true, new ExecutionFence(
                 pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()));
+    }
+
+    private static TapstateException generationUnavailable(String pipelineId, Throwable cause) {
+        return new TapstateException(ActuationError.EXECUTION_GENERATION_UNAVAILABLE,
+                Map.of("pipeline", pipelineId), cause);
+    }
+
+    private static TapstateException codeUnavailableStore(String pipelineId, TapstateException failure) {
+        if (failure.code() == IoError.STORE_UNAVAILABLE || failure.code() == IoError.STORE_UNAUTHORIZED) {
+            return generationUnavailable(pipelineId, failure);
+        }
+        return failure;
     }
 
     /**
@@ -283,6 +395,18 @@ final class PipelineActuationOwnership {
         if (state == null) {
             return false;
         }
+        state.lock.lock();
+        try {
+            if (held.get(pipelineId) != state) {
+                return false;
+            }
+            return memberLeftUnderHeldRun(state, settlingNanos);
+        } finally {
+            state.lock.unlock();
+        }
+    }
+
+    private boolean memberLeftUnderHeldRun(Held state, long settlingNanos) {
         if (state.runMembers == null) {
             if (!inheritedARunNobodyIsDriving(state)) {
                 return false;
@@ -324,9 +448,21 @@ final class PipelineActuationOwnership {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Held state = fenced ? held.get(pipelineId) : null;
         ClusterMembership current = fenced ? membership.committed() : null;
-        if (state == null || state.runMembers == null || current == null) {
+        if (state == null || current == null) {
             return Map.of();
         }
+        state.lock.lock();
+        try {
+            if (held.get(pipelineId) != state || state.runMembers == null) {
+                return Map.of();
+            }
+            return runMembershipOfHeld(state, current);
+        } finally {
+            state.lock.unlock();
+        }
+    }
+
+    private static Map<String, MemberRunState> runMembershipOfHeld(Held state, ClusterMembership current) {
         Map<String, MemberRunState> byNode = new LinkedHashMap<>();
         for (String nodeId : current.activeNodeIds()) {
             byNode.put(nodeId, state.runMembers.contains(nodeId)
@@ -376,17 +512,26 @@ final class PipelineActuationOwnership {
         if (!fenced) {
             return;
         }
-        Iterator<Map.Entry<String, Held>> entries = held.entrySet().iterator();
-        while (entries.hasNext()) {
-            Map.Entry<String, Held> entry = entries.next();
+        for (Map.Entry<String, Held> entry : held.entrySet()) {
             if (pipelineIds.contains(entry.getKey())) {
                 continue;
             }
-            WorkloadClaim claim = entry.getValue().claim;
-            if (claim != null) {
-                claims.release(claim);
+            Held state = entry.getValue();
+            if (!state.lock.tryLock()) {
+                continue;
             }
-            entries.remove();
+            try {
+                if (held.get(entry.getKey()) != state) {
+                    continue;
+                }
+                WorkloadClaim claim = state.claim;
+                if (claim != null) {
+                    claims.release(claim);
+                }
+                held.remove(entry.getKey(), state);
+            } finally {
+                state.lock.unlock();
+            }
         }
     }
 
@@ -407,7 +552,7 @@ final class PipelineActuationOwnership {
             return Permit.denied();
         }
         state.claim = renewed.get();
-        return new Permit(true, state.claim);
+        return Permit.granted(state.claim);
     }
 
     private Permit acquire(String pipelineId, Held state, long now) {
@@ -429,6 +574,6 @@ final class PipelineActuationOwnership {
             return Permit.denied();
         }
         state.claim = attempt.get().claim();
-        return new Permit(true, state.claim);
+        return Permit.granted(state.claim);
     }
 }

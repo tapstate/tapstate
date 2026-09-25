@@ -343,7 +343,7 @@ class CaptureToSinkAckFrontierTest {
         StoreBackedDagSource.SinkWriterBinder capturingSink =
                 (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
         DagSource dagSource = wrapDag.apply(new StoreBackedDagSource(store, capturingSink));
-        return new EngineLifecycleActuator(
+        return TestEngineLifecycleActuators.create(
                 new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
     }
 

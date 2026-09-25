@@ -205,7 +205,7 @@ class UpsertOverlapIdempotencyTest {
         StoreBackedDagSource.SinkWriterBinder upsertSink =
                 (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) () -> new UpsertSink(target);
         DagSource dagSource = new StoreBackedDagSource(store, upsertSink);
-        return new EngineLifecycleActuator(
+        return TestEngineLifecycleActuators.create(
                 new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
     }
 

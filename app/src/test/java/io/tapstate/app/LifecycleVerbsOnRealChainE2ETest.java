@@ -251,7 +251,7 @@ class LifecycleVerbsOnRealChainE2ETest {
                 (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) () -> new RecordingSink(target);
         DagSource dagSource = new StoreBackedDagSource(store, recordingSink);
         Engine engine = new Engine(member);
-        EngineLifecycleActuator actuator = new EngineLifecycleActuator(
+        EngineLifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 engine, dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
 
         Clock clock = Clock.fixed(T0, ZoneOffset.UTC);

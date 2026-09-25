@@ -64,10 +64,10 @@ final class ClusterWorkloadClaims {
         return store.release(expected);
     }
 
-    Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+    Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
         if (!membership.businessEligible()) {
             return Optional.empty();
         }
-        return store.advanceExecution(expected, topologyRevision);
+        return store.advanceUnderClaim(expected, topologyRevision);
     }
 }

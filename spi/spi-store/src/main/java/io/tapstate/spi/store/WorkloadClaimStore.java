@@ -5,9 +5,10 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /** Persistence port for Mongo-time owner leases and their monotonic fencing generations. */
-public interface WorkloadClaimStore {
+public interface WorkloadClaimStore extends ExecutionGenerationStore {
 
     /** Acquires an absent, expired, or already-self-owned claim atomically. */
     WorkloadClaimAttempt acquire(
@@ -19,8 +20,11 @@ public interface WorkloadClaimStore {
     /** Expires only the exact owner and generation; the document and generation remain. */
     boolean release(WorkloadClaim expected);
 
-    /** Allocates the next execution generation under the exact live claim and topology revision. */
-    Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision);
+    /** Test and non-Mongo claim stores must explicitly opt into standalone generation allocation. */
+    @Override
+    default OptionalLong advanceStandalone(String clusterId, String pipelineId) {
+        throw new UnsupportedOperationException("standalone execution generation is unavailable");
+    }
 
     /**
      * Reads a claim and, in the same answer, how much of its lease the store's own clock says is left.

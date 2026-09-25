@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /** Mongo server-time implementation of the cluster-scoped workload-claim port. */
 public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
@@ -95,16 +96,51 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     @Override
-    public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+    public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
         Objects.requireNonNull(expected, "expected");
         if (topologyRevision < 0) {
             throw new IllegalArgumentException("topologyRevision must not be negative");
         }
-        Document next = new Document("$set", new Document("executionGeneration",
-                new Document("$add", List.of(
-                        new Document("$ifNull", List.of("$executionGeneration", 0L)), 1L))));
+        Document next = new Document("$set", new Document("executionGeneration", nextExecutionGeneration()));
         Document advanced = findOneAndUpdate(liveExpected(expected, topologyRevision), List.of(next), false);
         return Optional.ofNullable(advanced).map(MongoWorkloadClaimStore::read);
+    }
+
+    @Override
+    public OptionalLong advanceStandalone(String clusterId, String pipelineId) {
+        WorkloadClaimKey key = new WorkloadClaimKey(
+                clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
+        Document fields = new Document("clusterId", key.clusterId())
+                .append("resourceType", key.type().name())
+                .append("resourceId", key.resourceId())
+                .append("executionGeneration", nextExecutionGeneration());
+        Document eligible = new Document("$and", List.of(
+                new Document("_id", id(key)),
+                new Document("$or", List.of(
+                        new Document("ownerNodeId", new Document("$exists", false)),
+                        new Document("$and", List.of(
+                                new Document("leaseUntil", new Document("$type", "date")),
+                                new Document("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")))))))));
+        List<Document> update = List.of(new Document("$set", fields));
+        Document advanced = findOneAndUpdate(eligible, update, false);
+        if (advanced != null) {
+            return OptionalLong.of(number(advanced, "executionGeneration"));
+        }
+        Document absentClaim = new Document("_id", id(key))
+                .append("ownerNodeId", new Document("$exists", false));
+        try {
+            advanced = collection.findOneAndUpdate(absentClaim, update,
+                    new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
+        } catch (MongoException raced) {
+            if (!duplicateKey(raced)) {
+                throw StoreIo.coded(raced);
+            }
+            // A simultaneous insert or an ineligible live claim can occupy this id. Retry only the
+            // conditional advance: the former gets the next number, the latter stays refused.
+            advanced = findOneAndUpdate(eligible, update, false);
+        }
+        return advanced == null ? OptionalLong.empty()
+                : OptionalLong.of(number(advanced, "executionGeneration"));
     }
 
     @Override
@@ -117,7 +153,9 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 new Document("$match", new Document("_id", id(key))),
                 leaseRemaining());
         Document found = StoreIo.call(() -> collection.aggregate(pipeline).first());
-        return Optional.ofNullable(found).map(MongoWorkloadClaimStore::reading);
+        return Optional.ofNullable(found)
+                .filter(document -> document.containsKey("ownerNodeId"))
+                .map(MongoWorkloadClaimStore::reading);
     }
 
     /**
@@ -147,7 +185,9 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 leaseRemaining());
         List<Document> found = StoreIo.call(() -> collection.aggregate(pipeline).into(new ArrayList<>()));
         for (Document document : found) {
-            readings.put(asked.get(document.get("_id", Document.class)), reading(document));
+            if (document.containsKey("ownerNodeId")) {
+                readings.put(asked.get(document.get("_id", Document.class)), reading(document));
+            }
         }
         return readings;
     }
@@ -184,6 +224,11 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 .append("topologyRevision", topologyRevision)
                 .append("leaseUntil", leaseUntil(ttl));
         return List.of(new Document("$set", fields));
+    }
+
+    private static Document nextExecutionGeneration() {
+        return new Document("$add", List.of(
+                new Document("$ifNull", List.of("$executionGeneration", 0L)), 1L));
     }
 
     private static Document liveExpected(WorkloadClaim expected, long topologyRevision) {

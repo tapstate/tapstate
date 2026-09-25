@@ -234,7 +234,7 @@ class AStoppedPipelineLetsGoOfItsJoinStateTest {
 
     /** The actuator as production composes it, over a capture coordinator that does nothing. */
     private EngineLifecycleActuator actuator(InMemoryStorePort store) {
-        return new EngineLifecycleActuator(new Engine(member), new StoreBackedDagSource(store),
+        return TestEngineLifecycleActuators.create(new Engine(member), new StoreBackedDagSource(store),
                 new NoOpCaptureCoordinator(),
                 new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
     }

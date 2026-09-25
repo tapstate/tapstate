@@ -775,7 +775,7 @@ class CaptureOwnershipTest {
         }
 
         @Override
-        public synchronized Optional<WorkloadClaim> advanceExecution(
+        public synchronized Optional<WorkloadClaim> advanceUnderClaim(
                 WorkloadClaim expected, long topologyRevision) {
             return Optional.empty();
         }

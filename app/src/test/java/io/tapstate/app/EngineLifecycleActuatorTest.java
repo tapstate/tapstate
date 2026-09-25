@@ -28,6 +28,11 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.ExecutionGenerationStore;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,6 +43,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Supplier;
@@ -86,8 +92,9 @@ class EngineLifecycleActuatorTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
         RecordingDagSource dagSource = new RecordingDagSource(events);
-        LifecycleActuator actuator =
-                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+        InMemoryWorkloadClaimStore generations = new InMemoryWorkloadClaimStore();
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(new Engine(member), dagSource,
+                coordinator, teardown(), PipelineActuationOwnership.single("single", generations));
         // At stop the coordinator awaits the pipeline's job going terminal; that only happens if the cancel ran
         // before the capture stop, so it discriminates the stop ordering rather than racing it.
         coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
@@ -97,6 +104,10 @@ class EngineLifecycleActuatorTest {
         // Capture opens and fills the ring before the DAG is built and submitted against that generation.
         assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
         assertThat(coordinator.jobWasAbsentAtStart).isTrue();
+        assertThat(dagSource.fences).as("even a standalone submission has a durable run identity")
+                .singleElement().isNotNull();
+        assertThat(dagSource.fences.getFirst().claimGeneration()).isZero();
+        assertThat(dagSource.fences.getFirst().executionGeneration()).isEqualTo(1);
         Job job = member.getJet().getJob(PIPE);
         assertThat(job).as("start submits a job named by the pipeline id").isNotNull();
         awaitStatus(job, JobStatus.RUNNING);
@@ -107,6 +118,7 @@ class EngineLifecycleActuatorTest {
         awaitStatus(job, JobStatus.RUNNING);
         // Pause and resume are engine-only: the capture keeps running, so the coordinator is never touched.
         assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
+        assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(1);
 
         actuator.stop(PIPE, true);
         awaitStatus(job, JobStatus.FAILED); // Jet reports a cancelled job as FAILED
@@ -114,6 +126,7 @@ class EngineLifecycleActuatorTest {
         assertThat(events).containsExactly(
                 "startCapture:" + PIPE, "buildDag:" + PIPE,
                 "stopCapture:" + PIPE + "[purge][jobTerminal]");
+        assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(1);
     }
 
     @Test
@@ -121,7 +134,7 @@ class EngineLifecycleActuatorTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
         coordinator.activeCapture = true;
-        LifecycleActuator actuator = new EngineLifecycleActuator(
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 new Engine(member), new RecordingDagSource(events), coordinator, teardown());
 
         actuator.start(PIPE);
@@ -137,14 +150,74 @@ class EngineLifecycleActuatorTest {
     void aDuplicateStartWithALiveJobKeepsItsCapture() {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
-        LifecycleActuator actuator = new EngineLifecycleActuator(
-                new Engine(member), new RecordingDagSource(events), coordinator, teardown());
+        InMemoryWorkloadClaimStore generations = new InMemoryWorkloadClaimStore();
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
+                new Engine(member), new RecordingDagSource(events), coordinator, teardown(),
+                PipelineActuationOwnership.single("single", generations));
 
         actuator.start(PIPE);
         awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
         actuator.start(PIPE);
 
         assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
+        assertThat(generations.executionGeneration(standaloneKey()))
+                .as("the live job was not submitted a second time").isEqualTo(1);
+    }
+
+    @Test
+    void anUnconfirmedStandaloneGenerationRefusesBeforeCaptureOrJobSubmission() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        ExecutionGenerationStore unavailable = new ExecutionGenerationStore() {
+            @Override
+            public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long revision) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public OptionalLong advanceStandalone(String clusterId, String pipelineId) {
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "unreachable"), null);
+            }
+        };
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
+                new Engine(member), dagSource, coordinator, teardown(),
+                PipelineActuationOwnership.single("single", unavailable));
+
+        assertThatThrownBy(() -> actuator.start(PIPE))
+                .isInstanceOfSatisfying(TapstateException.class, failure ->
+                        assertThat(failure.code()).isEqualTo(ActuationError.EXECUTION_GENERATION_UNAVAILABLE));
+        assertThat(events).isEmpty();
+        assertThat(member.getJet().getJob(PIPE)).isNull();
+    }
+
+    @Test
+    void aCancelledStartClosesItsCaptureWithoutSubmittingOrPurging() {
+        for (boolean cancelDuringBuild : List.of(false, true)) {
+            List<String> events = new CopyOnWriteArrayList<>();
+            RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+            RecordingDagSource dagSource = new RecordingDagSource(events);
+            coordinator.interruptAfterStart = !cancelDuringBuild;
+            dagSource.interruptDuringBuild = cancelDuringBuild;
+            LifecycleActuator actuator = TestEngineLifecycleActuators.create(
+                    new Engine(member), dagSource, coordinator, teardown());
+
+            try {
+                actuator.start(PIPE);
+                assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            } finally {
+                Thread.interrupted();
+            }
+            assertThat(coordinator.activeCapture).isFalse();
+            assertThat(member.getJet().getJob(PIPE)).isNull();
+            assertThat(events).contains("startCapture:" + PIPE,
+                    "stopCapture:" + PIPE + "[keep][jobLive]");
+            if (cancelDuringBuild) {
+                assertThat(events).contains("buildDag:" + PIPE);
+            } else {
+                assertThat(events).doesNotContain("buildDag:" + PIPE);
+            }
+        }
     }
 
     @Test
@@ -153,7 +226,7 @@ class EngineLifecycleActuatorTest {
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
         RecordingDagSource dagSource = new RecordingDagSource(events);
         dagSource.artifactSnapshot = new InMemoryArtifactStore();
-        LifecycleActuator actuator = new EngineLifecycleActuator(
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 new Engine(member), dagSource, coordinator, teardown());
 
         actuator.start(PIPE);
@@ -174,7 +247,7 @@ class EngineLifecycleActuatorTest {
         coordinator.givesTheStartBack = true;
         RecordingDagSource dagSource = new RecordingDagSource(events);
         LifecycleActuator actuator =
-                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+                TestEngineLifecycleActuators.create(new Engine(member), dagSource, coordinator, teardown());
 
         actuator.start(PIPE);
 
@@ -188,7 +261,7 @@ class EngineLifecycleActuatorTest {
         RuntimeException boom = new RuntimeException("cdc tail died");
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
         coordinator.captureFailure = boom;
-        LifecycleActuator actuator = new EngineLifecycleActuator(
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 new Engine(member), new IdleDagSource(), coordinator, teardown());
 
         // No job was submitted, so the engine reports no failure; the cdc capture's death still surfaces through
@@ -208,7 +281,7 @@ class EngineLifecycleActuatorTest {
             events.add("validate:" + PIPE);
             throw refused;
         };
-        LifecycleActuator actuator = new EngineLifecycleActuator(
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 new Engine(member), dagSource, coordinator, teardown());
 
         assertThatThrownBy(() -> actuator.start(PIPE)).isSameAs(refused);
@@ -222,7 +295,7 @@ class EngineLifecycleActuatorTest {
         RecordingDagSource dagSource = new RecordingDagSource(events);
         ArtifactStore snapshot = ReadOnlyArtifactSnapshot.capture(new InMemoryArtifactStore());
         dagSource.artifactSnapshot = snapshot;
-        LifecycleActuator actuator = new EngineLifecycleActuator(
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 new Engine(member), dagSource, coordinator, teardown());
         coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
 
@@ -248,7 +321,7 @@ class EngineLifecycleActuatorTest {
         assertThat(ownership.permit(PIPE).granted())
                 .as("the member has to hold the pipeline before a start of it can be fenced at all")
                 .isTrue();
-        LifecycleActuator actuator = new EngineLifecycleActuator(
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 new Engine(member), dagSource, coordinator, teardown(), ownership);
         coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
 
@@ -269,7 +342,7 @@ class EngineLifecycleActuatorTest {
     @Test
     void reportsNoFailureWhenNeitherTheJobNorTheCaptureHasFailed() {
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
-        LifecycleActuator actuator = new EngineLifecycleActuator(
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 new Engine(member), new IdleDagSource(), coordinator, teardown());
 
         assertThat(actuator.failure(PIPE)).isEmpty();
@@ -293,8 +366,9 @@ class EngineLifecycleActuatorTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
         RecordingDagSource dagSource = new RecordingDagSource(events);
-        LifecycleActuator actuator =
-                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+        InMemoryWorkloadClaimStore generations = new InMemoryWorkloadClaimStore();
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(new Engine(member), dagSource,
+                coordinator, teardown(), PipelineActuationOwnership.single("single", generations));
         coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
 
         actuator.start(PIPE);
@@ -313,6 +387,8 @@ class EngineLifecycleActuatorTest {
         Job rebuilt = member.getJet().getJob(PIPE);
         assertThat(rebuilt).as("the rebuild submits a job of its own").isNotSameAs(held);
         awaitStatus(rebuilt, JobStatus.RUNNING);
+        assertThat(dagSource.fences).extracting(ExecutionFence::executionGeneration).containsExactly(1L, 2L);
+        assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(2);
     }
 
     /**
@@ -355,7 +431,7 @@ class EngineLifecycleActuatorTest {
         };
         PipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
                 store, starter, new SrsCoordinator(store.meta()), new SnapshotBuffer());
-        LifecycleActuator actuator = new EngineLifecycleActuator(
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 new Engine(member), new IdleDagSource(), coordinator, teardown());
 
         actuator.start(PIPE);
@@ -390,6 +466,10 @@ class EngineLifecycleActuatorTest {
 
     private NestStateTeardown teardown() {
         return new NestStateTeardown(member, new InMemoryKeyedStateStore(), new InMemoryNestDeadLetterStore());
+    }
+
+    private static WorkloadClaimKey standaloneKey() {
+        return new WorkloadClaimKey("single", WorkloadClaimType.PIPELINE_ACTUATION, PIPE);
     }
 
     private static void awaitStatus(Job job, JobStatus expected) {
@@ -439,6 +519,7 @@ class EngineLifecycleActuatorTest {
         private Supplier<Boolean> jobAbsentProbe = () -> true;
         private boolean jobWasAbsentAtStart;
         private boolean givesTheStartBack;
+        private boolean interruptAfterStart;
         private boolean activeCapture;
         private final List<String> captureTokens = new CopyOnWriteArrayList<>();
 
@@ -455,6 +536,9 @@ class EngineLifecycleActuatorTest {
                         new CaptureConfig("mysql", Map.of("host", "h"), List.of("orders")), null));
             }
             activeCapture = true;
+            if (interruptAfterStart) {
+                Thread.currentThread().interrupt();
+            }
         }
 
         @Override
@@ -500,6 +584,7 @@ class EngineLifecycleActuatorTest {
         private Runnable validation = () -> {
         };
         private ArtifactStore artifactSnapshot;
+        private boolean interruptDuringBuild;
         private final List<String> preparedTokens = new CopyOnWriteArrayList<>();
 
         RecordingDagSource(List<String> events) {
@@ -536,6 +621,9 @@ class EngineLifecycleActuatorTest {
         @Override
         public DAG dagFor(String pipelineId) {
             events.add("buildDag:" + pipelineId);
+            if (interruptDuringBuild) {
+                Thread.currentThread().interrupt();
+            }
             return idle.dagFor(pipelineId);
         }
 

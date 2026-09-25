@@ -317,7 +317,7 @@ class NestOverTwoSourcesDataFlowTest {
 
         StoreBackedDagSource.SinkWriterBinder capturingSink =
                 (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
-        return new EngineLifecycleActuator(
+        return TestEngineLifecycleActuators.create(
                 new Engine(member), new StoreBackedDagSource(store, capturingSink), coordinator,
                 new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
     }

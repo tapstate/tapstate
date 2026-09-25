@@ -14,6 +14,12 @@ cluster.membership-unreadable:
 actuation.pipeline-not-found:
   message: "No pipeline artifact `{pipeline}` is stored to run."
   solution: "Apply the pipeline before starting it, and check the id for typos."
+actuation.execution-generation-unavailable:
+  message: "Pipeline `{pipeline}` cannot start because a new durable execution generation could not be confirmed."
+  solution: "Check the coordination store and any still-live cluster owner lease, then retry. No data-plane job was submitted."
+actuation.lifecycle-dispatcher-invalid-capacity:
+  message: "Lifecycle worker count {maxConcurrency} and pending-work budget {queueCapacity} must both be at least 1."
+  solution: "Set both lifecycle dispatcher capacities to positive values and restart the server."
 actuation.not-a-pipeline:
   message: "Resource `{pipeline}` is a `{kind}`, not a pipeline, so it cannot be run."
   solution: "Start a pipeline resource; check the id names a pipeline and not another kind of resource."

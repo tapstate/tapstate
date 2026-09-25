@@ -128,7 +128,7 @@ class ANewStatefulComponentNeedsNoEditToBePurgedTest {
     }
 
     private EngineLifecycleActuator actuator(InMemoryStorePort store) {
-        return new EngineLifecycleActuator(
+        return TestEngineLifecycleActuators.create(
                 new Engine(member),
                 new NewComponentDagSource(),
                 new NoOpCaptureCoordinator(),

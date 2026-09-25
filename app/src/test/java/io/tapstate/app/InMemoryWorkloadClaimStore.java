@@ -5,6 +5,7 @@ import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 
 import java.time.Duration;
@@ -13,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /**
  * In-memory {@link WorkloadClaimStore} double holding the durable store's contract, so a test over it
@@ -33,6 +35,7 @@ import java.util.Optional;
 final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
 
     private final Map<WorkloadClaimKey, WorkloadClaim> claims = new LinkedHashMap<>();
+    private final Map<WorkloadClaimKey, Long> unclaimedGenerations = new LinkedHashMap<>();
     private Instant now = Instant.parse("2026-09-18T00:00:00Z");
 
     /** Moves the store's own clock on, the way waiting would move the coordination store's. */
@@ -49,6 +52,11 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
         now = Objects.requireNonNull(instant, "instant");
     }
 
+    synchronized long executionGeneration(WorkloadClaimKey key) {
+        WorkloadClaim current = claims.get(key);
+        return current == null ? unclaimedGenerations.getOrDefault(key, 0L) : current.executionGeneration();
+    }
+
     @Override
     public synchronized WorkloadClaimAttempt acquire(
             WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
@@ -60,10 +68,12 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
         }
         long claimGeneration = current == null ? 1
                 : current.owner().equals(owner) ? current.claimGeneration() : current.claimGeneration() + 1;
-        long executionGeneration = current == null ? 0 : current.executionGeneration();
+        long executionGeneration = current == null
+                ? unclaimedGenerations.getOrDefault(key, 0L) : current.executionGeneration();
         WorkloadClaim acquired = new WorkloadClaim(
                 key, owner, claimGeneration, executionGeneration, topologyRevision, now.plus(ttl));
         claims.put(key, acquired);
+        unclaimedGenerations.remove(key);
         return WorkloadClaimAttempt.acquired(acquired);
     }
 
@@ -91,7 +101,7 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     @Override
-    public synchronized Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+    public synchronized Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
         WorkloadClaim current = live(expected, topologyRevision);
         if (current == null) {
             return Optional.empty();
@@ -99,6 +109,25 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
         return Optional.of(store(new WorkloadClaim(
                 current.key(), current.owner(), current.claimGeneration(), current.executionGeneration() + 1,
                 current.topologyRevision(), current.leaseUntil())));
+    }
+
+    @Override
+    public synchronized OptionalLong advanceStandalone(String clusterId, String pipelineId) {
+        WorkloadClaimKey key = new WorkloadClaimKey(
+                clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
+        WorkloadClaim current = claims.get(key);
+        if (current == null) {
+            long next = unclaimedGenerations.getOrDefault(key, 0L) + 1;
+            unclaimedGenerations.put(key, next);
+            return OptionalLong.of(next);
+        }
+        if (current.leaseUntil().isAfter(now)) {
+            return OptionalLong.empty();
+        }
+        long next = current.executionGeneration() + 1;
+        store(new WorkloadClaim(current.key(), current.owner(), current.claimGeneration(), next,
+                current.topologyRevision(), current.leaseUntil()));
+        return OptionalLong.of(next);
     }
 
     @Override

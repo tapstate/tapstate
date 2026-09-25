@@ -4,7 +4,7 @@ import java.io.Serializable;
 import java.util.Objects;
 
 /**
- * The two generations one submitted run is fenced by, fixed into the job as it is submitted and carried
+ * The two generations one submitted run is identified by, fixed into the job as it is submitted and carried
  * to every member that runs a piece of it.
  *
  * <p>They answer different questions and neither stands in for the other. The claim generation says who
@@ -14,7 +14,9 @@ import java.util.Objects;
  * job from the previous run therefore reads the same claim generation and a stale execution generation,
  * which is exactly the case that a claim generation alone could not tell apart from being current.
  *
- * <p>{@link Serializable} because it travels on the DAG to whichever members run the sink vertices, the
+ * <p>Standalone has no claim, represented by claim generation zero; its execution generation still comes
+ * from the durable coordination document. {@link Serializable} because it travels on the DAG to whichever
+ * members run the sink vertices, the
  * same way the coordinates behind a sink writer and a durable ack do.
  */
 record ExecutionFence(String pipelineId, long claimGeneration, long executionGeneration)
@@ -25,8 +27,8 @@ record ExecutionFence(String pipelineId, long claimGeneration, long executionGen
         if (pipelineId.isBlank()) {
             throw new IllegalArgumentException("pipelineId must not be blank");
         }
-        if (claimGeneration < 1 || executionGeneration < 1) {
-            throw new IllegalArgumentException("a fenced run carries both of its generations");
+        if (claimGeneration < 0 || executionGeneration < 1) {
+            throw new IllegalArgumentException("a run carries a nonnegative claim and positive execution generation");
         }
     }
 }

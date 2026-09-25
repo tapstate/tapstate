@@ -493,7 +493,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     void theStateAProcessorWritesAsItClosesIsDroppedRatherThanLeftBehind() {
         InMemoryStorePort store = seedStore();
         String namespace = "nest." + PIPELINE + ".late_writer.$root";
-        EngineLifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member),
+        EngineLifecycleActuator actuator = TestEngineLifecycleActuators.create(new Engine(member),
                 new WritesStateAsItCloses(namespace), new NoOpCaptureCoordinator(),
                 new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
 
@@ -639,7 +639,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
     /** The actuator as production composes it, over a capture coordinator that does nothing. */
     private EngineLifecycleActuator actuator(InMemoryStorePort store) {
-        return new EngineLifecycleActuator(new Engine(member), new StoreBackedDagSource(store),
+        return TestEngineLifecycleActuators.create(new Engine(member), new StoreBackedDagSource(store),
                 new NoOpCaptureCoordinator(), new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
     }
 

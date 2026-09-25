@@ -13,6 +13,10 @@ import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.store.ConnectionTester;
+import io.tapstate.spi.store.ExecutionGenerationStore;
+import io.tapstate.spi.store.ClusterIdentity;
+import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -20,6 +24,8 @@ import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import java.time.Duration;
+import java.util.Map;
+import java.util.UUID;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -166,9 +172,12 @@ class DataPlaneActuationConfiguration {
             HazelcastInstance hazelcastMember,
             ClusterProperties clusterProperties,
             ClusterMembershipGate membershipGate,
-            ClusterWorkloadClaims workloadClaims) {
+            ClusterWorkloadClaims workloadClaims,
+            ClusterIdentityStore clusterIdentities,
+            ExecutionGenerationStore generations) {
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
-            return PipelineActuationOwnership.single();
+            return PipelineActuationOwnership.single(
+                    standaloneClusterId(clusterProperties, clusterIdentities), generations);
         }
         Object stored = hazelcastMember.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
         if (!(stored instanceof WorkloadClaim nodeSession)) {
@@ -177,6 +186,24 @@ class DataPlaneActuationConfiguration {
         return new PipelineActuationOwnership(
                 clusterProperties.getId(), nodeSession.owner(), membershipGate, workloadClaims,
                 clusterProperties.getWorkloadClaimTtl(), clusterProperties.getWorkloadClaimRenewInterval());
+    }
+
+    /** Reuses the identity the control store already owns, including across discovery-mode changes. */
+    static String standaloneClusterId(ClusterProperties properties, ClusterIdentityStore identities) {
+        String configured = properties.getId();
+        String proposed = configured == null || configured.isBlank() ? UUID.randomUUID().toString() : configured;
+        ClusterIdentity candidate;
+        try {
+            candidate = new ClusterIdentity(proposed);
+        } catch (IllegalArgumentException invalid) {
+            throw new TapstateException(BootError.CLUSTER_ID_INVALID, Map.of(), invalid);
+        }
+        ClusterIdentity stored = identities.createIfAbsent(candidate);
+        if (configured != null && !configured.isBlank() && !configured.equals(stored.clusterId())) {
+            throw new TapstateException(BootError.CLUSTER_ID_MISMATCH,
+                    Map.of("configured", configured, "stored", stored.clusterId()), null);
+        }
+        return stored.clusterId();
     }
 
     @Bean

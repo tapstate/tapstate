@@ -51,11 +51,6 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final PipelineActuationOwnership actuation;
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
-            NestStateTeardown stateTeardown) {
-        this(engine, dagSource, captureCoordinator, stateTeardown, PipelineActuationOwnership.single());
-    }
-
-    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown, PipelineActuationOwnership actuation) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
@@ -116,14 +111,37 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             // being opened on another member, and how long that may take is bounded where it is decided.
             return;
         }
+        if (Thread.currentThread().isInterrupted()) {
+            // A newer stop or delete cancelled this start while capture was opening. Delete can remove
+            // the desired row before another stop task is queued, so this worker closes its own capture.
+            closeCaptureAfterCancellation(pipelineId);
+            return;
+        }
         // Capture opens the SRS generation that source vertices compile into the DAG. Build only now, but
         // from the same frozen artifacts used above; placement and teardown were already fixed, so any
         // shape record this writes remains named even if construction refuses the start.
         DagSource.StartPlan plan = prepared.build(execution.fence());
+        if (Thread.currentThread().isInterrupted()) {
+            closeCaptureAfterCancellation(pipelineId);
+            return;
+        }
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
         engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+    }
+
+    private void closeCaptureAfterCancellation(String pipelineId) {
+        // The capture teardown may wait; let it run without the worker's cancellation flag, then
+        // preserve that flag for the dispatcher. The interrupted start never owns a state purge.
+        boolean interrupted = Thread.interrupted();
+        try {
+            captureCoordinator.stopCapture(pipelineId, false);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     @Override

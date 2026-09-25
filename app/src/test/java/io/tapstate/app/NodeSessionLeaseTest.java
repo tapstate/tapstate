@@ -162,7 +162,7 @@ class NodeSessionLeaseTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+        public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
             throw new UnsupportedOperationException();
         }
 
@@ -203,7 +203,7 @@ class NodeSessionLeaseTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+        public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
             throw new UnsupportedOperationException();
         }
 

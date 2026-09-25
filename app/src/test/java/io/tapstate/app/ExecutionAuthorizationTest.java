@@ -366,8 +366,8 @@ class ExecutionAuthorizationTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
-            return delegate.advanceExecution(expected, topologyRevision);
+        public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
+            return delegate.advanceUnderClaim(expected, topologyRevision);
         }
     }
 }

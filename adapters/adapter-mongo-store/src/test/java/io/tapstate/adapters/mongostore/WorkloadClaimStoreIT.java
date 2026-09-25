@@ -13,6 +13,7 @@ import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -87,11 +88,72 @@ class WorkloadClaimStoreIT {
                     new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders"),
                     new WorkloadOwner("node-a", "boot-1"), 7, TTL).claim();
 
-            WorkloadClaim advanced = store.advanceExecution(claim, 7).orElseThrow();
+            WorkloadClaim advanced = store.advanceUnderClaim(claim, 7).orElseThrow();
 
             assertThat(advanced.claimGeneration()).isEqualTo(claim.claimGeneration());
             assertThat(advanced.executionGeneration()).isEqualTo(1);
-            assertThat(store.advanceExecution(claim, 7)).isEmpty();
+            assertThat(store.advanceUnderClaim(claim, 7)).isEmpty();
+        });
+    }
+
+    @Test
+    void standaloneAndClusterAdvanceTheSameDocumentAcrossStoreInstancesAndOwnershipChanges() {
+        withStore((store, collection) -> {
+            WorkloadClaimKey pipeline =
+                    new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            assertThat(store.advanceStandalone("cluster-a", "orders")).hasValue(1);
+            assertThat(store.advanceStandalone("cluster-a", "orders")).hasValue(2);
+            assertThat(store.read(pipeline)).as("standalone allocation creates no claim or lease").isEmpty();
+            assertThat(store.readAll(List.of(pipeline))).isEmpty();
+            assertThat(collection.countDocuments()).isEqualTo(1);
+
+            MongoWorkloadClaimStore reopened = new MongoWorkloadClaimStore(collection);
+            assertThat(reopened.advanceStandalone("cluster-a", "orders"))
+                    .as("reopening the adapter must not reset the sequence").hasValue(3);
+
+            WorkloadClaim first = reopened.acquire(pipeline, new WorkloadOwner("node-a", "boot-1"), 7, TTL)
+                    .claim();
+            assertThat(first.executionGeneration()).isEqualTo(3);
+            WorkloadClaim fourth = reopened.advanceUnderClaim(first, 7).orElseThrow();
+            assertThat(fourth.executionGeneration()).isEqualTo(4);
+            assertThat(reopened.advanceUnderClaim(first, 7)).as("stale expected generation is refused").isEmpty();
+            assertThat(reopened.advanceStandalone("cluster-a", "orders"))
+                    .as("a live cluster claim blocks a standalone start").isEmpty();
+            assertThat(reopened.read(pipeline).orElseThrow().claim().executionGeneration()).isEqualTo(4);
+
+            assertThat(reopened.release(fourth)).isTrue();
+            assertThat(reopened.advanceStandalone("cluster-a", "orders"))
+                    .as("standalone may continue after the previous lease has ended").hasValue(5);
+            WorkloadClaim successor = reopened.acquire(
+                    pipeline, new WorkloadOwner("node-b", "boot-2"), 8, TTL).claim();
+            assertThat(successor.claimGeneration()).isEqualTo(2);
+            assertThat(successor.executionGeneration()).isEqualTo(5);
+            assertThat(reopened.advanceUnderClaim(fourth, 7)).as("the old owner cannot allocate").isEmpty();
+            assertThat(reopened.advanceUnderClaim(successor, 8).orElseThrow().executionGeneration())
+                    .isEqualTo(6);
+            assertThat(collection.countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void aClaimWithNoValidLeaseDateCannotBeTreatedAsExpiredByStandalone() {
+        withStore((store, collection) -> {
+            Document id = new Document("clusterId", "cluster-a")
+                    .append("resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
+                    .append("resourceId", "orders");
+            collection.insertOne(new Document("_id", id)
+                    .append("clusterId", "cluster-a")
+                    .append("resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
+                    .append("resourceId", "orders")
+                    .append("ownerNodeId", "node-a")
+                    .append("ownerBootId", "boot-1")
+                    .append("claimGeneration", 1L)
+                    .append("executionGeneration", 9L)
+                    .append("topologyRevision", 7L));
+
+            assertThat(store.advanceStandalone("cluster-a", "orders")).isEmpty();
+            assertThat(collection.find(new Document("_id", id)).first()
+                    .getLong("executionGeneration")).isEqualTo(9L);
         });
     }
 

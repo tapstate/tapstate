@@ -147,7 +147,7 @@ class ClusterWorkloadClaimsTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+        public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
             calls.incrementAndGet();
             return Optional.of(expected);
         }

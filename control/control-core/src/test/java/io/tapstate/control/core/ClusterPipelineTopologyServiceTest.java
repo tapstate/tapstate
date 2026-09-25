@@ -405,7 +405,7 @@ class ClusterPipelineTopologyServiceTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long revision) {
+        public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long revision) {
             throw new UnsupportedOperationException("a read face takes nothing");
         }
 

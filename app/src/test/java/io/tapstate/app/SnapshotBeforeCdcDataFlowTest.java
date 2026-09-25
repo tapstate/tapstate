@@ -155,7 +155,7 @@ class SnapshotBeforeCdcDataFlowTest {
         StoreBackedDagSource.SinkWriterBinder capturingSink =
                 (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
         DagSource dagSource = new StoreBackedDagSource(store, capturingSink);
-        LifecycleActuator actuator = new EngineLifecycleActuator(
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
 
         actuator.start(PIPELINE);

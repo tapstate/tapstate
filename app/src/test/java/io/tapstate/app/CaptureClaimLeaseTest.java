@@ -156,7 +156,7 @@ class CaptureClaimLeaseTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+        public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
             return Optional.empty();
         }
 

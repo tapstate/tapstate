@@ -20,6 +20,13 @@ enum ActuationError implements TapstateErrorCode {
     /** A start named a pipeline id with no stored artifact to run: {@code pipeline} is the id given. */
     PIPELINE_NOT_FOUND("actuation.pipeline-not-found", Set.of("pipeline")),
 
+    /** A new run was refused because its durable execution generation could not be confirmed. */
+    EXECUTION_GENERATION_UNAVAILABLE("actuation.execution-generation-unavailable", Set.of("pipeline")),
+
+    /** The configured lifecycle worker or pending-work budget cannot run any lifecycle task. */
+    LIFECYCLE_DISPATCHER_INVALID_CAPACITY("actuation.lifecycle-dispatcher-invalid-capacity",
+            Set.of("maxConcurrency", "queueCapacity")),
+
     /**
      * A start named an id that resolves to a resource of another kind: {@code pipeline} is the id given and
      * {@code kind} is the kind actually stored under it.
