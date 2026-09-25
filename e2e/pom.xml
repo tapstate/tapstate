@@ -134,6 +134,13 @@
       <version>${revision}</version>
       <scope>test</scope>
     </dependency>
+    <!-- The engine's substrate, for the in-process case that runs it out of memory from one of its own
+         threads: no HTTP verb reaches that. Named here for the same reason as the two above. -->
+    <dependency>
+      <groupId>com.hazelcast</groupId>
+      <artifactId>hazelcast</artifactId>
+      <scope>test</scope>
+    </dependency>
     <!-- Endpoints a specification seeds, changes and counts. This is the harness reading a pipeline's
          target the way a user would, from outside the product; rule R3 locks the driver to
          adapter-mongo-store for the rings, and this module is deliberately not one of them. -->

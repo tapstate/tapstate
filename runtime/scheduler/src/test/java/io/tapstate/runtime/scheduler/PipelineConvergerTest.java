@@ -524,6 +524,70 @@ class PipelineConvergerTest {
         assertThat(actuator.calls()).isEmpty(); // no restart of the dead job on every tick
     }
 
+    /**
+     * A paused pipeline's job is held on the data plane, and goes with it. Nothing is left for a resume to
+     * continue, so reading PAUSED from then on would be answering for a job that no longer exists.
+     */
+    @Test
+    @DisplayName("a paused pipeline whose job was lost with the data plane converges to FAILED, carries the cause, and stops it")
+    void aPausedPipelineWhoseJobWasLostConvergesToFailed() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.reset();
+        RuntimeException cause = new RuntimeException("the engine ran out of memory and shut down");
+        actuator.loseWith(cause);
+
+        ConvergeResult result = converger.converge("p1");
+
+        assertThat(result.status()).isEqualTo(ConvergeStatus.FAILED);
+        assertThat(result.failure()).contains(cause);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+        // With :keep, as for a running job that died: nobody asked for its position to be thrown away.
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+    }
+
+    /**
+     * Its intent still says PAUSED. Driving toward it again would ask every tick to hold a job that is gone,
+     * be refused, and fail the pipeline again, writing its state twice a tick and replacing the cause it
+     * failed with by whatever that refusal says.
+     */
+    @Test
+    @DisplayName("a failed pipeline is not re-driven toward a still-PAUSED target either")
+    void aFailedPipelineIsNotReDrivenTowardAPausedTarget() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.loseWith(new RuntimeException("the engine ran out of memory and shut down"));
+        converger.converge("p1"); // drives to FAILED
+        long failedAt = state.read("p1").orElseThrow().epoch();
+        actuator.reset();
+
+        ConvergeResult again = converger.converge("p1"); // desired still PAUSED
+
+        assertThat(again.status()).isEqualTo(CONVERGED);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+        assertThat(state.read("p1").orElseThrow().epoch()).isEqualTo(failedAt);
+        assertThat(actuator.calls()).isEmpty();
+    }
+
+    /**
+     * Only losing the held job fails a paused pipeline. What {@code failure} reports, a capture that died
+     * behind the held job among it, is still found once the pipeline is meant to run again.
+     */
+    @Test
+    @DisplayName("a paused pipeline is not failed over what failure() reports while its job is still held")
+    void aPausedPipelineIsNotFailedOverAFailureWhileItsJobIsHeld() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.reset();
+        actuator.failWith(new RuntimeException("cdc tail died"));
+
+        ConvergeResult result = converger.converge("p1");
+
+        assertThat(result.status()).isEqualTo(CONVERGED);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(PAUSED));
+        assertThat(actuator.calls()).isEmpty();
+    }
+
     @Test
     @DisplayName("stopping a failed pipeline clears it to STOPPED so a fresh start can run it again")
     void stoppingAFailedPipelineRecoversIt() {

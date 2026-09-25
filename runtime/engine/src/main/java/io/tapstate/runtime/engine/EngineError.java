@@ -74,6 +74,14 @@ public enum EngineError implements TapstateErrorCode {
     JOB_FAILED("engine.job-failed", Set.of("pipeline", "cause")),
 
     /**
+     * The member a pipeline ran on was shut down by its own out-of-memory handling, and the pipeline's job
+     * with it: {@code pipeline} is the pipeline that can no longer run. Reported for every pipeline the
+     * member carried and every job operation asked of it afterwards, since nothing runs until the server is
+     * restarted.
+     */
+    OUT_OF_MEMORY("engine.out-of-memory", Set.of("pipeline")),
+
+    /**
      * Running: a chain's durable position has stopped moving for long enough to be worth saying so, while
      * nothing else about the pipeline has changed. {@code chain} is the chain, {@code minutes} how long it
      * has been pinned, {@code gap} how far the bound combined for it has run on meanwhile and
