@@ -137,7 +137,8 @@ class PipelinePositionServiceTest {
         meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(3L, 91201L), "mysql-bin.000004:154"),
                 List.of(new ConsumerOffset("orders_sync", Map.of("orders", 12L),
                         new ChainPosition(new SourceOrder(3L, 91100L), "mysql-bin.000004:100"),
-                        List.of("orders"), "mysql-bin.000003:1", 2L),
+                        List.of("orders"), "mysql-bin.000003:1", 2L,
+                        List.of("orders"), 3L, "cursor-run"),
                         new ConsumerOffset("orders_audit", Map.of(),
                                 new ChainPosition(new SourceOrder(3L, 5L), "mysql-bin.000004:5"))),
                 List.of(), null, 3L, WRITTEN_AT));
@@ -158,6 +159,9 @@ class PipelinePositionServiceTest {
         assertThat(mine.snapshotCompletedTables()).containsExactly("orders");
         assertThat(mine.cdcStartPosition()).isEqualTo("mysql-bin.000003:1");
         assertThat(mine.snapshotEpoch()).isEqualTo(2L);
+        assertThat(mine.selectedTables()).containsExactly("orders");
+        assertThat(mine.selectedTablesEpoch()).isEqualTo(3L);
+        assertThat(mine.cursorWriterToken()).isEqualTo("cursor-run");
     }
 
     @Test

@@ -129,7 +129,8 @@ public final class PipelinePositionService {
                 // nothing about either.
                 meta.upsertConsumerOffset(chainId, new ConsumerOffset(offset.pipelineId(),
                         offset.perTableSeq(), null, offset.snapshotCompletedTables(),
-                        offset.cdcStartPosition(), offset.snapshotEpoch()));
+                        offset.cdcStartPosition(), offset.snapshotEpoch(), offset.selectedTables(),
+                        offset.selectedTablesEpoch(), offset.cursorWriterToken()));
             }
         }
     }
