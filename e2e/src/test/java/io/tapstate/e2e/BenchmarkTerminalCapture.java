@@ -14,9 +14,12 @@ import io.tapstate.spi.capture.Subscription;
 import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntConsumer;
@@ -46,9 +49,16 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
     static BenchmarkTerminalCapture open(String connectorId, Path connectorJar, Map<String, Object> settings,
                                          String table, long warmupRowId, long terminalRowId,
                                          BenchmarkBoundaryWrites.Boundary boundary) {
+        return open(connectorId, connectorJar, settings, table, warmupRowId, terminalRowId, boundary, Map.of());
+    }
+
+    static BenchmarkTerminalCapture open(String connectorId, Path connectorJar, Map<String, Object> settings,
+                                         String table, long warmupRowId, long terminalRowId,
+                                         BenchmarkBoundaryWrites.Boundary boundary,
+                                         Map<String, Long> measuredEnds) {
         if (connectorId == null || connectorId.isBlank() || connectorJar == null || settings == null
                 || table == null || table.isBlank() || warmupRowId < 0 || terminalRowId < 0
-                || warmupRowId == terminalRowId) {
+                || warmupRowId == terminalRowId || measuredEnds == null) {
             throw new IllegalArgumentException("one connector, table and two distinct row ids are required");
         }
         if (boundary != null && (!table.equals(boundary.table()) || boundary.rowId() < 0
@@ -57,6 +67,15 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
                 || boundary.changedValue() == null || boundary.restoredValue() == null
                 || valuesEqual(boundary.changedValue(), boundary.restoredValue()))) {
             throw new IllegalArgumentException("boundary must name a distinct row and two distinct field values");
+        }
+        Set<Long> rows = new HashSet<>();
+        BenchmarkMeasuredEndMarkers.phaseOrder(measuredEnds);
+        for (Map.Entry<String, Long> marker : measuredEnds.entrySet()) {
+            Long rowId = marker.getValue();
+            if (rowId == null || rowId < 0 || !rows.add(rowId) || rowId == warmupRowId
+                    || rowId == terminalRowId || (boundary != null && rowId == boundary.rowId())) {
+                throw new IllegalArgumentException("measured-end markers must uniquely name rows on this table");
+            }
         }
         var inspected = new ConnectorIntrospector().introspect(List.of(connectorJar));
         ConnectorRef ref = new ConnectorRef(List.of(connectorJar), inspected.className(),
@@ -69,7 +88,7 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
         });
         PipelineNode node = new PipelineNode("benchmark-sidecar-" + UUID.randomUUID(), "source-" + table);
         CaptureConfig config = new CaptureConfig(connectorId, settings, List.of(table), node);
-        Holder holder = new Holder(table, warmupRowId, terminalRowId, boundary);
+        Holder holder = new Holder(table, warmupRowId, terminalRowId, boundary, measuredEnds);
         Subscription subscription = capture.cdc(config, CaptureStart.present(), holder);
         return new BenchmarkTerminalCapture(table, warmupRowId, terminalRowId, subscription, holder);
     }
@@ -156,6 +175,29 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
         }
     }
 
+    /** The connector token of this phase's unique final source row. */
+    String awaitMeasuredEnd(String phaseId, Duration timeout) {
+        if (!listener.warmupSeen()) {
+            throw new AssertionError("sidecar has not observed its warm-up row");
+        }
+        if (!listener.hasMeasuredPhase(phaseId)) {
+            throw new IllegalArgumentException("sidecar has no measured-end marker for " + phaseId);
+        }
+        long deadline = deadline(timeout);
+        while (true) {
+            listener.check();
+            String token = listener.measuredToken(phaseId);
+            if (token != null) {
+                return token;
+            }
+            long remaining = remaining(deadline);
+            if (remaining == 0) {
+                throw new AssertionError("sidecar did not observe measured-end row for " + phaseId);
+            }
+            listener.waitForChange(remaining);
+        }
+    }
+
     /** Ends boundary matching after its token is ACKed and the restored target is verified. */
     void sealBoundary() {
         listener.sealBoundary();
@@ -214,6 +256,8 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
         if (!closed) {
             closed = true;
             subscription.close();
+            listener.check();
+            listener.requireMeasuredComplete();
         }
     }
 
@@ -224,21 +268,36 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
         private final long warmupRowId;
         private final long terminalRowId;
         private final BenchmarkBoundaryWrites.Boundary boundary;
+        private final Map<String, Long> measuredEnds;
+        private final List<String> measuredOrder;
+        private final Map<Long, String> phaseByRow;
+        private final Map<String, String> measuredTokens = new HashMap<>();
         private boolean warmupSeen;
         private boolean changedSeen;
         private int restoredCount;
         private String restoredToken;
         private boolean boundarySealed;
+        private int nextMeasuredIndex;
         private int terminalCount;
         private String terminalToken;
         private Throwable failure;
 
         Holder(String table, long warmupRowId, long terminalRowId,
                BenchmarkBoundaryWrites.Boundary boundary) {
+            this(table, warmupRowId, terminalRowId, boundary, Map.of());
+        }
+
+        Holder(String table, long warmupRowId, long terminalRowId,
+               BenchmarkBoundaryWrites.Boundary boundary, Map<String, Long> measuredEnds) {
             this.table = table;
             this.warmupRowId = warmupRowId;
             this.terminalRowId = terminalRowId;
             this.boundary = boundary;
+            this.measuredEnds = Map.copyOf(measuredEnds);
+            this.measuredOrder = BenchmarkMeasuredEndMarkers.phaseOrder(measuredEnds);
+            Map<Long, String> byRow = new HashMap<>();
+            this.measuredEnds.forEach((phase, row) -> byRow.put(row, phase));
+            this.phaseByRow = Map.copyOf(byRow);
         }
 
         @Override
@@ -258,6 +317,13 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
                     }
                     if (id == warmupRowId) {
                         warmupSeen = true;
+                    }
+                    String measured = phaseByRow.get(id);
+                    if (measured != null) {
+                        observeMeasured(event, position, measured);
+                        if (failure != null) {
+                            break;
+                        }
                     }
                     if (id == terminalRowId) {
                         if (boundary != null && restoredCount != 1) {
@@ -303,6 +369,23 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
             }
         }
 
+        private void observeMeasured(Envelope event, Optional<SourcePosition> position, String phaseId) {
+            if (!warmupSeen || (boundary != null && !boundarySealed)) {
+                failure = new AssertionError("measured-end row arrived before sidecar preflight and boundary");
+            } else if (nextMeasuredIndex >= measuredOrder.size()
+                    || !measuredOrder.get(nextMeasuredIndex).equals(phaseId)
+                    || measuredTokens.containsKey(phaseId)) {
+                failure = new AssertionError("measured-end row arrived out of phase order or twice");
+            } else if (event.op() != BenchmarkMeasuredEndMarkers.operation(phaseId)) {
+                failure = new AssertionError("measured-end row has the wrong source operation");
+            } else if (position.isEmpty() || position.get().token().isBlank()) {
+                failure = new AssertionError("measured-end row had no source position");
+            } else {
+                measuredTokens.put(phaseId, position.get().token());
+                nextMeasuredIndex++;
+            }
+        }
+
         @Override
         public void onError(Throwable error) {
             synchronized (monitor) {
@@ -325,6 +408,24 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
 
         boolean hasBoundary() {
             return boundary != null;
+        }
+
+        boolean hasMeasuredPhase(String phaseId) {
+            return measuredEnds.containsKey(phaseId);
+        }
+
+        String measuredToken(String phaseId) {
+            synchronized (monitor) {
+                return measuredTokens.get(phaseId);
+            }
+        }
+
+        void requireMeasuredComplete() {
+            synchronized (monitor) {
+                if (nextMeasuredIndex != measuredEnds.size()) {
+                    throw new AssertionError("sidecar closed before every configured measured phase ended");
+                }
+            }
         }
 
         boolean boundarySeen() {
