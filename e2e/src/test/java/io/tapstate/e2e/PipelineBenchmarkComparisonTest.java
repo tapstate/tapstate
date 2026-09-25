@@ -129,6 +129,27 @@ class PipelineBenchmarkComparisonTest {
         assertThat(result.passed()).isTrue();
     }
 
+    @Test
+    void observationCostGateNeedsNoBusinessGainButRejectsFivePercentRegressions() {
+        Map<PipelineBenchmarkComparison.Workload, List<PipelineBenchmarkComparison.Fork>> withinBudget = validRuns();
+        setThroughput(withinBudget, PipelineBenchmarkComparison.Workload.COPY,
+                PipelineBenchmarkComparison.Arm.B, 95, 95, 95, 95, 95);
+        setP99(withinBudget, PipelineBenchmarkComparison.Workload.COPY,
+                PipelineBenchmarkComparison.Arm.B, 10.5, 10.5, 10.5, 10.5, 10.5);
+        assertThat(PipelineBenchmarkComparison.evaluateObservabilityCost(withinBudget).passed()).isTrue();
+
+        setThroughput(withinBudget, PipelineBenchmarkComparison.Workload.STATELESS,
+                PipelineBenchmarkComparison.Arm.B, 94, 94, 94, 94, 94);
+        setP99(withinBudget, PipelineBenchmarkComparison.Workload.STATEFUL,
+                PipelineBenchmarkComparison.Arm.B, 10.6, 10.6, 10.6, 10.6, 10.6);
+        PipelineBenchmarkComparison.Evaluation exceeded =
+                PipelineBenchmarkComparison.evaluateObservabilityCost(withinBudget);
+        assertThat(exceeded.passed()).isFalse();
+        assertThat(exceeded.failures()).contains(
+                "STATELESS throughput regresses more than 5%",
+                "STATEFUL delivery p99 regresses more than 5%");
+    }
+
     private static PipelineBenchmarkComparison.Evaluation evaluate(
             Map<PipelineBenchmarkComparison.Workload, List<PipelineBenchmarkComparison.Fork>> runs) {
         return PipelineBenchmarkComparison.evaluate(runs, PipelineBenchmarkComparison.Workload.COPY,

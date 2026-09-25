@@ -15,6 +15,7 @@ final class PipelineBenchmarkComparison {
     private static final double P99_NOISE_LIMIT = 0.05;
     private static final double IMPROVEMENT_FLOOR = 0.10;
     private static final double REGRESSION_LIMIT = 0.10;
+    private static final double OBSERVABILITY_REGRESSION_LIMIT = 0.05;
     private static final double ROUNDING_TOLERANCE = 1e-12;
     private static final List<Arm> ORDER = List.of(
             Arm.A, Arm.B, Arm.B, Arm.A, Arm.A, Arm.B, Arm.B, Arm.A, Arm.A, Arm.B);
@@ -55,9 +56,21 @@ final class PipelineBenchmarkComparison {
     }
 
     static Evaluation evaluate(Map<Workload, List<Fork>> runs, Workload target, PrimaryMetric primary) {
-        if (runs == null || !runs.keySet().equals(java.util.Set.of(Workload.values()))
-                || target == null || primary == null) {
-            throw new AssertionError("benchmark requires three workloads, a target and a primary metric");
+        return evaluate(runs, target, primary, REGRESSION_LIMIT, true);
+    }
+
+    /** The added observation path is priced before any business optimization is credited. */
+    static Evaluation evaluateObservabilityCost(Map<Workload, List<Fork>> runs) {
+        return evaluate(runs, null, null, OBSERVABILITY_REGRESSION_LIMIT, false);
+    }
+
+    private static Evaluation evaluate(Map<Workload, List<Fork>> runs, Workload target, PrimaryMetric primary,
+                                       double performanceRegressionLimit, boolean requireImprovement) {
+        if (runs == null || !runs.keySet().equals(java.util.Set.of(Workload.values()))) {
+            throw new AssertionError("benchmark requires all three workloads");
+        }
+        if (requireImprovement && (target == null || primary == null)) {
+            throw new AssertionError("optimization requires a target and a primary metric");
         }
         Map<Workload, Pair> summaries = new EnumMap<>(Workload.class);
         List<String> failures = new ArrayList<>();
@@ -102,17 +115,19 @@ final class PipelineBenchmarkComparison {
             summaries.put(workload, new Pair(baseline, candidate));
             checkNoise(workload, Arm.A, baseline, failures);
             checkNoise(workload, Arm.B, candidate, failures);
-            checkRegression(workload, baseline, candidate, failures);
+            checkRegression(workload, baseline, candidate, performanceRegressionLimit, failures);
         }
 
-        Pair selected = summaries.get(target);
-        double gain = primary == PrimaryMetric.THROUGHPUT
-                ? selected.candidate().throughput() / selected.baseline().throughput() - 1
-                : 1 - selected.candidate().deliveryP99Nanos() / selected.baseline().deliveryP99Nanos();
-        double baselineNoise = primary == PrimaryMetric.THROUGHPUT
-                ? selected.baseline().throughputRelativeMad() : selected.baseline().p99RelativeMad();
-        if (gain + ROUNDING_TOLERANCE < Math.max(IMPROVEMENT_FLOOR, 2 * baselineNoise)) {
-            failures.add(target + " target improvement below 10% or twice baseline noise");
+        if (requireImprovement) {
+            Pair selected = summaries.get(target);
+            double gain = primary == PrimaryMetric.THROUGHPUT
+                    ? selected.candidate().throughput() / selected.baseline().throughput() - 1
+                    : 1 - selected.candidate().deliveryP99Nanos() / selected.baseline().deliveryP99Nanos();
+            double baselineNoise = primary == PrimaryMetric.THROUGHPUT
+                    ? selected.baseline().throughputRelativeMad() : selected.baseline().p99RelativeMad();
+            if (gain + ROUNDING_TOLERANCE < Math.max(IMPROVEMENT_FLOOR, 2 * baselineNoise)) {
+                failures.add(target + " target improvement below 10% or twice baseline noise");
+            }
         }
         return new Evaluation(summaries, failures);
     }
@@ -155,13 +170,16 @@ final class PipelineBenchmarkComparison {
     }
 
     private static void checkRegression(Workload workload, Summary baseline, Summary candidate,
+                                        double performanceRegressionLimit,
                                         List<String> failures) {
-        if (1 - candidate.throughput() / baseline.throughput() > REGRESSION_LIMIT + ROUNDING_TOLERANCE) {
-            failures.add(workload + " throughput regresses more than 10%");
+        int performanceLimitPercent = (int) Math.round(performanceRegressionLimit * 100);
+        if (1 - candidate.throughput() / baseline.throughput()
+                > performanceRegressionLimit + ROUNDING_TOLERANCE) {
+            failures.add(workload + " throughput regresses more than " + performanceLimitPercent + "%");
         }
         if (candidate.deliveryP99Nanos() / baseline.deliveryP99Nanos() - 1
-                > REGRESSION_LIMIT + ROUNDING_TOLERANCE) {
-            failures.add(workload + " delivery p99 regresses more than 10%");
+                > performanceRegressionLimit + ROUNDING_TOLERANCE) {
+            failures.add(workload + " delivery p99 regresses more than " + performanceLimitPercent + "%");
         }
         if ((double) candidate.peakHeapBytes() / baseline.peakHeapBytes() - 1
                 > REGRESSION_LIMIT + ROUNDING_TOLERANCE) {
