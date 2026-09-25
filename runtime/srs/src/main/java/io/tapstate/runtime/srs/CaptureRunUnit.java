@@ -267,9 +267,10 @@ public final class CaptureRunUnit {
                 BackgroundLoad reading = new BackgroundLoad(
                         load, handoff, tail, health,
                         "tapstate-load-" + spec.pipelineId() + "-" + spec.sourceId());
-                CaptureRun run = new CaptureRun(Optional.ofNullable(chainId), merged, ringSource, health, reading);
+                // Started before the run that owns it is made: a reader that cannot start then leaves no
+                // run behind, only the read it opened, which the failure path below closes with the chain.
                 reading.start();
-                return run;
+                return new CaptureRun(Optional.ofNullable(chainId), merged, ringSource, health, reading);
             }
 
             long snapshotCount = 0;
