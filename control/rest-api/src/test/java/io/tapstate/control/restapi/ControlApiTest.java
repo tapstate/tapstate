@@ -277,6 +277,50 @@ class ControlApiTest {
     }
 
     @Test
+    void secretSourceArtifactReadsAreSafeAndTheirDisplayCannotBeReapplied() {
+        String original = """
+                version: tapstate/v1
+                kind: source
+                id: atlas
+                connector: mongodb-atlas
+                config: { isUri: true, uri: "mongodb+srv://probe:sentinel@cluster.example/test" }
+                """;
+        ApplyResult written = applyDrafts(original);
+        StoredArtifact got = client().get().uri("/api/artifacts/atlas")
+                .retrieve().toEntity(StoredArtifact.class).getBody();
+        ArtifactList listed = client().get().uri("/api/artifacts?kind=source")
+                .retrieve().toEntity(ArtifactList.class).getBody();
+
+        assertThat(got.canonicalForm())
+                .contains("mongodb+srv://<redacted>@cluster.example/test")
+                .doesNotContain("probe:sentinel");
+        assertThat(listed.artifacts()).singleElement().satisfies(row ->
+                assertThat(row.canonicalForm()).isEqualTo(got.canonicalForm()));
+        assertThat(got.contentHash()).isEqualTo(written.outcomes().getFirst().contentHash());
+
+        ArtifactValidationResult validation = client().post().uri("/api/artifacts:validate")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("drafts", List.of(Map.of("content", got.canonicalForm()))))
+                .retrieve().toEntity(ArtifactValidationResult.class).getBody();
+        assertThat(validation.valid()).isFalse();
+        assertThat(validation.diagnostics()).extracting(ValidationDiagnostic::code)
+                .containsExactly("control.malformed-request");
+
+        ApiError refusal = client().post().uri("/api/artifacts:apply")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("drafts", List.of(Map.of("content", got.canonicalForm()))))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(refusal.code()).isEqualTo("control.malformed-request");
+        assertThat(refusal.toString()).doesNotContain("sentinel");
+        assertThat(client().get().uri("/api/artifacts/atlas")
+                .retrieve().toEntity(StoredArtifact.class).getBody().contentHash())
+                .isEqualTo(got.contentHash());
+    }
+
+    @Test
     void anApplyCarryingTheCurrentPreconditionIsAcceptedAndReplacesTheVersion() {
         applyDrafts(TGT_MG);
         String current = client().get().uri("/api/artifacts/tgt_mg")

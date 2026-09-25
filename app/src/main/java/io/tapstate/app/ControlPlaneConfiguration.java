@@ -338,8 +338,9 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    ArtifactQueryService artifactQueryService(ArtifactStore artifactStore) {
-        return new ArtifactQueryService(artifactStore);
+    ArtifactQueryService artifactQueryService(
+            ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView) {
+        return new ArtifactQueryService(artifactStore, connectorCatalogView::merged);
     }
 
     /**

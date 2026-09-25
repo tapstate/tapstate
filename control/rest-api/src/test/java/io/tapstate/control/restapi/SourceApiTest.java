@@ -191,6 +191,16 @@ class SourceApiTest {
     }
 
     @Test
+    void typedSourceWritesCannotPersistASecretDisplayMarker() {
+        assertError(request("writer").post().uri("/api/sources")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(Map.of("id", "masked", "connector", "mysql",
+                                "config", Map.of("host", "db.example", "password", "<redacted>"))),
+                HttpStatus.BAD_REQUEST, "control.malformed-request");
+        assertThat(context.getBean(InMemoryArtifactStore.class).get("masked")).isEmpty();
+    }
+
+    @Test
     void aSavedSourceCanBeTestedOverRestWithoutPostingSettings() {
         create("mysql-test", "saved");
 

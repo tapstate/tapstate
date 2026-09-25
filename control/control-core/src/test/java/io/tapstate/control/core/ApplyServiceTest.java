@@ -83,6 +83,36 @@ class ApplyServiceTest {
             config: { uri: "mongodb://10.30.0.11:27017/ods", auth_source: admin }
             """;
 
+    @Test
+    void redactedSourceReadsCannotBeReappliedOrPartiallyCommitted() {
+        String original = """
+                version: tapstate/v1
+                kind: source
+                id: atlas
+                connector: mongodb-atlas
+                config: { isUri: true, uri: "mongodb+srv://probe:sentinel@cluster.example/test" }
+                """;
+        service.apply("author", List.of(draft(original)));
+        String storedBefore = stored("atlas");
+        String display = new ArtifactQueryService(store).get("atlas").orElseThrow().canonicalForm();
+        assertThat(display).contains("<redacted>").doesNotContain("sentinel");
+
+        assertThatThrownBy(() -> service.plan(List.of(draft(display))))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThatThrownBy(() -> service.apply("author", List.of(draft(display), draft(TGT_MG))))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(error).hasMessageNotContaining("sentinel");
+                });
+        assertThat(stored("atlas")).isEqualTo(storedBefore);
+        assertThat(store.get("tgt_mg")).isEmpty();
+
+        assertThatThrownBy(() -> service.apply("author", List.of(draft(SourceReadProjection.WITHHELD))))
+                .isInstanceOf(TapstateException.class);
+        assertThat(stored("atlas")).isEqualTo(storedBefore);
+    }
+
     /**
      * The refusal is reached through apply, which is the path an edit to a stored Source usually takes.
      *

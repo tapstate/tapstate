@@ -3,10 +3,10 @@ package io.tapstate.control.core;
 import java.util.Objects;
 
 /**
- * The truth-layer view of one stored artifact returned by a read: its id, kind, canonical form as held
- * by the store, and the content hash of exactly those canonical bytes. This is what a face shows for the
- * artifact read verbs — the server, not a local draft, is the source of what an artifact is
- * (server-as-truth). The read peer of {@link PreparedArtifact}.
+ * The truth-layer view of one stored artifact returned by a read: its id, kind, public representation,
+ * and the content hash of the authoritative unredacted resource. A Source presentation
+ * carrying redacted credentials is not re-applicable and its bytes do not determine the hash. The server,
+ * not a local draft, remains the source of the stored resource (server-as-truth).
  *
  * <p>The hash travels with the read because it is the precondition an edit or a removal must supply, and
  * not every caller can compute it: a remote model driving the tool surface cannot take a SHA-256 of the

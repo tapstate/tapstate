@@ -1976,8 +1976,33 @@ class ReplTest {
         assertThat(h.repl().dispatch("get src_kfk")).isTrue();
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("kind: source").contains("src_kfk");
+        assertThat(out).doesNotContain("cannot be applied as-is");
         // the credential travels to the current landing node
         assertThat(client.getCalls).containsExactly("jwt-tok@http://node1:7900/src_kfk");
+    }
+
+    @Test
+    void getWarnsThatARedactedSourceCannotBeAppliedAsIs() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact(
+                "atlas", "source",
+                "version: tapstate/v1\nkind: source\nid: atlas\n"
+                        + "config: { uri: 'mongodb+srv://<redacted>@cluster.example/test' }\n"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("get atlas")).isTrue();
+
+        String output = h.sink().toString().substring(mark);
+        assertThat(output).contains("mongodb+srv://<redacted>@cluster.example/test")
+                .contains("cannot be applied as-is", "provide complete settings")
+                .doesNotContain("sentinel-secret");
+
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("atlas", "source", "<redacted-source>"));
+        mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("get atlas")).isTrue();
+        assertThat(h.sink().toString().substring(mark))
+                .contains("<redacted-source>", "cannot be applied as-is");
     }
 
     /**

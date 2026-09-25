@@ -1914,8 +1914,15 @@ final class Repl {
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case GetOutcome.Found found -> {
-                out.println(found.artifact().canonicalForm().stripTrailing());
+                String canonical = found.artifact().canonicalForm();
+                out.println(canonical.stripTrailing());
                 out.flush();
+                if ("source".equals(found.artifact().kind())
+                        && (canonical.contains("<redacted>") || canonical.equals("<redacted-source>"))) {
+                    err.println("get: Source credentials were redacted; this output cannot be applied as-is. "
+                            + "Use the Source API to retain saved credentials or provide complete settings.");
+                    err.flush();
+                }
                 yield Cli.EXIT_OK;
             }
             case GetOutcome.Absent ignored -> {

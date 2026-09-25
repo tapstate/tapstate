@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
@@ -15,16 +16,15 @@ import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * The read side of the double-layer model: the store is the truth layer, and a read returns an
- * artifact as its canonical form straight from that layer (server-as-truth). Its central guarantee is
- * that the online read path — apply -> store -> get — reproduces the offline canonical contract
- * byte-for-byte, the same {@link CanonicalWriter} the authoring corpus golden locks, so the online side
- * never forks the canonical form.
+ * The read side of the double-layer model: the store is the truth layer. Non-secret resources retain
+ * their byte-stable canonical round trip; a Source carrying credentials has a non-replayable public
+ * projection while its authoritative model and content hash stay unchanged.
  */
 class ArtifactQueryServiceTest {
 
@@ -65,15 +65,14 @@ class ArtifactQueryServiceTest {
     }
 
     @Test
-    void appliedArtifactsReadBackByteStableAsTheOfflineCanonical() {
-        // The core golden: the online read path (apply -> store -> get) reproduces the offline canonical
-        // form byte-for-byte, using the one CanonicalWriter the authoring corpus golden locks. No second
-        // baseline is checked in on the online side: forking the canonical form here is exactly the drift
-        // this guards, so the expectation is the offline contract.
+    void nonSecretArtifactsReadBackByteStableWhileAnUnknownSourceShapeIsWithheld() {
+        // A non-secret artifact retains the canonical round trip. The legacy Oracle fixture uses a
+        // config key outside the connector's catalog, so the public Source read cannot prove its
+        // credential boundary and must withhold the body rather than returning the raw password.
         apply.apply("alice", List.of(draft(SRC_ORA), draft(TGT_MG), draft(PIPELINE)));
 
         assertThat(query.get("src_ora")).get().extracting(StoredArtifact::canonicalForm)
-                .isEqualTo(offlineCanonical(SRC_ORA));
+                .isEqualTo(SourceReadProjection.WITHHELD);
         assertThat(query.get("tgt_mg")).get().extracting(StoredArtifact::canonicalForm)
                 .isEqualTo(offlineCanonical(TGT_MG));
     }
@@ -116,6 +115,91 @@ class ArtifactQueryServiceTest {
         assertThat(query.list()).allSatisfy(a ->
                 assertThat(a.canonicalForm())
                         .isEqualTo(query.get(a.id()).orElseThrow().canonicalForm()));
+    }
+
+    @Test
+    void genericArtifactReadsDoNotExposeAtlasUriCredentials() {
+        String uri = "mongodb+srv://alice:pa%40ss@cluster.example/test";
+        SourceResource atlas = new SourceResource(
+                "atlas", null, "mongodb-atlas", Map.of("isUri", true, "uri", uri),
+                null, null, null, null);
+        store.save(atlas);
+
+        StoredArtifact got = query.get("atlas").orElseThrow();
+        ArtifactListEntry listed = query.list("source").stream()
+                .filter(entry -> entry.id().equals("atlas")).findFirst().orElseThrow();
+
+        assertThat(got.canonicalForm()).contains("cluster.example/test").doesNotContain("alice", "pa%40ss");
+        assertThat(listed.canonicalForm()).isEqualTo(got.canonicalForm());
+        assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(atlas));
+        assertThat(((SourceResource) query.getResource("atlas").orElseThrow().resource()).config())
+                .containsEntry("uri", uri);
+    }
+
+    @Test
+    void declaredSecretFieldsAreMaskedWithoutChangingTheAuthoritativeHash() {
+        SourceResource oracle = new SourceResource(
+                "oracle", null, "oracle",
+                Map.of("host", "db.example", "user", "alice", "password", "sentinel-secret"),
+                null, null, null, null);
+        store.save(oracle);
+
+        StoredArtifact got = query.get("oracle").orElseThrow();
+
+        assertThat(got.canonicalForm())
+                .contains("host: db.example", "password: <redacted>")
+                .doesNotContain("sentinel-secret");
+        assertThat(got.contentHash()).isEqualTo(CanonicalHash.of(oracle));
+    }
+
+    @Test
+    void unreadableSourceInventoryDoesNotReturnUnparsedCredentials() {
+        store.putUnreadable("broken", "source", "uri: mongodb+srv://alice:pa%40ss@cluster.example/test");
+
+        ArtifactListEntry listed = query.list("source").getFirst();
+
+        assertThat(listed.readable()).isFalse();
+        assertThat(listed.canonicalForm()).doesNotContain("alice", "pa%40ss");
+    }
+
+    @Test
+    void missingCatalogWithholdsSourceBodiesAndListReadsTheCatalogOnce() {
+        SourceResource first = new SourceResource(
+                "first", null, "mongodb-atlas",
+                Map.of("isUri", true, "uri", "mongodb+srv://alice:first@db.example/test"),
+                null, null, null, null);
+        SourceResource second = new SourceResource(
+                "second", null, "mongodb-atlas",
+                Map.of("isUri", true, "uri", "mongodb+srv://alice:second@db.example/test"),
+                null, null, null, null);
+        store.save(first);
+        store.save(second);
+        ArtifactQueryService unavailable = new ArtifactQueryService(store, () -> {
+            throw new IllegalStateException("catalog unavailable");
+        });
+        assertThat(unavailable.get("first").orElseThrow().canonicalForm())
+                .isEqualTo(SourceReadProjection.WITHHELD);
+
+        AtomicInteger reads = new AtomicInteger();
+        ArtifactQueryService counted = new ArtifactQueryService(store, () -> {
+            reads.incrementAndGet();
+            return TapstateCatalog.load();
+        });
+        assertThat(counted.list("source")).hasSize(2)
+                .allSatisfy(row -> assertThat(row.canonicalForm()).doesNotContain("first@", "second@"));
+        assertThat(reads).hasValue(1);
+    }
+
+    @Test
+    void anUnboundedNestedConfigCannotBeDeclaredSafeByItsTopLevelFieldName() {
+        SourceResource malformed = new SourceResource(
+                "nested", null, "mongodb-atlas",
+                Map.of("isUri", true, "additionalString", Map.of("opaque", "sentinel-secret")),
+                null, null, null, null);
+        store.save(malformed);
+
+        assertThat(query.get("nested").orElseThrow().canonicalForm())
+                .isEqualTo(SourceReadProjection.WITHHELD);
     }
 
     @Test

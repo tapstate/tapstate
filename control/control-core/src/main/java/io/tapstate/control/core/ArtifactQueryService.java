@@ -1,6 +1,9 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.AssemblyIdentity;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -10,12 +13,13 @@ import io.tapstate.spi.store.StoredArtifactRecord;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * The resource-type-agnostic read side of the double-layer model: the store is the truth layer, and a
- * read returns an artifact as its canonical form straight from that layer — never from a local draft
- * (server-as-truth). {@link ApplyService} is the write side; this is its read peer, backing the artifact
- * read verbs (get / list).
+ * read returns an artifact from that layer — never from a local draft (server-as-truth). Public reads of
+ * credential-bearing Sources are a non-replayable redacted projection; their stored resource, content hash,
+ * and typed internal reads are unchanged. {@link ApplyService} is the write side; this is its read peer.
  *
  * <p>The canonical form a read returns is produced by the same {@link CanonicalWriter} the offline
  * authoring path uses, so an applied artifact reads back byte-for-byte as its offline canonical form:
@@ -26,9 +30,16 @@ public final class ArtifactQueryService {
 
     private final ArtifactStore store;
     private final CanonicalWriter writer = new CanonicalWriter();
+    private final DslParser parser = new DslParser();
+    private final SourceReadProjection sourceProjection;
 
     public ArtifactQueryService(ArtifactStore store) {
+        this(store, TapstateCatalog::load);
+    }
+
+    public ArtifactQueryService(ArtifactStore store, Supplier<TapstateCatalog> catalog) {
         this.store = Objects.requireNonNull(store, "store");
+        this.sourceProjection = new SourceReadProjection(catalog);
     }
 
     /** Returns the stored artifact for the id as its canonical form, or empty when none is stored. */
@@ -51,7 +62,7 @@ public final class ArtifactQueryService {
 
     /** Lists every stored artifact, retaining rows whose stored body is unreadable. */
     public List<ArtifactListEntry> list() {
-        return store.listStored().stream().map(this::view).toList();
+        return views(store.listStored());
     }
 
     /** Returns one typed stored resource and its canonical hash without parsing canonical text. */
@@ -74,20 +85,45 @@ public final class ArtifactQueryService {
         if (kind == null || kind.isBlank()) {
             return list();
         }
-        return store.listStored(kind).stream().map(this::view).toList();
+        return views(store.listStored(kind));
+    }
+
+    private List<ArtifactListEntry> views(List<StoredArtifactRecord> rows) {
+        // The online catalog may read registered rows from a store; take one snapshot for the inventory,
+        // not one catalog read per Source, while still withholding Source bodies if it is unavailable.
+        TapstateCatalog catalog = rows.stream().anyMatch(row -> "source".equals(row.kind()))
+                ? sourceProjection.catalogSnapshot() : null;
+        return rows.stream().map(row -> view(row, catalog)).toList();
     }
 
     private StoredArtifact view(Resource resource) {
         // The hash comes back beside the canonical form rather than being derivable from it: it is taken
         // over the resource's structure, so a caller holding only these bytes cannot recompute it and
         // must hand this field straight back as a precondition.
-        return new StoredArtifact(
-                resource.id(), resource.kind(), writer.write(resource), CanonicalHash.of(resource));
+        String canonical = writer.write(resource);
+        if (resource instanceof SourceResource source) {
+            canonical = sourceProjection.canonicalForRead(source, canonical);
+        }
+        return new StoredArtifact(resource.id(), resource.kind(), canonical, CanonicalHash.of(resource));
     }
 
-    private ArtifactListEntry view(StoredArtifactRecord row) {
-        return new ArtifactListEntry(
-                row.id(), row.kind(), row.canonicalForm(), row.contentHash(), row.readable());
+    private ArtifactListEntry view(StoredArtifactRecord row, TapstateCatalog catalog) {
+        String canonical = row.canonicalForm();
+        if ("source".equals(row.kind())) {
+            if (!row.readable() || canonical == null) {
+                canonical = SourceReadProjection.WITHHELD;
+            } else {
+                try {
+                    Resource parsed = parser.parse(canonical);
+                    canonical = parsed instanceof SourceResource source
+                            ? sourceProjection.canonicalForRead(source, canonical, catalog)
+                            : SourceReadProjection.WITHHELD;
+                } catch (RuntimeException unsafeSource) {
+                    canonical = SourceReadProjection.WITHHELD;
+                }
+            }
+        }
+        return new ArtifactListEntry(row.id(), row.kind(), canonical, row.contentHash(), row.readable());
     }
 
     private StoredResource typedView(Resource resource) {
