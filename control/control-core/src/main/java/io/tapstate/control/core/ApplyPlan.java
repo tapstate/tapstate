@@ -12,10 +12,9 @@ import java.util.Map;
  * <p>The warnings are notes about a batch that validated, never reasons it did not: a plan exists only
  * for a batch that passed, and a plan carrying warnings is applied exactly like one that carries none.
  *
- * <p>{@code preconditions} carries the version each draft declared it was editing, keyed by the id
- * that draft parsed to, and holds only the ids whose draft declared one. It travels with the plan
- * because the declaration belongs to the submitted draft, not to the artifact: by the time the plan
- * is written, the drafts are behind us and nothing else can say which write was version-checked.
+ * <p>{@code preconditions} carries a caller-declared version or the stored version from which an
+ * existing partial Source copied omitted fields, keyed by resource id. It travels with the plan
+ * because the declaration and field presence belong to the submitted draft, not to the artifact.
  */
 public record ApplyPlan(List<PreparedArtifact> artifacts, List<ValidationDiagnostic> warnings,
         Map<String, String> preconditions, Map<String, String> workspacePreconditions) {
@@ -27,17 +26,17 @@ public record ApplyPlan(List<PreparedArtifact> artifacts, List<ValidationDiagnos
         workspacePreconditions = Map.copyOf(workspacePreconditions);
     }
 
-    /** A plan whose drafts declared no version preconditions. */
+    /** A plan with no write preconditions. */
     public ApplyPlan(List<PreparedArtifact> artifacts, List<ValidationDiagnostic> warnings) {
         this(artifacts, warnings, Map.of(), Map.of());
     }
 
-    /** A plan with nothing advisory to say and no version preconditions declared. */
+    /** A plan with nothing advisory to say and no write preconditions. */
     public ApplyPlan(List<PreparedArtifact> artifacts) {
         this(artifacts, List.of(), Map.of(), Map.of());
     }
 
-    /** The version the draft for {@code id} declared it was editing, or null when it declared none. */
+    /** The version the write for {@code id} must still match, or null when it needs no condition. */
     public String precondition(String id) {
         return preconditions.get(id);
     }

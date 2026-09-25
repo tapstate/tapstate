@@ -1970,7 +1970,8 @@ class ReplTest {
     void getWhileAuthenticatedFetchesTheArtifactFromTheServer() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
+                new RemoteArtifact("src_kfk", "source",
+                        "version: tapstate/v1\nkind: source\nid: src_kfk\nconnector: kafka\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get src_kfk")).isTrue();

@@ -45,8 +45,10 @@ import java.util.function.Supplier;
  * schema store — an observation of what discovery found, never the config truth layer, which apply is
  * the one writer of. Typed online writes additionally read the artifact truth layer so validation can
  * include only the relevant dependency/referrer closure; offline {@link #plan} keeps the historical
- * contract that the submitted batch itself is the closure. A draft carrying a precondition also reads
- * its stored version to report a stale edit before the atomic write check; a pipeline reads back the srs
+ * contract that the submitted batch itself is the closure. A partial Source draft also reads the
+ * stored Source and retains omitted top-level fields, including its connector config; an explicitly
+ * supplied config replaces the whole config map. A draft carrying a precondition reads its stored
+ * version to report a stale edit before the atomic write check; a pipeline reads back the srs
  * switches it has already recorded so that an unedited file re-applies as a no-op.
  * {@link #apply} runs a plan and then upserts each artifact into the store by its id, skipping the
  * write when the stored artifact's content hash is unchanged (a no-op).
@@ -71,10 +73,11 @@ import java.util.function.Supplier;
  * updated artifacts — as one atomic batch, so a mid-batch write failure rolls the whole batch back and
  * no partial batch is stored, matching the validation-failure guarantee on the write side.
  *
- * <p>A declared version is enforced <em>inside</em> that batch write, not only compared beforehand.
- * The comparison in {@link #plan} is what produces the diagnostic an author can read; it is not what
- * makes the edit safe, because validation runs between it and the write and a second author lands in
- * that window. Handing the declared versions to the store makes the comparison and the write one
+ * <p>A declared version, or the version a partial Source copied omitted fields from, is enforced
+ * <em>inside</em> that batch write, not only compared beforehand. The comparison in {@link #plan}
+ * produces a diagnostic an author can read; it is not what makes the edit safe, because validation
+ * runs between it and the write and a second author lands in that window. Handing these versions
+ * to the store makes the comparison and the write one
  * indivisible operation, so the losing author is refused with {@code artifact.version-conflict}
  * rather than silently overwriting the winner.
  */
@@ -95,6 +98,8 @@ public final class ApplyService {
     private final LivePipelines live;
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
+    private static final Set<String> SOURCE_PATCH_FIELDS = Set.of(
+            "metadata", "config", "mode", "tables", "srs", "experimental");
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
@@ -132,14 +137,19 @@ public final class ApplyService {
     public ApplyPlan plan(List<ArtifactDraft> drafts) {
         Objects.requireNonNull(drafts, "drafts");
         List<Resource> resources = new ArrayList<>();
+        List<Set<String>> declaredFields = new ArrayList<>();
         for (ArtifactDraft draft : drafts) {
-            resources.add(parse(draft));
+            DslParser.ParsedResource parsed = parseWithDeclaredFields(draft);
+            resources.add(parsed.resource());
+            declaredFields.add(parsed.declaredFields());
         }
         // Preconditions are judged once every draft has parsed, so a malformed document is reported as
         // malformed rather than as a version conflict, and before the batch is validated, so an author
         // editing a version that has moved on is told that instead of being handed diagnostics about
         // content they are about to rewrite. Each one declared is kept under the id it was declared
         // against: this is the only point at which a draft and the id it parses to are both in hand.
+        // A partial Source also carries the version of the stored fields it copied, unless the caller
+        // supplied an explicit version, so concurrent changes cannot be overwritten by that copy.
         Map<String, String> preconditions = new LinkedHashMap<>();
         for (int index = 0; index < drafts.size(); index++) {
             ArtifactDraft draft = drafts.get(index);
@@ -148,8 +158,42 @@ public final class ApplyService {
             if (draft.expectedContentHash() != null) {
                 preconditions.put(parsed.id(), draft.expectedContentHash());
             }
+            if (parsed instanceof SourceResource source) {
+                MergedSource merged = mergeSource(source, declaredFields.get(index));
+                resources.set(index, merged.resource());
+                if (merged.storedHash() != null && draft.expectedContentHash() == null) {
+                    preconditions.put(source.id(), merged.storedHash());
+                }
+            }
         }
         return planResources(resources, preconditions, ValidationScope.OFFLINE);
+    }
+
+    private MergedSource mergeSource(SourceResource submitted, Set<String> fields) {
+        if (fields.containsAll(SOURCE_PATCH_FIELDS)) {
+            return new MergedSource(submitted, null);
+        }
+        Resource found = store.get(submitted.id()).orElse(null);
+        if (!(found instanceof SourceResource existing)) {
+            return new MergedSource(submitted, null);
+        }
+        if (!existing.connector().equals(submitted.connector()) && !fields.contains("config")) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "changing a Source connector requires an explicit config"), null);
+        }
+        SourceResource merged = new SourceResource(
+                submitted.id(),
+                fields.contains("metadata") ? submitted.metadata() : existing.metadata(),
+                submitted.connector(),
+                fields.contains("config") ? submitted.config() : existing.config(),
+                fields.contains("mode") ? submitted.mode() : existing.mode(),
+                fields.contains("tables") ? submitted.tables() : existing.tables(),
+                fields.contains("srs") ? submitted.srs() : existing.srs(),
+                fields.contains("experimental") ? submitted.experimental() : existing.experimental());
+        return new MergedSource(merged, storedHash(existing));
+    }
+
+    private record MergedSource(SourceResource resource, String storedHash) {
     }
 
     /**
@@ -453,7 +497,7 @@ public final class ApplyService {
         // The changed set is audited per artifact, then written as one atomic batch: all of it lands or,
         // on a write failure, none does.
         //
-        // The declared versions are handed to the write rather than only to plan(). plan()'s comparison
+        // The explicit or implicit versions are handed to the write rather than only to plan(). plan()'s comparison
         // happens before a whole workspace validation and a schema-store read, so a second author
         // editing the same id inside that window passes the same comparison and both writes land — the
         // first author's edit is gone, and nothing anywhere reports it. Passing them here makes the
@@ -566,9 +610,9 @@ public final class ApplyService {
         }
     }
 
-    private Resource parse(ArtifactDraft draft) {
+    private DslParser.ParsedResource parseWithDeclaredFields(ArtifactDraft draft) {
         try {
-            return parser.parse(draft.content());
+            return parser.parseWithDeclaredFields(draft.content());
         } catch (DslException e) {
             throw draft.source() != null ? e.withSource(draft.source()) : e;
         }

@@ -173,6 +173,20 @@ public final class DslParser {
         return bind(rootMapping(yaml));
     }
 
+    /** Parses once while retaining which top-level fields the author actually supplied. */
+    public ParsedResource parseWithDeclaredFields(String yaml) {
+        MappingNode mapping = rootMapping(yaml);
+        Set<String> fields = Set.copyOf(YamlMap.of(mapping, "").keys());
+        return new ParsedResource(bind(mapping), fields);
+    }
+
+    public record ParsedResource(Resource resource, Set<String> declaredFields) {
+        public ParsedResource {
+            Objects.requireNonNull(resource, "resource");
+            declaredFields = Set.copyOf(declaredFields);
+        }
+    }
+
     /**
      * Parses text an earlier release wrote, dropping the keys this build has retired since.
      *

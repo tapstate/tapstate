@@ -1,11 +1,11 @@
 package io.tapstate.app;
 
 import io.tapstate.control.core.ConnectorCatalogView;
+import io.tapstate.control.core.ApplyResult;
+import io.tapstate.control.core.ArtifactOutcome;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceProjectionService;
-import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.SourceResource;
-import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.testsupport.RequiresDocker;
@@ -99,7 +99,7 @@ class ControlPlaneAssemblyIT {
         String token = (String) login.get("token");
         assertThat(token).isNotNull();
 
-        // Apply an artifact with the session token, then read it back as its canonical form.
+        // Apply an artifact with the session token, then read its config-omitting public form.
         HttpStatusCode applied = client.post().uri("/api/artifacts:apply")
                 .header("Authorization", "Bearer " + token)
                 .contentType(MediaType.APPLICATION_JSON)
@@ -111,7 +111,31 @@ class ControlPlaneAssemblyIT {
                 .header("Authorization", "Bearer " + token)
                 .retrieve().body(Map.class);
         assertThat(got.get("id")).isEqualTo("src_ora");
-        assertThat(got.get("canonicalForm")).isEqualTo(offlineCanonical(SOURCE));
+        assertThat((String) got.get("canonicalForm"))
+                .contains("id: src_ora", "connector: oracle")
+                .doesNotContain("config:", "10.20.0.15");
+        ApplyResult replay = client.post().uri("/api/artifacts:apply")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("drafts", List.of(Map.of("content", got.get("canonicalForm")))))
+                .retrieve().body(ApplyResult.class);
+        assertThat(replay.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UNCHANGED);
+        ApplyResult metadataEdit = client.post().uri("/api/artifacts:apply")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("drafts", List.of(Map.of("content", """
+                        version: tapstate/v1
+                        kind: source
+                        id: src_ora
+                        connector: oracle
+                        metadata: { description: updated }
+                        """))))
+                .retrieve().body(ApplyResult.class);
+        assertThat(metadataEdit.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UPDATED);
+        assertThat(((SourceResource) context.getBean(ArtifactStore.class)
+                .get("src_ora").orElseThrow()).config()).containsEntry("host", "10.20.0.15");
 
         // The node-local logs read face is served by the assembled control plane: a pipeline that has logged
         // nothing yields a benign empty tail with a normal 200, not a 404 like a missing observation.
@@ -131,6 +155,13 @@ class ControlPlaneAssemblyIT {
                 .isEqualTo("/api/sources/frontend_source");
         assertThat(created.getHeaders().getETag()).matches("\"[0-9a-f]{64}\"");
         assertStructuredSource(created.getBody(), "db-primary");
+
+        Map<?, ?> genericSource = client.get().uri("/api/artifacts/frontend_source")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .retrieve().body(Map.class);
+        assertThat((String) genericSource.get("canonicalForm"))
+                .contains("id: frontend_source", "connector: mysql")
+                .doesNotContain("config:", "not-returned", "db-primary");
 
         StorePort store = context.getBean(StorePort.class);
         assertThat(store.artifacts().get("frontend_source"))
@@ -368,11 +399,6 @@ class ControlPlaneAssemblyIT {
                 // keeps receiving what this test sends.
                 .run("--server.address=127.0.0.1", "--server.port=0");
         return ((WebServerApplicationContext) context).getWebServer().getPort();
-    }
-
-    /** The offline canonical contract for a draft: the exact bytes the authoring corpus golden locks. */
-    private static String offlineCanonical(String draft) {
-        return new CanonicalWriter().write(new DslParser().parse(draft));
     }
 
     private static final String SOURCE = """

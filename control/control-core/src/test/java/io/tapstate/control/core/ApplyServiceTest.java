@@ -41,7 +41,7 @@ import static org.assertj.core.api.Assertions.tuple;
 /**
  * The resource-type-agnostic apply pipeline. {@code plan} validates a batch (structural, reference
  * closure, connector capability matrix, batch duplicate id) and emits each resource's canonical form
- * and content hash, touching no store. {@code apply} runs a plan and then upserts each artifact by id
+ * and content hash, writing no store state. {@code apply} runs a plan and then upserts each artifact by id
  * into the store, skipping the write when the stored artifact's content hash is unchanged — the
  * idempotency key is the hash over the canonical form, so re-applying unchanged content writes
  * nothing. A validation failure aborts before any write.
@@ -84,7 +84,24 @@ class ApplyServiceTest {
             """;
 
     @Test
-    void redactedSourceReadsCannotBeReappliedOrPartiallyCommitted() {
+    void reapplyingAConfigOmittingSourceReadKeepsItsConnectionAndIsANoOp() {
+        service.apply("author", List.of(draft(TGT_MG)));
+        SourceResource original = (SourceResource) store.get("tgt_mg").orElseThrow();
+        String publicRead = new ArtifactQueryService(store).get("tgt_mg").orElseThrow().canonicalForm();
+        assertThat(publicRead).doesNotContain("config:");
+
+        ApplyResult replay = service.apply("author", List.of(draft(publicRead)));
+
+        assertThat(replay.outcomes()).singleElement().extracting(ArtifactOutcome::change)
+                .isEqualTo(ArtifactOutcome.Change.UNCHANGED);
+        assertThat(((SourceResource) store.get("tgt_mg").orElseThrow()).config())
+                .isEqualTo(original.config());
+        assertThat(CanonicalHash.of(store.get("tgt_mg").orElseThrow()))
+                .isEqualTo(CanonicalHash.of(original));
+    }
+
+    @Test
+    void configOmittingSourceReadsCanBeReappliedWithoutExposingOrChangingCredentials() {
         String original = """
                 version: tapstate/v1
                 kind: source
@@ -95,22 +112,92 @@ class ApplyServiceTest {
         service.apply("author", List.of(draft(original)));
         String storedBefore = stored("atlas");
         String display = new ArtifactQueryService(store).get("atlas").orElseThrow().canonicalForm();
-        assertThat(display).contains("<redacted>").doesNotContain("sentinel");
+        assertThat(display).doesNotContain("config:", "sentinel");
 
-        assertThatThrownBy(() -> service.plan(List.of(draft(display))))
-                .isInstanceOfSatisfying(TapstateException.class, error ->
-                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
-        assertThatThrownBy(() -> service.apply("author", List.of(draft(display), draft(TGT_MG))))
-                .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
-                    assertThat(error).hasMessageNotContaining("sentinel");
-                });
+        ApplyResult replay = service.apply("author", List.of(draft(display), draft(TGT_MG)));
+
+        assertThat(replay.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UNCHANGED, ArtifactOutcome.Change.CREATED);
         assertThat(stored("atlas")).isEqualTo(storedBefore);
-        assertThat(store.get("tgt_mg")).isEmpty();
+        assertThat(((SourceResource) store.get("atlas").orElseThrow()).config())
+                .containsEntry("uri", "mongodb+srv://probe:sentinel@cluster.example/test");
 
         assertThatThrownBy(() -> service.apply("author", List.of(draft(SourceReadProjection.WITHHELD))))
                 .isInstanceOf(TapstateException.class);
         assertThat(stored("atlas")).isEqualTo(storedBefore);
+    }
+
+    @Test
+    void omittedSourceFieldsArePreservedWhileSubmittedTopLevelFieldsChange() {
+        String initial = TGT_MG + "metadata: { labels: { team: ops }, description: original }\n"
+                + "experimental: { retained: true }\n";
+        service.apply("author", List.of(draft(initial)));
+
+        ApplyResult edit = service.apply("author", List.of(draft("""
+                version: tapstate/v1
+                kind: source
+                id: tgt_mg
+                connector: mongodb
+                metadata: { description: updated }
+                """)));
+
+        assertThat(edit.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UPDATED);
+        SourceResource after = (SourceResource) store.get("tgt_mg").orElseThrow();
+        assertThat(after.config()).containsExactlyInAnyOrderEntriesOf(
+                Map.of("uri", "mongodb://10.30.0.11:27017/ods", "auth_source", "admin"));
+        assertThat(after.metadata().description()).isEqualTo("updated");
+        assertThat(after.metadata().labels()).isEmpty();
+        assertThat(after.experimental()).containsEntry("retained", true);
+    }
+
+    @Test
+    void explicitlySubmittedSourceConfigReplacesTheWholeConfigMap() {
+        service.apply("author", List.of(draft(TGT_MG + "metadata: { description: retained }\n")));
+
+        service.apply("author", List.of(draft("""
+                version: tapstate/v1
+                kind: source
+                id: tgt_mg
+                connector: mongodb
+                config: { uri: "mongodb://10.30.0.12:27017/ods" }
+                """)));
+
+        SourceResource after = (SourceResource) store.get("tgt_mg").orElseThrow();
+        assertThat(after.config()).containsExactlyInAnyOrderEntriesOf(
+                Map.of("uri", "mongodb://10.30.0.12:27017/ods"));
+        assertThat(after.metadata().description()).isEqualTo("retained");
+    }
+
+    @Test
+    void explicitlyEmptySourceConfigClearsThePreviouslyStoredConfig() {
+        service.apply("author", List.of(draft(TGT_MG)));
+
+        service.apply("author", List.of(draft("""
+                version: tapstate/v1
+                kind: source
+                id: tgt_mg
+                connector: mongodb
+                config: {}
+                """)));
+
+        assertThat(((SourceResource) store.get("tgt_mg").orElseThrow()).config()).isEmpty();
+    }
+
+    @Test
+    void changingSourceConnectorRequiresAnExplicitConfig() {
+        service.apply("author", List.of(draft(TGT_MG)));
+
+        assertThatThrownBy(() -> service.apply("author", List.of(draft("""
+                version: tapstate/v1
+                kind: source
+                id: tgt_mg
+                connector: mysql
+                """))))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThat(((SourceResource) store.get("tgt_mg").orElseThrow()).connector())
+                .isEqualTo("mongodb");
     }
 
     /**
@@ -330,7 +417,7 @@ class ApplyServiceTest {
         return new CanonicalWriter().write(new DslParser().parse(yaml));
     }
 
-    // ---- the store-free front half: validate -> canonical -> hash ----
+    // ---- the write-free front half: validate -> canonical -> hash ----
 
     @Test
     void planCanonicalizesAndHashesAValidResource() {
@@ -1121,19 +1208,18 @@ class ApplyServiceTest {
     }
 
     @Test
-    void anApplyWithNoDeclaredVersionIsStillWrittenWhenAnotherWriterLandsFirst() {
-        // The other half of the same window: a caller that declared nothing asked for no check, and
-        // must keep overwriting exactly as it always did. Guarding an unasked-for precondition would
-        // turn every concurrent apply into a refusal.
+    void aPartialSourceApplyRefusesToOverwriteAConcurrentConnectionChange() {
+        // A partial Source edit copies omitted fields from the stored version. Even without a caller-
+        // declared hash, the copied fields must be guarded by an atomic precondition.
         service.apply("alice", List.of(draft(TGT_MG)));
         Resource alicesEdit = new DslParser().parse(TGT_MG_EDITED);
         store.concurrentWriter = () -> store.landDirectly(alicesEdit);
 
-        ApplyResult result = service.apply("bob", List.of(draft(TGT_MG_EDITED_AGAIN)));
+        assertThatThrownBy(() -> service.apply("bob", List.of(draft(TGT_MG_EDITED_AGAIN))))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ArtifactError.VERSION_CONFLICT));
 
-        assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
-                .containsExactly(ArtifactOutcome.Change.UPDATED);
-        assertThat(stored("tgt_mg")).isEqualTo(canonicalOf(TGT_MG_EDITED_AGAIN));
+        assertThat(stored("tgt_mg")).isEqualTo(canonicalOf(TGT_MG_EDITED));
     }
 
     @Test

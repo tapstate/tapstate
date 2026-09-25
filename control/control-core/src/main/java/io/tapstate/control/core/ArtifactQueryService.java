@@ -1,6 +1,5 @@
 package io.tapstate.control.core;
 
-import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -13,33 +12,25 @@ import io.tapstate.spi.store.StoredArtifactRecord;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.function.Supplier;
 
 /**
  * The resource-type-agnostic read side of the double-layer model: the store is the truth layer, and a
- * read returns an artifact from that layer — never from a local draft (server-as-truth). Public reads of
- * credential-bearing Sources are a non-replayable redacted projection; their stored resource, content hash,
- * and typed internal reads are unchanged. {@link ApplyService} is the write side; this is its read peer.
+ * read returns an artifact from that layer — never from a local draft (server-as-truth). Public Source
+ * reads omit connector config, while their stored resource, content hash, and typed internal reads are
+ * unchanged. {@link ApplyService} is the write side; this is its read peer.
  *
- * <p>The canonical form a read returns is produced by the same {@link CanonicalWriter} the offline
- * authoring path uses, so an applied artifact reads back byte-for-byte as its offline canonical form:
- * the online path reuses the one canonical contract rather than forking it. Reconstructing the stored
- * form is the store's concern; this layer only re-serializes the reconstructed resource to canonical.
+ * <p>Non-Source reads remain byte-stable canonical output. A Source read is a config-omitting projection
+ * produced by the same writer; the server is still the truth for its omitted configuration.
  */
 public final class ArtifactQueryService {
 
     private final ArtifactStore store;
     private final CanonicalWriter writer = new CanonicalWriter();
     private final DslParser parser = new DslParser();
-    private final SourceReadProjection sourceProjection;
+    private final SourceReadProjection sourceProjection = new SourceReadProjection();
 
     public ArtifactQueryService(ArtifactStore store) {
-        this(store, TapstateCatalog::load);
-    }
-
-    public ArtifactQueryService(ArtifactStore store, Supplier<TapstateCatalog> catalog) {
         this.store = Objects.requireNonNull(store, "store");
-        this.sourceProjection = new SourceReadProjection(catalog);
     }
 
     /** Returns the stored artifact for the id as its canonical form, or empty when none is stored. */
@@ -62,7 +53,7 @@ public final class ArtifactQueryService {
 
     /** Lists every stored artifact, retaining rows whose stored body is unreadable. */
     public List<ArtifactListEntry> list() {
-        return views(store.listStored());
+        return store.listStored().stream().map(this::view).toList();
     }
 
     /** Returns one typed stored resource and its canonical hash without parsing canonical text. */
@@ -85,29 +76,19 @@ public final class ArtifactQueryService {
         if (kind == null || kind.isBlank()) {
             return list();
         }
-        return views(store.listStored(kind));
-    }
-
-    private List<ArtifactListEntry> views(List<StoredArtifactRecord> rows) {
-        // The online catalog may read registered rows from a store; take one snapshot for the inventory,
-        // not one catalog read per Source, while still withholding Source bodies if it is unavailable.
-        TapstateCatalog catalog = rows.stream().anyMatch(row -> "source".equals(row.kind()))
-                ? sourceProjection.catalogSnapshot() : null;
-        return rows.stream().map(row -> view(row, catalog)).toList();
+        return store.listStored(kind).stream().map(this::view).toList();
     }
 
     private StoredArtifact view(Resource resource) {
         // The hash comes back beside the canonical form rather than being derivable from it: it is taken
         // over the resource's structure, so a caller holding only these bytes cannot recompute it and
         // must hand this field straight back as a precondition.
-        String canonical = writer.write(resource);
-        if (resource instanceof SourceResource source) {
-            canonical = sourceProjection.canonicalForRead(source, canonical);
-        }
+        String canonical = resource instanceof SourceResource source
+                ? sourceProjection.canonicalForRead(source) : writer.write(resource);
         return new StoredArtifact(resource.id(), resource.kind(), canonical, CanonicalHash.of(resource));
     }
 
-    private ArtifactListEntry view(StoredArtifactRecord row, TapstateCatalog catalog) {
+    private ArtifactListEntry view(StoredArtifactRecord row) {
         String canonical = row.canonicalForm();
         if ("source".equals(row.kind())) {
             if (!row.readable() || canonical == null) {
@@ -116,7 +97,7 @@ public final class ArtifactQueryService {
                 try {
                     Resource parsed = parser.parse(canonical);
                     canonical = parsed instanceof SourceResource source
-                            ? sourceProjection.canonicalForRead(source, canonical, catalog)
+                            ? sourceProjection.canonicalForRead(source)
                             : SourceReadProjection.WITHHELD;
                 } catch (RuntimeException unsafeSource) {
                     canonical = SourceReadProjection.WITHHELD;

@@ -265,7 +265,7 @@ class ControlApiTest {
     }
 
     @Test
-    void getReadsBackTheAppliedArtifactAsItsCanonicalForm() {
+    void getReadsBackSourceIdentityWithoutItsConnectorConfig() {
         applyDrafts(TGT_MG);
 
         ResponseEntity<StoredArtifact> got = client().get().uri("/api/artifacts/tgt_mg")
@@ -273,11 +273,13 @@ class ControlApiTest {
 
         assertThat(got.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(got.getBody().id()).isEqualTo("tgt_mg");
-        assertThat(got.getBody().canonicalForm()).isEqualTo(offlineCanonical(TGT_MG));
+        assertThat(got.getBody().canonicalForm())
+                .contains("id: tgt_mg", "connector: mongodb")
+                .doesNotContain("config:", "10.30.0.11");
     }
 
     @Test
-    void secretSourceArtifactReadsAreSafeAndTheirDisplayCannotBeReapplied() {
+    void secretSourceArtifactReadsOmitConfigAndCanBeReapplied() {
         String original = """
                 version: tapstate/v1
                 kind: source
@@ -292,8 +294,8 @@ class ControlApiTest {
                 .retrieve().toEntity(ArtifactList.class).getBody();
 
         assertThat(got.canonicalForm())
-                .contains("mongodb+srv://<redacted>@cluster.example/test")
-                .doesNotContain("probe:sentinel");
+                .contains("id: atlas", "connector: mongodb-atlas")
+                .doesNotContain("config:", "probe:sentinel");
         assertThat(listed.artifacts()).singleElement().satisfies(row ->
                 assertThat(row.canonicalForm()).isEqualTo(got.canonicalForm()));
         assertThat(got.contentHash()).isEqualTo(written.outcomes().getFirst().contentHash());
@@ -302,19 +304,16 @@ class ControlApiTest {
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(Map.of("drafts", List.of(Map.of("content", got.canonicalForm()))))
                 .retrieve().toEntity(ArtifactValidationResult.class).getBody();
-        assertThat(validation.valid()).isFalse();
-        assertThat(validation.diagnostics()).extracting(ValidationDiagnostic::code)
-                .containsExactly("control.malformed-request");
+        assertThat(validation.valid()).isTrue();
+        assertThat(validation.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UNCHANGED);
 
-        ApiError refusal = client().post().uri("/api/artifacts:apply")
+        ApplyResult replay = client().post().uri("/api/artifacts:apply")
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(Map.of("drafts", List.of(Map.of("content", got.canonicalForm()))))
-                .exchange((request, response) -> {
-                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-                    return response.bodyTo(ApiError.class);
-                });
-        assertThat(refusal.code()).isEqualTo("control.malformed-request");
-        assertThat(refusal.toString()).doesNotContain("sentinel");
+                .retrieve().toEntity(ApplyResult.class).getBody();
+        assertThat(replay.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UNCHANGED);
         assertThat(client().get().uri("/api/artifacts/atlas")
                 .retrieve().toEntity(StoredArtifact.class).getBody().contentHash())
                 .isEqualTo(got.contentHash());
@@ -329,9 +328,10 @@ class ControlApiTest {
         ApplyResult result = applyDraftsWithPrecondition(TGT_MG_CHANGED, current);
 
         assertThat(result.outcomes()).extracting(ArtifactOutcome::id).containsExactly("tgt_mg");
-        assertThat(client().get().uri("/api/artifacts/tgt_mg")
-                .retrieve().toEntity(StoredArtifact.class).getBody().canonicalForm())
-                .isEqualTo(offlineCanonical(TGT_MG_CHANGED));
+        StoredArtifact after = client().get().uri("/api/artifacts/tgt_mg")
+                .retrieve().toEntity(StoredArtifact.class).getBody();
+        assertThat(after.contentHash()).isEqualTo(result.outcomes().getFirst().contentHash());
+        assertThat(after.canonicalForm()).doesNotContain("config:", "10.30.0.12");
     }
 
     @Test
@@ -404,15 +404,14 @@ class ControlApiTest {
 
     @Test
     void anApplyWithNoPreconditionKeepsOverwritingAsItAlwaysHas() {
-        // The backward-compatibility half: the field is optional, and a caller that never sends it is
-        // never refused by a check it did not ask for.
+        // A Source edit with explicit config can update the connection without a caller-declared hash.
         applyDrafts(TGT_MG);
 
-        applyDrafts(TGT_MG_CHANGED);
+        ApplyResult changed = applyDrafts(TGT_MG_CHANGED);
 
         assertThat(client().get().uri("/api/artifacts/tgt_mg")
-                .retrieve().toEntity(StoredArtifact.class).getBody().canonicalForm())
-                .isEqualTo(offlineCanonical(TGT_MG_CHANGED));
+                .retrieve().toEntity(StoredArtifact.class).getBody().contentHash())
+                .isEqualTo(changed.outcomes().getFirst().contentHash());
     }
 
     private ApplyResult applyDraftsWithPrecondition(String draft, String expectedContentHash) {
