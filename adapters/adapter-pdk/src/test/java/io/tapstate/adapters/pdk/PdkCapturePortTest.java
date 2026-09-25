@@ -24,6 +24,7 @@ import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -133,6 +134,48 @@ class PdkCapturePortTest {
         assertThat(got.get(1).after()).containsEntry("id", 2L);
     }
 
+    /**
+     * A snapshot is read as it is taken, not collected first: with one row taken, the connector has handed
+     * over a few of its batches and is waiting, not the whole table.
+     *
+     * <p>The bound is what makes the heap a load needs independent of the table. A port that collects the
+     * read before handing over its first row holds the table whole on the heap -- as the connector's events
+     * and again decoded -- so a table larger than the heap cannot be read at all, and one merely large
+     * crowds out everything else the server runs. The count is read after a pause, so a read with no bound
+     * has had every chance to run on ahead before it is looked at; and the rows are then taken to the end,
+     * so a bound that simply lost the tail of the table would not pass for one that paced it.
+     */
+    @Test
+    void aSnapshotReadsOnlyAFewBatchesAheadOfTheRowsTaken(@TempDir Path dir) throws Exception {
+        int rows = 50_000;
+        String counter = "synthetic.large.handed." + System.nanoTime();
+        AtomicLong handed = new AtomicLong();
+        System.getProperties().put(counter, handed);
+        try {
+            Path jar = Synthetic.largeSource(dir, rows, counter);
+            PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.LargeSource", null));
+            try (CaptureBatch batch = port.snapshot(config("t1"))) {
+                assertThat(batch.hasNext()).isTrue();
+                assertThat(batch.next().after()).containsEntry("id", 1L);
+                Thread.sleep(300);
+
+                assertThat(handed.get())
+                        .as("rows the connector handed over with one of them taken: a few batches of a "
+                                + "thousand, not the %d-row table", rows)
+                        .isLessThanOrEqualTo(10_000L);
+
+                long taken = 1;
+                while (batch.hasNext()) {
+                    batch.next();
+                    taken++;
+                }
+                assertThat(taken).as("every row still arrives, however far ahead the read may run").isEqualTo(rows);
+            }
+        } finally {
+            System.getProperties().remove(counter);
+        }
+    }
+
     @Test
     void snapshotHandsTheConnectorItsDiscoveredTableNotABareName(@TempDir Path dir) throws Exception {
         // A real connector builds its read from the table's own columns - a mysql SELECT names them - and
@@ -206,11 +249,14 @@ class PdkCapturePortTest {
         assertThat(got.get(0).op()).isEqualTo(Op.READ);
     }
 
+    // A failure after the seam is sampled reaches whoever is taking the rows, as the rows would have: the read
+    // is under way by the time the batch is handed back. What it is, and its code, are what they always were.
+
     @Test
     void aConnectorThatThrowsWhileReadingIsACodedCaptureFailure(@TempDir Path dir) throws Exception {
         Path jar = Synthetic.throwingReadSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.ThrowingRead", null));
-        assertThatThrownBy(() -> port.snapshot(config("t1")))
+        assertThatThrownBy(() -> takeAll(port.snapshot(config("t1"))))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
     }
@@ -221,9 +267,20 @@ class PdkCapturePortTest {
         // so the codec refuses it. That is a projection failure, distinct from a connector read failure.
         Path jar = Synthetic.badRowSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.BadRow", null));
-        assertThatThrownBy(() -> port.snapshot(config("t1")))
+        assertThatThrownBy(() -> takeAll(port.snapshot(config("t1"))))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.PROJECTION_FAILED));
+    }
+
+    /** Takes every row of {@code batch} and closes it, the way a snapshot phase does. */
+    private static List<Envelope> takeAll(CaptureBatch batch) {
+        List<Envelope> rows = new ArrayList<>();
+        try (batch) {
+            while (batch.hasNext()) {
+                rows.add(batch.next());
+            }
+        }
+        return rows;
     }
 
     // ---- cdc drive: streamRead -> decodeChange ---------------------------------------------------

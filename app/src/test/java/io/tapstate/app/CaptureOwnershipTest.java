@@ -42,12 +42,15 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class CaptureOwnershipTest {
 
@@ -65,6 +68,56 @@ class CaptureOwnershipTest {
 
     /** The chain every pipeline here reads, whichever member drives it. */
     private static final String CHAIN = SourceCaptureResolution.of(SOURCE).chainId().value();
+
+    /**
+     * A capture nobody tails is not taken over while a pipeline here is still reading its own load of it.
+     * The tail would hand its changes over while that load is still arriving, and a change ahead of a
+     * snapshot row of the same key is overwritten by the older value. The tail resumes from where the durable
+     * record says the last one got to, so asking again on a later pass costs time and nothing else.
+     */
+    @Test
+    void aCaptureIsNotTakenOverWhileAPipelineOnItIsStillReadingItsLoad() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p", "q"));
+        MemoryClaims raw = new MemoryClaims();
+        ClusterMembershipGate gate = eligibleGate();
+        AtomicInteger tails = new AtomicInteger();
+        CaptureAttacher holding = (spec, handoff, startTail) -> {
+            if (startTail) {
+                tails.incrementAndGet();
+                opensTheRing(store);
+            }
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator nodeA =
+                managed(store, holding, gate, raw, new WorkloadOwner("node-a", "boot-a"));
+        nodeA.startCapture("p");
+
+        AtomicBoolean reading = new AtomicBoolean(true);
+        CaptureRun loading = mock(CaptureRun.class);
+        when(loading.loading()).thenAnswer(invocation -> reading.get());
+        CaptureAttacher joining = (spec, handoff, startTail) -> {
+            if (startTail) {
+                tails.incrementAndGet();
+                return run(() -> { });
+            }
+            return loading;
+        };
+        StoreBackedPipelineCaptureCoordinator nodeB =
+                managed(store, joining, gate, raw, new WorkloadOwner("node-b", "boot-b"));
+        nodeB.startCapture("q");
+        nodeA.stopCapture("p", false);
+
+        nodeB.tailWhatNobodyTails();
+        assertThat(tails).as("nothing taken over while q is still reading its load").hasValue(1);
+
+        reading.set(false);
+        nodeB.tailWhatNobodyTails();
+        assertThat(tails).as("taken over once the load is through").hasValue(2);
+
+        nodeB.stopCapture("q", false);
+        nodeA.close();
+        nodeB.close();
+    }
 
     @Test
     void twoMemberBaselineReadsTwiceWithoutAClaimAndOnceWithCaptureOwnership() {

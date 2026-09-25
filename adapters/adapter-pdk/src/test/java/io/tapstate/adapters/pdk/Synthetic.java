@@ -489,6 +489,37 @@ final class Synthetic {
                 source("CtorThrows", "throw new RuntimeException(\"ctor boom\");", ""));
     }
 
+    /**
+     * A source whose batch read hands over {@code rows} rows of table {@code t1}, a batch of the size it is
+     * asked for at a time, and stops when the host stops it. Each batch is added to the count held under
+     * {@code counter} in the system properties once its hand-over returns: the connector runs in a loader of
+     * its own, and the system properties are one thing both sides of that boundary reach, so it is how a case
+     * sees how far the read has got.
+     */
+    static Path largeSource(Path dir, int rows, String counter) {
+        String register = ""
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  java.util.concurrent.atomic.AtomicLong handed ="
+                + "      (java.util.concurrent.atomic.AtomicLong) System.getProperties().get(\"" + counter + "\");"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + "  for (int i = 1; i <= " + rows + " && !stopped; i++) {"
+                + "    Map<String,Object> row = new LinkedHashMap<>(); row.put(\"id\", i);"
+                + "    evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(row));"
+                + "    if (evs.size() == size) {"
+                + "      consumer.accept(evs, null); handed.addAndGet(evs.size()); evs = new ArrayList<>();"
+                + "    }"
+                + "  }"
+                + "  if (!evs.isEmpty() && !stopped) { consumer.accept(evs, null); handed.addAndGet(evs.size()); }"
+                + "});";
+        String discovery = "TapTable table = new TapTable(\"t1\");"
+                + "table.add(new TapField(\"id\", \"int\"));"
+                + "List<TapTable> tables = new ArrayList<>();"
+                + "tables.add(table);"
+                + "s.accept(tables);";
+        return SyntheticJar.compileToJar(dir, "synthetic.LargeSource", source(
+                "LargeSource", "", register, "  private volatile boolean stopped;", discovery, "stopped = true;"));
+    }
+
     /** A connector whose batchRead throws — a connector-side read failure. */
     static Path throwingReadSource(Path dir) {
         String register = "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
