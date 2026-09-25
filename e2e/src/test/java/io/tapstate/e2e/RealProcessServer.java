@@ -119,7 +119,7 @@ final class RealProcessServer implements ServerHandle {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);
     }
 
-    private static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar) {
+    static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar) {
         return start(storeUri, operatorStateDatabase, jar, List.of());
     }
 
