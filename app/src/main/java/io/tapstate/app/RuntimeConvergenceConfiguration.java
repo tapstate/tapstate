@@ -18,6 +18,7 @@ import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.StorePort;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableScheduling;
@@ -135,13 +136,22 @@ class RuntimeConvergenceConfiguration {
         return new RateSampler(storePort.rateHistory(), history.getSampleInterval());
     }
 
+    /** One bounded pool for lifecycle coordination across every pipeline in this process. */
+    @Bean(destroyMethod = "close")
+    LifecycleWorkDispatcher lifecycleWorkDispatcher(
+            @Value("${tapstate.lifecycle.max-concurrency:4}") int maxConcurrency,
+            @Value("${tapstate.lifecycle.queue-capacity:64}") int queueCapacity) {
+        return new LifecycleWorkDispatcher(maxConcurrency, queueCapacity);
+    }
+
     @Bean
     ConvergenceDriver convergenceDriver(
             PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
             RateSampler rateSampler, MetricsExport metricsExport,
-            ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership) {
+            ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership,
+            LifecycleWorkDispatcher lifecycleWorkDispatcher) {
         return new ConvergenceDriver(
                 pipelineConverger, storePort.desired(), observationPublisher, rateSampler, metricsExport,
-                membershipGate::businessEligible, pipelineActuationOwnership);
+                membershipGate::businessEligible, pipelineActuationOwnership, lifecycleWorkDispatcher);
     }
 }

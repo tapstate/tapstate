@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.runtime.scheduler.ConvergeResult;
 import io.tapstate.runtime.scheduler.ConvergeStatus;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
@@ -34,11 +35,15 @@ final class ConvergenceDriver {
     private final ObservationPublisher publisher;
     private final BooleanSupplier businessEligible;
     private final PipelineActuationOwnership actuation;
+    private final LifecycleWorkDispatcher lifecycleWork;
 
     // Consecutive failed-reconcile passes per pipeline, so a pipeline that keeps throwing surfaces as a
     // climbing errorCount rather than an empty read face. Reconcile runs on a single scheduler thread with a
     // fixed delay (passes never overlap), so a plain map needs no synchronization.
     private final Map<String, Long> reconcileFailures = new HashMap<>();
+    // The queue is bounded. Rotate the first pipeline each tick so a stable list of quick jobs cannot
+    // refill every slot before a later pipeline in that same list is ever offered one.
+    private long dispatchTurn;
 
     private final RateSampler sampler;
 
@@ -76,6 +81,13 @@ final class ConvergenceDriver {
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
             RateSampler sampler, MetricsExport export, BooleanSupplier businessEligible,
             PipelineActuationOwnership actuation) {
+        this(converger, desired, publisher, sampler, export, businessEligible, actuation,
+                LifecycleWorkDispatcher.inline());
+    }
+
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            RateSampler sampler, MetricsExport export, BooleanSupplier businessEligible,
+            PipelineActuationOwnership actuation, LifecycleWorkDispatcher lifecycleWork) {
         this.converger = converger;
         this.desired = desired;
         this.publisher = publisher;
@@ -83,30 +95,72 @@ final class ConvergenceDriver {
         this.export = export == null ? MetricsExport.none() : export;
         this.businessEligible = businessEligible;
         this.actuation = actuation;
+        this.lifecycleWork = lifecycleWork;
     }
 
     @Scheduled(fixedDelayString = "${tapstate.converge.interval-ms:1000}")
     void reconcile() {
         if (!businessEligible.getAsBoolean()) {
+            lifecycleWork.cancelAll();
             return;
         }
         List<String> pipelineIds = desired.pipelineIds();
-        for (String pipelineId : pipelineIds) {
+        int first = pipelineIds.isEmpty() ? 0 : (int) Math.floorMod(dispatchTurn++, pipelineIds.size());
+        for (int at = 0; at < pipelineIds.size(); at++) {
+            String pipelineId = pipelineIds.get((first + at) % pipelineIds.size());
             // Attribute every line logged while reconciling this pipeline to it, so the logs read face can
             // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
             MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
             try {
-                if (!actuation.permit(pipelineId).granted()) {
+                PipelineActuationOwnership.Permit permit = actuation.permit(pipelineId);
+                if (permit.retry()) {
+                    // This pipeline's execution generation is being advanced on a worker. Waiting for
+                    // its per-pipeline lock would stall every later pipeline in this scheduler pass;
+                    // treating that short wait as lost ownership would cancel the worker holding it.
+                    publisher.publish(pipelineId, null).ifPresent(published -> {
+                        sample(published);
+                        export(published);
+                    });
+                    continue;
+                }
+                if (!permit.granted()) {
                     // Another member drives this pipeline. Observe desired and actual; drive neither. Both
                     // halves matter: converging here would call the same lifecycle verb a second time --
                     // this member is carrying no job, which is exactly the condition the converge side
                     // starts one in -- and publishing here would overwrite the driver's observation with
                     // this member's own run statistics, which are absent because the run is not here.
+                    lifecycleWork.cancel(pipelineId);
                     continue;
                 }
-                ConvergeResult result = converger.converge(pipelineId);
+                LifecycleWorkDispatcher.Outcome completed = lifecycleWork.take(pipelineId);
+                if (completed == null || completed.superseded()) {
+                    DesiredState intent = desired.read(pipelineId).orElse(null);
+                    if (intent == null) {
+                        lifecycleWork.cancel(pipelineId);
+                        continue;
+                    }
+                    LifecycleWorkDispatcher.Submission submission = lifecycleWork.offer(
+                            pipelineId, intent, () -> converger.converge(pipelineId));
+                    if (submission == LifecycleWorkDispatcher.Submission.CAPACITY) {
+                        LOG.debug("Lifecycle work for pipeline {} is waiting for dispatcher capacity", pipelineId);
+                    }
+                    // Inline fixtures finish now; a real worker normally leaves this empty until a later
+                    // tick. In both cases the same result path publishes the reconciled state.
+                    completed = lifecycleWork.take(pipelineId);
+                }
                 ObservationFailure failure = null;
-                if (result.status() == ConvergeStatus.FAILED) {
+                if (completed != null && completed.failure() != null) {
+                    if (completed.failure() instanceof Error error) {
+                        throw error;
+                    }
+                    if (completed.failure() instanceof RuntimeException runtime) {
+                        throw runtime;
+                    }
+                    throw new IllegalStateException("lifecycle work failed with a checked throwable",
+                            completed.failure());
+                }
+                ConvergeResult result = completed == null ? null : completed.result();
+                if (result != null && result.status() == ConvergeStatus.FAILED) {
                     // The job died on its own; the converge side moved the pipeline to the observable FAILED
                     // state. This is the only pass that holds the cause, so it goes two ways: coded onto the
                     // observation, so a read face can say why, and into the log with its code and stack.
@@ -120,8 +174,11 @@ final class ConvergenceDriver {
                     sample(published);
                     export(published);
                 });
-                // A clean pass ends the failure streak; the next throw starts counting from one again.
-                reconcileFailures.remove(pipelineId);
+                // A completed clean reconciliation, rather than an idle tick while work is pending,
+                // ends the failure streak. Pending work has not yet shown it can succeed.
+                if (result != null) {
+                    reconcileFailures.remove(pipelineId);
+                }
             } catch (RuntimeException e) {
                 // A pass that keeps throwing never reaches publish(), so the read face would stay empty and a
                 // permanently broken pipeline would look identical to a slow one. Count the consecutive
@@ -149,6 +206,7 @@ final class ConvergenceDriver {
         // pipeline: the control ring's synchronous surface into the runtime is a closed set, and this set
         // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
+        lifecycleWork.retain(pipelineIds);
         // Same for the claims: a pipeline that is gone still has this member named as its driver until the
         // lease runs out, which delays nothing but reads as an owner over something that no longer exists.
         actuation.retain(pipelineIds);

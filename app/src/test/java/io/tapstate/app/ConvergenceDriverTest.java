@@ -10,6 +10,8 @@ import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.runtime.scheduler.RateSampler;
+import io.tapstate.spi.metrics.MetricsExport;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -18,6 +20,8 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static io.tapstate.core.lifecycle.PipelineState.FAILED;
 import static io.tapstate.core.lifecycle.PipelineState.NEW;
@@ -55,6 +59,62 @@ class ConvergenceDriverTest {
         // Each converged pipeline also has its observation published for the read faces to serve.
         assertThat(observations.read("orders").orElseThrow().state()).isEqualTo(RUNNING);
         assertThat(observations.read("users").orElseThrow().state()).isEqualTo(RUNNING);
+    }
+
+    @Test
+    void aBlockedLifecycleStartDoesNotStopAnotherPipelinesObservation() throws Exception {
+        CountDownLatch slowEntered = new CountDownLatch(1);
+        CountDownLatch releaseSlow = new CountDownLatch(1);
+        CountDownLatch fastEntered = new CountDownLatch(1);
+        LifecycleActuator blocking = new LifecycleActuator() {
+            @Override
+            public void start(String pipelineId) {
+                if (pipelineId.equals("slow")) {
+                    slowEntered.countDown();
+                    try {
+                        if (!releaseSlow.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("slow start was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("slow start was interrupted", interrupted);
+                    }
+                } else {
+                    fastEntered.countDown();
+                }
+            }
+
+            @Override public void pause(String pipelineId) { }
+            @Override public void resume(String pipelineId) { }
+            @Override public void stop(String pipelineId, boolean purgeState) { }
+            @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String pipelineId) { return true; }
+        };
+        desired.save(new DesiredState("slow", RUNNING, "rev-1"));
+        desired.save(new DesiredState("fast", RUNNING, "rev-1"));
+        PipelineConverger asyncConverger = new PipelineConverger(
+                desired, state, blocking, Clock.fixed(T0, ZoneOffset.UTC));
+        try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(2, 2)) {
+            ConvergenceDriver async = new ConvergenceDriver(asyncConverger, desired,
+                    new ObservationPublisher(state, observations), (RateSampler) null,
+                    MetricsExport.none(), () -> true, PipelineActuationOwnership.single(), work);
+
+            async.reconcile();
+            assertThat(slowEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(fastEntered.await(5, TimeUnit.SECONDS))
+                    .as("the fast pipeline starts while the slow snapshot is still blocked").isTrue();
+            assertThat(releaseSlow.getCount()).isEqualTo(1L);
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (System.nanoTime() < until && observations.read("fast")
+                    .filter(observation -> observation.state() == RUNNING).isEmpty()) {
+                async.reconcile();
+                TimeUnit.MILLISECONDS.sleep(5);
+            }
+            assertThat(observations.read("fast").orElseThrow().state()).isEqualTo(RUNNING);
+            assertThat(releaseSlow.getCount()).isEqualTo(1L);
+        } finally {
+            releaseSlow.countDown();
+        }
     }
 
     @Test
