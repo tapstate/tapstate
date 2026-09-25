@@ -24,7 +24,13 @@ import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
+import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.control.core.ClusterIdentityService;
+import io.tapstate.control.core.ClusterPipelineTopologyService;
+import io.tapstate.control.core.ClusterTopologyService;
+import io.tapstate.control.core.LiveClusterMembers;
+import io.tapstate.control.core.LivePipelineRuns;
+import io.tapstate.spi.store.ClusterMembershipStore;
 import io.tapstate.control.core.ConnectorConfigValidator;
 import io.tapstate.control.core.ConnectorRegisterService;
 import io.tapstate.control.core.ControlOperations;
@@ -94,6 +100,7 @@ import io.tapstate.spi.store.SchemaDiscoverer;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.TokenStore;
 import io.tapstate.spi.store.UserStore;
 import org.slf4j.Logger;
@@ -125,7 +132,9 @@ import java.time.Clock;
 @Configuration
 @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
 @EnableConfigurationProperties({ControlAuthProperties.class, ConnectorPluginProperties.class})
-@Import(ControlHttpFace.class)
+// The topology read face reads the cluster id, and a control plane assembled without the engine must
+// still be able to stand up; the gate and the properties come from one place for everybody.
+@Import({ClusterMembershipConfiguration.class, ControlHttpFace.class})
 class ControlPlaneConfiguration {
 
     private static final Logger LOG = LoggerFactory.getLogger(ControlPlaneConfiguration.class);
@@ -172,6 +181,52 @@ class ControlPlaneConfiguration {
     @Bean
     ClusterIdentityService clusterIdentityService(ClusterIdentityStore store) {
         return new ClusterIdentityService(store);
+    }
+
+    /**
+     * The topology read face.
+     *
+     * <p>Both collaborators are optional, and for different reasons. A single-node build keeps no
+     * committed membership: one member is the whole cluster, and there is nothing for it to be outside
+     * of. An assembly with no engine member -- the control plane brought up on its own -- has no member
+     * list to read, and answers that it sees nobody, which is true of it: inventing itself as a
+     * one-member cluster would be the control plane reporting a data plane that is not running.
+     */
+    @Bean
+    ClusterTopologyService clusterTopologyService(
+            ObjectProvider<HazelcastInstance> member,
+            ObjectProvider<ClusterMembershipStore> membership,
+            ClusterPipelineTopologyService pipelines,
+            ClusterProperties clusterProperties) {
+        HazelcastInstance engine = member.getIfAvailable();
+        return new ClusterTopologyService(
+                engine == null ? LiveClusterMembers.none() : new HazelcastLiveClusterMembers(engine),
+                membership.getIfAvailable(),
+                pipelines,
+                clusterProperties.getId());
+    }
+
+    /**
+     * The pipeline half of the topology read face.
+     *
+     * <p>Its two optional collaborators mirror the member half's. With no engine there are no runs to
+     * report, and a control plane on its own says so rather than inventing an empty execution. With no
+     * claim store nothing is fenced -- a single node owns everything it runs and there is nobody to take
+     * it from -- so the pipelines are listed with no owner rather than with a fabricated one.
+     */
+    @Bean
+    ClusterPipelineTopologyService clusterPipelineTopologyService(
+            ObjectProvider<HazelcastInstance> member,
+            ObjectProvider<WorkloadClaimStore> claims,
+            StorePort storePort,
+            ClusterProperties clusterProperties) {
+        HazelcastInstance engine = member.getIfAvailable();
+        return new ClusterPipelineTopologyService(
+                engine == null ? LivePipelineRuns.none() : new HazelcastLivePipelineRuns(engine),
+                new StoreBackedPipelineCaptures(storePort),
+                claims.getIfAvailable(),
+                storePort.desired(),
+                clusterProperties.getId());
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----

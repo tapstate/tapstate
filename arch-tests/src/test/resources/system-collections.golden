@@ -3,6 +3,8 @@ artifacts | store | MongoArtifactStore | migrated | 0 | kind
 pipeline_state | store | MongoStateStore | migrated | 0 | -
 pipeline_desired | store | MongoDesiredStore | migrated | 0 | -
 pipeline_observation | store | MongoObservationStore | migrated | 0 | -
+workload_claims | store | MongoWorkloadClaimStore | owned-elsewhere | 0 | -
+cluster_membership | store | MongoClusterMembershipStore | owned-elsewhere | 0 | -
 connections | store | MongoCatalogStore | migrated | 0 | -
 source_schemas | store | MongoSchemaStore | migrated | 0 | -
 connector_catalog | store | MongoConnectorCatalogStore | migrated | 0 | -

@@ -144,7 +144,7 @@ class ANestResumesOnlyOntoStateOfItsOwnShapeTest {
         DagSource.StartPreparation prepared = source.prepareStart(
                 PIPELINE, store.operatorStateStores().defaultDatabase());
         store.artifacts().save(pipeline("items", laterDatabase));
-        DagSource.StartPlan plan = prepared.build();
+        DagSource.StartPlan plan = prepared.build(null);
 
         assertThat(plan.capacity().mapDatabases().values()).containsOnly(firstDatabase);
         assertThat(plan.stateLocations())

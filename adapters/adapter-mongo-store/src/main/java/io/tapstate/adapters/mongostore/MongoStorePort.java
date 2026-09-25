@@ -6,6 +6,7 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.CatalogStore;
+import io.tapstate.spi.store.ClusterMembershipStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.ConnectorCatalogStore;
@@ -24,6 +25,7 @@ import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaimStore;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -32,7 +34,7 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * The MongoDB implementation of the persistence port: it aggregates fourteen sub-stores — the artifact
+ * The MongoDB implementation of the persistence port: it aggregates the product sub-stores — the artifact
  * truth layer, the epoch-fencing pipeline state store, the plain-upsert pipeline desired-state store,
  * the connection catalog, the discovered source-schema store, the connector distribution registry, the
  * derived connector catalog rows, the latest connection-test result per connection, the plain-upsert
@@ -56,6 +58,10 @@ public final class MongoStorePort implements StorePort {
     public static final String PIPELINE_DESIRED = "pipeline_desired";
     /** The collection holding one plain-upsert observation doc per pipeline. */
     public static final String PIPELINE_OBSERVATION = "pipeline_observation";
+    /** Cluster-scoped owner leases, one durable document per workload identity. */
+    public static final String WORKLOAD_CLAIMS = "workload_claims";
+    /** The last majority-committed ACTIVE node set per cluster. */
+    public static final String CLUSTER_MEMBERSHIP = "cluster_membership";
     /** One document per movement sample, left to expire by the server; the one series among these. */
     public static final String PIPELINE_RATE_HISTORY = "pipeline_rate_history";
     /** The collection holding one editor-only canvas layout per pipeline. */
@@ -127,6 +133,8 @@ public final class MongoStorePort implements StorePort {
     private final ObservationStore observations;
     private final RateHistoryStore rateHistory;
     private final PipelineLayoutStore layouts;
+    private final WorkloadClaimStore workloadClaims;
+    private final ClusterMembershipStore clusterMembership;
     private final SrsMetaStore meta;
     private final SrsLogStore srsLog;
     private final DerivedSchemaStore derivedSchemas;
@@ -166,9 +174,14 @@ public final class MongoStorePort implements StorePort {
         this.rateHistory = new MongoRateHistoryStore(
                 database, SystemCollections.PIPELINE_RATE_HISTORY.on(database), rateHistoryRetention);
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
+        this.workloadClaims = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database));
+        this.clusterMembership =
+                new MongoClusterMembershipStore(SystemCollections.CLUSTER_MEMBERSHIP.on(database));
         this.meta = new MongoSrsMetaStore(connection.client(),
                 SystemCollections.SRS_META.on(database), SystemCollections.SRS_CONSUMER_OFFSETS.on(database));
-        this.srsLog = new MongoSrsLogStore(SystemCollections.SRS_LOG.on(database));
+        this.srsLog = new MongoSrsLogStore(
+                connection.client(), SystemCollections.SRS_LOG.on(database),
+                SystemCollections.WORKLOAD_CLAIMS.on(database));
         this.derivedSchemas = new MongoDerivedSchemaStore(SystemCollections.DERIVED_SCHEMAS.on(database));
         // Operator state alone sits in its configured database on the same client. Same connection, same
         // credentials, same lifecycle - a different database. What that operator could not assemble goes
@@ -270,6 +283,16 @@ public final class MongoStorePort implements StorePort {
     @Override
     public SrsMetaStore meta() {
         return meta;
+    }
+
+    @Override
+    public WorkloadClaimStore workloadClaims() {
+        return workloadClaims;
+    }
+
+    @Override
+    public ClusterMembershipStore clusterMembership() {
+        return clusterMembership;
     }
 
     @Override

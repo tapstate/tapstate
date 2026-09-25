@@ -3,6 +3,8 @@ package io.tapstate.app;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +18,8 @@ import java.util.Optional;
 final class InMemoryArtifactStore implements ArtifactStore {
 
     private final Map<String, Resource> byId = new LinkedHashMap<>();
+    /** Synchronized because members read one of these from their own threads, and a lost count lies. */
+    private final Map<String, Integer> reads = Collections.synchronizedMap(new HashMap<>());
 
     @Override
     public void saveAll(List<Resource> artifacts) {
@@ -40,7 +44,20 @@ final class InMemoryArtifactStore implements ArtifactStore {
 
     @Override
     public Optional<Resource> get(String id) {
+        reads.merge(id, 1, Integer::sum);
         return Optional.ofNullable(byId.get(id));
+    }
+
+    /**
+     * How many times each id has been read. Counted rather than left to a case to assert that it
+     * "worked": reading a source once for every pipeline naming it and reading it once give the same
+     * answer, and the difference only shows with many pipelines over few sources -- which is where it
+     * costs.
+     */
+    Map<String, Integer> reads() {
+        synchronized (reads) {
+            return new HashMap<>(reads);
+        }
     }
 
     @Override

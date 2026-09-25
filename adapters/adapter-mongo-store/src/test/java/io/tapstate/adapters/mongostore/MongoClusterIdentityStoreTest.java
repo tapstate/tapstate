@@ -19,7 +19,10 @@ class MongoClusterIdentityStoreTest {
         MongoCollection<Document> collection = (MongoCollection<Document>) Proxy.newProxyInstance(
                 MongoCollection.class.getClassLoader(),
                 new Class<?>[] {MongoCollection.class},
-                (proxy, method, args) -> method.getName().equals("findOneAndUpdate") ? null : null);
+                // The read and write concerns the store pins on construction each hand back a collection,
+                // so the stand-in answers those with itself; everything the test drives answers null,
+                // which is the missing upsert result it is here to witness.
+                (proxy, method, args) -> method.getName().startsWith("with") ? proxy : null);
 
         Throwable thrown = catchThrowable(() -> new MongoClusterIdentityStore(collection)
                 .createIfAbsent(new ClusterIdentity("01J5FIXTURE")));

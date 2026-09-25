@@ -70,9 +70,8 @@ class CliFaceProjectionGatesTest {
      * The registered operations the CLI does not project, each a deliberate deferral rather than an
      * oversight. The security domain has no face anywhere — no command and no endpoint — so nothing
      * invokes those verbs today; the first administrator is created through the bootstrap entry point
-     * instead. {@code cluster.members} is routed over HTTP but answers 501 with no topology service
-     * behind it, so a command for it would surface a stub rather than a cluster. The frontend-only source
-     * and connector detail and icon faces are HTTP contracts with no command shape yet.
+     * instead. The frontend-only source and connector detail and icon faces are HTTP contracts with no
+     * command shape yet.
      *
      * <p>An entry here is a reviewed decision, not a running to-do list: an operation added to the
      * registry with no verb must turn this gate red, and deleting its entry is how it earns one.
@@ -80,7 +79,6 @@ class CliFaceProjectionGatesTest {
     private static final Set<String> DEFERRED_WITH_NO_VERB = Set.of(
             "connector.get",
             "connector.icon",
-            "cluster.members",
             "source.create", "source.delete", "source.draft", "source.get", "source.list", "source.schema",
             "source.update",
             "pipeline.get", "pipeline.list", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create", "pipeline.update",

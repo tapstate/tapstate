@@ -10,10 +10,13 @@ import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaimStore;
+import io.tapstate.spi.store.ClusterMembershipStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
 
 /**
  * Wires the store into the assembly root. Under {@code --role=all} the server connects to the store
@@ -26,6 +29,7 @@ import org.springframework.context.annotation.Configuration;
  */
 @Configuration
 @EnableConfigurationProperties({MongoProperties.class, MetricsHistoryProperties.class})
+@Import(ClusterMembershipConfiguration.class)
 class StoreConfiguration {
 
     @Bean(destroyMethod = "close")
@@ -87,6 +91,28 @@ class StoreConfiguration {
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
     SrsMetaStore srsMetaStore(StorePort storePort) {
         return storePort.meta();
+    }
+
+    /** The single cluster-ownership port consumed by node, pipeline, capture and recovery controllers. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    WorkloadClaimStore workloadClaimStore(StorePort storePort) {
+        return storePort.workloadClaims();
+    }
+
+    /** The last ACTIVE membership committed by the prior majority. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    ClusterMembershipStore clusterMembershipStore(StorePort storePort) {
+        return storePort.clusterMembership();
+    }
+
+    /** Business claims gated by the same committed-membership predicate as the Hazelcast data plane. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    ClusterWorkloadClaims clusterWorkloadClaims(
+            WorkloadClaimStore workloadClaimStore, ClusterMembershipGate membershipGate) {
+        return new ClusterWorkloadClaims(workloadClaimStore, membershipGate);
     }
 
     /**

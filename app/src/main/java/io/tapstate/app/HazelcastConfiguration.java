@@ -3,12 +3,16 @@ package io.tapstate.app;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.JoinConfig;
+import com.hazelcast.config.MapConfig;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
+import com.hazelcast.config.SplitBrainProtectionConfig;
+import com.hazelcast.splitbrainprotection.SplitBrainProtectionOn;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
@@ -28,13 +32,24 @@ import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.store.ClusterMembershipStore;
+import io.tapstate.spi.store.WorkloadClaimStore;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
 import org.springframework.lang.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Wires the embedded Hazelcast member into the assembly root: exactly one full member per process,
@@ -50,8 +65,21 @@ import java.util.function.Supplier;
  * widening the bind is a deliberate multi-node change.
  */
 @Configuration
-@EnableConfigurationProperties(HazelcastProperties.class)
+@EnableConfigurationProperties({HazelcastProperties.class, ControlEndpointProperties.class})
+@Import(ClusterMembershipConfiguration.class)
 class HazelcastConfiguration {
+
+    static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
+
+    /**
+     * When, on the monotonic clock, this member's node session was asked for: no later than the moment
+     * its lease began, and so where a lease this member cannot renew is timed from.
+     */
+    static final String NODE_SESSION_ASKED_AT_CONTEXT_KEY = "tapstate.cluster.node-session.asked-at";
+    private static final Logger LOG = LoggerFactory.getLogger(HazelcastConfiguration.class);
+
+    /** A single port, or an inclusive range, in the form the library itself accepts. */
+    private static final Pattern PORT_DEFINITION = Pattern.compile("(\\d{1,5})(?:-(\\d{1,5}))?");
 
     /**
      * The bounded capacity of each per-table SRS change ring. Headroom backpressure, not size, is the
@@ -61,13 +89,54 @@ class HazelcastConfiguration {
     private static final int SRS_RING_CAPACITY = 1024;
 
     @Bean(destroyMethod = "shutdown")
-    HazelcastInstance hazelcastMember(HazelcastProperties properties, @Nullable SrsMetaStore srsMetaStore,
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
+            ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
             @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
             @Nullable NestDeadLetterStore nestDeadLetterStore,
-            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore) {
+            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
+            ObjectProvider<ClusterIdentityStore> clusterIdentities,
+            ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ClusterMembershipGate membershipGate) {
+        ClusterMemberPreflight.Identity identity =
+                ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
+        warnAboutClusterProfile(clusterProperties);
+        WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
+        long sessionAskedAt = System.nanoTime();
+        if (identity != null) {
+            identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
+                    clusterIdentities.getIfAvailable(), claimStore, UUID.randomUUID().toString());
+        }
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
-        HazelcastInstance member = startMember(() -> Hazelcast.newHazelcastInstance(config));
+        if (identity != null) {
+            identify(config, identity);
+            configureClusterProtection(config, membershipGate);
+        }
+        HazelcastInstance member;
+        try {
+            member = startMember(() -> Hazelcast.newHazelcastInstance(config));
+        } catch (RuntimeException startupFailure) {
+            if (identity != null && claimStore != null) {
+                claimStore.release(identity.nodeSession());
+            }
+            throw startupFailure;
+        }
+        if (identity != null) {
+            // What the rings and maps of this member will answer when work reaches them. Asked rather
+            // than assumed, because the library caches its answer and recomputes it on its own schedule:
+            // admitting work this member's data plane is still refusing produces a run that reaches
+            // RUNNING and then dies on its first write.
+            membershipGate.observeDataPlane(() -> dataPlaneAdmitsWork(member));
+            member.getUserContext().put("tapstate.cluster.id", identity.clusterId());
+            member.getUserContext().put("tapstate.cluster.node-id", identity.nodeId());
+            member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
+            member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
+            member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
+            member.getUserContext().put(NODE_SESSION_ASKED_AT_CONTEXT_KEY, sessionAskedAt);
+            member.getUserContext().put(
+                    io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
+                    ClusterMembershipGate.PROTECTION_NAME);
+        }
         // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
         // Jet source and resolved member-side -- can reach it through the user context and publish durable
         // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
@@ -143,13 +212,78 @@ class HazelcastConfiguration {
         return member;
     }
 
-    /** Compatibility assembly seam retained for focused tests that supply the pre-routing bean set. */
-    HazelcastInstance hazelcastMember(HazelcastProperties properties, SrsMetaStore srsMetaStore,
-            ConnectorProvisioner connectorProvisioner, SnapshotBuffer snapshotBuffer,
-            KeyedStateStore nestStateStore, NestSettings nestSettings,
-            NestDeadLetterStore nestDeadLetterStore, SrsLogStore srsLogStore) {
-        return hazelcastMember(properties, srsMetaStore, connectorProvisioner, snapshotBuffer,
-                nestStateStore, nestSettings, nestDeadLetterStore, null, srsLogStore);
+    /** Renews and releases the claim that was acquired before this member was created. */
+    @Bean(destroyMethod = "close")
+    NodeSessionLease nodeSessionLease(
+            HazelcastInstance member,
+            ClusterProperties clusterProperties,
+            ObjectProvider<WorkloadClaimStore> workloadClaims) {
+        Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);
+        if (!(stored instanceof io.tapstate.spi.store.WorkloadClaim claim)) {
+            return NodeSessionLease.inactive();
+        }
+        WorkloadClaimStore store = workloadClaims.getIfAvailable();
+        if (store == null) {
+            throw new IllegalStateException("cluster member started without its workload-claim store");
+        }
+        if (!(member.getUserContext().get(NODE_SESSION_ASKED_AT_CONTEXT_KEY) instanceof Long askedAt)) {
+            throw new IllegalStateException("cluster member started without the time its node session was asked for");
+        }
+        return new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
+                clusterProperties.getNodeSessionRenewInterval(), member::shutdown);
+    }
+
+    /** Keeps the local gate aligned with the majority-committed ACTIVE node set. */
+    @Bean(destroyMethod = "close")
+    ClusterMembershipController clusterMembershipController(
+            HazelcastInstance member,
+            ClusterProperties clusterProperties,
+            ClusterMembershipGate membershipGate,
+            ObjectProvider<ClusterMembershipStore> membershipStores) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return ClusterMembershipController.inactive();
+        }
+        ClusterMembershipStore store = membershipStores.getIfAvailable();
+        if (store == null) {
+            throw new IllegalStateException("cluster member started without its membership store");
+        }
+        return new ClusterMembershipController(clusterProperties.getId(), member, store, membershipGate,
+                clusterProperties.getMembershipReconcileInterval());
+    }
+
+    /** Test seam retaining the single-member call shape that predates cluster identity configuration. */
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, @Nullable SrsMetaStore srsMetaStore,
+            @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
+            @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
+            @Nullable NestDeadLetterStore nestDeadLetterStore, @Nullable SrsLogStore srsLogStore) {
+        return hazelcastMember(properties, new ClusterProperties(), new ControlEndpointProperties(),
+                srsMetaStore, connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings,
+                nestDeadLetterStore, null, srsLogStore, emptyProvider(), emptyProvider(),
+                new ClusterMembershipGate(new ClusterProperties()));
+    }
+
+    private static <T> ObjectProvider<T> emptyProvider() {
+        return new ObjectProvider<>() {
+            @Override
+            public T getObject(Object... args) {
+                throw new org.springframework.beans.factory.NoSuchBeanDefinitionException(Object.class);
+            }
+
+            @Override
+            public T getIfAvailable() {
+                return null;
+            }
+
+            @Override
+            public T getIfUnique() {
+                return null;
+            }
+
+            @Override
+            public T getObject() {
+                throw new org.springframework.beans.factory.NoSuchBeanDefinitionException(Object.class);
+            }
+        };
     }
 
     /**
@@ -179,7 +313,7 @@ class HazelcastConfiguration {
         if (nestStateStore == null) {
             return;
         }
-        member.getConfig().addMapConfig(nestSettings.backedStateMaps());
+        member.getConfig().addMapConfig(protectIfCluster(member, nestSettings.backedStateMaps()));
     }
 
     /** Declares the nest map pattern with the deployment's resolved default database. */
@@ -214,7 +348,28 @@ class HazelcastConfiguration {
         if (joinStateStore == null) {
             return;
         }
-        member.getConfig().addMapConfig(JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY));
+        member.getConfig().addMapConfig(protectIfCluster(
+                member, JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY)));
+    }
+
+    /**
+     * Writes this node's Tapstate identity onto the member before it joins, as member attributes.
+     *
+     * <p>Attributes rather than a lookup: they travel with membership itself, so every member holds every
+     * other's identity the moment it sees it, with no round trip and no second place for them to go
+     * stale. That is what lets the topology read face answer the same on any node, and it is why they are
+     * set here -- before the member joins -- rather than published afterwards, which would leave a window
+     * in which a member is in the cluster and anonymous.
+     */
+    static Config identify(Config config, ClusterMemberPreflight.Identity identity) {
+        config.setClusterName(identity.clusterId());
+        config.getMemberAttributeConfig()
+                .setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, identity.nodeId())
+                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE,
+                        identity.nodeSession().owner().bootId())
+                .setAttribute(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE,
+                        identity.controlUrl().toString());
+        return config;
     }
 
     /**
@@ -275,14 +430,57 @@ class HazelcastConfiguration {
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
         // An embedded member of a server product must not report usage data anywhere.
         config.setProperty("hazelcast.phone.home.enabled", "false");
+        config.setProperty("hazelcast.heartbeat.interval.seconds",
+                Long.toString(properties.getHeartbeatInterval().toSeconds()));
+        config.setProperty("hazelcast.max.no.heartbeat.seconds",
+                Long.toString(properties.getMaximumNoHeartbeat().toSeconds()));
         // Loopback-only listen socket: the member port also serves the unauthenticated client
         // protocol, so a single local member must not expose it on a LAN interface.
         config.setProperty("hazelcast.socket.bind.any", "false");
         config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        if (!"127.0.0.1".equals(properties.getBindAddress())) {
+            config.getNetworkConfig().getInterfaces().clear().addInterface(properties.getBindAddress());
+            LOG.warn("Hazelcast member port is exposed on {} and serves an unauthenticated protocol. "
+                    + "Keep it inside a private network or NetworkPolicy.", properties.getBindAddress());
+        }
+        applyAdvertisedMemberAddress(config, properties);
+        applyOutboundMemberPorts(config, properties);
         JoinConfig join = config.getNetworkConfig().getJoin();
         join.getAutoDetectionConfig().setEnabled(false);
         join.getMulticastConfig().setEnabled(false);
         join.getTcpIpConfig().setEnabled(false);
+        join.getKubernetesConfig().setEnabled(false);
+        switch (properties.getDiscovery().getMode()) {
+            case NONE -> {
+                // The default path deliberately keeps every network value above byte-for-byte unchanged.
+            }
+            case TCP_IP -> {
+                if (properties.getDiscovery().getTcpIp().getSeeds().isEmpty()) {
+                    throw invalidDiscovery("tcp-ip requires at least one seed address");
+                }
+                config.getNetworkConfig().setPort(properties.getMemberPort()).setPortAutoIncrement(false);
+                join.getTcpIpConfig().setEnabled(true)
+                        .setMembers(properties.getDiscovery().getTcpIp().getSeeds());
+            }
+            case KUBERNETES -> {
+                HazelcastProperties.Kubernetes kubernetes = properties.getDiscovery().getKubernetes();
+                boolean hasDns = hasText(kubernetes.getServiceDns());
+                boolean hasApiService = hasText(kubernetes.getServiceName());
+                if (hasDns == hasApiService) {
+                    throw invalidDiscovery("kubernetes requires exactly one of service-dns or service-name");
+                }
+                config.getNetworkConfig().setPort(properties.getMemberPort()).setPortAutoIncrement(false);
+                join.getKubernetesConfig().setEnabled(true);
+                if (hasDns) {
+                    join.getKubernetesConfig().setProperty("service-dns", kubernetes.getServiceDns().trim());
+                } else {
+                    join.getKubernetesConfig().setProperty("service-name", kubernetes.getServiceName().trim());
+                    if (hasText(kubernetes.getNamespace())) {
+                        join.getKubernetesConfig().setProperty("namespace", kubernetes.getNamespace().trim());
+                    }
+                }
+            }
+        }
         config.getJetConfig().setEnabled(true);
         Integer cooperativeThreads = properties.getJet().getCooperativeThreadCount();
         if (cooperativeThreads != null) {
@@ -336,5 +534,136 @@ class HazelcastConfiguration {
         // there is nothing behind the pattern being shadowed yet - which is exactly the state the nest
         // maps were in until the day one was added.
         return config;
+    }
+
+    /**
+     * Whether this member's own rings and maps would accept a write right now.
+     *
+     * <p>Not a second opinion on the same question: it is the same call. What a ring does before it
+     * accepts a write ends in {@code hasMinimumSize()}, which is what this reads - so the two cannot
+     * drift apart without the library's own enforcement drifting with them.
+     *
+     * <p>A member on its way out answers no rather than throwing: shutdown order between the member and
+     * whatever is still asking is not ours to fix here, and a member that is stopping is a member that
+     * must not be taking work on anyway.
+     */
+    private static boolean dataPlaneAdmitsWork(HazelcastInstance member) {
+        try {
+            return member.getSplitBrainProtectionService()
+                    .getSplitBrainProtection(ClusterMembershipGate.PROTECTION_NAME)
+                    .hasMinimumSize();
+        } catch (HazelcastInstanceNotActiveException stopping) {
+            return false;
+        }
+    }
+
+    static void configureClusterProtection(Config config, ClusterMembershipGate gate) {
+        config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(
+                ClusterMembershipGate.PROTECTION_NAME, true)
+                .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
+                .setFunctionImplementation(gate));
+        config.getRingbufferConfigs().values().forEach(ring -> {
+            ring.setBackupCount(Math.max(1, ring.getBackupCount()));
+            ring.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME);
+        });
+        config.getMapConfigs().values().forEach(map ->
+                map.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME));
+    }
+
+    static void warnAboutClusterProfile(ClusterProperties properties) {
+        if (properties.getProfile() == ClusterProperties.Profile.PROCESS_FAILURE_ONLY) {
+            LOG.warn("Cluster profile process-failure-only supports process-loss recovery but does not provide "
+                    + "network-partition safety. Use production-ha with at least three members for HA.");
+        }
+    }
+
+    private static MapConfig protectIfCluster(HazelcastInstance member, MapConfig config) {
+        if (member.getConfig().getSplitBrainProtectionConfigs()
+                .containsKey(ClusterMembershipGate.PROTECTION_NAME)) {
+            config.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME);
+        }
+        return config;
+    }
+
+    private static boolean hasText(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    /**
+     * Tells the member to report an address other than the one it binds, when the deployment says so.
+     *
+     * <p>What this changes is where the other members dial, and nothing else -- the interfaces above
+     * still decide what this member listens on, and therefore who can reach it at all. Reporting an
+     * address nobody can route to is not a way to hide a member that binds a routable interface.
+     *
+     * <p>Refused outright while discovery is off: a single loopback-only member has no others to be
+     * reached by, so an address here is either a misconfiguration or a preparation for something this
+     * mode does not do, and both are worth saying out loud rather than accepting silently.
+     */
+    private static void applyAdvertisedMemberAddress(Config config, HazelcastProperties properties) {
+        String advertised = properties.getAdvertisedMemberAddress();
+        if (!hasText(advertised)) {
+            return;
+        }
+        if (properties.getDiscovery().getMode() == HazelcastProperties.DiscoveryMode.NONE) {
+            throw invalidDiscovery(
+                    "advertised-member-address needs a discovery mode: a loopback-only member has "
+                            + "nobody to advertise to");
+        }
+        config.getNetworkConfig().setPublicAddress(advertised.trim());
+        LOG.info("Hazelcast member advertises {} to the other members and binds {}.",
+                advertised.trim(), properties.getBindAddress());
+    }
+
+    /**
+     * Restricts which local ports this member dials the other members from, when the deployment says so.
+     *
+     * <p>An outgoing member connection takes an arbitrary ephemeral port otherwise, and an egress rule
+     * written against that has to allow the whole ephemeral range. Naming the ports here is what lets
+     * the rule name them too.
+     *
+     * <p>Refused outright while discovery is off, for the same reason as the reported address: a member
+     * that never dials anybody has no outgoing connection for this to apply to, so a value here is
+     * either a misconfiguration or a preparation for something this mode does not do.
+     */
+    private static void applyOutboundMemberPorts(Config config, HazelcastProperties properties) {
+        List<String> definitions = properties.getOutboundMemberPorts();
+        if (definitions.isEmpty()) {
+            return;
+        }
+        if (properties.getDiscovery().getMode() == HazelcastProperties.DiscoveryMode.NONE) {
+            throw invalidDiscovery(
+                    "outbound-member-ports needs a discovery mode: a member that dials nobody has no "
+                            + "outgoing connection to place");
+        }
+        for (String definition : definitions) {
+            config.getNetworkConfig().addOutboundPortDefinition(checkedPortDefinition(definition));
+        }
+        LOG.info("Hazelcast member dials the other members from local port(s) {}.", definitions);
+    }
+
+    /**
+     * Accepts {@code port} or {@code low-high} and refuses anything else here rather than deep inside
+     * the library, where a malformed definition surfaces as a start-up failure naming neither the
+     * setting nor the value.
+     */
+    private static String checkedPortDefinition(String definition) {
+        String trimmed = definition == null ? "" : definition.trim();
+        Matcher matcher = PORT_DEFINITION.matcher(trimmed);
+        if (!matcher.matches()) {
+            throw invalidDiscovery("outbound-member-ports takes a port or a low-high range, not '"
+                    + trimmed + "'");
+        }
+        int low = Integer.parseInt(matcher.group(1));
+        int high = matcher.group(2) == null ? low : Integer.parseInt(matcher.group(2));
+        if (low < 1 || high > 65535 || low > high) {
+            throw invalidDiscovery("outbound-member-ports needs 1-65535 with the low end first, not '"
+                    + trimmed + "'");
+        }
+        return trimmed;
+    }
+
+    private static TapstateException invalidDiscovery(String detail) {
+        return new TapstateException(BootError.DISCOVERY_CONFIG_INVALID, Map.of("detail", detail), null);
     }
 }

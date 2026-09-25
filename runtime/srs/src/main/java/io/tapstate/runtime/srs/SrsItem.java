@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -12,7 +13,8 @@ import java.util.Objects;
  * One cdc change as it sits in the per-table change ring: the source position it was captured at, the
  * change kind and event time, the before/after row images, and the schema version in force. The ring
  * assigns each item a monotonic sequence on append — that sequence is the consumers' read cursor, held
- * by the ring itself and not carried in the item.
+ * by the ring itself and not carried in the item. A clustered item also carries the expected capture claim
+ * generation so the durable store can reject an append from a fenced owner before the ring admits it.
  *
  * <p>The ring holds only cdc mutations: ops {@code i} / {@code u} / {@code d} / {@code ddl}. A snapshot
  * read (op {@code r}) goes straight to the sink and is rejected here by construction. Which row image is
@@ -37,7 +39,18 @@ public record SrsItem(
         long ts,
         Map<String, Object> before,
         Map<String, Object> after,
-        long schemaVer) {
+        long schemaVer,
+        WorkloadClaimFence captureFence) {
+
+    public SrsItem(
+            SourcePosition srcPos,
+            Op op,
+            long ts,
+            Map<String, Object> before,
+            Map<String, Object> after,
+            long schemaVer) {
+        this(srcPos, op, ts, before, after, schemaVer, null);
+    }
 
     public SrsItem {
         Objects.requireNonNull(op, "op");

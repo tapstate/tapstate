@@ -42,6 +42,29 @@ import java.util.function.ToIntFunction;
  */
 public final class NestDag {
 
+    /**
+     * How many instances of each state-carrying vertex one member runs.
+     *
+     * <p>Pinned rather than defaulted, and the number is an IO one. These vertices declare themselves
+     * non-cooperative, so every instance holds a thread of its own for the life of the job, outside the
+     * pool the rest of the graph shares. Left to the engine, the count is the member's core count - the
+     * budget for work that computes, where what these do is wait on a state map. A wider machine
+     * therefore buys nothing here and costs a thread per vertex per core, and since a tree may compile to
+     * as many state-carrying vertices as {@link NestTopology#DEFAULT_RESOLVER_VERTEX_LIMIT} allows, the
+     * two numbers multiply. Pinned, the worst case is the same on every machine.
+     *
+     * <p>Above one, deliberately. At one there is a single instance of each vertex per member, and
+     * everything a nest does between instances - a subtree handed from the key leaving it to the key
+     * gaining it - would happen inside one of them, where releasing what is held and merely forgetting it
+     * locally look the same. Those paths would still be written and would stop being reachable on a
+     * single machine.
+     *
+     * <p>A staged number rather than a tuned one: nothing has yet measured what concurrency the layer
+     * behind these maps rewards. It is the one place the count is decided, so whatever later works it out
+     * per member replaces this and nothing else.
+     */
+    static final int STATE_VERTEX_LOCAL_PARALLELISM = 4;
+
     private NestDag() {
     }
 
@@ -69,7 +92,8 @@ public final class NestDag {
         Vertex assembler = null;
         for (NestVertex spec : topology.vertices()) {
             Vertex vertex = dag.newVertex(spec.name(), processorFor(spec, topology, binding, outputStream,
-                    frontier, chainsInto(spec, carried, frontier)));
+                    frontier, chainsInto(spec, carried, frontier)))
+                    .localParallelism(STATE_VERTEX_LOCAL_PARALLELISM);
             built.put(spec.pathId(), vertex);
             for (NestInbound edge : spec.inbound()) {
                 connect(dag, vertex, edge, built, upstream, nextOutbound, frontier);
@@ -115,7 +139,8 @@ public final class NestDag {
         Vertex vertex = dag.newVertex(lookup.name(), ProcessorMetaSupplier.of(
                 new NestLookupSupplier(lookup, binding.stores(),
                         binding.settings().referrersAllowedIn(lookup.mapName()),
-                        frontier == null ? null : frontier.axes(), chainsIntoLookup(lookup, frontier))));
+                        frontier == null ? null : frontier.axes(), chainsIntoLookup(lookup, frontier))))
+                .localParallelism(STATE_VERTEX_LOCAL_PARALLELISM);
         Vertex source = sources.size() == 1
                 ? sources.get(0)
                 : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);
