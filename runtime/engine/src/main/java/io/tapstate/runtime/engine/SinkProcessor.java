@@ -72,6 +72,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     private final SinkWriter writer;
     private final SinkAck sinkAck;
+    // The vertex this processor writes for, and whether that vertex runs as one processor for the cluster;
+    // together with the processor's own index they name it as a writer. Null where it was built by hand
+    // outside a graph, which reports through the ack as it stands.
+    private final String writerOf;
+    private final boolean totalOne;
+    // The ack this processor reports through: the one supplied, bound to this processor as a writer once
+    // init knows its index. See init.
+    private SinkAck ack;
     private final SinkFrontier frontier;
     private final FrontierGauge gauge;
     private final DeliveryGauge supplied;
@@ -150,6 +158,22 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
             int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock) {
+        this(writer, sinkAck, frontier, maxInFlight, maxBatchSize, gauge, delivery, clock, null, true);
+    }
+
+    /**
+     * A sink that reports as one writer of the vertex {@code writerOf}: the processor names itself by that
+     * vertex and its own index once it knows the index, so where several writers land one pipeline's changes
+     * each one's progress is kept apart and the slowest decides how far the pipeline has landed. A vertex
+     * running as one processor for the cluster names its one writer by index zero whichever member it runs
+     * on; the index the engine gives it depends on that member, and a writer that changed name with the
+     * member it landed on would never be the one the run expects.
+     */
+    SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
+            int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock,
+            String writerOf, boolean totalOne) {
+        this.writerOf = writerOf;
+        this.totalOne = totalOne;
         this.writer = Objects.requireNonNull(writer, "writer");
         this.gauge = Objects.requireNonNull(gauge, "gauge");
         this.supplied = Objects.requireNonNull(delivery, "delivery");
@@ -170,6 +194,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             }
         }
         this.sinkAck = sinkAck;
+        this.ack = sinkAck;
         this.frontier = frontier;
         this.maxInFlight = maxInFlight;
         this.maxBatchSize = maxBatchSize;
@@ -215,7 +240,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         Objects.requireNonNull(sinkAckFactory, "sinkAckFactory");
         Objects.requireNonNull(frontierFactory, "frontierFactory");
         return ProcessorMetaSupplier.forceTotalParallelismOne(
-                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory), vertexName);
+                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory, vertexName, true), vertexName);
     }
 
     /**
@@ -229,6 +254,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         this.timer = StageTimer.of(stage(), context);
         this.pipelineId = context.jobConfig().getName();
         this.countingSince = clock.getAsLong();
+        if (sinkAck != null && writerOf != null) {
+            ack = sinkAck.forWriter(writerId(writerOf, totalOne ? 0 : context.globalProcessorIndex()));
+        }
         HazelcastInstance instance = context.hazelcastInstance();
         this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
         // A gauge that writes into a job's statistics can only do so from that job's own threads, and a
@@ -244,6 +272,15 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     /** What this stage has timed so far, for a witness driving it by hand. */
     StageTimer timing() {
         return timer;
+    }
+
+    /**
+     * The name of the writer at {@code index} of the sink vertex {@code vertex}: how a writer reports its
+     * progress, and how a run names the writers it expects progress from. One spelling in one place, because
+     * a writer and the run expecting it that spelled it differently would each wait on the other forever.
+     */
+    public static String writerId(String vertex, int index) {
+        return vertex + "#" + index;
     }
 
     @Override
@@ -344,7 +381,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             return;
         }
         for (Watermark bound : heldBounds.values()) {
-            frontier.bound(bound, sinkAck);
+            frontier.bound(bound, ack);
+            // Nothing is in flight, so every change this writer was given at or below the bound has landed,
+            // whatever the frontier made of it: a writer given none of a chain's rows says so here and holds
+            // no chain back by having nothing to write for it.
+            String chain = frontier.chainOf(bound);
+            if (chain != null) {
+                ack.bounded(chain, FrontierOrders.unpack(bound.timestamp()));
+            }
         }
         heldBounds.clear();
     }
@@ -388,7 +432,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 throw failure;
             }
             if (frontier != null) {
-                frontier.settled(batch.positions(), sinkAck);
+                frontier.settled(batch.positions(), ack);
             }
             // Counted here and nowhere earlier: this is the first line after the write is known to have
             // succeeded, which is the boundary the count is defined at. A row counted on hand-off would be
@@ -600,13 +644,18 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         private final SupplierEx<? extends SinkWriter> writerFactory;
         private final SinkAckFactory sinkAckFactory;
         private final SupplierEx<SinkFrontier> frontierFactory;
+        private final String vertexName;
+        private final boolean totalOne;
         private transient SinkAck sinkAck;
 
         AckSinkSupplier(SupplierEx<? extends SinkWriter> writerFactory,
-                SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory) {
+                SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
+                String vertexName, boolean totalOne) {
             this.writerFactory = writerFactory;
             this.sinkAckFactory = sinkAckFactory;
             this.frontierFactory = frontierFactory;
+            this.vertexName = vertexName;
+            this.totalOne = totalOne;
         }
 
         @Override
@@ -622,7 +671,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 // the reading, and a shared one would have each sink's readings land under the other's.
                 processors.add(new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
                         DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, new JetFrontierGauge(),
-                        new JetDeliveryGauge()));
+                        new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne));
             }
             return processors;
         }

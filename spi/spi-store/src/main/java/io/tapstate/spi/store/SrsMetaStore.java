@@ -144,6 +144,39 @@ public interface SrsMetaStore {
     }
 
     /**
+     * Starts {@code runId}'s writer accounting for {@code pipelineId} on the chain, replacing whatever run's
+     * accounting was there: each table maps to the writers its changes are expected to reach in this run.
+     *
+     * <p>Replacing rather than merging is what keeps a writer of the run being replaced from standing for a
+     * writer of this one: its progress is dropped with its run, and nothing it writes afterwards lands. What
+     * the replaced run proved has already been carried into the pipeline's own record as it was proved, so
+     * dropping the per-writer detail loses nothing a resume reads. A mutate on an unseeded chain is a caller
+     * ordering error.
+     */
+    default void beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable) {
+        throw new UnsupportedOperationException("this store keeps no per-writer accounting");
+    }
+
+    /**
+     * Records how far {@code writerId} of {@code runId} has durably landed {@code table}'s changes, and answers
+     * the run's accounting as it stands after the write - or empty where {@code runId} is no longer the
+     * chain's current run for the pipeline, in which case nothing was written.
+     *
+     * <p>Each writer reports only its own progress and only ever forward, so the write is a plain replacement
+     * of that writer's entry; the store's part is refusing a run that has been replaced.
+     */
+    default Optional<WriterRun> advanceWriter(String miningChainId, String pipelineId, String runId,
+            String writerId, String table, WriterProgress progress) {
+        throw new UnsupportedOperationException("this store keeps no per-writer accounting");
+    }
+
+    /** The pipeline's current writer accounting on the chain, or empty where no run has begun one. */
+    default Optional<WriterRun> writerRun(String miningChainId, String pipelineId) {
+        return Optional.empty();
+    }
+
+    /**
      * Per table, the ring sequence up to which this pipeline has nothing left to receive from that table's
      * change ring: the last change its sink confirmed there, or where the ring stood when the pipeline
      * arrived on it, whichever {@link #advanceSinkAcked(String, String, String, ChainPosition)} and

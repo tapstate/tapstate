@@ -12,6 +12,7 @@ import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.result.UpdateResult;
+
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
@@ -20,7 +21,8 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
-import org.bson.Document;
+import io.tapstate.spi.store.WriterProgress;
+import io.tapstate.spi.store.WriterRun;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -32,6 +34,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
+
+import org.bson.Document;
 
 /**
  * The MongoDB SRS meta store: one durable coordination document per mining chain — the offset and schema
@@ -292,6 +296,105 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     public void advanceSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {
         updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, table, position));
+    }
+
+    /** The consumer-document field holding the current run's per-writer accounting. */
+    static final String WRITER_RUN = "writerRun";
+
+    @Override
+    public void beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable) {
+        Objects.requireNonNull(runId, "runId");
+        Document expected = new Document();
+        expectedWritersByTable.forEach((table, writers) -> expected.append(table, List.copyOf(writers)));
+        updateConsumer(miningChainId, pipelineId, new Document("$set", new Document(WRITER_RUN,
+                new Document("id", runId).append("expected", expected).append("progress", new Document()))));
+    }
+
+    @Override
+    public Optional<WriterRun> advanceWriter(String miningChainId, String pipelineId, String runId,
+            String writerId, String table, WriterProgress progress) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(runId, "runId");
+        Objects.requireNonNull(writerId, "writerId");
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(progress, "progress");
+        migrateLegacyConsumers(miningChainId, true);
+        // The writer's key is encoded because a writer id names its vertex, and a vertex name may hold the
+        // dot a field path reads as a step into a nested document; the id itself travels inside the entry.
+        String path = WRITER_RUN + ".progress." + table + "." + writerKey(writerId);
+        Document entry = new Document("writer", writerId)
+                .append("durableEpoch", progress.durableThrough().epoch())
+                .append("durableSeq", progress.durableThrough().seq());
+        if (progress.lastTokened() != null) {
+            entry.append("tokenEpoch", progress.lastTokened().order().epoch())
+                    .append("tokenSeq", progress.lastTokened().order().seq())
+                    .append("token", progress.lastTokened().token());
+        }
+        Document filter = new Document(consumerKey(miningChainId, pipelineId))
+                .append(WRITER_RUN + ".id", runId);
+        Document[] after = new Document[1];
+        writeConsumer(miningChainId, session -> after[0] = consumers.findOneAndUpdate(session, filter,
+                new Document("$set", new Document(path, entry)),
+                new FindOneAndUpdateOptions()
+                        .returnDocument(ReturnDocument.AFTER)
+                        .projection(Projections.include(WRITER_RUN, "snapshotEpoch", "cdcStartPosition"))));
+        return after[0] == null ? Optional.empty() : writerRunOf(after[0]);
+    }
+
+    @Override
+    public Optional<WriterRun> writerRun(String miningChainId, String pipelineId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Document consumer = StoreIo.call(() -> consumers.find(consumerKey(miningChainId, pipelineId))
+                .projection(Projections.include(WRITER_RUN, "snapshotEpoch", "cdcStartPosition")).first());
+        return consumer == null ? Optional.empty() : writerRunOf(consumer);
+    }
+
+    /** A writer id as a field name: its UTF-8 bytes in URL-safe base64, which holds no dot or dollar. */
+    static String writerKey(String writerId) {
+        return java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(writerId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    /** The run accounting a consumer document carries, or empty where it carries none. */
+    private static Optional<WriterRun> writerRunOf(Document consumer) {
+        if (!(consumer.get(WRITER_RUN) instanceof Document run)) {
+            return Optional.empty();
+        }
+        Map<String, List<String>> expected = new LinkedHashMap<>();
+        if (run.get("expected") instanceof Document byTable) {
+            for (Map.Entry<String, Object> table : byTable.entrySet()) {
+                List<String> writers = new ArrayList<>();
+                if (table.getValue() instanceof List<?> listed) {
+                    listed.forEach(writer -> writers.add(String.valueOf(writer)));
+                }
+                expected.put(table.getKey(), writers);
+            }
+        }
+        Map<String, Map<String, WriterProgress>> progress = new LinkedHashMap<>();
+        if (run.get("progress") instanceof Document byTable) {
+            for (Map.Entry<String, Object> table : byTable.entrySet()) {
+                Map<String, WriterProgress> byWriter = new LinkedHashMap<>();
+                if (table.getValue() instanceof Document entries) {
+                    for (Object value : entries.values()) {
+                        if (value instanceof Document entry) {
+                            ChainPosition tokened = entry.getString("token") == null ? null : new ChainPosition(
+                                    new SourceOrder(entry.getLong("tokenEpoch"), entry.getLong("tokenSeq")),
+                                    entry.getString("token"));
+                            byWriter.put(entry.getString("writer"), new WriterProgress(
+                                    new SourceOrder(entry.getLong("durableEpoch"), entry.getLong("durableSeq")),
+                                    tokened));
+                        }
+                    }
+                }
+                progress.put(table.getKey(), byWriter);
+            }
+        }
+        Long snapshotEpoch = consumer.getString("cdcStartPosition") == null ? null
+                : readEpoch(consumer, "snapshotEpoch");
+        return Optional.of(new WriterRun(run.getString("id"), expected, progress, snapshotEpoch));
     }
 
     @Override
