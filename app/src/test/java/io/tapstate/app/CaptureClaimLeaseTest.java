@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.ClusterMembership;
@@ -22,8 +23,27 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CaptureClaimLeaseTest {
+
+    @Test
+    void aPositiveSubmillisecondRenewIntervalIsRefusedWithTheBootCode() {
+        RefusingRenewals raw = new RefusingRenewals();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate,
+                new ClusterWorkloadClaims(raw, gate), Duration.ofSeconds(30));
+        CaptureOwnership.Permit permit = ownership.acquire(CAPTURE);
+        try {
+            assertThatThrownBy(() -> new CaptureClaimLease(
+                    ownership, permit.claim(), Duration.ofNanos(1), () -> { }))
+                    .isInstanceOfSatisfying(TapstateException.class, error ->
+                            assertThat(error.code()).isEqualTo(BootError.WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID));
+        } finally {
+            ownership.release(permit.claim());
+        }
+    }
 
     @Test
     void aRenewalThatNoLongerMatchesStopsTheCaptureWithoutReleasingTheNewOwner() {

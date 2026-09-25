@@ -1,9 +1,12 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.WorkloadClaim;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -40,13 +43,16 @@ final class CaptureClaimLease implements AutoCloseable {
         this.current = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
         this.lost = Objects.requireNonNull(lost, "lost");
         Objects.requireNonNull(renewInterval, "renewInterval");
+        long everyMillis = renewInterval.toMillis();
+        if (everyMillis <= 0) {
+            throw new TapstateException(BootError.WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID, Map.of(), null);
+        }
         this.renewer = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "tapstate-capture-claim-renewer");
             thread.setDaemon(true);
             return thread;
         });
-        renewer.scheduleWithFixedDelay(
-                this::renew, renewInterval.toMillis(), renewInterval.toMillis(), TimeUnit.MILLISECONDS);
+        renewer.scheduleWithFixedDelay(this::renew, everyMillis, everyMillis, TimeUnit.MILLISECONDS);
     }
 
     void renew() {
@@ -54,9 +60,18 @@ final class CaptureClaimLease implements AutoCloseable {
             return;
         }
         try {
-            ownership.renew(current.get()).ifPresentOrElse(
-                    current::set,
-                    this::lose);
+            Optional<WorkloadClaim> renewed = ownership.renew(current.get());
+            if (renewed.isEmpty()) {
+                lose();
+                return;
+            }
+            WorkloadClaim next = renewed.orElseThrow();
+            current.set(next);
+            // close may have released the previous lease while renewal was in flight. Do not leave
+            // the refreshed claim alive until TTL merely because that release raced this write.
+            if (closed.get()) {
+                ownership.release(next);
+            }
         } catch (RuntimeException unavailable) {
             lose();
         }
