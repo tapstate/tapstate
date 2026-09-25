@@ -68,10 +68,14 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         }
     }
 
-    private record Pending(ExpectedChange change, long issuedAtNanos) {
+    /** Stable across fresh databases and application jars; counts repeated physical target writes. */
+    record ObservedKey(String phaseId, String targetId, String key, Kind kind) {}
+
+    private record Pending(String phaseId, ExpectedChange change, long issuedAtNanos, boolean measured) {
     }
 
     private final Object lock = new Object();
+    private final String targetId;
     private final String targetCollection;
     private final String databaseName;
     private final Function<Document, String> keyOf;
@@ -80,18 +84,24 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private final Thread reader;
     private final Map<String, ArrayDeque<Pending>> pendingByKey = new HashMap<>();
     private final List<Delivery> deliveries = new ArrayList<>();
+    private final Map<ObservedKey, Long> observedCoverage = new HashMap<>();
 
-    private int expectedCount;
-    private String barrierId;
+    private String activePhase;
+    private int phaseExpected;
+    private int phaseObserved;
+    private int returnedDeliveries;
+    private String pendingBarrierId;
     private boolean barrierSeen;
-    private boolean sealed;
+    private boolean checkpointing;
+    private boolean legacyFinished;
     private boolean closed;
     private AssertionError failure;
 
-    private BenchmarkMongoDeliveryObserver(String uri, String targetCollection,
+    private BenchmarkMongoDeliveryObserver(String uri, String targetId, String targetCollection,
                                            Function<Document, String> keyOf) {
         ConnectionString address = new ConnectionString(uri);
         this.databaseName = Objects.requireNonNull(address.getDatabase(), "target URI has no database");
+        this.targetId = Objects.requireNonNull(targetId, "target identity");
         this.targetCollection = Objects.requireNonNull(targetCollection, "target collection");
         this.keyOf = Objects.requireNonNull(keyOf, "target key extractor");
         this.client = MongoClients.create(address);
@@ -114,11 +124,17 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             Function<Document, String> keyOf) {
         String uri = target.location() == BenchmarkWorkloadDefinitions.TargetLocation.MANAGED_VIEW
                 ? managedViewsUri : externalTargetUri;
-        return new BenchmarkMongoDeliveryObserver(uri, target.table(), keyOf);
+        return new BenchmarkMongoDeliveryObserver(uri, target.pipelineId() + "/" + target.table(),
+                target.table(), keyOf);
     }
 
     /** Register before the corresponding source SQL begins, using its captured monotonic start time. */
     void expectBatch(long issuedAtNanos, List<ExpectedChange> expected) {
+        expectBatch("legacy-measured", issuedAtNanos, expected);
+    }
+
+    /** Register one measured batch before its source SQL begins. */
+    void expectBatch(String phaseId, long issuedAtNanos, List<ExpectedChange> expected) {
         Objects.requireNonNull(expected, "expected target changes");
         if (expected.isEmpty()) {
             throw new IllegalArgumentException("an issued batch must name target changes");
@@ -126,40 +142,76 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         if (System.nanoTime() - issuedAtNanos < 0) {
             throw new IllegalArgumentException("source batch issue time is in the future");
         }
+        register(phaseId, issuedAtNanos, expected, true);
+    }
+
+    /** Terminal writes are checked for identity and kind but never enter measured latency samples. */
+    void expectUnmeasured(String phaseId, List<ExpectedChange> expected) {
+        Objects.requireNonNull(expected, "expected target changes");
+        if (expected.isEmpty()) {
+            throw new IllegalArgumentException("an unmeasured phase must name target changes");
+        }
+        register(phaseId, 0, expected, false);
+    }
+
+    private void register(String phaseId, long issuedAtNanos, List<ExpectedChange> expected, boolean measured) {
+        if (phaseId == null || phaseId.isBlank()) {
+            throw new IllegalArgumentException("a target change phase is required");
+        }
         synchronized (lock) {
-            requireOpenAndUnsealed();
+            requireOpenAndReady();
+            if (activePhase == null) {
+                activePhase = phaseId;
+            } else if (!activePhase.equals(phaseId)) {
+                throw new IllegalStateException("target changes for " + activePhase + " are not checkpointed");
+            }
             for (ExpectedChange change : expected) {
                 pendingByKey.computeIfAbsent(change.key(), ignored -> new ArrayDeque<>())
-                        .addLast(new Pending(change, issuedAtNanos));
-                expectedCount++;
+                        .addLast(new Pending(phaseId, change, issuedAtNanos, measured));
+                phaseExpected = Math.addExact(phaseExpected, 1);
             }
         }
     }
 
     /**
-     * Call only after the target-ACK counter covers every expected output in this measured phase. The
-     * barrier is an acknowledged write in the same database stream as the target changes, so seeing it
-     * proves all earlier target writes in that stream have been inspected. The source terminal ACK and
-     * final target count/checksum are checked separately after the measured phases.
+     * Reconcile one phase after its source terminal is target-ACKed. The stream remains live across the
+     * next phase and through the final terminal ACK; an unregistered write between barriers is a failure.
+     * A target with no expected changes may checkpoint an otherwise active phase with zero deliveries.
      */
-    List<Delivery> finish(Duration timeout) {
-        Objects.requireNonNull(timeout, "finish timeout");
+    List<Delivery> checkpoint(String phaseId, Duration timeout) {
+        Objects.requireNonNull(timeout, "checkpoint timeout");
         if (timeout.isZero() || timeout.isNegative()) {
-            throw new IllegalArgumentException("finish timeout must be positive");
+            throw new IllegalArgumentException("checkpoint timeout must be positive");
         }
+        if (phaseId == null || phaseId.isBlank()) {
+            throw new IllegalArgumentException("a checkpoint phase is required");
+        }
+        String id;
         synchronized (lock) {
-            requireOpenAndUnsealed();
-            if (expectedCount == 0) {
-                throw new IllegalStateException("no target changes registered");
+            requireOpenAndReady();
+            if (activePhase == null) {
+                activePhase = phaseId;
+            } else if (!activePhase.equals(phaseId)) {
+                throw new IllegalStateException("target changes for " + activePhase + " are not checkpointed");
             }
-            sealed = true;
-            barrierId = UUID.randomUUID().toString();
+            checkpointing = true;
+            pendingBarrierId = UUID.randomUUID().toString();
+            barrierSeen = false;
+            id = pendingBarrierId;
         }
         MongoCollection<Document> barriers = client.getDatabase(databaseName)
                 .getCollection(BARRIER_COLLECTION);
-        barriers.insertOne(new Document("_id", barrierId));
+        try {
+            barriers.insertOne(new Document("_id", id));
+        } catch (RuntimeException writeFailure) {
+            synchronized (lock) {
+                fail("target change-stream barrier write failed", writeFailure);
+                throw failure;
+            }
+        }
 
         long deadline = System.nanoTime() + timeout.toNanos();
+        List<Delivery> phaseDeliveries;
         synchronized (lock) {
             while (failure == null && !barrierSeen) {
                 long remaining = deadline - System.nanoTime();
@@ -176,11 +228,47 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             if (failure != null) {
                 throw failure;
             }
-            if (deliveries.size() != expectedCount) {
+            if (phaseObserved != phaseExpected) {
                 throw new AssertionError("target change-stream reached its barrier with "
-                        + (expectedCount - deliveries.size()) + " missing deliveries");
+                        + (phaseExpected - phaseObserved) + " missing deliveries in " + phaseId);
             }
-            return List.copyOf(deliveries);
+            phaseDeliveries = List.copyOf(deliveries.subList(returnedDeliveries, deliveries.size()));
+            returnedDeliveries = deliveries.size();
+            activePhase = null;
+            phaseExpected = 0;
+            phaseObserved = 0;
+            pendingBarrierId = null;
+            barrierSeen = false;
+            checkpointing = false;
+        }
+        barriers.deleteOne(Filters.eq("_id", id));
+        return phaseDeliveries;
+    }
+
+    /** Compatibility path for a single measured phase; callers may migrate to repeated checkpoints. */
+    List<Delivery> finish(Duration timeout) {
+        synchronized (lock) {
+            if (legacyFinished) {
+                throw new IllegalStateException("single-phase observer already finished");
+            }
+        }
+        List<Delivery> result = checkpoint("legacy-measured", timeout);
+        synchronized (lock) {
+            legacyFinished = true;
+        }
+        return result;
+    }
+
+    /** The physically observed key/kind multiset, with stable target identity and phase. */
+    Map<ObservedKey, Long> observedCoverage() {
+        synchronized (lock) {
+            if (failure != null) {
+                throw failure;
+            }
+            if (activePhase != null || checkpointing) {
+                throw new IllegalStateException("target change phase has not reached its checkpoint");
+            }
+            return Map.copyOf(observedCoverage);
         }
     }
 
@@ -188,7 +276,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         try {
             while (true) {
                 synchronized (lock) {
-                    if (closed || failure != null || barrierSeen) {
+                    if (closed || failure != null) {
                         return;
                     }
                 }
@@ -216,7 +304,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             Document body = change.getFullDocument();
             synchronized (lock) {
                 if (operation == OperationType.INSERT && body != null
-                        && Objects.equals(barrierId, body.getString("_id"))) {
+                        && Objects.equals(pendingBarrierId, body.getString("_id"))) {
                     barrierSeen = true;
                     lock.notifyAll();
                 }
@@ -271,12 +359,21 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                         + expected.change().kind() + " but saw " + actual, null);
                 return;
             }
-            long duration = observedAtNanos - expected.issuedAtNanos();
-            if (duration < 0) {
-                fail("target change preceded its source batch for key " + key, null);
+            if (!expected.phaseId().equals(activePhase)) {
+                fail("target change belongs to an uncheckpointed phase for key " + key, null);
                 return;
             }
-            deliveries.add(new Delivery(key, actual, expected.issuedAtNanos(), observedAtNanos, duration));
+            if (expected.measured()) {
+                long duration = observedAtNanos - expected.issuedAtNanos();
+                if (duration < 0) {
+                    fail("target change preceded its source batch for key " + key, null);
+                    return;
+                }
+                deliveries.add(new Delivery(key, actual, expected.issuedAtNanos(), observedAtNanos, duration));
+            }
+            observedCoverage.merge(new ObservedKey(expected.phaseId(), targetId, key, actual), 1L,
+                    Math::addExact);
+            phaseObserved = Math.addExact(phaseObserved, 1);
             lock.notifyAll();
         }
     }
@@ -288,9 +385,12 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         }
     }
 
-    private void requireOpenAndUnsealed() {
-        if (closed || sealed) {
+    private void requireOpenAndReady() {
+        if (closed || legacyFinished) {
             throw new IllegalStateException("target change-stream window is closed");
+        }
+        if (checkpointing) {
+            throw new IllegalStateException("target change-stream checkpoint is in progress");
         }
         if (failure != null) {
             throw failure;
@@ -315,9 +415,9 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 Thread.currentThread().interrupt();
             } finally {
                 try {
-                    if (barrierId != null) {
+                    if (pendingBarrierId != null) {
                         client.getDatabase(databaseName).getCollection(BARRIER_COLLECTION)
-                                .deleteOne(Filters.eq("_id", barrierId));
+                                .deleteOne(Filters.eq("_id", pendingBarrierId));
                     }
                 } finally {
                     client.close();

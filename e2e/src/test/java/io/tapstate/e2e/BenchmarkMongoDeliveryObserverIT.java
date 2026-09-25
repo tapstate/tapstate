@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -164,6 +165,72 @@ class BenchmarkMongoDeliveryObserverIT {
             assertThatThrownBy(() -> observer.finish(BOUND))
                     .isInstanceOf(AssertionError.class)
                     .hasMessageContaining("target operation mismatch for key 1");
+        }
+    }
+
+    @Test
+    void checkpointsKeepOneStreamOpenAndExcludeTerminalWritesFromMeasuredLatency() {
+        String external = SharedMongo.replicaSetUrl("benchmark_delivery_phases");
+        String views = SharedMongo.replicaSetUrl("views");
+        String table = "benchmark_delivery_phases_test";
+        MongoCollection<Document> target = freshCollection(external, table);
+        target.insertOne(new Document("id", 1L).append("value", "seed"));
+
+        try (BenchmarkMongoDeliveryObserver observer = BenchmarkMongoDeliveryObserver.open(
+                target(BenchmarkWorkloadDefinitions.TargetLocation.EXTERNAL_MONGO, table),
+                external, views, row -> String.valueOf(row.get("id")))) {
+            observer.expectBatch("cold-read", System.nanoTime(), List.of(
+                    new BenchmarkMongoDeliveryObserver.ExpectedChange(
+                            "1", BenchmarkMongoDeliveryObserver.Kind.UPDATE)));
+            target.updateOne(Filters.eq("id", 1L), Updates.set("value", "cold"));
+            assertThat(observer.checkpoint("cold-read", BOUND)).singleElement()
+                    .extracting(BenchmarkMongoDeliveryObserver.Delivery::key).isEqualTo("1");
+            assertThat(observer.checkpoint("join-idle", BOUND)).isEmpty();
+
+            observer.expectBatch("cdc-update", System.nanoTime(), List.of(
+                    new BenchmarkMongoDeliveryObserver.ExpectedChange(
+                            "1", BenchmarkMongoDeliveryObserver.Kind.UPDATE)));
+            target.updateOne(Filters.eq("id", 1L), Updates.set("value", "cdc"));
+            assertThat(observer.checkpoint("cdc-update", BOUND)).singleElement()
+                    .extracting(BenchmarkMongoDeliveryObserver.Delivery::key).isEqualTo("1");
+
+            observer.expectUnmeasured("terminal", List.of(
+                    new BenchmarkMongoDeliveryObserver.ExpectedChange(
+                            "2", BenchmarkMongoDeliveryObserver.Kind.INSERT)));
+            target.insertOne(new Document("id", 2L).append("value", "terminal"));
+            assertThat(observer.checkpoint("terminal", BOUND)).isEmpty();
+            String targetId = "observer_test/" + table;
+            assertThat(observer.observedCoverage()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                    new BenchmarkMongoDeliveryObserver.ObservedKey(
+                            "cold-read", targetId, "1", BenchmarkMongoDeliveryObserver.Kind.UPDATE), 1L,
+                    new BenchmarkMongoDeliveryObserver.ObservedKey(
+                            "cdc-update", targetId, "1", BenchmarkMongoDeliveryObserver.Kind.UPDATE), 1L,
+                    new BenchmarkMongoDeliveryObserver.ObservedKey(
+                            "terminal", targetId, "2", BenchmarkMongoDeliveryObserver.Kind.INSERT), 1L));
+        }
+    }
+
+    @Test
+    void aLateDuplicateAfterTheFirstCheckpointFailsBeforeTheNextBarrier() {
+        String external = SharedMongo.replicaSetUrl("benchmark_delivery_late_duplicate");
+        String views = SharedMongo.replicaSetUrl("views");
+        String table = "benchmark_delivery_late_duplicate_test";
+        MongoCollection<Document> target = freshCollection(external, table);
+        target.insertOne(new Document("id", 1L).append("value", "seed"));
+
+        try (BenchmarkMongoDeliveryObserver observer = BenchmarkMongoDeliveryObserver.open(
+                target(BenchmarkWorkloadDefinitions.TargetLocation.EXTERNAL_MONGO, table),
+                external, views, row -> String.valueOf(row.get("id")))) {
+            observer.expectBatch("cold-read", System.nanoTime(), List.of(
+                    new BenchmarkMongoDeliveryObserver.ExpectedChange(
+                            "1", BenchmarkMongoDeliveryObserver.Kind.UPDATE)));
+            target.updateOne(Filters.eq("id", 1L), Updates.set("value", "first"));
+            assertThat(observer.checkpoint("cold-read", BOUND)).hasSize(1);
+
+            target.updateOne(Filters.eq("id", 1L), Updates.set("value", "late-duplicate"));
+            assertThatThrownBy(() -> observer.checkpoint("cdc-update", BOUND))
+                    .isInstanceOf(AssertionError.class)
+                    .hasMessageContaining("extra or duplicate target change for key 1");
         }
     }
 
