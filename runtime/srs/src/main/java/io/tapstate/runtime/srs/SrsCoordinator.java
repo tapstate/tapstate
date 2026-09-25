@@ -4,12 +4,12 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 /**
  * The single-node coordinator for SRS mining chains: it force-merges cdc sources onto shared chains and
@@ -36,13 +36,13 @@ import java.util.Set;
  *
  * <p>The durable per-consumer read cursor ({@code consumer_offsets[].perTableSeq}) is published later, when
  * the capture run unit is wired; attaching a consumer here registers its membership, the input to that
- * wiring and to the affected-pipeline list, not the cursor itself. Methods are synchronized: lifecycle acts
- * are few and already serialized by the control plane, and the check-then-act steps must stay atomic.
+ * wiring and to the affected-pipeline list, not the cursor itself. Each chain serializes its own lifecycle
+ * acts, including durable metadata IO, without holding up an unrelated chain.
  */
 public final class SrsCoordinator {
 
     private final SrsMetaStore meta;
-    private final Map<String, ChainState> chains = new LinkedHashMap<>();
+    private final ConcurrentHashMap<String, ChainSlot> chains = new ConcurrentHashMap<>();
 
     public SrsCoordinator(SrsMetaStore meta) {
         this.meta = Objects.requireNonNull(meta, "meta");
@@ -65,37 +65,39 @@ public final class SrsCoordinator {
      * starts a generation of its own for the reason a restart does. What the join attached stays attached,
      * and a start that fails after this leaves it attached too, which is why it still answers as a merge.
      */
-    public synchronized ProvisionOutcome provisionSource(
+    public ProvisionOutcome provisionSource(
             String sourceId, MiningChainId chainId, List<String> streams, String retention) {
         Objects.requireNonNull(sourceId, "sourceId");
         Objects.requireNonNull(chainId, "chainId");
         Objects.requireNonNull(streams, "streams");
-        ChainState state = chains.get(chainId.value());
-        boolean merged = state != null;
-        if (state != null && !state.minedHere) {
-            state.mineHere(meta.openEpoch(chainId.value()));
-        } else if (state == null) {
-            // Seed only a chain that has none, and open regardless. The durable record outlives this
-            // process, so after a restart the chain is opened again with its record already there; seeding
-            // is insert-only precisely so an accumulated offset / cursor / schema truth is never discarded,
-            // and skipping the seed is how that is honoured. Opening still happens either way -- a rebuilt
-            // ring is a new generation.
-            //
-            // Re-opening a chain that already has durable history stays a quiet, ordinary act, and the
-            // reason has changed rather than merely survived: the record it preserves is now read back by
-            // the run that follows -- the position its tail starts from, and whether its full load already
-            // finished. Refusing here, or branching on "this chain has been read before", would announce
-            // what the caller is about to ask the store anyway, and would refuse the one case resuming is
-            // for. What would be wrong is discarding the record, which insert-only seeding already stops.
-            if (meta.read(chainId.value()).isEmpty()) {
-                meta.create(chainId.value(), retention);
+        return onChain(chainId, slot -> {
+            ChainState state = slot.state;
+            boolean merged = state != null;
+            if (state != null && !state.minedHere) {
+                state.mineHere(meta.openEpoch(chainId.value()));
+            } else if (state == null) {
+                // Seed only a chain that has none, and open regardless. The durable record outlives this
+                // process, so after a restart the chain is opened again with its record already there; seeding
+                // is insert-only precisely so an accumulated offset / cursor / schema truth is never discarded,
+                // and skipping the seed is how that is honoured. Opening still happens either way -- a rebuilt
+                // ring is a new generation.
+                //
+                // Re-opening a chain that already has durable history stays a quiet, ordinary act, and the
+                // reason has changed rather than merely survived: the record it preserves is now read back by
+                // the run that follows -- the position its tail starts from, and whether its full load already
+                // finished. Refusing here, or branching on "this chain has been read before", would announce
+                // what the caller is about to ask the store anyway, and would refuse the one case resuming is
+                // for. What would be wrong is discarding the record, which insert-only seeding already stops.
+                if (meta.read(chainId.value()).isEmpty()) {
+                    meta.create(chainId.value(), retention);
+                }
+                state = new ChainState(chainId, meta.openEpoch(chainId.value()), true);
+                slot.state = state;
             }
-            state = new ChainState(chainId, meta.openEpoch(chainId.value()), true);
-            chains.put(chainId.value(), state);
-        }
-        state.sources.add(sourceId);
-        state.tables.addAll(streams);
-        return new ProvisionOutcome(chainId, merged, List.copyOf(state.tables), state.epoch);
+            state.sources.add(sourceId);
+            state.tables.addAll(streams);
+            return new ProvisionOutcome(chainId, merged, List.copyOf(state.tables), state.epoch);
+        });
     }
 
     /**
@@ -114,38 +116,40 @@ public final class SrsCoordinator {
      * <p>A chain with no generation open is one nobody has started mining, and joining it is an ordering
      * error of the caller's rather than something to answer with a generation made up here.
      */
-    public synchronized ProvisionOutcome joinSource(String sourceId, MiningChainId chainId, List<String> streams) {
+    public ProvisionOutcome joinSource(String sourceId, MiningChainId chainId, List<String> streams) {
         Objects.requireNonNull(sourceId, "sourceId");
         Objects.requireNonNull(chainId, "chainId");
         Objects.requireNonNull(streams, "streams");
-        ChainState state = chains.get(chainId.value());
-        if (state == null) {
-            long running = meta.read(chainId.value()).map(SrsMeta::epoch).orElse(0L);
-            if (running < 1) {
-                throw new IllegalStateException(
-                        "mining chain has no ring generation open to join: " + chainId.value());
+        return onChain(chainId, slot -> {
+            ChainState state = slot.state;
+            if (state == null) {
+                long running = meta.read(chainId.value()).map(SrsMeta::epoch).orElse(0L);
+                if (running < 1) {
+                    throw new IllegalStateException(
+                            "mining chain has no ring generation open to join: " + chainId.value());
+                }
+                state = new ChainState(chainId, running, false);
+                slot.state = state;
             }
-            state = new ChainState(chainId, running, false);
-            chains.put(chainId.value(), state);
-        }
-        state.sources.add(sourceId);
-        state.tables.addAll(streams);
-        return new ProvisionOutcome(chainId, true, List.copyOf(state.tables), state.epoch);
+            state.sources.add(sourceId);
+            state.tables.addAll(streams);
+            return new ProvisionOutcome(chainId, true, List.copyOf(state.tables), state.epoch);
+        });
     }
 
     /** Whether the chain has been opened by a source. */
-    public synchronized boolean isProvisioned(MiningChainId chainId) {
-        return chains.containsKey(chainId.value());
+    public boolean isProvisioned(MiningChainId chainId) {
+        return onChain(chainId, slot -> slot.state != null);
     }
 
     /** The chain's unioned table set. The chain must be provisioned. */
-    public synchronized List<String> tablesOf(MiningChainId chainId) {
-        return List.copyOf(require(chainId).tables);
+    public List<String> tablesOf(MiningChainId chainId) {
+        return onChain(chainId, slot -> List.copyOf(require(slot, chainId).tables));
     }
 
     /** The cdc sources force-merged onto the chain. The chain must be provisioned. */
-    public synchronized List<String> sourcesOf(MiningChainId chainId) {
-        return List.copyOf(require(chainId).sources);
+    public List<String> sourcesOf(MiningChainId chainId) {
+        return onChain(chainId, slot -> List.copyOf(require(slot, chainId).sources));
     }
 
     /**
@@ -153,9 +157,12 @@ public final class SrsCoordinator {
      * already open (else a caller ordering error). This records membership only; the durable read cursor is
      * published when the capture run unit is wired.
      */
-    public synchronized void attachConsumer(MiningChainId chainId, String pipelineId) {
+    public void attachConsumer(MiningChainId chainId, String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        require(chainId).consumers.add(pipelineId);
+        onChain(chainId, slot -> {
+            require(slot, chainId).consumers.add(pipelineId);
+            return null;
+        });
     }
 
     /**
@@ -163,9 +170,12 @@ public final class SrsCoordinator {
      * pipeline's own entry: never the shared chain, its tables, its other consumers, or the durable meta.
      * Removing a pipeline that is not a consumer is a no-op.
      */
-    public synchronized void detachConsumer(MiningChainId chainId, String pipelineId) {
+    public void detachConsumer(MiningChainId chainId, String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        require(chainId).consumers.remove(pipelineId);
+        onChain(chainId, slot -> {
+            require(slot, chainId).consumers.remove(pipelineId);
+            return null;
+        });
     }
 
     /**
@@ -185,23 +195,25 @@ public final class SrsCoordinator {
      * no pipeline reading it, and that chain is left standing here because no consumer was ever on it to
      * give one back. Taking that one away is the source-level act.
      */
-    public synchronized boolean releaseConsumer(MiningChainId chainId, String pipelineId) {
+    public boolean releaseConsumer(MiningChainId chainId, String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        ChainState state = require(chainId);
-        state.consumers.remove(pipelineId);
-        if (!state.consumers.isEmpty()) {
-            return false;
-        }
-        chains.remove(chainId.value());
-        return true;
+        return onChain(chainId, slot -> {
+            ChainState state = require(slot, chainId);
+            state.consumers.remove(pipelineId);
+            if (!state.consumers.isEmpty()) {
+                return false;
+            }
+            slot.state = null;
+            return true;
+        });
     }
 
     /**
      * The consumer pipelines currently on the chain — the list a source-level teardown must present before it
      * runs, so the boundary is never crossed implicitly. The chain must be provisioned.
      */
-    public synchronized List<String> affectedConsumers(MiningChainId chainId) {
-        return List.copyOf(require(chainId).consumers);
+    public List<String> affectedConsumers(MiningChainId chainId) {
+        return onChain(chainId, slot -> List.copyOf(require(slot, chainId).consumers));
     }
 
     /**
@@ -209,13 +221,15 @@ public final class SrsCoordinator {
      * per-table ring names — without changing anything. This is the list a caller must present before an
      * actual teardown, so tearing a chain down is never implicit. The chain must be provisioned.
      */
-    public synchronized SourceTeardownPlan planSourceTeardown(MiningChainId chainId) {
-        ChainState state = require(chainId);
-        List<String> ringNames = new ArrayList<>();
-        for (String table : state.tables) {
-            ringNames.add(SrsRingbuffer.ringName(state.chainId.value(), table));
-        }
-        return new SourceTeardownPlan(state.chainId, List.copyOf(state.consumers), ringNames);
+    public SourceTeardownPlan planSourceTeardown(MiningChainId chainId) {
+        return onChain(chainId, slot -> {
+            ChainState state = require(slot, chainId);
+            List<String> ringNames = new ArrayList<>();
+            for (String table : state.tables) {
+                ringNames.add(SrsRingbuffer.ringName(state.chainId.value(), table));
+            }
+            return new SourceTeardownPlan(state.chainId, List.copyOf(state.consumers), ringNames);
+        });
     }
 
     /**
@@ -228,17 +242,52 @@ public final class SrsCoordinator {
      * between the two rather than an oversight: a source being taken away takes its chain with it, and
      * {@link #planSourceTeardown} exists so the consumers that costs are named to somebody first.
      */
-    public synchronized void teardownSource(MiningChainId chainId) {
-        require(chainId);
-        chains.remove(chainId.value());
+    public void teardownSource(MiningChainId chainId) {
+        onChain(chainId, slot -> {
+            require(slot, chainId);
+            slot.state = null;
+            return null;
+        });
     }
 
-    private ChainState require(MiningChainId chainId) {
-        ChainState state = chains.get(Objects.requireNonNull(chainId, "chainId").value());
+    private ChainState require(ChainSlot slot, MiningChainId chainId) {
+        ChainState state = slot.state;
         if (state == null) {
             throw new IllegalStateException("mining chain not provisioned: " + chainId.value());
         }
         return state;
+    }
+
+    private <T> T onChain(MiningChainId chainId, Function<ChainSlot, T> action) {
+        Objects.requireNonNull(chainId, "chainId");
+        ChainSlot[] retained = new ChainSlot[1];
+        chains.compute(chainId.value(), (ignored, existing) -> {
+            ChainSlot slot = existing == null ? new ChainSlot() : existing;
+            slot.users++;
+            retained[0] = slot;
+            return slot;
+        });
+        ChainSlot slot = retained[0];
+        synchronized (slot) {
+            try {
+                return action.apply(slot);
+            } finally {
+                // The reference covers waiters as well as the active operation. An empty slot is removed
+                // only when neither can still touch it, so a later start cannot race an old waiter on a
+                // different lock for the same chain.
+                chains.compute(chainId.value(), (ignored, existing) -> {
+                    if (existing != slot || slot.users <= 0) {
+                        throw new IllegalStateException("chain coordination slot changed while held");
+                    }
+                    return --slot.users == 0 && slot.state == null ? null : slot;
+                });
+            }
+        }
+    }
+
+    private static final class ChainSlot {
+        private int users;
+        private ChainState state;
     }
 
     /**

@@ -12,6 +12,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -43,6 +49,87 @@ class SrsCoordinatorTest {
         assertThat(out.tables()).containsExactlyInAnyOrder("orders");
         assertThat(meta.created).containsEntry(CHAIN.value(), "7d");
         assertThat(coord.isProvisioned(CHAIN)).isTrue();
+    }
+
+    @Test
+    void aSlowMetadataReadOnOneChainDoesNotBlockProvisioningAnother() throws Exception {
+        MiningChainId fastChain = MiningChainId.ofKey("customers-db");
+        BlockingMeta meta = new BlockingMeta(CHAIN);
+        SrsCoordinator coord = new SrsCoordinator(meta);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        CountDownLatch fastAttempted = new CountDownLatch(1);
+        CountDownLatch fastFinished = new CountDownLatch(1);
+        try {
+            Future<ProvisionOutcome> slow = workers.submit(
+                    () -> coord.provisionSource("orders-source", CHAIN, List.of("orders"), "7d"));
+            assertThat(meta.readEntered.await(5, TimeUnit.SECONDS))
+                    .as("the first chain must be waiting inside its metadata read").isTrue();
+            Future<ProvisionOutcome> fast = workers.submit(() -> {
+                fastAttempted.countDown();
+                try {
+                    return coord.provisionSource("customers-source", fastChain, List.of("customers"), "7d");
+                } finally {
+                    fastFinished.countDown();
+                }
+            });
+            assertThat(fastAttempted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(meta.releaseRead.getCount()).as("the slow read must still be blocked").isEqualTo(1);
+            assertThat(fastFinished.await(1, TimeUnit.SECONDS))
+                    .as("an unrelated chain must open while the first chain is blocked in metadata IO")
+                    .isTrue();
+            assertThat(fast.get(5, TimeUnit.SECONDS).merged()).isFalse();
+            meta.releaseRead.countDown();
+            assertThat(slow.get(5, TimeUnit.SECONDS).merged()).isFalse();
+            assertThat(coord.isProvisioned(fastChain)).isTrue();
+            assertThat(coord.isProvisioned(CHAIN)).isTrue();
+        } finally {
+            meta.releaseRead.countDown();
+            workers.shutdown();
+            if (!workers.awaitTermination(5, TimeUnit.SECONDS)) {
+                workers.shutdownNow();
+            }
+        }
+    }
+
+    @Test
+    void twoStartsOfOneChainStillOpenOneGeneration() throws Exception {
+        BlockingMeta meta = new BlockingMeta(CHAIN);
+        SrsCoordinator coord = new SrsCoordinator(meta);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        CountDownLatch secondAttempted = new CountDownLatch(1);
+        CountDownLatch secondFinished = new CountDownLatch(1);
+        try {
+            Future<ProvisionOutcome> first = workers.submit(
+                    () -> coord.provisionSource("orders-source", CHAIN, List.of("orders"), "7d"));
+            assertThat(meta.readEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            Future<ProvisionOutcome> second = workers.submit(() -> {
+                secondAttempted.countDown();
+                try {
+                    return coord.provisionSource("customers-source", CHAIN, List.of("customers"), "30d");
+                } finally {
+                    secondFinished.countDown();
+                }
+            });
+            assertThat(secondAttempted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(secondFinished.await(200, TimeUnit.MILLISECONDS))
+                    .as("a second start of the same chain must wait for the first open")
+                    .isFalse();
+            meta.releaseRead.countDown();
+            ProvisionOutcome opened = first.get(5, TimeUnit.SECONDS);
+            ProvisionOutcome merged = second.get(5, TimeUnit.SECONDS);
+            assertThat(opened.merged()).isFalse();
+            assertThat(merged.merged()).isTrue();
+            assertThat(merged.epoch()).isEqualTo(opened.epoch());
+            assertThat(coord.tablesOf(CHAIN)).containsExactlyInAnyOrder("orders", "customers");
+            assertThat(meta.mutations).filteredOn(m -> m.startsWith("create:")).hasSize(1);
+            assertThat(meta.mutations).filteredOn(m -> m.startsWith("openEpoch:")).hasSize(1);
+        } finally {
+            meta.releaseRead.countDown();
+            workers.shutdown();
+            if (!workers.awaitTermination(5, TimeUnit.SECONDS)) {
+                workers.shutdownNow();
+            }
+        }
     }
 
     @Test
@@ -285,7 +372,7 @@ class SrsCoordinatorTest {
      * its retention; {@code mutations} is the ordered log used to assert a step touched — or did not touch —
      * the durable store. {@code create} is insert-only, matching the contract.
      */
-    private static final class FakeMeta implements SrsMetaStore {
+    private static class FakeMeta implements SrsMetaStore {
         @Override
         public java.util.List<String> miningChainIdsWithConsumer(String pipelineId) {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");
@@ -374,6 +461,33 @@ class SrsCoordinatorTest {
         @Override
         public void appendSchemaVersion(String miningChainId, SchemaVersion version) {
             mutations.add("schema:" + miningChainId);
+        }
+    }
+
+    private static final class BlockingMeta extends FakeMeta {
+        private final MiningChainId slowChain;
+        private final AtomicBoolean blocked = new AtomicBoolean();
+        private final CountDownLatch readEntered = new CountDownLatch(1);
+        private final CountDownLatch releaseRead = new CountDownLatch(1);
+
+        private BlockingMeta(MiningChainId slowChain) {
+            this.slowChain = slowChain;
+        }
+
+        @Override
+        public Optional<SrsMeta> read(String miningChainId) {
+            if (slowChain.value().equals(miningChainId) && blocked.compareAndSet(false, true)) {
+                readEntered.countDown();
+                try {
+                    if (!releaseRead.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("slow metadata read was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("slow metadata read was interrupted", interrupted);
+                }
+            }
+            return super.read(miningChainId);
         }
     }
 }
