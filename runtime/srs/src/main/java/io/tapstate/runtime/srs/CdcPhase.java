@@ -182,16 +182,20 @@ public final class CdcPhase {
     }
 
     /**
-     * The slowest consumer's read cursor into one table's ring — how far ahead of its readers the ring may
-     * be written. {@link Long#MAX_VALUE} when nothing constrains it (no consumer has a durable cursor yet),
-     * and {@code -1} for a consumer that has read nothing of the table.
+     * The slowest subscribed consumer's read cursor into one table's ring — how far ahead of its readers
+     * the ring may be written. An older record with no selection protects every table. A selected table
+     * without a read cursor, or with one from another ring generation, protects the ring from its start.
+     * The answer is {@link Long#MAX_VALUE} when no consumer is subscribed to this table.
      *
      * <p>Derived here rather than fetched separately because it is a function of the same cursors the
      * durable frontier is: asking a store for it on its own means reading one record twice per run.
      */
-    static long headroomBound(Collection<ConsumerOffset> offsets, String table) {
+    static long headroomBound(Collection<ConsumerOffset> offsets, String table, long epoch) {
         return offsets.stream()
-                .mapToLong(offset -> offset.perTableSeq().getOrDefault(table, -1L))
+                .filter(offset -> offset.selectedTables() == null || offset.selectedTables().contains(table))
+                .mapToLong(offset -> offset.selectedTables() == null
+                        || !Objects.equals(offset.selectedTablesEpoch(), epoch)
+                        ? -1L : offset.perTableSeq().getOrDefault(table, -1L))
                 .min()
                 .orElse(Long.MAX_VALUE);
     }
@@ -306,7 +310,7 @@ public final class CdcPhase {
                 offsets = route.consumers().get();
                 OptionalLong appended;
                 try {
-                    appended = gate.appendAll(piece, headroomBound(offsets, table));
+                    appended = gate.appendAll(piece, headroomBound(offsets, table, route.chain().epoch()));
                 } catch (RingWriteRefusedException refused) {
                     // The cluster refused, not the headroom: nothing was written, and what refused clears
                     // itself as the members' verdicts converge. Waiting here is what pauses the source

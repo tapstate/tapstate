@@ -126,6 +126,7 @@ public final class CaptureRunUnit {
         boolean chainCreated = false;
         boolean consumerAttached = false;
         long epoch = 0;
+        String cursorWriterToken = null;
         Optional<Subscription> subscription = Optional.empty();
         List<String> tables = spec.config().streams();
         if (tables == null || tables.isEmpty()) {
@@ -146,6 +147,25 @@ public final class CaptureRunUnit {
                 merged = provisioned.merged();
                 epoch = provisioned.epoch();
                 chainCreated = !merged;
+            }
+
+            if (plan.sharedRing()) {
+                // A chain can carry other pipelines and several sources of this pipeline. Publish the
+                // complete selection before a miner writes, so headroom is guarded by exactly the tables
+                // this pipeline reads. A prior generation's cursor cannot grant headroom in this one.
+                List<String> selected = spec.selectedChainTables() == null
+                        ? tables : spec.selectedChainTables();
+                cursorWriterToken = spec.cursorWriterToken() == null
+                        ? java.util.UUID.randomUUID().toString() : spec.cursorWriterToken();
+                ConsumerOffset previous = meta.consumerOffsets(chainId.value()).stream()
+                        .filter(offset -> offset.pipelineId().equals(spec.pipelineId()))
+                        .findFirst().orElse(null);
+                if (previous == null || !selected.equals(previous.selectedTables())
+                        || !Objects.equals(previous.selectedTablesEpoch(), epoch)
+                        || !cursorWriterToken.equals(previous.cursorWriterToken())) {
+                    meta.selectConsumerTables(
+                            chainId.value(), spec.pipelineId(), selected, epoch, cursorWriterToken);
+                }
             }
 
             // Where this pipeline starts in each ring, marked now: after it is on the chain, and before its
@@ -211,7 +231,8 @@ public final class CaptureRunUnit {
                 String firstTable = tables.getFirst();
                 String firstRing = SrsRingbuffer.ringName(cid, firstTable);
                 ringSource = Optional.of(SrsRingSource.create(
-                        firstRing, spec.startFrom(), readCursorPublisher(cid, spec.pipelineId(), firstTable),
+                        firstRing, spec.startFrom(), readCursorPublisher(
+                                cid, spec.pipelineId(), firstTable, epoch, cursorWriterToken),
                         spec.retention()));
                 if (!startTail) {
                     return new CaptureRun(
@@ -515,17 +536,19 @@ public final class CaptureRunUnit {
      * The read-cursor publisher factory for one consumer's reader over one table's ring: carried onto the
      * Jet source, it resolves the coordination store from the member's user context and binds a sink that
      * advances that consumer's durable {@code perTableSeq} as the reader drains, without clobbering its
-     * sink-ack. It closes over only the chain, pipeline and table coordinates — never the store — so it
-     * stays serializable; a member with no store bound resolves to a no-op sink.
+     * sink-ack. It closes over only the chain, pipeline, table, ring generation and cursor-writer token —
+     * never the store — so it stays serializable; a member with no store bound resolves to a no-op sink.
+     * The generation and token fence reports from earlier readers.
      */
     public static SrsReadCursorPublisherFactory readCursorPublisher(
-            String miningChainId, String pipelineId, String table) {
+            String miningChainId, String pipelineId, String table, long epoch, String cursorWriterToken) {
         return member -> {
             Object bound = member.getUserContext().get(SRS_META_USER_CONTEXT_KEY);
             if (!(bound instanceof SrsMetaStore memberMeta)) {
                 return lastReadSeq -> { };
             }
-            return lastReadSeq -> memberMeta.advanceConsumerReadSeq(miningChainId, pipelineId, table, lastReadSeq);
+            return lastReadSeq -> memberMeta.advanceConsumerReadSeq(
+                    miningChainId, pipelineId, table, epoch, cursorWriterToken, lastReadSeq);
         };
     }
 }

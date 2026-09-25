@@ -200,6 +200,15 @@ class MongoSrsMetaStoreTest {
     }
 
     @Test
+    void aReaderMayReportAnUnreadCursorWithoutChangingOtherFields() {
+        Document update = MongoSrsMetaStore.consumerReadSeqUpdate("p1", "orders", -1L);
+
+        assertThat(update.get("$set", Document.class))
+                .containsExactly(Map.entry("perTableSeq.orders", -1L));
+        assertThat(update).doesNotContainKey("$max");
+    }
+
+    @Test
     void sinkAckedUpdateTargetsOnlyThatConsumersAckPathNotThePerTableCursor() {
         // The sink's ack advance is a path-scoped $set: it touches only that consumer's acked position, so a
         // sink advancing it never clobbers the per-table read cursor the reader writes to the same consumer
@@ -260,6 +269,8 @@ class MongoSrsMetaStoreTest {
         ConsumerOffset p1 = meta.consumerOffsets().get(0);
         assertThat(p1.pipelineId()).isEqualTo("p1");
         assertThat(p1.perTableSeq()).isEmpty();
+        assertThat(p1.selectedTables()).isNull();
+        assertThat(p1.selectedTablesEpoch()).isNull();
         assertThat(p1.sinkAcked()).isEqualTo(new ChainPosition(new SourceOrder(1, 99), "gtid:aaa-1:99"));
     }
 

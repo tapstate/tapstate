@@ -32,6 +32,20 @@ interface PipelineCaptureCoordinator {
     }
 
     /**
+     * Starts capture with the cursor-writer token fixed by this prepared run. Lightweight coordinators
+     * that do not publish SRS cursors use the ordinary start path.
+     */
+    default void startCapture(
+            String pipelineId, ArtifactStore artifactSnapshot, String cursorWriterToken) {
+        startCapture(pipelineId, artifactSnapshot);
+    }
+
+    /** Whether this member still holds capture handles for the pipeline after its Jet job has ended. */
+    default boolean hasActiveCapture(String pipelineId) {
+        return false;
+    }
+
+    /**
      * Stops the cdc capture started for the pipeline, tearing down each source run and giving back its hold
      * on each chain it read. {@code purgeState} additionally lets go of what the pipeline left in the
      * source-side record -- the cursor it reads and acknowledges from.

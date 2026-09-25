@@ -37,6 +37,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -397,10 +398,44 @@ class CaptureRunUnitJetSmokeTest {
                     ack,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
-                    existing == null ? 0L : existing.snapshotEpoch()));
+                    existing == null ? 0L : existing.snapshotEpoch(),
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    existing == null ? null : existing.cursorWriterToken()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
                     m.schemaHistory(), m.retention(), m.epoch()));
+        }
+
+        @Override
+        public synchronized void selectConsumerTables(
+                String miningChainId, String pipelineId, List<String> tables, long epoch,
+                String cursorWriterToken) {
+            SrsMeta m = require(miningChainId);
+            ConsumerOffset previous = m.consumerOffset(pipelineId).orElse(null);
+            Map<String, Long> cursors = previous != null
+                    && Objects.equals(previous.selectedTablesEpoch(), epoch)
+                    && Objects.equals(previous.cursorWriterToken(), cursorWriterToken)
+                    && tables.equals(previous.selectedTables())
+                    ? previous.perTableSeq() : Map.of();
+            upsertConsumerOffset(miningChainId, new ConsumerOffset(
+                    pipelineId, cursors, previous == null ? null : previous.sinkAcked(),
+                    previous == null ? List.of() : previous.snapshotCompletedTables(),
+                    previous == null ? null : previous.cdcStartPosition(),
+                    previous == null ? 0L : previous.snapshotEpoch(),
+                    tables, epoch, cursorWriterToken));
+        }
+
+        @Override
+        public synchronized void advanceConsumerReadSeq(
+                String miningChainId, String pipelineId, String table, long epoch,
+                String cursorWriterToken, long lastReadSeq) {
+            ConsumerOffset current = require(miningChainId).consumerOffset(pipelineId).orElse(null);
+            if (current != null && Objects.equals(current.selectedTablesEpoch(), epoch)
+                    && Objects.equals(current.cursorWriterToken(), cursorWriterToken)
+                    && current.selectedTables().contains(table)) {
+                advanceConsumerReadSeq(miningChainId, pipelineId, table, lastReadSeq);
+            }
         }
 
         @Override
@@ -422,7 +457,10 @@ class CaptureRunUnitJetSmokeTest {
                     position,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
-                    existing == null ? 0L : existing.snapshotEpoch()));
+                    existing == null ? 0L : existing.snapshotEpoch(),
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    existing == null ? null : existing.cursorWriterToken()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
                     m.schemaHistory(), m.retention(), m.epoch()));
@@ -447,7 +485,10 @@ class CaptureRunUnitJetSmokeTest {
                     existing == null ? null : existing.sinkAcked(),
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     cdcStartPosition,
-                    snapshotEpoch));
+                    snapshotEpoch,
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    existing == null ? null : existing.cursorWriterToken()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
                     m.schemaHistory(), m.retention(), m.epoch()));
@@ -495,7 +536,10 @@ class CaptureRunUnitJetSmokeTest {
             consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
                     mine == null ? null : mine.sinkAcked(), completed,
                     mine == null ? null : mine.cdcStartPosition(),
-                    mine == null ? 0L : mine.snapshotEpoch()));
+                    mine == null ? 0L : mine.snapshotEpoch(),
+                    mine == null ? null : mine.selectedTables(),
+                    mine == null ? null : mine.selectedTablesEpoch(),
+                    mine == null ? null : mine.cursorWriterToken()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
                     m.schemaHistory(), m.retention(), m.epoch()));
         }

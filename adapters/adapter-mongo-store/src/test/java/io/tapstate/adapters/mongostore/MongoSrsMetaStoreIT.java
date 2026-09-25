@@ -281,6 +281,42 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void selectedTablesPreserveOnlyContinuouslySelectedCursorsInOneGeneration() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            assertThat(store.openEpoch(CHAIN)).isEqualTo(1L);
+            store.selectConsumerTables(CHAIN, "p1", List.of("orders", "customers"), 1L, "run-1");
+            store.advanceConsumerReadSeq(CHAIN, "p1", "orders", 1L, "run-1", 42L);
+            store.advanceConsumerReadSeq(CHAIN, "p1", "customers", 1L, "run-1", 7L);
+            store.advanceSinkAcked(CHAIN, "p1", new ChainPosition(new SourceOrder(1, 7), "w7"));
+            store.selectConsumerTables(CHAIN, "p1", List.of("orders", "customers"), 1L, "run-1");
+            assertThat(onlyConsumer(store).perTableSeq())
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 42L, "customers", 7L));
+
+            store.selectConsumerTables(CHAIN, "p1", List.of("orders"), 1L, "run-2");
+            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
+            assertThat(onlyConsumer(store).selectedTables()).containsExactly("orders");
+            assertThat(onlyConsumer(store).sinkAcked()).isEqualTo(new ChainPosition(new SourceOrder(1, 7), "w7"));
+
+            store.selectConsumerTables(CHAIN, "p1", List.of("orders", "customers"), 1L, "run-3");
+            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
+            assertThat(onlyConsumer(store).selectedTables()).containsExactly("orders", "customers");
+            store.advanceConsumerReadSeq(CHAIN, "p1", "customers", 1L, "run-1", 99L);
+            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
+            store.advanceConsumerReadSeq(CHAIN, "p1", "customers", 1L, "run-3", 0L);
+            assertThat(onlyConsumer(store).perTableSeq()).containsExactly(Map.entry("customers", 0L));
+
+            assertThat(store.openEpoch(CHAIN)).isEqualTo(2L);
+            store.selectConsumerTables(CHAIN, "p1", List.of("orders", "customers"), 2L, "run-4");
+            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
+            store.advanceConsumerReadSeq(CHAIN, "p1", "orders", 1L, "run-3", 99L);
+            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
+            store.advanceConsumerReadSeq(CHAIN, "p1", "orders", 2L, "run-4", 0L);
+            assertThat(onlyConsumer(store).perTableSeq()).containsExactly(Map.entry("orders", 0L));
+        });
+    }
+
+    @Test
     void advanceSinkAckedSrcposAdvancesTheAckedPositionWithoutClobberingTheReadCursor() {
         withStore(store -> {
             store.create(CHAIN, null);

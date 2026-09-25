@@ -116,6 +116,52 @@ class EngineLifecycleActuatorTest {
                 "stopCapture:" + PIPE + "[purge][jobTerminal]");
     }
 
+    @Test
+    void aJoblessRestartClosesAnOldCaptureBeforeOpeningTheNewReader() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        coordinator.activeCapture = true;
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), new RecordingDagSource(events), coordinator, teardown());
+
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly(
+                "stopCapture:" + PIPE + "[keep][jobLive]",
+                "startCapture:" + PIPE,
+                "buildDag:" + PIPE);
+        assertThat(coordinator.activeCapture).isTrue();
+    }
+
+    @Test
+    void aDuplicateStartWithALiveJobKeepsItsCapture() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), new RecordingDagSource(events), coordinator, teardown());
+
+        actuator.start(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
+    }
+
+    @Test
+    void aPreparedStartPassesTheSameCursorTokenToCapture() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        dagSource.artifactSnapshot = new InMemoryArtifactStore();
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), dagSource, coordinator, teardown());
+
+        actuator.start(PIPE);
+
+        assertThat(dagSource.preparedTokens).hasSize(1);
+        assertThat(coordinator.captureTokens).containsExactly(dagSource.preparedTokens.getFirst());
+    }
+
     /**
      * A start the capture side gives back submits nothing and throws nothing. The pipeline is left carrying
      * no job, which is what the next pass starts again -- rather than a job over a ring nobody opened, or a
@@ -393,6 +439,8 @@ class EngineLifecycleActuatorTest {
         private Supplier<Boolean> jobAbsentProbe = () -> true;
         private boolean jobWasAbsentAtStart;
         private boolean givesTheStartBack;
+        private boolean activeCapture;
+        private final List<String> captureTokens = new CopyOnWriteArrayList<>();
 
         RecordingCaptureCoordinator(List<String> events) {
             this.events = events;
@@ -406,6 +454,7 @@ class EngineLifecycleActuatorTest {
                 throw new RingNotOpenYet(CaptureId.of(
                         new CaptureConfig("mysql", Map.of("host", "h"), List.of("orders")), null));
             }
+            activeCapture = true;
         }
 
         @Override
@@ -415,9 +464,21 @@ class EngineLifecycleActuatorTest {
         }
 
         @Override
+        public void startCapture(String pipelineId, ArtifactStore artifactSnapshot, String cursorWriterToken) {
+            captureTokens.add(cursorWriterToken);
+            startCapture(pipelineId, artifactSnapshot);
+        }
+
+        @Override
         public void stopCapture(String pipelineId, boolean purgeState) {
             events.add("stopCapture:" + pipelineId + (purgeState ? "[purge]" : "[keep]")
                     + (jobTerminalProbe.get() ? "[jobTerminal]" : "[jobLive]"));
+            activeCapture = false;
+        }
+
+        @Override
+        public boolean hasActiveCapture(String pipelineId) {
+            return activeCapture;
         }
 
         @Override
@@ -439,6 +500,7 @@ class EngineLifecycleActuatorTest {
         private Runnable validation = () -> {
         };
         private ArtifactStore artifactSnapshot;
+        private final List<String> preparedTokens = new CopyOnWriteArrayList<>();
 
         RecordingDagSource(List<String> events) {
             this.events = events;
@@ -452,13 +514,17 @@ class EngineLifecycleActuatorTest {
         @Override
         public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
             if (artifactSnapshot == null) {
-                return DagSource.super.prepareStart(pipelineId, defaultDatabase);
+                StartPreparation prepared = DagSource.super.prepareStart(pipelineId, defaultDatabase);
+                preparedTokens.add(prepared.cursorWriterToken());
+                return prepared;
             }
             validateStart(pipelineId);
-            return new StartPreparation(
+            StartPreparation prepared = new StartPreparation(
                     capacityOf(pipelineId), stateLocations(pipelineId, defaultDatabase),
                     Optional.of(artifactSnapshot),
                     fence -> dagFor(pipelineId, fence));
+            preparedTokens.add(prepared.cursorWriterToken());
+            return prepared;
         }
 
         /** Keeps no state, so there is nothing for a budget to be applied to. */

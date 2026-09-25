@@ -30,6 +30,7 @@ import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.SourcePosition;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -181,6 +182,47 @@ class SrsSourceProcessorTest {
         // The source reports its read progress member-side: the last sequence it read (4, the 5th change).
         assertThat(PUBLISHED).isNotEmpty();
         assertThat(PUBLISHED.get(PUBLISHED.size() - 1)).isEqualTo(4L);
+    }
+
+    @Test
+    void aFutureInstantStartPublishesItsSkippedCursorBeforeTheFirstChange() throws InterruptedException {
+        PUBLISHED.clear();
+        String ringName = "srs.chain.future-cursor";
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(ringName));
+        ring.append(new SrsItem(new SourcePosition("w0"), Op.INSERT, 10L,
+                null, Map.of("id", 0), 0L));
+        ring.append(new SrsItem(new SourcePosition("w1"), Op.INSERT, 20L,
+                null, Map.of("id", 1), 0L));
+        hz.getUserContext().put(CURSOR_KEY, (LongConsumer) SrsSourceProcessorTest::collect);
+        SrsReadCursorPublisherFactory factory =
+                member -> (LongConsumer) member.getUserContext().get(CURSOR_KEY);
+        DAG dag = new DAG();
+        Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
+                PIPELINE, ringName, "orders", StartFrom.at(Instant.ofEpochMilli(999)),
+                1L, factory, SourcePlacement.anyMember()));
+        Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
+                .localParallelism(1);
+        Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP("out-future-cursor"))
+                .localParallelism(1);
+        dag.edge(between(source, project)).edge(between(project, sink));
+        Job job = hz.getJet().newJob(dag);
+        try {
+            long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+            while (!PUBLISHED.contains(1L) && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertThat(PUBLISHED).as("the ring was skipped through seq 1 before any new change")
+                    .contains(1L);
+            assertThat(hz.getList("out-future-cursor")).isEmpty();
+
+            ring.append(new SrsItem(new SourcePosition("w2"), Op.INSERT, 1_000L,
+                    null, Map.of("id", 2), 0L));
+            awaitSize(hz.getList("out-future-cursor"), 1);
+            assertThat(PUBLISHED.get(PUBLISHED.size() - 1)).isEqualTo(2L);
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(CURSOR_KEY);
+        }
     }
 
     @Test

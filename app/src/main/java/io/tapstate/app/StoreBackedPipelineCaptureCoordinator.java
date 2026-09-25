@@ -40,6 +40,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -148,6 +149,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public synchronized void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
+        startCapture(pipelineId, artifactSnapshot, UUID.randomUUID().toString());
+    }
+
+    @Override
+    public synchronized void startCapture(
+            String pipelineId, ArtifactStore artifactSnapshot, String cursorWriterToken) {
         // Idempotent: a pipeline whose capture is already running is left running, so a repeated start does not
         // open a second capture behind the one already filling the ring.
         if (runsByPipeline.containsKey(pipelineId)) {
@@ -166,7 +173,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // back is given back having opened nothing: a source opened first would otherwise read its whole
         // load again on every pass until the last one was ready.
         Map<CaptureId, CaptureOwnership.Permit> permits = new LinkedHashMap<>();
-        List<SourcePlan> plans = plan(pipelineId, pipeline, captured, snapshotEpoch, permits);
+        List<SourcePlan> plans = withCompleteChainSelections(
+                plan(pipelineId, pipeline, captured, snapshotEpoch, permits),
+                Objects.requireNonNull(cursorWriterToken, "cursorWriterToken"));
         List<PipelineRun> runs = new ArrayList<>();
         List<AttributedSnapshot> attributed = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
@@ -297,6 +306,29 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             throw failure;
         }
         return plans;
+    }
+
+    /** Every source of one pipeline on a mining chain publishes the same complete table selection. */
+    private static List<SourcePlan> withCompleteChainSelections(
+            List<SourcePlan> plans, String cursorWriterToken) {
+        Map<MiningChainId, LinkedHashSet<String>> selected = new LinkedHashMap<>();
+        for (SourcePlan plan : plans) {
+            CaptureRunSpec spec = plan.spec();
+            if (spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY) {
+                selected.computeIfAbsent(MiningChainId.resolve(spec.config(), spec.srsKey()),
+                        ignored -> new LinkedHashSet<>()).addAll(spec.config().streams());
+            }
+        }
+        List<SourcePlan> complete = new ArrayList<>(plans.size());
+        for (SourcePlan plan : plans) {
+            CaptureRunSpec spec = plan.spec();
+            LinkedHashSet<String> tables = spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY
+                    ? selected.get(MiningChainId.resolve(spec.config(), spec.srsKey())) : null;
+            complete.add(tables == null ? plan : new SourcePlan(
+                    plan.sourceId(), plan.discovered(), plan.resolution(),
+                    spec.withChainSelection(List.copyOf(tables), cursorWriterToken), plan.captureId()));
+        }
+        return List.copyOf(complete);
     }
 
     /**
@@ -1035,6 +1067,11 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** Whether this pipeline currently has a live capture -- a test-visible view of the retained handles. */
     synchronized boolean isActive(String pipelineId) {
         return runsByPipeline.containsKey(pipelineId);
+    }
+
+    @Override
+    public synchronized boolean hasActiveCapture(String pipelineId) {
+        return isActive(pipelineId);
     }
 
     private ArtifactStore artifacts() {

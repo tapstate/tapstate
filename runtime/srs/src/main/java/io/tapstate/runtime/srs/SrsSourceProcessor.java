@@ -206,6 +206,10 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             reader = ringTail.resumeAfter() != null
                     ? SrsRingReader.resumingAfter(ring, ringTail.resumeAfter(), cursor)
                     : SrsRingReader.from(ring, ringTail.start(), cursor);
+            // A future or latest start may skip every buffered change and then see no new one for a long
+            // time. Report that starting boundary now: leaving the subscription at -1 until a non-empty
+            // fill would fill the ring and prevent the first owed change from ever being appended.
+            cursor.accept(reader.initialReadThrough());
             refused = false;
             return true;
         } catch (RingWriteRefusedException refusal) {

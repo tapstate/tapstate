@@ -129,12 +129,23 @@ interface DagSource {
             NestCapacity capacity,
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot,
+            String cursorWriterToken,
             Function<ExecutionFence, DAG> dagBuilder) {
+
+        StartPreparation(
+                NestCapacity capacity,
+                Set<OperatorStateLocation> stateLocations,
+                Optional<ArtifactStore> artifactSnapshot,
+                Function<ExecutionFence, DAG> dagBuilder) {
+            this(capacity, stateLocations, artifactSnapshot,
+                    java.util.UUID.randomUUID().toString(), dagBuilder);
+        }
 
         public StartPreparation {
             Objects.requireNonNull(capacity, "capacity");
             stateLocations = Set.copyOf(Objects.requireNonNull(stateLocations, "stateLocations"));
             Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
+            Objects.requireNonNull(cursorWriterToken, "cursorWriterToken");
             Objects.requireNonNull(dagBuilder, "dagBuilder");
         }
 

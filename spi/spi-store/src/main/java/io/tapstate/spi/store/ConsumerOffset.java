@@ -10,12 +10,18 @@ import java.util.Map;
  * One consumer pipeline's own state on a mining chain — everything the chain records that belongs to a
  * single pipeline rather than to the chain. It carries quantities of three lifetimes: {@code perTableSeq}
  * — the run-local read cursor into each per-table ring (a table-to-sequence map; not stable across a
- * restart, because a re-mine allocates a fresh sequence space) — {@code sinkAcked} — the source position
+ * restart, because a re-mine can allocate a fresh sequence space) — {@code sinkAcked} — the source position
  * durably acked to the pipeline's sink (stable across a restart; the quantity a source-read-offset advance
  * is bounded by) — and the snapshot state: {@code snapshotCompletedTables}, the tables whose initial load
  * this pipeline's sink has confirmed, plus {@code cdcStartPosition} and {@code snapshotEpoch}, the seam and
- * generation at which this pipeline's load began. The acked position is absent until the pipeline's sink
- * first acks a change.
+ * generation at which this pipeline's load began. {@code selectedTables} is the pipeline's current table
+ * selection; absent means an older record whose selection is unknown, so every chain table remains
+ * protected as unread until that pipeline attaches again. {@code selectedTablesEpoch} identifies the ring
+ * generation those cursors belong to; a cursor from another generation cannot authorize overwriting this
+ * one's unread changes.
+ * {@code cursorWriterToken} fences cursor writes from an earlier reader after a pipeline is reassembled in
+ * the same generation; it is internal to the read cursor and is not a pipeline execution identity.
+ * The acked position is absent until the pipeline's sink first acks a change.
  *
  * <p>The acked position is a pair, and both halves are needed for different reasons. The token is what
  * a read resumes from and the only half a connector understands. The order is the engine's own record of
@@ -55,7 +61,10 @@ public record ConsumerOffset(
         ChainPosition sinkAcked,
         List<String> snapshotCompletedTables,
         String cdcStartPosition,
-        long snapshotEpoch) {
+        long snapshotEpoch,
+        List<String> selectedTables,
+        Long selectedTablesEpoch,
+        String cursorWriterToken) {
 
     public ConsumerOffset {
         if (pipelineId == null || pipelineId.isBlank()) {
@@ -71,8 +80,36 @@ public record ConsumerOffset(
             throw new IllegalArgumentException(
                     "consumer offset snapshotEpoch must not be negative, got " + snapshotEpoch);
         }
+        if (selectedTablesEpoch != null && selectedTablesEpoch < 1) {
+            throw new IllegalArgumentException("consumer offset selectedTablesEpoch must be positive");
+        }
+        if (selectedTables == null && selectedTablesEpoch != null) {
+            throw new IllegalArgumentException("consumer offset selectedTablesEpoch requires selectedTables");
+        }
+        if (cursorWriterToken != null && cursorWriterToken.isBlank()) {
+            throw new IllegalArgumentException("consumer offset cursorWriterToken must be non-blank");
+        }
+        if (selectedTables == null && cursorWriterToken != null) {
+            throw new IllegalArgumentException("consumer offset cursorWriterToken requires selectedTables");
+        }
+        if (selectedTables != null && (selectedTablesEpoch == null || cursorWriterToken == null)) {
+            throw new IllegalArgumentException("consumer offset selection requires an epoch and cursor writer token");
+        }
         perTableSeq = Collections.unmodifiableMap(new LinkedHashMap<>(perTableSeq));
         snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
+        selectedTables = selectedTables == null ? null : List.copyOf(selectedTables);
+    }
+
+    /** A consumer whose selected tables were not recorded by its writer. */
+    public ConsumerOffset(
+            String pipelineId,
+            Map<String, Long> perTableSeq,
+            ChainPosition sinkAcked,
+            List<String> snapshotCompletedTables,
+            String cdcStartPosition,
+            long snapshotEpoch) {
+        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition,
+                snapshotEpoch, null, null, null);
     }
 
     /** A cursor with completion state but no snapshot seam recorded yet. */

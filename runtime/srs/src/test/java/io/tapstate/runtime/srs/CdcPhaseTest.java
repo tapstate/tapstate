@@ -362,8 +362,9 @@ class CdcPhaseTest {
         // has to move eventually: one that never did would park the writer for the length of the run.
         Supplier<Collection<ConsumerOffset>> reader = () -> {
             long readTo = looks.incrementAndGet() < 5 ? 0L : burst;
-            return List.of(new ConsumerOffset("p1", Map.of("orders", readTo),
-                    new ChainPosition(new SourceOrder(RING_GENERATION, readTo), "w" + readTo)));
+            return List.of(selected("p1", Map.of("orders", readTo),
+                    new ChainPosition(new SourceOrder(RING_GENERATION, readTo), "w" + readTo),
+                    "orders", RING_GENERATION));
         };
 
         CdcPhase.run(new BatchingCdcPort(burst, burst), config(), chain, reader, new CaptureHealth());
@@ -382,8 +383,77 @@ class CdcPhaseTest {
 
     /** A consumer acked far past anything these cases deliver, so the clamp never decides the reading. */
     private static ConsumerOffset keepingUp() {
-        return new ConsumerOffset("p1", Map.of("orders", 99_999L),
-                new ChainPosition(new SourceOrder(RING_GENERATION, 99_999), "w99999"));
+        return selected("p1", Map.of("orders", 99_999L),
+                new ChainPosition(new SourceOrder(RING_GENERATION, 99_999), "w99999"),
+                "orders", RING_GENERATION);
+    }
+
+    @Test
+    void aConsumerOfAnotherTableCannotPinThisSharedChainsRing() {
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.disjoint-consumers"));
+        SrsWriteGate gate = new SrsWriteGate(ring);
+        for (int i = 0; i < ring.capacity(); i++) {
+            assertThat(gate.append(cdcItem("initial-" + i), -1L)).isPresent();
+        }
+        // Both pipelines share the mining chain. Only Nest reads this table; Join's cursor belongs
+        // to another table and cannot hold back a ring it never reads.
+        List<ConsumerOffset> consumers = List.of(
+                selected("nest", Map.of("bench_nest_items", 7L), "bench_nest_items", RING_GENERATION),
+                selected("join", Map.of("bench_join_orders", 7L), "bench_join_orders", RING_GENERATION));
+
+        long readThrough = CdcPhase.headroomBound(consumers, "bench_nest_items", RING_GENERATION);
+
+        assertThat(readThrough).as("only readers subscribed to bench_nest_items bound its ring")
+                .isEqualTo(7L);
+        assertThat(gate.append(cdcItem("after-nest-read"), readThrough))
+                .as("Nest freed room even though Join is still on the shared mining chain")
+                .hasValue(8L);
+    }
+
+    @Test
+    void aSubscriberThatHasReadNothingStillProtectsThisSharedChainsRing() {
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.unread-subscriber"));
+        SrsWriteGate gate = new SrsWriteGate(ring);
+        for (int i = 0; i < ring.capacity(); i++) {
+            assertThat(gate.append(cdcItem("initial-" + i), -1L)).isPresent();
+        }
+        // A subscribed-but-unread cursor is absent. Ignoring it would overwrite the first
+        // change before this pipeline has read anything from its own table.
+        List<ConsumerOffset> consumers = List.of(
+                selected("nest", Map.of("bench_nest_items", 7L), "bench_nest_items", RING_GENERATION),
+                selected("new-nest-reader", Map.of(), "bench_nest_items", RING_GENERATION),
+                selected("join", Map.of("bench_join_orders", 7L), "bench_join_orders", RING_GENERATION));
+
+        long readThrough = CdcPhase.headroomBound(consumers, "bench_nest_items", RING_GENERATION);
+
+        assertThat(readThrough).as("the slowest subscribed reader has read no item yet").isEqualTo(-1L);
+        assertThat(gate.append(cdcItem("must-wait"), readThrough))
+                .as("the ring must not evict an unread item").isEmpty();
+        assertThat(ring.tailSequence()).isEqualTo(7L);
+    }
+
+    @Test
+    void anUnknownLegacySelectionAndAnOlderGenerationCannotGrantHeadroom() {
+        ConsumerOffset legacy = new ConsumerOffset("legacy", Map.of("bench_join_orders", 7L), null);
+        ConsumerOffset previousGeneration = selected(
+                "nest", Map.of("bench_nest_items", 99L), "bench_nest_items", RING_GENERATION);
+
+        assertThat(CdcPhase.headroomBound(List.of(legacy), "bench_nest_items", RING_GENERATION))
+                .isEqualTo(-1L);
+        assertThat(CdcPhase.headroomBound(
+                List.of(previousGeneration), "bench_nest_items", RING_GENERATION + 1))
+                .isEqualTo(-1L);
+    }
+
+    private static ConsumerOffset selected(
+            String pipelineId, Map<String, Long> cursors, String table, long epoch) {
+        return selected(pipelineId, cursors, null, table, epoch);
+    }
+
+    private static ConsumerOffset selected(
+            String pipelineId, Map<String, Long> cursors, ChainPosition acked, String table, long epoch) {
+        return new ConsumerOffset(pipelineId, cursors, acked, List.of(), null, 0L,
+                List.of(table), epoch, "run-1");
     }
 
     /**
@@ -572,8 +642,9 @@ class CdcPhaseTest {
         // The bound is read off the consumer cursors, so this is a consumer that has read nothing of orders
         // on the first poll and has reached seq 0 by the next. It has acked nothing, which is why no offset
         // is written here: this case is about the refused write being retried, not about the frontier.
-        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
-                "p1", polls.getAndIncrement() == 0 ? Map.of() : Map.of("orders", 0L), null));
+        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(selected(
+                "p1", Map.of("orders", polls.getAndIncrement() == 0 ? -1L : 0L),
+                "orders", RING_GENERATION));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
@@ -596,8 +667,8 @@ class CdcPhaseTest {
         }
         // The slowest consumer reads nothing until the test frees a slot: the write stays backpressured.
         AtomicBoolean freed = new AtomicBoolean(false);
-        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
-                "p1", freed.get() ? Map.of("orders", 0L) : Map.of(), null));
+        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(selected(
+                "p1", Map.of("orders", freed.get() ? 0L : -1L), "orders", RING_GENERATION));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 

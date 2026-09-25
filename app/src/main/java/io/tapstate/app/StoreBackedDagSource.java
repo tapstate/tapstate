@@ -39,6 +39,7 @@ import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SourcePlacement;
+import io.tapstate.runtime.srs.SrsReadCursorPublisherFactory;
 import io.tapstate.runtime.srs.SrsSourceProcessor;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.sink.DdlPolicy;
@@ -101,6 +102,7 @@ final class StoreBackedDagSource implements DagSource {
     private final SourceSchemaCopy sourceSchemaCopy;
     private final StepSchemaRecord stepSchemaRecord;
     private final SourcePlacement sourcePlacement;
+    private final String cursorWriterToken;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -148,13 +150,15 @@ final class StoreBackedDagSource implements DagSource {
     @Override
     public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
         ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
+        String cursorToken = java.util.UUID.randomUUID().toString();
         StoreBackedDagSource captured = new StoreBackedDagSource(
-                storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot);
+                storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
+                snapshot, cursorToken);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(
-                capacity, locations, Optional.of(snapshot),
+                capacity, locations, Optional.of(snapshot), cursorToken,
                 fence -> captured.dagFor(pipelineId, fence));
     }
 
@@ -213,6 +217,14 @@ final class StoreBackedDagSource implements DagSource {
     private StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
+                artifactStore, null);
+    }
+
+    private StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, SourcePlacement sourcePlacement,
+            ArtifactStore artifactStore, String cursorWriterToken) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
@@ -223,6 +235,7 @@ final class StoreBackedDagSource implements DagSource {
         this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
         this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
         this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
+        this.cursorWriterToken = cursorWriterToken;
     }
 
     @Override
@@ -2292,11 +2305,22 @@ final class StoreBackedDagSource implements DagSource {
         Long doneThrough = storePort.meta()
                 .ringDoneThrough(vertex.resolution().chainId().value(), vertex.pipelineId())
                 .get(vertex.table());
+        long generation = ringGeneration(vertex.resolution());
+        String chainId = vertex.resolution().chainId().value();
+        // A prepared product start fixes its token before capture begins, so an older deferred DAG cannot
+        // adopt a later start's token. Direct topology inspection has no prepared capture; it binds the
+        // current selection when one exists and otherwise has no cursor to publish.
+        String boundCursorToken = cursorWriterToken != null ? cursorWriterToken
+                : storePort.meta().consumerOffsets(chainId).stream()
+                        .filter(offset -> offset.pipelineId().equals(vertex.pipelineId()))
+                        .findFirst().map(offset -> offset.cursorWriterToken()).orElse(null);
+        SrsReadCursorPublisherFactory cursorPublisher = boundCursorToken == null
+                ? SrsReadCursorPublisherFactory.NONE
+                : CaptureRunUnit.readCursorPublisher(
+                        chainId, vertex.pipelineId(), vertex.table(), generation, boundCursorToken);
         return SrsSourceProcessor.metaSupplier(
                 vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), freshStart,
-                doneThrough, ringGeneration(vertex.resolution()),
-                CaptureRunUnit.readCursorPublisher(
-                        vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),
+                doneThrough, generation, cursorPublisher,
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
     }
 

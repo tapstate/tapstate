@@ -348,6 +348,9 @@ class SrsRingReaderTest {
         SrsRingReader reader = SrsRingReader.from(ring, StartFrom.at(Instant.ofEpochMilli(999)));
         List<SrsItem> out = new ArrayList<>();
 
+        assertThat(reader.initialReadThrough())
+                .as("an instant after the current tail starts with earlier entries already skipped")
+                .isEqualTo(1L);
         assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(0);
         ring.append(insertAt(2, 1000));
         assertThat(reader.fill((item, seq) -> out.add(item), 10)).isEqualTo(1);

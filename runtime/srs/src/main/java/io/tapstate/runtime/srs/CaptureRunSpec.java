@@ -5,6 +5,7 @@ import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.store.WorkloadClaimFence;
 
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -23,6 +24,10 @@ import java.util.Objects;
  *       generation assigned to a bounded read that has no change chain of its own.</li>
  *   <li>{@code captureFence} — the cluster claim generation a durable append must still match, or null on
  *       the unchanged single-member path.</li>
+ *   <li>{@code selectedChainTables} — the full table selection of this pipeline on the mining chain,
+ *       across its source run units; null when a standalone caller selects only this source's streams.</li>
+ *   <li>{@code cursorWriterToken} — one internal cursor-writer fence shared by this pipeline's source run
+ *       units during one start, distinct from the product's execution identity.</li>
  * </ul>
  *
  * <p>No connector position is carried here. Both a run's seam and its per-change positions are the
@@ -43,7 +48,25 @@ public record CaptureRunSpec(
         String retention,
         long schemaVer,
         long snapshotEpoch,
-        WorkloadClaimFence captureFence) {
+        WorkloadClaimFence captureFence,
+        List<String> selectedChainTables,
+        String cursorWriterToken) {
+
+    public CaptureRunSpec(
+            CaptureConfig config,
+            ReadMode readMode,
+            String srsKey,
+            boolean srsEnabled,
+            String sourceId,
+            String pipelineId,
+            StartFrom startFrom,
+            String retention,
+            long schemaVer,
+            long snapshotEpoch,
+            WorkloadClaimFence captureFence) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, null, null);
+    }
 
     /**
      * The ordinary construction used by callers that do not allocate a chainless snapshot generation.
@@ -87,7 +110,16 @@ public record CaptureRunSpec(
     public CaptureRunSpec withCaptureFence(WorkloadClaimFence fence) {
         return new CaptureRunSpec(
                 config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, fence);
+                startFrom, retention, schemaVer, snapshotEpoch, fence, selectedChainTables,
+                cursorWriterToken);
+    }
+
+    /** The same run with its pipeline's complete table selection and cursor-writer fence. */
+    public CaptureRunSpec withChainSelection(List<String> tables, String runId) {
+        return new CaptureRunSpec(
+                config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence,
+                List.copyOf(tables), Objects.requireNonNull(runId, "runId"));
     }
 
     public CaptureRunSpec {
@@ -99,6 +131,10 @@ public record CaptureRunSpec(
         if (snapshotEpoch < 0) {
             throw new IllegalArgumentException(
                     "a chainless snapshot generation must not be negative, got " + snapshotEpoch);
+        }
+        selectedChainTables = selectedChainTables == null ? null : List.copyOf(selectedChainTables);
+        if (cursorWriterToken != null && cursorWriterToken.isBlank()) {
+            throw new IllegalArgumentException("cursorWriterToken must be non-blank");
         }
         // The connector doing this read files notes it has to find again on a later drive, and which node
         // they belong to is the pair named right here. Scoped from those two rather than accepted on the

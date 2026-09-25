@@ -11,6 +11,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Objects;
 
 /**
  * A faithful in-memory {@link SrsMetaStore} for the data-plane tests, synchronized so a Jet worker's
@@ -104,10 +105,56 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 ack,
                 completedOf(existing),
                 existing == null ? null : existing.cdcStartPosition(),
-                existing == null ? 0L : existing.snapshotEpoch()));
+                existing == null ? 0L : existing.snapshotEpoch(),
+                existing == null ? null : existing.selectedTables(),
+                existing == null ? null : existing.selectedTablesEpoch(),
+                existing == null ? null : existing.cursorWriterToken()));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
                 m.schemaHistory(), m.retention(), m.epoch()));
+    }
+
+    @Override
+    public synchronized void selectConsumerTables(
+            String miningChainId, String pipelineId, List<String> tables, long epoch,
+            String cursorWriterToken) {
+        SrsMeta m = require(miningChainId);
+        if (m.epoch() != epoch) {
+            throw new IllegalStateException("consumer selection must match the open ring generation");
+        }
+        ConsumerOffset previous = m.consumerOffset(pipelineId).orElse(null);
+        Map<String, Long> retained = new LinkedHashMap<>();
+        if (previous != null && Objects.equals(previous.selectedTablesEpoch(), epoch)
+                && Objects.equals(previous.cursorWriterToken(), cursorWriterToken)
+                && previous.selectedTables() != null) {
+            for (String table : tables) {
+                if (previous.selectedTables().contains(table)
+                        && previous.perTableSeq().containsKey(table)) {
+                    retained.put(table, previous.perTableSeq().get(table));
+                }
+            }
+        }
+        List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
+        next.removeIf(offset -> offset.pipelineId().equals(pipelineId));
+        next.add(new ConsumerOffset(pipelineId, retained,
+                previous == null ? null : previous.sinkAcked(), completedOf(previous),
+                previous == null ? null : previous.cdcStartPosition(),
+                previous == null ? 0L : previous.snapshotEpoch(),
+                tables, epoch, cursorWriterToken));
+        records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), next,
+                m.schemaHistory(), m.retention(), m.epoch()));
+    }
+
+    @Override
+    public synchronized void advanceConsumerReadSeq(
+            String miningChainId, String pipelineId, String table, long epoch,
+            String cursorWriterToken, long lastReadSeq) {
+        ConsumerOffset current = require(miningChainId).consumerOffset(pipelineId).orElse(null);
+        if (current != null && Objects.equals(current.selectedTablesEpoch(), epoch)
+                && Objects.equals(current.cursorWriterToken(), cursorWriterToken)
+                && current.selectedTables() != null && current.selectedTables().contains(table)) {
+            advanceConsumerReadSeq(miningChainId, pipelineId, table, lastReadSeq);
+        }
     }
 
     @Override
@@ -129,7 +176,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 position,
                 completedOf(existing),
                 existing == null ? null : existing.cdcStartPosition(),
-                existing == null ? 0L : existing.snapshotEpoch()));
+                existing == null ? 0L : existing.snapshotEpoch(),
+                existing == null ? null : existing.selectedTables(),
+                existing == null ? null : existing.selectedTablesEpoch(),
+                existing == null ? null : existing.cursorWriterToken()));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
                 m.schemaHistory(), m.retention(), m.epoch()));
@@ -154,7 +204,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 existing == null ? null : existing.sinkAcked(),
                 completedOf(existing),
                 cdcStartPosition,
-                snapshotEpoch));
+                snapshotEpoch,
+                existing == null ? null : existing.selectedTables(),
+                existing == null ? null : existing.selectedTablesEpoch(),
+                existing == null ? null : existing.cursorWriterToken()));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
                 m.schemaHistory(), m.retention(), m.epoch()));
@@ -202,7 +255,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
                 mine == null ? null : mine.sinkAcked(), completed,
                 mine == null ? null : mine.cdcStartPosition(),
-                mine == null ? 0L : mine.snapshotEpoch()));
+                mine == null ? 0L : mine.snapshotEpoch(),
+                mine == null ? null : mine.selectedTables(),
+                mine == null ? null : mine.selectedTablesEpoch(),
+                mine == null ? null : mine.cursorWriterToken()));
         records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
                 m.schemaHistory(), m.retention(), m.epoch()));
     }

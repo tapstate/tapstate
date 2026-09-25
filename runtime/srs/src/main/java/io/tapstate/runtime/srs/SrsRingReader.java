@@ -102,6 +102,11 @@ public final class SrsRingReader {
         return new SrsRingReader(ring, start, onAdvance);
     }
 
+    /** The last sequence this reader deliberately starts past, before its first fill. */
+    long initialReadThrough() {
+        return cursor - 1;
+    }
+
     private static long resolveStartSeq(SrsRingbuffer ring, StartFrom start, String retention) {
         return switch (start) {
             case StartFrom.Earliest ignored -> ring.headSequence();

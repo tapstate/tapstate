@@ -223,6 +223,28 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void eachPreparedStartKeepsItsOwnCursorTokenThroughDeferredBuild() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        store.artifacts().save(new PipelineResource(
+                "p", null, List.of(SourceRef.spec("orders_src", true)), List.of(), null,
+                serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")), null, null));
+        discovered(store, "orders_src", "orders");
+        OpenRingGenerations.forSources(store, "orders_src");
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+
+        DagSource.StartPreparation earlier = source.prepareStart("p", "default");
+        String earlierToken = earlier.cursorWriterToken();
+        DagSource.StartPreparation later = source.prepareStart("p", "default");
+
+        assertThat(later.cursorWriterToken()).isNotEqualTo(earlierToken);
+        later.build(null);
+        earlier.build(null);
+        assertThat(earlier.cursorWriterToken()).isEqualTo(earlierToken);
+    }
+
+    @Test
     void building_the_dag_copies_each_read_source_table_into_the_pipelines_own_record() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(cdcSource("orders_src", "orders"));

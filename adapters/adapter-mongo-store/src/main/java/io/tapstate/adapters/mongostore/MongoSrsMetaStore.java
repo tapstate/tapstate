@@ -284,6 +284,83 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public void selectConsumerTables(
+            String miningChainId, String pipelineId, List<String> tables, long epoch,
+            String cursorWriterToken) {
+        Objects.requireNonNull(tables, "tables");
+        if (cursorWriterToken == null || cursorWriterToken.isBlank()) {
+            throw new IllegalArgumentException("consumer cursor writer token must be non-blank");
+        }
+        if (epoch < 1) {
+            throw new IllegalArgumentException("consumer selection epoch must be positive");
+        }
+        List<String> selected = List.copyOf(tables);
+        migrateLegacyConsumers(miningChainId, true);
+        writeConsumer(miningChainId, session -> {
+            Document root = collection.find(session, new Document("_id", miningChainId))
+                    .projection(Projections.include("epoch")).first();
+            if (root == null || readEpoch(root, "epoch") != epoch) {
+                throw new IllegalStateException("consumer selection must match the open ring generation");
+            }
+            Document key = consumerKey(miningChainId, pipelineId);
+            Document prior = consumers.find(session, key)
+                    .projection(Projections.include(
+                            "selectedTables", "selectedTablesEpoch", "cursorWriterToken", "perTableSeq"))
+                    .first();
+            List<String> previous = prior == null ? null : selectedTablesFrom(prior, pipelineId);
+            Long previousEpoch = prior == null ? null : selectedTablesEpochFrom(prior);
+            String previousToken = prior == null ? null : cursorWriterTokenFrom(prior, pipelineId);
+            if (selected.equals(previous) && Objects.equals(epoch, previousEpoch)
+                    && cursorWriterToken.equals(previousToken)) {
+                return;
+            }
+            Object rawCursors = prior == null ? null : prior.get("perTableSeq");
+            if (rawCursors != null && !(rawCursors instanceof Document)) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", pipelineId, "field", "perTableSeq"), null);
+            }
+            Document priorCursors = (Document) rawCursors;
+            // Only another source of this same prepared run may reuse read progress. A replacement job
+            // may resume below the old reader's cursor, even while the ring generation stays the same.
+            Document retained = new Document();
+            if (previous != null && Objects.equals(epoch, previousEpoch)
+                    && cursorWriterToken.equals(previousToken)
+                    && priorCursors != null) {
+                for (String table : selected) {
+                    if (previous.contains(table) && priorCursors.containsKey(table)) {
+                        retained.put(table, priorCursors.get(table));
+                    }
+                }
+            }
+            Document update = new Document("$set", new Document("selectedTables", selected)
+                    .append("selectedTablesEpoch", epoch)
+                    .append("cursorWriterToken", cursorWriterToken)
+                    .append("perTableSeq", retained))
+                    .append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
+            consumers.updateOne(session, key, update, new UpdateOptions().upsert(true));
+        });
+    }
+
+    @Override
+    public void advanceConsumerReadSeq(
+            String miningChainId, String pipelineId, String table, long epoch,
+            String cursorWriterToken, long lastReadSeq) {
+        if (epoch < 1) {
+            throw new IllegalArgumentException("consumer read epoch must be positive");
+        }
+        if (cursorWriterToken == null || cursorWriterToken.isBlank()) {
+            throw new IllegalArgumentException("consumer cursor writer token must be non-blank");
+        }
+        migrateLegacyConsumers(miningChainId, true);
+        writeConsumer(miningChainId, session -> consumers.updateOne(session,
+                new Document(consumerKey(miningChainId, pipelineId))
+                        .append("selectedTablesEpoch", epoch)
+                        .append("cursorWriterToken", cursorWriterToken)
+                        .append("selectedTables", table),
+                consumerReadSeqUpdate(pipelineId, table, lastReadSeq)));
+    }
+
+    @Override
     public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
         updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, position));
     }
@@ -325,14 +402,18 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     /**
-     * The path-scoped update advancing one consumer document's read cursor for one table. It sets only
-     * {@code perTableSeq.<table>}, so the sink-acked position in that document is left untouched. The L1
-     * stream name is a bare identifier, so the dotted path addresses exactly one field. A deep
-     * {@code $set} creates the cursor map when a reader advances before the sink has written anything.
+     * The path-scoped update advancing one consumer document's read cursor for one table. A seed at
+     * {@code -1} and later reader reports use {@code $set}; a new ring generation may number below an
+     * earlier cursor. The selection write clears a replaced reader's cursors before it starts reporting.
+     * Neither form touches the sink-acked position. The L1 stream name is a bare identifier, so the
+     * dotted path addresses one field.
      */
     static Document consumerReadSeqUpdate(String pipelineId, String table, long lastReadSeq) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(table, "table");
+        if (lastReadSeq < -1) {
+            throw new IllegalArgumentException("a consumer read cursor cannot precede an unread ring");
+        }
         return new Document("$set", new Document("perTableSeq." + table, lastReadSeq));
     }
 
@@ -933,13 +1014,61 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                     Map.of("id", pipelineId, "field", "perTable"), null);
         }
+        List<String> selectedTables = selectedTablesFrom(document, pipelineId);
+        Long selectedEpoch = selectedTablesEpochFrom(document);
+        String cursorWriterToken = cursorWriterTokenFrom(document, pipelineId);
+        if ((selectedTables == null) != (selectedEpoch == null)
+                || (selectedTables == null) != (cursorWriterToken == null)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", pipelineId, "field", "selectedTables"), null);
+        }
         return new ConsumerOffset(
                 pipelineId,
                 perTableSeq,
                 sinkAckedFrom(document),
                 snapshotCompletedFrom(document),
                 document.getString("cdcStartPosition"),
-                readEpoch(document, "snapshotEpoch"));
+                readEpoch(document, "snapshotEpoch"),
+                selectedTables,
+                selectedEpoch,
+                cursorWriterToken);
+    }
+
+    /** An absent selection belongs to an older consumer and conservatively matches every table. */
+    private static List<String> selectedTablesFrom(Document document, String pipelineId) {
+        Object raw = document.get("selectedTables");
+        if (raw == null) {
+            return null;
+        }
+        if (!(raw instanceof List<?> entries) || entries.stream().anyMatch(entry -> !(entry instanceof String))) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", pipelineId, "field", "selectedTables"), null);
+        }
+        return entries.stream().map(String.class::cast).toList();
+    }
+
+    private static Long selectedTablesEpochFrom(Document document) {
+        Object raw = document.get("selectedTablesEpoch");
+        if (raw == null && !document.containsKey("selectedTablesEpoch")) {
+            return null;
+        }
+        if (raw instanceof Number number && number.longValue() > 0) {
+            return number.longValue();
+        }
+        throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", String.valueOf(document.get("_id")), "field", "selectedTablesEpoch"), null);
+    }
+
+    private static String cursorWriterTokenFrom(Document document, String pipelineId) {
+        Object raw = document.get("cursorWriterToken");
+        if (raw == null && !document.containsKey("cursorWriterToken")) {
+            return null;
+        }
+        if (raw instanceof String token && !token.isBlank()) {
+            return token;
+        }
+        throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", pipelineId, "field", "cursorWriterToken"), null);
     }
 
     /**
@@ -1034,6 +1163,15 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             perTable.append(entry.getKey(), entry.getValue());
         }
         Document document = new Document("perTableSeq", perTable);
+        if (offset.selectedTables() != null) {
+            document.append("selectedTables", offset.selectedTables());
+        }
+        if (offset.selectedTablesEpoch() != null) {
+            document.append("selectedTablesEpoch", offset.selectedTablesEpoch());
+        }
+        if (offset.cursorWriterToken() != null) {
+            document.append("cursorWriterToken", offset.cursorWriterToken());
+        }
         if (!offset.snapshotCompletedTables().isEmpty()) {
             document.append("snapshotCompletedTables", List.copyOf(offset.snapshotCompletedTables()));
         }

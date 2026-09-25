@@ -346,6 +346,31 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
+    void everySourceOnOneChainCarriesThePipelinesCompleteTableSelectionAndCursorToken() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(cdcSource("items_src", "items", null));
+        artifacts.save(twoSourcePipeline("p", "orders_src", "items_src"));
+        List<CaptureRunSpec> started = new ArrayList<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            started.add(spec);
+            return new CaptureRun(Optional.empty(), false, 0L,
+                    Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                new InMemoryStorePort(artifacts), starter,
+                new SrsCoordinator(new InMemorySrsMetaStore()), new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+
+        assertThat(started).hasSize(2);
+        assertThat(started).allSatisfy(spec ->
+                assertThat(spec.selectedChainTables()).containsExactly("orders", "items"));
+        assertThat(started.getFirst().cursorWriterToken()).isNotBlank()
+                .isEqualTo(started.getLast().cursorWriterToken());
+    }
+
+    @Test
     void twoSourcesNamingOneTableAreAddedRatherThanOneWinning() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("orders_src", "orders", null));

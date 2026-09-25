@@ -99,14 +99,37 @@ public interface SrsMetaStore {
     void upsertConsumerOffset(String miningChainId, ConsumerOffset offset);
 
     /**
-     * Advances one consumer pipeline's read cursor into one table's change ring — a scoped set of that
-     * consumer's {@code perTableSeq} entry for the table alone. It touches only the read cursor, so a
-     * reader advancing here never clobbers the {@code sinkAckedSrcpos} the pipeline's sink writes to the
+     * Advances one consumer pipeline's read cursor into one table's change ring. It touches only that
+     * read cursor, so a reader advancing here never clobbers the {@code sinkAckedSrcpos} the sink writes to the
      * same consumer record: the read cursor and the sink-ack are independent writers of one consumer, of
      * different lifetime. It creates the consumer entry when the pipeline has none yet, so a reader may
      * advance before the sink first acks. A mutate on an unseeded chain is a caller ordering error.
      */
     void advanceConsumerReadSeq(String miningChainId, String pipelineId, String table, long lastReadSeq);
+
+    /**
+     * Replaces one pipeline's selected tables for this chain and identifies the generation whose read
+     * cursors are valid. Repeating the exact selection with the same cursor-writer token retains read
+     * progress. A new token, changed selection, or older generation starts unread, since a new reader may
+     * resume below the old reader's progress. The selection and cursor change must be atomic with respect
+     * to concurrent cursor reports. A missing selection on an older consumer record remains conservatively
+     * unknown until this method succeeds. {@code cursorWriterToken} fences reports from an earlier reader.
+     */
+    default void selectConsumerTables(
+            String miningChainId, String pipelineId, List<String> tables, long epoch, String cursorWriterToken) {
+        throw new UnsupportedOperationException("consumer table selection is not implemented");
+    }
+
+    /**
+     * Reports a reader cursor only while the consumer still belongs to the same ring generation and
+     * selects this table and run. A late report from a previous reader must not raise the current run's
+     * headroom bound.
+     */
+    default void advanceConsumerReadSeq(
+            String miningChainId, String pipelineId, String table, long epoch,
+            String cursorWriterToken, long lastReadSeq) {
+        throw new UnsupportedOperationException("generation-fenced consumer cursor is not implemented");
+    }
 
     /**
      * Advances one consumer pipeline's durable sink-acked source position on the chain — a scoped set of

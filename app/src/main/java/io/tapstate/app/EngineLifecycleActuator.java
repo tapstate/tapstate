@@ -66,6 +66,11 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void start(String pipelineId) {
+        // Submitting by name is idempotent, but preparing another execution before that check would move
+        // its fence while the existing Jet job and capture still use the previous one.
+        if (engine.hasLiveJob(pipelineId)) {
+            return;
+        }
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
         DagSource.StartPreparation prepared = dagSource.prepareStart(
@@ -79,6 +84,11 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             LOG.warn("Not starting pipeline {} on this member: its run could not be fenced to a new "
                     + "execution generation", pipelineId);
             return;
+        }
+        if (captureCoordinator.hasActiveCapture(pipelineId)) {
+            // A prior job can die while its source capture remains open. Close that run before opening
+            // another so its reader cursor is not reused by a new job that resumes from an earlier sink ACK.
+            captureCoordinator.stopCapture(pipelineId, false);
         }
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
@@ -97,7 +107,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         stateTeardown.willKeepStateAt(pipelineId, prepared.stateLocations());
         try {
             prepared.artifactSnapshot().ifPresentOrElse(
-                    snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
+                    snapshot -> captureCoordinator.startCapture(
+                            pipelineId, snapshot, prepared.cursorWriterToken()),
                     () -> captureCoordinator.startCapture(pipelineId));
         } catch (RingNotOpenYet notYet) {
             // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,

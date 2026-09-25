@@ -529,7 +529,9 @@ class CaptureRunUnitTest {
         assertThat(run.cdcSubscription()).isPresent();
 
         String chainId = run.chainId().get().value();
-        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1")).isEmpty();
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1"))
+                .get().extracting(ConsumerOffset::selectedTables)
+                .isEqualTo(List.of("orders"));
         Ringbuffer<SrsItem> ring = hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders"));
         assertThat(ring.tailSequence()).isEqualTo(1L);
     }
@@ -783,6 +785,7 @@ class CaptureRunUnitTest {
         meta.startRingAfter(chain, "pipe-b", "orders", hadReached);
         ring.append(buffered(2));
         ring.append(buffered(3));
+        meta.advanceConsumerReadSeq(chain, "pipe-b", "orders", 1L);
 
         new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
                 .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-return"), e -> { }, false);
@@ -790,6 +793,11 @@ class CaptureRunUnitTest {
         assertThat(meta.ringDoneThrough(chain, "pipe-b"))
                 .as("the two changes written while it was away are still owed to it")
                 .containsExactly(Map.entry("orders", hadReached));
+        assertThat(meta.consumerOffsets(chain).stream()
+                .filter(offset -> offset.pipelineId().equals("pipe-b"))
+                .findFirst().orElseThrow().perTableSeq())
+                .as("a new ring generation cannot trust an earlier generation's read cursor")
+                .isEmpty();
     }
 
     @Test
@@ -814,6 +822,11 @@ class CaptureRunUnitTest {
         assertThat(meta.ringDoneThrough(chain, "pipe-earliest"))
                 .as("a read from the earliest change is owed everything the ring holds, so nothing is marked")
                 .isEmpty();
+        assertThat(meta.consumerOffsets(chain)).filteredOn(offset ->
+                        offset.pipelineId().equals("pipe-present") || offset.pipelineId().equals("pipe-earliest"))
+                .allSatisfy(offset -> assertThat(offset.selectedTables())
+                        .as("both selected readers are subscribed before their Jet readers open")
+                        .containsExactly("orders"));
     }
 
     private static SrsItem buffered(int id) {
@@ -839,6 +852,9 @@ class CaptureRunUnitTest {
         assertThat(run.chainId()).isPresent();
         assertThat(run.cdcSubscription()).isPresent();
         assertThat(run.snapshotCounts()).containsExactlyInAnyOrderEntriesOf(Map.of("orders", 1L, "customers", 1L));
+        assertThat(meta.read(run.chainId().orElseThrow().value()).orElseThrow()
+                .consumerOffset("pipe-1").orElseThrow().selectedTables())
+                .containsExactlyInAnyOrder("orders", "customers");
         assertThat(passthrough).extracting(Envelope::src).containsExactly("orders", "customers");
         String chainId = run.chainId().orElseThrow().value();
         assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders")).tailSequence()).isEqualTo(0L);
@@ -851,8 +867,10 @@ class CaptureRunUnitTest {
         meta.create("chain-pub", null);
         hz.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
         try {
+            meta.openEpoch("chain-pub");
+            meta.selectConsumerTables("chain-pub", "pipe-7", List.of("orders"), 1L, "run-1");
             SrsReadCursorPublisherFactory factory =
-                    CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "orders");
+                    CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "orders", 1L, "run-1");
 
             factory.resolve(hz).accept(7L);
 
@@ -872,9 +890,11 @@ class CaptureRunUnitTest {
         meta.create("chain-pub", null);
         hz.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
         try {
-            CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "orders")
+            meta.openEpoch("chain-pub");
+            meta.selectConsumerTables("chain-pub", "pipe-7", List.of("orders", "customers"), 1L, "run-1");
+            CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "orders", 1L, "run-1")
                     .resolve(hz).accept(7L);
-            CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "customers")
+            CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "customers", 1L, "run-1")
                     .resolve(hz).accept(11L);
 
             ConsumerOffset offset = meta.read("chain-pub").orElseThrow().consumerOffsets().stream()
@@ -923,7 +943,8 @@ class CaptureRunUnitTest {
 
         // No store bound on the member: the factory resolves to a no-op sink, so a source still runs before
         // the assembly layer makes the member SRS-capable. Resolving and calling it does not throw.
-        SrsReadCursorPublisherFactory factory = CaptureRunUnit.readCursorPublisher("chain-x", "pipe-x", "orders");
+        SrsReadCursorPublisherFactory factory = CaptureRunUnit.readCursorPublisher(
+                "chain-x", "pipe-x", "orders", 1L, "run-1");
         factory.resolve(hz).accept(3L);
     }
 
@@ -950,7 +971,7 @@ class CaptureRunUnitTest {
         InMemoryMeta many = new InMemoryMeta();
         runUnit(new FakeSource(List.of(), List.of(
                         change(10), change(11), change(12), change(13), change(14),
-                        change(15), change(16), change(17), change(18), change(19))),
+                        change(15), change(16), change(17))),
                 many)
                 .start(spec(ReadMode.CDC_ONLY, true, "chain-reads-many"), e -> { });
 
@@ -958,9 +979,9 @@ class CaptureRunUnitTest {
         // costs when both come from the same record.
         assertThat(many.cursorReads - few.cursorReads)
                 .as("cursor reads scale one-for-one with runs of changes")
-                .isEqualTo(8);
+                .isEqualTo(6);
         // And the whole record is fetched only by the start path, the same number of times either way:
-        // eight more runs of changes fetch it not once more.
+        // six more runs of changes fetch it not once more.
         assertThat(many.wholeRecordReads)
                 .as("whole-record fetches do not scale with the number of change runs")
                 .isEqualTo(few.wholeRecordReads);
@@ -970,11 +991,14 @@ class CaptureRunUnitTest {
     void theHeadroomBoundIsTheSlowestCursorAcrossTheChainsConsumers() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-min", null);
+        meta.openEpoch("chain-min");
         // Two consumers on the chain: one has read orders up to 5, the other only to 2 -- the slowest bounds it.
+        meta.selectConsumerTables("chain-min", "p1", List.of("orders"), 1L, "run-p1");
+        meta.selectConsumerTables("chain-min", "p2", List.of("orders"), 1L, "run-p2");
         meta.advanceConsumerReadSeq("chain-min", "p1", "orders", 5L);
         meta.advanceConsumerReadSeq("chain-min", "p2", "orders", 2L);
 
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-min"), "orders")).isEqualTo(2L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-min"), "orders", 1L)).isEqualTo(2L);
     }
 
     @Test
@@ -983,19 +1007,91 @@ class CaptureRunUnitTest {
         meta.create("chain-none", null);
 
         // No consumer has published a cursor: nothing constrains the ring, so the write gate sees no bound.
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-none"), "orders"))
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-none"), "orders", 1L))
                 .isEqualTo(Long.MAX_VALUE);
     }
 
     @Test
-    void theHeadroomBoundTreatsAConsumerThatHasNotReadTheTableAsHavingReadNothing() {
+    void theHeadroomBoundTreatsAnExplicitUnreadSubscriptionAsHavingReadNothing() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-other", null);
-        // The consumer has a cursor on another table but none on orders: for orders it has read nothing (-1),
-        // holding the orders ring at the head until it starts reading orders.
+        meta.openEpoch("chain-other");
+        // The consumer has a cursor on another selected table but none on orders. Its orders selection
+        // still protects the ring's first change.
+        meta.selectConsumerTables("chain-other", "p1", List.of("customers", "orders"), 1L, "run-1");
         meta.advanceConsumerReadSeq("chain-other", "p1", "customers", 9L);
 
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders")).isEqualTo(-1L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders", 1L)).isEqualTo(-1L);
+    }
+
+    @Test
+    void aSelectionChangeClearsRemovedTablesBeforeTheyCanBeReadded() {
+        InMemoryMeta meta = new InMemoryMeta();
+        meta.create("chain-selection", null);
+        meta.openEpoch("chain-selection");
+        meta.selectConsumerTables("chain-selection", "p1", List.of("orders", "items"), 1L, "run-1");
+        meta.advanceConsumerReadSeq("chain-selection", "p1", "orders", 7L);
+        meta.advanceConsumerReadSeq("chain-selection", "p1", "items", 99L);
+        meta.selectConsumerTables("chain-selection", "p1", List.of("orders", "items"), 1L, "run-1");
+        assertThat(meta.consumerOffsets("chain-selection").getFirst().perTableSeq())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 7L, "items", 99L));
+
+        meta.selectConsumerTables("chain-selection", "p1", List.of("orders"), 1L, "run-2");
+        assertThat(meta.consumerOffsets("chain-selection").getFirst().perTableSeq())
+                .isEmpty();
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-selection"), "items", 1L))
+                .isEqualTo(Long.MAX_VALUE);
+
+        meta.selectConsumerTables("chain-selection", "p1", List.of("orders", "items"), 1L, "run-3");
+        assertThat(meta.consumerOffsets("chain-selection").getFirst().perTableSeq())
+                .isEmpty();
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-selection"), "items", 1L))
+                .as("the earlier items cursor is not valid for the renewed subscription")
+                .isEqualTo(-1L);
+        meta.advanceConsumerReadSeq("chain-selection", "p1", "items", 1L, "run-1", 100L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-selection"), "items", 1L))
+                .as("a reader from the previous run cannot raise the new run's headroom")
+                .isEqualTo(-1L);
+    }
+
+    @Test
+    void anOldReaderCannotPublishIntoTheNewRingGeneration() {
+        InMemoryMeta meta = new InMemoryMeta();
+        meta.create("chain-generation", null);
+        meta.openEpoch("chain-generation");
+        meta.selectConsumerTables("chain-generation", "p1", List.of("orders"), 1L, "run-1");
+        meta.advanceConsumerReadSeq("chain-generation", "p1", "orders", 99L);
+
+        meta.openEpoch("chain-generation");
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-generation"), "orders", 2L))
+                .isEqualTo(-1L);
+        meta.selectConsumerTables("chain-generation", "p1", List.of("orders"), 2L, "run-2");
+        meta.advanceConsumerReadSeq("chain-generation", "p1", "orders", 1L, "run-1", 100L);
+        assertThat(meta.consumerOffsets("chain-generation").getFirst().perTableSeq()).isEmpty();
+        meta.advanceConsumerReadSeq("chain-generation", "p1", "orders", 2L, "run-2", 0L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-generation"), "orders", 2L))
+                .isEqualTo(0L);
+    }
+
+    @Test
+    void aSameGenerationReassemblyStartsUnreadBelowTheOldReadersProgress() {
+        InMemoryMeta meta = new InMemoryMeta();
+        meta.create("chain-reassembly", null);
+        meta.openEpoch("chain-reassembly");
+        meta.selectConsumerTables("chain-reassembly", "p1", List.of("orders"), 1L, "old-reader");
+        meta.advanceConsumerReadSeq("chain-reassembly", "p1", "orders", 1L, "old-reader", 99L);
+        ChainPosition acked = new ChainPosition(new SourceOrder(1, 7), "w7");
+        meta.advanceSinkAcked("chain-reassembly", "p1", acked);
+
+        meta.selectConsumerTables("chain-reassembly", "p1", List.of("orders"), 1L, "new-reader");
+
+        ConsumerOffset current = meta.consumerOffsets("chain-reassembly").getFirst();
+        assertThat(current.sinkAcked()).isEqualTo(acked);
+        assertThat(current.perTableSeq()).isEmpty();
+        assertThat(CdcPhase.headroomBound(List.of(current), "orders", 1L)).isEqualTo(-1L);
+        meta.advanceConsumerReadSeq("chain-reassembly", "p1", "orders", 1L, "old-reader", 100L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-reassembly"), "orders", 1L))
+                .isEqualTo(-1L);
     }
 
     /** A mock connector: a fixed snapshot batch and a fixed change stream driven into the listener when cdc starts. */
@@ -1220,10 +1316,53 @@ class CaptureRunUnitTest {
                     ack,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
-                    existing == null ? 0L : existing.snapshotEpoch()));
+                    existing == null ? 0L : existing.snapshotEpoch(),
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    existing == null ? null : existing.cursorWriterToken()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
                     m.schemaHistory(), m.retention(), m.epoch()));
+        }
+
+        @Override
+        public void selectConsumerTables(
+                String miningChainId, String pipelineId, List<String> tables, long epoch,
+                String cursorWriterToken) {
+            SrsMeta m = require(miningChainId);
+            if (m.epoch() != epoch) {
+                throw new IllegalStateException("consumer selection must match the open ring generation");
+            }
+            ConsumerOffset previous = m.consumerOffset(pipelineId).orElse(null);
+            Map<String, Long> retained = new LinkedHashMap<>();
+            if (previous != null && Objects.equals(previous.selectedTablesEpoch(), epoch)
+                    && Objects.equals(previous.cursorWriterToken(), cursorWriterToken)
+                    && previous.selectedTables() != null) {
+                for (String table : tables) {
+                    if (previous.selectedTables().contains(table)
+                            && previous.perTableSeq().containsKey(table)) {
+                        retained.put(table, previous.perTableSeq().get(table));
+                    }
+                }
+            }
+            upsertConsumerOffset(miningChainId, new ConsumerOffset(
+                    pipelineId, retained, previous == null ? null : previous.sinkAcked(),
+                    previous == null ? List.of() : previous.snapshotCompletedTables(),
+                    previous == null ? null : previous.cdcStartPosition(),
+                    previous == null ? 0L : previous.snapshotEpoch(), tables, epoch,
+                    cursorWriterToken));
+        }
+
+        @Override
+        public void advanceConsumerReadSeq(
+                String miningChainId, String pipelineId, String table, long epoch,
+                String cursorWriterToken, long lastReadSeq) {
+            ConsumerOffset current = require(miningChainId).consumerOffset(pipelineId).orElse(null);
+            if (current != null && Objects.equals(current.selectedTablesEpoch(), epoch)
+                    && Objects.equals(current.cursorWriterToken(), cursorWriterToken)
+                    && current.selectedTables() != null && current.selectedTables().contains(table)) {
+                advanceConsumerReadSeq(miningChainId, pipelineId, table, lastReadSeq);
+            }
         }
 
         @Override
@@ -1245,7 +1384,10 @@ class CaptureRunUnitTest {
                     position,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
-                    existing == null ? 0L : existing.snapshotEpoch()));
+                    existing == null ? 0L : existing.snapshotEpoch(),
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    existing == null ? null : existing.cursorWriterToken()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
                     m.schemaHistory(), m.retention(), m.epoch()));
@@ -1270,7 +1412,10 @@ class CaptureRunUnitTest {
                     existing == null ? null : existing.sinkAcked(),
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     cdcStartPosition,
-                    snapshotEpoch));
+                    snapshotEpoch,
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    existing == null ? null : existing.cursorWriterToken()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
                     m.schemaHistory(), m.retention(), m.epoch()));
@@ -1318,7 +1463,10 @@ class CaptureRunUnitTest {
             consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
                     mine == null ? null : mine.sinkAcked(), completed,
                     mine == null ? null : mine.cdcStartPosition(),
-                    mine == null ? 0L : mine.snapshotEpoch()));
+                    mine == null ? 0L : mine.snapshotEpoch(),
+                    mine == null ? null : mine.selectedTables(),
+                    mine == null ? null : mine.selectedTablesEpoch(),
+                    mine == null ? null : mine.cursorWriterToken()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
                     m.schemaHistory(), m.retention(), m.epoch()));
         }
