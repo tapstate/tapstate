@@ -1,7 +1,9 @@
 package io.tapstate.control.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactStore;
@@ -57,6 +59,25 @@ class SourceConnectionResolverTest {
 
         assertThat(resolved.settings()).containsEntry("password", "saved-secret")
                 .doesNotContainKey("host");
+    }
+
+    @Test
+    void restoresOnlyTheMatchingAtlasUriDisplayForConnectionTests() {
+        String original = "mongodb+srv://alice:pa%40ss@cluster.example/test";
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource(
+                "atlas", null, "mongodb-atlas", Map.of("isUri", true, "uri", original),
+                null, null, null, null));
+        SourceConnectionResolver resolver = new SourceConnectionResolver(artifacts);
+
+        ConnectionConfig kept = resolver.resolve("atlas", "mongodb-atlas",
+                Map.of("isUri", true, "uri", "mongodb+srv://<redacted>@cluster.example/test"));
+        assertThat(kept.settings()).containsEntry("uri", original);
+
+        assertThatThrownBy(() -> resolver.resolve("atlas", "mongodb-atlas",
+                Map.of("isUri", true, "uri", "mongodb+srv://<redacted>@other.example/test")))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
     }
 
     private static final class InMemoryArtifactStore implements ArtifactStore {

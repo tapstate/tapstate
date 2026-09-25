@@ -28,6 +28,7 @@ import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
@@ -150,6 +151,43 @@ class SourceApiTest {
         assertThat(report.connectionId()).isEqualTo("mysql-refresh");
         assertThat(context.getBean(RecordingSchemaDiscoveryProbe.class).captured().settings())
                 .containsEntry("password", SECRET);
+    }
+
+    @Test
+    void atlasUriUserInfoIsNotReturnedButAReadModifyWriteAndConnectionTestKeepIt() throws Exception {
+        String uri = "mongodb+srv://alice:pa%40ss@cluster.example/test?retryWrites=true";
+        String display = "mongodb+srv://<redacted>@cluster.example/test?retryWrites=true";
+        ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "atlas", "connector", "mongodb-atlas", "mode", "snapshot",
+                        "config", Map.of("isUri", true, "uri", uri)))
+                .retrieve().toEntity(String.class);
+
+        assertThat(created.getBody()).contains(display).doesNotContain("alice", "pa%40ss");
+        String listed = request("reader").get().uri("/api/sources").retrieve().body(String.class);
+        assertThat(listed).contains(display).doesNotContain("alice", "pa%40ss");
+        JsonNode saved = JSON.readTree(request("reader").get().uri("/api/sources/atlas")
+                .retrieve().body(String.class));
+        Map<String, Object> redactedConfig = JSON.convertValue(saved.path("config"), Map.class);
+
+        ResponseEntity<String> replaced = request("writer").put().uri("/api/sources/atlas")
+                .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "atlas", "connector", "mongodb-atlas", "mode", "snapshot",
+                        "config", redactedConfig,
+                        "metadata", Map.of("description", "updated")))
+                .retrieve().toEntity(String.class);
+        assertThat(replaced.getBody()).contains(display).doesNotContain("alice", "pa%40ss");
+        SourceResource persisted = (SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("atlas").orElseThrow();
+        assertThat(persisted.config()).containsEntry("uri", uri);
+
+        request("writer").post().uri("/api/connections:test")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "atlas", "connectorId", "mongodb-atlas", "settings", redactedConfig))
+                .retrieve().toBodilessEntity();
+        assertThat(context.getBean(RecordingConnectionProbe.class).captured().settings())
+                .containsEntry("uri", uri);
     }
 
     @Test

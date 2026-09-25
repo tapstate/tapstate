@@ -5,6 +5,7 @@ import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.logging.SecretRedactor;
+import io.tapstate.core.logging.MongoUriUserInfo;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactMutation;
@@ -153,6 +154,12 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
                 .map(field -> configValue(source.config(), field.name()))
                 .filter(Objects::nonNull)
                 .forEach(value -> collectScalars(value, secrets));
+        boolean trackedMongoUri = "mongodb-atlas".equals(source.connector())
+                || ("mongodb".equals(source.connector())
+                        && ViewTargetResolver.STATE_STORE_SOURCE_ID.equals(source.id()));
+        if (trackedMongoUri && source.config().get("uri") instanceof String uri) {
+            secrets.addAll(MongoUriUserInfo.secretValues(uri));
+        }
         return secrets;
     }
 

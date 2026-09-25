@@ -184,6 +184,47 @@ class SourceRepresentationTest {
     }
 
     @Test
+    void redactsAtlasUriUserInfoButRetainsConnectionLocation() {
+        String uri = "mongodb+srv://alice:pa%40ss@cluster.example/test?retryWrites=true";
+        SourceResource model = source("mongodb-atlas", Map.of("isUri", true, "uri", uri));
+
+        SourceView view = representation.toView(model, hash(model));
+
+        assertThat(view.config().get("uri"))
+                .isEqualTo("mongodb+srv://<redacted>@cluster.example/test?retryWrites=true");
+        assertThat(view.config().toString()).doesNotContain("alice", "pa%40ss");
+    }
+
+    @Test
+    void preservesAnUnchangedRedactedAtlasUriButRequiresFullCredentialsForAChangedLocation() {
+        String original = "mongodb+srv://alice:pa%40ss@cluster.example/test";
+        SourceResource existing = source("mongodb-atlas", Map.of("isUri", true, "uri", original));
+        String display = "mongodb+srv://<redacted>@cluster.example/test";
+
+        SourceResource kept = representation.toModel(
+                draft("mongodb-atlas", Map.of("isUri", true, "uri", display), List.of()), existing);
+        assertThat(kept.config()).containsEntry("uri", original);
+
+        assertThatThrownBy(() -> representation.toModel(
+                draft("mongodb-atlas", Map.of("isUri", true,
+                        "uri", "mongodb+srv://<redacted>@other.example/test"), List.of()), existing))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(error).hasMessageNotContaining("pa%40ss");
+                });
+    }
+
+    @Test
+    void neverPersistsAUriDisplayMarkerAsANewConnection() {
+        SourceDraft draft = draft("mongodb-atlas",
+                Map.of("isUri", true, "uri", "mongodb+srv://<redacted>@cluster.example/test"), List.of());
+
+        assertThatThrownBy(() -> representation.toModel(draft, null))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+    }
+
+    @Test
     void preservesAnOmittedConfiguredSecretOnReplace() {
         SourceResource existing = source(
                 "mysql",

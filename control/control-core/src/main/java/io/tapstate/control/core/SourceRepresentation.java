@@ -4,6 +4,7 @@ import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.logging.MongoUriUserInfo;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Srs;
@@ -71,6 +72,15 @@ public final class SourceRepresentation {
                 }
             }
         }
+        if ("mongodb-atlas".equals(draft.connector()) && config.get("uri") instanceof String uri
+                && MongoUriUserInfo.isRedactedDisplay(uri)) {
+            Object saved = existing != null && existing.connector().equals(draft.connector())
+                    ? existing.config().get("uri") : null;
+            if (!(saved instanceof String savedUri) || !uri.equals(MongoUriUserInfo.redact(savedUri))) {
+                throw malformed("a redacted URI cannot replace connection settings; provide a complete URI");
+            }
+            config.put("uri", savedUri);
+        }
         clearSecrets.forEach(config::remove);
 
         // Options are the engine's own configuration and its vocabulary is empty today, so the model
@@ -96,6 +106,14 @@ public final class SourceRepresentation {
         Map<String, ConfigField> secrets = secretFields(connector(source.connector()));
         Map<String, Object> redactedConfig = new LinkedHashMap<>(source.config());
         secrets.keySet().forEach(redactedConfig::remove);
+        if ("mongodb-atlas".equals(source.connector())) {
+            Object uri = redactedConfig.get("uri");
+            if (uri instanceof String value) {
+                redactedConfig.put("uri", MongoUriUserInfo.redact(value));
+            } else if (uri != null) {
+                redactedConfig.put("uri", MongoUriUserInfo.REDACTED);
+            }
+        }
         List<String> configuredSecrets = secrets.keySet().stream()
                 .filter(name -> source.config().containsKey(name)
                         && source.config().get(name) != null)

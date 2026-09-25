@@ -2,6 +2,8 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.logging.MongoUriUserInfo;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionConfig;
@@ -47,6 +49,21 @@ public final class SourceConnectionResolver {
                                 && source.config().containsKey(secret)
                                 && source.config().get(secret) != null) {
                             resolved.put(secret, source.config().get(secret));
+                        }
+                    }
+                    if ("mongodb-atlas".equals(source.connector())) {
+                        Object saved = source.config().get("uri");
+                        Object supplied = resolved.get("uri");
+                        if (!resolved.containsKey("uri") && saved instanceof String) {
+                            resolved.put("uri", saved);
+                        } else if (supplied instanceof String uri
+                                && MongoUriUserInfo.isRedactedDisplay(uri)) {
+                            if (!(saved instanceof String savedUri)
+                                    || !uri.equals(MongoUriUserInfo.redact(savedUri))) {
+                                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                                        Map.of("reason", "a redacted URI cannot test a different connection"), null);
+                            }
+                            resolved.put("uri", savedUri);
                         }
                     }
                     return new ConnectionConfig(source.id(), connectorId, resolved);

@@ -47,6 +47,48 @@ class SecretTrackingArtifactStoreTest {
                 .isEqualTo("db.internal 3306 ********");
     }
 
+    @Test
+    void tracksAtlasUriUserInfoWithoutMaskingTheConnectionLocation() {
+        RecordingStore delegate = new RecordingStore();
+        SecretRedactor redactor = new SecretRedactor();
+        SecretTrackingArtifactStore store = tracking(delegate, redactor);
+        String uri = "mongodb+srv://alice:pa%40ss@cluster.example/test";
+
+        store.save(new SourceResource(
+                "atlas", null, "mongodb-atlas", Map.of("isUri", true, "uri", uri),
+                null, null, null, null));
+
+        assertThat(redactor.redact(uri + " decoded=pa@ss"))
+                .isEqualTo("mongodb+srv://********@cluster.example/test decoded=********");
+
+        store.save(new SourceResource(
+                "atlas", null, "mongodb-atlas",
+                Map.of("isUri", true, "uri", "mongodb+srv://bob:new-secret@cluster.example/test"),
+                null, null, null, null));
+
+        assertThat(redactor.redact("pa@ss new-secret"))
+                .isEqualTo("pa@ss ********");
+    }
+
+    @Test
+    void tracksTheManagedViewsSourceUriWithoutChangingOrdinaryMongoSources() {
+        RecordingStore delegate = new RecordingStore();
+        SecretRedactor redactor = new SecretRedactor();
+        SecretTrackingArtifactStore store = tracking(delegate, redactor);
+        String managed = "mongodb://state:managed-secret@db.example/metadata";
+        String ordinary = "mongodb://app:ordinary-secret@db.example/user-data";
+
+        store.save(new SourceResource(
+                ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "mongodb",
+                Map.of("isUri", true, "uri", managed), null, null, null, null));
+        store.save(new SourceResource(
+                "user-mongo", null, "mongodb", Map.of("isUri", true, "uri", ordinary),
+                null, null, null, null));
+
+        assertThat(redactor.redact(managed + " " + ordinary))
+                .isEqualTo("mongodb://********@db.example/metadata " + ordinary);
+    }
+
     private static SecretTrackingArtifactStore tracking(ArtifactStore delegate, SecretRedactor redactor) {
         return new SecretTrackingArtifactStore(delegate, TapstateCatalog::load, redactor);
     }
