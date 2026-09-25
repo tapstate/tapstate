@@ -217,6 +217,37 @@ class ControlPlaneTest {
                 .contains("bin.000003:2210");
     }
 
+    @Test
+    void readsEachChainsAuthoritativeTargetAckWithoutFoldingSourcesTogether() {
+        String body = JsonWriter.write(Map.of("pipelineId", PIPELINE, "chains", List.of(
+                Map.of("chainId", "orders-chain", "targetAcked",
+                        Map.of("token", "orders-offset", "epoch", 3, "seq", 42)),
+                Map.of("chainId", "customers-chain", "targetAcked",
+                        Map.of("token", "customers-offset", "epoch", 8, "seq", 9)))));
+
+        assertThat(ControlPlane.interpretTargetAckedTokens(200, body, PIPELINE))
+                .isEqualTo(Map.of("orders-chain", "orders-offset", "customers-chain", "customers-offset"));
+    }
+
+    @Test
+    void aChainWithoutAnAckStaysAbsentAndDuplicateChainsAreRefused() {
+        String pending = JsonWriter.write(Map.of("pipelineId", PIPELINE, "chains", List.of(
+                Map.of("chainId", "orders-chain", "targetAcked", Map.of("token", "orders-offset")),
+                Map.of("chainId", "customers-chain"))));
+        assertThat(ControlPlane.interpretTargetAckedTokens(200, pending, PIPELINE))
+                .isEqualTo(Map.of("orders-chain", "orders-offset"));
+
+        String duplicate = JsonWriter.write(Map.of("pipelineId", PIPELINE, "chains", List.of(
+                Map.of("chainId", "orders-chain", "targetAcked", Map.of("token", "first")),
+                Map.of("chainId", "orders-chain", "targetAcked", Map.of("token", "second")))));
+        assertThatThrownBy(() -> ControlPlane.interpretTargetAckedTokens(200, duplicate, PIPELINE))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("duplicate chain");
+        assertThatThrownBy(() -> ControlPlane.interpretTargetAckedTokens(500, "boom", PIPELINE))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("got 500");
+    }
+
     /**
      * A table with nothing acked yet reads as absent rather than as a crash, and so does a whole answer
      * carrying no positions at all. Both are real readings: positions appear only once something is acked,

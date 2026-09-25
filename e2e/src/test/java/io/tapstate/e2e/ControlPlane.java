@@ -1632,6 +1632,42 @@ final class ControlPlane {
         return Optional.empty();
     }
 
+    /** Authoritative target-ACK tokens by chain, for a fork that knows its own source terminal tokens. */
+    Map<String, String> targetAckedTokens(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
+        return interpretTargetAckedTokens(response.statusCode(), response.body(), pipelineId);
+    }
+
+    static Map<String, String> interpretTargetAckedTokens(int status, String body, String pipelineId) {
+        if (status != 200) {
+            throw new AssertionError("could not read acknowledged positions of " + pipelineId
+                    + ": expected HTTP 200, got " + status + " - " + body);
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> document)
+                || !(document.get("chains") instanceof List<?> chains)) {
+            throw new AssertionError("position answer carried no chains: " + body);
+        }
+        Map<String, String> tokens = new LinkedHashMap<>();
+        Set<String> seen = new TreeSet<>();
+        for (Object value : chains) {
+            if (!(value instanceof Map<?, ?> chain)
+                    || !(chain.get("chainId") instanceof String chainId) || chainId.isBlank()
+                    || !seen.add(chainId)) {
+                throw new AssertionError("position answer carried an invalid or duplicate chain: " + body);
+            }
+            Object targetAcked = chain.get("targetAcked");
+            if (targetAcked == null) {
+                continue;
+            }
+            if (!(targetAcked instanceof Map<?, ?> point)
+                    || !(point.get("token") instanceof String token) || token.isBlank()) {
+                throw new AssertionError("position answer carried an invalid target ACK: " + body);
+            }
+            tokens.put(chainId, token);
+        }
+        return Map.copyOf(tokens);
+    }
+
     /**
      * Puts a chain back at a token, and answers what the product says the pipeline now stands at.
      *

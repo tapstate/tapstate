@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -11,7 +12,7 @@ final class BenchmarkAckOracle {
     private BenchmarkAckOracle() {
     }
 
-    /** The source connector's rule for whether this fork's target ACK includes its terminal event. */
+    /** The source connector's rule for whether one chain's target ACK includes its terminal event. */
     @FunctionalInterface
     interface PositionCoverage {
         boolean covers(String targetAck, String terminalPosition);
@@ -19,17 +20,22 @@ final class BenchmarkAckOracle {
 
     record TerminalEvent(String logicalId, String sourcePosition) {}
 
+    record SourceChain(String id, List<TerminalEvent> sourceTerminals, String authoritativeTargetAck,
+                       PositionCoverage positionCoverage) {
+        SourceChain {
+            sourceTerminals = List.copyOf(sourceTerminals);
+        }
+    }
+
     /** Logical coverage includes occurrence counts, so duplicate deliveries cannot hide in a set. */
     record Fork(
             String id,
-            List<TerminalEvent> sourceTerminals,
-            String targetAck,
-            PositionCoverage positionCoverage,
+            List<SourceChain> chains,
             Map<String, Long> logicalCoverage,
             String checksum,
             long errorTotal) {
         Fork {
-            sourceTerminals = List.copyOf(sourceTerminals);
+            chains = List.copyOf(chains);
             logicalCoverage = Map.copyOf(logicalCoverage);
         }
     }
@@ -39,8 +45,14 @@ final class BenchmarkAckOracle {
             throw new AssertionError("no benchmark forks to verify");
         }
         Set<String> seen = new HashSet<>();
+        Map<String, String> expectedTerminals = null;
         for (Fork fork : forks) {
-            verifyFork(fork);
+            Map<String, String> terminals = verifyFork(fork);
+            if (expectedTerminals == null) {
+                expectedTerminals = terminals;
+            } else if (!expectedTerminals.equals(terminals)) {
+                throw new AssertionError("source chains or terminal identities differ in fork " + fork.id());
+            }
             if (!seen.add(fork.id())) {
                 throw new AssertionError("duplicate benchmark fork id: " + fork.id());
             }
@@ -60,24 +72,44 @@ final class BenchmarkAckOracle {
         }
     }
 
-    private static void verifyFork(Fork fork) {
+    private static Map<String, String> verifyFork(Fork fork) {
         if (fork.id() == null || fork.id().isBlank()) {
             throw new AssertionError("benchmark fork has no id");
         }
-        if (fork.sourceTerminals().size() != 1) {
-            throw new AssertionError("fork " + fork.id() + " must have exactly one source terminal event");
+        if (fork.chains().isEmpty()) {
+            throw new AssertionError("fork " + fork.id() + " declares no source chains");
         }
-        TerminalEvent terminal = fork.sourceTerminals().getFirst();
-        if (terminal.logicalId() == null || terminal.logicalId().isBlank()
-                || terminal.sourcePosition() == null || terminal.sourcePosition().isBlank()) {
-            throw new AssertionError("fork " + fork.id() + " has an incomplete source terminal event");
-        }
-        if (fork.targetAck() == null || fork.targetAck().isBlank() || fork.positionCoverage() == null
-                || !fork.positionCoverage().covers(fork.targetAck(), terminal.sourcePosition())) {
-            throw new AssertionError("fork " + fork.id() + " has no target ACK covering its source terminal event");
-        }
-        if (fork.logicalCoverage().getOrDefault(terminal.logicalId(), 0L) < 1) {
-            throw new AssertionError("fork " + fork.id() + " did not deliver its terminal event");
+        Map<String, String> terminalsByChain = new HashMap<>();
+        Set<String> terminalIds = new HashSet<>();
+        for (SourceChain chain : fork.chains()) {
+            if (chain.id() == null || chain.id().isBlank()
+                    || terminalsByChain.containsKey(chain.id())) {
+                throw new AssertionError("fork " + fork.id() + " has a missing or duplicate source chain id");
+            }
+            if (chain.sourceTerminals().size() != 1) {
+                throw new AssertionError("fork " + fork.id() + " chain " + chain.id()
+                        + " must have exactly one source terminal event");
+            }
+            TerminalEvent terminal = chain.sourceTerminals().getFirst();
+            if (terminal.logicalId() == null || terminal.logicalId().isBlank()
+                    || terminal.sourcePosition() == null || terminal.sourcePosition().isBlank()) {
+                throw new AssertionError("fork " + fork.id() + " chain " + chain.id()
+                        + " has an incomplete source terminal event");
+            }
+            if (!terminalIds.add(terminal.logicalId())) {
+                throw new AssertionError("fork " + fork.id() + " has a duplicate source terminal event");
+            }
+            terminalsByChain.put(chain.id(), terminal.logicalId());
+            if (chain.authoritativeTargetAck() == null || chain.authoritativeTargetAck().isBlank()
+                    || chain.positionCoverage() == null
+                    || !chain.positionCoverage().covers(chain.authoritativeTargetAck(), terminal.sourcePosition())) {
+                throw new AssertionError("fork " + fork.id() + " chain " + chain.id()
+                        + " has no authoritative target ACK covering its source terminal event");
+            }
+            if (fork.logicalCoverage().getOrDefault(terminal.logicalId(), 0L) < 1) {
+                throw new AssertionError("fork " + fork.id() + " chain " + chain.id()
+                        + " did not deliver its terminal event");
+            }
         }
         if (fork.logicalCoverage().isEmpty() || fork.logicalCoverage().values().stream().anyMatch(count -> count < 1)) {
             throw new AssertionError("fork " + fork.id() + " has invalid logical event coverage");
@@ -85,5 +117,6 @@ final class BenchmarkAckOracle {
         if (fork.checksum() == null || fork.checksum().isBlank() || fork.errorTotal() < 0) {
             throw new AssertionError("fork " + fork.id() + " has incomplete output evidence");
         }
+        return Map.copyOf(terminalsByChain);
     }
 }
