@@ -60,6 +60,44 @@ final class RoutingKeys {
             throw new IllegalStateException("stream '" + stream + "' reached node '" + node
                     + "' with no key to route it by");
         }
+        return lane(stream, rowKey(node, stream, columns, event));
+    }
+
+    /**
+     * The routing function for the edges into and within the sink {@code node}, whose streams write the
+     * targets given. A row goes by the table it lands in and its key there, never by the stream it came in
+     * on, so rows of two source tables written into one target table meet on one writer when their keys
+     * are the same. A row of a table with no key, and a schema change, goes by the table alone: the table is
+     * then written serially, on one writer, while the sink's other tables are not held to it.
+     */
+    static FunctionEx<Object, Object> forSink(String node, Map<String, SinkTarget> targetsByStream) {
+        Map<String, SinkTarget> targets = new LinkedHashMap<>(targetsByStream);
+        return item -> sinkKeyOf(node, targets, item);
+    }
+
+    static Object sinkKeyOf(String node, Map<String, SinkTarget> targetsByStream, Object item) {
+        if (item instanceof SettledPositions) {
+            return SETTLED_POSITIONS_LANE;
+        }
+        Envelope event = (Envelope) item;
+        SinkTarget target = targetsByStream.get(event.src());
+        if (target == null) {
+            // Every stream a sink receives had its target worked out when the graph was drawn.
+            throw new IllegalStateException("stream '" + event.src() + "' reached sink '" + node
+                    + "' with no target table to route it by");
+        }
+        if (event.op() == Op.DDL || !target.keyed()) {
+            return lane(target.table(), "");
+        }
+        return lane(target.table(), rowKey(node, event.src(), target.keyColumns(), event));
+    }
+
+    /**
+     * The key {@code columns} spell on the row {@code event} changes, read off its later image or, for a
+     * removal, its earlier one. A key that cannot be read, or a change that moves its row to another key, ends
+     * the run with a code - see the class comment.
+     */
+    private static String rowKey(String node, String stream, List<String> columns, Envelope event) {
         Map<String, Object> image = event.op() == Op.DELETE ? event.before() : event.after();
         JoinKey key = keyFrom(image, columns);
         if (key == null) {
@@ -75,7 +113,7 @@ final class RoutingKeys {
                         Map.of("node", node, "stream", stream), null);
             }
         }
-        return lane(stream, key.name());
+        return key.name();
     }
 
     /** The key {@code columns} spell on {@code image}, or null where a column is absent or holds nothing. */

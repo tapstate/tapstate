@@ -21,13 +21,18 @@ import java.util.Objects;
  * stream reaching it: the same key must reach the same processor, and which columns make up a key is a
  * property of the stream at that point in the graph, not of the node.
  *
+ * <p>{@code sinkTargets} names, for each sink that runs wider than one processor, the target table and key of
+ * every stream reaching it. A sink routes by where a row lands rather than by the stream it came in on, which
+ * is what lets two streams written into one target table keep a key's changes on one writer.
+ *
  * <p>A node this shape says nothing about runs the way every node ran before shapes existed: one processor
  * for the whole cluster.
  */
 public record ExecutionShape(
         int plannedMembers,
         Map<String, NodeParallelism> nodes,
-        Map<String, Map<String, List<String>>> inputKeys) {
+        Map<String, Map<String, List<String>>> inputKeys,
+        Map<String, Map<String, SinkTarget>> sinkTargets) {
 
     public ExecutionShape {
         if (plannedMembers < 1) {
@@ -41,6 +46,10 @@ public record ExecutionShape(
             keys.put(node, Collections.unmodifiableMap(copy));
         });
         inputKeys = Collections.unmodifiableMap(keys);
+        Map<String, Map<String, SinkTarget>> targets = new LinkedHashMap<>();
+        Objects.requireNonNull(sinkTargets, "sinkTargets").forEach((node, byStream) ->
+                targets.put(node, Collections.unmodifiableMap(new LinkedHashMap<>(byStream))));
+        sinkTargets = Collections.unmodifiableMap(targets);
         nodes.forEach((node, parallelism) -> {
             if (parallelism.scope() == NodeParallelism.Scope.NATIVE
                     && parallelism.memberCount() != plannedMembers) {
@@ -50,9 +59,32 @@ public record ExecutionShape(
         });
     }
 
+    /** A shape in which no sink runs wider than one processor. */
+    public ExecutionShape(int plannedMembers, Map<String, NodeParallelism> nodes,
+            Map<String, Map<String, List<String>>> inputKeys) {
+        this(plannedMembers, nodes, inputKeys, Map.of());
+    }
+
     /** A shape that runs every node as one processor for the cluster: how every graph ran before shapes. */
     public static ExecutionShape totalOne() {
         return new ExecutionShape(1, Map.of(), Map.of());
+    }
+
+    /**
+     * The target table and key of each stream reaching the sink {@code node}; only asked of a sink that runs
+     * natively.
+     */
+    public Map<String, SinkTarget> sinkTargetsOf(String node) {
+        Map<String, SinkTarget> targets = sinkTargets.get(node);
+        if (targets == null) {
+            throw new IllegalStateException("sink '" + node + "' runs natively but no targets were worked out");
+        }
+        return targets;
+    }
+
+    /** How many processors {@code node} runs across the cluster: its per-member count times the members. */
+    public int effectiveOf(String node) {
+        return localOf(node) * plannedMembers;
     }
 
     /** Whether {@code node} runs the same number of processors on every member rather than one in total. */

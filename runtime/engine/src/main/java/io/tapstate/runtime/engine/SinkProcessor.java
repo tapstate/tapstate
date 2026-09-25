@@ -46,9 +46,10 @@ import java.util.concurrent.CompletionException;
  * record carrying a lower one has landed, and settling with the batch is what makes that true here without
  * anything having to work out what is still outstanding.
  *
- * <p>The vertex runs at total parallelism one and, by default, keeps a single write in flight: one
- * {@code serve.sync} is one external target, and applying one batch to completion before the next is
- * issued is what keeps a key's change events in their arrival order. Two batches that straddle a key
+ * <p>Each processor keeps a single write in flight by default: applying one batch to completion before the
+ * next is issued is what keeps a key's change events in their arrival order - on the one processor a vertex
+ * running at total parallelism one has, and on the one writer a key is routed to where the vertex runs
+ * several. Two batches that straddle a key
  * (an insert last in one, its update first in the next) would otherwise be free to apply out of order,
  * since the writer runs them off the caller's thread with no ordering of its own — the contract hands
  * in-flight ordering to the runtime, and this is where the runtime keeps it. Raising the in-flight
@@ -275,6 +276,32 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         return ProcessorMetaSupplier.forceTotalParallelismOne(
                 new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory, edgesFactory, vertexName, true),
                 vertexName);
+    }
+
+    /**
+     * A meta-supplier for a sink vertex that runs the same number of writers on every member, each a writer
+     * of its own: it lands whatever rows reach it and reports as the writer at its own index among all of the
+     * vertex's processors, so the run can wait on each of them. The vertex is as wide on every member as the
+     * builder sets it, and refuses an execution that starts on a member count other than the one its width
+     * was worked out for - a run on more members would have writers nobody waits on.
+     *
+     * <p>Rows reach a writer over more than one queue - from every instance of the router in front of it, and
+     * over two edges - so a later position can land before an earlier one: {@code frontierFactory} is the
+     * shape that goes by bounds, and {@code edgesFactory} combines them over the edges that carry each chain.
+     * Without an ack factory the writers land rows and report nothing.
+     */
+    static ProcessorMetaSupplier nativeMetaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory, SinkAckFactory sinkAckFactory,
+            SupplierEx<SinkFrontier> frontierFactory, SupplierEx<LevelBounds> edgesFactory, int plannedMembers) {
+        Objects.requireNonNull(vertexName, "vertexName");
+        Objects.requireNonNull(writerFactory, "writerFactory");
+        ProcessorSupplier supplier = sinkAckFactory == null
+                ? ProcessorSupplier.of((SupplierEx<Processor>) () -> new SinkProcessor(writerFactory.get(), null,
+                        null, DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, FrontierGauge.none(),
+                        new JetDeliveryGauge()))
+                : new AckSinkSupplier(writerFactory, sinkAckFactory,
+                        Objects.requireNonNull(frontierFactory, "frontierFactory"), edgesFactory, vertexName, false);
+        return PlannedMembersGuard.of(ProcessorMetaSupplier.of(supplier), plannedMembers);
     }
 
     /**
