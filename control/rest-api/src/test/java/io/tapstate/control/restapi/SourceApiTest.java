@@ -291,6 +291,27 @@ class SourceApiTest {
     }
 
     @Test
+    void draftReturnsOnlyCallerSuppliedConfigWhenTheSourceAlreadyExists() throws Exception {
+        String storedSecret = "stored-only-secret";
+        InMemoryArtifactStore artifacts = context.getBean(InMemoryArtifactStore.class);
+        artifacts.save(new SourceResource("orders", null, "mysql",
+                Map.of("host", "localhost", "port", 3306, "database", "orders",
+                        "username", "app", "password", storedSecret),
+                null, null, null, null));
+
+        ResponseEntity<String> drafted = request("reader")
+                .post().uri("/api/sources:draft")
+                .contentType(MediaType.APPLICATION_JSON).body(sourceJson("orders", "draft"))
+                .retrieve().toEntity(String.class);
+
+        String yaml = JSON.readTree(drafted.getBody()).path("yaml").asText();
+        assertThat(yaml).contains("password: " + SECRET).doesNotContain(storedSecret);
+        SourceResource stored = (SourceResource) artifacts.get("orders").orElseThrow();
+        assertThat(stored.config()).containsEntry("password", storedSecret);
+        assertThat(context.getBean(RecordingAuditStore.class).records).isEmpty();
+    }
+
+    @Test
     void replaceRequiresOneStrongQuotedEtagAndDeleteUsesTheNewVersion() throws Exception {
         String etag = create("orders", "before").getHeaders().getETag();
 
