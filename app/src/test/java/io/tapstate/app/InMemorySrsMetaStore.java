@@ -5,6 +5,8 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WriterProgress;
+import io.tapstate.spi.store.WriterRun;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -24,6 +26,11 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     private final Map<String, SrsMeta> records = new LinkedHashMap<>();
     /** Per chain, per pipeline: the ring sequence of the last change each table's sink confirmed. */
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
+    /**
+     * Per chain, per pipeline: the current run's writer accounting, without the load generation - that is
+     * read off the consumer when the run is answered, as the real store reads both off one document.
+     */
+    private final Map<String, Map<String, WriterRun>> writerRuns = new LinkedHashMap<>();
 
     @Override
     public synchronized Optional<SrsMeta> read(String miningChainId) {
@@ -57,7 +64,8 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
         SrsMeta m = require(miningChainId);
-        // A rewritten record carries no per-table acks, as the real store's replacement carries none.
+        // A rewritten record carries no per-table acks and no writer accounting, as the real store's
+        // replacement carries neither.
         forgetRingSeqs(miningChainId, offset.pipelineId());
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
@@ -223,6 +231,90 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         // Idempotent for the same reason the detach below is: an absent chain already satisfies it.
         records.remove(miningChainId);
         ringDone.remove(miningChainId);
+        writerRuns.remove(miningChainId);
+    }
+
+    /**
+     * Replaces the pipeline's writer accounting on the chain with {@code runId}'s, creating the consumer when
+     * the pipeline has none yet, as the real store's upsert of the consumer document does.
+     */
+    @Override
+    public synchronized void beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable) {
+        require(miningChainId);
+        if (consumerOf(miningChainId, pipelineId) == null) {
+            advanceConsumer(miningChainId, pipelineId, existing -> new ConsumerOffset(
+                    pipelineId, Map.of(), null, List.of(), null, 0L));
+        }
+        writerRuns.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
+                .put(pipelineId, new WriterRun(runId, expectedWritersByTable, Map.of(), null));
+    }
+
+    /** Refuses a run that is not the current one, as the real store's run-filtered update does. */
+    @Override
+    public synchronized Optional<WriterRun> advanceWriter(String miningChainId, String pipelineId, String runId,
+            String writerId, String table, WriterProgress progress) {
+        require(miningChainId);
+        WriterRun run = writerRuns.getOrDefault(miningChainId, Map.of()).get(pipelineId);
+        if (run == null || !run.runId().equals(runId)) {
+            return Optional.empty();
+        }
+        Map<String, Map<String, WriterProgress>> next = new LinkedHashMap<>(run.progress());
+        Map<String, WriterProgress> byWriter = new LinkedHashMap<>(run.progressFor(table));
+        byWriter.put(writerId, progress);
+        next.put(table, byWriter);
+        WriterRun advanced = new WriterRun(runId, run.expected(), next, null);
+        writerRuns.get(miningChainId).put(pipelineId, advanced);
+        return Optional.of(withLoadOf(miningChainId, pipelineId, advanced));
+    }
+
+    @Override
+    public synchronized Optional<WriterRun> writerRun(String miningChainId, String pipelineId) {
+        return Optional.ofNullable(writerRuns.getOrDefault(miningChainId, Map.of()).get(pipelineId))
+                .map(run -> withLoadOf(miningChainId, pipelineId, run));
+    }
+
+    /** {@code run} with the generation the pipeline's load was read under, where it recorded one. */
+    private WriterRun withLoadOf(String miningChainId, String pipelineId, WriterRun run) {
+        ConsumerOffset consumer = consumerOf(miningChainId, pipelineId);
+        Long loadedIn = consumer == null || consumer.cdcStartPosition() == null ? null : consumer.snapshotEpoch();
+        return new WriterRun(run.runId(), run.expected(), run.progress(), loadedIn);
+    }
+
+    @Override
+    public synchronized void advanceRingDone(String miningChainId, String pipelineId, String table, long seq) {
+        require(miningChainId);
+        if (seq >= 0) {
+            ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
+                    .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
+                    .merge(table, seq, Math::max);
+        }
+    }
+
+    private ConsumerOffset consumerOf(String miningChainId, String pipelineId) {
+        SrsMeta m = records.get(miningChainId);
+        return m == null ? null : m.consumerOffsets().stream()
+                .filter(consumer -> consumer.pipelineId().equals(pipelineId))
+                .findFirst()
+                .orElse(null);
+    }
+
+    /** Replaces the pipeline's consumer with what {@code next} makes of the one there, or of none. */
+    private void advanceConsumer(String miningChainId, String pipelineId,
+            java.util.function.UnaryOperator<ConsumerOffset> next) {
+        SrsMeta m = require(miningChainId);
+        List<ConsumerOffset> consumers = new ArrayList<>();
+        ConsumerOffset existing = null;
+        for (ConsumerOffset consumer : m.consumerOffsets()) {
+            if (consumer.pipelineId().equals(pipelineId)) {
+                existing = consumer;
+            } else {
+                consumers.add(consumer);
+            }
+        }
+        consumers.add(next.apply(existing));
+        records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
+                m.schemaHistory(), m.retention(), m.epoch()));
     }
 
     @Override
@@ -253,6 +345,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         Map<String, Map<String, Long>> byPipeline = ringDone.get(miningChainId);
         if (byPipeline != null) {
             byPipeline.remove(pipelineId);
+        }
+        Map<String, WriterRun> runs = writerRuns.get(miningChainId);
+        if (runs != null) {
+            runs.remove(pipelineId);
         }
     }
 

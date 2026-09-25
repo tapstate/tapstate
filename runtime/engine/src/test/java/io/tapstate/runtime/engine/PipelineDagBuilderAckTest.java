@@ -22,12 +22,14 @@ import com.hazelcast.function.FunctionEx;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.transform.TransformPort;
@@ -100,6 +102,79 @@ class PipelineDagBuilderAckTest {
         drain(sink);
 
         assertThat(ack.calls).containsExactly("orders=p1");
+    }
+
+    /**
+     * Each chain is expected at exactly the writers the graph routes it to, and the execution writes that down
+     * before any of them exists: the first sink the graph draws starts the accounting as the execution starts.
+     *
+     * <p>Two tables and three sinks, and the shape is chosen to tell the wrong answers apart. The view reads
+     * one table and the two serve elements read both, so a set that named every sink for every table would
+     * wait on the view for a table it never receives - a table whose progress then never lands - and a set
+     * that named only the sinks one table reaches would leave a writer of the other out, so a faster writer
+     * could stand for it.
+     */
+    @Test
+    void theFirstSinkStartsARunExpectingEachChainAtTheWritersItReaches() throws Exception {
+        RunRecordingAcks sinkAck = new RunRecordingAcks();
+        PipelineResource pipeline = new PipelineResource(
+                "p", null, List.of(SourceRef.bare("orders_src"), SourceRef.bare("items_src")), null,
+                new ViewBlock.Inline("v", FromRef.literal("orders_src"), "id", null),
+                new ServeBlock.Inline(null,
+                        new FromClause.Flow(List.of(FromRef.literal("orders_src"), FromRef.literal("items_src"))),
+                        List.of(new SyncElement("a", "dest_a", null, null, null),
+                                new SyncElement("b", "dest_b", null, null, null)), null, null),
+                null, null);
+
+        DAG dag = PipelineDagBuilder.build(pipeline, twoSourceBindings(), sinkAck,
+                new FrontierBinding(Map.of("orders_src", "orders", "items_src", "items")));
+
+        ProcessorMetaSupplier first = dag.getVertex("view.v").getMetaSupplier();
+        assertThat(first).isInstanceOf(WriterRunStart.class);
+        assertThat(((WriterRunStart) first).writersByChain()).isEqualTo(Map.of(
+                "orders", List.of("view.v#0", "serve.a#0", "serve.b#0"),
+                "items", List.of("serve.a#0", "serve.b#0")));
+        assertThat(dag.getVertex("serve.a").getMetaSupplier())
+                .as("one vertex starts the run; a second would only write the same set again")
+                .isNotInstanceOf(WriterRunStart.class);
+        assertThat(dag.getVertex("serve.b").getMetaSupplier()).isNotInstanceOf(WriterRunStart.class);
+
+        first.init(new TestProcessorMetaSupplierContext()
+                .setHazelcastInstance(member).setTotalParallelism(1).setLocalParallelism(1));
+
+        assertThat(sinkAck.started).containsExactly(((WriterRunStart) first).writersByChain());
+    }
+
+    /** Acks that record every run started through them; each resolves to an ack recording nothing. */
+    private static final class RunRecordingAcks implements SinkAckFactory {
+
+        private static final long serialVersionUID = 1L;
+
+        private final List<Map<String, List<String>>> started = new ArrayList<>();
+
+        @Override
+        public SinkAck resolve(HazelcastInstance on) {
+            return new RecordingAck();
+        }
+
+        @Override
+        public void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
+            started.add(writersByChain);
+        }
+    }
+
+    /** Two sources, each its own vertex, with a view sink and a writer for every serve element. */
+    private static DagBindings twoSourceBindings() {
+        Map<FromRef, List<String>> upstreams = Map.of(
+                FromRef.literal("orders_src"), List.of("orders_src"),
+                FromRef.literal("items_src"), List.of("items_src"));
+        return new DagBindings(
+                srcId -> ProcessorMetaSupplier.of(Processors.mapP(FunctionEx.identity())),
+                step -> (SupplierEx<TransformPort>) () -> ev -> List.of(ev),
+                syncElement -> (SupplierEx<SinkWriter>) RecordingWriter::new,
+                ref -> upstreams.getOrDefault(ref, List.of()),
+                sourceId -> List.of(sourceId),
+                view -> (SupplierEx<SinkWriter>) RecordingWriter::new);
     }
 
     /** Structural stubs for the leaves; the serve sink is the only vertex this test drives. */

@@ -410,6 +410,21 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)));
     }
 
+    /**
+     * A {@code $max}, as the raise that comes with an acked change is: writers of one run landing at once
+     * each write, and the record only ever moves forward. A snapshot row sits at a reserved sequence below
+     * every change and is no place in any ring, so it raises nothing.
+     */
+    @Override
+    public void advanceRingDone(String miningChainId, String pipelineId, String table, long seq) {
+        Objects.requireNonNull(table, "table");
+        if (seq < 0) {
+            return;
+        }
+        updateConsumer(miningChainId, pipelineId,
+                new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)));
+    }
+
     @Override
     public Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");

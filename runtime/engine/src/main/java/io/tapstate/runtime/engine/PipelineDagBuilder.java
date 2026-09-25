@@ -387,43 +387,87 @@ public final class PipelineDagBuilder {
             }
         }
 
+        // Every sink the graph draws, worked out before any is drawn. Which writers each chain reaches is only
+        // known once every sink is, and an execution has to have written that down before any of its writers
+        // can report.
+        List<SinkNode> sinks = sinkNodes(pipeline, bindings);
+        Map<String, List<String>> writersByChain = chains == null ? null : writersByChain(sinks, chains);
+        boolean startsTheRun = sinkAck != null && writersByChain != null;
+        for (SinkNode sink : sinks) {
+            // A chain reaching the sink over several paths arrives in whatever order they drain in, which is
+            // the reading an assembly needs, for the same reason.
+            boolean severalPaths = chains != null && chains.anyOverSeveralPaths(sink.upstream());
+            ProcessorMetaSupplier supplier =
+                    sinkVertex(sink.name(), sink.writers(), sinkAck, axes, assembled || severalPaths);
+            if (startsTheRun) {
+                supplier = WriterRunStart.of(supplier, sinkAck, writersByChain);
+                startsTheRun = false;
+            }
+            Vertex vertex = dag.newVertex(sink.name(), supplier);
+            connect(dag, verticesOf(sink.upstream(), byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
+        }
+
+        return dag;
+    }
+
+    /** One sink a graph draws: its vertex, the producers it reads, and the writers it opens. */
+    private record SinkNode(String name, List<String> upstream, SupplierEx<? extends SinkWriter> writers) {
+    }
+
+    /**
+     * The sinks a pipeline draws, in the order they are drawn: its view, then each {@code serve.sync} element.
+     *
+     * <p>A view id names data, not a vertex that can be read from: the view compiles to a terminal sink, so a
+     * later reference to it resolves to whatever the view itself reads. Without this the parser's own default
+     * - {@code serve.from} = the view's id - resolves to no vertex at all.
+     */
+    private static List<SinkNode> sinkNodes(PipelineResource pipeline, DagBindings bindings) {
         if (pipeline.view() instanceof ViewBlock.Use) {
             throw new IllegalArgumentException(
                     "view block is a use-reference; resolve it to an inline view first");
         }
-        // A view id names data, not a vertex that can be read from: the view compiles to a terminal
-        // sink, so a downstream reference to it resolves to whatever the view itself reads. Without
-        // this the parser's own default - serve.from = the view's id - resolves to no vertex at all.
-        Map<String, List<Vertex>> readsAs = new HashMap<>();
-
-        if (pipeline.view() instanceof ViewBlock.Inline view) {
-            // A declared view IS its own instruction to materialize: the pipeline needs no serve block
-            // to reach the state store, and the vertex is a terminal sink like any other.
-            List<Vertex> upstream = upstreamOf(view.from(), byKey, bindings);
-            String viewName = VIEW_VERTEX_PREFIX + view.id();
-            Vertex vertex = dag.newVertex(viewName,
-                    sinkVertex(viewName, bindings.viewSinks().apply(view), sinkAck, axes, assembled));
-            connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal, shape);
-            readsAs.put(view.id(), upstream);
-        }
-
         if (pipeline.serve() instanceof ServeBlock.Use) {
             throw new IllegalArgumentException(
                     "serve block is a use-reference; resolve it to an inline serve first");
         }
+        List<SinkNode> sinks = new ArrayList<>();
+        Map<String, List<String>> readsAs = new HashMap<>();
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            // A declared view IS its own instruction to materialize: the pipeline needs no serve block to reach
+            // the state store, and the vertex is a terminal sink like any other.
+            List<String> upstream = resolve(view.from(), bindings);
+            sinks.add(new SinkNode(VIEW_VERTEX_PREFIX + view.id(), upstream, bindings.viewSinks().apply(view)));
+            readsAs.put(view.id(), upstream);
+        }
         if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
-            List<Vertex> upstream = upstreamOf(serve.from(), byKey, bindings, readsAs);
+            List<String> upstream = upstreamOf(serve.from(), bindings, readsAs);
             List<SyncElement> sync = serve.sync();
             for (int i = 0; i < sync.size(); i++) {
                 SyncElement element = sync.get(i);
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
-                Vertex vertex = dag.newVertex(name,
-                        sinkVertex(name, bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
-                connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal, shape);
+                sinks.add(new SinkNode(name, upstream, bindings.sinkWriters().apply(element)));
             }
         }
+        return sinks;
+    }
 
-        return dag;
+    /**
+     * For each chain, every writer the graph routes that chain's changes to: each sink the chain reaches, by
+     * the one writer a sink running as one processor for the cluster has.
+     *
+     * <p>Taken from the graph rather than from what a running writer has seen, for the reason the levels
+     * above take their edges from it: at runtime a writer that has not reported yet and a writer that never
+     * will look exactly alike, and leaving the first out lets a faster writer stand for it.
+     */
+    private static Map<String, List<String>> writersByChain(List<SinkNode> sinks, PipelineChains chains) {
+        Map<String, List<String>> byChain = new LinkedHashMap<>();
+        for (SinkNode sink : sinks) {
+            String writer = SinkProcessor.writerId(sink.name(), 0);
+            for (String chain : chains.union(sink.upstream())) {
+                byChain.computeIfAbsent(chain, ignored -> new ArrayList<>()).add(writer);
+            }
+        }
+        return byChain;
     }
 
     /**
@@ -432,11 +476,11 @@ public final class PipelineDagBuilder {
      * one generic sink adapter, pinned to total parallelism one.
      *
      * <p>{@code assembled} picks the shape of frontier the ack-bearing sink runs. Where the graph gathers
-     * several chains into one stream, what arrives can no longer say by itself how far a chain has
-     * travelled, and the sink goes by the bound the engine combines across its input queues instead. Where
-     * it does not, the events of one chain arrive in their own order and the settled prefix is the whole
-     * answer; a bound reaching such a sink is discarded rather than acted on, because the source stamps
-     * bounds whatever the graph does with them.
+     * several chains into one stream, splits one over several processors, or brings one to the sink over
+     * several paths, what arrives can no longer say by itself how far a chain has travelled, and the sink
+     * goes by the bound the engine combines across its input queues instead. Where it does none of these,
+     * the events of one chain arrive in their own order, so a later position settling closes every earlier
+     * one and a bound closes the last.
      *
      * <p>An assembling graph built without a chain numbering gets the same shape with nothing to attribute
      * a bound to, so its frontier stands still. That is the direction to fail in: reading a stream of
@@ -540,38 +584,23 @@ public final class PipelineDagBuilder {
         return keys;
     }
 
-    /** The vertices a {@code from:} reference names, for a graph with no such names to stand in for. */
-    private static List<Vertex> upstreamOf(FromRef ref, Map<String, Vertex> byKey, DagBindings bindings) {
-        return upstreamOf(ref, byKey, bindings, Map.of());
-    }
-
     /**
-     * As above, but first honours the names that stand for data rather than for a vertex - today a
-     * declared view, which is a terminal sink and so cannot itself be read from. Reading such a name
-     * means reading what it reads, which is a fan-out from the shared upstream rather than a chain.
+     * The producer keys a serve flow reads, preserving every selected table in one sink path. A name that
+     * stands for data rather than for a vertex - today a declared view, which is a terminal sink and so cannot
+     * itself be read from - reads what it reads, which is a fan-out from the shared upstream rather than a
+     * chain.
      */
-    private static List<Vertex> upstreamOf(FromRef ref, Map<String, Vertex> byKey, DagBindings bindings,
-            Map<String, List<Vertex>> readsAs) {
-        if (ref instanceof FromRef.Literal literal) {
-            List<Vertex> aliased = readsAs.get(literal.ref());
-            if (aliased != null) {
-                return aliased;
-            }
+    private static List<String> upstreamOf(FromClause from, DagBindings bindings,
+            Map<String, List<String>> readsAs) {
+        if (!(from instanceof FromClause.Flow flow)) {
+            throw new IllegalArgumentException("serve.from must be a flow of references");
         }
-        return verticesOf(resolve(ref, bindings), byKey);
-    }
-
-    /** The vertices named by a serve flow, preserving every selected table in one sink path. */
-    private static List<Vertex> upstreamOf(FromClause from, Map<String, Vertex> byKey,
-            DagBindings bindings, Map<String, List<Vertex>> readsAs) {
-        if (from instanceof FromClause.Flow flow) {
-            List<Vertex> upstream = new ArrayList<>();
-            for (FromRef ref : flow.refs()) {
-                upstream.addAll(upstreamOf(ref, byKey, bindings, readsAs));
-            }
-            return upstream;
+        List<String> upstream = new ArrayList<>();
+        for (FromRef ref : flow.refs()) {
+            List<String> aliased = ref instanceof FromRef.Literal literal ? readsAs.get(literal.ref()) : null;
+            upstream.addAll(aliased != null ? aliased : resolve(ref, bindings));
         }
-        throw new IllegalArgumentException("serve.from must be a flow of references");
+        return upstream;
     }
 
     /** The vertices those producer keys name, refusing a key no vertex was built for. */

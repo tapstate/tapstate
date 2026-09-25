@@ -19,15 +19,41 @@ import java.util.Set;
 final class PipelineChains {
 
     private final Map<String, List<String>> byVertex = new LinkedHashMap<>();
+    // Per vertex: over how many distinct paths each chain reaching it gets there.
+    private final Map<String, Map<String, Integer>> pathsByVertex = new LinkedHashMap<>();
 
     /** Records that the vertex keyed {@code vertexKey} reads {@code chain} and nothing else. */
     void source(String vertexKey, String chain) {
         byVertex.put(vertexKey, List.of(chain));
+        pathsByVertex.put(vertexKey, Map.of(chain, 1));
     }
 
     /** Records that the vertex keyed {@code vertexKey} carries whatever the vertices behind it carry. */
     void derived(String vertexKey, List<String> upstreamKeys) {
         byVertex.put(vertexKey, union(upstreamKeys));
+        pathsByVertex.put(vertexKey, paths(upstreamKeys));
+    }
+
+    /**
+     * Whether some chain reaches a vertex fed by all of {@code upstreamKeys} at once over more than one path.
+     *
+     * <p>Such a chain's changes arrive in whatever order its paths drain in - somewhere along the way, or at
+     * the vertex itself, two queues carrying it are drained independently - so a later change can arrive
+     * before an earlier one, and nothing that arrives says by itself how far the chain has travelled.
+     */
+    boolean anyOverSeveralPaths(List<String> upstreamKeys) {
+        return paths(upstreamKeys).values().stream().anyMatch(count -> count > 1);
+    }
+
+    /** For each chain reaching a vertex fed by all of {@code upstreamKeys}, how many paths it arrives over. */
+    private Map<String, Integer> paths(List<String> upstreamKeys) {
+        Map<String, Integer> paths = new LinkedHashMap<>();
+        for (String key : upstreamKeys) {
+            // Through of() first, so a vertex wired before whatever feeds it is refused by name.
+            of(key);
+            pathsByVertex.get(key).forEach((chain, count) -> paths.merge(chain, count, Integer::sum));
+        }
+        return paths;
     }
 
     /**

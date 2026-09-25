@@ -109,6 +109,9 @@ class CaptureToSinkAckFrontierTest {
     private static final String SOURCE_ID = "orders_src";
     private static final String DEST_ID = "orders_dest";
     private static final String TABLE = "orders";
+    /** The second destination, and the sync element writing to it, in the case where one sink holds. */
+    private static final String HELD_DEST_ID = "orders_held_dest";
+    private static final String HELD_SYNC = "sync_held";
 
     private HazelcastInstance member;
 
@@ -131,6 +134,7 @@ class CaptureToSinkAckFrontierTest {
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         member = Hazelcast.newHazelcastInstance(config);
         CapturingSinkWriter.reset();
+        HeldSinkWriter.hold();
     }
 
     @AfterEach
@@ -325,6 +329,13 @@ class CaptureToSinkAckFrontierTest {
      */
     private LifecycleActuator wireRuntime(
             InMemoryStorePort store, GatedSource gatedSource, UnaryOperator<DagSource> wrapDag) {
+        return wireRuntime(store, gatedSource, wrapDag,
+                (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new);
+    }
+
+    /** The same runtime with every sink bound through {@code sinks}. */
+    private LifecycleActuator wireRuntime(InMemoryStorePort store, GatedSource gatedSource,
+            UnaryOperator<DagSource> wrapDag, StoreBackedDagSource.SinkWriterBinder sinks) {
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
         ConnectorProvisioner provisioner = connectorId -> {
@@ -340,9 +351,7 @@ class CaptureToSinkAckFrontierTest {
         PipelineCaptureCoordinator coordinator =
                 new StoreBackedPipelineCaptureCoordinator(store, captureRunUnit::start, srsCoordinator, snapshotBuffer);
 
-        StoreBackedDagSource.SinkWriterBinder capturingSink =
-                (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
-        DagSource dagSource = wrapDag.apply(new StoreBackedDagSource(store, capturingSink));
+        DagSource dagSource = wrapDag.apply(new StoreBackedDagSource(store, sinks));
         return new EngineLifecycleActuator(
                 new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
     }
@@ -423,6 +432,92 @@ class CaptureToSinkAckFrontierTest {
             actuator.stop(DIRECT_PIPELINE, true);
             actuator.stop(PIPELINE, true);
         }
+    }
+
+    /**
+     * A pipeline has landed a change only once every one of its sinks has.
+     *
+     * <p>Two sinks of one pipeline take the same table's changes, and one of them holds every write it is
+     * given. The other writes all four changes and says so. Where the pipeline resumes from is still nowhere
+     * at all: a resume from where the faster sink got to would skip every change the held one never wrote,
+     * and nothing would ever write them again - the target of the held sink stays short of those rows with
+     * the run healthy and nothing logged.
+     *
+     * <p>What the faster sink said is proven before its absence from the pipeline's record is asserted, so the
+     * assertion cannot pass merely because the faster sink had not got round to saying anything yet. The two
+     * readings are taken in one loop that stops at whichever comes first: the pipeline's record moving at all
+     * is the failure, and the faster sink's own progress arriving is the precondition for the assertion.
+     *
+     * <p>Released, the held sink writes what it held and the pipeline lands as far as both got - which is
+     * the other half of the rule: the slower sink holds the pipeline back only for as long as it is slower.
+     */
+    @Test
+    @DisplayName("a pipeline has not landed a change that one of its sinks still holds")
+    void aChangeOneSinkStillHoldsIsNotLandedForThePipeline() {
+        InMemoryStorePort store = seedStoreWithTwoSinks();
+        GatedSource gatedSource = new GatedSource();
+        LifecycleActuator actuator = wireRuntime(store, gatedSource, UnaryOperator.identity(),
+                (connectorId, settings, writeMode, ddl, target, node) -> node.nodeId().contains(HELD_SYNC)
+                        ? (SupplierEx<SinkWriter>) HeldSinkWriter::new
+                        : (SupplierEx<SinkWriter>) CapturingSinkWriter::new);
+        SrsMetaStore meta = store.meta();
+        String chainId = SourceCaptureResolution
+                .of(StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID)).chainId().value();
+
+        actuator.start(PIPELINE);
+        try {
+            for (int id = 0; id < 4; id++) {
+                gatedSource.feed(change(id));
+            }
+            awaitSinkSize(4);
+            long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+            while (ackedPosition(meta, chainId) == null && !anyWriterLanded(meta, chainId, "src-3")) {
+                if (System.nanoTime() > deadline) {
+                    throw new AssertionError("the sink that wrote every change never said how far it got");
+                }
+                park();
+            }
+
+            assertThat(ackedPosition(meta, chainId))
+                    .as("where the pipeline resumes from while one of its sinks has written nothing: a resume "
+                            + "from where the other sink got to skips every change the held one holds")
+                    .isNull();
+            assertThat(meta.ringDoneThrough(chainId, PIPELINE).getOrDefault(TABLE, -1L))
+                    .as("how far the pipeline has nothing left to receive from the table's ring")
+                    .isNegative();
+
+            HeldSinkWriter.release();
+            awaitSinkAck(meta, chainId, "src-3");
+            assertThat(meta.ringDoneThrough(chainId, PIPELINE)).containsEntry(TABLE, 3L);
+        } finally {
+            HeldSinkWriter.release();
+            actuator.stop(PIPELINE, true);
+        }
+    }
+
+    /** Whether any writer of the pipeline's current run has landed {@code token} on the table. */
+    private static boolean anyWriterLanded(SrsMetaStore meta, String chainId, String token) {
+        return meta.writerRun(chainId, PIPELINE)
+                .map(run -> run.progressFor(TABLE).values().stream()
+                        .anyMatch(progress -> progress.lastTokened() != null
+                                && token.equals(progress.lastTokened().token())))
+                .orElse(false);
+    }
+
+    /** The seeded pipeline serving its stream to two destinations, one of which will hold its writes. */
+    private static InMemoryStorePort seedStoreWithTwoSinks() {
+        InMemoryStorePort store = seedStore();
+        store.artifacts().save(new SourceResource(HELD_DEST_ID, null, "fake", Map.of("host", "e"),
+                null, null, null, null));
+        store.artifacts().save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(SOURCE_ID, true)),
+                List.of(Step.inline("keep_all", FromClause.list(FromRef.literal(SOURCE_ID)),
+                        new TransformBody.Filter("true"), null)),
+                null,
+                new ServeBlock.Inline(null, FromRef.literal("keep_all"),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null),
+                                new SyncElement(HELD_SYNC, HELD_DEST_ID, null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+        return store;
     }
 
     /** The direct pipeline's acked position, or null while it has acked nothing. */
@@ -535,10 +630,12 @@ class CaptureToSinkAckFrontierTest {
         return meta.read(chainId).map(record -> record.sourceReadOffset()).orElse(null);
     }
 
+    /** The pipeline's acked position, or null while its record holds none - which a started run's record may. */
     private static String ackedPosition(SrsMetaStore meta, String chainId) {
         return meta.read(chainId).map(record -> record.consumerOffsets().stream()
                 .filter(offset -> offset.pipelineId().equals(PIPELINE))
                 .map(ConsumerOffset::sinkAckedSrcpos)
+                .filter(java.util.Objects::nonNull)
                 .findFirst()
                 .orElse(null)).orElse(null);
     }
@@ -625,6 +722,33 @@ class CaptureToSinkAckFrontierTest {
             // Sampled by the source before its first row. The run refuses to start a tail without one,
             // because a tail that begins wherever it likes loses every change made while the snapshot ran.
             return Optional.of(new SourcePosition("seam-0"));
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    /**
+     * Holds every write it is given until the test releases them all at once: a sink that has written
+     * nothing for as long as the test needs it to. JVM-static, like the capturing writer, because the sink
+     * opens its writer on the member and the test cannot reach that instance.
+     */
+    private static final class HeldSinkWriter implements SinkWriter {
+
+        private static volatile CompletableFuture<Void> gate = new CompletableFuture<>();
+
+        static void hold() {
+            gate = new CompletableFuture<>();
+        }
+
+        static void release() {
+            gate.complete(null);
+        }
+
+        @Override
+        public CompletionStage<WriteResult> write(List<Envelope> records) {
+            return gate.thenApply(ignored -> new WriteResult(records.size()));
         }
 
         @Override

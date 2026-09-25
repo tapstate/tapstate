@@ -68,6 +68,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.IntSupplier;
 import java.util.regex.Pattern;
@@ -348,7 +349,7 @@ final class StoreBackedDagSource implements DagSource {
                 builtPipeline,
                 bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
-                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId), fence), frontier, shape);
+                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier, shape);
     }
 
     /** The stream each source vertex emits: the table it reads, which is what its rows name as their stream. */
@@ -1284,14 +1285,23 @@ final class StoreBackedDagSource implements DagSource {
      * source the pipeline reads. The map is built here, on the assembly side; only serializable
      * coordinates ship.
      */
-    private SinkAckFactory sinkAckFactory(PipelineResource pipeline, String pipelineId) {
+    private SinkAckFactory sinkAckFactory(PipelineResource pipeline, String pipelineId, ExecutionFence fence) {
         // A snapshot-only read deliberately has no durable change-chain position. Its order exists for
         // stateful processing, not as a position a later tail can resume from, so settling it must not
         // manufacture a chain acknowledgement or ask for a cdc seam that cannot exist.
         if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
             return SinkAckFactory.NONE;
         }
-        return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId);
+        return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId, runIdOf(fence));
+    }
+
+    /**
+     * The name this run's writers report their progress under. A fenced run is named by its execution
+     * generation, which every submission moves; a single-member run has no generation and takes a name of
+     * its own, so no two starts ever share one and a writer of an earlier start lands nothing in a later one.
+     */
+    private static String runIdOf(ExecutionFence fence) {
+        return fence != null ? "g" + fence.executionGeneration() : "local-" + UUID.randomUUID();
     }
 
     /**

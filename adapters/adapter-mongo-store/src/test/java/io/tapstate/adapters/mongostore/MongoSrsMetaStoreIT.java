@@ -15,6 +15,8 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.WriterProgress;
+import io.tapstate.spi.store.WriterRun;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -362,6 +364,93 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * A run's writers each keep their own progress per table, and the run answers back all of it - every
+     * writer's, under the name it reported with, even a name holding the dot a field path would read as a
+     * step into a nested document - together with the generation the pipeline's load was read under.
+     */
+    @Test
+    void aWriterRunKeepsEachWritersProgressAndAnswersItBack() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.setCdcStart(CHAIN, "p1", "seam-0", 3L);
+            store.beginWriterRun(CHAIN, "p1", "g7", Map.of(
+                    "orders", List.of("serve.a#0", "view.v#0"),
+                    "items", List.of("serve.a#0")));
+
+            store.advanceWriter(CHAIN, "p1", "g7", "serve.a#0", "orders", new WriterProgress(
+                    new SourceOrder(3, 9), new ChainPosition(new SourceOrder(3, 8), "t8")));
+            WriterRun run = store.advanceWriter(CHAIN, "p1", "g7", "view.v#0", "orders",
+                    new WriterProgress(new SourceOrder(3, 5), null)).orElseThrow();
+
+            assertThat(run.runId()).isEqualTo("g7");
+            assertThat(run.expectedFor("orders")).containsExactly("serve.a#0", "view.v#0");
+            assertThat(run.expectedFor("items")).containsExactly("serve.a#0");
+            assertThat(run.progressFor("orders")).containsOnly(
+                    Map.entry("serve.a#0", new WriterProgress(
+                            new SourceOrder(3, 9), new ChainPosition(new SourceOrder(3, 8), "t8"))),
+                    Map.entry("view.v#0", new WriterProgress(new SourceOrder(3, 5), null)));
+            assertThat(run.snapshotEpoch()).isEqualTo(3L);
+            assertThat(store.writerRun(CHAIN, "p1")).contains(run);
+        });
+    }
+
+    /**
+     * Starting a run replaces the one before it whole: its accounting starts empty, and a writer of the
+     * replaced run is turned away at the store - what it says lands nowhere, however far it got.
+     */
+    @Test
+    void aReplacedRunTurnsItsWritersAwayAndTheNewOneStartsEmpty() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.beginWriterRun(CHAIN, "p1", "g7", Map.of("orders", List.of("serve.a#0")));
+            store.advanceWriter(CHAIN, "p1", "g7", "serve.a#0", "orders",
+                    new WriterProgress(new SourceOrder(1, 9), null));
+
+            store.beginWriterRun(CHAIN, "p1", "g8", Map.of("orders", List.of("serve.a#0")));
+
+            assertThat(store.advanceWriter(CHAIN, "p1", "g7", "serve.a#0", "orders",
+                    new WriterProgress(new SourceOrder(1, 12), null))).isEmpty();
+            WriterRun current = store.writerRun(CHAIN, "p1").orElseThrow();
+            assertThat(current.runId()).isEqualTo("g8");
+            assertThat(current.progressFor("orders")).isEmpty();
+            assertThat(store.advanceWriter(CHAIN, "p1", "g8", "serve.a#0", "orders",
+                    new WriterProgress(new SourceOrder(1, 4), null))).isPresent();
+        });
+    }
+
+    @Test
+    void aRewrittenConsumerRecordCarriesNoWriterRun() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.beginWriterRun(CHAIN, "p1", "g7", Map.of("orders", List.of("serve.a#0")));
+
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("p1", Map.of(), null));
+
+            assertThat(store.writerRun(CHAIN, "p1")).isEmpty();
+        });
+    }
+
+    /**
+     * Landed progress with no token behind it raises the table's ring place alone: the acked position is a
+     * token and the order it sat at, and there is no token to pair a new order with.
+     */
+    @Test
+    void aRingPlaceRaisedWithoutAnAckLeavesTheAckedPositionAsItWas() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 5), "t5"));
+
+            store.advanceRingDone(CHAIN, "p1", "orders", 9);
+            store.advanceRingDone(CHAIN, "p1", "orders", 7);
+            store.advanceRingDone(CHAIN, "p1", "orders", SourceOrder.SNAPSHOT_SEQ);
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsExactlyEntriesOf(Map.of("orders", 9L));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 5), "t5"));
+        });
+    }
+
     @Test
     void setCdcStartPersistsEachPipelinesSeamPositionAndGenerationIndependently() {
         withStore(store -> {
@@ -662,6 +751,13 @@ class MongoSrsMetaStoreIT {
             assertThatThrownBy(() -> store.markSnapshotComplete("nope", "p1", "orders"))
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.openEpoch("nope"))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> store.beginWriterRun("nope", "p", "g1", Map.of("orders", List.of("w#0"))))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> store.advanceWriter("nope", "p", "g1", "w#0", "orders",
+                    new WriterProgress(new SourceOrder(1, 1), null)))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> store.advanceRingDone("nope", "p", "orders", 1L))
                     .isInstanceOf(IllegalStateException.class);
         });
     }

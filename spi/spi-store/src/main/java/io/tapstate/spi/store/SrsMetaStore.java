@@ -203,6 +203,20 @@ public interface SrsMetaStore {
     }
 
     /**
+     * Raises how far {@code pipelineId} has nothing left to receive from {@code table}'s change ring to
+     * {@code seq}, leaving the chain's acked position as it is.
+     *
+     * <p>For progress that names no place a read can resume from: every change of the table at or below
+     * {@code seq} is durable in the pipeline's target, but the change there carried no token, so the acked
+     * position - a token and the order it sat at - has nothing new to say. A run replacing this one carries on
+     * in the ring from just past {@code seq} all the same. Only ever raised, never lowered. The default records
+     * nothing, which leaves a replacing run carrying on from the last acked change instead: more replayed than
+     * needed, nothing missed.
+     */
+    default void advanceRingDone(String miningChainId, String pipelineId, String table, long seq) {
+    }
+
+    /**
      * Records one pipeline's snapshot-to-cdc seam: the opaque position its cdc tail starts from, together
      * with the ring generation that pipeline's snapshot began in. A mutate on an unseeded chain is a
      * caller ordering error. The consumer entry is created when the pipeline has none yet, and only these

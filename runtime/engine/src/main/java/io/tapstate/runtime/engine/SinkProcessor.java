@@ -81,7 +81,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // init knows its index. See init.
     private SinkAck ack;
     private final SinkFrontier frontier;
-    private final FrontierGauge gauge;
+    private final FrontierGauge suppliedGauge;
+    // Which of the two the frontier readings go to, settled at init for the reason the delivery readings'
+    // is: the one supplied, or one that reads nothing when this processor is not running inside a job.
+    private FrontierGauge gauge;
     private final DeliveryGauge supplied;
     // Which of the two the readings actually go to, settled at init: the one supplied, or one that reads
     // nothing when this processor turns out not to be running inside a job. See init.
@@ -175,7 +178,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         this.writerOf = writerOf;
         this.totalOne = totalOne;
         this.writer = Objects.requireNonNull(writer, "writer");
-        this.gauge = Objects.requireNonNull(gauge, "gauge");
+        this.suppliedGauge = Objects.requireNonNull(gauge, "gauge");
+        this.gauge = this.suppliedGauge;
         this.supplied = Objects.requireNonNull(delivery, "delivery");
         this.delivery = this.supplied;
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -266,6 +270,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         // above, and for the same reason: neither exists until there is a job to hold it.
         if (instance == null && supplied.readableOnlyOnAJobThread()) {
             this.delivery = DeliveryGauge.none();
+        }
+        if (instance == null && suppliedGauge.readableOnlyOnAJobThread()) {
+            this.gauge = FrontierGauge.none();
         }
     }
 

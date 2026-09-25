@@ -19,6 +19,8 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -30,8 +32,16 @@ import org.mockito.AdditionalAnswers;
  * mining chain and the consumer pipeline, resolves the durable store from the member it runs on, and
  * advances that consumer's durable sink-acked position. It ships only serializable coordinates and binds
  * the store member-side, so nothing store-bound crosses the wire.
+ *
+ * <p>Every sink processor reports as a writer of the run, and the pipeline's record moves only as far as the
+ * slowest writer the run expects for a table. Most cases here have one writer, which is a pipeline with one
+ * sink: its record then says exactly what that writer landed. The cases with two are what the writers are
+ * kept apart for.
  */
 class StoreBackedSinkAckFactoryTest {
+
+    private static final String WRITER = "serve.s#0";
+    private static final String OTHER_WRITER = "serve.t#0";
 
     @Test
     void advancesTheDurableSinkAckedPositionForTheChainThatMapsToTheTable() {
@@ -40,8 +50,7 @@ class StoreBackedSinkAckFactoryTest {
         store.create("mc-items", null);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(
-                Map.of("orders", "mc-orders", "items", "mc-items"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders", "items", "mc-items"), "pipe-1");
 
         ack.advance("orders", at(7, "w7"));
         ack.advance("items", at(3, "w3"));
@@ -57,7 +66,7 @@ class StoreBackedSinkAckFactoryTest {
         store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
 
         // A snapshot row is ordered but is not a spot in a change stream, so it has no token. The frontier
         // has confirmed rows of the snapshot and no change at all, which is exactly where cdc begins.
@@ -73,8 +82,7 @@ class StoreBackedSinkAckFactoryTest {
         store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(
-                Map.of("orders", "mc-orders", "items", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders", "items", "mc-orders"), "pipe-1");
 
         ack.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
 
@@ -99,7 +107,7 @@ class StoreBackedSinkAckFactoryTest {
         store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
 
         ack.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
         ack.advance("orders", at(7, "w7"));
@@ -122,7 +130,7 @@ class StoreBackedSinkAckFactoryTest {
         store.create("mc-orders", null);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
 
         ack.advance("orders", at(7, "w7"));
 
@@ -137,8 +145,7 @@ class StoreBackedSinkAckFactoryTest {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-shop", null);
         HazelcastInstance member = memberWith(store);
-        SinkAck ack = new StoreBackedSinkAckFactory(
-                Map.of("orders", "mc-shop", "items", "mc-shop"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-shop", "items", "mc-shop"), "pipe-1");
 
         ack.advance("orders", at(7, "w7"));
         ack.advance("items", at(3, "w3"));
@@ -156,7 +163,7 @@ class StoreBackedSinkAckFactoryTest {
         store.create("mc-orders", null);
         store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
         HazelcastInstance member = memberWith(store);
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
 
         ack.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
 
@@ -169,11 +176,12 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     @Test
-    void aTokenlessPositionOnAChainWithNoRecordIsAnInvariantViolation() {
+    void aSnapshotRowOfAPipelineThatRecordedNoCdcStartIsAnInvariantViolation() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
 
         // The capture writes where cdc begins before it drains a snapshot, so a snapshot row reaching a sink
         // without one means this pipeline was never seeded. Writing an absent position over a real one would
@@ -190,7 +198,7 @@ class StoreBackedSinkAckFactoryTest {
         store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-2").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-2");
 
         assertThatThrownBy(() -> ack.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null)))
                 .isInstanceOf(IllegalStateException.class)
@@ -201,20 +209,26 @@ class StoreBackedSinkAckFactoryTest {
     void resolvesToANoOpWhenNoStoreIsBoundOnTheMember() {
         HazelcastInstance member = mock(HazelcastInstance.class);
         when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>());
-
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        StoreBackedSinkAckFactory factory =
+                new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1", "run-1");
 
         // A member the assembly layer has not made SRS-capable resolves to a no-op ack rather than failing,
-        // mirroring the read-cursor publisher; a sink still runs before the store is bound.
+        // mirroring the read-cursor publisher; a sink still runs before the store is bound. Starting the run
+        // there starts nothing, for the same reason.
+        factory.beginRun(member, Map.of("orders", List.of(WRITER)));
+        SinkAck ack = factory.resolve(member).forWriter(WRITER);
+
         assertThat(catchThrowable(() -> ack.advance("orders", at(1, "w1")))).isNull();
+        assertThat(catchThrowable(() -> ack.bounded("orders", new SourceOrder(1, 2)))).isNull();
     }
 
     @Test
     void aChainWithNoMappedTableIsAnInvariantViolation() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
 
         // The sink advances a chain the pipeline never sourced: a builder-side wiring defect, surfaced bare.
         assertThatThrownBy(() -> ack.advance("unknown_table", at(1, "w1")))
@@ -223,14 +237,14 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     @Test
-    void aChangeThatNamesNoPositionIsAckedByItsOrderAloneRatherThanRefused() {
+    void aChangeThatNamesNoPositionLandsByItsOrderWithoutInventingAToken() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         // A chain with no cdc start, which is every chain a cdc_only read ever has: only the snapshot
         // phase writes where changes begin, and that mode does not run one.
         store.create("mc-orders", null);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
 
         // A source names a position for a run of changes when it has one and names none when it has not,
         // and that absence is load-bearing: the contract has a recipient carry on rather than invent one,
@@ -238,12 +252,15 @@ class StoreBackedSinkAckFactoryTest {
         // cdc start here instead crashed the whole job, with nothing ever delivered to the target.
         ack.advance("orders", at(7, null));
 
-        ChainPosition acked = ackedChainPosition(store, "mc-orders", "pipe-1");
-        // Both halves, because each fails on its own: an ack quietly dropped would leave the frontier
-        // with no input and still not throw, and a token conjured from somewhere would resume a later
-        // run past changes it never delivered.
-        assertThat(acked.order()).isEqualTo(new SourceOrder(1, 7));
-        assertThat(acked.token()).isNull();
+        // Both halves, because each fails on its own: an ack quietly dropped would leave a replacing run
+        // starting the ring over from where it last knew, and a token conjured from somewhere would resume
+        // a later run past changes it never delivered.
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .as("the change landed, so a replacing run carries on in the ring past it")
+                .containsEntry("orders", 7L);
+        assertThat(ackedChainPosition(store, "mc-orders", "pipe-1"))
+                .as("and nothing a read could resume from was recorded, because the change named nothing")
+                .isNull();
     }
 
     @Test
@@ -252,7 +269,7 @@ class StoreBackedSinkAckFactoryTest {
         store.create("mc-orders", null);
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
 
         ack.advance("orders", at(7, "w7"));
 
@@ -274,10 +291,8 @@ class StoreBackedSinkAckFactoryTest {
         HazelcastInstance member = memberWith(store);
 
         // A second pipeline on the same chain, three changes behind the first.
-        new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-2").resolve(member)
-                .advance("orders", at(4, "w4"));
-        new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member)
-                .advance("orders", at(7, "w7"));
+        soleWriter(member, Map.of("orders", "mc-orders"), "pipe-2").advance("orders", at(4, "w4"));
+        soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1").advance("orders", at(7, "w7"));
 
         // The faster one's acknowledgement must not carry the chain past what the slower one holds: a
         // change that sink has not written is one this chain still has to be able to hand out again, and
@@ -294,13 +309,10 @@ class StoreBackedSinkAckFactoryTest {
         store.upsertConsumerOffset("mc-orders", new ConsumerOffset("pipe-2", Map.of(), null));
         HazelcastInstance member = memberWith(store);
 
-        new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member)
-                .advance("orders", at(7, "w7"));
+        soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1").advance("orders", at(7, "w7"));
 
-        // Green before this file learned to record the read as well as the ack, and that is what it is
-        // for: it holds the half that must not change. Nothing is known about how far that consumer has
-        // got, so nothing may be written -- a chain that read past it would drop changes it was never
-        // handed.
+        // Nothing is known about how far that consumer has got, so nothing may be written -- a chain that
+        // read past it would drop changes it was never handed.
         assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isNull();
     }
 
@@ -323,7 +335,7 @@ class StoreBackedSinkAckFactoryTest {
         SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
         for (int seq = 3; seq <= 7; seq++) {
             ack.advance("orders", at(seq, "w" + seq));
         }
@@ -352,7 +364,7 @@ class StoreBackedSinkAckFactoryTest {
         SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
         HazelcastInstance member = memberWith(store);
 
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1").resolve(member);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
         for (int seq = 3; seq <= 7; seq++) {
             ack.advance("orders", at(seq, "w" + seq));
         }
@@ -365,9 +377,196 @@ class StoreBackedSinkAckFactoryTest {
                 .isEqualTo("w2");
     }
 
+    /**
+     * Two writers land one table, and the pipeline has landed it as far as the slower one has - not as far as
+     * whichever reported last, and not as far as the faster one. A resume from the faster one's position
+     * would skip every change the slower one still holds, and nothing would ever write them again.
+     */
+    @Test
+    void aTableHasLandedOnlyAsFarAsItsSlowestWriter() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER, OTHER_WRITER)));
+        SinkAck fast = factory.resolve(member).forWriter(WRITER);
+        SinkAck slow = factory.resolve(member).forWriter(OTHER_WRITER);
+
+        slow.advance("orders", at(50, "w50"));
+        fast.advance("orders", at(100, "w100"));
+
+        assertThat(ackedPosition(store, "mc-orders", "pipe-1"))
+                .as("where the pipeline resumes: the slower writer's position, reported first or not")
+                .isEqualTo("w50");
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).containsEntry("orders", 50L);
+
+        slow.advance("orders", at(100, "w100"));
+
+        assertThat(ackedPosition(store, "mc-orders", "pipe-1"))
+                .as("and once the slower one has caught up, both of theirs")
+                .isEqualTo("w100");
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).containsEntry("orders", 100L);
+    }
+
+    /**
+     * A writer handed none of a table's rows holds the table back until a bound says none are coming, and no
+     * longer. Until it has said anything it may be holding every change there is; once a bound covers them,
+     * it is holding none, and the other writer's progress stands.
+     */
+    @Test
+    void aWriterGivenNoneOfATablesRowsHoldsItBackOnlyUntilABoundSaysNoneAreComing() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER, OTHER_WRITER)));
+        SinkAck busy = factory.resolve(member).forWriter(WRITER);
+        SinkAck idle = factory.resolve(member).forWriter(OTHER_WRITER);
+
+        busy.advance("orders", at(7, "w7"));
+
+        assertThat(ackedPosition(store, "mc-orders", "pipe-1"))
+                .as("a writer that has said nothing may be holding every change there is")
+                .isNull();
+
+        idle.bounded("orders", new SourceOrder(1, 9));
+
+        assertThat(ackedPosition(store, "mc-orders", "pipe-1")).isEqualTo("w7");
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .as("and the ring no further than the busy writer got: the bound runs past it, the rows do not")
+                .containsEntry("orders", 7L);
+    }
+
+    /**
+     * The table's load is recorded as landed only once every writer the run expects has passed it: each
+     * writer is given its own share of the load's rows, and the one that has not reported may still hold its
+     * share.
+     */
+    @Test
+    void theLoadIsRecordedOnlyOnceEveryWriterHasPassedIt() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER, OTHER_WRITER)));
+
+        factory.resolve(member).forWriter(WRITER).advance("orders",
+                new ChainPosition(SourceOrder.snapshotRow(1), null));
+
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1")).isEmpty();
+
+        factory.resolve(member).forWriter(OTHER_WRITER).advance("orders",
+                new ChainPosition(SourceOrder.snapshotRow(1), null));
+
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1"))
+                .containsExactly("orders");
+    }
+
+    /**
+     * A writer of a run that a later one has replaced lands nothing, however far it got: it belongs to a run
+     * being stopped, and what it says could stand for a writer of the current run that has landed less.
+     */
+    @Test
+    void aWriterOfAReplacedRunLandsNothing() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        Map<String, String> chains = Map.of("orders", "mc-orders");
+        SinkAck stale = startedRun(member, chains, "pipe-1", Map.of("orders", List.of(WRITER)), "run-1")
+                .resolve(member).forWriter(WRITER);
+        StoreBackedSinkAckFactory current =
+                startedRun(member, chains, "pipe-1", Map.of("orders", List.of(WRITER)), "run-2");
+
+        stale.advance("orders", at(9, "w9"));
+
+        assertThat(ackedPosition(store, "mc-orders", "pipe-1")).isNull();
+        assertThat(store.writerRun("mc-orders", "pipe-1").orElseThrow().progressFor("orders")).isEmpty();
+
+        current.resolve(member).forWriter(WRITER).advance("orders", at(5, "w5"));
+
+        assertThat(ackedPosition(store, "mc-orders", "pipe-1")).isEqualTo("w5");
+    }
+
+    /**
+     * A writer reporting into a run nothing started crashes bare: an execution starts its run before any of
+     * its writers exists, so this is a writer wired to the wrong run, and nothing would ever wait for what it
+     * landed.
+     */
+    @Test
+    void aWriterReportingIntoARunNothingStartedIsAnInvariantViolation() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1", "run-1")
+                .resolve(member).forWriter(WRITER);
+
+        assertThatThrownBy(() -> ack.advance("orders", at(7, "w7")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("run-1");
+    }
+
+    /**
+     * A writer the run does not route a table to, reporting that table, crashes bare: left out of the writers
+     * the run waits for, it would hold nothing back, and a resume could pass the changes it still holds.
+     */
+    @Test
+    void aWriterTheRunDoesNotRouteATableToIsAnInvariantViolation() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        SinkAck ack = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(OTHER_WRITER))).resolve(member).forWriter(WRITER);
+
+        assertThatThrownBy(() -> ack.advance("orders", at(7, "w7")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(WRITER);
+    }
+
+    /**
+     * The member's ack, before a writer is named, lands nothing at all: progress with no writer behind it has
+     * no place among the writers the run waits for, and a record it moved would stand for all of them.
+     */
+    @Test
+    void anAckNoWriterIsNamedForLandsNothing() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        SinkAck unbound = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER))).resolve(member);
+
+        assertThatThrownBy(() -> unbound.advance("orders", at(7, "w7")))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(ackedPosition(store, "mc-orders", "pipe-1")).isNull();
+    }
+
     /** One change's position: the order the engine assigned it, and the token the connector gave. */
     private static ChainPosition at(long seq, String token) {
         return new ChainPosition(new SourceOrder(1, seq), token);
+    }
+
+    /**
+     * The ack of a pipeline whose one sink is its only writer: the run started with that writer expected on
+     * every table the pipeline reads, and the member's ack bound to it - the way every sink reports.
+     */
+    private static SinkAck soleWriter(HazelcastInstance member, Map<String, String> chainIdByTable, String pipelineId) {
+        Map<String, List<String>> writers = new LinkedHashMap<>();
+        chainIdByTable.keySet().forEach(table -> writers.put(table, List.of(WRITER)));
+        return startedRun(member, chainIdByTable, pipelineId, writers).resolve(member).forWriter(WRITER);
+    }
+
+    private static StoreBackedSinkAckFactory startedRun(HazelcastInstance member,
+            Map<String, String> chainIdByTable, String pipelineId, Map<String, List<String>> writersByTable) {
+        return startedRun(member, chainIdByTable, pipelineId, writersByTable, "run-1");
+    }
+
+    /** A factory for {@code runId}, with the run started as an execution starts it. */
+    private static StoreBackedSinkAckFactory startedRun(HazelcastInstance member,
+            Map<String, String> chainIdByTable, String pipelineId, Map<String, List<String>> writersByTable,
+            String runId) {
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(chainIdByTable, pipelineId, runId);
+        factory.beginRun(member, writersByTable);
+        return factory;
     }
 
     private static HazelcastInstance memberWith(SrsMetaStore store) {
@@ -382,6 +581,7 @@ class StoreBackedSinkAckFactoryTest {
         return store.read(chainId).orElseThrow().consumerOffsets().stream()
                 .filter(offset -> offset.pipelineId().equals(pipelineId))
                 .map(ConsumerOffset::sinkAcked)
+                .filter(java.util.Objects::nonNull)
                 .findFirst()
                 .orElse(null);
     }
@@ -390,6 +590,7 @@ class StoreBackedSinkAckFactoryTest {
         return store.read(chainId).orElseThrow().consumerOffsets().stream()
                 .filter(offset -> offset.pipelineId().equals(pipelineId))
                 .map(ConsumerOffset::sinkAckedSrcpos)
+                .filter(java.util.Objects::nonNull)
                 .findFirst()
                 .orElse(null);
     }

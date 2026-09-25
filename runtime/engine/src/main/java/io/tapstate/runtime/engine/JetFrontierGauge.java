@@ -47,6 +47,11 @@ final class JetFrontierGauge implements FrontierGauge {
                 stallsByChain.computeIfAbsent(chain, JetFrontierGauge::stallMetricFor).set(millis));
     }
 
+    @Override
+    public boolean readableOnlyOnAJobThread() {
+        return true;
+    }
+
     /** The chain a distance named {@code metric} concerns, or {@code null} when it is not one of these. */
     static String chainOf(String metric) {
         return metric.startsWith(METRIC_PREFIX) ? metric.substring(METRIC_PREFIX.length()) : null;

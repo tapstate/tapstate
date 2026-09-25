@@ -2,6 +2,8 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
 import java.io.Serializable;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Resolves, on the member it runs on, the {@link SinkAck} a sink advances its durable watermark through. It
@@ -24,4 +26,16 @@ public interface SinkAckFactory extends Serializable {
      * watermark through, bound to the store the member holds.
      */
     SinkAck resolve(HazelcastInstance member);
+
+    /**
+     * Starts the accounting one execution of the graph lands its progress under, on the member coordinating
+     * that execution and before any writer of it exists: for each chain, every writer the graph routes that
+     * chain's changes to, named as {@link SinkProcessor#writerId} names them.
+     *
+     * <p>How far a pipeline has landed a chain is the lowest of what those writers have landed, so the set
+     * comes first: progress from a writer nobody knew to wait for would be progress nobody waits on. A factory
+     * whose acks do not keep writers apart has nothing to start, which is the default.
+     */
+    default void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
+    }
 }
