@@ -76,6 +76,9 @@ class ASourceRefusedPartWayThroughItsRingWaitsForTheClusterTest {
     void aSourceRefusedAfterItHasStartedReadingWaitsForTheClusterInsteadOfEndingTheRun()
             throws InterruptedException {
         member = Hazelcast.newHazelcastInstance(member());
+        // The verdict is worked out on the heartbeat, after the member has started, so a write made before
+        // the first one is refused for that reason alone - which is not the refusal this case is about.
+        awaitProtectionSatisfied(member);
         SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
         append(ring, 0, BEFORE);
         Job job = member.getJet().newJob(sourceToList(), new JobConfig()
@@ -148,6 +151,17 @@ class ASourceRefusedPartWayThroughItsRingWaitsForTheClusterTest {
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(SINK)).localParallelism(1);
         dag.edge(between(source, render)).edge(between(render, sink));
         return dag;
+    }
+
+    /** Until {@code member}'s protection admits the cluster, which it does once its first verdict is in. */
+    private static void awaitProtectionSatisfied(HazelcastInstance member) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        while (!member.getSplitBrainProtectionService().getSplitBrainProtection(PROTECTION).hasMinimumSize()) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("the protection never admitted the cluster it was started on");
+            }
+            Thread.sleep(25);
+        }
     }
 
     private static void append(SrsRingbuffer ring, int from, int count) {

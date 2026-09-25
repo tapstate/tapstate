@@ -71,6 +71,10 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
     void aSourceRefusedItsFirstReadWaitsForTheClusterInsteadOfEndingTheRun() throws InterruptedException {
         first = Hazelcast.newHazelcastInstance(member());
         second = Hazelcast.newHazelcastInstance(member());
+        // A member's verdict is worked out after it has started, so a write made before both have one is
+        // refused for that reason alone - which is not the refusal this case is about.
+        awaitProtectionSatisfied(first);
+        awaitProtectionSatisfied(second);
         // Written while the protection is satisfied, so what the source later cannot reach is a ring that
         // demonstrably holds these changes rather than one that was never filled.
         fill(first, CHANGES);
@@ -152,6 +156,17 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(SINK)).localParallelism(1);
         dag.edge(between(source, render)).edge(between(render, sink));
         return dag;
+    }
+
+    /** Until {@code member}'s protection admits the cluster, which it does once its first verdict is in. */
+    private static void awaitProtectionSatisfied(HazelcastInstance member) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        while (!member.getSplitBrainProtectionService().getSplitBrainProtection(PROTECTION).hasMinimumSize()) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("the protection never admitted the cluster it was started on");
+            }
+            Thread.sleep(25);
+        }
     }
 
     private static void fill(HazelcastInstance member, int count) {
