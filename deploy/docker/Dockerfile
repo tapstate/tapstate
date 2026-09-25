@@ -33,7 +33,7 @@ RUN set -eu; \
     fi; \
     mv "$1" tapstate.jar
 
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:21-jre AS runtime-base
 
 # Image self-description (OCI). The source label connects this package to its repository, so the
 # registry renders the repository README on the package page; the description states the preview
@@ -93,3 +93,19 @@ ENTRYPOINT ["java", "-jar", "/opt/tapstate/tapstate.jar"]
 
 # Overridable: replacing it is how an operator passes a different role or extra Spring arguments.
 CMD ["--role=all"]
+
+# Cloud release builds reuse the exact Boot JAR and runtime layers above. The connector context is
+# supplied only to this target, so ordinary server builds neither fetch nor bundle connector jars.
+FROM runtime-base AS cloud
+LABEL org.opencontainers.image.title="Tapstate Cloud cluster" \
+      org.opencontainers.image.description="Tapstate Cloud cluster runtime with a verified connector seed"
+COPY --from=cloud_connectors --chown=tapstate:tapstate /connectors/ /opt/tapstate/connectors/
+COPY --from=cloud_connectors --chown=tapstate:tapstate /release/ /opt/tapstate/release/
+ENV TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors
+RUN set -eu; \
+    cd /opt/tapstate/connectors; \
+    sha256sum -c /opt/tapstate/release/connectors.sha256; \
+    test "$(find . -maxdepth 1 -type f -name '*-connector.jar' | wc -l | tr -d ' ')" = 7
+
+# Keep the standard image as the default target and preserve its on-prem connector lifecycle.
+FROM runtime-base AS server
