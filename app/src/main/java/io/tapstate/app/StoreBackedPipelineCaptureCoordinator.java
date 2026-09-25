@@ -230,10 +230,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     }
                     runs.add(PipelineRun.managed(captureId, run));
                 }
-                if (!run.loading()) {
+                if (run.loadOverWhenHandedBack()) {
                     // Handed back with its load already over -- read on this thread, or none owed. What the
                     // run said about each table as it went is said again here, so a starter that says
                     // nothing still leaves every table reported and every declared load ended.
+                    //
+                    // Only such a run. A load read behind the run reports each table itself, as its rows
+                    // are all in, and one that has ended by the time this looks may have ended by failing:
+                    // what arrived of the table it failed on is a prefix, and ending that declaration here
+                    // is what would let the table be recorded as written short.
                     loadOver(pipelineId, plan, run, observedSnapshotCounts, load);
                 }
                 snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
@@ -946,6 +951,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (!owned.pipelines.isEmpty()) {
             if (pipelineRun.run != owned.run) {
                 pipelineRun.run.close();
+            } else {
+                // The run stays, because the pipelines still on the capture read what it goes on to do; the
+                // load in it was this pipeline's alone, so that is let go of. Left reading, it would end on
+                // the release of this pipeline's hand-off below, as a failure of the run the others read --
+                // or, not waiting for room at that moment, go on handing rows to a queue nothing declares,
+                // bounds or drains.
+                owned.run.abandonLoad();
             }
             return;
         }

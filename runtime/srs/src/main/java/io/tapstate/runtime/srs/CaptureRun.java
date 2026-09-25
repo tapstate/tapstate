@@ -152,6 +152,29 @@ public final class CaptureRun implements AutoCloseable {
     }
 
     /**
+     * Whether this run came back with its load already over -- read on the thread that started it, or none
+     * owed -- rather than {@linkplain CaptureRunUnit#begin begun} with its load still to read. Settled when the
+     * run is made. {@link #loading()} is not the same question asked later: once a load read behind the run
+     * has ended, it answers alike whether that load went through, failed or was abandoned.
+     */
+    public boolean loadOverWhenHandedBack() {
+        return load == null;
+    }
+
+    /**
+     * Lets go of the load this run is still reading and keeps the rest of the run: the tail that follows the
+     * load opens once the read has let go, as it would have after the last row, and nothing of the load is
+     * reported or counted as a failure. For a run other pipelines go on reading after the pipeline whose load
+     * it was has stopped -- the load was that pipeline's alone, the tail is theirs as well. A run handed back
+     * with its load over has nothing to let go of.
+     */
+    public void abandonLoad() {
+        if (load != null) {
+            load.abandonLoad();
+        }
+    }
+
+    /**
      * Stops the capture: abandons a load still being read, then closes the cdc subscription, or does
      * nothing when the run has neither.
      */

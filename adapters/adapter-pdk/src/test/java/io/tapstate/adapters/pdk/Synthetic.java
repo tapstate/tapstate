@@ -653,6 +653,37 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.BadRow", source("BadRow", "", register));
     }
 
+    /**
+     * The same unprojectable row, handed over the way a JDBC connector hands over its rows: from inside the
+     * callback its query runs the result set through, with whatever that callback throws wrapped in an
+     * exception of the connector's own.
+     */
+    static Path wrappingBadRowSource(Path dir) {
+        String register = "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + row("b", 1)
+                + "  evs.add(TapDeleteRecordEvent.create().table(\"t1\").referenceTime(1L).before(b));"
+                + "  try { consumer.accept(evs, null); }"
+                + "  catch (Throwable t) { throw new RuntimeException(\"the query failed\", t); }"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.WrappingBadRow", source("WrappingBadRow", "", register));
+    }
+
+    /**
+     * The same unprojectable row, handed over by a connector that catches whatever its hand-over throws and
+     * reads on -- as one reading on a thread of its own does, keeping the failure for later or dropping it.
+     */
+    static Path swallowingBadRowSource(Path dir) {
+        String register = "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + row("b", 1)
+                + "  evs.add(TapDeleteRecordEvent.create().table(\"t1\").referenceTime(1L).before(b));"
+                + "  try { consumer.accept(evs, null); } catch (Throwable ignored) { }"
+                + "});";
+        return SyntheticJar.compileToJar(
+                dir, "synthetic.SwallowingBadRow", source("SwallowingBadRow", "", register));
+    }
+
     /** Records target preparation independently of record delivery. */
     static Path preparationSink(Path dir, Path trace, boolean exists) {
         String register = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\"); });"

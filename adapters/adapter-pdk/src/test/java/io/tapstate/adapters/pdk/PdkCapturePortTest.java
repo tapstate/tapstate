@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -270,6 +271,53 @@ class PdkCapturePortTest {
         assertThatThrownBy(() -> takeAll(port.snapshot(config("t1"))))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.PROJECTION_FAILED));
+    }
+
+    /**
+     * Still a projection failure when the connector wraps whatever its hand-over throws, as a JDBC one does
+     * around the callback its query runs the result set through. A row refused while the hand-over is under
+     * way reaches the taker inside the connector's exception, and so under the code for a read that failed:
+     * a message sending whoever reads it to the source rather than to the row.
+     */
+    @Test
+    void anUnprojectableRowIsAProjectionFailureWhenTheConnectorWrapsWhatItsHandOverThrows(@TempDir Path dir) {
+        Path jar = Synthetic.wrappingBadRowSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.WrappingBadRow", null));
+        assertThatThrownBy(() -> takeAll(port.snapshot(config("t1"))))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.PROJECTION_FAILED));
+    }
+
+    /**
+     * And not lost when the connector catches whatever its hand-over throws and reads on. A row refused while
+     * the hand-over is under way goes with the batch the connector drops, and the read then ends as one read
+     * through: the table short, and nothing said.
+     */
+    @Test
+    void anUnprojectableRowIsNotLostWhenTheConnectorSwallowsWhatItsHandOverThrows(@TempDir Path dir) {
+        Path jar = Synthetic.swallowingBadRowSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.SwallowingBadRow", null));
+        assertThatThrownBy(() -> takeAll(port.snapshot(config("t1"))))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.PROJECTION_FAILED));
+    }
+
+    /**
+     * A read abandoned before it has sampled its seam leaves no connector running behind it. The abandonment
+     * is reported as itself, and waiting on the seam hands such an end back unwrapped -- past the clean-up
+     * that every other early failure of the read goes through.
+     */
+    @Test
+    void aReadAbandonedBeforeItsSeamStopsItsConnector(@TempDir Path dir) {
+        Path jar = Synthetic.emittingSource(dir);
+        PdkConnector connector = PdkConnector.open(
+                "demo", new ConnectorRef(List.of(jar), "synthetic.EmittingSource", "2.0.8", null), Map.of());
+        CancellationException abandoned = new CancellationException("abandoned before its seam");
+
+        assertThatThrownBy(() -> PdkCaptureBatch.start(connector, reading -> {
+            throw abandoned;
+        }, "abandoned-read")).isSameAs(abandoned);
+        assertThat(connector.isAlive()).as("the connector was stopped").isFalse();
     }
 
     /** Takes every row of {@code batch} and closes it, the way a snapshot phase does. */

@@ -52,10 +52,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * for a read capability it does not provide is a caller invariant violation (the DSL validated the
  * connector's modes upstream) and crashes bare rather than being laundered into a code.
  *
- * <p>A snapshot read runs on a background thread of its own, decoding each of the connector's batches as
- * it is handed over and staying a few batches ahead of whoever takes the rows; the connector's read loop
- * waits when it gets further ahead than that, so a table of any size holds the same few thousand rows at
- * once. The cdc stream runs on a background thread that delivers each decoded change to the listener; how a
+ * <p>A snapshot read runs on a background thread of its own, staying a few of the connector's batches ahead
+ * of whoever takes the rows, who decodes each batch as it takes it; the connector's read loop waits when it
+ * gets further ahead than that, so a table of any size holds the same few thousand rows at once. The cdc
+ * stream runs on a background thread that delivers each decoded change to the listener; how a
  * stream failure reaches the caller and the backpressure that bounds the stream belong to the runtime that
  * owns stream execution, not to this port.
  */
@@ -293,10 +293,11 @@ public final class PdkCapturePort implements CapturePort {
      * all -- the same shape of loss, but silent. It is handed over the moment it is taken, rather than
      * with the rows, because it is only the right position while it is the one taken before the first row.
      *
-     * <p>Each of the connector's batches is decoded as it arrives, against the tables it was read from. A
-     * connector's own way back from a converted value reads the column's declared type to decide what to
-     * rebuild, so a row decoded without its table can be written to a target of the same kind and still
-     * land as text.
+     * <p>Each of the connector's batches is decoded when it is taken, against the tables it was read from --
+     * not here, inside the connector's own read loop, where a refusal would be the connector's to wrap or to
+     * swallow before it reached anybody. A connector's own way back from a converted value reads the column's
+     * declared type to decide what to rebuild, so a row decoded without its table can be written to a target
+     * of the same kind and still land as text.
      */
     private Void batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch,
             PdkCaptureBatch reading) throws Throwable {
@@ -318,8 +319,14 @@ public final class PdkCapturePort implements CapturePort {
                 throw new IllegalStateException(
                         "stream " + stream + " was requested but the connector did not discover it");
             }
-            batch.batchRead(connector.context(), table, null, BATCH_SIZE,
-                    (events, offset) -> reading.rowsRead(decodeSnapshotRows(connector, events, declared)));
+            batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
+                if (events.isEmpty()) {
+                    return;
+                }
+                // A copy: the list is the connector's, and is decoded only once somebody takes it.
+                List<TapEvent> handed = new ArrayList<>(events);
+                reading.rowsRead(() -> decodeSnapshotRows(connector, handed, declared));
+            });
         }
         return null;
     }

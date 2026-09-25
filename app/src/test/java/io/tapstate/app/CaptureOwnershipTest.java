@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FromClause;
@@ -17,9 +18,18 @@ import io.tapstate.runtime.srs.CaptureError;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
+import io.tapstate.spi.capture.CaptureBatch;
+import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.ConnectionReport;
+import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.ConsumerOffset;
@@ -40,12 +50,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -117,6 +129,89 @@ class CaptureOwnershipTest {
         nodeB.stopCapture("q", false);
         nodeA.close();
         nodeB.close();
+    }
+
+    /**
+     * Stopping the pipeline whose run the others on a capture share lets go of that pipeline's load. The run
+     * stays, because the pipelines still on the capture read what it goes on to do; the load in it was the
+     * stopped pipeline's alone. Left reading, it went on handing rows to a hand-off the stop had already
+     * released -- a queue nobody declared, bounds or drains -- which is the rest of the table on the heap, for
+     * nobody.
+     */
+    @Test
+    void stoppingThePipelineWhoseRunOthersShareLetsGoOfItsLoad() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "p", "q"));
+        HeldSnapshots source = new HeldSnapshots(true);
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        StoreBackedPipelineCaptureCoordinator node = managed(store, reading(source, store), buffer);
+        node.startCapture("p");
+        node.startCapture("q");
+
+        node.stopCapture("p", false);
+        source.rest.countDown();
+        awaitLoadLetGo("p");
+
+        assertThat(buffer.drain("p", SourceCaptureResolution.of(SOURCE).ringName()))
+                .as("rows of the stopped pipeline's load, handed over after the stop").isEmpty();
+        assertThat(node.captureFailure("q")).isEmpty();
+        node.stopCapture("q", false);
+        node.close();
+    }
+
+    /**
+     * Nor is that stop a failure of the pipelines still on the capture. The load ends when the stop releases
+     * the hand-off it is waiting on, the way a closed run's load ends, and that end is the stop's: the run the
+     * others read goes on healthy.
+     */
+    @Test
+    void stoppingThePipelineWhoseRunOthersShareIsNotTheirFailure() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "p", "q"));
+        // Room for one row, so the second of each load waits for room nobody is making.
+        SnapshotBuffer buffer = new SnapshotBuffer(1);
+        StoreBackedPipelineCaptureCoordinator node =
+                managed(store, reading(new HeldSnapshots(false), store), buffer);
+        node.startCapture("p");
+        node.startCapture("q");
+        awaitLoadWaitingForRoom("p");
+
+        node.stopCapture("p", false);
+        awaitLoadLetGo("p");
+
+        assertThat(node.captureFailure("q")).isEmpty();
+        node.stopCapture("q", false);
+        node.close();
+    }
+
+    /** The run unit reading {@code source}, with nothing of a ring to open: its loads are snapshot-only. */
+    private static CaptureAttacher reading(CapturePort source, InMemoryStorePort store) {
+        CaptureRunUnit unit = new CaptureRunUnit(
+                source, new SrsCoordinator(store.meta()), store.meta(), mock(HazelcastInstance.class));
+        return unit::begin;
+    }
+
+    /** Waits for the thread reading {@code pipelineId}'s load to be gone, so what it did is all it did. */
+    private static void awaitLoadLetGo(String pipelineId) throws InterruptedException {
+        awaitLoadThread(pipelineId, "let go", List::isEmpty);
+    }
+
+    /** Waits for the thread reading {@code pipelineId}'s load to be parked, waiting for room. */
+    private static void awaitLoadWaitingForRoom(String pipelineId) throws InterruptedException {
+        awaitLoadThread(pipelineId, "wait for room",
+                threads -> threads.stream().anyMatch(thread -> thread.getState() == Thread.State.WAITING));
+    }
+
+    private static void awaitLoadThread(String pipelineId, String what, Predicate<List<Thread>> reached)
+            throws InterruptedException {
+        String name = "tapstate-load-" + pipelineId + "-" + SOURCE.id();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!reached.test(Thread.getAllStackTraces().keySet().stream()
+                .filter(thread -> thread.getName().equals(name) && thread.isAlive())
+                .toList())) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("the load of " + pipelineId + " did not " + what);
+            }
+            Thread.sleep(20);
+        }
     }
 
     @Test
@@ -618,10 +713,99 @@ class CaptureOwnershipTest {
             ClusterMembershipGate gate,
             MemoryClaims raw,
             WorkloadOwner owner) {
+        return managed(store, attacher, gate, raw, owner, new SnapshotBuffer());
+    }
+
+    /** One member alone in its cluster, handing its loads over through {@code buffer}. */
+    private static StoreBackedPipelineCaptureCoordinator managed(
+            InMemoryStorePort store, CaptureAttacher attacher, SnapshotBuffer buffer) {
+        return managed(store, attacher, eligibleGate(), new MemoryClaims(), Member.owner("node-a"), buffer);
+    }
+
+    private static StoreBackedPipelineCaptureCoordinator managed(
+            InMemoryStorePort store,
+            CaptureAttacher attacher,
+            ClusterMembershipGate gate,
+            MemoryClaims raw,
+            WorkloadOwner owner,
+            SnapshotBuffer buffer) {
         CaptureOwnership ownership = new CaptureOwnership(
                 "cluster-a", owner, gate, new ClusterWorkloadClaims(raw, gate), TTL);
         return new StoreBackedPipelineCaptureCoordinator(
-                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer(), ownership, RENEW);
+                store, attacher, new SrsCoordinator(store.meta()), buffer, ownership, RENEW);
+    }
+
+    /**
+     * A snapshot source whose every read hands its first row over at once and, when it {@code holds}, keeps
+     * the other two back until {@link #rest} opens or that read is closed -- which is what letting go of a
+     * load does to it.
+     */
+    private static final class HeldSnapshots implements CapturePort {
+        private final boolean holds;
+        final CountDownLatch rest = new CountDownLatch(1);
+
+        HeldSnapshots(boolean holds) {
+            this.holds = holds;
+        }
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            return new CaptureBatch() {
+                private int next = 1;
+                private volatile boolean closed;
+
+                @Override
+                public boolean hasNext() {
+                    if (next == 2 && holds) {
+                        awaitRest();
+                    }
+                    return next <= 3;
+                }
+
+                @Override
+                public Envelope next() {
+                    return Envelope.read(1L, "orders", Map.of("id", (long) next++), Map.of());
+                }
+
+                @Override
+                public Optional<SourcePosition> seam() {
+                    return Optional.of(new SourcePosition("seam-0"));
+                }
+
+                @Override
+                public void close() {
+                    closed = true;
+                }
+
+                private void awaitRest() {
+                    try {
+                        while (!rest.await(20, TimeUnit.MILLISECONDS)) {
+                            if (closed) {
+                                throw new CancellationException("closed while holding the rest");
+                            }
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new CancellationException("interrupted while holding the rest");
+                    }
+                }
+            };
+        }
+
+        @Override
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            throw new UnsupportedOperationException("a snapshot-only read opens no tail");
+        }
+
+        @Override
+        public ConnectionReport testConnection(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public DiscoveredSchema discoverSchema(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
     }
 
     private static ClusterMembershipGate eligibleGate() {

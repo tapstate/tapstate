@@ -47,6 +47,7 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.StorePort;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -814,6 +815,104 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(buffer.snapshotState("p", ring).handedOver()).isTrue();
         assertThat(coordinator.snapshotProgress("p").byTable())
                 .containsOnly(entry("orders", new TableSnapshot(1L, null, null)));
+    }
+
+    /**
+     * A load that has already failed by the time the start looks at its run is neither ended nor published.
+     * What arrived of it is a prefix of the table, and ending its declaration is what lets the source vertex
+     * take that prefix for the whole load: it moves on to the ring and promises the load's bound, and the sink
+     * records a short table as written. The start is overtaken here on purpose -- it waits for the load to be
+     * over before handing the run back -- which is an order a table too small ever to wait for room, followed
+     * by a read that fails at once, takes on its own.
+     */
+    @Test
+    void aLoadThatHasFailedByTheTimeTheStartLooksIsNeitherEndedNorPublished() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_ONLY));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        IllegalStateException broken = new IllegalStateException("the source broke off after its first row");
+        CaptureRunUnit unit = new CaptureRunUnit(new BrokenOffSource(broken), new SrsCoordinator(store.meta()),
+                store.meta(), mock(HazelcastInstance.class));
+        CaptureStarter overtaken = (spec, handoff) -> {
+            CaptureRun run = unit.begin(spec, handoff);
+            try {
+                assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(interrupted);
+            }
+            return run;
+        };
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, overtaken, new SrsCoordinator(store.meta()), buffer);
+        String ring = SourceCaptureResolution.of(source).ringName();
+
+        coordinator.startCapture("p");
+
+        assertThat(buffer.drain("p", ring)).as("the row that arrived before the read broke off").hasSize(1);
+        assertThat(buffer.snapshotState("p", ring).handedOver())
+                .as("a prefix of the table is not the table's load").isFalse();
+        assertThat(coordinator.snapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
+        assertThat(coordinator.captureFailure("p")).containsSame(broken);
+        coordinator.stopCapture("p", false);
+    }
+
+    /** A source whose read hands over one row and then fails with {@code failure}. */
+    private static final class BrokenOffSource implements CapturePort {
+        private final RuntimeException failure;
+
+        BrokenOffSource(RuntimeException failure) {
+            this.failure = failure;
+        }
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            return new CaptureBatch() {
+                private boolean handed;
+
+                @Override
+                public boolean hasNext() {
+                    if (handed) {
+                        throw failure;
+                    }
+                    return true;
+                }
+
+                @Override
+                public Envelope next() {
+                    handed = true;
+                    return Envelope.read(1L, "orders", Map.of("id", 1L), Map.of());
+                }
+
+                @Override
+                public Optional<SourcePosition> seam() {
+                    return Optional.of(new SourcePosition("seam-0"));
+                }
+
+                @Override
+                public void close() {
+                    // Nothing is held open.
+                }
+            };
+        }
+
+        @Override
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            throw new UnsupportedOperationException("a snapshot-only read opens no tail");
+        }
+
+        @Override
+        public ConnectionReport testConnection(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public DiscoveredSchema discoverSchema(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
     }
 
     /**

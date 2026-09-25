@@ -15,6 +15,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * A snapshot batch read from the connector while it is being taken, holding the connector open until
@@ -23,10 +24,15 @@ import java.util.concurrent.TimeUnit;
  *
  * <p><b>The connector reads on a thread of its own, at most a few of its batches ahead of whoever takes the
  * rows.</b> A connector hands its rows over a batch at a time from inside its own read loop, and that loop
- * is paused, by the hand-over waiting, whenever {@link #READ_AHEAD} decoded batches are already waiting
+ * is paused, by the hand-over waiting, whenever {@link #READ_AHEAD} of its batches are already waiting
  * here -- which pauses the fetch from the source with it. Collecting the whole read first was the shape this
  * replaced: a table held twice over on the heap, as the connector's events and again decoded, before a
  * single row of it could go anywhere, so the heap a snapshot needed was the size of its largest table.
+ *
+ * <p><b>A batch is decoded by whoever takes it, not where it is handed over.</b> The hand-over runs inside the
+ * connector's read loop, so whatever is thrown there is the connector's to handle before anybody else sees it:
+ * one wraps it in an exception of its own, another catches it and reads on. Decoded out here, a row the codec
+ * refuses is refused where no connector can touch it, and reaches the taker as a projection failure.
  *
  * <p>The seam is sampled before the first row is read and is in hand by the time the batch is. A failure
  * before that is the opening's own and is thrown by it; one afterwards reaches whoever is taking the rows,
@@ -35,9 +41,9 @@ import java.util.concurrent.TimeUnit;
 final class PdkCaptureBatch implements CaptureBatch {
 
     /**
-     * How many of the connector's decoded batches may wait for the reader of this one. Enough that taking a
-     * row never waits on the source while the source has one ready; each batch is at most the size the
-     * connector reads in, so this bounds the rows the read holds at once to a few thousand.
+     * How many of the connector's batches may wait for the reader of this one. Enough that taking a row never
+     * waits on the source while the source has one ready; each batch is at most the size the connector reads
+     * in, so this bounds the rows the read holds at once to a few thousand.
      */
     static final int READ_AHEAD = 4;
 
@@ -89,6 +95,10 @@ final class PdkCaptureBatch implements CaptureBatch {
         } catch (ExecutionException failed) {
             batch.close();
             throw unchecked(failed.getCause());
+        } catch (CancellationException abandoned) {
+            // A read abandoned before its seam ends the wait with that as itself, not wrapped as a failure is.
+            batch.close();
+            throw abandoned;
         }
         return batch;
     }
@@ -104,13 +114,11 @@ final class PdkCaptureBatch implements CaptureBatch {
     }
 
     /**
-     * Called by the read with each of the connector's batches, decoded. Waits while {@link #READ_AHEAD} are
-     * already waiting, and gives up if the batch is closed meanwhile.
+     * Called by the read with each of the connector's batches, as {@code decode} turns it into rows when it is
+     * taken. Waits while {@link #READ_AHEAD} are already waiting, and gives up if the batch is closed meanwhile.
      */
-    void rowsRead(List<Envelope> rows) {
-        if (!rows.isEmpty()) {
-            put(rows);
-        }
+    void rowsRead(Supplier<List<Envelope>> decode) {
+        put(decode);
     }
 
     @Override
@@ -129,8 +137,15 @@ final class PdkCaptureBatch implements CaptureBatch {
                 throw unchecked(failure.cause());
             }
             @SuppressWarnings("unchecked")
-            List<Envelope> rows = (List<Envelope>) next;
-            current = rows.iterator();
+            Supplier<List<Envelope>> decode = (Supplier<List<Envelope>>) next;
+            try {
+                current = decode.get().iterator();
+            } catch (RuntimeException | Error refused) {
+                // A batch that cannot be taken ends the read as a failure of the read does: what would come
+                // after it is not the rest of the table.
+                over = true;
+                throw refused;
+            }
         }
         return true;
     }
