@@ -1,0 +1,6 @@
+version: tapstate/v1
+kind: transform
+id: mask_notes
+type: map
+fields:
+  notes: false

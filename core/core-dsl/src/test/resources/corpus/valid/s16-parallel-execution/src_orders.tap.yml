@@ -1,0 +1,11 @@
+# A source says how it is read. One processor reads a source whatever parallelism is written,
+# so only the batch it hands rows on in is set here.
+version: tapstate/v1
+kind: source
+id: src_orders
+connector: mysql
+config: { host: 10.10.0.8, username: cdc_user, password: Ord_2026 }
+mode: cdc
+tables: [ orders ]
+execution:
+  batch: { max_records: 512 }

@@ -3,6 +3,23 @@
   "$id": "https://tapstate.io/schema/tapstate/v1.json",
   "$ref": "#/$defs/Resource",
   "$defs": {
+    "BatchSpec": {
+      "type": "object",
+      "description": "The batch a node forms: at most max_records rows, closed early once max_wait has passed since its first row.",
+      "properties": {
+        "max_records": {
+          "description": "The most rows one batch holds, from 1 to 65536.",
+          "type": "integer",
+          "default": 1024
+        },
+        "max_wait": {
+          "description": "How long a batch may wait for more rows after its first one: a whole number followed by ms, s or m, at most 60s. 0ms means no waiting.",
+          "type": "string",
+          "default": "0ms"
+        }
+      },
+      "additionalProperties": false
+    },
     "DdlPolicy": {
       "type": "string",
       "description": "How the sink reacts to incoming schema-change (DDL) events; defaults to fail to avoid silent drift.",
@@ -153,6 +170,21 @@
           "description": "Stop the pipeline and report the failure."
         }
       ]
+    },
+    "ExecutionSpec": {
+      "type": "object",
+      "description": "How one pipeline node runs: its target total parallelism across the cluster and the batch it works in.",
+      "properties": {
+        "parallelism": {
+          "description": "Target total number of processors for this node across the whole cluster, from 1 to 1024. Omitted means the node type's default: 1 for sources and transforms, 4 for view and serve.sync sinks.",
+          "type": "integer"
+        },
+        "batch": {
+          "description": "The batch this node forms before handing its rows on or writing them out.",
+          "$ref": "#/$defs/BatchSpec"
+        }
+      },
+      "additionalProperties": false
     },
     "FieldRule": {
       "description": "One field projection rule: rename a source field, drop a field, set a literal value, or compute a value from a CEL expression."
@@ -780,6 +812,10 @@
           "description": "Shared Record Store configuration; only valid on cdc sources.",
           "$ref": "#/$defs/Srs"
         },
+        "execution": {
+          "description": "How this source is read: its target total parallelism (one processor reads a source today, whatever is written) and the batch it hands rows on in.",
+          "$ref": "#/$defs/ExecutionSpec"
+        },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",
           "type": "object",
@@ -859,6 +895,10 @@
           "description": "The upstream steps or sources this transform reads from.",
           "$ref": "#/$defs/FromClause"
         },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
+        },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",
           "type": "object",
@@ -891,6 +931,10 @@
         "from": {
           "description": "The upstream steps or sources this transform reads from.",
           "$ref": "#/$defs/FromClause"
+        },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
         }
       },
       "required": [
@@ -997,6 +1041,10 @@
           "description": "Treatment of existing target rows before a new full load; resume, recovery and CDC-only never clear rows.",
           "$ref": "#/$defs/OnFullLoad",
           "default": "append"
+        },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
         }
       },
       "required": [
@@ -1300,6 +1348,10 @@
         "storage": {
           "description": "Storage backend used to persist this view.",
           "$ref": "#/$defs/Storage"
+        },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
         }
       },
       "required": [
@@ -1359,6 +1411,10 @@
         "storage": {
           "description": "Where and how the view's data is materialized.",
           "$ref": "#/$defs/Storage"
+        },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
         },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",

@@ -1,7 +1,9 @@
 package io.tapstate.core.model.canonical;
 
+import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -150,6 +152,7 @@ public final class CanonicalWriter {
         if (s.srs() != null) {
             b.put("srs", srs(s.srs()));
         }
+        execution(b, s.execution());
         b.freeMap("experimental", s.experimental());
         return b.build();
     }
@@ -194,6 +197,7 @@ public final class CanonicalWriter {
         if (v.storage() != null) {
             b.put("storage", storage(v.storage()));
         }
+        execution(b, v.execution());
         b.freeMap("experimental", v.experimental());
         return b.build();
     }
@@ -288,6 +292,7 @@ public final class CanonicalWriter {
                 b.scalar("type", s.body().type());
                 b.put("from", fromClause(s.from()));
                 body(b, s.body());
+                execution(b, s.execution());
                 b.freeMap("experimental", s.experimental());
             }
             case Step.Use u -> {
@@ -296,6 +301,7 @@ public final class CanonicalWriter {
                 }
                 b.scalar("use", u.use());
                 b.put("from", fromClause(u.from()));
+                execution(b, u.execution());
             }
         }
         return b.build();
@@ -428,6 +434,7 @@ public final class CanonicalWriter {
                 if (v.storage() != null) {
                     b.put("storage", storage(v.storage()));
                 }
+                execution(b, v.execution());
             }
             case ViewBlock.Use u -> {
                 if (!u.id().equals(u.use())) {
@@ -511,7 +518,30 @@ public final class CanonicalWriter {
         if (e.onFullLoad() != null && e.onFullLoad() != OnFullLoad.APPEND) {
             b.scalar("on_full_load", e.onFullLoad().yaml());
         }
+        execution(b, e.execution());
         return b.build();
+    }
+
+    /**
+     * A node's {@code execution} block, written exactly as far as the author wrote it. Unlike the sync
+     * element's other policies, a value equal to its default is kept rather than dropped: whether a
+     * parallelism was written or left to the node type is itself reported when the node runs, and
+     * dropping a written default here would make the artifact say the author left it out.
+     */
+    private static void execution(B b, ExecutionSpec execution) {
+        if (execution == null) {
+            return;
+        }
+        B e = new B();
+        e.scalar("parallelism", execution.parallelism());
+        BatchSpec batch = execution.batch();
+        if (batch != null) {
+            B t = new B();
+            t.scalar("max_records", batch.maxRecords());
+            t.scalar("max_wait", batch.maxWait());
+            e.put("batch", t.build());
+        }
+        b.put("execution", e.build());
     }
 
     private Node rename(RenameSpec r) {

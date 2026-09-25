@@ -15,15 +15,24 @@ public record SourceInput(
         List<SourceTableDraft> tables,
         Map<String, Object> options,
         SourceDraft.SourceSrs srs,
+        Map<String, Object> execution,
         Map<String, Object> experimental,
         List<String> clearSecrets) {
 
+    public SourceInput(String id, Metadata metadata, String connector, Map<String, Object> config, String mode,
+            List<SourceTableDraft> tables, Map<String, Object> options, SourceDraft.SourceSrs srs,
+            Map<String, Object> experimental, List<String> clearSecrets) {
+        this(id, metadata, connector, config, mode, tables, options, srs, null, experimental, clearSecrets);
+    }
+
     public SourceInput {
         // SourceDraft owns the defensive JSON copies shared by the draft and persistent input faces.
-        new SourceDraft(id, metadata, connector, config, mode, tables, options, srs, experimental, clearSecrets);
+        new SourceDraft(id, metadata, connector, config, mode, tables, options, srs, execution, experimental,
+                clearSecrets);
         config = SourceDraft.copyJsonMap(config, false);
         tables = tables == null ? null : List.copyOf(tables);
         options = SourceDraft.copyJsonMap(options, true);
+        execution = SourceDraft.copyJsonMap(execution, true);
         experimental = SourceDraft.copyJsonMap(experimental, true);
         clearSecrets = clearSecrets == null ? List.of() : List.copyOf(clearSecrets);
     }
@@ -38,6 +47,7 @@ public record SourceInput(
     }
 
     SourceDraft asDraft() {
-        return new SourceDraft(id, metadata, connector, config, mode, tables, options, srs, experimental, clearSecrets);
+        return new SourceDraft(id, metadata, connector, config, mode, tables, options, srs, execution, experimental,
+                clearSecrets);
     }
 }

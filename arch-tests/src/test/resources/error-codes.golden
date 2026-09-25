@@ -181,6 +181,8 @@ dsl.mode-required-for-read
 dsl.row-expression-needs-discovery
 dsl.row-expression-type-unknown
 dsl.row-expression-type-unsupported
+dsl.setting-has-no-effect
+dsl.source-read-not-split
 dsl.undefined-variable
 dsl.unknown-field
 dsl.unsupported-mode

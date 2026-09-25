@@ -2,9 +2,11 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
@@ -148,12 +150,13 @@ public final class PipelineRepresentation {
         }
         String use = textOrNull(step.get("use"), path + ".use");
         FromClause from = fromClause(step.get("from"), path + ".from");
+        ExecutionSpec execution = execution(step.get("execution"), path + ".execution");
         if (use != null) {
-            return Step.use(id, use, from);
+            return Step.use(id, use, from, execution);
         }
         String type = transformType(step.get("type"), body, path);
         TransformBody transform = body(type, payload, path);
-        return Step.inline(id, from, transform,
+        return Step.inline(id, from, transform, execution,
                 copyJson(objectOrNull(step.get("experimental"), path + ".experimental")));
     }
 
@@ -273,7 +276,86 @@ public final class PipelineRepresentation {
             value.putAll(bodyValue(inline.body()));
             value.put("experimental", copyJson(inline.experimental()));
         }
+        value.put("execution", executionValue(step.execution()));
         return Collections.unmodifiableMap(value);
+    }
+
+    /**
+     * A node's execution block as the editor reads it, or null where the node says nothing. Absent parts
+     * stay absent rather than being filled with the node type's defaults: which default applies is the
+     * runtime's to report, beside whether the author wrote the value at all.
+     */
+    static Map<String, Object> executionValue(ExecutionSpec execution) {
+        if (execution == null) {
+            return null;
+        }
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("parallelism", execution.parallelism());
+        BatchSpec batch = execution.batch();
+        if (batch == null) {
+            value.put("batch", null);
+        } else {
+            Map<String, Object> limits = new LinkedHashMap<>();
+            limits.put("maxRecords", batch.maxRecords());
+            limits.put("maxWait", batch.maxWait());
+            value.put("batch", Collections.unmodifiableMap(limits));
+        }
+        return Collections.unmodifiableMap(value);
+    }
+
+    /**
+     * Reads a node's execution block from the editor payload, or null where there is none. The same rules
+     * as the authored form hold: the parallelism is a cluster-wide target and nothing else - a per-member
+     * count or a request to guess is refused by name rather than dropped, since a payload that lost it on
+     * the way in would read as accepted and run at a width nobody asked for.
+     */
+    static ExecutionSpec execution(Object raw, String path) {
+        Map<String, Object> value = objectOrNull(raw, path);
+        if (value == null) {
+            return null;
+        }
+        for (String key : value.keySet()) {
+            if (!key.equals("parallelism") && !key.equals("batch")) {
+                throw malformed(path + "." + key + " is not a field of execution; "
+                        + "set parallelism (the cluster-wide target) or batch");
+            }
+        }
+        Integer parallelism = boundedInteger(value.get("parallelism"), path + ".parallelism",
+                1, ExecutionSpec.MAX_PARALLELISM);
+        BatchSpec batch = null;
+        Map<String, Object> limits = objectOrNull(value.get("batch"), path + ".batch");
+        if (limits != null) {
+            for (String key : limits.keySet()) {
+                if (!java.util.Set.of("max_records", "maxRecords", "max_wait", "maxWait").contains(key)) {
+                    throw malformed(path + ".batch." + key + " is not a field of batch; "
+                            + "set maxRecords or maxWait");
+                }
+            }
+            Integer maxRecords = boundedInteger(value(limits, "max_records", "maxRecords"),
+                    path + ".batch.maxRecords", 1, BatchSpec.MAX_RECORDS_LIMIT);
+            String maxWait = textOrNull(value(limits, "max_wait", "maxWait"), path + ".batch.maxWait");
+            if (maxWait != null) {
+                long millis = BatchSpec.durationMillis(maxWait);
+                if (millis < 0 || millis > BatchSpec.MAX_WAIT_LIMIT_MILLIS) {
+                    throw malformed(path + ".batch.maxWait must be a duration from 0ms to 60s, "
+                            + "such as 0ms, 50ms or 2s; got '" + maxWait + "'");
+                }
+            }
+            batch = maxRecords == null && maxWait == null ? null : new BatchSpec(maxRecords, maxWait);
+        }
+        return parallelism == null && batch == null ? null : new ExecutionSpec(parallelism, batch);
+    }
+
+    /** A whole number from {@code min} to {@code max}, or null where the value is absent. */
+    private static Integer boundedInteger(Object value, String path, int min, int max) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Number number) || number.doubleValue() != number.longValue()
+                || number.longValue() < min || number.longValue() > max) {
+            throw malformed(path + " must be a whole number from " + min + " to " + max);
+        }
+        return number.intValue();
     }
 
     private static Map<String, Object> bodyValue(TransformBody body) {
@@ -385,6 +467,7 @@ public final class PipelineRepresentation {
             value.put("from", fromRefValue(inline.from()));
             value.put("primaryKey", inline.primaryKey());
             value.put("storage", storageValue(inline.storage()));
+            value.put("execution", executionValue(inline.execution()));
         }
         return Collections.unmodifiableMap(value);
     }
@@ -442,6 +525,7 @@ public final class PipelineRepresentation {
             value.put("rename", renameValue(element.rename()));
             value.put("ddl", element.ddl() == null ? null : element.ddl().name());
             value.put("onFullLoad", element.onFullLoad() == null ? null : element.onFullLoad().name());
+            value.put("execution", executionValue(element.execution()));
             return Collections.unmodifiableMap(value);
         }).toList();
     }
@@ -560,13 +644,18 @@ public final class PipelineRepresentation {
         FromRef from = fromRef(value(value, "from"), path + ".from");
         String id = textOrNull(value.get("id"), path + ".id");
         if (use != null) {
+            if (value.get("execution") != null) {
+                throw malformed(path + ".execution belongs to the view definition a use: reference names; "
+                        + "set it there");
+            }
             return new ViewBlock.Use(id, use, from);
         }
         return new ViewBlock.Inline(
                 id == null ? "view" : id,
                 from,
                 textOrNull(value(value, "primary_key", "primaryKey"), path + ".primary_key"),
-                storage(objectOrNull(value.get("storage"), path + ".storage")));
+                storage(objectOrNull(value.get("storage"), path + ".storage")),
+                execution(value.get("execution"), path + ".execution"));
     }
 
     private static ServeBlock serve(Map<String, Object> value) {
@@ -605,7 +694,8 @@ public final class PipelineRepresentation {
                     rename(objectOrNull(value.get("rename"), path + ".rename")),
                     enumValue(value.get("ddl"), DdlPolicy.values(), DdlPolicy::yaml, path + ".ddl"),
                     enumValue(value(value, "on_full_load", "onFullLoad"), OnFullLoad.values(), OnFullLoad::yaml,
-                            path + ".onFullLoad")));
+                            path + ".onFullLoad"),
+                    execution(value.get("execution"), path + "[" + index + "].execution")));
         }
         return List.copyOf(result);
     }
@@ -941,7 +1031,7 @@ public final class PipelineRepresentation {
          * empty map would arrive in the transform body.
          */
         private static final java.util.Set<String> STEP_META = java.util.Set.of(
-                "id", "from", "type", "use", "options", "experimental", "body");
+                "id", "from", "type", "use", "options", "experimental", "body", "execution");
 
         private SetOf() {
         }

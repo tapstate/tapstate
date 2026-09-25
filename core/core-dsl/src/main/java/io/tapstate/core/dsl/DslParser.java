@@ -1,10 +1,12 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.ErrorPolicy;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -92,10 +94,11 @@ public final class DslParser {
     private static final String STORAGE_FIELD = "storage";
     private static final String FILTER_TOKEN = "filter";
     private static final String FORMAT_FIELD = "format";
+    private static final String EXECUTION_FIELD = "execution";
 
     static final Set<String> SOURCE_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, CONNECTOR_FIELD, "config", "mode",
-            "tables", OPTIONS_FIELD, "srs", EXPERIMENTAL_FIELD);
+            "tables", OPTIONS_FIELD, "srs", EXECUTION_FIELD, EXPERIMENTAL_FIELD);
     static final Set<String> PIPELINE_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, SOURCE_TOKEN, TRANSFORMS_FIELD, "view", SERVE_TOKEN,
             "settings", EXPERIMENTAL_FIELD);
@@ -110,15 +113,17 @@ public final class DslParser {
      */
     private static final Set<String> NO_ENGINE_OPTIONS = Set.of();
     static final Set<String> TABLE_SPEC_KEYS = Set.of("name", FILTER_TOKEN, "pk", OPTIONS_FIELD);
-    static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
-    static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", OPTIONS_FIELD);
+    static final Set<String> STEP_BASE_KEYS =
+            Set.of("id", "type", "from", OPTIONS_FIELD, EXECUTION_FIELD, EXPERIMENTAL_FIELD);
+    static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", OPTIONS_FIELD, EXECUTION_FIELD);
     private static final Set<String> NEST_ROOT_KEYS =
             Set.of("from", "key", "mode", "trackKeyChanges", "embed");
     static final Set<String> NEST_STATE_KEYS = Set.of("database");
     static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
             "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
-    private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD);
+    private static final Set<String> VIEW_INLINE_KEYS =
+            Set.of("id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD, EXECUTION_FIELD);
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> STORAGE_KEYS = Set.of("hot", "warm", "cold");
     private static final Set<String> HOT_KEYS = Set.of("ttl");
@@ -127,7 +132,10 @@ public final class DslParser {
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
     static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
-    static final Set<String> SYNC_KEYS = Set.of("id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD);
+    static final Set<String> SYNC_KEYS = Set.of(
+            "id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD, EXECUTION_FIELD);
+    static final Set<String> EXECUTION_KEYS = Set.of("parallelism", "batch");
+    static final Set<String> BATCH_KEYS = Set.of("max_records", "max_wait");
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
     static final Set<String> PUSH_KEYS = Set.of("id", SOURCE_TOKEN, "topic", FORMAT_FIELD, OPTIONS_FIELD);
@@ -136,7 +144,8 @@ public final class DslParser {
     static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, "type", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> VIEW_DEF_KEYS = Set.of(
-            VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD, EXPERIMENTAL_FIELD);
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD, EXECUTION_FIELD,
+            EXPERIMENTAL_FIELD);
     private static final Set<String> SERVE_DEF_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, "sync", "query", "push", EXPERIMENTAL_FIELD);
 
@@ -339,6 +348,7 @@ public final class DslParser {
                 mode(m, "mode"),
                 tables(m.seq("tables")),
                 srs(m.mapping("srs")),
+                execution(m.mapping(EXECUTION_FIELD)),
                 m.freeMap(EXPERIMENTAL_FIELD));
     }
 
@@ -453,7 +463,8 @@ public final class DslParser {
                 if (s.has("use")) {
                     s.requireOnly(STEP_USE_KEYS);
                     requireKnownOptions(s, NO_ENGINE_OPTIONS);
-                    step = Step.use(idOf(s), s.string("use"), fromFlow(s, prevId, n));
+                    step = Step.use(idOf(s), s.string("use"), fromFlow(s, prevId, n),
+                            execution(s.mapping(EXECUTION_FIELD)));
                 } else {
                     step = inlineStep(s, index, prevId, n);
                 }
@@ -481,7 +492,8 @@ public final class DslParser {
         boolean aliased = type.equals("nest") || type.equals("join");
         FromClause from = aliased ? fromAliases(s, at) : fromFlow(s, prevId, at);
         requireKnownOptions(s, NO_ENGINE_OPTIONS);
-        return Step.inline(id, from, body(type, s), s.freeMap(EXPERIMENTAL_FIELD));
+        return Step.inline(id, from, body(type, s), execution(s.mapping(EXECUTION_FIELD)),
+                s.freeMap(EXPERIMENTAL_FIELD));
     }
 
     private static Set<String> payloadKeys(String type) {
@@ -652,7 +664,8 @@ public final class DslParser {
                 id != null ? id : "view",
                 blockFrom(v, prevId, n),
                 v.string(PRIMARY_KEY_FIELD),
-                storage(v.mapping(STORAGE_FIELD)));
+                storage(v.mapping(STORAGE_FIELD)),
+                execution(v.mapping(EXECUTION_FIELD)));
     }
 
     private Storage storage(YamlMap st) {
@@ -721,7 +734,8 @@ public final class DslParser {
                     enumByYaml(WriteMode.values(), WriteMode::yaml, s, "write_mode"),
                     rename(s.mapping("rename")),
                     enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl"),
-                    enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, s, "on_full_load")));
+                    enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, s, "on_full_load"),
+                    execution(s.mapping(EXECUTION_FIELD))));
         }
         return out;
     }
@@ -839,7 +853,8 @@ public final class DslParser {
         m.requirePresent(REQUIRED_VIEW_DEF_KEYS);
         return new ViewResource(
                 m.require("id", idOf(m)), metadata(m), m.string(PRIMARY_KEY_FIELD),
-                storage(m.mapping(STORAGE_FIELD)), m.freeMap(EXPERIMENTAL_FIELD));
+                storage(m.mapping(STORAGE_FIELD)), execution(m.mapping(EXECUTION_FIELD)),
+                m.freeMap(EXPERIMENTAL_FIELD));
     }
 
     /** A reusable publish-surface definition (§8, X19): sync / query / push, no wiring. */
@@ -997,6 +1012,71 @@ public final class DslParser {
             throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", l, "expected", "a 32-bit integer"));
         }
         return num.intValue();
+    }
+
+    /**
+     * How one node runs, or null where the node carries no {@code execution} block. The parallelism is
+     * the target total across the cluster, so it is a whole number and nothing else: a word such as
+     * {@code auto} is refused here rather than read as a request to guess, because a guess that changes
+     * with a restart or a resize would change how wide the node runs without anybody changing its artifact.
+     * The per-member count is worked out when a run is built and is never written, so a key naming it is
+     * refused as unknown like any other key outside the block.
+     */
+    private static ExecutionSpec execution(YamlMap e) {
+        if (e == null) {
+            return null;
+        }
+        e.requireOnly(EXECUTION_KEYS);
+        Integer parallelism = boundedIntValue(e, "parallelism", 1, ExecutionSpec.MAX_PARALLELISM);
+        BatchSpec batch = null;
+        YamlMap b = e.mapping("batch");
+        if (b != null) {
+            b.requireOnly(BATCH_KEYS);
+            Integer maxRecords = boundedIntValue(b, "max_records", 1, BatchSpec.MAX_RECORDS_LIMIT);
+            String maxWait = waitValue(b, "max_wait");
+            // A block that says nothing is read as no block, so that it reads back from the canonical
+            // form - which writes nothing for it - as the same thing it was parsed into.
+            batch = maxRecords == null && maxWait == null ? null : new BatchSpec(maxRecords, maxWait);
+        }
+        return parallelism == null && batch == null ? null : new ExecutionSpec(parallelism, batch);
+    }
+
+    /** A whole number from {@code min} to {@code max}, or null where the key is absent. */
+    private static Integer boundedIntValue(YamlMap m, String key, int min, int max) {
+        Object v = m.value(key);
+        if (v == null) {
+            return null;
+        }
+        String expected = "a whole number from " + min + " to " + max;
+        if (!(v instanceof Integer || v instanceof Long)) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", String.valueOf(v), "expected", expected));
+        }
+        long value = ((Number) v).longValue();
+        if (value < min || value > max) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", value, "expected", expected));
+        }
+        return (int) value;
+    }
+
+    /**
+     * A wait written as a whole number and a unit ({@code ms}, {@code s} or {@code m}), at most a minute's
+     * worth of 60s, or null where the key is absent. A bare number is refused rather than read in some unit:
+     * {@code 50} could be meant as milliseconds or as seconds, and the two differ by a factor of a thousand.
+     */
+    private static String waitValue(YamlMap m, String key) {
+        Object v = m.value(key);
+        if (v == null) {
+            return null;
+        }
+        String expected = "a duration from 0ms to 60s, such as 0ms, 50ms or 2s";
+        if (!(v instanceof String text)) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", String.valueOf(v), "expected", expected));
+        }
+        long millis = BatchSpec.durationMillis(text);
+        if (millis < 0 || millis > BatchSpec.MAX_WAIT_LIMIT_MILLIS) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", text, "expected", expected));
+        }
+        return text;
     }
 
     /**

@@ -16,6 +16,7 @@ import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
+import io.tapstate.control.core.ExecutionAdvisories;
 import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
@@ -330,10 +331,13 @@ class ControlPlaneConfiguration {
         // lands in a document store as a key that store reads as a path, so the ordinary read for it
         // answers nothing and no index can be declared over it. Nothing downstream of apply says this,
         // and the discovered model already holds the name, so this is the one moment it can be said.
+        // Last, how the batch asks its nodes to run where that will not happen as written: a
+        // pipeline-level parallelism or batch size nothing reads, and a source asking for parallel reads.
         return new ApplyService(connectorCatalogView::merged, artifactStore, auditGate, schemaStore,
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
-                        new DocumentKeyAdvisories()),
+                        new DocumentKeyAdvisories(),
+                        new ExecutionAdvisories()),
                 derivation, livePipelines);
     }
 

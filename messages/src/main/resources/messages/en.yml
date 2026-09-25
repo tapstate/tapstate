@@ -318,6 +318,12 @@ dsl.mode-mismatch:
 dsl.illegal-value:
   message: "Value '{value}' at {path} is not allowed; expected {expected}."
   solution: "Use one of the accepted values."
+dsl.setting-has-no-effect:
+  message: "Pipeline {pipeline} sets {setting}, which no longer decides anything; nothing reads it."
+  solution: "Remove {setting} and set {instead} on each node that should run differently. A node that sets nothing runs at its node type's default."
+dsl.source-read-not-split:
+  message: "Source {source} asks to be read by {requested} processors; one processor reads it."
+  solution: "No connector has declared a split read yet, so a source is read by one processor whatever is written. Remove the parallelism, or leave it; nothing else changes."
 dsl.illegal-expression:
   message: "Expression at {path} did not compile: {detail} (expression: {expr})."
   solution: "Fix the CEL expression; only the row envelope fields are in scope."
