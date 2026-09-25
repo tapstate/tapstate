@@ -68,6 +68,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     public void start(String pipelineId) {
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
+        // An engine whose member was shut down for want of memory is the first such refusal. Everything
+        // below would otherwise run up to the member and be thrown back uncoded, a capture left reading for
+        // a job that cannot exist.
+        engine.refuseIfLost(pipelineId);
         DagSource.StartPreparation prepared = dagSource.prepareStart(
                 pipelineId, stateTeardown.defaultDatabase());
         // The run's own generation, taken before the first side effect for the same reason: a run this
@@ -160,9 +164,15 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         }
         boolean jobOver = engine.awaitTerminal(pipelineId, JOB_TEARDOWN_BUDGET);
         captureCoordinator.stopCapture(pipelineId, purgeState);
-        if (purgeState && jobOver) {
+        if (purgeState && jobOver && !engine.isLost()) {
             // Only once nothing is left to write into it. A processor still winding down writes state as it
             // closes, and a drop racing that leaves entries behind with the note already gone.
+            //
+            // Nor on an engine whose member was shut down for want of memory. Half of the drop is on that
+            // member, which refuses it with an uncoded error, and "no job" there only means the member no
+            // longer answers: its shutdown can still be waiting for the job to end. Left noted, the drop is
+            // finished by the next start, which on a lost engine comes after the restart that is the only
+            // way back.
             stateTeardown.finishPending(pipelineId);
         }
     }
@@ -173,6 +183,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // cdc capture feeding its ring dies while the job keeps running over a ring gone quiet (coordinator).
         // Either surfaces here so the converge side drives the pipeline into the observable FAILED state.
         return engine.failureOf(pipelineId).or(() -> captureCoordinator.captureFailure(pipelineId));
+    }
+
+    @Override
+    public Optional<Throwable> lost(String pipelineId) {
+        // The engine alone: a member shut down for want of memory took every job it held with it. The capture is
+        // not asked. It keeps running behind a paused pipeline, and whether it has died is failure()'s to say.
+        return engine.lost(pipelineId).map(Throwable.class::cast);
     }
 
     @Override

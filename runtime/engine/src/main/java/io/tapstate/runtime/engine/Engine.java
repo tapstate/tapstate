@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.config.ProcessingGuarantee;
@@ -27,8 +28,10 @@ import io.tapstate.spi.store.OperatorStateStores;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -111,6 +114,7 @@ public final class Engine {
      * does.
      */
     public void submit(String pipelineId, DAG dag, Set<String> stateNamespaces, NestSettings settings) {
+        refuseIfLost(pipelineId);
         NestMemoryBudget.applyTo(member, stateNamespaces, settings);
         submitJob(pipelineId, dag);
     }
@@ -118,6 +122,7 @@ public final class Engine {
     /** Submits after pinning every nest namespace to the database the compiled artifact resolved. */
     public void submit(String pipelineId, DAG dag, Map<String, String> stateDatabases,
             NestSettings settings) {
+        refuseIfLost(pipelineId);
         configureNestState(stateDatabases, settings);
         submitJob(pipelineId, dag);
     }
@@ -125,6 +130,27 @@ public final class Engine {
     /** Validates and pins placement before capture or graph construction performs a side effect. */
     public void configureNestState(Map<String, String> stateDatabases, NestSettings settings) {
         NestStatePlacement.applyTo(member, stateDatabases, settings);
+    }
+
+    /**
+     * Refuses, with the coded reason, once this engine's member has been shut down for want of memory; does
+     * nothing while it runs. Asked before any job operation that would need the member, including by a caller
+     * with work to do before it gets as far as this engine, so that nothing is started for a job that cannot
+     * be.
+     */
+    public void refuseIfLost(String pipelineId) {
+        lost(pipelineId).ifPresent(refusal -> {
+            throw refusal;
+        });
+    }
+
+    /**
+     * Whether this engine's member has been shut down for want of memory, from the moment its out-of-memory
+     * handling starts taking it down. Nothing on the member can be reached from then on, and for as long as that
+     * shutdown lasts a job on it can still be ending where no lookup sees it any more.
+     */
+    public boolean isLost() {
+        return MemberOutOfMemory.of(member).isPresent();
     }
 
     /**
@@ -238,7 +264,7 @@ public final class Engine {
      * continues it; treating it as absent would submit a second job over a paused one.
      */
     public boolean hasLiveJob(String pipelineId) {
-        Job job = member.getJet().getJob(pipelineId);
+        Job job = jobNamed(pipelineId);
         if (job == null) {
             return false;
         }
@@ -247,7 +273,7 @@ public final class Engine {
     }
 
     public boolean awaitTerminal(String pipelineId, Duration budget) {
-        Job job = member.getJet().getJob(pipelineId);
+        Job job = jobNamed(pipelineId);
         if (job == null) {
             return true;
         }
@@ -278,9 +304,21 @@ public final class Engine {
      * exception records it there before that teardown can happen, so a hit is always the real cause. Only
      * a job that failed for a reason no processor recorded — a fault inside Jet itself, for one — falls
      * through to asking Jet, which after that same teardown can answer with the degraded mock instead.
+     *
+     * <p>A member shut down for want of memory cannot be asked about its jobs at all: every job it ran died with
+     * it, so the loss is the failure. The one exception is a cause the registry already holds, which is still
+     * readable: a job that had died of it before the member went down died of that, not of the loss, and it is
+     * the cause that names what an operator has to change. A recorded cause that is itself the heap running out,
+     * anywhere down its chain, is the loss as a processor caught it, and is answered as the loss.
      */
     public Optional<Throwable> failureOf(String pipelineId) {
-        Job job = member.getJet().getJob(pipelineId);
+        Optional<TapstateException> lost = lost(pipelineId);
+        if (lost.isPresent()) {
+            Optional<Throwable> recorded = JobFailureRegistry.of(member).get(pipelineId)
+                    .filter(cause -> !ranOutOfMemory(cause));
+            return recorded.isPresent() ? recorded : lost.map(Throwable.class::cast);
+        }
+        Job job = jobNamed(pipelineId);
         if (job == null || job.getStatus() != JobStatus.FAILED) {
             return Optional.empty();
         }
@@ -775,12 +813,52 @@ public final class Engine {
      * mistake a stopped pipeline for a running one.
      */
     private Job liveJob(String pipelineId) {
-        Job job = member.getJet().getJob(pipelineId);
+        Job job = jobNamed(pipelineId);
         return job == null || job.getStatus().isTerminal() ? null : job;
     }
 
-    /** The pipeline's live job, or a coded {@code engine.no-such-job} when it has none to act on. */
+    /**
+     * The job named for the pipeline, or {@code null} when there is none, which is also what a member shut
+     * down for want of memory has: every job went with it. Every lookup goes through here. A member that is
+     * gone refuses the lookup with an error that says why nowhere, and passing that refusal on is what kept a
+     * lost engine's pipelines reading as running; so a refusal from a member its out-of-memory handling took
+     * down is the answer "no job". A member refusing for any other reason, the server shutting it down on
+     * purpose among them, still refuses.
+     */
+    private Job jobNamed(String pipelineId) {
+        try {
+            return member.getJet().getJob(pipelineId);
+        } catch (HazelcastInstanceNotActiveException gone) {
+            if (MemberOutOfMemory.of(member).isPresent()) {
+                return null;
+            }
+            throw gone;
+        }
+    }
+
+    /** Why this engine can no longer run {@code pipelineId}, as the coded failure; empty while its member runs. */
+    public Optional<TapstateException> lost(String pipelineId) {
+        return MemberOutOfMemory.of(member).map(error ->
+                new TapstateException(EngineError.OUT_OF_MEMORY, Map.of("pipeline", pipelineId), error));
+    }
+
+    /** Whether {@code failure}, or anything down its chain of causes, is the heap running out. */
+    private static boolean ranOutOfMemory(Throwable failure) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable cause = failure; cause != null && seen.add(cause); cause = cause.getCause()) {
+            if (cause instanceof OutOfMemoryError) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The pipeline's live job, or a coded refusal when there is none to act on: {@code engine.out-of-memory}
+     * once the member has been lost, {@code engine.no-such-job} otherwise.
+     */
     private Job requireJob(String pipelineId) {
+        refuseIfLost(pipelineId);
         Job job = liveJob(pipelineId);
         if (job == null) {
             throw new TapstateException(EngineError.NO_SUCH_JOB, Map.of("pipeline", pipelineId), null);

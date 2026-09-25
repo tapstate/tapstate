@@ -112,19 +112,34 @@ public final class PipelineConverger {
             }
         }
 
-        if (target == PipelineState.RUNNING && actual == PipelineState.FAILED && !rebuildOwed) {
+        if (target == PipelineState.PAUSED && actual == PipelineState.PAUSED) {
+            // A paused pipeline's job is held, not run, so it is not asked for a failure the way a running
+            // one is. It can still be lost: the data plane holding the job goes, and the job with it. The
+            // pipeline would then go on reading PAUSED over a job that no longer exists, and turn FAILED
+            // only once somebody resumed it. It fails now, with the cause, the way a dead running job does.
+            Optional<Throwable> lost = actuator.lost(pipelineId);
+            if (lost.isPresent()) {
+                return failedWith(pipelineId, lost.get());
+            }
+        }
+
+        if ((target == PipelineState.RUNNING || target == PipelineState.PAUSED)
+                && actual == PipelineState.FAILED && !rebuildOwed) {
             // A run that died because the cluster changed under it is the one death this loop may answer
             // by itself, and it is asked here rather than where the death was observed so that the
             // failure is recorded and published first: whatever is decided next, nobody is left reading a
             // healthy pipeline over a dead job while it is being decided. The admission bounds itself --
-            // a yes that never runs out is a restart loop wearing the word "recovery".
-            if (rebuilds.admits(pipelineId)) {
+            // a yes that never runs out is a restart loop wearing the word "recovery". It is asked only of
+            // a pipeline meant to run: a rebuild starts a run, which is not what a paused intent asks for.
+            if (target == PipelineState.RUNNING && rebuilds.admits(pipelineId)) {
                 return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false);
             }
             // Otherwise a failed run stays failed: re-driving it toward RUNNING would restart the dead job
-            // on every tick. The user recovers by stopping it then starting a fresh run -- which arrives
-            // as the one instruction above, and that is let through: it is somebody saying so once,
-            // which is the whole difference from this loop noticing the same death every second.
+            // on every tick, and toward PAUSED would try every tick to hold a job that is gone, be refused,
+            // and fail the pipeline over again. The user recovers by stopping it then starting a fresh
+            // run -- which arrives as the one instruction above, and that is let through: it is somebody
+            // saying so once, which is the whole difference from this loop noticing the same death every
+            // second.
             // actual is FAILED only when the checkpoint was read and parsed, so
             // the doc is necessarily present; orElseThrow makes that invariant explicit and fail-loud.
             return ConvergeResult.converged(actualDoc.orElseThrow());
@@ -270,7 +285,7 @@ public final class PipelineConverger {
      * it as the observation's coded failure. Shared with the dead-job path, which reaches the same state
      * by a different road.
      */
-    private ConvergeResult failedWith(String pipelineId, TapstateException cause) {
+    private ConvergeResult failedWith(String pipelineId, Throwable cause) {
         ConvergeResult driven =
                 driveTo(pipelineId, PipelineState.FAILED, false, requireCheckpoint(pipelineId), false);
         return driven.checkpoint()
