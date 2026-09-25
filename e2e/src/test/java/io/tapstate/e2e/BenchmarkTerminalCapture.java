@@ -11,6 +11,7 @@ import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 
+import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -39,10 +40,23 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
 
     static BenchmarkTerminalCapture open(String connectorId, Path connectorJar, Map<String, Object> settings,
                                          String table, long warmupRowId, long terminalRowId) {
+        return open(connectorId, connectorJar, settings, table, warmupRowId, terminalRowId, null);
+    }
+
+    static BenchmarkTerminalCapture open(String connectorId, Path connectorJar, Map<String, Object> settings,
+                                         String table, long warmupRowId, long terminalRowId,
+                                         BenchmarkBoundaryWrites.Boundary boundary) {
         if (connectorId == null || connectorId.isBlank() || connectorJar == null || settings == null
                 || table == null || table.isBlank() || warmupRowId < 0 || terminalRowId < 0
                 || warmupRowId == terminalRowId) {
             throw new IllegalArgumentException("one connector, table and two distinct row ids are required");
+        }
+        if (boundary != null && (!table.equals(boundary.table()) || boundary.rowId() < 0
+                || boundary.rowId() == warmupRowId || boundary.rowId() == terminalRowId
+                || boundary.field() == null || boundary.field().isBlank()
+                || boundary.changedValue() == null || boundary.restoredValue() == null
+                || valuesEqual(boundary.changedValue(), boundary.restoredValue()))) {
+            throw new IllegalArgumentException("boundary must name a distinct row and two distinct field values");
         }
         var inspected = new ConnectorIntrospector().introspect(List.of(connectorJar));
         ConnectorRef ref = new ConnectorRef(List.of(connectorJar), inspected.className(),
@@ -55,7 +69,7 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
         });
         PipelineNode node = new PipelineNode("benchmark-sidecar-" + UUID.randomUUID(), "source-" + table);
         CaptureConfig config = new CaptureConfig(connectorId, settings, List.of(table), node);
-        Holder holder = new Holder(table, warmupRowId, terminalRowId);
+        Holder holder = new Holder(table, warmupRowId, terminalRowId, boundary);
         Subscription subscription = capture.cdc(config, CaptureStart.present(), holder);
         return new BenchmarkTerminalCapture(table, warmupRowId, terminalRowId, subscription, holder);
     }
@@ -120,11 +134,52 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
         }
     }
 
+    /** The connector token of the restored boundary row, retained while target ACK catches up. */
+    String awaitBoundary(Duration timeout) {
+        if (!listener.warmupSeen()) {
+            throw new AssertionError("sidecar has not observed its warm-up row");
+        }
+        if (!listener.hasBoundary()) {
+            throw new IllegalStateException("sidecar has no boundary row");
+        }
+        long deadline = deadline(timeout);
+        while (true) {
+            listener.check();
+            if (listener.boundarySeen()) {
+                return listener.boundaryToken();
+            }
+            long remaining = remaining(deadline);
+            if (remaining == 0) {
+                throw new AssertionError("sidecar did not observe a restored boundary row on " + table);
+            }
+            listener.waitForChange(remaining);
+        }
+    }
+
+    /** Ends boundary matching after its token is ACKed and the restored target is verified. */
+    void sealBoundary() {
+        listener.sealBoundary();
+    }
+
     /** Closes after target-ACK observation and rejects every duplicate seen while the stream was open. */
     String closeAndTerminal() {
         close();
         listener.check();
+        if (listener.hasBoundary()) {
+            listener.boundaryToken();
+        }
         return listener.terminalToken();
+    }
+
+    private static boolean valuesEqual(Object observed, Object expected) {
+        if (observed instanceof Number left && expected instanceof Number right) {
+            try {
+                return new BigDecimal(left.toString()).compareTo(new BigDecimal(right.toString())) == 0;
+            } catch (NumberFormatException invalid) {
+                return false;
+            }
+        }
+        return expected.equals(observed);
     }
 
     private static void sleep(long nanos, long deadline) {
@@ -162,21 +217,28 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
         }
     }
 
-    private static final class Holder implements CaptureListener {
+    static final class Holder implements CaptureListener {
 
         private final Object monitor = new Object();
         private final String table;
         private final long warmupRowId;
         private final long terminalRowId;
+        private final BenchmarkBoundaryWrites.Boundary boundary;
         private boolean warmupSeen;
+        private boolean changedSeen;
+        private int restoredCount;
+        private String restoredToken;
+        private boolean boundarySealed;
         private int terminalCount;
         private String terminalToken;
         private Throwable failure;
 
-        Holder(String table, long warmupRowId, long terminalRowId) {
+        Holder(String table, long warmupRowId, long terminalRowId,
+               BenchmarkBoundaryWrites.Boundary boundary) {
             this.table = table;
             this.warmupRowId = warmupRowId;
             this.terminalRowId = terminalRowId;
+            this.boundary = boundary;
         }
 
         @Override
@@ -187,10 +249,21 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
                         failure = new AssertionError("sidecar read a row from the wrong table: " + event.src());
                         break;
                     }
-                    if (rowId(event) == warmupRowId) {
+                    long id = rowId(event);
+                    if (boundary != null && !boundarySealed && id == boundary.rowId()) {
+                        observeBoundary(event, position);
+                        if (failure != null) {
+                            break;
+                        }
+                    }
+                    if (id == warmupRowId) {
                         warmupSeen = true;
                     }
-                    if (rowId(event) == terminalRowId) {
+                    if (id == terminalRowId) {
+                        if (boundary != null && restoredCount != 1) {
+                            failure = new AssertionError("terminal row arrived before the restored boundary row");
+                            break;
+                        }
                         terminalCount++;
                         if (terminalCount > 1) {
                             failure = new AssertionError("sidecar saw duplicate terminal row " + terminalRowId);
@@ -204,6 +277,29 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
                     }
                 }
                 monitor.notifyAll();
+            }
+        }
+
+        private void observeBoundary(Envelope event, Optional<SourcePosition> position) {
+            Object value = event.after() == null ? null : event.after().get(boundary.field());
+            if (value == null) {
+                failure = new AssertionError("boundary row has no selected field value");
+            } else if (valuesEqual(value, boundary.changedValue())) {
+                if (changedSeen || restoredCount != 0) {
+                    failure = new AssertionError("sidecar saw duplicate or late changed boundary row");
+                } else {
+                    changedSeen = true;
+                }
+            } else if (valuesEqual(value, boundary.restoredValue())) {
+                if (!changedSeen || ++restoredCount != 1) {
+                    failure = new AssertionError("sidecar saw restored boundary row out of order or twice");
+                } else if (position.isEmpty() || position.get().token().isBlank()) {
+                    failure = new AssertionError("restored boundary row had no source position");
+                } else {
+                    restoredToken = position.get().token();
+                }
+            } else {
+                failure = new AssertionError("boundary row has an unexpected field value");
             }
         }
 
@@ -224,6 +320,36 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
         boolean terminalSeen() {
             synchronized (monitor) {
                 return terminalCount > 0;
+            }
+        }
+
+        boolean hasBoundary() {
+            return boundary != null;
+        }
+
+        boolean boundarySeen() {
+            synchronized (monitor) {
+                return restoredCount > 0;
+            }
+        }
+
+        String boundaryToken() {
+            synchronized (monitor) {
+                if (boundary == null || !changedSeen || restoredCount != 1
+                        || restoredToken == null || restoredToken.isBlank()) {
+                    throw new AssertionError("sidecar has no unique restored boundary source position");
+                }
+                return restoredToken;
+            }
+        }
+
+        void sealBoundary() {
+            synchronized (monitor) {
+                if (failure != null) {
+                    throw new AssertionError("sidecar capture failed", failure);
+                }
+                boundaryToken();
+                boundarySealed = true;
             }
         }
 

@@ -13,7 +13,7 @@ final class BenchmarkBoundaryWrites {
     }
 
     record Boundary(String table, long rowId, String field, String seededValueSql,
-                    String changedSql, String restoredSql) {
+                    String changedSql, String restoredSql, Object changedValue, Object restoredValue) {
     }
 
     static Boundary forChain(BenchmarkWorkloadDefinitions.Workload workload,
@@ -47,7 +47,7 @@ final class BenchmarkBoundaryWrites {
         String restored = "UPDATE " + chain.table() + " SET " + value.field() + " = " + value.seededSql()
                 + row + " AND " + value.field() + " = " + value.changedSql();
         return new Boundary(chain.table(), value.rowId(), value.field(), value.seededSql(),
-                changed, restored);
+                changed, restored, value.changedValue(), value.seededValue());
     }
 
     static String changedSql(BenchmarkWorkloadDefinitions.Workload workload,
@@ -60,14 +60,17 @@ final class BenchmarkBoundaryWrites {
         return forChain(workload, chain).restoredSql();
     }
 
-    private record Value(long rowId, String field, String seededSql, String changedSql) {
+    private record Value(long rowId, String field, String seededSql, String changedSql,
+                         Object seededValue, Object changedValue) {
     }
 
     private static Value numeric(long rowId, String field, long seeded) {
-        return new Value(rowId, field, String.valueOf(seeded), String.valueOf(seeded + 1));
+        return new Value(rowId, field, String.valueOf(seeded), String.valueOf(seeded + 1),
+                seeded, seeded + 1);
     }
 
     private static Value text(long rowId, String field, String seeded) {
-        return new Value(rowId, field, "'" + seeded + "'", "'" + seeded + "-boundary'");
+        return new Value(rowId, field, "'" + seeded + "'", "'" + seeded + "-boundary'",
+                seeded, seeded + "-boundary");
     }
 }
