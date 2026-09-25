@@ -253,7 +253,7 @@ class RestartResumesTheTailIT {
     /**
      * The rows-read reading, taken only once the run it is a reading of is shown to be there at all and
      * to be a new one. Two situations answer "it read nought" while the claim above it is false, and both
-     * have been met in this file: a pipeline with no live run answers the snapshot face with nothing, and
+     * have been met in this file: a pipeline with no live run answers the run-local snapshot metric with nothing, and
      * the default this reading takes for a missing table turns that into the very value the claim
      * asserts; and a restart that did not restart leaves the run before it delivering the rows the case
      * waited for, so they arrive on time while saying nothing about a run that was never built.
@@ -272,7 +272,7 @@ class RestartResumesTheTailIT {
                         + "not there", pipelineId, read)
                 .contains(PipelineState.RUNNING);
         assertThat(control.snapshotRowsRead(pipelineId))
-                .as("the snapshot face of %s: with no live run it answers nothing at all, which the "
+                .as("the run-local snapshot metric of %s: with no live run it answers nothing at all, which the "
                         + "reading taken from it would report as a table that was never read", pipelineId)
                 .containsKey(TABLE);
         assertThat(settledRecordCount(control, pipelineId))

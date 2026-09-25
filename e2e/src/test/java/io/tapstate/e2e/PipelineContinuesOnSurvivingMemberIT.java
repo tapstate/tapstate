@@ -2,8 +2,13 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.testsupport.DockerGate;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -11,6 +16,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.List;
+import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -80,7 +87,8 @@ class PipelineContinuesOnSurvivingMemberIT {
             files.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
 
             String store = SharedMongo.replicaSetUrl("e2e_failover_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-failover")) {
+            try (MongoClient durable = MongoClients.create(store);
+                    TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-failover")) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -92,6 +100,13 @@ class PipelineContinuesOnSurvivingMemberIT {
                 Await.until("the seeded rows to cross before anything is killed",
                         () -> files.count(targetAddress, TABLE) >= SEEDED_ROWS,
                         () -> "rows at target = " + files.count(targetAddress, TABLE));
+                Await.until("the target to confirm the initial load in the shared record",
+                        () -> loadCompleted(durable, store),
+                        () -> "completion mark absent for " + TABLE);
+                TableSnapshot before = Await.answered("the first run's snapshot reading",
+                        () -> control.snapshotTable(PIPELINE, TABLE)
+                                .filter(reading -> reading.rowsDone() == SEEDED_ROWS));
+                assertThat(before.rowsDone()).isEqualTo(SEEDED_ROWS);
 
                 // Who is carrying it, said by the cluster rather than guessed.
                 String driver = Await.answered("the cluster to name the member driving the pipeline",
@@ -132,8 +147,29 @@ class PipelineContinuesOnSurvivingMemberIT {
                                 + "rebuild that kept going would also leave this higher, and a pipeline "
                                 + "rebuilt three times before it caught is not a recovered one")
                         .contains(generationBefore + 1);
+                Await.until("the replacement's snapshot face to retain the confirmed load",
+                        Duration.ofSeconds(30),
+                        () -> survivor.snapshotTable(PIPELINE, TABLE)
+                                .map(reading -> reading.equals(new TableSnapshot(SEEDED_ROWS, SEEDED_ROWS, 100)))
+                                .orElse(false),
+                        () -> String.valueOf(survivor.snapshotTable(PIPELINE, TABLE)));
+                assertThat(survivor.snapshotRowsRead(PIPELINE))
+                        .describedAs("the replacement run skipped the already confirmed table")
+                        .containsEntry(TABLE, 0L);
             }
         }
+    }
+
+    private static boolean loadCompleted(MongoClient client, String storeUri) {
+        String database = new ConnectionString(storeUri).getDatabase();
+        for (Document consumer : client.getDatabase(database)
+                .getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).find()) {
+            if (consumer.get("snapshotCompletedTables") instanceof List<?> tables
+                    && tables.contains(TABLE)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void awaitRunning(ControlPlane control, String pipelineId, Duration bound) {

@@ -106,6 +106,7 @@ class RuntimeConvergenceConfiguration {
                 // Where the run spends its time, per stage of the graph, as the processors time their own
                 // units of work; a run that has timed nothing yet reports nothing rather than a stage at zero.
                 engine::stageDurations,
+                captureCoordinator::runSnapshotProgress,
                 Clock.systemUTC());
     }
 

@@ -137,7 +137,7 @@ class AWrittenBackPositionIsWhereTheNextRunBeginsIT {
 
             // First that the run read nothing from the collection, so the count below can only be changes.
             assertThat(control.snapshotRowsRead(suffix))
-                    .as("the snapshot face of the run after the write-back: with no live run it answers "
+                    .as("the run-local snapshot metric after the write-back: with no live run it answers "
                             + "nothing at all, which the reading taken from it would report as a "
                             + "collection that was never read")
                     .containsKey(COLLECTION);
