@@ -147,12 +147,16 @@ class PipelineContinuesOnSurvivingMemberIT {
                                 + "rebuild that kept going would also leave this higher, and a pipeline "
                                 + "rebuilt three times before it caught is not a recovered one")
                         .contains(generationBefore + 1);
-                Await.until("the replacement's snapshot face to retain the confirmed load",
+                TableSnapshot completedLoad = new TableSnapshot(SEEDED_ROWS, SEEDED_ROWS, 100);
+                Await.until("the replacement observation to retain the confirmed load without rereading it",
                         Duration.ofSeconds(30),
-                        () -> survivor.snapshotTable(PIPELINE, TABLE)
-                                .map(reading -> reading.equals(new TableSnapshot(SEEDED_ROWS, SEEDED_ROWS, 100)))
-                                .orElse(false),
-                        () -> String.valueOf(survivor.snapshotTable(PIPELINE, TABLE)));
+                        () -> Long.valueOf(0L).equals(survivor.snapshotRowsRead(PIPELINE).get(TABLE))
+                                && survivor.snapshotTable(PIPELINE, TABLE)
+                                        .filter(completedLoad::equals).isPresent(),
+                        () -> "snapshot = " + survivor.snapshotTable(PIPELINE, TABLE)
+                                + ", rows read this run = " + survivor.snapshotRowsRead(PIPELINE));
+                assertThat(survivor.snapshotTable(PIPELINE, TABLE))
+                        .contains(completedLoad);
                 assertThat(survivor.snapshotRowsRead(PIPELINE))
                         .describedAs("the replacement run skipped the already confirmed table")
                         .containsEntry(TABLE, 0L);
