@@ -231,6 +231,11 @@ final class RealProcessServer implements ServerHandle {
         return process.isAlive();
     }
 
+    /** The child JVM identity used by external benchmark resource sampling. */
+    long pid() {
+        return process.pid();
+    }
+
     /**
      * What it exited with, for a witness whose subject is the server declining to start.
      *
