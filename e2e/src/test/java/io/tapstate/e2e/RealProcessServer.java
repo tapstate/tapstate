@@ -266,6 +266,14 @@ final class RealProcessServer implements ServerHandle {
         return output;
     }
 
+    /**
+     * The operating system's id for this process: what a connector running inside it names itself by, and so how
+     * a case finds the member carrying a write the connector reports.
+     */
+    long pid() {
+        return process.pid();
+    }
+
     /** Whether it is still running, so a witness waiting on it can tell waiting from waiting forever. */
     boolean isAlive() {
         return process.isAlive();
