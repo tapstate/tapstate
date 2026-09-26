@@ -155,6 +155,34 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
 
         assertThat(plans.current(List.of("a", "b"))).containsOnlyKeys("b");
         assertThat(plans.current(List.of())).isEmpty();
+        assertThat(plans.last("a"))
+                .as("a stopped pipeline has no current plan, and its last one is what its next run is compared with")
+                .isEqualTo(first);
+        assertThat(plans.last("never-ran")).isNull();
+    }
+
+    @Test
+    void aStartAfterAnEarlierRunWritesDownTheRunItReplacedAndHowEachWidthMoved() {
+        RecordingPlans plans = new RecordingPlans();
+        plans.last = new ExecutionPlan(PIPE, 2L, 6L, 10L, List.of("m1", "m2", "m3", "m4"),
+                List.of(new ExecutionPlan.Node("serve.s", 8, "explicit", "native", 4, 2, 8, List.of(), 512, 50L,
+                        List.of("route.serve.s", "serve.s"))),
+                T0.minusSeconds(600));
+        EngineLifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member), new PlannedIdle(),
+                new NoOpCaptureCoordinator(),
+                new NestStateTeardown(member, new InMemoryKeyedStateStore(), new InMemoryNestDeadLetterStore()),
+                PipelineActuationOwnership.single(), plans, Clock.fixed(T0, ZoneOffset.UTC));
+
+        actuator.start(PIPE);
+
+        assertThat(plans.recorded).singleElement().satisfies(plan -> {
+            assertThat(plan.replaces()).isEqualTo(
+                    new ExecutionPlan.Replaced(6L, List.of("m1", "m2", "m3", "m4"), T0.minusSeconds(600)));
+            assertThat(plan.nodes()).filteredOn(node -> node.node().equals("serve.s")).singleElement()
+                    .extracting(ExecutionPlan.Node::change)
+                    .isEqualTo(new ExecutionPlan.Change(8, List.of(ExecutionPlan.Change.MEMBERS_CHANGED,
+                            ExecutionPlan.Change.CAPABILITY_CHANGED)));
+        });
     }
 
     /** The idle stand-in topology, planned over three members: a source held to one, a sink eight wide. */
@@ -202,11 +230,20 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
         }
     }
 
-    /** Remembers every plan written down and every pipeline let go of, in order. */
+    /**
+     * Remembers every plan written down and every pipeline let go of, in order, and answers {@code last} as the plan
+     * of the run before.
+     */
     private static final class RecordingPlans implements ExecutionPlanRecorder {
 
         private final List<ExecutionPlan> recorded = new ArrayList<>();
         private final List<String> forgotten = new ArrayList<>();
+        private ExecutionPlan last;
+
+        @Override
+        public ExecutionPlan last(String pipelineId) {
+            return last;
+        }
 
         @Override
         public void record(ExecutionPlan plan) {

@@ -117,6 +117,8 @@ import org.springframework.lang.Nullable;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Clock;
+import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * Wires the control plane into the assembly root: the authentication ports over the store, the control-core
@@ -238,6 +240,11 @@ class ControlPlaneConfiguration {
      */
     private static ExecutionPlans executionPlans(HazelcastInstance engine) {
         return engine == null ? ExecutionPlans.NONE : new HazelcastExecutionPlans(engine);
+    }
+
+    /** The members a run would take part on now, by stable id; none on a server that is no cluster member. */
+    private static Supplier<List<String>> dataMembers(HazelcastInstance engine) {
+        return engine == null ? List::of : () -> ClusterMembershipGate.dataMembers(engine);
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----
@@ -602,8 +609,9 @@ class ControlPlaneConfiguration {
     @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
             ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member) {
+        HazelcastInstance engine = member.getIfAvailable();
         return new PipelineObservationQueryService(artifactQueryService, storePort.observations(),
-                executionPlans(member.getIfAvailable()));
+                executionPlans(engine), dataMembers(engine));
     }
 
     @Bean
@@ -622,9 +630,10 @@ class ControlPlaneConfiguration {
             ArtifactQueryService artifactQueryService, StorePort storePort, Clock clock,
             ObjectProvider<HazelcastInstance> member) {
         ExplanationCatalog messages = ExplanationCatalog.bundled();
+        HazelcastInstance engine = member.getIfAvailable();
         return new PipelineExplainService(
                 artifactQueryService, storePort.observations(), clock, messages::render,
-                executionPlans(member.getIfAvailable()));
+                executionPlans(engine), dataMembers(engine));
     }
 
     /**

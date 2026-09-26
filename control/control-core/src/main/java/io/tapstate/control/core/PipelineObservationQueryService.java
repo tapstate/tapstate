@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
@@ -10,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * The pipeline observation read side: the three store-backed read faces — status / metrics / snapshot —
@@ -34,6 +36,7 @@ public final class PipelineObservationQueryService {
     private final ArtifactQueryService artifacts;
     private final ObservationStore observations;
     private final ExecutionPlans plans;
+    private final Supplier<List<String>> members;
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations) {
         this(artifacts, observations, ExecutionPlans.NONE);
@@ -42,19 +45,30 @@ public final class PipelineObservationQueryService {
     /** As above, answering a status with the plan its pipeline's current run was submitted on, from {@code plans}. */
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
             ExecutionPlans plans) {
-        this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
-        this.observations = Objects.requireNonNull(observations, "observations");
-        this.plans = Objects.requireNonNull(plans, "plans");
+        this(artifacts, observations, plans, List::of);
     }
 
     /**
-     * The pipeline's lifecycle state, with the coded reason its run died when there is one, and the plan its
-     * current run was submitted on where one is recorded.
+     * As above, also naming the members of the cluster - {@code members}, by stable id - the plan was not worked
+     * out for.
+     */
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members) {
+        this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
+        this.observations = Objects.requireNonNull(observations, "observations");
+        this.plans = Objects.requireNonNull(plans, "plans");
+        this.members = Objects.requireNonNull(members, "members");
+    }
+
+    /**
+     * The pipeline's lifecycle state, with the coded reason its run died when there is one, the plan its current
+     * run was submitted on where one is recorded, and the members of the cluster that plan was not worked out for.
      */
     public PipelineStatus status(String pipelineId) {
         PipelineStatus status = lifecycleStatus(pipelineId);
+        ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
         return new PipelineStatus(status.pipelineId(), status.state(), status.failure(), status.observedAt(),
-                plans.current(List.of(pipelineId)).get(pipelineId));
+                plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
     }
 
     /**

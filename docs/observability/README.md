@@ -274,12 +274,19 @@ No explanation rule reads it; it answers beside the diagnosis.
 | `claimGeneration`, `executionGeneration`, `topologyRevision` | Which run the plan belongs to. Absent where nothing fences the run, such as a server that is not a cluster member |
 | `members` | The members the widths were worked out for, by stable id |
 | `plannedAt` | When the run was planned |
+| `replaces` | The run this plan replaced, after a lost member, a stop or a restart: its `executionGeneration` where it had one, its `members`, and when it was planned. Absent for a pipeline's first run |
 | `nodes[].requested`, `nodes[].requestedOrigin` | The target total the node was given, and whether its author wrote it (`explicit`) or it is the default for the node's kind (`node-default`) |
 | `nodes[].scope` | `total-one`: one processor for the whole cluster. `native`: the same number of processors on every member |
 | `nodes[].memberCount`, `nodes[].computedLocal`, `nodes[].effective` | The member count and per-member count the width was worked out for, and the processors that makes in total. `computedLocal` is absent for `total-one` |
 | `nodes[].reasons` | Stable ids for why the width is what it is: `requested-one`, `source-reads-not-split`, `single-target-keyless`, `key-not-derivable`, `rounded-up`, `rounded-down`, or `budget:<name>` |
 | `nodes[].batch` | `maxRecords` and `maxWaitMillis`: the batch the node takes its input in |
+| `nodes[].change` | How the node's width moved from the run before: `previousEffective`, and `causes` naming each input that moved it apart - `members-changed`, `target-changed`, `capability-changed`. Absent where the width did not move |
 | `nodes[].resources` | Sinks only: `writers`; `connectorMode` (`isolated`: a connector per writer, `shared`: one per member, used only for an artifact certified to be shared) and `connectorInstances`; `bufferedRecords`, two batches per writer; and `edgeQueueRecords`, a full queue from every processor sending into the sink to every processor it takes its input on. These are upper bounds worked out before anything opens. A connector's own connection pool is sized inside the connector and is not counted |
+
+Beside the plan, both faces send `awaitingRebalance`: members of the cluster the plan was not worked
+out for, by stable id. A running pipeline keeps the members it was planned over, so a member that joins
+afterwards is given no part of it until a rebalance. This is not a failure, and it is told apart from a
+run rebuilt after a member was lost, whose plan names the run it `replaces`.
 
 The status watch stream does not carry the plan. Read `status` again after a restart to see the new
 run's plan.

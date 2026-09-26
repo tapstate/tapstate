@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import java.time.Instant;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -19,14 +20,24 @@ import java.util.Objects;
  *
  * <p>{@code plan} is the plan the pipeline's current run was submitted on - how wide each node runs and why - or
  * {@code null} when no run has one recorded. It qualifies the run the state describes rather than measuring it,
- * and is replaced only when a new run is submitted.
+ * and is replaced only when a new run is submitted. {@code awaitingRebalance} are the members of the cluster that
+ * plan was not worked out for, by stable id: members that joined after the run was planned and are given no part
+ * of it until it is rebalanced. Empty where every member is planned for, or where there is no plan.
  */
 public record PipelineStatus(String pipelineId, PipelineState state, ObservationFailure failure,
-        Instant observedAt, ExecutionPlan plan) {
+        Instant observedAt, ExecutionPlan plan, List<String> awaitingRebalance) {
 
     public PipelineStatus {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(state, "state");
+        // Absent reads as none: the wire omits an empty list, and a status read back from it names nobody.
+        awaitingRebalance = awaitingRebalance == null ? List.of() : List.copyOf(awaitingRebalance);
+    }
+
+    /** A status whose plan, if any, was worked out for every member of the cluster. */
+    public PipelineStatus(String pipelineId, PipelineState state, ObservationFailure failure, Instant observedAt,
+            ExecutionPlan plan) {
+        this(pipelineId, state, failure, observedAt, plan, List.of());
     }
 
     /** A status of a run with no plan recorded. */

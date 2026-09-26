@@ -195,11 +195,26 @@ class PipelineObservationQueryServiceTest {
     }
 
     @Test
+    void statusNamesTheMembersThatJoinedAfterTheRunWasPlanned() {
+        ExecutionPlan plan = new ExecutionPlan("orders_sync", 3L, 7L, 11L, List.of("m1", "m2"), List.of(),
+                Instant.parse("2026-09-26T10:00:00Z"));
+        var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()),
+                new ReadCountingPlans(Map.of("orders_sync", plan)), () -> List.of("m1", "m2", "m3"));
+
+        // Awaiting a rebalance, not failed: the run keeps the members it was planned over, and a member that
+        // joined since is given no part of it until somebody asks for one.
+        assertThat(service.status("orders_sync").awaitingRebalance()).containsExactly("m3");
+    }
+
+    @Test
     void statusOfAPipelineWhoseRunHasNoPlanRecordedCarriesNone() {
         var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()),
-                new ReadCountingPlans(Map.of()));
+                new ReadCountingPlans(Map.of()), () -> List.of("m1", "m2", "m3"));
 
         assertThat(service.status("orders_sync").plan()).isNull();
+        assertThat(service.status("orders_sync").awaitingRebalance())
+                .as("with no plan there is nothing a member could be left out of")
+                .isEmpty();
     }
 
     @Test

@@ -23,6 +23,12 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
     /** The map the plans are kept in, one entry per pipeline with a run. */
     static final String MAP_NAME = "tapstate.execution-plans";
 
+    /**
+     * The map the latest plan of each pipeline that ever ran is kept in, whether or not its run is still going:
+     * what the next run's plan is compared against, across a stop as much as across a lost member.
+     */
+    static final String LAST_MAP_NAME = "tapstate.execution-plans.last";
+
     private final HazelcastInstance member;
 
     HazelcastExecutionPlans(HazelcastInstance member) {
@@ -32,6 +38,12 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
     @Override
     public void record(ExecutionPlan plan) {
         plans().set(plan.pipelineId(), plan);
+        member.<String, ExecutionPlan>getMap(LAST_MAP_NAME).set(plan.pipelineId(), plan);
+    }
+
+    @Override
+    public ExecutionPlan last(String pipelineId) {
+        return member.<String, ExecutionPlan>getMap(LAST_MAP_NAME).get(pipelineId);
     }
 
     @Override

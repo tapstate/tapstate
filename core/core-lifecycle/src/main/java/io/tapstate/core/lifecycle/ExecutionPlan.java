@@ -2,7 +2,10 @@ package io.tapstate.core.lifecycle;
 
 import java.io.Serializable;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -23,6 +26,8 @@ import java.util.Objects;
  * @param members             the members the widths were worked out for, by stable id
  * @param nodes               every node the run draws, in the order they were worked out
  * @param plannedAt           when the run was planned
+ * @param replaces            the run this one's plan replaced, or null where the pipeline had none planned
+ *                            before
  */
 public record ExecutionPlan(
         String pipelineId,
@@ -31,7 +36,8 @@ public record ExecutionPlan(
         Long topologyRevision,
         List<String> members,
         List<Node> nodes,
-        Instant plannedAt) implements Serializable {
+        Instant plannedAt,
+        Replaced replaces) implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
@@ -40,6 +46,85 @@ public record ExecutionPlan(
         members = List.copyOf(Objects.requireNonNull(members, "members"));
         nodes = List.copyOf(Objects.requireNonNull(nodes, "nodes"));
         Objects.requireNonNull(plannedAt, "plannedAt");
+    }
+
+    /** A plan that replaced no earlier one. */
+    public ExecutionPlan(String pipelineId, Long claimGeneration, Long executionGeneration, Long topologyRevision,
+            List<String> members, List<Node> nodes, Instant plannedAt) {
+        this(pipelineId, claimGeneration, executionGeneration, topologyRevision, members, nodes, plannedAt, null);
+    }
+
+    /**
+     * The members among {@code members} this plan's widths were not worked out for, in their order: members that
+     * joined after the run was planned. A run keeps the members it was planned over, so these are given no part
+     * of it until it is rebalanced - which is not a failure, and is told apart from a run rebuilt after losing a
+     * member, whose plan names the run it replaced.
+     */
+    public List<String> notPlannedFor(List<String> members) {
+        return members.stream().filter(member -> !this.members.contains(member)).toList();
+    }
+
+    /**
+     * This plan as the one that replaced {@code previous}: naming the run it replaced, and saying of each node
+     * whose width moved what it was and which of its inputs moved it. {@code previous} null is a pipeline with
+     * no plan before, and leaves this one as it is.
+     */
+    public ExecutionPlan replacing(ExecutionPlan previous) {
+        if (previous == null) {
+            return this;
+        }
+        Map<String, Node> before = new HashMap<>();
+        previous.nodes().forEach(node -> before.put(node.node(), node));
+        List<Node> after = nodes.stream().map(node -> node.after(before.get(node.node()))).toList();
+        return new ExecutionPlan(pipelineId, claimGeneration, executionGeneration, topologyRevision, members, after,
+                plannedAt, new Replaced(previous.executionGeneration(), previous.members(), previous.plannedAt()));
+    }
+
+    /**
+     * The run a plan replaced, as far as a reader asking what changed needs it: its generation, the members its
+     * widths were worked out for, and when it was planned.
+     *
+     * @param executionGeneration the replaced run's generation, or null where nothing fenced it
+     * @param members             the members its widths were worked out for, by stable id
+     * @param plannedAt           when it was planned
+     */
+    public record Replaced(Long executionGeneration, List<String> members, Instant plannedAt)
+            implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        public Replaced {
+            members = List.copyOf(Objects.requireNonNull(members, "members"));
+            Objects.requireNonNull(plannedAt, "plannedAt");
+        }
+    }
+
+    /**
+     * How a node's width moved from the run before: the width it ran at then, and each input of the working-out
+     * that moved - named apart rather than folded into one reason, because each is answered by someone else.
+     * {@code members-changed}: the run was worked out for a different number of members, as after one was lost.
+     * {@code target-changed}: its author gave it a different target. {@code capability-changed}: what bounds the
+     * node moved - whether its rows carry a key, or a budget it is held to.
+     *
+     * @param previousEffective the processors the node ran in total in the run before
+     * @param causes            the inputs that moved, in that order; empty where none can be named
+     */
+    public record Change(int previousEffective, List<String> causes) implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        /** The run was worked out for a different number of members. */
+        public static final String MEMBERS_CHANGED = "members-changed";
+
+        /** The node's author gave it a different target. */
+        public static final String TARGET_CHANGED = "target-changed";
+
+        /** What bounds the node moved: whether its rows carry a key, or a budget it is held to. */
+        public static final String CAPABILITY_CHANGED = "capability-changed";
+
+        public Change {
+            causes = List.copyOf(Objects.requireNonNull(causes, "causes"));
+        }
     }
 
     /**
@@ -62,7 +147,8 @@ public record ExecutionPlan(
             int maxRecords,
             long maxWaitMillis,
             List<String> vertices,
-            Resources resources) implements Serializable {
+            Resources resources,
+            Change change) implements Serializable {
 
         private static final long serialVersionUID = 1L;
 
@@ -74,17 +160,47 @@ public record ExecutionPlan(
             vertices = List.copyOf(Objects.requireNonNull(vertices, "vertices"));
         }
 
+        /** A node whose width did not move from a run before, holding open and buffering what is given. */
+        public Node(String node, int requested, String origin, String scope, int memberCount, Integer computedLocal,
+                int effective, List<String> reasons, int maxRecords, long maxWaitMillis, List<String> vertices,
+                Resources resources) {
+            this(node, requested, origin, scope, memberCount, computedLocal, effective, reasons, maxRecords,
+                    maxWaitMillis, vertices, resources, null);
+        }
+
         /** A node that holds open and buffers nothing worked out here: any node but a sink. */
         public Node(String node, int requested, String origin, String scope, int memberCount, Integer computedLocal,
                 int effective, List<String> reasons, int maxRecords, long maxWaitMillis, List<String> vertices) {
             this(node, requested, origin, scope, memberCount, computedLocal, effective, reasons, maxRecords,
-                    maxWaitMillis, vertices, null);
+                    maxWaitMillis, vertices, null, null);
         }
 
         /** The same node, holding open and buffering what {@code resources} says. */
         public Node withResources(Resources resources) {
             return new Node(node, requested, origin, scope, memberCount, computedLocal, effective, reasons,
-                    maxRecords, maxWaitMillis, vertices, resources);
+                    maxRecords, maxWaitMillis, vertices, resources, change);
+        }
+
+        /**
+         * This node as worked out after {@code before} - the same node in the run before, or null where that run
+         * had none: saying how its width moved, where it moved.
+         */
+        Node after(Node before) {
+            if (before == null || before.effective() == effective) {
+                return this;
+            }
+            List<String> causes = new ArrayList<>();
+            if (before.memberCount() != memberCount) {
+                causes.add(Change.MEMBERS_CHANGED);
+            }
+            if (before.requested() != requested) {
+                causes.add(Change.TARGET_CHANGED);
+            }
+            if (!before.reasons().equals(reasons)) {
+                causes.add(Change.CAPABILITY_CHANGED);
+            }
+            return new Node(node, requested, origin, scope, memberCount, computedLocal, effective, reasons,
+                    maxRecords, maxWaitMillis, vertices, resources, new Change(before.effective(), causes));
         }
 
         /**

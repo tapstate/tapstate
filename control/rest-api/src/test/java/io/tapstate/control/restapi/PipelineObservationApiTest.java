@@ -269,6 +269,8 @@ class PipelineObservationApiTest {
                 "node", "orders_sink", "requested", 8, "requestedOrigin", "explicit", "scope", "native",
                 "memberCount", 3, "computedLocal", 3, "effective", 9, "reasons", List.of("rounded-up"),
                 "batch", Map.of("maxRecords", 512, "maxWaitMillis", 50)));
+        // A fourth member joined after the run was planned over three: it waits for a rebalance.
+        assertThat(body.get("awaitingRebalance")).isEqualTo(List.of("m4"));
     }
 
     @Test
@@ -277,7 +279,7 @@ class PipelineObservationApiTest {
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
 
-        assertThat(body).containsEntry("state", "RUNNING").doesNotContainKey("plan");
+        assertThat(body).containsEntry("state", "RUNNING").doesNotContainKeys("plan", "awaitingRebalance");
     }
 
     @Test
@@ -647,7 +649,7 @@ class PipelineObservationApiTest {
         PipelineObservationQueryService pipelineObservationQueryService(ObservationStore observations) {
             ExecutionPlans plans = pipelineIds -> pipelineIds.contains("pl2") ? Map.of("pl2", PL_POS_PLAN) : Map.of();
             return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations,
-                    plans);
+                    plans, () -> List.of("m1", "m2", "m3", "m4"));
         }
 
         @Bean

@@ -22,6 +22,18 @@ interface ExecutionPlanRecorder {
     /** Records {@code plan} as its pipeline's current one, in place of whatever run came before it. */
     void record(ExecutionPlan plan);
 
-    /** Lets go of {@code pipelineId}'s plan: nothing of it runs any more. */
+    /**
+     * Lets go of {@code pipelineId}'s plan as its current one: nothing of it runs any more. It stays the one
+     * {@link #last} answers with, so a run started later can say how it differs from it.
+     */
     void forget(String pipelineId);
+
+    /**
+     * The plan {@code pipelineId}'s latest run was submitted on, whether or not that run is still going, or null
+     * where none was recorded - what the next run's plan is compared against. A recorder that keeps nothing
+     * answers null.
+     */
+    default ExecutionPlan last(String pipelineId) {
+        return null;
+    }
 }

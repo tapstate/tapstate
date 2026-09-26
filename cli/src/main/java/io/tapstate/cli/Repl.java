@@ -5140,6 +5140,10 @@ final class Repl {
         if (answer.plan() != null) {
             renderPlan(out, answer.plan());
         }
+        if (!answer.awaitingRebalance().isEmpty()) {
+            out.println("  awaiting   " + String.join(", ", answer.awaitingRebalance())
+                    + " -- joined after this run was planned; given no part of it until a rebalance");
+        }
     }
 
     /**
@@ -5161,6 +5165,11 @@ final class Repl {
         }
         out.println("  planned    " + plan.plannedAt() + " on " + String.join(", ", plan.members())
                 + (run.isEmpty() ? "" : " (" + String.join(", ", run) + ")"));
+        if (plan.replaces() != null) {
+            out.println("  replaced   " + (plan.replaces().executionGeneration() == null ? "the run"
+                    : "execution " + plan.replaces().executionGeneration()) + " planned " + plan.replaces().plannedAt()
+                    + " on " + String.join(", ", plan.replaces().members()));
+        }
         plan.nodes().forEach(node -> {
             out.println("  width      " + node.node() + "  " + width(node));
             if (node.resources() != null) {
@@ -5185,7 +5194,14 @@ final class Repl {
         return node.effective() + " in all (" + spread + "), requested " + node.requested()
                 + " (" + node.requestedOrigin() + ")"
                 + (node.reasons().isEmpty() ? "" : " -- " + String.join(", ", node.reasons()))
-                + "; batch " + node.maxRecords() + " records, " + node.maxWaitMillis() + "ms wait";
+                + "; batch " + node.maxRecords() + " records, " + node.maxWaitMillis() + "ms wait"
+                + (node.change() == null ? "" : "; " + changed(node.change()));
+    }
+
+    /** How a node's width moved from the run before, and what moved it where the server could say. */
+    private static String changed(ExplainOutcome.PlanChange change) {
+        return "was " + change.previousEffective()
+                + (change.causes().isEmpty() ? "" : " (" + String.join(", ", change.causes()) + ")");
     }
 
     private static String evidenceValue(Object value) {

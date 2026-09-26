@@ -247,15 +247,22 @@ class ObservabilityConsumerContractTest {
         assertGolden(PipelineExplanationResponse.of(pending), "explain-start-pending.golden.json");
 
         // The plan the run was submitted on, beside the diagnosis: a source held to one processor for the
-        // cluster, which has no per-member count to send, and a sink worked out to three per member.
+        // cluster, which has no per-member count to send, and a sink worked out to three per member - rebuilt on
+        // three members after a run on four, so the sink's width moved and says what moved it, and a fifth member
+        // that joined since waits for a rebalance.
+        ExecutionPlan.Node source = new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
+                List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src"));
+        ExecutionPlan before = new ExecutionPlan("orders", 3L, 6L, 11L, List.of("m1", "m2", "m3", "m4"),
+                List.of(source, new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 4, 2, 8, List.of(),
+                        512, 50L, List.of("route.orders_sink", "orders_sink"))),
+                Instant.parse("2026-09-20T09:40:00Z"));
         PipelineExplanation planned = noMatch.withPlan(new ExecutionPlan("orders", 3L, 7L, 11L,
                 List.of("m1", "m2", "m3"),
-                List.of(new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
-                                List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src")),
+                List.of(source,
                         new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 3, 3, 9,
                                 List.of("rounded-up"), 512, 50L, List.of("route.orders_sink", "orders_sink"))
                                 .withResources(new ExecutionPlan.Resources(9, "isolated", 9, 9_216L, 175_104L))),
-                Instant.parse("2026-09-20T09:58:00Z")));
+                Instant.parse("2026-09-20T09:58:00Z")).replacing(before), List.of("m5"));
         assertGolden(PipelineExplanationResponse.of(planned), "explain-with-plan.golden.json");
     }
 

@@ -1356,12 +1356,14 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             return null;
         }
         ExplainOutcome.Plan plan = explanationPlan(map.get("plan"));
-        if (map.get("plan") != null && plan == null) {
+        List<String> awaitingRebalance = map.get("awaitingRebalance") == null ? List.of()
+                : strings(map.get("awaitingRebalance"));
+        if (map.get("plan") != null && plan == null || awaitingRebalance == null) {
             return null;
         }
         return new ExplainOutcome.Found(pipelineId, state, kind, message, (String) rawObservedAt,
                 rawAge == null ? null : ((Number) rawAge).longValue(), freshness,
-                evidence, cannotSay, next, pending, plan);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance);
     }
 
     private static ExplainOutcome.Plan explanationPlan(Object raw) {
@@ -1374,7 +1376,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             return null;
         }
         List<String> members = strings(plan.get("members"));
-        if (members == null) {
+        ExplainOutcome.PlanReplaced replaces = explanationPlanReplaced(plan.get("replaces"));
+        if (members == null || plan.get("replaces") != null && replaces == null) {
             return null;
         }
         List<ExplainOutcome.PlanNode> nodes = new ArrayList<>();
@@ -1387,7 +1390,26 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
         return new ExplainOutcome.Plan(longOrNull(plan.get("claimGeneration")),
                 longOrNull(plan.get("executionGeneration")), longOrNull(plan.get("topologyRevision")),
-                members, nodes, plannedAt);
+                members, nodes, plannedAt, replaces);
+    }
+
+    private static ExplainOutcome.PlanReplaced explanationPlanReplaced(Object raw) {
+        if (!(raw instanceof Map<?, ?> replaced)
+                || !(replaced.get("plannedAt") instanceof String plannedAt)
+                || !absentOrNumber(replaced.get("executionGeneration"))) {
+            return null;
+        }
+        List<String> members = strings(replaced.get("members"));
+        return members == null ? null
+                : new ExplainOutcome.PlanReplaced(longOrNull(replaced.get("executionGeneration")), members, plannedAt);
+    }
+
+    private static ExplainOutcome.PlanChange explanationPlanChange(Object raw) {
+        if (!(raw instanceof Map<?, ?> change) || !(change.get("previousEffective") instanceof Number previous)) {
+            return null;
+        }
+        List<String> causes = strings(change.get("causes"));
+        return causes == null ? null : new ExplainOutcome.PlanChange(previous.intValue(), causes);
     }
 
     private static ExplainOutcome.PlanNode explanationPlanNode(Object raw) {
@@ -1406,12 +1428,14 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
         List<String> reasons = strings(node.get("reasons"));
         ExplainOutcome.PlanResources resources = explanationPlanResources(node.get("resources"));
-        if (reasons == null || node.get("resources") != null && resources == null) {
+        ExplainOutcome.PlanChange change = explanationPlanChange(node.get("change"));
+        if (reasons == null || node.get("resources") != null && resources == null
+                || node.get("change") != null && change == null) {
             return null;
         }
         return new ExplainOutcome.PlanNode(id, requested.intValue(), origin, scope, memberCount.intValue(),
                 node.get("computedLocal") instanceof Number local ? local.intValue() : null, effective.intValue(),
-                reasons, maxRecords.intValue(), maxWaitMillis.longValue(), resources);
+                reasons, maxRecords.intValue(), maxWaitMillis.longValue(), resources, change);
     }
 
     private static ExplainOutcome.PlanResources explanationPlanResources(Object raw) {

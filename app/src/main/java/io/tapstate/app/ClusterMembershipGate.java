@@ -1,11 +1,13 @@
 package io.tapstate.app;
 
 import com.hazelcast.cluster.Member;
+import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.splitbrainprotection.SplitBrainProtectionFunction;
 import io.tapstate.spi.store.ClusterMembership;
 
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
@@ -39,6 +41,18 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     static String stableIdOf(Member member) {
         String nodeId = member.getAttribute(NODE_ID_ATTRIBUTE);
         return nodeId != null ? nodeId : member.getUuid().toString();
+    }
+
+    /**
+     * The members of {@code member}'s cluster a run submitted now would take part on, by stable id and in order:
+     * every member that holds data, which in this product is every member - none joins as a lite member.
+     */
+    static List<String> dataMembers(HazelcastInstance member) {
+        return member.getCluster().getMembers().stream()
+                .filter(candidate -> !candidate.isLiteMember())
+                .map(ClusterMembershipGate::stableIdOf)
+                .sorted()
+                .toList();
     }
 
     @Override

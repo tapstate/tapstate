@@ -83,6 +83,9 @@ class PipelineExplainParityTest {
         if (found.plan() != null) {
             value.put("plan", asMap(found.plan()));
         }
+        if (!found.awaitingRebalance().isEmpty()) {
+            value.put("awaitingRebalance", found.awaitingRebalance());
+        }
         return value;
     }
 
@@ -103,6 +106,10 @@ class PipelineExplainParityTest {
             item.put("effective", (long) node.effective());
             item.put("reasons", node.reasons());
             item.put("batch", Map.of("maxRecords", (long) node.maxRecords(), "maxWaitMillis", node.maxWaitMillis()));
+            if (node.change() != null) {
+                item.put("change", Map.of("previousEffective", (long) node.change().previousEffective(),
+                        "causes", node.change().causes()));
+            }
             if (node.resources() != null) {
                 item.put("resources", Map.of(
                         "writers", (long) node.resources().writers(),
@@ -114,6 +121,13 @@ class PipelineExplainParityTest {
             return item;
         }).toList());
         value.put("plannedAt", plan.plannedAt());
+        if (plan.replaces() != null) {
+            Map<String, Object> replaced = new LinkedHashMap<>();
+            putPresent(replaced, "executionGeneration", plan.replaces().executionGeneration());
+            replaced.put("members", plan.replaces().members());
+            replaced.put("plannedAt", plan.replaces().plannedAt());
+            value.put("replaces", replaced);
+        }
         return value;
     }
 

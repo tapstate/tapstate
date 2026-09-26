@@ -13,13 +13,26 @@ import java.util.List;
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 record ExecutionPlanResponse(Long claimGeneration, Long executionGeneration, Long topologyRevision,
-        List<String> members, List<Node> nodes, String plannedAt) {
+        List<String> members, List<Node> nodes, String plannedAt, Replaced replaces) {
 
     /** {@code plan} as a read face sends it, or null where there is none. */
     static ExecutionPlanResponse of(ExecutionPlan plan) {
         return plan == null ? null : new ExecutionPlanResponse(plan.claimGeneration(), plan.executionGeneration(),
                 plan.topologyRevision(), plan.members(), plan.nodes().stream().map(Node::of).toList(),
-                plan.plannedAt().toString());
+                plan.plannedAt().toString(), Replaced.of(plan.replaces()));
+    }
+
+    /**
+     * The run a plan replaced: its generation, omitted where nothing fenced it, the members its widths were worked
+     * out for, and when it was planned. Absent where the pipeline had no plan before.
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    record Replaced(Long executionGeneration, List<String> members, String plannedAt) {
+
+        static Replaced of(ExecutionPlan.Replaced replaced) {
+            return replaced == null ? null
+                    : new Replaced(replaced.executionGeneration(), replaced.members(), replaced.plannedAt().toString());
+        }
     }
 
     /**
@@ -31,17 +44,28 @@ record ExecutionPlanResponse(Long claimGeneration, Long executionGeneration, Lon
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     record Node(String node, int requested, String requestedOrigin, String scope, int memberCount,
-            Integer computedLocal, int effective, List<String> reasons, Batch batch, Resources resources) {
+            Integer computedLocal, int effective, List<String> reasons, Batch batch, Resources resources,
+            Change change) {
 
         static Node of(ExecutionPlan.Node node) {
             ExecutionPlan.Resources resources = node.resources();
+            ExecutionPlan.Change change = node.change();
             return new Node(node.node(), node.requested(), node.origin(), node.scope(), node.memberCount(),
                     node.computedLocal(), node.effective(), node.reasons(),
                     new Batch(node.maxRecords(), node.maxWaitMillis()),
                     resources == null ? null : new Resources(resources.writers(), resources.connectorMode(),
                             resources.connectorInstances(), resources.bufferedRecords(),
-                            resources.edgeQueueRecords()));
+                            resources.edgeQueueRecords()),
+                    change == null ? null : new Change(change.previousEffective(), change.causes()));
         }
+    }
+
+    /**
+     * How a node's width moved from the run before: what it ran at then, and each input of the working-out that
+     * moved it - {@code members-changed}, {@code target-changed} or {@code capability-changed}. Absent where the
+     * width did not move or there was no run before.
+     */
+    record Change(int previousEffective, List<String> causes) {
     }
 
     /**

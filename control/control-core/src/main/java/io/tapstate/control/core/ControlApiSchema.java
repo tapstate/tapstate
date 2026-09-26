@@ -382,6 +382,9 @@ public final class ControlApiSchema {
         properties.put("next", nullable(next));
         properties.put("pending", pending);
         properties.put("plan", executionPlan());
+        properties.put("awaitingRebalance", array(string(
+                "Stable id of a member that joined after the run was planned and is given no part of it until a "
+                        + "rebalance")));
         return object(List.of(
                 "pipelineId", "state", "kind", "message", "freshness", "evidence", "cannotSay", "next"),
                 properties, false);
@@ -421,6 +424,13 @@ public final class ControlApiSchema {
         resources.put("edgeQueueRecords", withDescription(nonNegativeInteger(),
                 "Most records the queues of the edges into the sink hold: one full queue from every processor "
                         + "sending into it to every processor it takes its input on"));
+        Map<String, Object> change = new LinkedHashMap<>();
+        change.put("previousEffective", positiveInteger("Processors the node ran in total in the run before"));
+        change.put("causes", array(withDescription(enumString(
+                "members-changed", "target-changed", "capability-changed"),
+                "An input of the working-out that moved: the member count, the node's target, or what bounds it")));
+        node.put("change", withDescription(object(List.of("previousEffective", "causes"), change, false),
+                "How the node's width moved from the run before; absent where it did not move or there was none"));
         node.put("resources", withDescription(object(List.of(
                 "writers", "connectorMode", "connectorInstances", "bufferedRecords", "edgeQueueRecords"),
                 resources, false), "What a sink holds open and buffers at its width, as upper bounds; absent for "
@@ -438,6 +448,13 @@ public final class ControlApiSchema {
                 "node", "requested", "requestedOrigin", "scope", "memberCount", "effective", "reasons", "batch"),
                 node, false)));
         properties.put("plannedAt", instant("When the run was planned"));
+        Map<String, Object> replaced = new LinkedHashMap<>();
+        replaced.put("executionGeneration", withDescription(nonNegativeInteger(),
+                "The replaced run's generation; absent where nothing fenced it"));
+        replaced.put("members", array(string("Stable id of a member its widths were worked out for")));
+        replaced.put("plannedAt", instant("When the replaced run was planned"));
+        properties.put("replaces", withDescription(object(List.of("members", "plannedAt"), replaced, false),
+                "The run this plan replaced, after a lost member, a stop or a restart; absent where there was none"));
         return object(List.of("members", "nodes", "plannedAt"), properties, false);
     }
 

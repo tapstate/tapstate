@@ -81,11 +81,7 @@ class DataPlaneActuationConfiguration {
      * its engine identity instead.
      */
     private static List<String> dataMembers(HazelcastInstance member) {
-        return member.getCluster().getMembers().stream()
-                .filter(m -> !m.isLiteMember())
-                .map(ClusterMembershipGate::stableIdOf)
-                .sorted()
-                .toList();
+        return ClusterMembershipGate.dataMembers(member);
     }
 
     /** The plans of the runs the cluster is executing, written by whichever member submits each. */

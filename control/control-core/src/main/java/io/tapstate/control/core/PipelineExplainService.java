@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
+import java.util.function.Supplier;
 
 /**
  * The fixed five-rule explain projection over one current observation, answered beside the plan the pipeline's
@@ -46,6 +47,7 @@ public final class PipelineExplainService {
     private final Clock clock;
     private final ExplanationMessages messages;
     private final ExecutionPlans plans;
+    private final Supplier<List<String>> members;
 
     public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
             Clock clock, ExplanationMessages messages) {
@@ -55,11 +57,21 @@ public final class PipelineExplainService {
     /** As above, answering beside each explanation the plan its pipeline's current run was submitted on. */
     public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
             Clock clock, ExplanationMessages messages, ExecutionPlans plans) {
+        this(artifacts, observations, clock, messages, plans, List::of);
+    }
+
+    /**
+     * As above, also naming the members of the cluster - {@code members}, by stable id - the plan was not worked
+     * out for.
+     */
+    public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
+            Clock clock, ExplanationMessages messages, ExecutionPlans plans, Supplier<List<String>> members) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.messages = Objects.requireNonNull(messages, "messages");
         this.plans = Objects.requireNonNull(plans, "plans");
+        this.members = Objects.requireNonNull(members, "members");
     }
 
     /**
@@ -70,7 +82,8 @@ public final class PipelineExplainService {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation observation = observations.read(pipelineId).orElseThrow(() -> unobserved(pipelineId));
         ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
-        return diagnose(pipelineId, observation).withPlan(plan);
+        return diagnose(pipelineId, observation)
+                .withPlan(plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
     }
 
     private PipelineExplanation diagnose(String pipelineId, Observation observation) {

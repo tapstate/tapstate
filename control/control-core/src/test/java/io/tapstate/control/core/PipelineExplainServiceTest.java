@@ -203,11 +203,13 @@ class PipelineExplainServiceTest {
                 NOW.minusSeconds(60));
         PipelineExplainService planned = new PipelineExplainService(artifacts(ID), observations(observation),
                 Clock.fixed(NOW, ZoneOffset.UTC), (key, args) -> key,
-                pipelineIds -> pipelineIds.contains(ID) ? Map.of(ID, plan) : Map.of());
+                pipelineIds -> pipelineIds.contains(ID) ? Map.of(ID, plan) : Map.of(),
+                () -> List.of("m1", "m2", "m3", "m4"));
 
         PipelineExplanation answer = planned.explain(ID);
 
         assertThat(answer.plan()).isEqualTo(plan);
+        assertThat(answer.awaitingRebalance()).containsExactly("m4");
         // No rule reads the plan: the diagnosis is the one the same observation gets with no plan recorded.
         assertThat(answer.withPlan(null)).isEqualTo(service(observation).explain(ID));
     }

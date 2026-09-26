@@ -154,8 +154,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         DagSource.StartPlan plan = prepared.build(execution.fence());
         // Written down before the run is submitted, so a reader never finds a run executing on a plan nobody
         // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
+        // Compared with the plan of the run before - lost to a failed member, a stop or a restart - so a node
+        // whose width moved says what it was and which of its inputs moved it.
         plans.record(planOf(pipelineId, execution, plan.planned(), clock.instant(), prepared.sinkConnectors(),
-                sharedConnectors));
+                sharedConnectors).replacing(plans.last(pipelineId)));
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
