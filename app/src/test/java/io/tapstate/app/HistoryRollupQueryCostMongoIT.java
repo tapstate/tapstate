@@ -253,9 +253,10 @@ class HistoryRollupQueryCostMongoIT {
         long[] sorted = Arrays.copyOf(samples, samples.length);
         Arrays.sort(sorted);
         Runtime runtime = Runtime.getRuntime();
+        // Record text size is a comparison proxy; only an HTTP response can prove serialized API bytes.
         System.out.printf("history-rollup-query mode=%s span=%s p50Ms=%.3f p95Ms=%.3f"
                         + " coldMs=%.3f mongoCommands=%d rawReads=%d rollupReads=%d"
-                        + " mongoReplyBytes=%d dtoUtf8Bytes=%d outputPoints=%d"
+                        + " mongoReplyBytes=%d dtoTextProxyUtf8Bytes=%d outputPoints=%d"
                         + " os=%s/%s java=%s processors=%d maxHeapBytes=%d processHeapUsedBytes=%d%n",
                 mode, span, percentile(sorted, 0.50) / 1_000_000d,
                 percentile(sorted, 0.95) / 1_000_000d, cold.nanos() / 1_000_000d,
