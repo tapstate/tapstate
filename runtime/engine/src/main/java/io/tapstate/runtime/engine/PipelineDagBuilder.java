@@ -6,6 +6,8 @@ import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.lifecycle.AwaitedLoad;
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
@@ -414,7 +416,8 @@ public final class PipelineDagBuilder {
             // the reading an assembly needs, for the same reason.
             boolean severalPaths = chains != null && chains.anyOverSeveralPaths(sink.upstream());
             ProcessorMetaSupplier supplier = preparingTargets(sinkVertex(sink.name(), sink.writers(), sinkAck, axes,
-                    assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream())), sink);
+                    assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream()),
+                    sink.batch()), sink);
             if (startsTheRun) {
                 supplier = WriterRunStart.of(supplier, sinkAck, writersByChain);
                 startsTheRun = false;
@@ -492,8 +495,9 @@ public final class PipelineDagBuilder {
         return gates;
     }
 
-    /** One sink a graph draws: its vertex, the producers it reads, and the writers it opens. */
-    private record SinkNode(String name, List<String> upstream, SupplierEx<? extends SinkWriter> writers) {
+    /** One sink a graph draws: its vertex, the producers it reads, the writers it opens and the batch it forms. */
+    private record SinkNode(String name, List<String> upstream, SupplierEx<? extends SinkWriter> writers,
+            BatchSpec batch) {
     }
 
     /**
@@ -532,7 +536,8 @@ public final class PipelineDagBuilder {
                         LevelBounds.HOLDS_NOTHING);
         ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.writers(),
                 sinkAck, () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
-                shape.plannedMembers()), sink);
+                shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis()),
+                sink);
         if (startsTheRun != null) {
             writers = WriterRunStart.of(writers, sinkAck, startsTheRun);
         }
@@ -574,7 +579,8 @@ public final class PipelineDagBuilder {
             // A declared view IS its own instruction to materialize: the pipeline needs no serve block to reach
             // the state store, and the vertex is a terminal sink like any other.
             List<String> upstream = resolve(view.from(), bindings);
-            sinks.add(new SinkNode(VIEW_VERTEX_PREFIX + view.id(), upstream, bindings.viewSinks().apply(view)));
+            sinks.add(new SinkNode(VIEW_VERTEX_PREFIX + view.id(), upstream, bindings.viewSinks().apply(view),
+                    batchOf(view.execution())));
             readsAs.put(view.id(), upstream);
         }
         if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
@@ -583,10 +589,16 @@ public final class PipelineDagBuilder {
             for (int i = 0; i < sync.size(); i++) {
                 SyncElement element = sync.get(i);
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
-                sinks.add(new SinkNode(name, upstream, bindings.sinkWriters().apply(element)));
+                sinks.add(new SinkNode(name, upstream, bindings.sinkWriters().apply(element),
+                        batchOf(element.execution())));
             }
         }
         return sinks;
+    }
+
+    /** The batch a node's execution block asks for, or the defaults where it asks for none. */
+    private static BatchSpec batchOf(ExecutionSpec execution) {
+        return execution == null ? BatchSpec.DEFAULTS : execution.batchOrDefaults();
     }
 
     /**
@@ -646,9 +658,11 @@ public final class PipelineDagBuilder {
      */
     private static ProcessorMetaSupplier sinkVertex(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory,
-            SinkAckFactory sinkAck, ChainAxes axes, boolean assembled, Map<Integer, List<String>> chainsByOrdinal) {
+            SinkAckFactory sinkAck, ChainAxes axes, boolean assembled, Map<Integer, List<String>> chainsByOrdinal,
+            BatchSpec batch) {
         if (sinkAck == null) {
-            return SinkProcessor.metaSupplier(vertexName, writerFactory);
+            return SinkProcessor.metaSupplier(vertexName, writerFactory, batch.effectiveMaxRecords(),
+                    batch.effectiveMaxWaitMillis());
         }
         SupplierEx<SinkFrontier> frontier = assembled
                 ? () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN)
@@ -656,7 +670,8 @@ public final class PipelineDagBuilder {
         SupplierEx<LevelBounds> edges = axes == null || chainsByOrdinal == null
                 ? null
                 : () -> new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING);
-        return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier, edges);
+        return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier, edges,
+                batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis());
     }
 
     /**
