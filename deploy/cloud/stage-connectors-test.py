@@ -38,6 +38,15 @@ class StageConnectorsTest(unittest.TestCase):
         self.entries = []
         for connector_id in MODULE.REQUIRED_IDS:
             self.make_jar(connector_id)
+        self.license_files = []
+        for name in MODULE.REQUIRED_LICENSE_FILES:
+            content = f"synthetic terms for {name}\n".encode("utf-8")
+            (self.jars / name).write_bytes(content)
+            self.license_files.append({
+                "name": name,
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            })
         self.write_lock()
 
     def make_jar(self, connector_id: str, *, spec_id: str | None = None,
@@ -71,11 +80,16 @@ class StageConnectorsTest(unittest.TestCase):
         self.entries.append(entry)
 
     def write_lock(self) -> None:
-        self.lock.write_text(json.dumps({"schemaVersion": 1, "connectors": self.entries}), encoding="utf-8")
+        self.lock.write_text(json.dumps({
+            "schemaVersion": 2,
+            "connectors": self.entries,
+            "licenseFiles": self.license_files,
+        }), encoding="utf-8")
 
     def make_oci(self, *, architectures: tuple[str, ...] = ("amd64", "arm64"),
                  tamper: str | None = None, license_label: str | None = "NOASSERTION",
-                 boot_jars: dict[str, bytes] | None = None) -> Path:
+                 boot_jars: dict[str, bytes] | None = None,
+                 omit_path: str | None = None, add_license_directory: bool = False) -> Path:
         MODULE.stage(self.lock, self.jars, self.staged)
         layout = self.root / "oci"
         (layout / "blobs/sha256").mkdir(parents=True)
@@ -92,11 +106,17 @@ class StageConnectorsTest(unittest.TestCase):
         for architecture in architectures:
             layer_stream = io.BytesIO()
             with tarfile.open(fileobj=layer_stream, mode="w") as archive:
+                if add_license_directory:
+                    directory = tarfile.TarInfo("opt/tapstate/release/licenses")
+                    directory.type = tarfile.DIRTYPE
+                    archive.addfile(directory)
                 boot_jar = (boot_jars or {}).get(architecture, b"synthetic-boot-jar")
                 files = {"opt/tapstate/tapstate.jar": boot_jar}
                 for path in self.staged.rglob("*"):
                     if path.is_file():
                         name = "opt/tapstate/" + str(path.relative_to(self.staged))
+                        if name == omit_path:
+                            continue
                         files[name] = path.read_bytes()
                 if tamper is not None:
                     files[tamper] = b"tampered"
@@ -137,6 +157,9 @@ class StageConnectorsTest(unittest.TestCase):
         self.assertEqual(len(lines), 7)
         for entry in self.entries:
             self.assertIn(f"{entry['sha256']}  {entry['id']}-connector.jar", lines)
+        for entry in self.license_files:
+            staged_license = self.staged / "release/licenses" / entry["name"]
+            self.assertEqual(staged_license.read_bytes(), (self.jars / entry["name"]).read_bytes())
 
     def test_missing_or_extra_jar_refuses_without_staging(self) -> None:
         (self.jars / "mysql-connector.jar").unlink()
@@ -154,6 +177,17 @@ class StageConnectorsTest(unittest.TestCase):
         with (self.jars / "mongodb-atlas-connector.jar").open("ab") as stream:
             stream.write(b"changed")
         with self.assertRaisesRegex(MODULE.StageError, "JAR bytes differ"):
+            MODULE.stage(self.lock, self.jars, self.staged)
+        self.assertFalse(self.staged.exists())
+
+    def test_missing_or_changed_companion_license_refuses(self) -> None:
+        path = self.jars / "ORACLE-FREE-USE-TERMS.txt"
+        path.unlink()
+        with self.assertRaisesRegex(MODULE.StageError, "companion license file is missing"):
+            MODULE.stage(self.lock, self.jars, self.staged)
+        self.assertFalse(self.staged.exists())
+        path.write_bytes(b"changed terms")
+        with self.assertRaisesRegex(MODULE.StageError, "companion license bytes differ"):
             MODULE.stage(self.lock, self.jars, self.staged)
         self.assertFalse(self.staged.exists())
 
@@ -233,6 +267,20 @@ class StageConnectorsTest(unittest.TestCase):
     def test_oci_rejects_unlocked_release_content(self) -> None:
         layout = self.make_oci(tamper="opt/tapstate/release/secret.txt")
         with self.assertRaisesRegex(IMAGE.ImageError, "unexpected files"):
+            IMAGE.verify(layout, self.lock)
+
+    def test_oci_requires_companion_license_file(self) -> None:
+        layout = self.make_oci(omit_path="opt/tapstate/release/licenses/ORACLE-FREE-USE-TERMS.txt")
+        with self.assertRaisesRegex(IMAGE.ImageError, "release metadata has missing or unexpected files"):
+            IMAGE.verify(layout, self.lock)
+
+    def test_oci_accepts_companion_license_directory_entry(self) -> None:
+        layout = self.make_oci(add_license_directory=True)
+        self.assertTrue(IMAGE.verify(layout, self.lock).startswith("sha256:"))
+
+    def test_oci_rejects_changed_companion_license_file(self) -> None:
+        layout = self.make_oci(tamper="opt/tapstate/release/licenses/MICROSOFT-MIT-LICENSE.txt")
+        with self.assertRaisesRegex(IMAGE.ImageError, "companion license differs"):
             IMAGE.verify(layout, self.lock)
 
     def test_oci_rejects_missing_architecture(self) -> None:

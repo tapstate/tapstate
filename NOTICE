@@ -8,11 +8,14 @@ This product includes software developed by Tapstate, Inc.
 Connector plugin jars distributed as release assets
 
 Tapstate loads connector plugins as separate, independently licensed artifacts;
-none of them are part of this source tree or of any Tapstate binary. For
-convenience, prebuilt connector jars are published as assets on the
+none of them are part of this source tree or of the standard Tapstate server
+image. For convenience, prebuilt connector jars are published as assets on the
 "connectors-preview" release for the online-runtime quickstart and explicit CLI
-registration without building the connector repositories first. Those jars are
-shaded and carry their own drivers on an isolated class loader:
+registration without building the connector repositories first. The Cloud image
+target stages a byte-locked release set and includes the
+Oracle and Microsoft companion license texts under
+/opt/tapstate/release/licenses/. Those jars are shaded and carry their own
+drivers on an isolated class loader:
 
   * mysql-connector.jar bundles Oracle MySQL Connector/J 8.0, licensed under
     GPL-2.0 with the Universal FOSS Exception. That exception is what permits its

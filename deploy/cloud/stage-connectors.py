@@ -24,7 +24,9 @@ from typing import Any
 REQUIRED_IDS = (
     "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql"
 )
+REQUIRED_LICENSE_FILES = ("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt")
 ENTRY_KEYS = {"id", "bytes", "sha256", "upstreamRevision", "pdkApiVersion", "specPath"}
+LICENSE_KEYS = {"name", "bytes", "sha256"}
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 REVISION = re.compile(r"[0-9a-f]{40}\Z")
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -44,15 +46,15 @@ def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def read_lock(path: Path) -> list[dict[str, Any]]:
+def read_lock(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     try:
         lock = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise StageError(f"cannot read connector lock: {exc}") from exc
-    if not isinstance(lock, dict) or set(lock) != {"schemaVersion", "connectors"}:
-        raise StageError("connector lock must have only schemaVersion and connectors")
-    if type(lock["schemaVersion"]) is not int or lock["schemaVersion"] != 1:
-        raise StageError("connector lock schemaVersion must be 1")
+    if not isinstance(lock, dict) or set(lock) != {"schemaVersion", "connectors", "licenseFiles"}:
+        raise StageError("connector lock must have schemaVersion, connectors, and licenseFiles")
+    if type(lock["schemaVersion"]) is not int or lock["schemaVersion"] != 2:
+        raise StageError("connector lock schemaVersion must be 2")
     entries = lock["connectors"]
     if not isinstance(entries, list) or len(entries) != len(REQUIRED_IDS):
         raise StageError("connector lock must contain exactly seven entries")
@@ -76,7 +78,24 @@ def read_lock(path: Path) -> list[dict[str, Any]]:
         ids.append(connector_id)
     if sorted(ids) != sorted(REQUIRED_IDS):
         raise StageError("connector lock has a duplicate or missing id")
-    return entries
+    license_files = lock["licenseFiles"]
+    if not isinstance(license_files, list) or len(license_files) != len(REQUIRED_LICENSE_FILES):
+        raise StageError("connector lock must contain both companion license files")
+    names = []
+    for entry in license_files:
+        if not isinstance(entry, dict) or set(entry) != LICENSE_KEYS:
+            raise StageError("companion license entry has missing or unexpected fields")
+        name = entry["name"]
+        if not isinstance(name, str) or name not in REQUIRED_LICENSE_FILES:
+            raise StageError(f"unexpected companion license file: {name!r}")
+        if type(entry["bytes"]) is not int or not 1 <= entry["bytes"] <= 1_000_000:
+            raise StageError(f"{name}: invalid companion license length")
+        if not isinstance(entry["sha256"], str) or not SHA256.fullmatch(entry["sha256"]):
+            raise StageError(f"{name}: invalid companion license SHA-256")
+        names.append(name)
+    if sorted(names) != sorted(REQUIRED_LICENSE_FILES):
+        raise StageError("connector lock has a duplicate or missing companion license file")
+    return entries, license_files
 
 
 def manifest_headers(raw: bytes) -> dict[str, str]:
@@ -150,8 +169,21 @@ def verify_jar(path: Path, entry: dict[str, Any]) -> None:
         raise StageError(f"{connector_id}: JAR spec id disagrees with the release lock")
 
 
+def verify_companion_license(path: Path, entry: dict[str, Any]) -> None:
+    name = entry["name"]
+    try:
+        mode = path.lstat().st_mode
+    except OSError as exc:
+        raise StageError(f"{name}: companion license file is missing") from exc
+    if not stat.S_ISREG(mode):
+        raise StageError(f"{name}: companion license file must be regular")
+    actual_hash, actual_size = sha256_and_size(path)
+    if (actual_hash, actual_size) != (entry["sha256"], entry["bytes"]):
+        raise StageError(f"{name}: companion license bytes differ from the release lock")
+
+
 def stage(lock_path: Path, jar_dir: Path, stage_dir: Path) -> None:
-    entries = read_lock(lock_path)
+    entries, license_files = read_lock(lock_path)
     expected_names = {f"{entry['id']}-connector.jar" for entry in entries}
     if not jar_dir.is_dir():
         raise StageError("connector JAR directory is missing")
@@ -163,6 +195,8 @@ def stage(lock_path: Path, jar_dir: Path, stage_dir: Path) -> None:
         raise StageError("stage directory already exists; refusing to overwrite it")
     for entry in entries:
         verify_jar(jar_dir / f"{entry['id']}-connector.jar", entry)
+    for entry in license_files:
+        verify_companion_license(jar_dir / entry["name"], entry)
 
     stage_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".cloud-connectors-", dir=stage_dir.parent))
@@ -171,12 +205,18 @@ def stage(lock_path: Path, jar_dir: Path, stage_dir: Path) -> None:
         release = temporary / "release"
         connectors.mkdir()
         release.mkdir()
+        licenses = release / "licenses"
+        licenses.mkdir()
         for entry in entries:
             filename = f"{entry['id']}-connector.jar"
             destination = connectors / filename
             shutil.copyfile(jar_dir / filename, destination)
             verify_jar(destination, entry)
         shutil.copyfile(lock_path, release / "connectors.lock.json")
+        for entry in license_files:
+            name = entry["name"]
+            shutil.copyfile(jar_dir / name, licenses / name)
+            verify_companion_license(licenses / name, entry)
         (release / "connectors.sha256").write_text(
             "".join(f"{entry['sha256']}  {entry['id']}-connector.jar\n" for entry in entries),
             encoding="ascii",

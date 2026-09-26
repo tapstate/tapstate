@@ -71,7 +71,7 @@ def selected_files(layout: Path, layers: list[Any], platform: str) -> dict[str, 
                     wanted = path == "opt/tapstate/tapstate.jar" or path.startswith(
                         ("opt/tapstate/connectors/", "opt/tapstate/release/")
                     )
-                    if not wanted or path.endswith("/"):
+                    if not wanted or member.isdir():
                         continue
                     if path in files or not member.isfile() or "/.wh." in path:
                         raise ImageError(f"{platform} has a duplicate, linked, or deleted image input: {path}")
@@ -85,7 +85,8 @@ def selected_files(layout: Path, layers: list[Any], platform: str) -> dict[str, 
 
 
 def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
-                    entries: list[dict[str, Any]], lock_bytes: bytes) -> tuple[dict[str, str], str]:
+                    entries: list[dict[str, Any]], license_files: list[dict[str, Any]],
+                    lock_bytes: bytes) -> tuple[dict[str, str], str]:
     manifest = object_from_bytes(blob(layout, descriptor.get("digest")), f"{platform} manifest")
     config_descriptor = manifest.get("config")
     if not isinstance(config_descriptor, dict):
@@ -113,6 +114,9 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
         "opt/tapstate/release/connectors.lock.json",
         "opt/tapstate/release/connectors.sha256",
     }
+    expected_release_paths.update(
+        f"opt/tapstate/release/licenses/{entry['name']}" for entry in license_files
+    )
     actual_release_paths = {path for path in files if path.startswith("opt/tapstate/release/")}
     if actual_release_paths != expected_release_paths:
         raise ImageError(f"{platform} release metadata has missing or unexpected files")
@@ -131,12 +135,17 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
         jar = files[path]
         if len(jar) != entry["bytes"] or hashlib.sha256(jar).hexdigest() != entry["sha256"]:
             raise ImageError(f"{platform} {entry['id']} JAR differs from the release lock")
+    for entry in license_files:
+        path = f"opt/tapstate/release/licenses/{entry['name']}"
+        license_bytes = files[path]
+        if len(license_bytes) != entry["bytes"] or hashlib.sha256(license_bytes).hexdigest() != entry["sha256"]:
+            raise ImageError(f"{platform} {entry['name']} companion license differs from the release lock")
     return relevant_labels, boot_jar_sha256
 
 
 def verify(layout: Path, lock_path: Path, boot_jar_path: Path | None = None) -> str:
     try:
-        entries = STAGING.read_lock(lock_path)
+        entries, license_files = STAGING.read_lock(lock_path)
         lock_bytes = lock_path.read_bytes()
         root = object_from_bytes((layout / "index.json").read_bytes(), "OCI root index")
     except (OSError, STAGING.StageError) as exc:
@@ -161,7 +170,9 @@ def verify(layout: Path, lock_path: Path, boot_jar_path: Path | None = None) -> 
         platform = f"linux/{info['architecture']}"
         if platform in platforms:
             raise ImageError(f"OCI archive has duplicate platform {platform}")
-        platforms[platform] = verify_platform(layout, descriptor, platform, entries, lock_bytes)
+        platforms[platform] = verify_platform(
+            layout, descriptor, platform, entries, license_files, lock_bytes
+        )
     if set(platforms) != {"linux/amd64", "linux/arm64"}:
         raise ImageError(f"OCI archive platforms are {sorted(platforms)}, expected amd64 and arm64")
     if platforms["linux/amd64"][1] != platforms["linux/arm64"][1]:

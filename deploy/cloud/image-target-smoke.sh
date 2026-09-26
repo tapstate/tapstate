@@ -61,8 +61,18 @@ for connector_id in ids:
         "pdkApiVersion": "2.0.5-SNAPSHOT",
         "specPath": spec_path,
     })
+license_files = []
+for name in ("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt"):
+    content = f"synthetic terms for {name}\n".encode("utf-8")
+    (root / "jars" / name).write_bytes(content)
+    license_files.append({
+        "name": name,
+        "bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    })
 (root / "connectors.lock.json").write_text(
-    json.dumps({"schemaVersion": 1, "connectors": entries}), encoding="utf-8"
+    json.dumps({"schemaVersion": 2, "connectors": entries, "licenseFiles": license_files}),
+    encoding="utf-8"
 )
 PY
 
@@ -110,4 +120,4 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/deploy/cloud/verify-image.py" \
     --oci-layout "$TEMP_ROOT/oci-layout" --lock "$TEMP_ROOT/connectors.lock.json" \
     --boot-jar "$TEMP_ROOT/context/app/target/app-smoke-boot.jar"
 
-echo "PASS: default server target remains connector-free; Cloud target and both OCI platforms carry seven locked synthetic JARs"
+echo "PASS: default server target remains connector-free; Cloud target and both OCI platforms carry seven locked synthetic JARs and companion licenses"
