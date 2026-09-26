@@ -182,6 +182,28 @@ final class ExecutionAuthorization implements AutoCloseable {
                 && entry.executionGeneration() == fence.executionGeneration();
     }
 
+    /** Files a sink's known independent failure under the exact run while its claim is still live. */
+    void recordSinkWriteFailure(ExecutionFence fence) {
+        if (!fenced) {
+            return;
+        }
+        try {
+            Optional<WorkloadClaimReading> reading = claims.read(new WorkloadClaimKey(
+                    clusterId, WorkloadClaimType.PIPELINE_ACTUATION, fence.pipelineId()));
+            if (reading.isEmpty() || !reading.get().leased()) {
+                return;
+            }
+            var claim = reading.get().claim();
+            if (claim.claimGeneration() == fence.claimGeneration()
+                    && claim.executionGeneration() == fence.executionGeneration()) {
+                claims.recordExecutionFailure(claim, false);
+            }
+        } catch (TapstateException unreachable) {
+            // A coordination-store error must not replace the sink's own failure.
+            LOG.debug("Could not record the sink failure for {}", fence.pipelineId(), unreachable);
+        }
+    }
+
     /**
      * Whether {@code entry} was read before the run {@code fence} names was submitted, ordered the way
      * the store advances the pair: taking a claim over takes the next claim generation and carries the

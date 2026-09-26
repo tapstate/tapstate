@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
@@ -20,9 +21,11 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -91,6 +94,68 @@ class ExecutionAuthorizationTest {
 
         assertThat(target.batches).hasValue(2);
         assertThat(acked).hasValue(1);
+    }
+
+    @Test
+    void aSinkFailureOnAnotherMemberMarksItsRunBeforeTheFailedWriteIsReported() {
+        ExecutionFence fence = submittedRun();
+        CompletableFuture<WriteResult> write = new CompletableFuture<>();
+        SinkWriter sink = new SinkWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return write;
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        CompletionStage<WriteResult> guarded = FencedSinkWriterFactory.guarded(sink, fence, guard(claims))
+                .write(List.of());
+
+        write.completeExceptionally(new TapstateException(ConnectorError.WRITE_FAILED,
+                Map.of("connector", "e2e_file", "detail", "sink refused the write"), null));
+
+        assertThatThrownBy(() -> guarded.toCompletableFuture().join())
+                .isInstanceOf(CompletionException.class)
+                .hasCauseInstanceOf(TapstateException.class);
+        WorkloadClaim marked = claims.read(new WorkloadClaimKey(
+                "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow().claim();
+        assertThat(marked.failureClaimGeneration()).isEqualTo(fence.claimGeneration());
+        assertThat(marked.failureAfterMemberLoss()).isFalse();
+    }
+
+    @Test
+    void aLateSinkFailureCannotMarkTheExecutionThatReplacedIt() {
+        ExecutionFence first = submittedRun();
+        CompletableFuture<WriteResult> write = new CompletableFuture<>();
+        SinkWriter sink = new SinkWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return write;
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        CompletionStage<WriteResult> guarded = FencedSinkWriterFactory.guarded(sink, first, guard(claims))
+                .write(List.of());
+
+        claims.elapse(TTL.plusSeconds(1));
+        PipelineActuationOwnership nodeB = ownership(NODE_B);
+        assertThat(nodeB.permit("orders").granted()).isTrue();
+        ExecutionFence replacement = nodeB.beginExecution("orders").fence();
+        assertThat(replacement.executionGeneration()).isGreaterThan(first.executionGeneration());
+
+        write.completeExceptionally(new TapstateException(ConnectorError.WRITE_FAILED,
+                Map.of("connector", "e2e_file", "detail", "the old write finished late"), null));
+
+        assertThatThrownBy(() -> guarded.toCompletableFuture().join())
+                .isInstanceOf(CompletionException.class);
+        WorkloadClaim current = claims.read(new WorkloadClaimKey(
+                "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow().claim();
+        assertThat(current.failureClaimGeneration()).isZero();
     }
 
     @Test
