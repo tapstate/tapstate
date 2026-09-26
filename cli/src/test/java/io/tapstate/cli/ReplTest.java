@@ -4441,6 +4441,19 @@ class ReplTest {
                 List.of("Whether the source has changes waiting is not measured."), null, null);
     }
 
+    /** {@code answer} beside the plan of a run on three members: a source held to one, a sink three per member. */
+    private static ExplainOutcome.Found planned(ExplainOutcome.Found answer) {
+        return new ExplainOutcome.Found(answer.pipelineId(), answer.state(), answer.kind(), answer.message(),
+                answer.observedAt(), answer.observedAgeMillis(), answer.freshness(), answer.evidence(),
+                answer.cannotSay(), answer.next(), answer.pending(),
+                new ExplainOutcome.Plan(3L, 7L, 11L, List.of("m1", "m2", "m3"), List.of(
+                        new ExplainOutcome.PlanNode("orders_src", 1, "node-default", "total-one", 3, null, 1,
+                                List.of("requested-one", "source-reads-not-split"), 1024, 0L),
+                        new ExplainOutcome.PlanNode("orders_sink", 8, "explicit", "native", 3, 3, 9,
+                                List.of("rounded-up"), 512, 50L)),
+                        "2026-09-17T09:58:00Z"));
+    }
+
     private static ExplainOutcome.Found stale(String id, String state, long ageMillis) {
         return new ExplainOutcome.Found(id, state, "OBSERVATION_STALE",
                 "The latest observation is 4m12s old, so the publisher may have stopped.",
@@ -5087,6 +5100,47 @@ class ReplTest {
         assertThat(client.statusCalls).isEmpty();
         assertThat(client.metricsCalls).isEmpty();
         assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void explainShowsHowWideEachNodeOfTheRunWasPlannedAndWhy() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.explainOutcome = planned(noMatch("pl1", "RUNNING", 2_000L));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("explain pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out)
+                .contains("  planned    2026-09-17T09:58:00Z on m1, m2, m3 (execution 7, claim 3, topology 11)\n")
+                .contains("  width      orders_src  1 in all (one processor for the cluster), requested 1"
+                        + " (node-default) -- requested-one, source-reads-not-split; batch 1024 records, 0ms wait\n")
+                .contains("  width      orders_sink  9 in all (3 per member on 3 members), requested 8 (explicit)"
+                        + " -- rounded-up; batch 512 records, 50ms wait\n");
+    }
+
+    @Test
+    void statusShowsTheRunsPlanUnderTheAnswerAndLeavesOutGenerationsTheRunDoesNotHave() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        ExplainOutcome.Found answer = noMatch("pl1", "RUNNING", 2_000L);
+        client.explainOutcome = new ExplainOutcome.Found(answer.pipelineId(), answer.state(), answer.kind(),
+                answer.message(), answer.observedAt(), answer.observedAgeMillis(), answer.freshness(),
+                answer.evidence(), answer.cannotSay(), answer.next(), answer.pending(),
+                new ExplainOutcome.Plan(null, null, null, List.of("local"), List.of(new ExplainOutcome.PlanNode(
+                        "orders_sink", 4, "node-default", "native", 1, 4, 4, List.of(), 1024, 0L)),
+                        "2026-09-17T09:58:00Z"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // A run on one member is fenced by nothing: no generation is printed rather than a made-up zero.
+        assertThat(out).contains("  planned    2026-09-17T09:58:00Z on local\n")
+                .contains("  width      orders_sink  4 in all (4 per member on 1 member), requested 4"
+                        + " (node-default); batch 1024 records, 0ms wait\n");
     }
 
     @Test

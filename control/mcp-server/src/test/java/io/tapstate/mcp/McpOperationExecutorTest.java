@@ -149,7 +149,8 @@ class McpOperationExecutorTest {
                 "explain-frontier-stalled.golden.json",
                 "explain-no-match.golden.json",
                 "explain-unknown.golden.json",
-                "explain-start-pending.golden.json");
+                "explain-start-pending.golden.json",
+                "explain-with-plan.golden.json");
         AtomicReference<String> response = new AtomicReference<>();
         HttpServer server = server(exchange -> answer(exchange, 200, response.get()));
         try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {

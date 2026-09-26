@@ -7,7 +7,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
-/** Stable JSON projection of the shared pipeline explanation. */
+/**
+ * Stable JSON projection of the shared pipeline explanation, with the plan the pipeline's current run was submitted
+ * on beside it where one is recorded, omitted otherwise.
+ */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 record PipelineExplanationResponse(
         String pipelineId,
@@ -20,7 +23,8 @@ record PipelineExplanationResponse(
         List<Evidence> evidence,
         List<String> cannotSay,
         @JsonInclude(JsonInclude.Include.ALWAYS) Next next,
-        Pending pending) {
+        Pending pending,
+        ExecutionPlanResponse plan) {
 
     record Evidence(String source, String field,
             @JsonInclude(JsonInclude.Include.ALWAYS) Object value) {
@@ -49,7 +53,8 @@ record PipelineExplanationResponse(
                 explanation.next() == null ? null
                         : new Next(explanation.next().action().name(), explanation.next().message()),
                 explanation.pending() == null ? null
-                        : new Pending(explanation.pending().reason().name()));
+                        : new Pending(explanation.pending().reason().name()),
+                ExecutionPlanResponse.of(explanation.plan()));
     }
 
     private static Evidence evidence(PipelineExplanation.Evidence evidence) {

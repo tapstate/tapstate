@@ -28,6 +28,7 @@ pipeline. The history and explanation responses, including coded errors, carry
 | What did this node log for the pipeline? | `GET /api/pipelines/{id}/logs` | `logs <id>` | `pipeline_logs` |
 | How did output rate and selected table lag change? | `GET /api/pipelines/{id}/metrics/history` | `metrics <id> --from ... --to ...` | `pipeline_metrics_history` |
 | Why does the latest observation look this way? | `GET /api/pipelines/{id}/explain` | `explain <id>` or `status <id>` | `pipeline_explain` |
+| How wide does each node of the current run run, and why? | `plan` in `GET /api/pipelines/{id}/status` or `.../explain` | `explain <id>` or `status <id>` | `pipeline_status` or `pipeline_explain` |
 
 The snapshot read shows progress for the pipeline's initial load. A replacement run keeps a table's
 confirmed progress even when it skips reading that table again. Once the target confirms the load,
@@ -260,6 +261,27 @@ the available observation cannot establish. In particular, `NO_MATCH` is not a h
 always has a non-empty `cannotSay` list. `next`, when present, is an operator suggestion rather than
 authorization to perform an action. An optional `pending` field is reserved for a server-provided
 capacity or lifecycle wait reason; its absence does not prove that no wait exists.
+
+## Read how wide a run is
+
+`status` and `explain` both carry an optional `plan`: the plan the pipeline's current run was submitted
+on, written down when the run was submitted and replaced by the next run's. The two faces send it in
+the same shape. It is absent when no run has one recorded, for example after the pipeline was stopped.
+No explanation rule reads it; it answers beside the diagnosis.
+
+| Field | Meaning |
+|---|---|
+| `claimGeneration`, `executionGeneration`, `topologyRevision` | Which run the plan belongs to. Absent where nothing fences the run, such as a server that is not a cluster member |
+| `members` | The members the widths were worked out for, by stable id |
+| `plannedAt` | When the run was planned |
+| `nodes[].requested`, `nodes[].requestedOrigin` | The target total the node was given, and whether its author wrote it (`explicit`) or it is the default for the node's kind (`node-default`) |
+| `nodes[].scope` | `total-one`: one processor for the whole cluster. `native`: the same number of processors on every member |
+| `nodes[].memberCount`, `nodes[].computedLocal`, `nodes[].effective` | The member count and per-member count the width was worked out for, and the processors that makes in total. `computedLocal` is absent for `total-one` |
+| `nodes[].reasons` | Stable ids for why the width is what it is: `requested-one`, `source-reads-not-split`, `single-target-keyless`, `key-not-derivable`, `rounded-up`, `rounded-down`, or `budget:<name>` |
+| `nodes[].batch` | `maxRecords` and `maxWaitMillis`: the batch the node takes its input in |
+
+The status watch stream does not carry the plan. Read `status` again after a restart to see the new
+run's plan.
 
 ## Coded errors and operator response
 

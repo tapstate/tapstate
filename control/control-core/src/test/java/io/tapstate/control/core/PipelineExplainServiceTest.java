@@ -8,6 +8,7 @@ import io.tapstate.control.core.PipelineExplanation.NextAction;
 import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
@@ -190,6 +191,33 @@ class PipelineExplainServiceTest {
 
         assertThat(answer.observedAgeMillis()).isZero();
         assertThat(answer.freshness()).isEqualTo(Freshness.FRESH);
+    }
+
+    @Test
+    void anExplanationCarriesThePlanItsPipelinesRunWasSubmittedOnBesideAnUnchangedDiagnosis() {
+        Observation observation = observation(PipelineState.RUNNING, Map.of("recordCount", 0L), 0L,
+                NOW.minusSeconds(2));
+        ExecutionPlan plan = new ExecutionPlan(ID, 3L, 7L, 11L, List.of("m1", "m2", "m3"),
+                List.of(new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 3, 3, 9,
+                        List.of("rounded-up"), 512, 50L, List.of("orders_sink"))),
+                NOW.minusSeconds(60));
+        PipelineExplainService planned = new PipelineExplainService(artifacts(ID), observations(observation),
+                Clock.fixed(NOW, ZoneOffset.UTC), (key, args) -> key,
+                pipelineIds -> pipelineIds.contains(ID) ? Map.of(ID, plan) : Map.of());
+
+        PipelineExplanation answer = planned.explain(ID);
+
+        assertThat(answer.plan()).isEqualTo(plan);
+        // No rule reads the plan: the diagnosis is the one the same observation gets with no plan recorded.
+        assertThat(answer.withPlan(null)).isEqualTo(service(observation).explain(ID));
+    }
+
+    @Test
+    void anExplanationOfARunWithNoPlanRecordedCarriesNone() {
+        Observation observation = observation(PipelineState.RUNNING, Map.of("recordCount", 5L), 5L,
+                NOW.minusSeconds(2));
+
+        assertThat(service(observation).explain(ID).plan()).isNull();
     }
 
     @Test

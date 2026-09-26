@@ -229,7 +229,15 @@ class ControlPlaneConfiguration {
                 claims.getIfAvailable(),
                 storePort.desired(),
                 clusterProperties.getId(),
-                engine == null ? ExecutionPlans.NONE : new HazelcastExecutionPlans(engine));
+                executionPlans(engine));
+    }
+
+    /**
+     * Where a read face reads the plan of each pipeline's current run from: the cluster's own record of it,
+     * whichever member submitted the run, or nowhere on a server that is no cluster member.
+     */
+    private static ExecutionPlans executionPlans(HazelcastInstance engine) {
+        return engine == null ? ExecutionPlans.NONE : new HazelcastExecutionPlans(engine);
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----
@@ -594,9 +602,8 @@ class ControlPlaneConfiguration {
     @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
             ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member) {
-        HazelcastInstance engine = member.getIfAvailable();
         return new PipelineObservationQueryService(artifactQueryService, storePort.observations(),
-                engine == null ? ExecutionPlans.NONE : new HazelcastExecutionPlans(engine));
+                executionPlans(member.getIfAvailable()));
     }
 
     @Bean
@@ -612,10 +619,12 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineExplainService pipelineExplainService(
-            ArtifactQueryService artifactQueryService, StorePort storePort, Clock clock) {
+            ArtifactQueryService artifactQueryService, StorePort storePort, Clock clock,
+            ObjectProvider<HazelcastInstance> member) {
         ExplanationCatalog messages = ExplanationCatalog.bundled();
         return new PipelineExplainService(
-                artifactQueryService, storePort.observations(), clock, messages::render);
+                artifactQueryService, storePort.observations(), clock, messages::render,
+                executionPlans(member.getIfAvailable()));
     }
 
     /**

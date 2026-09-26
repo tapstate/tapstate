@@ -8,6 +8,8 @@ import io.tapstate.control.core.PipelineExplanation.Next;
 import io.tapstate.control.core.PipelineExplanation.NextAction;
 import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
@@ -26,7 +28,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 
-/** The fixed five-rule explain projection over one current observation. */
+/**
+ * The fixed five-rule explain projection over one current observation, answered beside the plan the pipeline's
+ * current run was submitted on where one is recorded.
+ */
 public final class PipelineExplainService {
 
     public static final Duration PUBLISHER_SILENCE = Duration.ofSeconds(30);
@@ -40,19 +45,35 @@ public final class PipelineExplainService {
     private final ObservationStore observations;
     private final Clock clock;
     private final ExplanationMessages messages;
+    private final ExecutionPlans plans;
 
     public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
             Clock clock, ExplanationMessages messages) {
+        this(artifacts, observations, clock, messages, ExecutionPlans.NONE);
+    }
+
+    /** As above, answering beside each explanation the plan its pipeline's current run was submitted on. */
+    public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
+            Clock clock, ExplanationMessages messages, ExecutionPlans plans) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.messages = Objects.requireNonNull(messages, "messages");
+        this.plans = Objects.requireNonNull(plans, "plans");
     }
 
-    /** Reads one observation once and applies the fixed first-match checklist without writing it back. */
+    /**
+     * Reads one observation once and applies the fixed first-match checklist without writing it back, answering
+     * beside it the plan the pipeline's current run was submitted on where one is recorded.
+     */
     public PipelineExplanation explain(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation observation = observations.read(pipelineId).orElseThrow(() -> unobserved(pipelineId));
+        ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
+        return diagnose(pipelineId, observation).withPlan(plan);
+    }
+
+    private PipelineExplanation diagnose(String pipelineId, Observation observation) {
         Time time = time(observation.observedAt());
         Facts facts = facts(observation);
 

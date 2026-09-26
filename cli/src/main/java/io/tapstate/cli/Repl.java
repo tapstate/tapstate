@@ -5117,6 +5117,42 @@ final class Repl {
             out.println("  pending    " + answer.pending().reason());
         }
         answer.cannotSay().forEach(unanswerable -> out.println("  cannot say " + unanswerable));
+        if (answer.plan() != null) {
+            renderPlan(out, answer.plan());
+        }
+    }
+
+    /**
+     * How wide the pipeline's current run was planned to run, node by node, and why, as the server sent it: the
+     * run the plan belongs to, then per node the width it runs at and how that is spread, the target it was given
+     * and where that came from, why the width is not the target where it is not, and the batch it takes its
+     * input in. Nothing is worked out here; a generation the run does not have is left out rather than shown as 0.
+     */
+    private static void renderPlan(PrintWriter out, ExplainOutcome.Plan plan) {
+        List<String> run = new ArrayList<>();
+        if (plan.executionGeneration() != null) {
+            run.add("execution " + plan.executionGeneration());
+        }
+        if (plan.claimGeneration() != null) {
+            run.add("claim " + plan.claimGeneration());
+        }
+        if (plan.topologyRevision() != null) {
+            run.add("topology " + plan.topologyRevision());
+        }
+        out.println("  planned    " + plan.plannedAt() + " on " + String.join(", ", plan.members())
+                + (run.isEmpty() ? "" : " (" + String.join(", ", run) + ")"));
+        plan.nodes().forEach(node -> out.println("  width      " + node.node() + "  " + width(node)));
+    }
+
+    private static String width(ExplainOutcome.PlanNode node) {
+        String spread = node.computedLocal() == null
+                ? "one processor for the cluster"
+                : node.computedLocal() + " per member on " + node.memberCount()
+                        + (node.memberCount() == 1 ? " member" : " members");
+        return node.effective() + " in all (" + spread + "), requested " + node.requested()
+                + " (" + node.requestedOrigin() + ")"
+                + (node.reasons().isEmpty() ? "" : " -- " + String.join(", ", node.reasons()))
+                + "; batch " + node.maxRecords() + " records, " + node.maxWaitMillis() + "ms wait";
     }
 
     private static String evidenceValue(Object value) {

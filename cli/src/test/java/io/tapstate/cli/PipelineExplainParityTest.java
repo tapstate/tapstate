@@ -27,7 +27,8 @@ class PipelineExplainParityTest {
             "explain-frontier-stalled.golden.json",
             "explain-no-match.golden.json",
             "explain-unknown.golden.json",
-            "explain-start-pending.golden.json");
+            "explain-start-pending.golden.json",
+            "explain-with-plan.golden.json");
 
     @Test
     void everyRestFixtureReachesTheCliWithTheSameTypedFields() throws Exception {
@@ -79,7 +80,39 @@ class PipelineExplainParityTest {
         if (found.pending() != null) {
             value.put("pending", Map.of("reason", found.pending().reason()));
         }
+        if (found.plan() != null) {
+            value.put("plan", asMap(found.plan()));
+        }
         return value;
+    }
+
+    private static Map<String, Object> asMap(ExplainOutcome.Plan plan) {
+        Map<String, Object> value = new LinkedHashMap<>();
+        putPresent(value, "claimGeneration", plan.claimGeneration());
+        putPresent(value, "executionGeneration", plan.executionGeneration());
+        putPresent(value, "topologyRevision", plan.topologyRevision());
+        value.put("members", plan.members());
+        value.put("nodes", plan.nodes().stream().map(node -> {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("node", node.node());
+            item.put("requested", (long) node.requested());
+            item.put("requestedOrigin", node.requestedOrigin());
+            item.put("scope", node.scope());
+            item.put("memberCount", (long) node.memberCount());
+            putPresent(item, "computedLocal", node.computedLocal() == null ? null : (long) node.computedLocal());
+            item.put("effective", (long) node.effective());
+            item.put("reasons", node.reasons());
+            item.put("batch", Map.of("maxRecords", (long) node.maxRecords(), "maxWaitMillis", node.maxWaitMillis()));
+            return item;
+        }).toList());
+        value.put("plannedAt", plan.plannedAt());
+        return value;
+    }
+
+    private static void putPresent(Map<String, Object> value, String key, Object present) {
+        if (present != null) {
+            value.put(key, present);
+        }
     }
 
     private static String fixture(String name) throws IOException {

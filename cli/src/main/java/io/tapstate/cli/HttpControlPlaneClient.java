@@ -1338,9 +1338,70 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         if (map.get("pending") != null && pending == null) {
             return null;
         }
+        ExplainOutcome.Plan plan = explanationPlan(map.get("plan"));
+        if (map.get("plan") != null && plan == null) {
+            return null;
+        }
         return new ExplainOutcome.Found(pipelineId, state, kind, message, (String) rawObservedAt,
                 rawAge == null ? null : ((Number) rawAge).longValue(), freshness,
-                evidence, cannotSay, next, pending);
+                evidence, cannotSay, next, pending, plan);
+    }
+
+    private static ExplainOutcome.Plan explanationPlan(Object raw) {
+        if (!(raw instanceof Map<?, ?> plan)
+                || !(plan.get("plannedAt") instanceof String plannedAt)
+                || !(plan.get("nodes") instanceof List<?> rawNodes)
+                || !absentOrNumber(plan.get("claimGeneration"))
+                || !absentOrNumber(plan.get("executionGeneration"))
+                || !absentOrNumber(plan.get("topologyRevision"))) {
+            return null;
+        }
+        List<String> members = strings(plan.get("members"));
+        if (members == null) {
+            return null;
+        }
+        List<ExplainOutcome.PlanNode> nodes = new ArrayList<>();
+        for (Object item : rawNodes) {
+            ExplainOutcome.PlanNode node = explanationPlanNode(item);
+            if (node == null) {
+                return null;
+            }
+            nodes.add(node);
+        }
+        return new ExplainOutcome.Plan(longOrNull(plan.get("claimGeneration")),
+                longOrNull(plan.get("executionGeneration")), longOrNull(plan.get("topologyRevision")),
+                members, nodes, plannedAt);
+    }
+
+    private static ExplainOutcome.PlanNode explanationPlanNode(Object raw) {
+        if (!(raw instanceof Map<?, ?> node)
+                || !(node.get("node") instanceof String id)
+                || !(node.get("requested") instanceof Number requested)
+                || !(node.get("requestedOrigin") instanceof String origin)
+                || !(node.get("scope") instanceof String scope)
+                || !(node.get("memberCount") instanceof Number memberCount)
+                || !absentOrNumber(node.get("computedLocal"))
+                || !(node.get("effective") instanceof Number effective)
+                || !(node.get("batch") instanceof Map<?, ?> batch)
+                || !(batch.get("maxRecords") instanceof Number maxRecords)
+                || !(batch.get("maxWaitMillis") instanceof Number maxWaitMillis)) {
+            return null;
+        }
+        List<String> reasons = strings(node.get("reasons"));
+        if (reasons == null) {
+            return null;
+        }
+        return new ExplainOutcome.PlanNode(id, requested.intValue(), origin, scope, memberCount.intValue(),
+                node.get("computedLocal") instanceof Number local ? local.intValue() : null, effective.intValue(),
+                reasons, maxRecords.intValue(), maxWaitMillis.longValue());
+    }
+
+    private static boolean absentOrNumber(Object raw) {
+        return raw == null || raw instanceof Number;
+    }
+
+    private static Long longOrNull(Object raw) {
+        return raw instanceof Number number ? number.longValue() : null;
     }
 
     private static List<ExplainOutcome.Evidence> explanationEvidence(Object raw) {

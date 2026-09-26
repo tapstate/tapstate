@@ -1,5 +1,6 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.PipelineState;
 
 import java.time.Instant;
@@ -10,7 +11,13 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 
-/** One evidence-backed explanation projected from one current observation. */
+/**
+ * One evidence-backed explanation projected from one current observation.
+ *
+ * <p>{@code plan} is the plan the pipeline's current run was submitted on - how wide each node runs and why - or
+ * {@code null} when no run has one recorded. It answers beside the diagnosis rather than as part of it: no rule
+ * reads it, and no conclusion is drawn from a width.
+ */
 public record PipelineExplanation(
         String pipelineId,
         PipelineState state,
@@ -22,7 +29,8 @@ public record PipelineExplanation(
         List<Evidence> evidence,
         List<String> cannotSay,
         Next next,
-        Pending pending) {
+        Pending pending,
+        ExecutionPlan plan) {
 
     public PipelineExplanation {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -38,6 +46,20 @@ public record PipelineExplanation(
         if (kind == Kind.NO_MATCH && cannotSay.isEmpty()) {
             throw new IllegalArgumentException("a no-match explanation names what it cannot say");
         }
+    }
+
+    /** An explanation of a run with no plan recorded. */
+    public PipelineExplanation(String pipelineId, PipelineState state, Kind kind, String message,
+            Instant observedAt, Long observedAgeMillis, Freshness freshness, List<Evidence> evidence,
+            List<String> cannotSay, Next next, Pending pending) {
+        this(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness, evidence, cannotSay, next,
+                pending, null);
+    }
+
+    /** The same explanation, beside the plan the pipeline's current run was submitted on. */
+    public PipelineExplanation withPlan(ExecutionPlan plan) {
+        return new PipelineExplanation(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness,
+                evidence, cannotSay, next, pending, plan);
     }
 
     public enum Kind {

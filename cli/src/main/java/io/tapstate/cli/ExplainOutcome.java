@@ -16,11 +16,20 @@ sealed interface ExplainOutcome {
             List<Evidence> evidence,
             List<String> cannotSay,
             Next next,
-            Pending pending) implements ExplainOutcome {
+            Pending pending,
+            Plan plan) implements ExplainOutcome {
 
         public Found {
             evidence = List.copyOf(evidence);
             cannotSay = List.copyOf(cannotSay);
+        }
+
+        /** An explanation with no plan beside it. */
+        Found(String pipelineId, String state, String kind, String message, String observedAt,
+                Long observedAgeMillis, String freshness, List<Evidence> evidence, List<String> cannotSay, Next next,
+                Pending pending) {
+            this(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness, evidence, cannotSay,
+                    next, pending, null);
         }
     }
 
@@ -31,6 +40,29 @@ sealed interface ExplainOutcome {
     }
 
     record Pending(String reason) {
+    }
+
+    /**
+     * The plan the pipeline's current run was submitted on, as the server sent it: the generations are absent
+     * where nothing fences the run, and so is a node's per-member count where it runs as one processor for the
+     * cluster.
+     */
+    record Plan(Long claimGeneration, Long executionGeneration, Long topologyRevision, List<String> members,
+            List<PlanNode> nodes, String plannedAt) {
+
+        public Plan {
+            members = List.copyOf(members);
+            nodes = List.copyOf(nodes);
+        }
+    }
+
+    /** One node of a plan, with the batch it takes its input in. */
+    record PlanNode(String node, int requested, String requestedOrigin, String scope, int memberCount,
+            Integer computedLocal, int effective, List<String> reasons, int maxRecords, long maxWaitMillis) {
+
+        public PlanNode {
+            reasons = List.copyOf(reasons);
+        }
     }
 
     record Rejected(String code, String message) implements ExplainOutcome {

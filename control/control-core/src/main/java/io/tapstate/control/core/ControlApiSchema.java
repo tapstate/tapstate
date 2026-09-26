@@ -381,9 +381,49 @@ public final class ControlApiSchema {
         properties.put("cannotSay", array(string("A fact this observation cannot establish")));
         properties.put("next", nullable(next));
         properties.put("pending", pending);
+        properties.put("plan", executionPlan());
         return object(List.of(
                 "pipelineId", "state", "kind", "message", "freshness", "evidence", "cannotSay", "next"),
                 properties, false);
+    }
+
+    /**
+     * The plan a pipeline's current run was submitted on: why each node runs as wide as it does. Absent when no
+     * run has one recorded, and so are the values a run does not have - a run on a single member is fenced by
+     * nothing and names no generations, and a node run as one processor for the cluster has no per-member count.
+     */
+    private static Map<String, Object> executionPlan() {
+        Map<String, Object> batch = new LinkedHashMap<>();
+        batch.put("maxRecords", positiveInteger("The most records the node takes its input in at once"));
+        batch.put("maxWaitMillis", withDescription(nonNegativeInteger(),
+                "The longest the node waits for a batch to fill, in milliseconds"));
+        Map<String, Object> node = new LinkedHashMap<>();
+        node.put("node", string("Pipeline node id"));
+        node.put("requested", positiveInteger("Target total number of processors the node was given"));
+        node.put("requestedOrigin", withDescription(enumString("explicit", "node-default"),
+                "Whether the pipeline's author wrote the target, or it is the default for the node's kind"));
+        node.put("scope", withDescription(enumString("total-one", "native"),
+                "One processor for the whole cluster, or the same number of processors on every member"));
+        node.put("memberCount", positiveInteger("Members the width was worked out for"));
+        node.put("computedLocal", positiveInteger(
+                "Processors per member; absent for a node run as one processor for the cluster"));
+        node.put("effective", positiveInteger("Processors the node runs in total"));
+        node.put("reasons", array(string("Why the width is what it is: requested-one, source-reads-not-split, "
+                + "single-target-keyless, key-not-derivable, rounded-up, rounded-down, or budget:<name>")));
+        node.put("batch", object(List.of("maxRecords", "maxWaitMillis"), batch, false));
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("claimGeneration", withDescription(nonNegativeInteger(),
+                "Generation of the claim the run was submitted under; absent where nothing fences the run"));
+        properties.put("executionGeneration", withDescription(nonNegativeInteger(),
+                "The run's own generation, moved by every submission; absent where nothing fences the run"));
+        properties.put("topologyRevision", withDescription(nonNegativeInteger(),
+                "Committed topology the claim was held under; absent where nothing fences the run"));
+        properties.put("members", array(string("Stable id of a member the widths were worked out for")));
+        properties.put("nodes", array(object(List.of(
+                "node", "requested", "requestedOrigin", "scope", "memberCount", "effective", "reasons", "batch"),
+                node, false)));
+        properties.put("plannedAt", instant("When the run was planned"));
+        return object(List.of("members", "nodes", "plannedAt"), properties, false);
     }
 
     /**
@@ -498,6 +538,16 @@ public final class ControlApiSchema {
 
     private static Map<String, Object> nonNegativeInteger() {
         return Map.of("type", "integer", "minimum", 0);
+    }
+
+    private static Map<String, Object> positiveInteger(String description) {
+        return Map.of("type", "integer", "minimum", 1, "description", description);
+    }
+
+    private static Map<String, Object> withDescription(Map<String, Object> schema, String description) {
+        Map<String, Object> described = new LinkedHashMap<>(schema);
+        described.put("description", description);
+        return immutableMap(described);
     }
 
     private static Map<String, Object> nullable(Map<String, Object> value) {

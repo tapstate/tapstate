@@ -1752,6 +1752,26 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void anExplanationWhosePlanCannotBeReadIsNotTakenForOneWithNoPlan() throws Exception {
+        // A plan node without its batch is a plan this client cannot read, not a run with no plan: answering it
+        // as the latter would print an explanation that silently says nothing about how wide the run is.
+        HttpServer server = apiServer("/api/pipelines/pl1/explain", 200,
+                "{\"pipelineId\":\"pl1\",\"state\":\"RUNNING\",\"kind\":\"NO_MATCH\","
+                        + "\"message\":\"No diagnostic rule matched.\",\"freshness\":\"UNKNOWN\","
+                        + "\"evidence\":[],\"cannotSay\":[\"The observation has no time.\"],\"next\":null,"
+                        + "\"plan\":{\"members\":[\"local\"],\"plannedAt\":\"2026-09-20T10:00:00Z\","
+                        + "\"nodes\":[{\"node\":\"orders_sink\",\"requested\":4,\"requestedOrigin\":\"node-default\","
+                        + "\"scope\":\"native\",\"memberCount\":1,\"computedLocal\":4,\"effective\":4,"
+                        + "\"reasons\":[]}]}}", new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().explain(baseOf(server), "tok-abc", "pl1"))
+                    .isInstanceOf(ExplainOutcome.Unreachable.class);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void historySendsEverySelectorAndDecodesTheTypedPage() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/metrics/history", 200,

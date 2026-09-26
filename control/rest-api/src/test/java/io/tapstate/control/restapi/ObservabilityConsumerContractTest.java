@@ -1,5 +1,7 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.ControlApiSchema;
+import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.EffectiveHistoryResolution;
 import io.tapstate.control.core.PipelineExplanation;
 import io.tapstate.control.core.PipelineMetricsHistory;
@@ -13,14 +15,17 @@ import io.tapstate.control.core.PipelineMetricsHistory.Segment;
 import io.tapstate.control.core.PipelineMetricsHistory.StartReason;
 import io.tapstate.control.core.PipelineMetricsHistory.Status;
 import io.tapstate.control.core.PipelineMetricsHistory.Unavailable;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -59,7 +64,8 @@ class ObservabilityConsumerContractTest {
                 "explain-frontier-stalled.golden.json",
                 "explain-no-match.golden.json",
                 "explain-unknown.golden.json",
-                "explain-start-pending.golden.json");
+                "explain-start-pending.golden.json",
+                "explain-with-plan.golden.json");
     }
 
     @Test
@@ -239,6 +245,118 @@ class ObservabilityConsumerContractTest {
         assertGolden(PipelineExplanationResponse.of(noMatch), "explain-no-match.golden.json");
         assertGolden(PipelineExplanationResponse.of(unknown), "explain-unknown.golden.json");
         assertGolden(PipelineExplanationResponse.of(pending), "explain-start-pending.golden.json");
+
+        // The plan the run was submitted on, beside the diagnosis: a source held to one processor for the
+        // cluster, which has no per-member count to send, and a sink worked out to three per member.
+        PipelineExplanation planned = noMatch.withPlan(new ExecutionPlan("orders", 3L, 7L, 11L,
+                List.of("m1", "m2", "m3"),
+                List.of(new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
+                                List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src")),
+                        new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 3, 3, 9,
+                                List.of("rounded-up"), 512, 50L, List.of("route.orders_sink", "orders_sink"))),
+                Instant.parse("2026-09-20T09:58:00Z")));
+        assertGolden(PipelineExplanationResponse.of(planned), "explain-with-plan.golden.json");
+    }
+
+    /**
+     * The explain result's published schema is closed, so a strict consumer refuses any field it does not name.
+     * Every explanation fixture is therefore held to it, key by key: a field added to the answer and not to the
+     * schema passes every other case here and is refused by exactly the consumer the schema was published for.
+     */
+    @Test
+    void everyExplanationFixtureIsAdmittedByThePublishedClosedSchema() throws Exception {
+        Map<?, ?> schema = ControlApiSchema.resolve(ControlOperations.PIPELINE_EXPLAIN.schema().result());
+
+        for (String fixture : List.of(
+                "explain-stale.golden.json",
+                "explain-coded-failure.golden.json",
+                "explain-reconcile-failures.golden.json",
+                "explain-no-movement.golden.json",
+                "explain-frontier-stalled.golden.json",
+                "explain-no-match.golden.json",
+                "explain-unknown.golden.json",
+                "explain-start-pending.golden.json",
+                "explain-with-plan.golden.json")) {
+            Object answer = JSON.readValue(golden(fixture), Object.class);
+
+            assertThat(refusals("$", answer, schema)).as(fixture).isEmpty();
+        }
+    }
+
+    /**
+     * Where {@code schema} refuses {@code value}, by path. A closed object admits only the properties it names and
+     * needs every one it requires; an array admits items its item schema admits; a one-of admits what any of its
+     * branches admits; a typed scalar admits a value of that type, within its enum and minimum where it has them;
+     * and a schema naming no type admits any value.
+     */
+    private static List<String> refusals(String path, Object value, Map<?, ?> schema) {
+        List<String> refused = new ArrayList<>();
+        if (schema.get("oneOf") instanceof List<?> branches) {
+            if (branches.stream().noneMatch(branch -> refusals(path, value, (Map<?, ?>) branch).isEmpty())) {
+                refused.add(path + ": no branch admits " + value);
+            }
+            return refused;
+        }
+        if (!(schema.get("type") instanceof String type)) {
+            return refused;
+        }
+        switch (type) {
+            case "null" -> {
+                if (value != null) {
+                    refused.add(path + ": not null");
+                }
+            }
+            case "boolean" -> {
+                if (!(value instanceof Boolean)) {
+                    refused.add(path + ": not a boolean");
+                }
+            }
+            case "string" -> {
+                if (!(value instanceof String text)) {
+                    refused.add(path + ": not a string");
+                } else if (schema.get("enum") instanceof List<?> allowed && !allowed.contains(text)) {
+                    refused.add(path + ": " + text + " is not one of " + allowed);
+                }
+            }
+            case "integer", "number" -> {
+                boolean integral = value instanceof Integer || value instanceof Long || value instanceof BigInteger;
+                if (!(value instanceof Number number) || "integer".equals(type) && !integral) {
+                    refused.add(path + ": not an " + type);
+                } else if (schema.get("minimum") instanceof Number minimum
+                        && number.doubleValue() < minimum.doubleValue()) {
+                    refused.add(path + ": below " + minimum);
+                }
+            }
+            case "array" -> {
+                if (!(value instanceof List<?> items)) {
+                    refused.add(path + ": not an array");
+                } else {
+                    for (int i = 0; i < items.size(); i++) {
+                        refused.addAll(refusals(path + "[" + i + "]", items.get(i), (Map<?, ?>) schema.get("items")));
+                    }
+                }
+            }
+            case "object" -> {
+                if (!(value instanceof Map<?, ?> object)) {
+                    refused.add(path + ": not an object");
+                    break;
+                }
+                Map<?, ?> properties = (Map<?, ?>) schema.get("properties");
+                if (schema.get("required") instanceof List<?> required) {
+                    required.stream().filter(key -> !object.containsKey(key))
+                            .forEach(key -> refused.add(path + "." + key + ": required and absent"));
+                }
+                object.forEach((key, field) -> {
+                    if (properties.get(key) instanceof Map<?, ?> property) {
+                        refused.addAll(refusals(path + "." + key, field, property));
+                    } else if (Boolean.FALSE.equals(schema.get("additionalProperties"))) {
+                        refused.add(path + "." + key + ": not a property this closed object names");
+                    }
+                });
+            }
+            default -> refused.add(path + ": no reading of schema type " + type);
+        }
+        return refused;
     }
 
     private static PipelineMetricsHistory history(

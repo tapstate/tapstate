@@ -2,7 +2,6 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineStatus;
-import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
@@ -10,7 +9,6 @@ import io.tapstate.messages.MessageCatalog;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -39,7 +37,7 @@ import java.util.TreeMap;
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 record PipelineStatusResponse(String pipelineId, PipelineState state, Failure failure, Instant observedAt,
-        Long observedAgeMillis, Plan plan) {
+        Long observedAgeMillis, ExecutionPlanResponse plan) {
 
     /**
      * A coded failure as a client reads it: the canonical code string (the stable identity — the enum never
@@ -47,44 +45,6 @@ record PipelineStatusResponse(String pipelineId, PipelineState state, Failure fa
      * rendered from both through the shared catalog, so every face prints one wording.
      */
     record Failure(String code, Map<String, Object> params, String message) {
-    }
-
-    /**
-     * The plan a run was submitted on, as a reader asking why each node runs as wide as it does reads it: which
-     * run it is, the members the widths were worked out for, and every node in the order it was worked out. A
-     * value the run does not have is omitted rather than sent as zero or null - a run on a single member is
-     * fenced by nothing, so it names no generations.
-     */
-    @JsonInclude(JsonInclude.Include.NON_NULL)
-    record Plan(Long claimGeneration, Long executionGeneration, Long topologyRevision, List<String> members,
-            List<Node> nodes, Instant plannedAt) {
-
-        static Plan of(ExecutionPlan plan) {
-            return plan == null ? null : new Plan(plan.claimGeneration(), plan.executionGeneration(),
-                    plan.topologyRevision(), plan.members(), plan.nodes().stream().map(Node::of).toList(),
-                    plan.plannedAt());
-        }
-    }
-
-    /**
-     * One node of a plan: the target it was given and where that came from, whether it runs as one processor for
-     * the cluster or the same number on every member, the member count and per-member count it was worked out
-     * for, the width that makes, why that is not the target where it is not, and the batch it takes its input
-     * in. {@code computedLocal} is omitted for a node run as one processor for the cluster, which has none.
-     */
-    @JsonInclude(JsonInclude.Include.NON_NULL)
-    record Node(String node, int requested, String requestedOrigin, String scope, int memberCount,
-            Integer computedLocal, int effective, List<String> reasons, Batch batch) {
-
-        static Node of(ExecutionPlan.Node node) {
-            return new Node(node.node(), node.requested(), node.origin(), node.scope(), node.memberCount(),
-                    node.computedLocal(), node.effective(), node.reasons(),
-                    new Batch(node.maxRecords(), node.maxWaitMillis()));
-        }
-    }
-
-    /** The most records a node takes its input in at once, and the longest it waits for them. */
-    record Batch(int maxRecords, long maxWaitMillis) {
     }
 
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog) {
@@ -101,7 +61,7 @@ record PipelineStatusResponse(String pipelineId, PipelineState state, Failure fa
                 failure(status.failure(), catalog), observedAt,
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
-                Plan.of(status.plan()));
+                ExecutionPlanResponse.of(status.plan()));
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {
