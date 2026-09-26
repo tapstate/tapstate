@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 /**
  * The MongoDB history of movement samples: one document per sample, appended and never overwritten,
@@ -41,6 +42,8 @@ import java.util.Optional;
  * rather than on the moment.
  */
 public final class MongoRateHistoryStore implements RateHistoryStore {
+
+    private static final long APPEND_DEADLINE_SECONDS = 5;
 
     /** How long a sample is kept when nothing says otherwise. */
     public static final Duration DEFAULT_RETENTION = Duration.ofDays(15);
@@ -77,7 +80,8 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
     @Override
     public void append(RateSample sample) {
         Objects.requireNonNull(sample, "sample");
-        StoreIo.run(() -> collection.insertOne(toDocument(sample)));
+        StoreIo.run(() -> collection.withTimeout(APPEND_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .insertOne(toDocument(sample)));
     }
 
     @Override

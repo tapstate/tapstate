@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * The MongoDB per-pipeline observation store: one observation document per pipeline, keyed by the
@@ -49,6 +50,8 @@ import java.util.TreeMap;
  */
 public final class MongoObservationStore implements ObservationStore {
 
+    private static final long IO_DEADLINE_SECONDS = 5;
+
     private final MongoCollection<Document> collection;
 
     public MongoObservationStore(MongoCollection<Document> collection) {
@@ -60,7 +63,7 @@ public final class MongoObservationStore implements ObservationStore {
         Objects.requireNonNull(observation, "observation");
         // Upsert by the pipeline id (the document _id): a re-publish overwrites the latest projection in
         // place (last write wins) rather than accumulating documents. An observation is not fenced.
-        StoreIo.run(() -> collection.replaceOne(
+        StoreIo.run(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS).replaceOne(
                 new Document("_id", observation.pipelineId()), toDocument(observation), new ReplaceOptions().upsert(true)));
     }
 
@@ -87,7 +90,8 @@ public final class MongoObservationStore implements ObservationStore {
                 .append("executionGeneration", scope.executionGeneration());
         return StoreIo.call(id, () -> {
             try {
-                UpdateResult result = collection.replaceOne(filter, replacement, new ReplaceOptions().upsert(true));
+                UpdateResult result = collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                        .replaceOne(filter, replacement, new ReplaceOptions().upsert(true));
                 return result.getModifiedCount() != 0 || result.getUpsertedId() != null;
             } catch (MongoException conflict) {
                 // An existing _id whose scope or time did not match makes the upsert attempt collide.
@@ -108,14 +112,16 @@ public final class MongoObservationStore implements ObservationStore {
     @Override
     public Optional<Observation> read(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        Document document = StoreIo.call(() -> collection.find(new Document("_id", pipelineId)).first());
+        Document document = StoreIo.call(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .find(new Document("_id", pipelineId)).first());
         return document == null ? Optional.empty() : Optional.of(toObservation(document));
     }
 
     @Override
     public Optional<Stored> readStored(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        Document document = StoreIo.call(() -> collection.find(new Document("_id", pipelineId)).first());
+        Document document = StoreIo.call(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .find(new Document("_id", pipelineId)).first());
         if (document == null) {
             return Optional.empty();
         }

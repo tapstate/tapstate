@@ -58,20 +58,26 @@ public final class RateSampler {
      * interval older than this observation and the observation carries something to draw a line from.
      */
     public void offer(Observation observation) {
+        appendIfDue(observation);
+    }
+
+    /** Returns whether this frame appended a retained sample. */
+    public boolean appendIfDue(Observation observation) {
         Objects.requireNonNull(observation, "observation");
         if (observation.observedAt() == null) {
-            return;
+            return false;
         }
         RateSample sample = sampleOf(observation);
         if (sample == null) {
-            return;
+            return false;
         }
         Instant last = lastSampledAt.get(observation.pipelineId());
         if (last != null && observation.observedAt().isBefore(last.plus(interval))) {
-            return;
+            return false;
         }
         history.append(sample);
         lastSampledAt.put(observation.pipelineId(), observation.observedAt());
+        return true;
     }
 
     /** Drops the cadence bookkeeping of every pipeline outside {@code live}, which is the set that still exists. */
