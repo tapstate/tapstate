@@ -31,6 +31,7 @@ import io.tapstate.runtime.engine.DagBindings;
 import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.FrontierBinding;
 import io.tapstate.runtime.engine.FrontierOrders;
+import io.tapstate.runtime.engine.NodeVertices;
 import io.tapstate.runtime.engine.PipelineDagBuilder;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.engine.SinkTarget;
@@ -365,12 +366,14 @@ final class StoreBackedDagSource implements DagSource {
                                 nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get),
                         sourceExecutions(sourceVertices)),
                 sinksOf(pipeline, targets, serveStreams, viewStreams));
+        NodeVertices drawn = new NodeVertices();
         DAG dag = PipelineDagBuilder.build(
                 builtPipeline,
                 bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
-                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier, shape);
-        return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices));
+                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier, shape,
+                drawn);
+        return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode());
     }
 
     /**

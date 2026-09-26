@@ -73,20 +73,23 @@ interface DagSource {
      * runs as one processor for the cluster, and there is no plan to say so.
      */
     default PlannedDag plannedDagFor(String pipelineId, ExecutionFence fence) {
-        return new PlannedDag(dagFor(pipelineId, fence), ExecutionShape.totalOne(), List.of(), Map.of());
+        return new PlannedDag(dagFor(pipelineId, fence), ExecutionShape.totalOne(), List.of(), Map.of(), Map.of());
     }
 
     /**
      * A topology and the plan it was drawn from: {@code shape} holds each node's width, worked out for
-     * {@code members} - by stable id - and {@code batches} the batch each node takes its input in.
+     * {@code members} - by stable id - {@code batches} the batch each node takes its input in, and
+     * {@code vertices} which of the topology's vertices run at each node's width.
      */
-    record PlannedDag(DAG dag, ExecutionShape shape, List<String> members, Map<String, BatchSpec> batches) {
+    record PlannedDag(DAG dag, ExecutionShape shape, List<String> members, Map<String, BatchSpec> batches,
+            Map<String, List<String>> vertices) {
 
         public PlannedDag {
             Objects.requireNonNull(dag, "dag");
             Objects.requireNonNull(shape, "shape");
             members = List.copyOf(Objects.requireNonNull(members, "members"));
             batches = Map.copyOf(Objects.requireNonNull(batches, "batches"));
+            vertices = Map.copyOf(Objects.requireNonNull(vertices, "vertices"));
         }
     }
 

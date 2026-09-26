@@ -232,7 +232,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         List<ExecutionPlan.Node> nodes = new ArrayList<>();
         planned.shape().nodes().forEach((node, parallelism) -> {
             BatchSpec batch = planned.batches().getOrDefault(node, BatchSpec.DEFAULTS);
-            nodes.add(ExecutionPlan.Node.of(parallelism, batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis()));
+            nodes.add(ExecutionPlan.Node.of(parallelism, batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis(),
+                    planned.vertices().getOrDefault(node, List.of())));
         });
         return new ExecutionPlan(pipelineId, fence == null ? null : fence.claimGeneration(),
                 fence == null ? null : fence.executionGeneration(), execution.topologyRevision(), planned.members(),

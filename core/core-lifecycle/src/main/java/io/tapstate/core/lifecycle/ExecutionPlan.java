@@ -45,9 +45,9 @@ public record ExecutionPlan(
     /**
      * One node as it was planned: the target it was given and where that came from, whether it runs as one
      * processor for the cluster or the same number on every member, the members and per-member count it was
-     * worked out for, the width that makes, why it is not the target where it is not, and the batch it takes its
-     * input in. {@code origin} and {@code scope} are their wire spellings; {@code computedLocal} is absent for a
-     * node run as one processor for the cluster.
+     * worked out for, the width that makes, why it is not the target where it is not, the batch it takes its
+     * input in, and the vertices of the run that run at that width. {@code origin} and {@code scope} are their wire
+     * spellings; {@code computedLocal} is absent for a node run as one processor for the cluster.
      */
     public record Node(
             String node,
@@ -59,7 +59,8 @@ public record ExecutionPlan(
             int effective,
             List<String> reasons,
             int maxRecords,
-            long maxWaitMillis) implements Serializable {
+            long maxWaitMillis,
+            List<String> vertices) implements Serializable {
 
         private static final long serialVersionUID = 1L;
 
@@ -68,13 +69,17 @@ public record ExecutionPlan(
             Objects.requireNonNull(origin, "origin");
             Objects.requireNonNull(scope, "scope");
             reasons = List.copyOf(Objects.requireNonNull(reasons, "reasons"));
+            vertices = List.copyOf(Objects.requireNonNull(vertices, "vertices"));
         }
 
-        /** The node {@code parallelism} worked out, taking its input in batches of the size and wait given. */
-        public static Node of(NodeParallelism parallelism, int maxRecords, long maxWaitMillis) {
+        /**
+         * The node {@code parallelism} worked out, taking its input in batches of the size and wait given, run by
+         * {@code vertices}.
+         */
+        public static Node of(NodeParallelism parallelism, int maxRecords, long maxWaitMillis, List<String> vertices) {
             return new Node(parallelism.node(), parallelism.requested(), parallelism.origin().id(),
                     parallelism.scope().id(), parallelism.memberCount(), parallelism.computedLocal(),
-                    parallelism.effective(), parallelism.reasons(), maxRecords, maxWaitMillis);
+                    parallelism.effective(), parallelism.reasons(), maxRecords, maxWaitMillis, vertices);
         }
     }
 }

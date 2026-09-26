@@ -346,6 +346,33 @@ class PipelineDagBuilderTest {
         }
     }
 
+    /**
+     * The drawing says which vertices run at each node's width: a source's own, both of a join's vertices, and a
+     * wide sink's router as well as the sink - where a sink's own vertex is all it draws when it runs as one.
+     */
+    @Test
+    void the_drawing_tells_which_vertices_run_at_each_nodes_width() {
+        Map<String, NodeParallelism> nodes = new java.util.LinkedHashMap<>();
+        nodes.put("j", new NodeParallelism("j", 3, NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE,
+                1, 3, 3, List.of()));
+        nodes.put("serve.sync_1", new NodeParallelism("serve.sync_1", 4, NodeParallelism.Origin.NODE_DEFAULT,
+                NodeParallelism.Scope.NATIVE, 1, 4, 4, List.of()));
+        ExecutionShape wide = new ExecutionShape(1, nodes, Map.of(),
+                Map.of("serve.sync_1", Map.of("j", new SinkTarget("orders", List.of("id")))));
+        NodeVertices drawn = new NodeVertices();
+        NodeVertices narrow = new NodeVertices();
+
+        PipelineDagBuilder.build(joinPipeline(null), joinBindings(), null, null, wide, drawn);
+        PipelineDagBuilder.build(joinPipeline(null), joinBindings(), null, null, ExecutionShape.totalOne(), narrow);
+
+        assertThat(drawn.byNode()).containsExactly(
+                Map.entry("orders_src", List.of("orders_src")),
+                Map.entry("customers_src", List.of("customers_src")),
+                Map.entry("j", List.of("j", "j:project")),
+                Map.entry("serve.sync_1", List.of("route.serve.sync_1", "serve.sync_1")));
+        assertThat(narrow.byNode()).containsEntry("serve.sync_1", List.of("serve.sync_1"));
+    }
+
     private static PipelineResource joinPipeline(io.tapstate.core.model.ExecutionSpec execution) {
         return new PipelineResource(
                 "p", null,

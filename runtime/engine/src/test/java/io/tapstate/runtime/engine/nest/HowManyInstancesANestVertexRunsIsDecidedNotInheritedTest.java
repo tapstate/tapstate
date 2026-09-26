@@ -10,6 +10,7 @@ import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.processor.Processors;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.runtime.engine.NodeVertices;
 import io.tapstate.runtime.engine.NodeWidth;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -116,6 +117,18 @@ class HowManyInstancesANestVertexRunsIsDecidedNotInheritedTest {
         assertThat(PipelineDagBuilder.nestBlockingVertices(pipeline, tables()))
                 .as("what a member is charged for the nest, per processor wide it runs")
                 .containsExactly(Map.entry("doc", drawnWide));
+    }
+
+    @Test
+    void onlyTheVerticesThatKeepStateAreToldAsRunningAtTheNestsWidth() {
+        NestTopology topology = NestTopology.compile("p", "doc", TREE, tables());
+        NodeVertices drawn = new NodeVertices();
+
+        draw(topology, new NodeWidth("doc", 3, 1, null).drawingInto(drawn));
+
+        assertThat(drawn.byNode())
+                .as("the gathering vertex runs one processor whatever the nest's width, so it is not among them")
+                .containsExactly(Map.entry("doc", keepingState(topology)));
     }
 
     @Test

@@ -19,8 +19,9 @@ import java.util.Objects;
  * meet on one processor, and is held to the member count its width was worked out for.
  *
  * <p>{@code batch} is the batch the node's author asked for, if any: its vertices then take their input in it.
+ * {@code drawn}, where given, is told about every vertex drawn at the node's width.
  */
-public record NodeWidth(String node, int local, int plannedMembers, BatchSpec batch) {
+public record NodeWidth(String node, int local, int plannedMembers, BatchSpec batch, NodeVertices drawn) {
 
     public NodeWidth {
         Objects.requireNonNull(node, "node");
@@ -32,9 +33,19 @@ public record NodeWidth(String node, int local, int plannedMembers, BatchSpec ba
         }
     }
 
+    /** A width that tells nobody which vertices it was drawn at. */
+    public NodeWidth(String node, int local, int plannedMembers, BatchSpec batch) {
+        this(node, local, plannedMembers, batch, null);
+    }
+
     /** One processor for the whole cluster. */
     public static NodeWidth totalOne(String node, BatchSpec batch) {
         return new NodeWidth(node, 0, 1, batch);
+    }
+
+    /** The same width, telling {@code drawn} about every vertex drawn at it. */
+    public NodeWidth drawingInto(NodeVertices drawn) {
+        return new NodeWidth(node, local, plannedMembers, batch, drawn);
     }
 
     /** Whether the node runs the same number of processors on every member rather than one in total. */
@@ -52,6 +63,9 @@ public record NodeWidth(String node, int local, int plannedMembers, BatchSpec ba
 
     /** {@code vertex}, running as many processors on each member as the node does where it runs natively. */
     public Vertex sized(Vertex vertex) {
+        if (drawn != null) {
+            drawn.add(node, vertex.getName());
+        }
         return isNative() ? vertex.localParallelism(local) : vertex;
     }
 

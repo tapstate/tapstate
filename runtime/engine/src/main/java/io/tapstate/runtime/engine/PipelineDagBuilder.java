@@ -332,6 +332,16 @@ public final class PipelineDagBuilder {
      */
     public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
             FrontierBinding frontier, ExecutionShape shape) {
+        return build(pipeline, bindings, sinkAck, frontier, shape, new NodeVertices());
+    }
+
+    /**
+     * As above, telling {@code drawn} which vertices run at each node's width: a source's, a step's and a sink's
+     * own, a wide sink's router, and every vertex a nest or a join draws at its width - never one drawn to gather
+     * several producers into one, which runs as one processor whatever the node's width.
+     */
+    public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
+            FrontierBinding frontier, ExecutionShape shape, NodeVertices drawn) {
         Objects.requireNonNull(shape, "shape");
         DAG dag = new DAG();
         Map<String, Vertex> byKey = new HashMap<>();
@@ -356,6 +366,7 @@ public final class PipelineDagBuilder {
             }
             for (String sourceKey : sourceKeys) {
                 byKey.put(sourceKey, dag.newVertex(sourceKey, bindings.sourceVertices().apply(sourceKey)));
+                drawn.add(sourceKey, sourceKey);
                 // Per vertex rather than per source: a source reading several tables reads several chains,
                 // and a bound carrying one of their names for all of them would say how far one table had
                 // travelled about changes of a table nobody had read.
@@ -396,7 +407,7 @@ public final class PipelineDagBuilder {
                             chains == null ? null : new NestFrontier(axes,
                                     alias -> chains.perProducer(
                                             aliasUpstream(inline.from(), alias, bindings))),
-                            shape.widthOf(step.id(), writtenBatch(step))));
+                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn)));
                     if (chains != null) {
                         chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
@@ -418,7 +429,7 @@ public final class PipelineDagBuilder {
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             bindings.join().stores(), bindings.join().displaced(),
-                            shape.widthOf(step.id(), writtenBatch(step))));
+                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn)));
                     if (chains != null) {
                         chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
@@ -429,6 +440,7 @@ public final class PipelineDagBuilder {
                 Vertex vertex = transformVertex(dag, step, bindings, axes,
                         chains == null ? null : chains.perOrdinal(upstream), shape);
                 byKey.put(step.id(), vertex);
+                drawn.add(step.id(), vertex.getName());
                 if (chains != null) {
                     chains.derived(step.id(), upstream);
                 }
@@ -446,6 +458,8 @@ public final class PipelineDagBuilder {
             if (shape.isNative(sink.name())) {
                 drawNativeSink(dag, sink, sinkAck, axes, chains, shape, byKey, outboundOrdinal, inboundOrdinal,
                         startsTheRun ? writersByChain : null);
+                drawn.add(sink.name(), ROUTE_VERTEX_PREFIX + sink.name());
+                drawn.add(sink.name(), sink.name());
                 startsTheRun = false;
                 continue;
             }
@@ -460,6 +474,7 @@ public final class PipelineDagBuilder {
                 startsTheRun = false;
             }
             Vertex vertex = dag.newVertex(sink.name(), supplier);
+            drawn.add(sink.name(), sink.name());
             connect(dag, verticesOf(sink.upstream(), byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
         }
 

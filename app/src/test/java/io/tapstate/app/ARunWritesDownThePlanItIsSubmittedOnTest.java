@@ -75,9 +75,9 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
             assertThat(plan.topologyRevision()).isNull();
             assertThat(plan.nodes()).containsExactly(
                     new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
-                            List.of("requested-one", "source-reads-not-split"), 1024, 0L),
+                            List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src")),
                     new ExecutionPlan.Node("serve.s", 8, "explicit", "native", 3, 3, 9, List.of("rounded-up"),
-                            512, 50L));
+                            512, 50L, List.of("route.serve.s", "serve.s")));
         });
         assertThat(plans.forgotten).isEmpty();
 
@@ -136,7 +136,8 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
         @Override
         public PlannedDag plannedDagFor(String pipelineId, ExecutionFence fence) {
             PlannedDag planned = planned();
-            return new PlannedDag(dagFor(pipelineId), planned.shape(), planned.members(), planned.batches());
+            return new PlannedDag(dagFor(pipelineId), planned.shape(), planned.members(), planned.batches(),
+                    planned.vertices());
         }
 
         PlannedDag planned() {
@@ -146,7 +147,8 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
             nodes.put("serve.s", new NodeParallelism("serve.s", 8, NodeParallelism.Origin.EXPLICIT,
                     NodeParallelism.Scope.NATIVE, 3, 3, 9, List.of("rounded-up")));
             return new PlannedDag(new DAG(), new ExecutionShape(3, nodes, Map.of()), List.of("m1", "m2", "m3"),
-                    Map.of("serve.s", new BatchSpec(512, "50ms")));
+                    Map.of("serve.s", new BatchSpec(512, "50ms")),
+                    Map.of("orders_src", List.of("orders_src"), "serve.s", List.of("route.serve.s", "serve.s")));
         }
 
         @Override
