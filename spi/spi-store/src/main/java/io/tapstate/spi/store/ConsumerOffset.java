@@ -21,7 +21,8 @@ import java.util.Map;
  * one's unread changes.
  * {@code cursorWriterToken} fences cursor writes from an earlier reader after a pipeline is reassembled in
  * the same generation; it is internal to the read cursor and is not a pipeline execution identity.
- * The acked position is absent until the pipeline's sink first acks a change.
+ * The chain ack is absent until a capture owner proves a contiguous physical prefix. Table acknowledgements
+ * retain their own ring generation and sequence; a table's sequence never ranks another table's change.
  *
  * <p>The acked position is a pair, and both halves are needed for different reasons. The token is what
  * a read resumes from and the only half a connector understands. The order is the engine's own record of
@@ -64,7 +65,8 @@ public record ConsumerOffset(
         long snapshotEpoch,
         List<String> selectedTables,
         Long selectedTablesEpoch,
-        String cursorWriterToken) {
+        String cursorWriterToken,
+        Map<String, ChainPosition> sinkAckedByTable) {
 
     public ConsumerOffset {
         if (pipelineId == null || pipelineId.isBlank()) {
@@ -95,9 +97,29 @@ public record ConsumerOffset(
         if (selectedTables != null && (selectedTablesEpoch == null || cursorWriterToken == null)) {
             throw new IllegalArgumentException("consumer offset selection requires an epoch and cursor writer token");
         }
+        if (sinkAckedByTable == null || sinkAckedByTable.keySet().stream().anyMatch(table -> table == null || table.isBlank())
+                || sinkAckedByTable.values().stream().anyMatch(position -> position == null || position.order() == null)) {
+            throw new IllegalArgumentException("consumer table acks require named tables and ordered positions");
+        }
         perTableSeq = Collections.unmodifiableMap(new LinkedHashMap<>(perTableSeq));
         snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
         selectedTables = selectedTables == null ? null : List.copyOf(selectedTables);
+        sinkAckedByTable = Collections.unmodifiableMap(new LinkedHashMap<>(sinkAckedByTable));
+    }
+
+    /** Pre-vector constructor for stored consumers and callers that have not confirmed a table yet. */
+    public ConsumerOffset(
+            String pipelineId,
+            Map<String, Long> perTableSeq,
+            ChainPosition sinkAcked,
+            List<String> snapshotCompletedTables,
+            String cdcStartPosition,
+            long snapshotEpoch,
+            List<String> selectedTables,
+            Long selectedTablesEpoch,
+            String cursorWriterToken) {
+        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition,
+                snapshotEpoch, selectedTables, selectedTablesEpoch, cursorWriterToken, Map.of());
     }
 
     /** A consumer whose selected tables were not recorded by its writer. */
@@ -129,5 +151,12 @@ public record ConsumerOffset(
     /** The acked token, or null when the sink has acked nothing yet — what a read resumes from. */
     public String sinkAckedSrcpos() {
         return sinkAcked == null ? null : sinkAcked.token();
+    }
+
+    /** The same consumer after its physical chain prefix is durably confirmed. */
+    public ConsumerOffset withSinkAcked(ChainPosition position) {
+        return new ConsumerOffset(pipelineId, perTableSeq, position, snapshotCompletedTables,
+                cdcStartPosition, snapshotEpoch, selectedTables, selectedTablesEpoch,
+                cursorWriterToken, sinkAckedByTable);
     }
 }

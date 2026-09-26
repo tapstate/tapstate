@@ -73,6 +73,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * rewritten, as a write-back that lets the acks go does.
      */
     static final String PER_TABLE_RING_DONE = "perTableRingDone";
+    static final String SINK_ACKED_BY_TABLE = "sinkAckedByTable";
 
     /**
      * How much of a chain's schema history the record retains, in bytes of stored entries.
@@ -306,7 +307,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             Document key = consumerKey(miningChainId, pipelineId);
             Document prior = consumers.find(session, key)
                     .projection(Projections.include(
-                            "selectedTables", "selectedTablesEpoch", "cursorWriterToken", "perTableSeq"))
+                            "selectedTables", "selectedTablesEpoch", "cursorWriterToken", "perTableSeq",
+                            PER_TABLE_RING_DONE, SINK_ACKED_BY_TABLE))
                     .first();
             List<String> previous = prior == null ? null : selectedTablesFrom(prior, pipelineId);
             Long previousEpoch = prior == null ? null : selectedTablesEpochFrom(prior);
@@ -333,10 +335,32 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                     }
                 }
             }
+            Document retainedDone = new Document();
+            Document retainedAcks = new Document();
+            if (prior != null && Objects.equals(epoch, previousEpoch)) {
+                Object rawDone = prior.get(PER_TABLE_RING_DONE);
+                if (rawDone != null && !(rawDone instanceof Document)) {
+                    throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                            Map.of("id", pipelineId, "field", PER_TABLE_RING_DONE), null);
+                }
+                Document done = (Document) rawDone;
+                Map<String, ChainPosition> acks = tableAcksFrom(prior, pipelineId);
+                for (String table : selected) {
+                    if (done != null && done.containsKey(table)) {
+                        retainedDone.put(table, done.get(table));
+                    }
+                    ChainPosition ack = acks.get(table);
+                    if (ack != null) {
+                        retainedAcks.put(table, positionToDocument(ack));
+                    }
+                }
+            }
             Document update = new Document("$set", new Document("selectedTables", selected)
                     .append("selectedTablesEpoch", epoch)
                     .append("cursorWriterToken", cursorWriterToken)
-                    .append("perTableSeq", retained))
+                    .append("perTableSeq", retained)
+                    .append(PER_TABLE_RING_DONE, retainedDone)
+                    .append(SINK_ACKED_BY_TABLE, retainedAcks))
                     .append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
             consumers.updateOne(session, key, update, new UpdateOptions().upsert(true));
         });
@@ -370,6 +394,42 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     public void advanceSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {
         updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, table, position));
+    }
+
+    @Override
+    public void advanceTableSinkAcked(
+            String miningChainId, String pipelineId, String table, ChainPosition position) {
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        migrateLegacyConsumers(miningChainId, true);
+        writeConsumer(miningChainId, session -> {
+            Document key = consumerKey(miningChainId, pipelineId);
+            Document current = consumers.find(session, key)
+                    .projection(Projections.include(SINK_ACKED_BY_TABLE, "selectedTablesEpoch", "selectedTables"))
+                    .first();
+            if (current != null && current.get("selectedTablesEpoch") instanceof Number generation
+                    && generation.longValue() != position.order().epoch()) {
+                return;
+            }
+            if (current != null && current.get("selectedTables") instanceof List<?> selected
+                    && !selected.contains(table)) {
+                return;
+            }
+            ChainPosition prior = current == null ? null : tableAcksFrom(current, pipelineId).get(table);
+            if (prior != null && prior.order().compareTo(position.order()) >= 0) {
+                return;
+            }
+            Document fields = new Document(SINK_ACKED_BY_TABLE + "." + table,
+                    positionToDocument(position));
+            Document update = new Document("$set", fields)
+                    .append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
+            if (position.order().seq() >= 0) {
+                update.append("$max", new Document(PER_TABLE_RING_DONE + "." + table,
+                        position.order().seq()));
+            }
+            consumers.updateOne(session, key, update, new UpdateOptions().upsert(true));
+        });
     }
 
     @Override
@@ -1057,7 +1117,40 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 readEpoch(document, "snapshotEpoch"),
                 selectedTables,
                 selectedEpoch,
-                cursorWriterToken);
+                cursorWriterToken,
+                tableAcksFrom(document, pipelineId));
+    }
+
+    private static Map<String, ChainPosition> tableAcksFrom(Document document, String pipelineId) {
+        Object raw = document.get(SINK_ACKED_BY_TABLE);
+        if (raw == null) {
+            return Map.of();
+        }
+        if (!(raw instanceof Document tableAcks)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", pipelineId, "field", SINK_ACKED_BY_TABLE), null);
+        }
+        Map<String, ChainPosition> positions = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : tableAcks.entrySet()) {
+            if (!(entry.getValue() instanceof Document value)
+                    || !(value.get("epoch") instanceof Number epoch)
+                    || !(value.get("ringSeq") instanceof Number seq)) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", pipelineId, "field", SINK_ACKED_BY_TABLE + "." + entry.getKey()), null);
+            }
+            positions.put(entry.getKey(), new ChainPosition(
+                    new SourceOrder(epoch.longValue(), seq.longValue()), value.getString("token")));
+        }
+        return Map.copyOf(positions);
+    }
+
+    private static Document positionToDocument(ChainPosition position) {
+        Document value = new Document("epoch", position.order().epoch())
+                .append("ringSeq", position.order().seq());
+        if (position.token() != null) {
+            value.append("token", position.token());
+        }
+        return value;
     }
 
     /** An absent selection belongs to an older consumer and conservatively matches every table. */
@@ -1213,6 +1306,12 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             if (offset.sinkAcked().token() != null) {
                 document.append("sinkAckedSrcpos", offset.sinkAcked().token());
             }
+        }
+        if (!offset.sinkAckedByTable().isEmpty()) {
+            Document tableAcks = new Document();
+            offset.sinkAckedByTable().forEach((table, position) ->
+                    tableAcks.append(table, positionToDocument(position)));
+            document.append(SINK_ACKED_BY_TABLE, tableAcks);
         }
         return document;
     }
