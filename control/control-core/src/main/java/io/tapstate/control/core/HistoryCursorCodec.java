@@ -72,9 +72,17 @@ public final class HistoryCursorCodec {
         public CachePosition {
             Objects.requireNonNull(bucketStart, "bucketStart");
             Objects.requireNonNull(computedAt, "computedAt");
-            if (fragmentIndex < 0) {
-                throw new IllegalArgumentException("a cached fragment index is non-negative");
+            if (fragmentIndex < -1 || (fragmentIndex == -1 && !Instant.EPOCH.equals(computedAt))) {
+                throw new IllegalArgumentException("a cache cursor identifies a fragment or raw fallback bucket");
             }
+        }
+
+        public static CachePosition rawFallback(Instant bucketStart) {
+            return new CachePosition(bucketStart, -1, Instant.EPOCH);
+        }
+
+        public boolean isRawFallback() {
+            return fragmentIndex == -1;
         }
     }
 

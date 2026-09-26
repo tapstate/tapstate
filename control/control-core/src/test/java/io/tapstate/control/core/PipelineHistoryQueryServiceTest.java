@@ -159,6 +159,32 @@ class PipelineHistoryQueryServiceTest {
     }
 
     @Test
+    void aPageEndingInOneRawFallbackKeepsTheNextCachedBucket() {
+        RecordingHistory raw = samplesFor(Duration.ofHours(2));
+        RecordingRollups cache = new RecordingRollups();
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        cache.add(projectRollup(raw, from));
+        cache.add(projectRollup(raw, from.plusSeconds(3_600)));
+        PipelineHistoryQueryService service = cachedService(raw, cache);
+        PipelineHistoryQuery firstRequest = new PipelineHistoryQuery("orders", from,
+                from.plusSeconds(5_400), HistoryResolution.PT30M, 2, List.of("orders"), null);
+
+        PipelineMetricsHistory first = service.query(firstRequest);
+        assertThat(points(first)).hasSize(2);
+        assertThat(first.nextCursor()).isNotNull();
+        assertThat(raw.pageRanges).containsExactly(new TimeRange(from.plusSeconds(1_800),
+                from.plusSeconds(3_600)));
+
+        PipelineMetricsHistory second = service.query(new PipelineHistoryQuery("orders", from,
+                from.plusSeconds(5_400), HistoryResolution.PT30M, 2, List.of("orders"),
+                first.nextCursor()));
+        assertThat(points(second)).singleElement().satisfies(point ->
+                assertThat(point.intervalStart()).isEqualTo(from.plusSeconds(3_600)));
+        assertThat(raw.pageRanges).containsOnly(new TimeRange(from.plusSeconds(1_800),
+                from.plusSeconds(3_600)));
+    }
+
+    @Test
     void cachedProjectionMatchesRawAcrossResetAndGapBoundaries() {
         RecordingHistory raw = new RecordingHistory();
         Instant counting = Instant.parse("2026-09-21T00:00:00Z");

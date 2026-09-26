@@ -207,6 +207,7 @@ public final class PipelineHistoryQueryService {
         List<BucketSlice> slices = new ArrayList<>();
         int fallbackBuckets = 0;
         Instant checkedAt = clock.instant();
+        HistoryCursorCodec.CachePosition resume = frozen.cachePosition();
         for (Instant at = first; at.isBefore(end); at = at.plus(width)) {
             Instant sliceFrom = max(at, frozen.from());
             Instant sliceTo = min(at.plus(width), frozen.to());
@@ -214,7 +215,9 @@ public final class PipelineHistoryQueryService {
             boolean full = at.equals(sliceFrom) && at.plus(width).equals(sliceTo);
             if (!full || bucket == null || !bucket.usableAt(checkedAt)
                     || bucket.inWindowSamples() < 0
-                    || bucket.inWindowSamples() > 0 && bucket.fragments().isEmpty()) {
+                    || bucket.inWindowSamples() > 0 && bucket.fragments().isEmpty()
+                    || resume != null && resume.isRawFallback()
+                            && resume.bucketStart().equals(at)) {
                 bucket = null;
                 fallbackBuckets++;
             }
@@ -223,17 +226,21 @@ public final class PipelineHistoryQueryService {
         if (fallbackBuckets > MAX_RAW_FALLBACK_BUCKETS) {
             return null;
         }
-        HistoryCursorCodec.CachePosition resume = frozen.cachePosition();
         if (resume != null) {
-            Bucket anchor = cached.get(resume.bucketStart());
-            if (anchor == null || !anchor.usableAt(checkedAt)
-                    || !anchor.computedAt().equals(resume.computedAt())
-                    || resume.fragmentIndex() >= anchor.fragments().size()
-                    || !Objects.equals(anchor.fragments().get(resume.fragmentIndex()).resumeAfter(),
-                            frozen.afterKey())
-                    || !Objects.equals(anchor.fragments().get(resume.fragmentIndex()).resumeAt(),
-                            frozen.resumeAt())) {
+            if (resume.bucketStart().isBefore(first) || !resume.bucketStart().isBefore(end)) {
                 return null;
+            }
+            if (!resume.isRawFallback()) {
+                Bucket anchor = cached.get(resume.bucketStart());
+                if (anchor == null || !anchor.usableAt(checkedAt)
+                        || !anchor.computedAt().equals(resume.computedAt())
+                        || resume.fragmentIndex() >= anchor.fragments().size()
+                        || !Objects.equals(anchor.fragments().get(resume.fragmentIndex()).resumeAfter(),
+                                frozen.afterKey())
+                        || !Objects.equals(anchor.fragments().get(resume.fragmentIndex()).resumeAt(),
+                                frozen.resumeAt())) {
+                    return null;
+                }
             }
         }
 
@@ -249,7 +256,7 @@ public final class PipelineHistoryQueryService {
         boolean hasPriorPoint = resume != null;
         if (resume != null) {
             precedingBucket = resume.bucketStart();
-            precedingLocalSegment = cached.get(resume.bucketStart()).fragments()
+            precedingLocalSegment = resume.isRawFallback() ? 0 : cached.get(resume.bucketStart()).fragments()
                     .get(resume.fragmentIndex()).segment();
         }
         for (BucketSlice slice : slices) {
@@ -275,7 +282,11 @@ public final class PipelineHistoryQueryService {
             }
             for (SourcePoint source : projection.points()) {
                 if (!passedAnchor) {
-                    if (source.position() != null && source.position().equals(resume)) {
+                    if (resume.isRawFallback()
+                            ? source.position() == null
+                                    && Objects.equals(source.resumeAfter(), frozen.afterKey())
+                                    && Objects.equals(source.resumeAt(), frozen.resumeAt())
+                            : source.position() != null && source.position().equals(resume)) {
                         passedAnchor = true;
                     }
                     continue;
@@ -303,7 +314,9 @@ public final class PipelineHistoryQueryService {
                         : source.resumeAfter();
                 output.add(new Emitted(source.point(), globalSegment, reason,
                         anchor, source.resumeAt() == null ? source.point().intervalEnd() : source.resumeAt()));
-                positions.add(source.position());
+                positions.add(source.position() == null
+                        ? HistoryCursorCodec.CachePosition.rawFallback(slice.bucketStart())
+                        : source.position());
                 hasPriorPoint = true;
                 precedingBucket = slice.bucketStart();
                 precedingLocalSegment = source.localSegment();
@@ -332,16 +345,16 @@ public final class PipelineHistoryQueryService {
         if (hasMore && !emitted.isEmpty()) {
             Emitted last = emitted.getLast();
             HistoryCursorCodec.CachePosition position = positions.get(binding.limit() - 1);
-            if (position != null) {
+            if (position.isRawFallback()) {
+                next = cursors.issue(binding, frozen.from(), frozen.to(), frozen.cutoff(),
+                        last.resumeAfter(), last.resumeAt(), position);
+            } else {
                 Fragment fragment = cached.get(position.bucketStart()).fragments().get(position.fragmentIndex());
                 if (fragment.resumeAfter() == null || fragment.resumeAt() == null) {
                     return null;
                 }
                 next = cursors.issue(binding, frozen.from(), frozen.to(), frozen.cutoff(),
                         last.resumeAfter(), last.resumeAt(), position);
-            } else {
-                next = cursors.issue(binding, frozen.from(), frozen.to(), frozen.cutoff(),
-                        last.resumeAfter(), last.resumeAt());
             }
         }
         List<Segment> segments = segments(emitted);
