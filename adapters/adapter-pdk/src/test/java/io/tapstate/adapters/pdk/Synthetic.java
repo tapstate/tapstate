@@ -489,6 +489,37 @@ final class Synthetic {
                 source("CtorThrows", "throw new RuntimeException(\"ctor boom\");", ""));
     }
 
+    /**
+     * A source whose batch read hands over {@code rows} rows of table {@code t1}, a batch of the size it is
+     * asked for at a time, and stops when the host stops it. Each batch is added to the count held under
+     * {@code counter} in the system properties once its hand-over returns: the connector runs in a loader of
+     * its own, and the system properties are one thing both sides of that boundary reach, so it is how a case
+     * sees how far the read has got.
+     */
+    static Path largeSource(Path dir, int rows, String counter) {
+        String register = ""
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  java.util.concurrent.atomic.AtomicLong handed ="
+                + "      (java.util.concurrent.atomic.AtomicLong) System.getProperties().get(\"" + counter + "\");"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + "  for (int i = 1; i <= " + rows + " && !stopped; i++) {"
+                + "    Map<String,Object> row = new LinkedHashMap<>(); row.put(\"id\", i);"
+                + "    evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(row));"
+                + "    if (evs.size() == size) {"
+                + "      consumer.accept(evs, null); handed.addAndGet(evs.size()); evs = new ArrayList<>();"
+                + "    }"
+                + "  }"
+                + "  if (!evs.isEmpty() && !stopped) { consumer.accept(evs, null); handed.addAndGet(evs.size()); }"
+                + "});";
+        String discovery = "TapTable table = new TapTable(\"t1\");"
+                + "table.add(new TapField(\"id\", \"int\"));"
+                + "List<TapTable> tables = new ArrayList<>();"
+                + "tables.add(table);"
+                + "s.accept(tables);";
+        return SyntheticJar.compileToJar(dir, "synthetic.LargeSource", source(
+                "LargeSource", "", register, "  private volatile boolean stopped;", discovery, "stopped = true;"));
+    }
+
     /** A connector whose batchRead throws — a connector-side read failure. */
     static Path throwingReadSource(Path dir) {
         String register = "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
@@ -620,6 +651,37 @@ final class Synthetic {
                 + "  consumer.accept(evs, null);"
                 + "});";
         return SyntheticJar.compileToJar(dir, "synthetic.BadRow", source("BadRow", "", register));
+    }
+
+    /**
+     * The same unprojectable row, handed over the way a JDBC connector hands over its rows: from inside the
+     * callback its query runs the result set through, with whatever that callback throws wrapped in an
+     * exception of the connector's own.
+     */
+    static Path wrappingBadRowSource(Path dir) {
+        String register = "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + row("b", 1)
+                + "  evs.add(TapDeleteRecordEvent.create().table(\"t1\").referenceTime(1L).before(b));"
+                + "  try { consumer.accept(evs, null); }"
+                + "  catch (Throwable t) { throw new RuntimeException(\"the query failed\", t); }"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.WrappingBadRow", source("WrappingBadRow", "", register));
+    }
+
+    /**
+     * The same unprojectable row, handed over by a connector that catches whatever its hand-over throws and
+     * reads on -- as one reading on a thread of its own does, keeping the failure for later or dropping it.
+     */
+    static Path swallowingBadRowSource(Path dir) {
+        String register = "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + row("b", 1)
+                + "  evs.add(TapDeleteRecordEvent.create().table(\"t1\").referenceTime(1L).before(b));"
+                + "  try { consumer.accept(evs, null); } catch (Throwable ignored) { }"
+                + "});";
+        return SyntheticJar.compileToJar(
+                dir, "synthetic.SwallowingBadRow", source("SwallowingBadRow", "", register));
     }
 
     /** Records target preparation independently of record delivery. */

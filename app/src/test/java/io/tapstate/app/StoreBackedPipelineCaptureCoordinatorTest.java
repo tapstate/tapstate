@@ -25,12 +25,22 @@ import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.ViewBlock;
+import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.spi.capture.CaptureBatch;
+import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.ConnectionReport;
+import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SnapshotPhase;
@@ -45,15 +55,21 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.StorePort;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+
+import static org.mockito.Mockito.mock;
 
 /**
  * The app-side capture coordinator: how it derives a source run spec from a stored source and the pipeline
@@ -709,6 +725,278 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(generations).containsExactly(1L, 2L);
     }
 
+    // ---- a load read while the pipeline runs ---------------------------------------------------------
+
+    /**
+     * The start comes back with the load still being read, and the table is published to the read face only
+     * once its read is through -- with every row it read, and with the hand-off told the load is over. Here
+     * the source hands over one row and then holds the rest, as a source does while the pipeline behind it
+     * catches up: the start still returns, and it is the only way this pipeline's job could ever be submitted.
+     */
+    @Test
+    void aLoadReadWhileThePipelineRunsIsPublishedOnlyOnceItsTableIsThrough() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_ONLY));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        CountDownLatch rest = new CountDownLatch(1);
+        HeldSource port = new HeldSource(3, rest);
+        CaptureRunUnit unit = new CaptureRunUnit(
+                port, new SrsCoordinator(store.meta()), store.meta(), mock(HazelcastInstance.class));
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, unit::begin, new SrsCoordinator(store.meta()), buffer);
+        String ring = SourceCaptureResolution.of(source).ringName();
+
+        coordinator.startCapture("p");
+
+        assertThat(buffer.snapshotState("p", ring).declared()).as("declared before the job is assembled").isTrue();
+        assertThat(buffer.snapshotState("p", ring).handedOver()).isFalse();
+        assertThat(coordinator.snapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
+
+        rest.countDown();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (coordinator.snapshotProgress("p").byTable().isEmpty()) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("the table was never published once its read was through");
+            }
+            Thread.sleep(20);
+        }
+
+        assertThat(coordinator.snapshotProgress("p").byTable())
+                .containsOnly(entry("orders", new TableSnapshot(3L, null, null)));
+        assertThat(buffer.drain("p", ring)).hasSize(3);
+        assertThat(buffer.snapshotState("p", ring).handedOver()).isTrue();
+        coordinator.stopCapture("p", false);
+    }
+
+    /** A stop reaches a load still being read: the read is abandoned and the source let go of. */
+    @Test
+    void aStopAbandonsALoadStillBeingRead() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_ONLY));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        HeldSource port = new HeldSource(3, new CountDownLatch(1));
+        CaptureRunUnit unit = new CaptureRunUnit(
+                port, new SrsCoordinator(store.meta()), store.meta(), mock(HazelcastInstance.class));
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, unit::begin, new SrsCoordinator(store.meta()), buffer);
+        coordinator.startCapture("p");
+
+        coordinator.stopCapture("p", false);
+
+        assertThat(port.closed).as("the read under way was closed").isTrue();
+        assertThat(coordinator.snapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
+        assertThat(coordinator.captureFailure("p")).as("a stop is not a failure").isEmpty();
+        assertThat(buffer.snapshotState("p", SourceCaptureResolution.of(source).ringName()))
+                .isEqualTo(SnapshotBuffer.SnapshotState.UNDECLARED);
+    }
+
+    /**
+     * A starter that reads its load on the calling thread hands its run back with the load over; each of its
+     * tables is ended and published all the same, whether or not the starter said so itself.
+     */
+    @Test
+    void aRunHandedBackWithItsLoadOverHasEveryTableEndedAndPublished() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = SourceCaptureResolution.of(source).ringName();
+        List<Boolean> declaredAtStart = new ArrayList<>();
+        CaptureStarter starter = (spec, handoff) -> {
+            declaredAtStart.add(buffer.snapshotState("p", ring).declared());
+            handoff.accept(Envelope.read(1L, "orders", Map.of("id", 1L), Map.of()));
+            return new CaptureRun(Optional.empty(), false, 1L, Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                artifactsOnly(artifacts), starter, new SrsCoordinator(new InMemorySrsMetaStore()), buffer);
+
+        coordinator.startCapture("p");
+
+        assertThat(declaredAtStart).containsExactly(true);
+        assertThat(buffer.drain("p", ring)).hasSize(1);
+        assertThat(buffer.snapshotState("p", ring).handedOver()).isTrue();
+        assertThat(coordinator.snapshotProgress("p").byTable())
+                .containsOnly(entry("orders", new TableSnapshot(1L, null, null)));
+    }
+
+    /**
+     * A load that has already failed by the time the start looks at its run is neither ended nor published.
+     * What arrived of it is a prefix of the table, and ending its declaration is what lets the source vertex
+     * take that prefix for the whole load: it moves on to the ring and promises the load's bound, and the sink
+     * records a short table as written. The start is overtaken here on purpose -- it waits for the load to be
+     * over before handing the run back -- which is an order a table too small ever to wait for room, followed
+     * by a read that fails at once, takes on its own.
+     */
+    @Test
+    void aLoadThatHasFailedByTheTimeTheStartLooksIsNeitherEndedNorPublished() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_ONLY));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        IllegalStateException broken = new IllegalStateException("the source broke off after its first row");
+        CaptureRunUnit unit = new CaptureRunUnit(new BrokenOffSource(broken), new SrsCoordinator(store.meta()),
+                store.meta(), mock(HazelcastInstance.class));
+        CaptureStarter overtaken = (spec, handoff) -> {
+            CaptureRun run = unit.begin(spec, handoff);
+            try {
+                assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(interrupted);
+            }
+            return run;
+        };
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, overtaken, new SrsCoordinator(store.meta()), buffer);
+        String ring = SourceCaptureResolution.of(source).ringName();
+
+        coordinator.startCapture("p");
+
+        assertThat(buffer.drain("p", ring)).as("the row that arrived before the read broke off").hasSize(1);
+        assertThat(buffer.snapshotState("p", ring).handedOver())
+                .as("a prefix of the table is not the table's load").isFalse();
+        assertThat(coordinator.snapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
+        assertThat(coordinator.captureFailure("p")).containsSame(broken);
+        coordinator.stopCapture("p", false);
+    }
+
+    /** A source whose read hands over one row and then fails with {@code failure}. */
+    private static final class BrokenOffSource implements CapturePort {
+        private final RuntimeException failure;
+
+        BrokenOffSource(RuntimeException failure) {
+            this.failure = failure;
+        }
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            return new CaptureBatch() {
+                private boolean handed;
+
+                @Override
+                public boolean hasNext() {
+                    if (handed) {
+                        throw failure;
+                    }
+                    return true;
+                }
+
+                @Override
+                public Envelope next() {
+                    handed = true;
+                    return Envelope.read(1L, "orders", Map.of("id", 1L), Map.of());
+                }
+
+                @Override
+                public Optional<SourcePosition> seam() {
+                    return Optional.of(new SourcePosition("seam-0"));
+                }
+
+                @Override
+                public void close() {
+                    // Nothing is held open.
+                }
+            };
+        }
+
+        @Override
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            throw new UnsupportedOperationException("a snapshot-only read opens no tail");
+        }
+
+        @Override
+        public ConnectionReport testConnection(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public DiscoveredSchema discoverSchema(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    /**
+     * A source whose read hands over its first row and then holds the rest until {@code rest} opens -- or
+     * until it is closed, which is what a stop does to it.
+     */
+    private static final class HeldSource implements CapturePort {
+        private final int rows;
+        private final CountDownLatch rest;
+        volatile boolean closed;
+
+        HeldSource(int rows, CountDownLatch rest) {
+            this.rows = rows;
+            this.rest = rest;
+        }
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            return new CaptureBatch() {
+                private int next = 1;
+
+                @Override
+                public boolean hasNext() {
+                    if (next == 2) {
+                        awaitRest();
+                    }
+                    return next <= rows;
+                }
+
+                @Override
+                public Envelope next() {
+                    return Envelope.read(1L, "orders", Map.of("id", (long) next++), Map.of());
+                }
+
+                @Override
+                public Optional<SourcePosition> seam() {
+                    return Optional.of(new SourcePosition("seam-0"));
+                }
+
+                @Override
+                public void close() {
+                    closed = true;
+                }
+            };
+        }
+
+        private void awaitRest() {
+            try {
+                while (!rest.await(20, TimeUnit.MILLISECONDS)) {
+                    if (closed) {
+                        throw new CancellationException("closed while holding the rest");
+                    }
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new CancellationException("interrupted while holding the rest");
+            }
+        }
+
+        @Override
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            throw new UnsupportedOperationException("a snapshot-only read opens no tail");
+        }
+
+        @Override
+        public ConnectionReport testConnection(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public DiscoveredSchema discoverSchema(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
     @Test
     void snapshotProgressReportsTheRowsEachTableLoaded() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
@@ -797,6 +1085,106 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                         .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
             }
         }
+    }
+
+    @Test
+    void aReplacedRunReportsConfirmedRowsWhileAnotherTableIsStillLoading() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
+        artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", false)), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"),
+                        List.of(new SyncElement("sync_1", "orders_src", null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srs = new SrsCoordinator(store.meta());
+        CountDownLatch secondCustomerRead = new CountDownLatch(1);
+        CountDownLatch releaseSecondRead = new CountDownLatch(1);
+        AtomicInteger customerReads = new AtomicInteger();
+        CapturePort source = mock(CapturePort.class);
+        when(source.snapshot(any())).thenAnswer(invocation -> {
+            String table = ((CaptureConfig) invocation.getArgument(0)).streams().getFirst();
+            if (table.equals("orders")) {
+                return snapshotBatch(table, 5, null, null);
+            }
+            int read = customerReads.incrementAndGet();
+            return snapshotBatch(table, read == 1 ? 1 : 2,
+                    read == 1 ? null : releaseSecondRead,
+                    read == 1 ? null : secondCustomerRead);
+        });
+        when(source.cdc(any(), any(), any())).thenReturn(mock(Subscription.class));
+        CaptureRunUnit unit = new CaptureRunUnit(source, srs, store.meta(), mock(HazelcastInstance.class));
+        AtomicReference<CaptureRun> latest = new AtomicReference<>();
+        CaptureStarter starter = (spec, handoff) -> {
+            CaptureRun run = unit.begin(spec, handoff);
+            latest.set(run);
+            return run;
+        };
+
+        StoreBackedPipelineCaptureCoordinator first = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, srs, new SnapshotBuffer());
+        first.startCapture("p");
+        assertThat(latest.get().awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(first.captureFailure("p")).isEmpty();
+        assertThat(first.snapshotProgress("p").byTable().get("orders").rowsDone()).isEqualTo(5L);
+        MiningChainId chain = latest.get().chainId().orElseThrow();
+        store.meta().markSnapshotComplete(chain.value(), "p", "orders");
+        first.stopCapture("p", false);
+
+        StoreBackedPipelineCaptureCoordinator replacement = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, srs, new SnapshotBuffer());
+        try {
+            replacement.startCapture("p");
+            assertThat(secondCustomerRead.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(replacement.runSnapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
+            assertThat(replacement.snapshotProgress("p").byTable())
+                    .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
+            verify(source, times(1)).snapshot(org.mockito.ArgumentMatchers.argThat(
+                    config -> config.streams().equals(List.of("orders"))));
+        } finally {
+            releaseSecondRead.countDown();
+            replacement.stopCapture("p", false);
+        }
+    }
+
+    private static CaptureBatch snapshotBatch(
+            String table, int rows, CountDownLatch release, CountDownLatch entered) {
+        return new CaptureBatch() {
+            private int next = 1;
+
+            @Override
+            public boolean hasNext() {
+                if (release != null) {
+                    entered.countDown();
+                    try {
+                        if (!release.await(10, TimeUnit.SECONDS)) {
+                            throw new AssertionError("the held snapshot was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new CancellationException("the held snapshot was interrupted");
+                    }
+                }
+                return next <= rows;
+            }
+
+            @Override
+            public Envelope next() {
+                return Envelope.read(next, table, Map.of("id", next++), Map.of());
+            }
+
+            @Override
+            public Optional<SourcePosition> seam() {
+                return Optional.of(new SourcePosition("before-load"));
+            }
+
+            @Override
+            public void close() {
+                if (release != null) {
+                    release.countDown();
+                }
+            }
+        };
     }
 
     @Test

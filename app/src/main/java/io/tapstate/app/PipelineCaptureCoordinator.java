@@ -17,6 +17,10 @@ interface PipelineCaptureCoordinator {
     /**
      * Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop.
      *
+     * <p>Returns once every source's load is open, before its rows are read. The rows are read while the job
+     * that takes them runs, into a hand-off that holds a few thousand of them at a time, and the tail follows
+     * each load once it is through; a failure of either is reported by {@link #captureFailure}.
+     *
      * <p>May give the start back with {@link RingNotOpenYet} instead, having opened nothing: a capture it reads
      * is held by another member that has not opened its ring yet. The caller submits nothing for the
      * pipeline and starts it again on a later pass.
@@ -44,10 +48,10 @@ interface PipelineCaptureCoordinator {
     void stopCapture(String pipelineId, boolean purgeState);
 
     /**
-     * The failure a running pipeline's cdc capture died with, or empty while it is healthy. The cdc stream runs
-     * on its own thread feeding the ring the Jet job reads, so a tail that dies leaves the job running over a
-     * quiet ring; this is how the actuator seam surfaces that death for the converge loop to act on. A
-     * coordinator that runs no capture reports none.
+     * The failure a running pipeline's capture died with, or empty while it is healthy. The load and the cdc
+     * stream both run on threads of their own feeding what the Jet job reads, so a read that dies leaves the
+     * job running over a quiet hand-off or ring; this is how the actuator seam surfaces that death for the
+     * converge loop to act on. A coordinator that runs no capture reports none.
      */
     default Optional<Throwable> captureFailure(String pipelineId) {
         return Optional.empty();
@@ -57,10 +61,10 @@ interface PipelineCaptureCoordinator {
      * Whether every table this pipeline reads has had its initial load confirmed at this pipeline's target.
      *
      * <p>Delivered, not read -- and the two come apart for the whole of the window this question exists for.
-     * A bounded read drains in one blocking pass before the job that carries its rows is even submitted, so
-     * by the time anyone can hold a pipeline part way through its load, every table's read has long since
-     * returned while almost none of what it read has reached the target. A reading taken from the read side
-     * answers yes throughout, which is the same as not asking at all.
+     * A table's read is over once its last row is in the hand-off the job takes it from, which is still ahead
+     * of every step between there and the target; a load held part way through has tables read in full whose
+     * rows have not all reached the target. A reading taken from the read side answers yes for those, which
+     * is the same as not asking at all.
      *
      * <p>It has to be asked because the rows a read produced live nowhere durable until the target confirms
      * them: they reach the source vertex through a member-local hand-off that is consumed once. A job that
@@ -84,9 +88,9 @@ interface PipelineCaptureCoordinator {
      * cannot be read: a pipeline restarted onto a fresh load and one whose count went backwards are the
      * same observation otherwise.
      *
-     * <p>What this reports is the finished load, not a live position in one: a table's bounded snapshot read
-     * drains in one blocking pass, so its row count exists only once that pass returns. Until then the table
-     * is simply absent, which the read face publishes as unavailable rather than as a table at zero rows.
+     * <p>What this reports is each table's finished load, not a live position in one: a table's row count is
+     * published once its read is through, and not while it runs. Until then the table is simply absent, which
+     * the read face publishes as unavailable rather than as a table at zero rows.
      */
     default SnapshotReading snapshotProgress(String pipelineId) {
         return SnapshotReading.NONE;
@@ -107,10 +111,9 @@ interface PipelineCaptureCoordinator {
      * them, and that gap is the only thing distinguishing a pipeline that is keeping up from one whose
      * reading is fine and whose writing has stopped.
      *
-     * <p><strong>A bounded load lands in one step.</strong> Its read drains in one blocking pass before the
-     * pipeline has a job or a registered run at all, so its rows appear here the moment that pass returns
-     * and not while it runs -- the same window {@link #snapshotProgress} is blind through, for the same
-     * reason. What follows the load is counted as it arrives.
+     * <p>A load is counted as it is read, and what follows it as it arrives: the rows appear here while the
+     * load is still running, which is the window {@link #snapshotProgress} leaves a table out of until its
+     * read is through.
      */
     default CaptureReading capturedRows(String pipelineId) {
         return CaptureReading.NONE;

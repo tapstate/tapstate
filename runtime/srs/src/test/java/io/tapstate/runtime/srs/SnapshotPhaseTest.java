@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
@@ -24,6 +25,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -498,6 +500,202 @@ class SnapshotPhaseTest {
         assertThat(trace).isEmpty();
     }
 
+    // ---- a load opened before it is read -----------------------------------------------------------
+
+    /**
+     * Opening settles where the tail joins and records it, and takes no row: the rows are the load itself,
+     * read later by a thread that can wait for room to put them.
+     */
+    @Test
+    void openingRecordsTheSeamAndReadsNoRow() {
+        List<String> trace = new ArrayList<>();
+        RecordingMeta meta = new RecordingMeta(trace);
+        FakeBatch batch = new FakeBatch(List.of(row(1), row(2)), "seam-0");
+        List<Envelope> sink = new ArrayList<>();
+
+        SnapshotPhase.Load load = SnapshotPhase.open(
+                new FakePort(batch), config(), "chain", PIPE, List.of("orders"), 1L, meta);
+
+        assertThat(trace).containsExactly("cdc-start");
+        assertThat(meta.cdcStart).isEqualTo("seam-0");
+        assertThat(load.tailSeam()).isEqualTo("seam-0");
+        assertThat(load.readsAnything()).isTrue();
+        assertThat(batch.closed).as("the first table's read stays open for the load").isFalse();
+
+        assertThat(load.read(sink::add, table -> { })).isEqualTo(2);
+        assertThat(sink).hasSize(2);
+        assertThat(batch.closed).isTrue();
+    }
+
+    /**
+     * Each table is reported loaded once its last row is in and before the next table's first, so a reader
+     * of the rows can tell where one table's load ends.
+     */
+    @Test
+    void eachTableIsReportedLoadedOnceItsLastRowIsIn() {
+        FakePort port = new FakePort(Map.of(
+                "orders", new FakeBatch(List.of(row("orders", 1), row("orders", 2)), "seam-0"),
+                "customers", new FakeBatch(List.of(row("customers", 3)), "seam-1")));
+        List<String> seen = new ArrayList<>();
+
+        SnapshotPhase.Load load = SnapshotPhase.open(
+                port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+        load.read(event -> seen.add("row:" + event.src()), table -> seen.add("loaded:" + table));
+
+        assertThat(seen).containsExactly(
+                "row:orders", "row:orders", "loaded:orders", "row:customers", "loaded:customers");
+    }
+
+    /**
+     * A table this pipeline has already written owes no load, and is reported with no rows before it -- a
+     * reader waiting to hear it is through would otherwise wait for ever.
+     */
+    @Test
+    void aTableOwedNothingIsReportedLoadedWithNoRows() {
+        SrsMeta partly = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"), "seam-0", 1L)),
+                List.of(), null, 1L);
+        FakePort port = new FakePort(Map.of("customers", new FakeBatch(List.of(row("customers", 3)), "seam-1")));
+        List<String> seen = new ArrayList<>();
+
+        SnapshotPhase.Load load = SnapshotPhase.open(
+                port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"), 1L,
+                new RecordingMeta(new ArrayList<>(), partly));
+        load.read(event -> seen.add("row:" + event.src()), table -> seen.add("loaded:" + table));
+
+        assertThat(port.asked).containsExactly(List.of("customers"));
+        assertThat(seen).containsExactly("row:customers", "loaded:customers", "loaded:orders");
+    }
+
+    @Test
+    void aLoadOwingNothingReadsNothingAndReportsEveryTable() {
+        SrsMeta written = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders", "customers"), "seam-0", 1L)),
+                List.of(), null, 1L);
+        FakePort port = new FakePort(Map.of());
+        List<String> loaded = new ArrayList<>();
+
+        SnapshotPhase.Load load = SnapshotPhase.open(
+                port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"), 1L,
+                new RecordingMeta(new ArrayList<>(), written));
+
+        assertThat(load.readsAnything()).isFalse();
+        assertThat(load.tailSeam()).isNull();
+        assertThat(load.read(e -> { }, loaded::add)).isZero();
+        assertThat(loaded).containsExactly("orders", "customers");
+        assertThat(port.asked).isEmpty();
+    }
+
+    /**
+     * A load abandoned while it is read ends as abandoned and says nothing more: a table whose read was cut
+     * short is not a table whose rows were all handed over.
+     */
+    @Test
+    void aLoadClosedWhileItIsReadEndsAbandonedAndReportsNoFurtherTable() {
+        FakeBatch batch = new FakeBatch(List.of(row(1), row(2), row(3)), "seam-0");
+        SnapshotPhase.Load load = SnapshotPhase.open(
+                new FakePort(batch), config(), "chain", PIPE, List.of("orders"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+        List<String> loaded = new ArrayList<>();
+
+        assertThatThrownBy(() -> load.read(event -> load.close(), loaded::add))
+                .isInstanceOf(CancellationException.class);
+
+        assertThat(loaded).isEmpty();
+        assertThat(batch.closed).isTrue();
+    }
+
+    @Test
+    void aLoadClosedBeforeItIsReadClosesTheReadItHadOpenedAndReadsNothing() {
+        FakeBatch batch = new FakeBatch(List.of(row(1)), "seam-0");
+        SnapshotPhase.Load load = SnapshotPhase.open(
+                new FakePort(batch), config(), "chain", PIPE, List.of("orders"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+
+        load.close();
+
+        assertThat(batch.closed).isTrue();
+        assertThatThrownBy(() -> load.read(e -> { }, t -> { })).isInstanceOf(CancellationException.class);
+    }
+
+    /** Abandoned between one table and the next, the next table's read is closed as soon as it opens. */
+    @Test
+    void aTableOpenedAsTheLoadIsAbandonedIsClosedAndNotRead() {
+        FakeBatch orders = new FakeBatch(List.of(row("orders", 1)), "seam-0");
+        FakeBatch customers = new FakeBatch(List.of(row("customers", 2)), "seam-1");
+        SnapshotPhase.Load[] opened = new SnapshotPhase.Load[1];
+        FakePort port = new FakePort(Map.of("orders", orders, "customers", customers)) {
+            @Override
+            public CaptureBatch snapshot(CaptureConfig config) {
+                CaptureBatch batch = super.snapshot(config);
+                if (config.streams().equals(List.of("customers"))) {
+                    opened[0].close();
+                }
+                return batch;
+            }
+        };
+        List<Envelope> sink = new ArrayList<>();
+        opened[0] = SnapshotPhase.open(
+                port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+
+        assertThatThrownBy(() -> opened[0].read(sink::add, t -> { })).isInstanceOf(CancellationException.class);
+
+        assertThat(sink).extracting(Envelope::src).containsExactly("orders");
+        assertThat(customers.closed).isTrue();
+    }
+
+    /** Abandoned once a table is through, the load opens no read of the next one: a read is a connection. */
+    @Test
+    void aLoadAbandonedBetweenTablesOpensNoFurtherRead() {
+        FakePort port = new FakePort(Map.of(
+                "orders", new FakeBatch(List.of(row("orders", 1)), "seam-0"),
+                "customers", new FakeBatch(List.of(row("customers", 2)), "seam-1")));
+        SnapshotPhase.Load load = SnapshotPhase.open(
+                port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+
+        assertThatThrownBy(() -> load.read(e -> { }, table -> load.close()))
+                .isInstanceOf(CancellationException.class);
+
+        assertThat(port.asked).containsExactly(List.of("orders"));
+    }
+
+    @Test
+    void aLaterTableReportingNoSeamStopsTheLoadAfterTheTablesBeforeIt() {
+        FakeBatch customers = new FakeBatch(List.of(row("customers", 2)));
+        FakePort port = new FakePort(Map.of(
+                "orders", new FakeBatch(List.of(row("orders", 1)), "seam-0"), "customers", customers));
+        List<String> loaded = new ArrayList<>();
+
+        SnapshotPhase.Load load = SnapshotPhase.open(
+                port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"), 1L,
+                new RecordingMeta(new ArrayList<>()));
+
+        assertThatThrownBy(() -> load.read(e -> { }, loaded::add))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code())
+                        .isEqualTo(CaptureError.SNAPSHOT_REPORTS_NO_SEAM));
+        assertThat(loaded).containsExactly("orders");
+        assertThat(customers.closed).isTrue();
+    }
+
+    /** One read covers every table of a chainless load, so none of them is through before its last row. */
+    @Test
+    void aChainlessLoadReportsEveryTableOnceItsOneReadIsThrough() {
+        FakeBatch batch = new FakeBatch(List.of(row("orders", 1), row("customers", 2)), null);
+        List<String> seen = new ArrayList<>();
+
+        SnapshotPhase.Load load = SnapshotPhase.openChainless(new FakePort(batch), multiTableConfig(), 3L);
+        long rows = load.read(event -> seen.add("row:" + event.src()), table -> seen.add("loaded:" + table));
+
+        assertThat(rows).isEqualTo(2);
+        assertThat(seen).containsExactly("row:orders", "row:customers", "loaded:orders", "loaded:customers");
+        assertThat(load.readsAnything()).isTrue();
+        assertThat(load.tailSeam()).isNull();
+    }
+
     /** A bounded snapshot batch over a fixed list of events; records whether it was closed. */
     private static final class FakeBatch implements CaptureBatch {
         private final Iterator<Envelope> events;
@@ -541,7 +739,7 @@ class SnapshotPhaseTest {
      * it was asked for. Either one fixed batch whatever the selection, or one batch per stream name; the
      * streaming and discovery reads are unused here.
      */
-    private static final class FakePort implements CapturePort {
+    private static class FakePort implements CapturePort {
         private final FakeBatch batch;
         private final Map<String, FakeBatch> byTable;
         final List<List<String>> asked = new ArrayList<>();

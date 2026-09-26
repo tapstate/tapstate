@@ -1,19 +1,25 @@
 package io.tapstate.runtime.srs;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.event.Envelope;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -215,5 +221,178 @@ class SnapshotBufferTest {
 
         assertThat(rings).containsOnlyKeys(new SnapshotBuffer.BufferKey(otherPipeline, sharedRing));
         assertThat(buffer.drain(otherPipeline, sharedRing)).containsExactly(neighbour);
+    }
+
+    // ---- a declared load ----------------------------------------------------------------------------
+
+    /**
+     * The bound that keeps a load of any size to a few thousand rows on the heap: once a declared load has
+     * its capacity of rows waiting, the next append waits until the vertex has taken some, and then goes in.
+     */
+    @Test
+    void aDeclaredLoadWaitsForRoomOnceItsCapacityOfRowsIsWaiting() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer(2);
+        String ring = "srs.chain.bounded";
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, row("orders", 1));
+        buffer.append(PIPELINE, ring, row("orders", 2));
+
+        try (var capture = Executors.newSingleThreadExecutor()) {
+            Future<?> third = capture.submit(() -> buffer.append(PIPELINE, ring, row("orders", 3)));
+            assertThatThrownBy(() -> third.get(300, TimeUnit.MILLISECONDS))
+                    .as("a third row of the load waits while two of it are waiting")
+                    .isInstanceOf(TimeoutException.class);
+
+            assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(1L, 2L);
+            third.get(10, TimeUnit.SECONDS);
+            assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(3L);
+        }
+    }
+
+    /**
+     * A change a ring-less tail hands over behind the load is not part of the load and never waits: the
+     * load's one row is still waiting here, and at a capacity of one a row of the load would.
+     */
+    @Test
+    void whatIsAppendedAfterTheLoadEndedNeverWaits() {
+        SnapshotBuffer buffer = new SnapshotBuffer(1);
+        String ring = "srs.chain.after";
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, row("orders", 1));
+        buffer.endSnapshot(PIPELINE, ring);
+
+        buffer.append(PIPELINE, ring, row("orders", 2));
+        buffer.append(PIPELINE, ring, row("orders", 3));
+
+        assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(1L, 2L, 3L);
+    }
+
+    @Test
+    void aCoordinateNobodyDeclaredIsNotHeldToTheCapacity() {
+        SnapshotBuffer buffer = new SnapshotBuffer(1);
+        String ring = "srs.chain.undeclared";
+        buffer.append(PIPELINE, ring, row("orders", 1));
+        buffer.append(PIPELINE, ring, row("orders", 2));
+
+        assertThat(buffer.drain(PIPELINE, ring)).hasSize(2);
+        assertThat(buffer.snapshotState(PIPELINE, ring)).isEqualTo(SnapshotBuffer.SnapshotState.UNDECLARED);
+    }
+
+    /** A stop has to be able to end a load whose reader is parked waiting for a vertex that is gone. */
+    @Test
+    void releasingThePipelineAbandonsALoadWaitingForRoom() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer(1);
+        String ring = "srs.chain.released";
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, row("orders", 1));
+
+        try (var capture = Executors.newSingleThreadExecutor()) {
+            Future<?> waiting = capture.submit(() -> buffer.append(PIPELINE, ring, row("orders", 2)));
+            assertThatThrownBy(() -> waiting.get(200, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+
+            buffer.release(PIPELINE);
+
+            assertThatThrownBy(() -> waiting.get(10, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(CancellationException.class);
+        }
+        assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
+        assertThat(buffer.snapshotState(PIPELINE, ring)).isEqualTo(SnapshotBuffer.SnapshotState.UNDECLARED);
+    }
+
+    @Test
+    void anInterruptedWaitAbandonsTheRowAndKeepsTheInterrupt() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer(1);
+        String ring = "srs.chain.interrupted";
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, row("orders", 1));
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        AtomicBoolean interruptKept = new AtomicBoolean();
+        Thread capture = new Thread(() -> {
+            try {
+                buffer.append(PIPELINE, ring, row("orders", 2));
+            } catch (RuntimeException failure) {
+                thrown.set(failure);
+                interruptKept.set(Thread.currentThread().isInterrupted());
+            }
+        });
+        capture.start();
+        awaitWaiting(capture);
+
+        capture.interrupt();
+        capture.join(10_000);
+
+        assertThat(thrown.get()).isInstanceOf(CancellationException.class);
+        assertThat(interruptKept).as("the interrupt is left for whoever runs the thread next").isTrue();
+        assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(1L);
+    }
+
+    /**
+     * Handed over means ended with none of it left waiting. Ended with rows still waiting is not, and neither
+     * is every row taken while more may follow -- the two states an empty drain cannot tell apart.
+     */
+    @Test
+    void aLoadIsHandedOverOnceItHasEndedAndEveryRowOfItHasBeenTaken() {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = "srs.chain.state";
+        buffer.declareSnapshot(PIPELINE, ring);
+        assertThat(buffer.snapshotState(PIPELINE, ring)).isEqualTo(new SnapshotBuffer.SnapshotState(true, false, false));
+
+        buffer.append(PIPELINE, ring, row("orders", 1));
+        buffer.drain(PIPELINE, ring);
+        assertThat(buffer.snapshotState(PIPELINE, ring))
+                .as("every row so far taken, and the load not yet over")
+                .isEqualTo(new SnapshotBuffer.SnapshotState(true, true, false));
+
+        buffer.append(PIPELINE, ring, row("orders", 2));
+        buffer.endSnapshot(PIPELINE, ring);
+        assertThat(buffer.snapshotState(PIPELINE, ring))
+                .as("over, with its last row still waiting")
+                .isEqualTo(new SnapshotBuffer.SnapshotState(true, true, false));
+
+        buffer.drain(PIPELINE, ring);
+        assertThat(buffer.snapshotState(PIPELINE, ring)).isEqualTo(new SnapshotBuffer.SnapshotState(true, true, true));
+    }
+
+    /**
+     * A vertex starting after an empty load was over, and a ring-less tail had handed a change over behind
+     * it, has nothing of the load to vouch for or against: taking only that change does not begin the load.
+     */
+    @Test
+    void takingOnlyWhatFollowedTheLoadDoesNotCountAsBeginningIt() {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = "srs.chain.empty-load";
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.endSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, row("orders", 9));
+
+        assertThat(buffer.drain(PIPELINE, ring)).hasSize(1);
+        assertThat(buffer.snapshotState(PIPELINE, ring)).isEqualTo(new SnapshotBuffer.SnapshotState(true, false, true));
+    }
+
+    @Test
+    void endingALoadNobodyDeclaredDoesNothing() {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.endSnapshot(PIPELINE, "srs.chain.never");
+
+        assertThat(buffer.snapshotState(PIPELINE, "srs.chain.never"))
+                .isEqualTo(SnapshotBuffer.SnapshotState.UNDECLARED);
+    }
+
+    @Test
+    void aHandOffHoldsAtLeastOneRow() {
+        assertThatThrownBy(() -> new SnapshotBuffer(0)).isInstanceOf(IllegalArgumentException.class);
+        assertThat(new SnapshotBuffer().capacity()).isEqualTo(SnapshotBuffer.DEFAULT_CAPACITY);
+    }
+
+    /** Waits until {@code thread} is parked, so what follows is sure to reach it while it waits. */
+    private static void awaitWaiting(Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (thread.getState() != Thread.State.WAITING) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("the append never waited: " + thread.getState());
+            }
+            Thread.sleep(10);
+        }
     }
 }
