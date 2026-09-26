@@ -38,7 +38,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
 
     @Override
     public synchronized List<ConsumerOffset> consumerOffsets(String miningChainId) {
-        return require(miningChainId).consumerOffsets().stream().map(consumer ->
+        return read(miningChainId).map(SrsMeta::consumerOffsets).orElse(List.of()).stream().map(consumer ->
                 new ConsumerOffset(consumer.pipelineId(), consumer.perTableSeq(), consumer.sinkAcked(),
                         consumer.snapshotCompletedTables(), consumer.cdcStartPosition(), consumer.snapshotEpoch(),
                         consumer.selectedTables(), consumer.selectedTablesEpoch(), consumer.cursorWriterToken(),
