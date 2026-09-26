@@ -28,6 +28,7 @@ active_run="$(awk '
     }
     in_run { in_run = 0 }
 ' "$workflow")"
+# shellcheck disable=SC2016
 if [ -z "$gate" ] && grep -Fq 'gate="$(git log --diff-filter=A --format=%H "$base"..HEAD -- "$marker")"' <<< "$active_run"; then
     echo "FAIL - $base already contains $marker, but the upgrade lane still searches for its adding commit after $base." >&2
     echo "expected exactly one commit adding $marker since $base, found: none." >&2
