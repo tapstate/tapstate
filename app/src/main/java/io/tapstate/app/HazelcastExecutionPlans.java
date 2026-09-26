@@ -56,7 +56,18 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
         if (pipelineIds.isEmpty()) {
             return Map.of();
         }
-        return new LinkedHashMap<>(plans().getAll(new HashSet<>(pipelineIds)));
+        try {
+            return new LinkedHashMap<>(plans().getAll(new HashSet<>(pipelineIds)));
+        } catch (RuntimeException failed) {
+            if (!HazelcastLivePipelineRuns.theClusterIsChanging(failed)) {
+                throw failed;
+            }
+            // Asked while the engine is down, or while the cluster changes under the read: a plan only a running
+            // engine holds is not known here now. The read faces say so by leaving it out, not by failing the part
+            // of their answer the store holds along with it. Writing a plan is not let off - the start writing one
+            // has no engine to submit to either.
+            return Map.of();
+        }
     }
 
     private IMap<String, ExecutionPlan> plans() {

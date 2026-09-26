@@ -165,7 +165,7 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
      * as it came: a failure filed under a code that says the cluster is merely busy is one nobody goes
      * looking for.
      */
-    private static boolean theClusterIsChanging(Throwable failed) {
+    static boolean theClusterIsChanging(Throwable failed) {
         Throwable cause = failed;
         for (int depth = 0; cause != null && depth < 16; depth++, cause = cause.getCause()) {
             if (cause instanceof HazelcastInstanceNotActiveException || cause instanceof RetryableException) {

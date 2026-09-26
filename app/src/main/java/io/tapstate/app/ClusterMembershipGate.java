@@ -55,6 +55,22 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
                 .toList();
     }
 
+    /**
+     * {@link #dataMembers}, or none while {@code member}'s engine cannot be asked - down, or its cluster changing under
+     * the read. For the read faces, which leave out what only a running engine knows rather than failing the part of
+     * their answer the store holds; a run being planned asks {@link #dataMembers}, and fails with it.
+     */
+    static List<String> dataMembersIfReadable(HazelcastInstance member) {
+        try {
+            return dataMembers(member);
+        } catch (RuntimeException failed) {
+            if (!HazelcastLivePipelineRuns.theClusterIsChanging(failed)) {
+                throw failed;
+            }
+            return List.of();
+        }
+    }
+
     @Override
     public boolean apply(Collection<Member> members) {
         return eligible(rememberVisible(nodeIds(members)));

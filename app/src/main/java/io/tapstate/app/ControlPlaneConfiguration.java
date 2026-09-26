@@ -242,9 +242,12 @@ class ControlPlaneConfiguration {
         return engine == null ? ExecutionPlans.NONE : new HazelcastExecutionPlans(engine);
     }
 
-    /** The members a run would take part on now, by stable id; none on a server that is no cluster member. */
+    /**
+     * The members a run would take part on now, by stable id; none on a server that is no cluster member, and none
+     * while this member's engine cannot be asked.
+     */
     private static Supplier<List<String>> dataMembers(HazelcastInstance engine) {
-        return engine == null ? List::of : () -> ClusterMembershipGate.dataMembers(engine);
+        return engine == null ? List::of : () -> ClusterMembershipGate.dataMembersIfReadable(engine);
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----
