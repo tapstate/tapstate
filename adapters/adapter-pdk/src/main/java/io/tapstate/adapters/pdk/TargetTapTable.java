@@ -33,17 +33,21 @@ final class TargetTapTable {
         int keyPos = 1;
         for (TargetField field : target.fields()) {
             TapField column = new TapField(field.name(), field.type());
+            var number = field.numericType();
+            if (field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL && number == null) {
+                number = PdkTypeMapping.declaredDecimal(field.type());
+            }
             if (field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL
-                    && (field.numericType() == null || field.numericType().precision() == null
-                    || field.numericType().scale() == null || field.numericType().minValue() == null
-                    || field.numericType().maxValue() == null)) {
+                    && (number == null || number.precision() == null
+                    || number.scale() == null || number.minValue() == null
+                    || number.maxValue() == null)) {
                 throw new IllegalArgumentException("decimal field '" + field.name() + "' in table '" + target.name()
                         + "' requires declared precision, scale and bounds; rediscover the source schema. "
                         + "Computed decimal columns have no declared numeric metadata");
             }
             if (field.inferredType() != null) {
-                var restored = PdkTypeMapping.targetType(field.inferredType(), field.numericType(), field.stringType());
-                if (field.numericType() != null && restored instanceof io.tapdata.entity.schema.type.TapNumber
+                var restored = PdkTypeMapping.targetType(field.inferredType(), number, field.stringType());
+                if (number != null && restored instanceof io.tapdata.entity.schema.type.TapNumber
                         && PdkTypeMapping.resolve(restored).type() != field.inferredType()) {
                     throw new IllegalArgumentException("numeric metadata for field '" + field.name() + "' in table '"
                             + target.name() + "' disagrees with its inferred type " + field.inferredType()

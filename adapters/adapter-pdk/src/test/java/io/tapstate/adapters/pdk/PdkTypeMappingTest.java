@@ -2,8 +2,11 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.TapTable;
+import io.tapdata.entity.schema.type.TapNumber;
 import io.tapdata.entity.schema.type.TapRaw;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.spi.sink.TargetField;
+import io.tapstate.spi.sink.TargetTable;
 
 import io.tapdata.entity.schema.type.TapType;
 import java.util.Set;
@@ -48,6 +51,29 @@ class PdkTypeMappingTest {
         assertThat(PdkTypeMapping.of(amount.getTapType()))
                 .as("a decimal column carries a scale no binary floating point type holds losslessly")
                 .isEqualTo(TapstateType.DECIMAL);
+    }
+
+    @Test
+    void aPreviousReleaseDecimalTokenRestoresTheSourceConnectorsExactRange() {
+        TapNumber declared = (TapNumber) filled(DECIMAL_SPEC, "amount", "decimal(10,2)").getTapType();
+        TapTable target = TargetTapTable.build(new TargetTable("order_state", List.of(
+                new TargetField("amount", "decimal(10,2)", false, TapstateType.DECIMAL))));
+        TapNumber restored = (TapNumber) target.getNameFieldMap().get("amount").getTapType();
+
+        assertThat(restored.getFixed()).isEqualTo(declared.getFixed());
+        assertThat(restored.getPrecision()).isEqualTo(declared.getPrecision());
+        assertThat(restored.getScale()).isEqualTo(declared.getScale());
+        assertThat(restored.getMinValue()).isEqualByComparingTo(declared.getMinValue());
+        assertThat(restored.getMaxValue()).isEqualByComparingTo(declared.getMaxValue());
+        assertThat(PdkTypeMapping.numericType(restored)).isEqualTo(PdkTypeMapping.numericType(declared));
+        ConnectorRef ref = new ConnectorRef(List.of(Synthetic.discoverableSource(dir)),
+                "synthetic.Discoverable", "2.0.8", null, DECIMAL_SPEC);
+        try (PdkConnector connector = PdkConnector.open("demo", ref, Map.of())) {
+            connector.resolveTargetTypes(target);
+            assertThat(target.getNameFieldMap().get("amount").getDataType()).isEqualTo("decimal(10,2)");
+        }
+        assertThat(PdkTypeMapping.declaredDecimal("decimal(10,2) unsigned")).isNull();
+        assertThat(PdkTypeMapping.declaredDecimal("decimal(10,11)")).isNull();
     }
 
     /** The mysql connector's own declaration for its widest integer column type, verbatim from its spec. */
