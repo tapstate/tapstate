@@ -604,14 +604,37 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
         Objects.requireNonNull(table, "table");
-        // Read, then write only when there is nothing: a pipeline arrives on a ring from one member at a
-        // time, so nothing races this, and a raise here over a place the pipeline already has would carry it
-        // past changes it has not received.
-        if (ringDoneThrough(miningChainId, pipelineId).containsKey(table)) {
-            return;
+        // Older callers have no epoch to prove. Their marker may only enter an unselected legacy cursor,
+        // which the generation-scoped trimmer conservatively refuses to use.
+        migrateLegacyConsumers(miningChainId, true);
+        writeConsumer(miningChainId, session -> consumers.updateOne(session,
+                new Document(consumerKey(miningChainId, pipelineId))
+                        .append("selectedTablesEpoch", new Document("$exists", false))
+                        .append(PER_TABLE_RING_DONE + "." + table, new Document("$exists", false)),
+                new Document("$set", new Document(PER_TABLE_RING_DONE + "." + table, seq))));
+    }
+
+    @Override
+    public void startRingAfter(
+            String miningChainId, String pipelineId, String table, long epoch, long seq) {
+        Objects.requireNonNull(table, "table");
+        if (epoch < 1 || seq < -1) {
+            throw new IllegalArgumentException("ring arrival needs a positive epoch and valid sequence");
         }
-        updateConsumer(miningChainId, pipelineId,
-                new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)));
+        migrateLegacyConsumers(miningChainId, true);
+        writeConsumer(miningChainId, session -> {
+            Document root = collection.find(session, new Document("_id", miningChainId))
+                    .projection(Projections.include("epoch")).first();
+            if (root == null || readEpoch(root, "epoch") != epoch) {
+                return;
+            }
+            Document filter = new Document(consumerKey(miningChainId, pipelineId))
+                    .append("selectedTablesEpoch", epoch)
+                    .append("selectedTables", table)
+                    .append(PER_TABLE_RING_DONE + "." + table, new Document("$exists", false));
+            consumers.updateOne(session, filter,
+                    new Document("$set", new Document(PER_TABLE_RING_DONE + "." + table, seq)));
+        });
     }
 
     @Override
@@ -620,15 +643,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Document consumer = StoreIo.call(() -> consumers.find(consumerKey(miningChainId, pipelineId))
                 .projection(Projections.include(PER_TABLE_RING_DONE)).first());
-        Map<String, Long> seqs = new LinkedHashMap<>();
-        if (consumer != null && consumer.get(PER_TABLE_RING_DONE) instanceof Document perTable) {
-            for (Map.Entry<String, Object> entry : perTable.entrySet()) {
-                if (entry.getValue() instanceof Number seq) {
-                    seqs.put(entry.getKey(), seq.longValue());
-                }
-            }
-        }
-        return Map.copyOf(seqs);
+        return consumer == null ? Map.of() : ringDoneFrom(consumer, pipelineId);
     }
 
     /**
@@ -1287,7 +1302,29 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 selectedTables,
                 selectedEpoch,
                 cursorWriterToken,
-                tableAcksFrom(document, pipelineId));
+                tableAcksFrom(document, pipelineId),
+                ringDoneFrom(document, pipelineId));
+    }
+
+    private static Map<String, Long> ringDoneFrom(Document document, String pipelineId) {
+        Object raw = document.get(PER_TABLE_RING_DONE);
+        if (raw == null) {
+            return Map.of();
+        }
+        if (!(raw instanceof Document perTable)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", pipelineId, "field", PER_TABLE_RING_DONE), null);
+        }
+        Map<String, Long> seqs = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : perTable.entrySet()) {
+            if (entry.getKey() == null || entry.getKey().isBlank()
+                    || !(entry.getValue() instanceof Number seq) || seq.longValue() < -1L) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", pipelineId, "field", PER_TABLE_RING_DONE + "." + entry.getKey()), null);
+            }
+            seqs.put(entry.getKey(), seq.longValue());
+        }
+        return Map.copyOf(seqs);
     }
 
     private static Map<String, ChainPosition> tableAcksFrom(Document document, String pipelineId) {
@@ -1481,6 +1518,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             offset.sinkAckedByTable().forEach((table, position) ->
                     tableAcks.append(table, positionToDocument(position)));
             document.append(SINK_ACKED_BY_TABLE, tableAcks);
+        }
+        if (!offset.ringDoneThrough().isEmpty()) {
+            document.append(PER_TABLE_RING_DONE, new Document(offset.ringDoneThrough()));
         }
         return document;
     }

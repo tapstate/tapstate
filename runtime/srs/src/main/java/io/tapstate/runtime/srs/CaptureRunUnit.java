@@ -206,7 +206,7 @@ public final class CaptureRunUnit {
             // placed by that start instead, when its reader opens. A pipeline coming back keeps the place it
             // had -- see SrsMetaStore#startRingAfter.
             if (plan.sharedRing() && (plan.snapshot() || spec.startFrom() instanceof StartFrom.Latest)) {
-                markWhereThisPipelineArrives(chainId.value(), spec.pipelineId(), tables);
+                markWhereThisPipelineArrives(chainId.value(), spec.pipelineId(), epoch, tables);
             }
 
             // Opened before the load, not with the tail: the load's rows are this run's too, and an
@@ -359,22 +359,27 @@ public final class CaptureRunUnit {
         Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
         SrsLogStore log = hz.getUserContext().get(SRS_LOG_USER_CONTEXT_KEY) instanceof SrsLogStore
                 bound ? bound : null;
-        // One scalar ACK cannot identify which table's ring to cut on a multi-table chain.
-        boolean cuttable = log != null && physicalTables.size() == 1;
+        PerTableLogTrimmer trimmer = log == null ? null : new PerTableLogTrimmer(consumers, log, epoch);
         Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
         for (String table : physicalTables) {
             String ringName = SrsRingbuffer.ringName(cid, table);
             SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ringName)));
             CdcChain chain = new CdcChain(
                     gate, meta, cid, epoch, spec.schemaVer(), spec.captureFence());
-            LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
+            LongConsumer trim = trimmer == null ? seq -> { } : seq -> {
+                trimmer.observed(table, ringName, seq);
+                if (physicalTables.size() == 1) {
+                    trimmer.trim();
+                }
+            };
             routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
         }
         CaptureStart minerStart = tailStart(
                 meta, cid, spec.pipelineId(), ownSeam, CaptureStart.present());
         refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
         PhysicalSourcePrefix prefix = physicalTables.size() > 1
-                ? new PhysicalSourcePrefix(meta, cid, epoch, health) : null;
+                ? new PhysicalSourcePrefix(meta, cid, epoch, health,
+                        trimmer == null ? offsets -> { } : trimmer::trim) : null;
         if (current != null && current.epoch() == epoch
                 && !current.tables().equals(physicalTables) && !replacing) {
             if (prefix != null) {
@@ -843,10 +848,10 @@ public final class CaptureRunUnit {
      * place for every member that reads it. A refusal while the cluster is still forming surfaces as an
      * uncoded failure of this start, which the next pass tries again.
      */
-    private void markWhereThisPipelineArrives(String chainId, String pipelineId, List<String> tables) {
+    private void markWhereThisPipelineArrives(String chainId, String pipelineId, long epoch, List<String> tables) {
         for (String table : tables) {
             SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, table)));
-            meta.startRingAfter(chainId, pipelineId, table, ring.tailSequence());
+            meta.startRingAfter(chainId, pipelineId, table, epoch, ring.tailSequence());
         }
     }
 

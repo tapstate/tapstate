@@ -23,6 +23,8 @@ import java.util.Map;
  * the same generation; it is internal to the read cursor and is not a pipeline execution identity.
  * The chain ack is absent until a capture owner proves a contiguous physical prefix. Table acknowledgements
  * retain their own ring generation and sequence; a table's sequence never ranks another table's change.
+ * {@code ringDoneThrough} exposes the per-table completion stored alongside those acknowledgements and
+ * arrival markers, so a cut can use only consumers selecting that table in the current ring generation.
  *
  * <p>The acked position is a pair, and both halves are needed for different reasons. The token is what
  * a read resumes from and the only half a connector understands. The order is the engine's own record of
@@ -66,7 +68,8 @@ public record ConsumerOffset(
         List<String> selectedTables,
         Long selectedTablesEpoch,
         String cursorWriterToken,
-        Map<String, ChainPosition> sinkAckedByTable) {
+        Map<String, ChainPosition> sinkAckedByTable,
+        Map<String, Long> ringDoneThrough) {
 
     public ConsumerOffset {
         if (pipelineId == null || pipelineId.isBlank()) {
@@ -101,10 +104,25 @@ public record ConsumerOffset(
                 || sinkAckedByTable.values().stream().anyMatch(position -> position == null || position.order() == null)) {
             throw new IllegalArgumentException("consumer table acks require named tables and ordered positions");
         }
+        if (ringDoneThrough == null || ringDoneThrough.keySet().stream().anyMatch(table -> table == null || table.isBlank())
+                || ringDoneThrough.values().stream().anyMatch(seq -> seq == null || seq < -1L)) {
+            throw new IllegalArgumentException("consumer ring completion requires named tables and valid sequences");
+        }
         perTableSeq = Collections.unmodifiableMap(new LinkedHashMap<>(perTableSeq));
         snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
         selectedTables = selectedTables == null ? null : List.copyOf(selectedTables);
         sinkAckedByTable = Collections.unmodifiableMap(new LinkedHashMap<>(sinkAckedByTable));
+        ringDoneThrough = Collections.unmodifiableMap(new LinkedHashMap<>(ringDoneThrough));
+    }
+
+    public ConsumerOffset(
+            String pipelineId, Map<String, Long> perTableSeq, ChainPosition sinkAcked,
+            List<String> snapshotCompletedTables, String cdcStartPosition, long snapshotEpoch,
+            List<String> selectedTables, Long selectedTablesEpoch, String cursorWriterToken,
+            Map<String, ChainPosition> sinkAckedByTable) {
+        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition,
+                snapshotEpoch, selectedTables, selectedTablesEpoch, cursorWriterToken,
+                sinkAckedByTable, Map.of());
     }
 
     /** Pre-vector constructor for stored consumers and callers that have not confirmed a table yet. */
@@ -157,6 +175,6 @@ public record ConsumerOffset(
     public ConsumerOffset withSinkAcked(ChainPosition position) {
         return new ConsumerOffset(pipelineId, perTableSeq, position, snapshotCompletedTables,
                 cdcStartPosition, snapshotEpoch, selectedTables, selectedTablesEpoch,
-                cursorWriterToken, sinkAckedByTable);
+                cursorWriterToken, sinkAckedByTable, ringDoneThrough);
     }
 }

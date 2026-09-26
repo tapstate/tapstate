@@ -37,6 +37,17 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized List<ConsumerOffset> consumerOffsets(String miningChainId) {
+        return require(miningChainId).consumerOffsets().stream().map(consumer ->
+                new ConsumerOffset(consumer.pipelineId(), consumer.perTableSeq(), consumer.sinkAcked(),
+                        consumer.snapshotCompletedTables(), consumer.cdcStartPosition(), consumer.snapshotEpoch(),
+                        consumer.selectedTables(), consumer.selectedTablesEpoch(), consumer.cursorWriterToken(),
+                        consumer.sinkAckedByTable(),
+                        ringDone.getOrDefault(miningChainId, Map.of())
+                                .getOrDefault(consumer.pipelineId(), Map.of()))).toList();
+    }
+
+    @Override
     public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
         return Optional.ofNullable(physicalSelections.get(miningChainId));
     }
@@ -456,10 +467,29 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
 
     @Override
     public synchronized void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
-        require(miningChainId);
+        ConsumerOffset consumer = require(miningChainId).consumerOffset(pipelineId).orElse(null);
+        if (consumer == null || consumer.selectedTablesEpoch() != null) {
+            return;
+        }
+        putRingArrival(miningChainId, pipelineId, table, seq);
+    }
+
+    private void putRingArrival(String miningChainId, String pipelineId, String table, long seq) {
         ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
                 .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
                 .putIfAbsent(table, seq);
+    }
+
+    @Override
+    public synchronized void startRingAfter(
+            String miningChainId, String pipelineId, String table, long epoch, long seq) {
+        SrsMeta record = require(miningChainId);
+        ConsumerOffset consumer = record.consumerOffset(pipelineId).orElse(null);
+        if (record.epoch() == epoch && consumer != null
+                && Objects.equals(consumer.selectedTablesEpoch(), epoch)
+                && consumer.selectedTables() != null && consumer.selectedTables().contains(table)) {
+            putRingArrival(miningChainId, pipelineId, table, seq);
+        }
     }
 
     @Override

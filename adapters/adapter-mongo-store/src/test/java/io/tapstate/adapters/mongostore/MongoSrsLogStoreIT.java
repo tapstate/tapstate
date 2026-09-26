@@ -156,12 +156,12 @@ class MongoSrsLogStoreIT {
     void trimDropsTheFrontOfOneRingAndLeavesTheRest() {
         withStore(store -> {
             store.storeAll(RING, 1L, List.of(
-                    new SrsLogRecord("a", Op.INSERT, 1L, null, Map.of("id", 1), 0L),
-                    new SrsLogRecord("b", Op.INSERT, 2L, null, Map.of("id", 2), 0L),
-                    new SrsLogRecord("c", Op.INSERT, 3L, null, Map.of("id", 3), 0L)));
+                    new SrsLogRecord("a", Op.INSERT, 1L, null, Map.of("id", 1), 0L, null, 1L),
+                    new SrsLogRecord("b", Op.INSERT, 2L, null, Map.of("id", 2), 0L, null, 1L),
+                    new SrsLogRecord("c", Op.INSERT, 3L, null, Map.of("id", 3), 0L, null, 1L)));
             store.store(OTHER, 1L, new SrsLogRecord("x", Op.INSERT, 1L, null, Map.of("id", 9), 0L));
 
-            store.trim(RING, 2L);
+            store.trim(RING, 2L, 1L);
 
             assertThat(store.load(RING, 1L)).isEmpty();
             assertThat(store.load(RING, 2L)).isEmpty();
@@ -170,6 +170,63 @@ class MongoSrsLogStoreIT {
                     .as("a trim cuts the ring it names; reaching into the ring beside it would drop changes "
                             + "another table's consumers have not read")
                     .isPresent();
+        });
+    }
+
+    @Test
+    void delayedTrimFromAnOldGenerationCannotDeleteAReusedSequence() {
+        withStore(store -> {
+            store.store(RING, 0L, new SrsLogRecord("old", Op.INSERT, 1L,
+                    null, Map.of("id", 1), 0L, null, 1L));
+            store.store(RING, 0L, new SrsLogRecord("new", Op.INSERT, 2L,
+                    null, Map.of("id", 2), 0L, null, 2L));
+
+            store.trim(RING, 0L, 1L);
+
+            assertThat(store.load(RING, 0L))
+                    .as("a delayed cut from an earlier ring generation must not delete a new change "
+                            + "at the sequence that generation used")
+                    .get().extracting(SrsLogRecord::srcToken).isEqualTo("new");
+        });
+    }
+
+    @Test
+    void aFullyConfirmedRingRetainsItsHighestSequenceAcrossRecreate() {
+        withStore(store -> {
+            store.storeAll(RING, 0L, List.of(
+                    new SrsLogRecord("a", Op.INSERT, 1L, null, Map.of("id", 1), 0L, null, 1L),
+                    new SrsLogRecord("b", Op.INSERT, 2L, null, Map.of("id", 2), 0L, null, 1L)));
+
+            store.trim(RING, 1L, 1L);
+
+            assertThat(store.load(RING, 0L)).isEmpty();
+            assertThat(store.load(RING, 1L)).isPresent();
+            assertThat(store.largestSequence(RING)).isEqualTo(1L);
+
+            // A new physical subscription can keep the ring epoch. Its rebuilt ring resumes after the
+            // retained high-water record, so a delayed cut from the old subscription stops before it.
+            store.store(RING, 2L, new SrsLogRecord("new", Op.INSERT, 3L,
+                    null, Map.of("id", 3), 0L, null, 1L));
+            store.trim(RING, 1L, 1L);
+            assertThat(store.load(RING, 2L).orElseThrow().srcToken()).isEqualTo("new");
+        });
+    }
+
+    @Test
+    void aGenerationTrimRetainsLegacyUntaggedRecords() {
+        withStore(store -> {
+            store.store(RING, 0L, new SrsLogRecord("legacy", Op.INSERT, 1L,
+                    null, Map.of("id", 1), 0L));
+            store.store(RING, 1L, new SrsLogRecord("current", Op.INSERT, 2L,
+                    null, Map.of("id", 2), 0L, null, 2L));
+            store.store(RING, 2L, new SrsLogRecord("high-water", Op.INSERT, 3L,
+                    null, Map.of("id", 3), 0L, null, 2L));
+
+            store.trim(RING, 1L, 2L);
+
+            assertThat(store.load(RING, 0L)).isPresent();
+            assertThat(store.load(RING, 1L)).isEmpty();
+            assertThat(store.load(RING, 2L)).isPresent();
         });
     }
 

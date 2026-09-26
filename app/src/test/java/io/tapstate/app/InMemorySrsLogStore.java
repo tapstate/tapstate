@@ -45,10 +45,12 @@ final class InMemorySrsLogStore implements SrsLogStore {
     }
 
     @Override
-    public void trim(String ring, long throughSeq) {
+    public void trim(String ring, long throughSeq, long ringEpoch) {
         NavigableMap<Long, SrsLogRecord> entries = rings.get(ring);
-        if (entries != null) {
-            entries.headMap(throughSeq, true).clear();
+        if (entries != null && !entries.isEmpty()) {
+            long last = entries.lastKey();
+            entries.headMap(Math.min(throughSeq, last - 1), true).entrySet()
+                    .removeIf(entry -> Long.valueOf(ringEpoch).equals(entry.getValue().ringEpoch()));
         }
     }
 }
