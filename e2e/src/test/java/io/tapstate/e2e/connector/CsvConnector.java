@@ -26,10 +26,14 @@ import io.tapdata.pdk.apis.functions.connection.TableInfo;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -37,6 +41,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -148,6 +154,12 @@ public class CsvConnector implements TapConnector {
      * reading that lists the tables, and no lookup resolves to it.
      */
     private static final String STAGING_SUFFIX = ".staging";
+
+    /** What the file a table's writes meet on is named with, after the table's own file name. */
+    private static final String LOCK_SUFFIX = ".lock";
+
+    /** How long a write waits for the table while another holds it before saying so. */
+    private static final long LOCK_WAIT_NANOS = TimeUnit.SECONDS.toNanos(60);
 
     /**
      * The one command the read face dispatches. It is pinned on both sides on purpose: the caller sends
@@ -403,6 +415,11 @@ public class CsvConnector implements TapConnector {
                     "the '" + FAIL_WRITES + "' setting makes this sink reject every write");
         }
         Path file = file(context, target.getId());
+        return exclusively(file, () -> apply(file, events, target));
+    }
+
+    /** Applies {@code events} to the table in {@code file}: read it, change it, put it back whole. */
+    private static WriteListResult<TapRecordEvent> apply(Path file, List<TapRecordEvent> events, TapTable target) {
         List<String> key = primaryKeyOf(target);
         Map<String, Map<String, Object>> byKey = new LinkedHashMap<>();
         List<Map<String, Object>> appended = new ArrayList<>();
@@ -441,6 +458,55 @@ public class CsvConnector implements TapConnector {
                 .insertedCount(inserted)
                 .modifiedCount(modified)
                 .removedCount(removed);
+    }
+
+    /**
+     * Runs {@code work} as the only write of {@code file}'s table, in this process and in every other on this
+     * machine. A write reads the table, applies its batch and puts the whole table back, so two at once would each
+     * put back a table missing the other's rows - and a sink's writers write one table at once as a matter of
+     * course, each with a connector of its own and spread over every member, as they would a database.
+     *
+     * <p>A lock on a file beside the table is what they meet on, under a name that is not a table's. Nothing held
+     * in this class can do it: each writer's connector is loaded apart from the others', so a lock kept here is a
+     * lock per writer. The file lock is held for this machine as a whole; one already held by another writer in
+     * this process is refused rather than waited on, so that is waited out here as another process's is.
+     */
+    private static <T> T exclusively(Path file, java.util.function.Supplier<T> work) {
+        Path lockFile = file.resolveSibling("." + file.getFileName() + LOCK_SUFFIX);
+        try {
+            Files.createDirectories(file.getParent());
+            try (FileChannel channel = FileChannel.open(
+                    lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                FileLock held = acquire(channel, file);
+                try {
+                    return work.get();
+                } finally {
+                    held.release();
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot hold the table at " + file + " for a write", e);
+        }
+    }
+
+    /** The lock on {@code channel}'s file, waiting for whichever writer holds it now, here or elsewhere. */
+    private static FileLock acquire(FileChannel channel, Path file) throws IOException {
+        long deadline = System.nanoTime() + LOCK_WAIT_NANOS;
+        while (true) {
+            try {
+                FileLock held = channel.tryLock();
+                if (held != null) {
+                    return held;
+                }
+            } catch (OverlappingFileLockException heldInThisProcess) {
+                // Another writer in this process holds it; wait for it as for a writer in another process.
+            }
+            if (System.nanoTime() - deadline > 0) {
+                throw new IllegalStateException("the table at " + file + " was held by another write for over "
+                        + TimeUnit.NANOSECONDS.toSeconds(LOCK_WAIT_NANOS) + "s");
+            }
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+        }
     }
 
     /**
