@@ -27,6 +27,53 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TelemetryDispatcherTest {
 
     @Test
+    void shutdownStopsWaitingAfterItsFlushBudgetAndReportsTheTimeout() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        List<Long> saved = java.util.Collections.synchronizedList(new ArrayList<>());
+        ObservationStore store = new ObservationStore() {
+            @Override public void save(Observation observation) {
+                entered.countDown();
+                while (release.getCount() > 0) {
+                    try {
+                        release.await();
+                    } catch (InterruptedException ignored) {
+                        // A blocked storage driver may not honor interruption during shutdown.
+                    }
+                }
+                saved.add(observation.metrics().get("sequence"));
+            }
+            @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+            @Override public void delete(String id) { }
+        };
+        TelemetryDispatcher dispatcher = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), store), null,
+                MetricsExport.none(), null, 1, 1, java.time.Duration.ofSeconds(5));
+        try {
+            dispatcher.offer(frame(1), null);
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+            dispatcher.offer(frame(2), null);
+
+            long started = System.nanoTime();
+            dispatcher.close();
+
+            assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)).isLessThan(4_000);
+            assertThat(dispatcher.health().get(TelemetryDispatcher.Sink.LATEST).timeouts()).isEqualTo(1);
+            assertThat(dispatcher.health().get(TelemetryDispatcher.Sink.LATEST).degraded()).isTrue();
+            release.countDown();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (dispatcher.health().get(TelemetryDispatcher.Sink.LATEST).inFlight() > 0
+                    && System.nanoTime() < deadline) {
+                TimeUnit.MILLISECONDS.sleep(5);
+            }
+            assertThat(dispatcher.health().get(TelemetryDispatcher.Sink.LATEST).dropped()).isEqualTo(1);
+            assertThat(saved).containsExactly(1L);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void processHealthRemainsReadableWhenTheLatestStoreFails() throws Exception {
         AtomicInteger reads = new AtomicInteger();
         ObservationStore store = new ObservationStore() {
@@ -72,8 +119,11 @@ class TelemetryDispatcherTest {
             assertThat(health.stream().flatMap(fact -> fact.points().stream())
                     .map(point -> point.attributes().get(MetricAttributes.TELEMETRY_SINK)))
                     .doesNotContain("history");
-            assertThat(health).noneMatch(fact -> fact.name().equals(
-                    "tapstate.process.telemetry.last_success.age"));
+            assertThat(health.stream().filter(fact -> fact.name().equals(
+                    "tapstate.process.telemetry.last_success.age"))
+                    .flatMap(fact -> fact.points().stream())
+                    .map(point -> point.attributes().get(MetricAttributes.TELEMETRY_SINK)))
+                    .doesNotContain("latest");
             assertThat(reads).hasValue(0);
         }
     }

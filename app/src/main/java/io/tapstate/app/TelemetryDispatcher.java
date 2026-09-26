@@ -12,6 +12,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -35,6 +36,7 @@ final class TelemetryDispatcher implements AutoCloseable {
     static final int DEFAULT_LATEST_WORKERS = 4;
     static final int DEFAULT_QUEUE_CAPACITY = 64;
     private static final Duration DEFAULT_WRITE_DEADLINE = Duration.ofSeconds(5);
+    private static final Duration CLOSE_DEADLINE = Duration.ofSeconds(2);
     private static final Duration BREAKER_COOLDOWN = Duration.ofSeconds(1);
 
     enum Sink {
@@ -75,6 +77,25 @@ final class TelemetryDispatcher implements AutoCloseable {
         private void dropped() {
             dropped.incrementAndGet();
             lastProblemNanos = System.nanoTime();
+        }
+
+        private void dropped(long count) {
+            if (count > 0) {
+                dropped.addAndGet(count);
+                lastProblemNanos = System.nanoTime();
+            }
+        }
+
+        private void flushTimedOut() {
+            long now = System.nanoTime();
+            long newlyTimedOut = 0;
+            for (Operation operation : inFlight.values()) {
+                if (operation.state.compareAndSet(0, 1)) {
+                    newlyTimedOut++;
+                }
+            }
+            timeouts.addAndGet(newlyTimedOut);
+            lastProblemNanos = now;
         }
 
         private boolean allow() {
@@ -176,6 +197,8 @@ final class TelemetryDispatcher implements AutoCloseable {
     private final ConcurrentHashMap<String, LatestSlot> latestByPipeline = new ConcurrentHashMap<>();
     private final ScheduledExecutorService watchdog;
     private final Instant startedAt = Instant.now();
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean abort = new AtomicBoolean();
 
     TelemetryDispatcher(ObservationPublisher publisher, RateSampler sampler, MetricsExport export,
             int latestConcurrency, int queueCapacity) {
@@ -237,6 +260,9 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     void offer(ObservationPublisher.Prepared prepared, ObservationStore.Scope scope) {
         Objects.requireNonNull(prepared, "prepared");
+        if (closed.get()) {
+            return;
+        }
         if (scopes != null && (scope == null || scopes.current(prepared.observation().pipelineId())
                 .filter(scope::equals).isEmpty())) {
             return;
@@ -273,6 +299,9 @@ final class TelemetryDispatcher implements AutoCloseable {
     }
 
     void offerReconcileFailure(String pipelineId, long failures, ObservationStore.Scope scope) {
+        if (closed.get()) {
+            return;
+        }
         offerLatest(pipelineId, new ReconcileFailureFrame(pipelineId, failures, scope));
     }
 
@@ -371,21 +400,35 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     @Override
     public void close() {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         watchdog.shutdownNow();
-        shutdown(latestWorkers);
-        shutdown(historyWorker);
-        shutdown(exportWorker);
+        latestWorkers.shutdown();
+        historyWorker.shutdown();
+        exportWorker.shutdown();
+        long deadline = System.nanoTime() + CLOSE_DEADLINE.toNanos();
+        drain(latestWorkers, latestStats, "latest", deadline);
+        drain(historyWorker, historyStats, "history", deadline);
+        drain(exportWorker, exportStats, "export", deadline);
     }
 
-    private static void shutdown(ThreadPoolExecutor workers) {
-        workers.shutdown();
+    private void drain(ThreadPoolExecutor workers, Stats stats, String sink, long deadline) {
+        boolean complete = false;
         try {
-            if (!workers.awaitTermination(Duration.ofSeconds(2).toNanos(), TimeUnit.NANOSECONDS)) {
-                workers.shutdownNow();
-            }
+            complete = workers.awaitTermination(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            workers.shutdownNow();
+        }
+        if (!complete) {
+            abort.set(true);
+            stats.flushTimedOut();
+            List<Runnable> abandoned = workers.shutdownNow();
+            stats.dropped(abandoned.size());
+            abandoned.stream().filter(LatestSlot.class::isInstance).map(LatestSlot.class::cast)
+                    .forEach(LatestSlot::cancel);
+            LOG.warn("{} telemetry flush exceeded {} ms: inFlight={}, queued={}",
+                    sink, CLOSE_DEADLINE.toMillis(), stats.inFlight.size(), abandoned.size());
         }
     }
 
@@ -401,6 +444,13 @@ final class TelemetryDispatcher implements AutoCloseable {
             this.pending = first;
         }
 
+        private synchronized void cancel() {
+            retired = true;
+            pending = null;
+            latestByPipeline.remove(pipelineId, this);
+            latestCapacity.release();
+        }
+
         @Override
         public void run() {
             while (true) {
@@ -411,7 +461,11 @@ final class TelemetryDispatcher implements AutoCloseable {
                         latestPending.decrementAndGet();
                         pendingCounted = false;
                     }
-                    frame = pending;
+                    boolean aborting = abort.get();
+                    if (aborting && pending != null) {
+                        latestStats.dropped();
+                    }
+                    frame = aborting ? null : pending;
                     pending = null;
                     if (frame == null) {
                         retired = true;
