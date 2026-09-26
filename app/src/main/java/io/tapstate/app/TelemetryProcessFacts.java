@@ -71,6 +71,21 @@ final class TelemetryProcessFacts {
         }
         facts.add(gauge("tapstate.process.telemetry.degraded", "1", active,
                 reading -> reading.degraded() ? 1L : 0L, observedAt));
+        active.stream().filter(reading -> reading.sink() == TelemetryDispatcher.Sink.EVENT)
+                .findFirst().ifPresent(event -> {
+                    facts.add(new MetricFact("tapstate.process.telemetry.gap.open", MetricType.GAUGE,
+                            "{gap}", List.of(MetricPoint.reading(event.attributes(), observedAt,
+                                    event.health().openGaps()))));
+                    facts.add(new MetricFact("tapstate.process.telemetry.restoration.pending", MetricType.GAUGE,
+                            "{event}", List.of(MetricPoint.reading(event.attributes(), observedAt,
+                                    event.health().pendingRestorations()))));
+                    facts.add(new MetricFact("tapstate.process.telemetry.gap.opened", MetricType.COUNTER,
+                            "{gap}", List.of(MetricPoint.accumulated(event.attributes(), startedAt,
+                                    observedAt, event.health().gapsOpened()))));
+                    facts.add(new MetricFact("tapstate.process.telemetry.gap.closed", MetricType.COUNTER,
+                            "{gap}", List.of(MetricPoint.accumulated(event.attributes(), startedAt,
+                                    observedAt, event.health().gapsClosed()))));
+                });
         return List.copyOf(facts);
     }
 

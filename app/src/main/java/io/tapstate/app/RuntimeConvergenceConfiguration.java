@@ -146,8 +146,8 @@ class RuntimeConvergenceConfiguration {
 
     @Bean(destroyMethod = "close")
     TelemetryDispatcher telemetryDispatcher(ObservationPublisher publisher, RateSampler sampler,
-            MetricsExport export, ObservationScopeRegistry scopes) {
-        return new TelemetryDispatcher(publisher, sampler, export, scopes,
+            MetricsExport export, ObservationScopeRegistry scopes, StorePort storePort) {
+        return new TelemetryDispatcher(publisher, sampler, export, scopes, storePort.events(),
                 TelemetryDispatcher.DEFAULT_LATEST_WORKERS, TelemetryDispatcher.DEFAULT_QUEUE_CAPACITY);
     }
 

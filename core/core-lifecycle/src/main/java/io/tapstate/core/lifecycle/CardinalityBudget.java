@@ -90,18 +90,22 @@ public enum CardinalityBudget {
     /** Two readings about the pipeline as a whole: the pipeline is their only attribute, so nothing grows and nothing folds. */
     RECORDS_DRIVEN("tapstate.pipeline.records.driven", null, 1, Fold.ADDED),
     RECONCILE_FAILURES_STREAK("tapstate.pipeline.reconcile.failures.streak", null, 1, Fold.HIGHEST),
-    /** Process telemetry has only three closed sink values and no pipeline or data-derived label. */
-    TELEMETRY_QUEUE_DEPTH("tapstate.process.telemetry.queue.depth", null, 3, Fold.HIGHEST),
-    TELEMETRY_QUEUE_HIGH_WATER("tapstate.process.telemetry.queue.high_water", null, 3, Fold.HIGHEST),
-    TELEMETRY_IN_FLIGHT("tapstate.process.telemetry.in_flight", null, 3, Fold.HIGHEST),
-    TELEMETRY_COALESCED("tapstate.process.telemetry.coalesced", null, 3, Fold.ADDED),
-    TELEMETRY_DROPPED("tapstate.process.telemetry.dropped", null, 3, Fold.ADDED),
-    TELEMETRY_WRITE_SUCCESS("tapstate.process.telemetry.write.success", null, 3, Fold.ADDED),
-    TELEMETRY_WRITE_FAILURE("tapstate.process.telemetry.write.failure", null, 3, Fold.ADDED),
-    TELEMETRY_WRITE_TIMEOUT("tapstate.process.telemetry.write.timeout", null, 3, Fold.ADDED),
-    TELEMETRY_WRITE_DURATION_MAX("tapstate.process.telemetry.write.duration.max", null, 3, Fold.HIGHEST),
-    TELEMETRY_LAST_SUCCESS_AGE("tapstate.process.telemetry.last_success.age", null, 3, Fold.HIGHEST),
-    TELEMETRY_DEGRADED("tapstate.process.telemetry.degraded", null, 3, Fold.HIGHEST);
+    /** Process telemetry has only four closed sink values and no pipeline or data-derived label. */
+    TELEMETRY_QUEUE_DEPTH("tapstate.process.telemetry.queue.depth", null, 4, Fold.HIGHEST),
+    TELEMETRY_QUEUE_HIGH_WATER("tapstate.process.telemetry.queue.high_water", null, 4, Fold.HIGHEST),
+    TELEMETRY_IN_FLIGHT("tapstate.process.telemetry.in_flight", null, 4, Fold.HIGHEST),
+    TELEMETRY_COALESCED("tapstate.process.telemetry.coalesced", null, 4, Fold.ADDED),
+    TELEMETRY_DROPPED("tapstate.process.telemetry.dropped", null, 4, Fold.ADDED),
+    TELEMETRY_WRITE_SUCCESS("tapstate.process.telemetry.write.success", null, 4, Fold.ADDED),
+    TELEMETRY_WRITE_FAILURE("tapstate.process.telemetry.write.failure", null, 4, Fold.ADDED),
+    TELEMETRY_WRITE_TIMEOUT("tapstate.process.telemetry.write.timeout", null, 4, Fold.ADDED),
+    TELEMETRY_WRITE_DURATION_MAX("tapstate.process.telemetry.write.duration.max", null, 4, Fold.HIGHEST),
+    TELEMETRY_LAST_SUCCESS_AGE("tapstate.process.telemetry.last_success.age", null, 4, Fold.HIGHEST),
+    TELEMETRY_DEGRADED("tapstate.process.telemetry.degraded", null, 4, Fold.HIGHEST),
+    TELEMETRY_GAPS_OPEN("tapstate.process.telemetry.gap.open", null, 1, Fold.HIGHEST),
+    TELEMETRY_RESTORATIONS_PENDING("tapstate.process.telemetry.restoration.pending", null, 1, Fold.HIGHEST),
+    TELEMETRY_GAPS_OPENED("tapstate.process.telemetry.gap.opened", null, 1, Fold.ADDED),
+    TELEMETRY_GAPS_CLOSED("tapstate.process.telemetry.gap.closed", null, 1, Fold.ADDED);
 
     /**
      * What several series of one instrument make when they fold into one.
