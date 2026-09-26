@@ -1,7 +1,9 @@
 package io.tapstate.app;
 
+import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.runtime.engine.PreparesTargets;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 
@@ -20,6 +22,10 @@ import java.util.concurrent.CompletionStage;
  * <p>Refusing throws rather than dropping the batch silently. The records are not lost — nothing has
  * acknowledged them, and the run that is current re-reads them from the durable position — and a sink that
  * quietly wrote nothing would leave a pipeline reporting healthy over a target that had stopped moving.
+ *
+ * <p>Where the writers write tables prepared before they open, preparing them is held to the run too: a clear
+ * is a write, and a superseded run clearing a table after the current run has started writing into it would
+ * take the current run's rows with it.
  */
 final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
 
@@ -36,7 +42,11 @@ final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
     /** {@code factory} held to {@code fence}'s run, or {@code factory} itself where there is none. */
     static SupplierEx<? extends SinkWriter> heldTo(
             SupplierEx<? extends SinkWriter> factory, ExecutionFence fence) {
-        return fence == null ? factory : new FencedSinkWriterFactory(factory, fence);
+        if (fence == null) {
+            return factory;
+        }
+        FencedSinkWriterFactory writers = new FencedSinkWriterFactory(factory, fence);
+        return factory instanceof PreparesTargets targets ? new Preparing(writers, targets, fence) : writers;
     }
 
     @Override
@@ -48,6 +58,22 @@ final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
     static SinkWriter guarded(
             SinkWriter writer, ExecutionFence fence, ExecutionAuthorization authorization) {
         return new FencedSinkWriter(writer, fence, authorization);
+    }
+
+    /** Writers held to the run, over tables whose preparing is held to it too. */
+    private record Preparing(FencedSinkWriterFactory writers, PreparesTargets targets, ExecutionFence fence)
+            implements SupplierEx<SinkWriter>, PreparesTargets {
+
+        @Override
+        public SinkWriter getEx() throws Exception {
+            return writers.getEx();
+        }
+
+        @Override
+        public void prepareTargets(HazelcastInstance coordinator) {
+            ExecutionAuthorization.of(coordinator).require(fence);
+            targets.prepareTargets(coordinator);
+        }
     }
 
     private record FencedSinkWriter(

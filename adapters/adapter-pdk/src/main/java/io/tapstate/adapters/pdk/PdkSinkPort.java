@@ -5,6 +5,7 @@ import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkPort;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapdata.entity.schema.TapTable;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 import io.tapstate.spi.sink.TargetTable;
 import java.util.Map;
@@ -38,6 +39,52 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
+        return open(config, targets, false);
+    }
+
+    /**
+     * A writer for tables prepared before it opened, by {@link #prepare}: refused, before any connector is opened,
+     * unless each one was; then it only writes rows. Several writers of one sink open this way, and none of them
+     * clears a table another has started writing.
+     */
+    public SinkWriter openPrepared(SinkConfig config, Map<String, TargetTable> targets) {
+        PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values());
+        return open(config, targets, true);
+    }
+
+    /**
+     * Prepares each of {@code targets} for the writers that will write it - created where it is missing, cleared
+     * or checked as the full-load policy says, indexed - on a connector opened for that alone and closed again.
+     * A table prepared before, as its receipt says, is not cleared again. A failure is coded as a write failure,
+     * as it was when each writer prepared its own tables.
+     */
+    public void prepare(SinkConfig config, Map<String, TargetTable> targets) {
+        PdkConnector connector = PdkConnector.open(
+                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
+                config.node(), stateStore);
+        try {
+            connector.underLoader(() -> {
+                connector.connector().init(connector.context());
+                PdkTargetPreparation preparation = new PdkTargetPreparation(connector.context(),
+                        connector.functions(), config.onFullLoad(), config.fullLoad(), config.node(), stateStore);
+                for (TargetTable target : targets.values()) {
+                    TapTable table = TargetTapTable.build(target);
+                    connector.resolveTargetTypes(table);
+                    preparation.prepare(target, table);
+                }
+                return null;
+            });
+        } catch (TapstateException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
+        } finally {
+            connector.stopQuietly();
+            connector.close();
+        }
+    }
+
+    private SinkWriter open(SinkConfig config, Map<String, TargetTable> targets, boolean preparedAhead) {
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
                 config.node(), stateStore);
@@ -53,7 +100,7 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 return null;
             });
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {

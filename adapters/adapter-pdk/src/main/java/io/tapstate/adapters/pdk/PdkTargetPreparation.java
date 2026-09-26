@@ -11,10 +11,18 @@ import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.sink.SinkPreparationNamespace;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.store.KeyedStateStore;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.Set;
 
-/** Prepares each table before writing; a durable receipt prevents destructive preparation on recovery. */
+/**
+ * Prepares each table before writing; a durable receipt prevents destructive preparation on recovery.
+ *
+ * <p>A writer whose tables were prepared before it opened prepares nothing, and was checked for their receipts
+ * as it opened ({@link #requirePrepared}). Preparing again from each of several writers is what that avoids -
+ * the receipt is looked up and then written, not claimed, so two writers finding none would each clear the
+ * table, and the second would clear rows the first had already written.
+ */
 final class PdkTargetPreparation {
     private final TapConnectorContext context;
     private final ConnectorFunctions functions;
@@ -22,20 +30,31 @@ final class PdkTargetPreparation {
     private final boolean fullLoad;
     private final String namespace;
     private final KeyedStateStore stateStore;
+    private final boolean preparedAhead;
     private final Set<String> prepared = new HashSet<>();
 
     PdkTargetPreparation(TapConnectorContext context, ConnectorFunctions functions, OnFullLoad onFullLoad,
             boolean fullLoad, PipelineNode node, KeyedStateStore stateStore) {
+        this(context, functions, onFullLoad, fullLoad, node, stateStore, false);
+    }
+
+    /** As above, and where {@code preparedAhead}, one for tables prepared already, which prepares nothing. */
+    PdkTargetPreparation(TapConnectorContext context, ConnectorFunctions functions, OnFullLoad onFullLoad,
+            boolean fullLoad, PipelineNode node, KeyedStateStore stateStore, boolean preparedAhead) {
         this.context = context;
         this.functions = functions;
         this.onFullLoad = onFullLoad;
         this.fullLoad = fullLoad;
         this.namespace = SinkPreparationNamespace.of(node);
         this.stateStore = stateStore;
+        this.preparedAhead = preparedAhead;
     }
 
     void prepare(TargetTable target, TapTable table) throws Throwable {
         if (target == null || prepared.contains(target.name())) {
+            return;
+        }
+        if (preparedAhead) {
             return;
         }
         if (fullLoad && onFullLoad == OnFullLoad.CLEAR && namespace != null && stateStore == null) {
@@ -65,6 +84,25 @@ final class PdkTargetPreparation {
         }
         // A failed index call is not success: retry it before the next write without clearing again.
         prepared.add(target.name());
+    }
+
+    /**
+     * Refuses a writer of {@code node} for {@code targets} unless every one of them has its receipt. Such a
+     * writer opens only once the run has prepared every table it writes, so a missing receipt is a writer wired
+     * to a run that prepared nothing - and writing on would skip the clear a full load asked for. Where no
+     * receipt is kept at all there is nothing to check.
+     */
+    static void requirePrepared(PipelineNode node, KeyedStateStore stateStore, Collection<TargetTable> targets) {
+        String namespace = SinkPreparationNamespace.of(node);
+        if (namespace == null || stateStore == null) {
+            return;
+        }
+        for (TargetTable target : targets) {
+            if (target != null && stateStore.load(namespace, target.name()).isEmpty()) {
+                throw new IllegalStateException("target table " + target.name() + " of " + namespace
+                        + " was not prepared before its writers opened");
+            }
+        }
     }
 
     private boolean create(TapTable table) throws Throwable {

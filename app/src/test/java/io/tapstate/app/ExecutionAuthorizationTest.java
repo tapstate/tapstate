@@ -1,11 +1,13 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.EngineError;
+import io.tapstate.runtime.engine.PreparesTargets;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.spi.sink.SinkWriter;
@@ -255,6 +257,61 @@ class ExecutionAuthorizationTest {
                 .as("nothing the rebuilt-over run's writer says lands, positions and bounds alike")
                 .containsExactly("bound serve.s#0", "advance", "bounded");
         assertThat(started).as("and it does not start its accounting over the run that replaced it").hasSize(1);
+    }
+
+    /**
+     * Preparing a run's target tables is held to the run like writing into them: a clear is a write, and a run
+     * that has been rebuilt over clearing a table after its replacement started writing into it would take the
+     * replacement's rows with it.
+     */
+    @Test
+    void aRebuiltOverRunCannotPrepareItsTargetsAgain() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence fence = nodeA.beginExecution("orders").fence();
+        ExecutionAuthorization guard = guard(claims);
+        HazelcastInstance coordinator = mock(HazelcastInstance.class);
+        ConcurrentMap<String, Object> context = new ConcurrentHashMap<>();
+        context.put(ExecutionAuthorization.USER_CONTEXT_KEY, guard);
+        when(coordinator.getUserContext()).thenReturn(context);
+        List<String> prepared = new ArrayList<>();
+        SupplierEx<? extends SinkWriter> fenced =
+                FencedSinkWriterFactory.heldTo(new PreparingWriters(prepared), fence);
+
+        assertThat(fenced).isInstanceOf(PreparesTargets.class);
+        ((PreparesTargets) fenced).prepareTargets(coordinator);
+        assertThat(prepared).hasSize(1);
+
+        nodeA.beginExecution("orders");
+        nanos.addAndGet(WINDOW.toNanos());
+
+        assertThatThrownBy(() -> ((PreparesTargets) fenced).prepareTargets(coordinator))
+                .isInstanceOf(TapstateException.class)
+                .extracting(thrown -> ((TapstateException) thrown).code())
+                .isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED);
+        assertThat(prepared).as("nothing prepared for the run that was rebuilt over").hasSize(1);
+    }
+
+    /** Writers of tables prepared for them, recording each preparing. */
+    private static final class PreparingWriters implements SupplierEx<SinkWriter>, PreparesTargets {
+
+        private static final long serialVersionUID = 1L;
+
+        private final transient List<String> prepared;
+
+        PreparingWriters(List<String> prepared) {
+            this.prepared = prepared;
+        }
+
+        @Override
+        public void prepareTargets(HazelcastInstance coordinator) {
+            prepared.add("prepared");
+        }
+
+        @Override
+        public SinkWriter getEx() {
+            return new CountingWriter();
+        }
     }
 
     @Test

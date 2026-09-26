@@ -26,4 +26,13 @@ public final class SyntheticSinkJars {
     public static Path stateRecordingSink(Path workDir) {
         return Synthetic.stateRecordingSink(workDir);
     }
+
+    /**
+     * A sink connector that writes one line to {@code trace} for each thing done to its target - {@code
+     * create:<table>}, {@code clear:<table>}, {@code count:<table>}, {@code stop} - and whose tables already
+     * exist where {@code exists} says so.
+     */
+    public static Path preparationSink(Path workDir, Path trace, boolean exists) {
+        return Synthetic.preparationSink(workDir, trace, exists);
+    }
 }

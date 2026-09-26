@@ -72,9 +72,15 @@ final class PdkSinkWriter implements SinkWriter {
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
             Map<String, TargetTable> targets, KeyedStateStore stateStore) {
+        this(connector, write, config, targets, stateStore, false);
+    }
+
+    /** As above, and where {@code preparedAhead}, a writer of tables prepared already, which prepares nothing. */
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
                 new PdkTargetPreparation(connector.context(), connector.functions(), config.onFullLoad(),
-                        config.fullLoad(), config.node(), stateStore));
+                        config.fullLoad(), config.node(), stateStore, preparedAhead));
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,

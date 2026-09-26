@@ -413,8 +413,8 @@ public final class PipelineDagBuilder {
             // A chain reaching the sink over several paths arrives in whatever order they drain in, which is
             // the reading an assembly needs, for the same reason.
             boolean severalPaths = chains != null && chains.anyOverSeveralPaths(sink.upstream());
-            ProcessorMetaSupplier supplier = sinkVertex(sink.name(), sink.writers(), sinkAck, axes,
-                    assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream()));
+            ProcessorMetaSupplier supplier = preparingTargets(sinkVertex(sink.name(), sink.writers(), sinkAck, axes,
+                    assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream())), sink);
             if (startsTheRun) {
                 supplier = WriterRunStart.of(supplier, sinkAck, writersByChain);
                 startsTheRun = false;
@@ -530,9 +530,9 @@ public final class PipelineDagBuilder {
                 ? null
                 : () -> new LevelBounds(Map.of(SinkRouter.SPREAD, carried, SinkRouter.BY_KEY, carried), axes,
                         LevelBounds.HOLDS_NOTHING);
-        ProcessorMetaSupplier writers = SinkProcessor.nativeMetaSupplier(name, sink.writers(), sinkAck,
-                () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
-                shape.plannedMembers());
+        ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.writers(),
+                sinkAck, () -> new SettledFloor(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
+                shape.plannedMembers()), sink);
         if (startsTheRun != null) {
             writers = WriterRunStart.of(writers, sinkAck, startsTheRun);
         }
@@ -540,6 +540,16 @@ public final class PipelineDagBuilder {
         dag.edge(Edge.from(router, SinkRouter.SPREAD).to(vertex, SinkRouter.SPREAD).distributed());
         dag.edge(Edge.from(router, SinkRouter.BY_KEY).to(vertex, SinkRouter.BY_KEY)
                 .partitioned(byTarget).distributed());
+    }
+
+    /**
+     * {@code supplier}, preparing {@code sink}'s target tables as each execution starts, where its writers write
+     * only tables prepared for them: once for the sink, however many writers it runs.
+     */
+    private static ProcessorMetaSupplier preparingTargets(ProcessorMetaSupplier supplier, SinkNode sink) {
+        return sink.writers() instanceof PreparesTargets targets
+                ? TargetPreparationStart.of(supplier, targets)
+                : supplier;
     }
 
     /**
