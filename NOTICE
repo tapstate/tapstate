@@ -25,8 +25,9 @@ shaded and carry their own drivers on an isolated class loader:
     dependencies; the shaded jar carries their license and notice texts under
     META-INF/.
 
-  * aws-rds-mysql-connector.jar bundles third-party dependencies; the shaded
-    jar carries their license and notice texts, including under META-INF/.
+  * aws-rds-mysql-connector.jar bundles MySQL Connector/J 8.0 under GPL-2.0
+    with the Universal FOSS Exception and other dependencies; the shaded jar
+    carries their license and notice texts, including under META-INF/.
 
   * oracle-connector.jar bundles Oracle Database JDBC, NLS and XML artifacts
     21.5.0.0, governed by the Oracle Free Use Terms and Conditions.

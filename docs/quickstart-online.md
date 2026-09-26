@@ -104,7 +104,8 @@ publishing the binary does not grant a license to the upstream connector source 
 
 The `aws-rds-mysql` jar is also a separate, explicit-download asset on that release. Use
 `register aws-rds-mysql` only with the preview limitation above in mind; publishing and
-registering the JAR do not certify snapshot or CDC against a real Amazon RDS instance.
+registering the JAR do not certify snapshot or CDC against a real Amazon RDS instance. It
+bundles MySQL Connector/J 8.0; see the in-JAR license manual and [`NOTICE`](../NOTICE).
 
 The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
 miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
