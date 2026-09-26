@@ -138,7 +138,11 @@ class AChangeIsWrittenOnlyOnceTheLoadsItCouldOvertakeHaveLandedTest {
             buffer.endSnapshot(PIPELINE, ringOf(table));
         }
         StoreBackedSinkAckFactory acks = new StoreBackedSinkAckFactory(CHAINS, PIPELINE, "run-1");
-        Job job = member.getJet().newJob(PipelineDagBuilder.build(pipeline(), bindings(), acks, FRONTIER, shape()));
+        // Every source placed on this member, the way a server places a source on the member whose capture fills
+        // its hand-off: the gate is wrapped around what that placement makes, and the job has to carry the two
+        // together to every member.
+        SourcePlacement here = SourcePlacement.on(member.getCluster().getLocalMember().getAddress());
+        Job job = member.getJet().newJob(PipelineDagBuilder.build(pipeline(), bindings(here), acks, FRONTIER, shape()));
         try {
             awaitLoaded("a");
             awaitLoaded("c");
@@ -221,24 +225,24 @@ class AChangeIsWrittenOnlyOnceTheLoadsItCouldOvertakeHaveLandedTest {
                         "c", new SinkTarget("y", List.of("id")))));
     }
 
-    private static DagBindings bindings() {
+    private static DagBindings bindings(SourcePlacement placement) {
         Map<FromRef, List<String>> upstreams = Map.of(
                 FromRef.literal("a_src"), List.of("a_src"),
                 FromRef.literal("b_src"), List.of("b_src"),
                 FromRef.literal("c_src"), List.of("c_src"));
         return new DagBindings(
-                sourceKey -> source(FRONTIER.chainOf(sourceKey)),
+                sourceKey -> source(FRONTIER.chainOf(sourceKey), placement),
                 step -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
                 element -> (SupplierEx<SinkWriter>) HoldingWriter::new,
                 ref -> upstreams.getOrDefault(ref, List.of()));
     }
 
     /** {@code table}'s source: its load through the hand-off, then its ring, stamping bounds as it reads. */
-    private static ProcessorMetaSupplier source(String table) {
+    private static ProcessorMetaSupplier source(String table, SourcePlacement placement) {
         byte axis = FRONTIER.axes().axisOf(table);
         return SrsSourceProcessor.metaSupplier(PIPELINE, ringOf(table), table, StartFrom.earliest(), null, 1L,
                 SrsReadCursorPublisherFactory.NONE,
-                order -> new Watermark(FrontierOrders.pack(table, order), axis), SourcePlacement.anyMember());
+                order -> new Watermark(FrontierOrders.pack(table, order), axis), placement);
     }
 
     /** Writes everything at once, except a write carrying {@code b}'s load row, which waits to be let finish. */
