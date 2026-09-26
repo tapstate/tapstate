@@ -832,12 +832,15 @@ final class Repl {
             return applyOnline(words);
         }
         // The two streaming sugars ride the read verbs over the websocket channel: `status --watch` and
-        // `logs --follow`. They are the only dash-options a connected verb accepts, and only on their verb.
+        // `logs --follow`. Scoped tail reads carry their own bounded selector below.
         if (words.get(0).equals("status") && words.contains("--watch")) {
             return statusWatch(words);
         }
         if (words.get(0).equals("logs") && words.contains("--follow")) {
             return logsFollow(words);
+        }
+        if (words.get(0).equals("logs")) {
+            return logsOnline(words);
         }
         // Composed here out of the verbs the product has, so it parses its own words: the four it
         // composes are all positional, and the guard below would refuse the one option this takes.
@@ -3873,12 +3876,23 @@ final class Repl {
     }
 
     private int logsOnline(List<String> words) {
+        if (words.size() != 2 && (words.size() != 4 || !"--scope".equals(words.get(2)))) {
+            commandLine.getErr().println("logs: usage: logs <pipeline-id> [--scope current|incarnation]");
+            commandLine.getErr().flush();
+            return Cli.EXIT_USAGE;
+        }
         String id = readTargetId(words);
         if (id == null) {
             return Cli.EXIT_USAGE;
         }
+        String scope = words.size() == 4 ? words.get(3) : "current";
+        if (!scope.equals("current") && !scope.equals("incarnation")) {
+            commandLine.getErr().println("logs: scope must be current or incarnation");
+            commandLine.getErr().flush();
+            return Cli.EXIT_USAGE;
+        }
         LogsOutcome outcome = withFailover(() ->
-                controlPlane.logs(session.landingNode(), session.credential(), id),
+                controlPlane.logs(session.landingNode(), session.credential(), id, scope),
                 o -> o instanceof LogsOutcome.Unreachable);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {

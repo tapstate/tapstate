@@ -328,9 +328,18 @@ final class McpOperationExecutor {
 
     private McpResult pipelineLogs(Map<String, Object> arguments) {
         String path = "/api/pipelines/" + segment(required(arguments, "id")) + "/logs";
+        Object scope = arguments.get("scope");
+        if (scope != null && (!(scope instanceof String value)
+                || (!value.equals("current") && !value.equals("incarnation")))) {
+            return McpResult.coded(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "scope must be current or incarnation"));
+        }
         Object limit = arguments.get("limit");
         if (limit instanceof Number number) {
             path += "?limit=" + Math.max(1, Math.min(200, number.intValue()));
+        }
+        if (scope != null) {
+            path += (path.contains("?") ? "&" : "?") + "scope=" + segment((String) scope);
         }
         return get(path);
     }

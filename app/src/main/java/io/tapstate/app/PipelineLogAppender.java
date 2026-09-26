@@ -38,8 +38,25 @@ final class PipelineLogAppender extends AppenderBase<ILoggingEvent> {
         if (pipelineId == null || pipelineId.isBlank()) {
             return;
         }
-        sink.append(pipelineId,
-                new LogLine(event.getTimeStamp(), event.getLevel().toString(), redactor.redact(render(event))));
+        LogLine line = new LogLine(event.getTimeStamp(), event.getLevel().toString(),
+                redactor.redact(render(event)));
+        String incarnation = event.getMDCPropertyMap().get(PipelineAttribution.INCARNATION_MDC_KEY);
+        String generation = event.getMDCPropertyMap().get(PipelineAttribution.EXECUTION_MDC_KEY);
+        if (incarnation == null && generation == null) {
+            sink.append(pipelineId, line);
+            return;
+        }
+        if (incarnation == null || generation == null) {
+            return;
+        }
+        LogSink.Scope scope;
+        try {
+            scope = new LogSink.Scope(incarnation, Long.parseLong(generation));
+        } catch (IllegalArgumentException malformedContext) {
+            // An invalid diagnostic context cannot be assigned to another execution.
+            return;
+        }
+        sink.append(pipelineId, scope, line);
     }
 
     /** The formatted message, with the exception's stack trace appended when the event carries one. */

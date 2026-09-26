@@ -20,6 +20,10 @@ public final class PipelineAttribution {
     /** The diagnostic-context key a log line's pipeline id is carried in. */
     public static final String MDC_KEY = "pipeline_id";
 
+    /** Internal log-tail ownership keys; neither is a remote metrics label. */
+    public static final String INCARNATION_MDC_KEY = "pipeline_incarnation_id";
+    public static final String EXECUTION_MDC_KEY = "pipeline_execution_generation";
+
     private PipelineAttribution() {
     }
 }

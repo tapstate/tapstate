@@ -187,6 +187,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
         private final String pipelineId;
         private final DesiredState desired;
         private final Supplier<ConvergeResult> reconcile;
+        private final PipelineLogContext logContext;
         private volatile Thread runner;
         private volatile boolean cancelled;
         private volatile Outcome outcome;
@@ -195,6 +196,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
             this.pipelineId = pipelineId;
             this.desired = desired;
             this.reconcile = reconcile;
+            this.logContext = PipelineLogContext.capture();
         }
 
         private void supersede() {
@@ -215,7 +217,8 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
         @Override
         public void run() {
             runner = Thread.currentThread();
-            String previousPipeline = MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+            PipelineLogContext previousLogContext = PipelineLogContext.capture();
+            logContext.restore();
             MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
             try {
                 if (cancelled) {
@@ -230,11 +233,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
                     throw error;
                 }
             } finally {
-                if (previousPipeline == null) {
-                    MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
-                } else {
-                    MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, previousPipeline);
-                }
+                previousLogContext.restore();
                 runner = null;
             }
         }

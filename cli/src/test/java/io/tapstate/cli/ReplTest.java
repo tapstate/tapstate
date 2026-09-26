@@ -248,6 +248,7 @@ class ReplTest {
         final List<String> positionBodies = new ArrayList<>();
         final List<String> snapshotCalls = new ArrayList<>();
         final List<String> logsCalls = new ArrayList<>();
+        final List<String> logsScopes = new ArrayList<>();
         final List<String> watchCalls = new ArrayList<>();
         final List<String> followCalls = new ArrayList<>();
 
@@ -589,6 +590,12 @@ class ReplTest {
         public LogsOutcome logs(URI baseUrl, String credential, String pipelineId) {
             logsCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
             return healthy.contains(baseUrl) ? logsOutcome : new LogsOutcome.Unreachable();
+        }
+
+        @Override
+        public LogsOutcome logs(URI baseUrl, String credential, String pipelineId, String scope) {
+            logsScopes.add(scope);
+            return logs(baseUrl, credential, pipelineId);
         }
 
         /** What every member answers, which is the same answer: the cluster, not the node reached. */
@@ -5364,6 +5371,19 @@ class ReplTest {
         int mark = h.sink().toString().length();
         h.repl().dispatch("logs pl1");
         assertThat(h.sink().toString().substring(mark)).contains("no logs");
+    }
+
+    @Test
+    void logsScopeSelectsRetainedIncarnationWithoutAnInternalIdentitySelector() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.logsOutcome = new LogsOutcome.Found("pl1", List.of());
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("logs pl1 --scope incarnation")).isTrue();
+        assertThat(client.logsScopes).containsExactly("incarnation");
+        int calls = client.logsCalls.size();
+        assertThat(h.repl().dispatch("logs pl1 --scope old-run")).isTrue();
+        assertThat(client.logsCalls).hasSize(calls);
     }
 
     // --- cluster: the topology read -------------------------------------------------------------

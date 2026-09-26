@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import ch.qos.logback.classic.Logger;
 import io.tapstate.core.logging.LogLine;
+import io.tapstate.core.logging.LogSink;
+import io.tapstate.core.logging.PipelineAttribution;
 import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.core.logging.SecretRedactor;
 import org.junit.jupiter.api.Test;
@@ -30,9 +32,26 @@ class PipelineLogAppenderTest {
             body.accept(logger);
         } finally {
             MDC.remove(MDC_KEY);
+            MDC.remove(PipelineAttribution.INCARNATION_MDC_KEY);
+            MDC.remove(PipelineAttribution.EXECUTION_MDC_KEY);
             logger.detachAppender(appender);
             appender.stop();
         }
+    }
+
+    @Test
+    void capturesTheEmittingExecutionWithoutExposingItsIdentityInTheLine() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+        withAppender(sink, "test.logs.scoped", logger -> {
+            MDC.put(MDC_KEY, "orders");
+            MDC.put(PipelineAttribution.INCARNATION_MDC_KEY, "resource-a");
+            MDC.put(PipelineAttribution.EXECUTION_MDC_KEY, "7");
+            logger.info("execution line");
+        });
+
+        assertThat(sink.tail("orders")).isEmpty();
+        assertThat(sink.tail("orders", new LogSink.Scope("resource-a", 7)))
+                .extracting(LogLine::message).containsExactly("execution line");
     }
 
     @Test

@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.PipelineLogQueryService;
+import io.tapstate.control.core.PipelineLogQueryService.Scope;
 import io.tapstate.control.core.PipelineLogs;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -29,10 +30,16 @@ class PipelineLogsController {
     @GetMapping("/pipelines/{id}/logs")
     PipelineLogs logs(
             @PathVariable("id") String id,
-            @RequestParam(value = "limit", required = false) Integer limit) {
+            @RequestParam(value = "limit", required = false) Integer limit,
+            @RequestParam(value = "scope", required = false, defaultValue = "current") String scope) {
         if (limit != null && limit < 1) {
             throw MalformedRequest.rejecting("limit must be positive", null);
         }
-        return limit == null ? logs.logs(id) : logs.logs(id, limit);
+        Scope selected = switch (scope) {
+            case "current" -> Scope.CURRENT;
+            case "incarnation" -> Scope.INCARNATION;
+            default -> throw MalformedRequest.rejecting("scope must be current or incarnation", null);
+        };
+        return limit == null ? logs.logs(id, selected) : logs.logs(id, limit, selected);
     }
 }

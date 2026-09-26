@@ -1984,6 +1984,22 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void logsPassesIncarnationScopeToTheSharedReadEndpoint() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1/logs", 200,
+                "{\"pipelineId\":\"pl1\",\"lines\":[]}", seen);
+        try {
+            LogsOutcome outcome = new HttpControlPlaneClient().logs(
+                    baseOf(server), "tok", "pl1", "incarnation");
+            assertThat(outcome).isInstanceOf(LogsOutcome.Found.class);
+            assertThat(seen.get().path()).isEqualTo("/api/pipelines/pl1/logs");
+            assertThat(seen.get().query()).isEqualTo("scope=incarnation");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void logsWithNoLinesIsABenignEmptyFound() throws Exception {
         HttpServer server = apiServer("/api/pipelines/pl1/logs", 200,
                 "{\"pipelineId\":\"pl1\",\"lines\":[]}", new AtomicReference<>());

@@ -144,9 +144,12 @@ final class ConvergenceDriver {
         int first = pipelineIds.isEmpty() ? 0 : (int) Math.floorMod(dispatchTurn++, pipelineIds.size());
         for (int at = 0; at < pipelineIds.size(); at++) {
             String pipelineId = pipelineIds.get((first + at) % pipelineIds.size());
+            PipelineLogContext previousLogContext = PipelineLogContext.capture();
             // Attribute every line logged while reconciling this pipeline to it, so the logs read face can
             // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
             MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+            PipelineLogContext.bindScope(observationScopes == null ? null
+                    : observationScopes.current(pipelineId).orElse(null));
             try {
                 PipelineActuationOwnership.Permit permit = actuation.permit(pipelineId);
                 if (permit.retry()) {
@@ -256,7 +259,7 @@ final class ConvergenceDriver {
                     LOG.warn("Could not publish the reconcile failure for pipeline {}", pipelineId, unpublishable);
                 }
             } finally {
-                MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+                previousLogContext.restore();
             }
         }
         // Forget what is kept per pipeline for pipelines that are no longer desired, so a

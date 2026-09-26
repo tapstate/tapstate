@@ -356,14 +356,15 @@ class ControlPlaneConfiguration {
     ArtifactMutationService artifactMutationService(
             ArtifactStore artifactStore, StorePort storePort, AuditGate auditGate,
             ObjectProvider<DataBrowserFollows> follows,
-            java.util.concurrent.ThreadPoolExecutor rateHistoryCleanupExecutor) {
+            java.util.concurrent.ThreadPoolExecutor rateHistoryCleanupExecutor, LogSink logSink) {
         // The removal takes the same artifact store bean apply writes through, so both paths see one
         // view of a resource. The dependent bookkeeping a removed pipeline owns is reclaimed straight
         // off the store port: those facets have no service in front of them.
         return new ArtifactMutationService(
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
                 storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), storePort.rateHistory(),
-                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE), rateHistoryCleanupExecutor);
+                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE), rateHistoryCleanupExecutor,
+                logSink);
     }
 
     @Bean(destroyMethod = "shutdownNow")
@@ -688,8 +689,12 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    PipelineLogQueryService pipelineLogQueryService(LogSink logSink) {
-        return new PipelineLogQueryService(logSink);
+    PipelineLogQueryService pipelineLogQueryService(LogSink logSink, StorePort storePort,
+            ClusterProperties cluster, ClusterIdentityStore clusterIdentities) {
+        String clusterId = cluster.getProfile() == ClusterProperties.Profile.SINGLE
+                ? DataPlaneActuationConfiguration.standaloneClusterId(cluster, clusterIdentities)
+                : cluster.getId();
+        return new PipelineLogQueryService(logSink, storePort.artifacts(), storePort.workloadClaims(), clusterId);
     }
 
     @Bean

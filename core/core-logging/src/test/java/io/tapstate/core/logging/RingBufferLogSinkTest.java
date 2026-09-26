@@ -10,6 +10,38 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class RingBufferLogSinkTest {
 
+    @Test
+    void recreatedIdAndDelayedOldClearCannotExposeOrRemoveNewLines() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+        LogSink.Scope oldRun = new LogSink.Scope("old-resource", 4);
+        LogSink.Scope newRun = new LogSink.Scope("new-resource", 5);
+        sink.append("orders", oldRun, line("old line"));
+        sink.append("orders", newRun, line("new line"));
+
+        assertThat(sink.tail("orders", newRun)).extracting(LogLine::message)
+                .containsExactly("new line");
+        sink.clearIncarnation("orders", "old-resource");
+        assertThat(sink.tail("orders", newRun)).extracting(LogLine::message)
+                .containsExactly("new line");
+        assertThat(sink.tailIncarnation("orders", "old-resource")).isEmpty();
+    }
+
+    @Test
+    void scopedExecutionsShareTheExistingLineAndPipelineBounds() {
+        RingBufferLogSink sink = new RingBufferLogSink(1, 2);
+        LogSink.Scope first = new LogSink.Scope("resource-a", 1);
+        LogSink.Scope second = new LogSink.Scope("resource-a", 2);
+        sink.append("orders", first, line("oldest"));
+        sink.append("orders", second, line("newer"));
+        sink.append("orders", second, line("newest"));
+        assertThat(sink.tail("orders", first)).isEmpty();
+        assertThat(sink.tail("orders", second)).extracting(LogLine::message)
+                .containsExactly("newer", "newest");
+
+        sink.append("invoices", new LogSink.Scope("resource-b", 1), line("another pipeline"));
+        assertThat(sink.tailIncarnation("orders", "resource-a")).isEmpty();
+    }
+
     private static LogLine line(String message) {
         return new LogLine(0L, "INFO", message);
     }

@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -77,6 +78,7 @@ public final class ArtifactMutationService {
     private final PipelineLayoutStore layouts;
     private final RateHistoryStore rateHistory;
     private final Executor historyCleanup;
+    private final LogSink logSink;
     private final SrsMetaStore srsMeta;
     private final DerivedSchemaStore derivedSchemas;
     private final AuditGate auditGate;
@@ -229,6 +231,23 @@ public final class ArtifactMutationService {
             AuditGate auditGate,
             DataBrowserFollows follows,
             Executor historyCleanup) {
+        this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                auditGate, follows, historyCleanup, null);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            PipelineLayoutStore layouts,
+            SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
+            RateHistoryStore rateHistory,
+            AuditGate auditGate,
+            DataBrowserFollows follows,
+            Executor historyCleanup,
+            LogSink logSink) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
@@ -236,6 +255,7 @@ public final class ArtifactMutationService {
         this.layouts = Objects.requireNonNull(layouts, "layouts");
         this.rateHistory = Objects.requireNonNull(rateHistory, "rateHistory");
         this.historyCleanup = Objects.requireNonNull(historyCleanup, "historyCleanup");
+        this.logSink = logSink;
         this.srsMeta = Objects.requireNonNull(srsMeta, "srsMeta");
         this.derivedSchemas = Objects.requireNonNull(derivedSchemas, "derivedSchemas");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -378,7 +398,7 @@ public final class ArtifactMutationService {
      * left out of the other. Nothing runs while the list is built.
      */
     private List<ReclaimStep> reclaimStepsOf(String id, Visibility visibility) {
-        return List.of(
+        List<ReclaimStep> steps = new ArrayList<>(List.of(
                 new ReclaimStep("mining-chain-consumer", () -> detachFromEveryChain(id)),
                 new ReclaimStep("desired", () -> desired.delete(id)),
                 new ReclaimStep("state", () -> state.delete(id)),
@@ -390,7 +410,33 @@ public final class ArtifactMutationService {
                 new ReclaimStep("derived-schema", () -> derivedSchemas.delete(id)),
                 // The captured old owner protects a recreated resource from delayed cleanup. History
                 // visibility is already scoped, and expiry bounds any residue after a failed delete.
-                new ReclaimStep("rate-history", () -> submitHistoryCleanup(id, visibility)));
+                new ReclaimStep("rate-history", () -> submitHistoryCleanup(id, visibility))));
+        if (logSink != null) {
+            steps.add(new ReclaimStep("node-local-logs", () -> submitLogCleanup(id, visibility)));
+        }
+        return List.copyOf(steps);
+    }
+
+    private void submitLogCleanup(String id, Visibility visibility) {
+        if (logSink == null) {
+            return;
+        }
+        try {
+            historyCleanup.execute(() -> {
+                try {
+                    if (visibility.incarnationId() != null) {
+                        logSink.clearIncarnation(id, visibility.incarnationId());
+                    }
+                    if (visibility.includeLegacy()) {
+                        logSink.clearLegacy(id);
+                    }
+                } catch (RuntimeException failed) {
+                    LOG.log(Level.WARNING, "Could not clear node-local logs for " + id, failed);
+                }
+            });
+        } catch (RuntimeException rejected) {
+            LOG.log(Level.WARNING, "Could not schedule node-local log cleanup for " + id, rejected);
+        }
     }
 
     private void submitHistoryCleanup(String id, Visibility visibility) {

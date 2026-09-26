@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.sql.JoinKey;
+import io.tapstate.core.logging.PipelineAttribution;
 import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.engine.join.DimensionRowDisplacedAlert;
 
@@ -37,23 +38,30 @@ final class LoggingDimensionRowDisplacedAlert implements DimensionRowDisplacedAl
 
     private final String pipelineId;
     private final String stepId;
+    private final String incarnationId;
+    private final String generation;
     private final AtomicLong count = new AtomicLong();
 
     /** An unbound template, carried with the graph until a member starts one join vertex. */
     LoggingDimensionRowDisplacedAlert() {
         this.pipelineId = null;
         this.stepId = null;
+        this.incarnationId = MDC.get(PipelineAttribution.INCARNATION_MDC_KEY);
+        this.generation = MDC.get(PipelineAttribution.EXECUTION_MDC_KEY);
     }
 
-    private LoggingDimensionRowDisplacedAlert(String pipelineId, String stepId) {
+    private LoggingDimensionRowDisplacedAlert(String pipelineId, String stepId,
+            String incarnationId, String generation) {
         this.pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
         this.stepId = Objects.requireNonNull(stepId, "stepId");
+        this.incarnationId = incarnationId;
+        this.generation = generation;
     }
 
     /** Gives each member-side vertex its own attribution and widening counter. */
     @Override
     public DimensionRowDisplacedAlert bind(String pipelineId, String stepId) {
-        return new LoggingDimensionRowDisplacedAlert(pipelineId, stepId);
+        return new LoggingDimensionRowDisplacedAlert(pipelineId, stepId, incarnationId, generation);
     }
 
     @Override
@@ -75,17 +83,19 @@ final class LoggingDimensionRowDisplacedAlert implements DimensionRowDisplacedAl
         // is what this severity means. Throwing it would stop a job over data that is merely ambiguous.
         TapstateException coded =
                 new TapstateException(EngineError.JOIN_DIMENSION_ROW_DISPLACED, args, null);
-        String previousPipeline = MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+        PipelineLogContext previousLogContext = PipelineLogContext.capture();
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+        if (incarnationId == null || generation == null) {
+            PipelineLogContext.bindScope(null);
+        } else {
+            MDC.put(PipelineAttribution.INCARNATION_MDC_KEY, incarnationId);
+            MDC.put(PipelineAttribution.EXECUTION_MDC_KEY, generation);
+        }
         try {
             LOG.warn("{} (pipeline {}, step {}, {} displaced so far on this member)",
                     coded.getMessage(), pipelineId, stepId, seen);
         } finally {
-            if (previousPipeline == null) {
-                MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
-            } else {
-                MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, previousPipeline);
-            }
+            previousLogContext.restore();
         }
     }
 

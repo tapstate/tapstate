@@ -120,6 +120,29 @@ class PipelineLogsApiTest {
     }
 
     @Test
+    void logsAcceptsIncarnationScopeWithoutChangingTheResponseShape() {
+        PipelineLogs body = client().get().uri("/api/pipelines/pl1/logs?scope=incarnation")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+
+        assertThat(body.pipelineId()).isEqualTo("pl1");
+        assertThat(body.lines()).extracting(LogLine::message)
+                .containsExactly("submitted job", "converged to RUNNING");
+    }
+
+    @Test
+    void logsRejectsUnknownScopeAsCodedClientError() {
+        ApiError body = client().get().uri("/api/pipelines/pl1/logs?scope=old-run")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("control.malformed-request");
+    }
+
+    @Test
     void logsRejectsNonPositiveLimitsAsClientErrors() {
         for (String limit : List.of("0", "-1")) {
             ApiError body = client().get().uri("/api/pipelines/pl1/logs?limit=" + limit)

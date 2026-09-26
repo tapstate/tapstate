@@ -1703,9 +1703,16 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public LogsOutcome logs(URI baseUrl, String credential, String pipelineId) {
+        return logs(baseUrl, credential, pipelineId, "current");
+    }
+
+    @Override
+    public LogsOutcome logs(URI baseUrl, String credential, String pipelineId, String scope) {
         try {
+            String path = "/api/pipelines/" + pipelineId + "/logs"
+                    + ("current".equals(scope) ? "" : "?scope=" + scope);
             HttpRequest request =
-                    authed(baseUrl, "/api/pipelines/" + pipelineId + "/logs", credential).GET().build();
+                    authed(baseUrl, path, credential).GET().build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {

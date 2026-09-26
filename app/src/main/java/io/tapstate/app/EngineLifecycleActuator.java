@@ -177,8 +177,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         }
         // Capture opens the SRS generation that source vertices compile into the DAG. Build from the
         // same frozen artifacts after provisioning, but submit only when the checkpoint CAS succeeds.
+        PipelineLogContext previousLogContext = PipelineLogContext.capture();
         DagSource.StartPlan plan;
         try {
+            PipelineLogContext.bindScope(observationScope);
             plan = prepared.build(execution.fence());
         } catch (RuntimeException | Error failure) {
             try {
@@ -190,6 +192,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 observationScopes.discard(pipelineId, observationScope);
             }
             throw failure;
+        } finally {
+            previousLogContext.restore();
         }
         if (Thread.currentThread().isInterrupted()) {
             closeCaptureAfterCancellation(pipelineId);
@@ -208,7 +212,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     throw new IllegalStateException("prepared pipeline start was closed or already submitted");
                 }
                 submitted = true;
+                PipelineLogContext submitLogContext = PipelineLogContext.capture();
                 try {
+                    PipelineLogContext.bindScope(observationScope);
                     engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
                     captureCoordinator.activateSnapshot(pipelineId);
                 } catch (RuntimeException | Error failure) {
@@ -228,6 +234,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                         observationScopes.discard(pipelineId, observationScope);
                     }
                     throw failure;
+                } finally {
+                    submitLogContext.restore();
                 }
             }
 
@@ -238,11 +246,17 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 }
                 closed = true;
                 if (!submitted) {
+                    PipelineLogContext closeLogContext = PipelineLogContext.capture();
                     try {
+                        PipelineLogContext.bindScope(observationScope);
                         captureCoordinator.stopCapture(pipelineId, false);
                     } finally {
-                        if (observationScope != null) {
-                            observationScopes.discard(pipelineId, observationScope);
+                        try {
+                            if (observationScope != null) {
+                                observationScopes.discard(pipelineId, observationScope);
+                            }
+                        } finally {
+                            closeLogContext.restore();
                         }
                     }
                 }

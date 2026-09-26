@@ -16,8 +16,11 @@ import java.util.Objects;
  */
 public final class RingBufferLogSink implements LogSink {
 
+    private record StoredLine(Scope scope, LogLine line) {
+    }
+
     private final int maxLinesPerPipeline;
-    private final Map<String, Deque<LogLine>> byPipeline;
+    private final Map<String, Deque<StoredLine>> byPipeline;
 
     /**
      * @param maxPipelines        the most pipelines to retain lines for; the least-recently-appended
@@ -32,7 +35,7 @@ public final class RingBufferLogSink implements LogSink {
         this.maxLinesPerPipeline = maxLinesPerPipeline;
         this.byPipeline = new LinkedHashMap<>() {
             @Override
-            protected boolean removeEldestEntry(Map.Entry<String, Deque<LogLine>> eldest) {
+            protected boolean removeEldestEntry(Map.Entry<String, Deque<StoredLine>> eldest) {
                 return size() > maxPipelines;
             }
         };
@@ -40,15 +43,20 @@ public final class RingBufferLogSink implements LogSink {
 
     @Override
     public synchronized void append(String pipelineId, LogLine line) {
+        append(pipelineId, null, line);
+    }
+
+    @Override
+    public synchronized void append(String pipelineId, Scope scope, LogLine line) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(line, "line");
         // Remove then re-insert so this pipeline becomes the most-recently-appended entry (insertion
         // order is the recency order the cardinality bound evicts against).
-        Deque<LogLine> lines = byPipeline.remove(pipelineId);
+        Deque<StoredLine> lines = byPipeline.remove(pipelineId);
         if (lines == null) {
             lines = new ArrayDeque<>();
         }
-        lines.addLast(line);
+        lines.addLast(new StoredLine(scope, line));
         while (lines.size() > maxLinesPerPipeline) {
             lines.removeFirst();
         }
@@ -57,7 +65,49 @@ public final class RingBufferLogSink implements LogSink {
 
     @Override
     public synchronized List<LogLine> tail(String pipelineId) {
-        Deque<LogLine> lines = byPipeline.get(pipelineId);
-        return lines == null ? List.of() : List.copyOf(lines);
+        return select(pipelineId, scope -> scope == null);
+    }
+
+    @Override
+    public synchronized List<LogLine> tail(String pipelineId, Scope scope) {
+        Objects.requireNonNull(scope, "scope");
+        return select(pipelineId, scope::equals);
+    }
+
+    @Override
+    public synchronized List<LogLine> tailIncarnation(String pipelineId, String incarnationId) {
+        Objects.requireNonNull(incarnationId, "incarnationId");
+        return select(pipelineId, scope -> scope != null
+                && incarnationId.equals(scope.pipelineIncarnationId()));
+    }
+
+    private List<LogLine> select(String pipelineId, java.util.function.Predicate<Scope> matches) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Deque<StoredLine> lines = byPipeline.get(pipelineId);
+        return lines == null ? List.of() : lines.stream().filter(stored -> matches.test(stored.scope()))
+                .map(StoredLine::line).toList();
+    }
+
+    @Override
+    public synchronized void clearIncarnation(String pipelineId, String incarnationId) {
+        Objects.requireNonNull(incarnationId, "incarnationId");
+        clearMatching(pipelineId, scope -> scope != null
+                && incarnationId.equals(scope.pipelineIncarnationId()));
+    }
+
+    @Override
+    public synchronized void clearLegacy(String pipelineId) {
+        clearMatching(pipelineId, scope -> scope == null);
+    }
+
+    private void clearMatching(String pipelineId, java.util.function.Predicate<Scope> matches) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Deque<StoredLine> lines = byPipeline.get(pipelineId);
+        if (lines != null) {
+            lines.removeIf(stored -> matches.test(stored.scope()));
+            if (lines.isEmpty()) {
+                byPipeline.remove(pipelineId);
+            }
+        }
     }
 }

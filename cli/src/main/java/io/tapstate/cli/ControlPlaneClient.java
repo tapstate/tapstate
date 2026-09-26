@@ -279,6 +279,14 @@ interface ControlPlaneClient extends AutoCloseable {
      */
     LogsOutcome logs(URI baseUrl, String credential, String pipelineId);
 
+    /** Reads the current execution or the retained tail of the current resource. */
+    default LogsOutcome logs(URI baseUrl, String credential, String pipelineId, String scope) {
+        if (!"current".equals(scope)) {
+            throw new UnsupportedOperationException("scoped logs are unavailable");
+        }
+        return logs(baseUrl, credential, pipelineId);
+    }
+
     /**
      * Reads what a pipeline's join steps derive their output columns to be via
      * {@code GET {baseUrl}/api/pipelines/{pipelineId}/derived-schema}, authenticated by the bearer

@@ -11,12 +11,47 @@ import java.util.List;
  */
 public interface LogSink {
 
+    /** Internal owner of a captured line; never projected in a public logs response. */
+    record Scope(String pipelineIncarnationId, long executionGeneration) {
+        public Scope {
+            java.util.Objects.requireNonNull(pipelineIncarnationId, "pipelineIncarnationId");
+            if (pipelineIncarnationId.isBlank() || executionGeneration < 1) {
+                throw new IllegalArgumentException("log scope requires an incarnation and execution generation");
+            }
+        }
+    }
+
     /** Records one log line against a pipeline. */
     void append(String pipelineId, LogLine line);
+
+    /** Records a line under the execution that emitted it. */
+    default void append(String pipelineId, Scope scope, LogLine line) {
+        throw new UnsupportedOperationException("scoped log append is unavailable");
+    }
 
     /**
      * Returns the most recent buffered lines for a pipeline, oldest to newest, as an immutable
      * snapshot. Empty when the pipeline has logged nothing (or is unknown to this node).
      */
     List<LogLine> tail(String pipelineId);
+
+    /** Reads only lines from one current execution. */
+    default List<LogLine> tail(String pipelineId, Scope scope) {
+        throw new UnsupportedOperationException("scoped log tail is unavailable");
+    }
+
+    /** Reads retained executions belonging to one current resource. */
+    default List<LogLine> tailIncarnation(String pipelineId, String incarnationId) {
+        throw new UnsupportedOperationException("incarnation log tail is unavailable");
+    }
+
+    /** Best-effort removal that cannot match a recreated resource's lines. */
+    default void clearIncarnation(String pipelineId, String incarnationId) {
+        throw new UnsupportedOperationException("scoped log cleanup is unavailable");
+    }
+
+    /** Removes only lines emitted before this pipeline had an identity. */
+    default void clearLegacy(String pipelineId) {
+        throw new UnsupportedOperationException("legacy log cleanup is unavailable");
+    }
 }

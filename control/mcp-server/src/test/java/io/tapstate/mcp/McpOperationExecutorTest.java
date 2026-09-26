@@ -58,6 +58,7 @@ class McpOperationExecutorTest {
             Map<String, Object> stop = Map.of("id", "orders", "purgeState", true);
             Map<String, Object> logs = new LinkedHashMap<>(pipeline);
             logs.put("limit", 999);
+            logs.put("scope", "incarnation");
             Map<String, Object> history = Map.of(
                     "id", "orders",
                     "from", "2026-09-20T10:00:00Z",
@@ -126,7 +127,7 @@ class McpOperationExecutorTest {
                     "/api/pipelines/orders:start", "/api/pipelines/orders:stop",
                     "/api/pipelines/orders:pause", "/api/pipelines/orders:resume",
                     "/api/pipelines/orders/status", "/api/pipelines/orders/metrics",
-                    "/api/pipelines/orders/snapshot", "/api/pipelines/orders/logs?limit=200",
+                    "/api/pipelines/orders/snapshot", "/api/pipelines/orders/logs?limit=200&scope=incarnation",
                     "/api/pipelines/orders/metrics/history?from=2026-09-20T10%3A00%3A00Z"
                             + "&to=2026-09-20T11%3A00%3A00Z&resolution=raw&limit=10"
                             + "&table=public.orders&cursor=next%20page",

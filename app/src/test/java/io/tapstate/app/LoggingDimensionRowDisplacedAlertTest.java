@@ -5,6 +5,8 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.tapstate.core.logging.LogLine;
+import io.tapstate.core.logging.LogSink;
+import io.tapstate.core.logging.PipelineAttribution;
 import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.core.sql.JoinKey;
@@ -39,6 +41,8 @@ class LoggingDimensionRowDisplacedAlertTest {
     @AfterEach
     void stopCapturing() {
         MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+        MDC.remove(PipelineAttribution.INCARNATION_MDC_KEY);
+        MDC.remove(PipelineAttribution.EXECUTION_MDC_KEY);
         logger.detachAppender(written);
         written.stop();
     }
@@ -105,6 +109,34 @@ class LoggingDimensionRowDisplacedAlertTest {
                 .contains("customers")
                 .contains("join_customers");
         assertThat(sink.tail("outer_pipeline")).isEmpty();
+    }
+
+    @Test
+    void memberSideWarningKeepsTheExecutionCapturedWhenItsGraphWasBuilt() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+        PipelineLogAppender appender = new PipelineLogAppender(sink, new SecretRedactor());
+        appender.setContext(logger.getLoggerContext());
+        appender.start();
+        logger.addAppender(appender);
+        LoggingDimensionRowDisplacedAlert alert;
+        MDC.put(PipelineAttribution.INCARNATION_MDC_KEY, "resource-a");
+        MDC.put(PipelineAttribution.EXECUTION_MDC_KEY, "7");
+        try {
+            alert = bound();
+        } finally {
+            MDC.remove(PipelineAttribution.INCARNATION_MDC_KEY);
+            MDC.remove(PipelineAttribution.EXECUTION_MDC_KEY);
+        }
+        try {
+            alert.displaced("customers", JoinKey.of(List.of(1L)).name());
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
+
+        assertThat(sink.tail("orders_sync", new LogSink.Scope("resource-a", 7)))
+                .extracting(LogLine::message).singleElement().asString()
+                .contains("engine.join-dimension-row-displaced");
     }
 
     private static LoggingDimensionRowDisplacedAlert bound() {

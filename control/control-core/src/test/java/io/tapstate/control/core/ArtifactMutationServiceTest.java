@@ -20,6 +20,9 @@ import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.logging.LogLine;
+import io.tapstate.core.logging.LogSink;
+import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
@@ -399,6 +402,29 @@ class ArtifactMutationServiceTest {
         assertThat(rateHistory.deletedIncarnations).containsExactly("inc-old");
         assertThat(rateHistory.deleted).doesNotContain("inc-new");
         assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
+    }
+
+    @Test
+    void delayedLogCleanupUsesTheRemovedIncarnationAfterSameIdRecreation() {
+        List<Runnable> pending = new ArrayList<>();
+        RingBufferLogSink logs = new RingBufferLogSink(8, 8);
+        ArtifactMutationService delayed = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add, pending::add, logs);
+        PipelineResource first = pipeline("flow");
+        store.save(first);
+        store.assignIncarnation("flow", "inc-old");
+        logs.append("flow", new LogSink.Scope("inc-old", 1), new LogLine(1, "INFO", "old"));
+
+        delayed.delete(PRINCIPAL, "flow", hash(first));
+        store.save(pipeline("flow"));
+        store.assignIncarnation("flow", "inc-new");
+        LogSink.Scope newRun = new LogSink.Scope("inc-new", 2);
+        logs.append("flow", newRun, new LogLine(2, "INFO", "new"));
+        pending.forEach(Runnable::run);
+
+        assertThat(logs.tail("flow", newRun)).extracting(LogLine::message).containsExactly("new");
+        assertThat(logs.tailIncarnation("flow", "inc-old")).isEmpty();
     }
 
     @Test

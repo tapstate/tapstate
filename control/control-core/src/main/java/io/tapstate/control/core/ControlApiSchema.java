@@ -226,7 +226,9 @@ public final class ControlApiSchema {
         pair(defs, "PipelineSnapshot", pipelineId, opaque);
         Map<String, Object> logsRequest = object(
                 List.of("id"),
-                Map.of("id", id, "limit", integer(1, 200, "Maximum lines, capped by the server")),
+                Map.of("id", id, "limit", integer(1, 200, "Maximum lines, capped by the server"),
+                        "scope", Map.of("type", "string", "enum", List.of("current", "incarnation"),
+                                "description", "Current execution or retained executions of this resource")),
                 false);
         pair(defs, "PipelineLogs", logsRequest, opaque);
         pair(defs, "PipelineMetricsHistory", historyRequest(id), historyResult());
