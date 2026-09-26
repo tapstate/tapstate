@@ -284,6 +284,32 @@ class ObservabilityConsumerContractTest {
     }
 
     /**
+     * A run on a single member is fenced by nothing, so its plan names no generations - and every fixture's plan
+     * names them. Held to the schema here as well: a schema that required them would refuse exactly the answer
+     * a server that is no cluster member sends, and no fixture would say so.
+     */
+    @Test
+    void aPlanNamingNoGenerationsIsAdmittedByThePublishedClosedSchema() throws Exception {
+        Map<?, ?> schema = ControlApiSchema.resolve(ControlOperations.PIPELINE_EXPLAIN.schema().result());
+        PipelineExplanation unfenced = new PipelineExplanation(
+                "orders", PipelineState.RUNNING, PipelineExplanation.Kind.NO_MATCH,
+                "No diagnostic rule matched.", FROM, 1_000L, PipelineExplanation.Freshness.FRESH, List.of(),
+                List.of("Whether the source has changes waiting is not measured."), null, null)
+                .withPlan(new ExecutionPlan("orders", null, null, null, List.of("local"),
+                        List.of(new ExecutionPlan.Node("orders_sink", 4, "node-default", "native", 1, 4, 4,
+                                List.of(), 1024, 0L, List.of("orders_sink"))),
+                        FROM.minusSeconds(60)));
+
+        Object answer = JSON.readValue(JSON.writeValueAsString(PipelineExplanationResponse.of(unfenced)),
+                Object.class);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> plan = (Map<String, Object>) ((Map<String, Object>) answer).get("plan");
+        assertThat(plan).doesNotContainKey("claimGeneration").containsKey("nodes");
+        assertThat(refusals("$", answer, schema)).isEmpty();
+    }
+
+    /**
      * Where {@code schema} refuses {@code value}, by path. A closed object admits only the properties it names and
      * needs every one it requires; an array admits items its item schema admits; a one-of admits what any of its
      * branches admits; a typed scalar admits a value of that type, within its enum and minimum where it has them;
