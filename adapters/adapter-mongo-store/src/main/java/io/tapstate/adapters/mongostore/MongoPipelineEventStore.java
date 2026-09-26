@@ -4,6 +4,7 @@ import com.mongodb.MongoWriteException;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.Sorts;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ObservationFailure;
@@ -19,6 +20,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -77,15 +79,65 @@ public final class MongoPipelineEventStore implements PipelineEventStore {
                 if (duplicate.getError().getCode() != DUPLICATE_KEY) {
                     throw duplicate;
                 }
-                Document existing = bounded.find(Filters.eq(ID, event.id())).first();
-                if (existing == null) {
-                    throw duplicate;
-                }
-                if (!existing.equals(proposed)) {
-                    throw new IllegalStateException("an event id was reused with conflicting content: " + event.id());
-                }
+                settleDuplicate(bounded, event, proposed, duplicate);
             }
         });
+    }
+
+    private static void settleDuplicate(MongoCollection<Document> collection, PipelineEvent proposedEvent,
+            Document proposed, MongoWriteException duplicate) {
+        for (int attempt = 0; attempt < 4; attempt++) {
+            Document existing = collection.find(Filters.eq(ID, proposedEvent.id())).first();
+            if (existing == null) {
+                throw duplicate;
+            }
+            if (existing.equals(proposed)) {
+                return;
+            }
+            PipelineEvent merged = mergeGap(toEvent(existing), proposedEvent);
+            if (merged == null) {
+                throw new IllegalStateException(
+                        "an event id was reused with conflicting content: " + proposedEvent.id());
+            }
+            Document widened = toDocument(merged);
+            if (existing.equals(widened)) {
+                return;
+            }
+            Bson unchangedGap = Filters.and(Filters.eq(ID, proposedEvent.id()),
+                    Filters.eq(GAP_TO, existing.get(GAP_TO)),
+                    Filters.eq(GAP_REASONS, existing.get(GAP_REASONS)));
+            if (collection.replaceOne(unchangedGap, widened, new ReplaceOptions().upsert(false))
+                    .getModifiedCount() == 1) {
+                return;
+            }
+        }
+        throw new IllegalStateException("an event gap could not settle after concurrent retries: "
+                + proposedEvent.id());
+    }
+
+    private static PipelineEvent mergeGap(PipelineEvent existing, PipelineEvent proposed) {
+        if (existing.kind() != PipelineEvent.Kind.TELEMETRY_GAP
+                || proposed.kind() != PipelineEvent.Kind.TELEMETRY_GAP
+                || !existing.id().equals(proposed.id())
+                || !existing.pipelineId().equals(proposed.pipelineId())
+                || !existing.pipelineIncarnationId().equals(proposed.pipelineIncarnationId())
+                || existing.executionGeneration() != proposed.executionGeneration()
+                || !existing.occurredAt().equals(proposed.occurredAt())
+                || !Objects.equals(existing.beforeState(), proposed.beforeState())
+                || !Objects.equals(existing.afterState(), proposed.afterState())
+                || !Objects.equals(existing.failure(), proposed.failure())
+                || !Objects.equals(existing.reason(), proposed.reason())
+                || !existing.gap().from().equals(proposed.gap().from())) {
+            return null;
+        }
+        Instant to = existing.gap().to().isAfter(proposed.gap().to())
+                ? existing.gap().to() : proposed.gap().to();
+        EnumSet<PipelineEvent.GapReason> reasons = EnumSet.copyOf(existing.gap().reasons());
+        reasons.addAll(proposed.gap().reasons());
+        return new PipelineEvent(existing.id(), existing.pipelineId(), existing.pipelineIncarnationId(),
+                existing.executionGeneration(), existing.kind(), existing.occurredAt(),
+                existing.beforeState(), existing.afterState(), existing.failure(), existing.reason(),
+                new PipelineEvent.Gap(existing.gap().from(), to, List.copyOf(reasons)));
     }
 
     @Override

@@ -44,7 +44,10 @@ public interface PipelineEventStore {
         }
     }
 
-    /** Appends once; replaying an identical id and body succeeds, but a conflicting id fails visibly. */
+    /**
+     * Appends once. An identical replay succeeds; a gap marker may widen its interval and cause set
+     * after an ambiguous acknowledgement. Reusing an id for any other conflicting event fails visibly.
+     */
     void append(PipelineEvent event);
 
     /** Reads one incarnation in {@code [from,to)}, strictly after {@code after} when present. */

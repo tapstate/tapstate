@@ -53,6 +53,36 @@ class MongoPipelineEventStoreIT {
     }
 
     @Test
+    void ambiguousGapMarkerRetryCanWidenItsKnownLossWithoutMakingASecondMarker() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("pipeline_event_gap_retry_it");
+            database.drop();
+            MongoPipelineEventStore events = store(database);
+            Instant at = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+            PipelineEvent first = gap(at, at.minusSeconds(20), at.minusSeconds(10),
+                    List.of(PipelineEvent.GapReason.QUEUE_FULL));
+            PipelineEvent widened = gap(at, at.minusSeconds(20), at.minusSeconds(1),
+                    List.of(PipelineEvent.GapReason.QUEUE_FULL, PipelineEvent.GapReason.WRITE_FAILURE));
+
+            events.append(first);
+            events.append(widened);
+            events.append(first);
+
+            assertThat(SystemCollections.PIPELINE_EVENTS.on(database).countDocuments()).isEqualTo(1);
+            assertThat(events.readPage("orders", "inc-a", at, at.plusSeconds(1), null, 10).events())
+                    .containsExactly(widened);
+        }
+    }
+
+    private static PipelineEvent gap(Instant occurredAt, Instant from, Instant to,
+            List<PipelineEvent.GapReason> reasons) {
+        PipelineEvent.Gap gap = new PipelineEvent.Gap(from, to, reasons);
+        return new PipelineEvent(PipelineEvent.gapId("orders", "inc-a", 41, from),
+                "orders", "inc-a", 41, PipelineEvent.Kind.TELEMETRY_GAP,
+                occurredAt, null, null, null, null, gap);
+    }
+
+    @Test
     void pagesStayWithinOneIncarnationAcrossExecutionsAndOldCleanupKeepsNewEvents() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoDatabase database = client.getDatabase("pipeline_event_page_it");
