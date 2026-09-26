@@ -570,7 +570,12 @@ final class TelemetryDispatcher implements AutoCloseable {
         if (sampler != null) {
             offerSide(historyWorker, historyStats, observation.pipelineId(), "history",
                     () -> stillCurrent(observation.pipelineId(), scope)
-                            && sampler.appendIfDue(observation, scope));
+                            && sampler.appendIfDue(observation, scope),
+                    () -> {
+                        if (stillCurrent(observation.pipelineId(), scope)) {
+                            sampler.markDropped(observation, scope);
+                        }
+                    });
         }
         if (export != MetricsExport.none()) {
             offerSide(exportWorker, exportStats, observation.pipelineId(), "export", () -> {
@@ -590,7 +595,7 @@ final class TelemetryDispatcher implements AutoCloseable {
                     offeredScopes.put(observation.pipelineId(), scope);
                 }
                 return true;
-            });
+            }, null);
         }
     }
 
@@ -665,11 +670,12 @@ final class TelemetryDispatcher implements AutoCloseable {
     }
 
     private static void offerSide(ThreadPoolExecutor workers, Stats stats, String pipelineId, String sink,
-            BooleanSupplier write) {
+            BooleanSupplier write, Runnable onDrop) {
         try {
             workers.execute(() -> {
                 if (!stats.allow()) {
                     stats.dropped();
+                    dropped(onDrop, sink, pipelineId);
                     return;
                 }
                 Stats.Operation operation = stats.begin();
@@ -690,7 +696,19 @@ final class TelemetryDispatcher implements AutoCloseable {
             stats.queueDepth(workers.getQueue().size());
         } catch (java.util.concurrent.RejectedExecutionException saturated) {
             stats.dropped();
+            dropped(onDrop, sink, pipelineId);
             LOG.warn("{} telemetry for pipeline {} was dropped: queue is full", sink, pipelineId);
+        }
+    }
+
+    private static void dropped(Runnable onDrop, String sink, String pipelineId) {
+        if (onDrop == null) {
+            return;
+        }
+        try {
+            onDrop.run();
+        } catch (RuntimeException failed) {
+            LOG.warn("Could not record dropped {} telemetry for pipeline {}", sink, pipelineId, failed);
         }
     }
 

@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineEvent;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
@@ -10,6 +11,7 @@ import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineEventStore;
+import io.tapstate.spi.store.RateHistoryStore;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -28,6 +30,70 @@ import java.util.function.Supplier;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class TelemetryDispatcherTest {
+
+    @Test
+    void rejectedHistoryQueueFrameMarksTheNextRetainedSampleAsAGap() throws Exception {
+        Instant at = Instant.parse("2026-09-27T10:00:00Z");
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        InMemoryRateHistoryStore retained = new InMemoryRateHistoryStore();
+        RateHistoryStore blocked = new RateHistoryStore() {
+            @Override public void append(RateSample sample) { append(sample, null); }
+            @Override public void append(RateSample sample, Instant gapFrom) {
+                if (sample.observedAt().equals(at.plusSeconds(60))) {
+                    entered.countDown();
+                    try {
+                        if (!release.await(5, TimeUnit.SECONDS)) {
+                            throw new IllegalStateException("blocked append was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(interrupted);
+                    }
+                }
+                retained.append(sample, gapFrom);
+            }
+            @Override public Page readPage(String id, Instant from, Instant to, Key after, int limit) {
+                return retained.readPage(id, from, to, after, limit);
+            }
+            @Override public Optional<Entry> predecessor(String id, Instant time) {
+                return retained.predecessor(id, time);
+            }
+            @Override public Optional<Entry> read(String id, Key key) { return retained.read(id, key); }
+            @Override public Optional<Entry> successor(String id, Instant time) {
+                return retained.successor(id, time);
+            }
+            @Override public void deleteAll(String id) { retained.deleteAll(id); }
+            @Override public Duration retention() { return retained.retention(); }
+        };
+        RateSampler sampler = new RateSampler(blocked, Duration.ofSeconds(60));
+        sampler.appendIfDue(historyFrame(at, 100).observation());
+        try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), new InMemoryObservationStore()),
+                sampler, MetricsExport.none(), 1, 1)) {
+            dispatcher.offer(historyFrame(at.plusSeconds(60), 160), null);
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+            dispatcher.offer(historyFrame(at.plusSeconds(61), 161), null);
+            dispatcher.offer(historyFrame(at.plusSeconds(62), 162), null);
+            assertThat(dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).dropped()).isEqualTo(1);
+            release.countDown();
+            await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).successes() >= 1);
+            dispatcher.offer(historyFrame(at.plusSeconds(120), 220), null);
+            await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).successes() >= 2);
+
+            assertThat(retained.readPage("orders", at, at.plusSeconds(180), null, 10).entries())
+                    .extracting(RateHistoryStore.Entry::gapFrom)
+                    .containsExactly(null, null, at.plusSeconds(62));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    private static ObservationPublisher.Prepared historyFrame(Instant at, long out) {
+        Observation observation = new Observation("orders", PipelineState.RUNNING,
+                Map.of("records.out", out), Map.of(), Map.of(), null, at);
+        return new ObservationPublisher.Prepared(observation, false, Map.of(), Map.of(), Map.of());
+    }
 
     @Test
     void aBlockedExportResetCannotHoldAnotherPipelinesObservationOffer() throws Exception {
