@@ -22,6 +22,8 @@ import io.tapstate.runtime.engine.MemberOutOfMemory;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.join.JoinStateMapStoreFactory;
+import io.tapstate.runtime.engine.join.JoinUpdate;
+import io.tapstate.runtime.engine.join.JoinUpdateSerializer;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
@@ -522,6 +524,12 @@ class HazelcastConfiguration {
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
                 .setTypeClass(Envelope.class)
                 .setImplementation(new EnvelopeSerializer()));
+        // And what a join hands its projection, which carries a change inside it and would otherwise fall
+        // back to Java's serialization - which cannot write the change, on the first update routed to
+        // another member.
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(JoinUpdate.class)
+                .setImplementation(new JoinUpdateSerializer()));
         RingbufferConfig rings = new RingbufferConfig("srs.*")
                 .setCapacity(SRS_RING_CAPACITY)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
