@@ -37,6 +37,8 @@ final class PublishedConnectorArtifacts {
                     "7fbdbf1ef2965053c9c5e6d28c0c21c3aa2818938ab758b965cc278d61e0c7b4"),
             "mongodb-atlas", new Artifact(19_764_088,
                     "2f70bfe42baafcadb0c2d88042e173156c714f508d5089ce7eb8eab7edaa8e18"),
+            "aws-rds-mysql", new Artifact(47_043_627,
+                    "c70999b64201fbcfbe7b34acf9f6fa1b1d8aa357b3db770bbcab980deed9b399"),
             "postgres", new Artifact(52_771_466,
                     "535aaaed34594dcc9e2dd1937efc4b91865911f11de624aca555b59a609053ee"),
             "oracle", new Artifact(36_837_471,

@@ -497,6 +497,25 @@ if [[ "${TAPSTATE_NATIVE_SMOKE_PUBLIC_ATLAS:-0}" == "1" ]]; then
   fi
 fi
 
+# The RDS connector is published as a source-only preview. This checks its pinned distribution bytes
+# and native CLI registration transport, not connectivity to or CDC from a real Amazon RDS instance.
+if [[ "${TAPSTATE_NATIVE_SMOKE_PUBLIC_RDS:-0}" == "1" ]]; then
+  RDS_OUT=$(env -u TAPSTATE_CONNECTORS_URL -u TAPSTATE_BASE_URL TAPSTATE_PASSWORD=smoke-pw \
+              "$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin register aws-rds-mysql \
+              2>"$STUB_DIR/rds.err") && RDS_RC=0 || RDS_RC=$?
+  RDS_CLEAN=$(printf '%s' "$RDS_OUT" | strip_ansi)
+  RDS_ERR=$(<"$STUB_DIR/rds.err")
+  if (( RDS_RC == 0 )) \
+     && printf '%s' "$RDS_ERR" | grep -q 'downloading aws-rds-mysql-connector.jar from github.com' \
+     && printf '%s' "$RDS_ERR" | grep -q 'uploading aws-rds-mysql-connector.jar' \
+     && printf '%s' "$RDS_CLEAN" | grep -qE 'registered[[:space:]]+smoke'; then
+    ok "native register downloaded and uploaded the pinned public RDS preview JAR"
+  else
+    bad "native public RDS preview registration failed (rc=$RDS_RC); stdout:"; echo "$RDS_OUT"
+    echo "stderr:"; cat "$STUB_DIR/rds.err" 2>/dev/null || true
+  fi
+fi
+
 # a command that fails must fail the process: the whole point of running one from a script
 TAPSTATE_PASSWORD=smoke-pw "$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin start >/dev/null 2>&1 && BADRC=0 || BADRC=$?
 if (( BADRC != 0 )); then

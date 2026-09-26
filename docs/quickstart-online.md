@@ -50,6 +50,11 @@ scoped by direction:
 | Oracle | `oracle` | Read |
 | SQL Server | `sqlserver` | Read |
 
+`aws-rds-mysql` is available as a source-only **unverified preview**, outside the certified table.
+Its shaded PDK JAR exposes batch and stream read functions, but no real Amazon RDS for MySQL
+snapshot, binlog CDC, or restart-continuation run has been completed. It is not a write target.
+Real-service validation is tracked in [issue #529](https://github.com/tapstate/tapstate/issues/529).
+
 A `serve.sync` element installs onto the `mongodb` kind and no other,
 on any of its accepted ids. Applying a pipeline whose sync names one of the other
 certified connectors is refused, naming that connector and the document the element is
@@ -96,6 +101,10 @@ The `mongodb-atlas` jar is a separate asset on the same floating release. It is 
 three-database quickstart download; use `register mongodb-atlas` to install the verified bytes
 explicitly. The jar carries bundled third-party license and notice texts under `META-INF/`;
 publishing the binary does not grant a license to the upstream connector source repository.
+
+The `aws-rds-mysql` jar is also a separate, explicit-download asset on that release. Use
+`register aws-rds-mysql` only with the preview limitation above in mind; publishing and
+registering the JAR do not certify snapshot or CDC against a real Amazon RDS instance.
 
 The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
 miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
@@ -304,13 +313,15 @@ The jars are shaded and carry their own drivers on an isolated loader;
 `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
 FOSS Exception (see [`NOTICE`](../NOTICE)).
 
-The same release carries Oracle, SQL Server and MongoDB Atlas for explicit registration. From an
-authenticated CLI session, give `register` the published connector id instead of a local path:
+The same release carries Oracle, SQL Server, MongoDB Atlas, and the unverified AWS RDS MySQL preview
+for explicit registration. From an authenticated CLI session, give `register` the published
+connector id instead of a local path:
 
 ```console
 tapstate(admin@127.0.0.1:8080)> register oracle
 tapstate(admin@127.0.0.1:8080)> register sqlserver
 tapstate(admin@127.0.0.1:8080)> register mongodb-atlas
+tapstate(admin@127.0.0.1:8080)> register aws-rds-mysql
 ```
 
 The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to

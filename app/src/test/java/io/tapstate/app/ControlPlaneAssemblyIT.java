@@ -41,6 +41,7 @@ import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The whole control plane assembled over a real store, end to end through HTTP: the assembly root
@@ -310,6 +311,24 @@ class ControlPlaneAssemblyIT {
 
         String health = client.get().uri("/healthz").retrieve().body(String.class);
         assertThat(health).isEqualTo("ok");
+    }
+
+    @Test
+    void publishedAwsRdsMysqlArtifactSeedsIntoTheRealStoreWhenSupplied(@TempDir Path files)
+            throws IOException {
+        String artifact = System.getProperty("tapstate.pdk.it.awsRdsMysqlJar");
+        assumeTrue(artifact != null && !artifact.isBlank() && Files.isRegularFile(Path.of(artifact)),
+                "the published AWS RDS MySQL preview JAR is required");
+        Path seedDir = Files.createDirectories(files.resolve("seed"));
+        Path plugins = Files.createDirectories(files.resolve("plugins"));
+        Files.copy(Path.of(artifact), seedDir.resolve("aws-rds-mysql-connector.jar"));
+
+        start("tapstate.connectors.seed-dir=" + seedDir,
+                "tapstate.connectors.plugins-dir=" + plugins);
+
+        assertThat(context.getBean(StorePort.class).connectors().list())
+                .extracting(registration -> registration.connectorId())
+                .containsExactly("aws-rds-mysql");
     }
 
     @Test

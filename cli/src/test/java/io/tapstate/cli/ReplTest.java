@@ -3211,6 +3211,25 @@ class ReplTest {
     }
 
     @Test
+    void registerPublishedAwsRdsMysqlFromPublicReleaseWhenEnabled(@TempDir Path workdir) {
+        assumeTrue(Boolean.getBoolean("tapstate.it.published-connectors"),
+                "requires the live public connector release");
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("aws-rds-mysql", "hash-rds", "2.0.5-SNAPSHOT", true));
+        Harness h = onlineSession(workdir, client);
+
+        assertThat(h.repl().dispatch("register aws-rds-mysql")).isTrue();
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x47043627");
+        assertThat(h.sink().toString())
+                .contains("downloading aws-rds-mysql-connector.jar from github.com")
+                .contains("uploading aws-rds-mysql-connector.jar")
+                .contains("registered  aws-rds-mysql  hash-rds");
+    }
+
+    @Test
     void registerDownloadsFromTheConfiguredMirrorWithoutPollutingJson(@TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Registered(

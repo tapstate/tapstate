@@ -42,6 +42,21 @@ class PublishedConnectorArtifactsTest {
     }
 
     @Test
+    void awsRdsMysqlDownloadIsPinnedToThePublishedPreviewBytes() throws Exception {
+        URI source = PublishedConnectorArtifacts.artifact("aws-rds-mysql", ignored -> null);
+        assertThat(source).isEqualTo(URI.create("https://github.com/tapstate/tapstate/releases/download/"
+                + "connectors-preview/aws-rds-mysql-connector.jar"));
+        byte[] bytes = {1, 2, 3};
+        assertThat(PublishedConnectorArtifacts.download("aws-rds-mysql", source, (from, expected) -> {
+            assertThat(from).isEqualTo(source);
+            assertThat(expected.bytes()).isEqualTo(47_043_627);
+            assertThat(expected.sha256()).isEqualTo(
+                    "c70999b64201fbcfbe7b34acf9f6fa1b1d8aa357b3db770bbcab980deed9b399");
+            return PublishedConnectorArtifacts.Fetched.verified(bytes);
+        })).isEqualTo(bytes);
+    }
+
+    @Test
     void theHttpFetcherReturnsACompleteSuccessfulBody() throws Exception {
         byte[] jar = completeJar();
         HttpServer server = server(200, jar);
