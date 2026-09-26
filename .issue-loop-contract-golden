@@ -1,0 +1,7 @@
+Source: GitHub Actions run 36215942176, test-shards (e2e-2), commit eeb0074818e3c8f78df183924679b26e714c86ac
+Case: AnIndependentFailureStaysFailedAfterItsDriverLeavesIT, before the driver is killed
+Scenario: the test connector sink has fail_writes: true; the pipeline has reached FAILED
+Status failure code observed by CI: connector.write-failed
+Exact captured assertion value: Optional[connector.write-failed]
+The full status response was not printed by the failing test.
+Earlier local runs of this same case passed its engine.job-failed assertion.

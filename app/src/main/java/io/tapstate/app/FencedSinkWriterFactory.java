@@ -83,7 +83,18 @@ final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             authorization.require(fence);
-            return delegate.write(records);
+            try {
+                return delegate.write(records).whenComplete((ignored, failure) -> {
+                    if (PipelineFailures.isSinkWriteFailure(fence.pipelineId(), failure)) {
+                        authorization.recordSinkWriteFailure(fence);
+                    }
+                });
+            } catch (RuntimeException failure) {
+                if (PipelineFailures.isSinkWriteFailure(fence.pipelineId(), failure)) {
+                    authorization.recordSinkWriteFailure(fence);
+                }
+                throw failure;
+            }
         }
 
         @Override

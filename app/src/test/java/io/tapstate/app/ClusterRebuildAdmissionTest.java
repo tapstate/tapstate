@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
 import java.time.Duration;
 import java.util.Set;
@@ -21,6 +22,7 @@ class ClusterRebuildAdmissionTest {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Duration RENEW = Duration.ofSeconds(10);
     private static final Duration BACKOFF = TTL;
+    private static final Duration DETECTION = Duration.ofSeconds(30);
     private static final WorkloadOwner NODE_A = new WorkloadOwner("node-a", "boot-a");
 
     private final InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
@@ -31,7 +33,7 @@ class ClusterRebuildAdmissionTest {
             "cluster-a", NODE_A, membership, new ClusterWorkloadClaims(claims, membership), TTL, RENEW,
             nanos::get);
     private final ClusterRebuildAdmission admission =
-            new ClusterRebuildAdmission(ownership, BACKOFF, nanos::get);
+            new ClusterRebuildAdmission(ownership, BACKOFF, DETECTION, nanos::get);
 
     @Test
     void aRunNothingMovedUnderIsNotRebuilt() {
@@ -42,6 +44,187 @@ class ClusterRebuildAdmissionTest {
                 .as("the cluster is where it was when this run was fenced, so this death is the "
                         + "pipeline's own and stays recorded as one")
                 .isFalse();
+    }
+
+    @Test
+    void aRunThatFailedBeforeItsDriverRestartedIsNotRebuiltOnClaimTakeover() {
+        committed(7, "node-a", "node-b", "node-c");
+        assertThat(ownership.permit("orders").granted()).isTrue();
+        assertThat(ownership.beginExecution("orders").allowed()).isTrue();
+
+        // Admission is asked for a FAILED run. The intact view must survive failure detection.
+        assertThat(admission.admits("orders"))
+                .as("recovery waits for the member-loss detection window")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("an early intact publication cannot make the verdict durable")
+                .isFalse();
+        nanos.addAndGet(DETECTION.toNanos());
+        assertThat(admission.admits("orders"))
+                .as("the last publication may predate failure detection")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("an intact view after the detection window records an independent failure")
+                .isFalse();
+
+        // The driver restarts after that failure. Its stable node id remains in the committed and
+        // visible membership, but its new boot id must take over the expired claim.
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        PipelineActuationOwnership restarted = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a-restarted"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        PipelineActuationOwnership.Permit taken = restarted.permit("orders");
+        assertThat(taken.granted()).isTrue();
+        assertThat(taken.claim().claimGeneration()).isEqualTo(2);
+        assertThat(taken.claim().executionGeneration()).isEqualTo(1);
+        assertThat(membership.visibleNodeIds()).containsExactlyInAnyOrder("node-a", "node-b", "node-c");
+
+        assertThat(new ClusterRebuildAdmission(restarted, BACKOFF, DETECTION, nanos::get).admits("orders"))
+                .as("the run was already FAILED for its own reason before the claim changed hands")
+                .isFalse();
+    }
+
+    @Test
+    void aFailureRecordedBeforeAMemberLeavesDoesNotBecomeRecoverableLater() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+
+        assertThat(admission.admits("orders")).isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("an early intact view cannot confirm the failure was independent")
+                .isFalse();
+        nanos.addAndGet(DETECTION.toNanos());
+        assertThat(admission.admits("orders")).isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("the intact view after failure detection confirms the independent failure")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders"))
+                .as("the missing member appeared only after the failure was recorded")
+                .isFalse();
+    }
+
+    @Test
+    void aFailureSeenBeforeMembershipRefreshCanRecoverWhenTheMissingMemberBecomesVisible() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+
+        admission.recordFailure("orders");
+        assertThat(admission.admits("orders"))
+                .as("the last visible snapshot still includes every member, so recovery waits")
+                .isFalse();
+        assertThat(admission.admits("orders"))
+                .as("another pass over the same view is not new membership evidence")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders"))
+                .as("the refreshed view reveals the member lost under the failed run")
+                .isTrue();
+    }
+
+    @Test
+    void aStaleUnchangedPublicationCannotMakeTheFailureIndependentlyPermanent() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+
+        admission.recordFailure("orders");
+        // The membership reconciler can publish its old view again before Hazelcast detects the loss.
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders")).isFalse();
+        nanos.addAndGet(DETECTION.toNanos());
+        assertThat(admission.admits("orders"))
+                .as("the stale view cannot confirm a no-loss verdict at the detection boundary")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders"))
+                .as("an unchanged pre-detection view cannot make the later loss unrecoverable")
+                .isTrue();
+    }
+
+    @Test
+    void anUnmarkedFailureCanBeRebuiltWhenItsDriverLeavesDuringDetection() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        admission.recordFailure("orders");
+
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        membership.canCommit(Set.of("node-b", "node-c"));
+        PipelineActuationOwnership survivor = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-b", "boot-b"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(survivor.permit("orders").granted()).isTrue();
+
+        assertThat(new ClusterRebuildAdmission(survivor, BACKOFF, DETECTION, nanos::get).admits("orders"))
+                .as("the failure was still unclassified when its driver left")
+                .isTrue();
+    }
+
+    @Test
+    void aKnownSinkFailureMarkerStaysIndependentWhenMemberLossAppearsDuringDetection() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        assertThat(claims.recordExecutionFailure(ownership.permit("orders").claim(), false))
+                .as("a sink member records its known failure under the run before reporting it")
+                .isPresent();
+
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders"))
+                .as("the later loss must not override the sink failure recorded under this run")
+                .isFalse();
+    }
+
+    @Test
+    void aFailureRecordedAfterMemberLossRemainsRecoverableAcrossTakeoverAndReturn() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders")).isTrue();
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+
+        PipelineActuationOwnership restarted = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a-restarted"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(restarted.permit("orders").granted()).isTrue();
+        assertThat(new ClusterRebuildAdmission(restarted, BACKOFF, DETECTION, nanos::get).admits("orders"))
+                .as("the departure had already been recorded with the failure, even though the member returned")
+                .isTrue();
+    }
+
+    @Test
+    void aRunThatFailsWhileItsDriverIsClosingIsRecoveredAfterTakeover() {
+        committed(7, "node-a", "node-b", "node-c");
+        assertThat(ownership.permit("orders").granted()).isTrue();
+        assertThat(ownership.beginExecution("orders").allowed()).isTrue();
+
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.registerBean("ownership", PipelineActuationOwnership.class, () -> ownership);
+            context.refresh();
+        }
+        assertThat(ownership.permit("orders").granted()).isFalse();
+        admission.recordFailure("orders");
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+
+        PipelineActuationOwnership restarted = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a-restarted"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(restarted.permit("orders").granted()).isTrue();
+        assertThat(new ClusterRebuildAdmission(restarted, BACKOFF, DETECTION, nanos::get).admits("orders"))
+                .as("the run died after its driver began shutting down, even though every node id is in sight")
+                .isTrue();
     }
 
     @Test
@@ -67,7 +250,7 @@ class ClusterRebuildAdmissionTest {
     @Test
     void aRunRefusedForAChangedMembershipBeforeItStartedIsRebuiltWithinTheBudget() {
         ClusterRebuildAdmission afterARefusedStart = new ClusterRebuildAdmission(
-                ownership, pipelineId -> true, BACKOFF, nanos::get);
+                ownership, pipelineId -> true, BACKOFF, DETECTION, nanos::get);
         committed(7, "node-a", "node-b");
         submitRunUnder(7);
         committed(8, "node-a", "node-b", "node-c");

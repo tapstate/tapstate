@@ -1,5 +1,5 @@
-# Real connectors run on both fidelity tiers. The source pattern drives both the
-# exact shard selectors and the aggregate expectation; a new witness joins automatically.
+# Real connectors run on both fidelity tiers. The source inventory drives both the
+# exact shard selectors and the aggregate expectation; a new gated witness joins automatically.
 name: Real connectors
 
 on:

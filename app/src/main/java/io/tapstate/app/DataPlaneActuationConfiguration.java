@@ -187,8 +187,8 @@ class DataPlaneActuationConfiguration {
      */
     @Bean
     RebuildAdmission rebuildAdmission(
-            ClusterProperties clusterProperties, PipelineActuationOwnership pipelineActuationOwnership,
-            Engine engine) {
+            ClusterProperties clusterProperties, HazelcastProperties hazelcastProperties,
+            PipelineActuationOwnership pipelineActuationOwnership, Engine engine) {
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return RebuildAdmission.never();
         }
@@ -196,7 +196,7 @@ class DataPlaneActuationConfiguration {
                 pipelineActuationOwnership,
                 pipelineId -> engine.failureOf(pipelineId)
                         .map(ClusterRebuildAdmission::isMembershipChangedBeforeStart).orElse(false),
-                clusterProperties.getWorkloadClaimTtl());
+                clusterProperties.getWorkloadClaimTtl(), hazelcastProperties.getMaximumNoHeartbeat());
     }
 
     /**

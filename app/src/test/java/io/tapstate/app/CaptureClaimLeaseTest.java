@@ -156,7 +156,14 @@ class CaptureClaimLeaseTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+        public Optional<WorkloadClaim> advanceExecution(
+                WorkloadClaim expected, long topologyRevision, java.util.Set<String> executionNodeIds) {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<WorkloadClaim> recordExecutionFailure(
+                WorkloadClaim expected, boolean afterMemberLoss) {
             return Optional.empty();
         }
 
