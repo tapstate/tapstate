@@ -384,6 +384,42 @@ class HistoryRollupWorkerTest {
         assertThat(coarse.inWindowSamples()).isEqualTo(1);
     }
 
+    @Test
+    void childGapForcesRawReaggregationSoTheCoarseGapIsPreserved() {
+        Key target = new Key(ID, SCOPED, Resolution.PT30M, TEN);
+        MutableClock clock = new MutableClock(target.bucketEnd().plus(Duration.ofMinutes(1)));
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        raw.appendScoped(sample(TEN, 0, 1), owner(1));
+        raw.appendScoped(sample(TEN.plusSeconds(60), 10, 2), owner(1));
+        raw.appendScoped(sample(TEN.plusSeconds(300), 20, 3), owner(1));
+        raw.appendScoped(sample(TEN.plusSeconds(360), 30, 4), owner(1));
+        MemoryRollups rollups = new MemoryRollups();
+        int childIndex = 0;
+        for (Instant at = TEN; at.isBefore(target.bucketEnd()); at = at.plus(Duration.ofMinutes(5))) {
+            rollups.upsert(child(new Key(ID, SCOPED, Resolution.PT5M, at), clock.instant(), childIndex++));
+        }
+        Key firstChild = new Key(ID, SCOPED, Resolution.PT5M, TEN);
+        Bucket first = rollups.read(firstChild).orElseThrow();
+        rollups.upsert(new Bucket(first.key(), first.computedAt(), first.inputReadStartedAt(),
+                first.validUntil(), false, first.fragments(),
+                List.of(new HistoryRollupStore.Gap(1, TEN.plusSeconds(60),
+                        TEN.plusSeconds(300), HistoryRollupStore.GapReason.SAMPLE_GAP)),
+                first.inWindowSamples()));
+
+        try (HistoryRollupWorker worker = worker(raw, rollups, clock, 16,
+                List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+            assertThat(worker.requestRefresh(target)).isTrue();
+            worker.runOneBatch();
+        }
+
+        Bucket coarse = rollups.read(target).orElseThrow();
+        assertThat(coarse.inputReadStartedAt()).isEqualTo(clock.instant());
+        assertThat(coarse.gaps()).singleElement().satisfies(gap -> {
+            assertThat(gap.intervalStart()).isEqualTo(TEN.plusSeconds(60));
+            assertThat(gap.intervalEnd()).isEqualTo(TEN.plusSeconds(300));
+        });
+    }
+
     private static Bucket child(Key key, Instant now, int childIndex) {
         Instant readAt = now.minusSeconds(60);
         Instant validUntil = now.plusSeconds(childIndex == 0 ? 120 : 240);
