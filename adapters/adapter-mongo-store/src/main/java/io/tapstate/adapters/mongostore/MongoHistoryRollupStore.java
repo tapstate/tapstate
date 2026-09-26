@@ -7,6 +7,7 @@ import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.Sorts;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.HistoryRollupStore;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.IoError;
 import org.bson.Document;
 
@@ -37,6 +38,7 @@ public final class MongoHistoryRollupStore implements HistoryRollupStore {
     static final String INPUT_READ_STARTED_AT = "inputReadStartedAt";
     static final String VALID_UNTIL = "validUntil";
     static final String REQUIRES_FINER_RESOLUTION = "requiresFinerResolution";
+    static final String IN_WINDOW_SAMPLES = "inWindowSamples";
     static final String FRAGMENTS = "fragments";
     static final String GAPS = "gaps";
 
@@ -140,6 +142,9 @@ public final class MongoHistoryRollupStore implements HistoryRollupStore {
                 .append(REQUIRES_FINER_RESOLUTION, bucket.requiresFinerResolution())
                 .append(FRAGMENTS, bucket.fragments().stream().map(MongoHistoryRollupStore::toDocument).toList())
                 .append(GAPS, bucket.gaps().stream().map(MongoHistoryRollupStore::toDocument).toList());
+        if (bucket.inWindowSamples() >= 0) {
+            document.append(IN_WINDOW_SAMPLES, bucket.inWindowSamples());
+        }
         key.scope().incarnationId().ifPresent(id -> document.append(INCARNATION_ID, id));
         return document;
     }
@@ -167,7 +172,24 @@ public final class MongoHistoryRollupStore implements HistoryRollupStore {
         if (fragment.bytesOut() != null) {
             document.append("bytesOut", toDocument(fragment.bytesOut()));
         }
+        if (fragment.recordsOutStats() != null) {
+            document.append("recordsOutStats", toDocument(fragment.recordsOutStats()));
+        }
+        if (fragment.bytesOutStats() != null) {
+            document.append("bytesOutStats", toDocument(fragment.bytesOutStats()));
+        }
+        if (fragment.resumeAfter() != null) {
+            document.append("resumeAfter", new Document("observedAt", Date.from(fragment.resumeAfter().observedAt()))
+                    .append("internalKey", fragment.resumeAfter().internalKey()));
+            document.append("resumeAt", Date.from(fragment.resumeAt()));
+        }
         return document;
+    }
+
+    private static Document toDocument(CounterStats stats) {
+        return new Document("delta", stats.delta().toPlainString())
+                .append("coveredNanos", stats.coveredNanos())
+                .append("maxRate", stats.maxRate().toPlainString());
     }
 
     private static Document toDocument(Rate rate) {
@@ -218,18 +240,50 @@ public final class MongoHistoryRollupStore implements HistoryRollupStore {
                     documents(document, FRAGMENTS, pipelineId).stream()
                             .map(fragment -> toFragment(fragment, pipelineId)).toList(),
                     documents(document, GAPS, pipelineId).stream()
-                            .map(gap -> toGap(gap, pipelineId)).toList());
+                            .map(gap -> toGap(gap, pipelineId)).toList(),
+                    optionalInt(document, IN_WINDOW_SAMPLES, pipelineId, -1));
         } catch (IllegalArgumentException invalid) {
             throw corrupt(pipelineId, "bucket");
         }
     }
 
     private static Fragment toFragment(Document document, String pipelineId) {
+        boolean hasAnchor = document.containsKey("resumeAfter");
+        boolean hasResumeAt = document.containsKey("resumeAt");
+        if (hasAnchor != hasResumeAt) {
+            throw corrupt(pipelineId, "resumeAfter");
+        }
+        RateHistoryStore.Key anchor = null;
+        Instant resumeAt = null;
+        if (hasAnchor) {
+            if (!(document.get("resumeAfter") instanceof Document stored)) {
+                throw corrupt(pipelineId, "resumeAfter");
+            }
+            Object internalKey = stored.get("internalKey");
+            if (!(internalKey instanceof String key) || key.isBlank()) {
+                throw corrupt(pipelineId, "resumeAfter.internalKey");
+            }
+            anchor = new RateHistoryStore.Key(requiredDate(stored, "observedAt"), key);
+            resumeAt = requiredDate(document, "resumeAt");
+        }
         return new Fragment(requiredInt(document, "segment", pipelineId),
                 StartReason.valueOf(requiredString(document, "startReason")),
                 requiredDate(document, "intervalStart"), requiredDate(document, "intervalEnd"),
                 optionalRate(document, "recordsOut", pipelineId), optionalRate(document, "bytesOut", pipelineId),
-                documents(document, "lag", pipelineId).stream().map(lag -> toLag(lag, pipelineId)).toList());
+                documents(document, "lag", pipelineId).stream().map(lag -> toLag(lag, pipelineId)).toList(),
+                optionalCounterStats(document, "recordsOutStats", pipelineId),
+                optionalCounterStats(document, "bytesOutStats", pipelineId), anchor, resumeAt);
+    }
+
+    private static CounterStats optionalCounterStats(Document document, String field, String pipelineId) {
+        if (!document.containsKey(field)) {
+            return null;
+        }
+        if (!(document.get(field) instanceof Document stats)) {
+            throw corrupt(pipelineId, field);
+        }
+        return new CounterStats(decimal(stats, "delta"),
+                requiredLong(stats, "coveredNanos", pipelineId), decimal(stats, "maxRate"));
     }
 
     private static Rate optionalRate(Document document, String field, String pipelineId) {
@@ -296,6 +350,10 @@ public final class MongoHistoryRollupStore implements HistoryRollupStore {
             throw corrupt(pipelineId, field);
         }
         return ((Number) raw).intValue();
+    }
+
+    private static int optionalInt(Document document, String field, String pipelineId, int fallback) {
+        return document.containsKey(field) ? requiredInt(document, field, pipelineId) : fallback;
     }
 
     private static long requiredLong(Document document, String field, String pipelineId) {

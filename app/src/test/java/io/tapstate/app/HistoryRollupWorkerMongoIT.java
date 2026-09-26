@@ -71,10 +71,50 @@ class HistoryRollupWorkerMongoIT {
         }
     }
 
+    @Test
+    void aClosedCoarseBucketRetainsItsRawAnchorAndInputDeadlineInMongo() {
+        Instant bucketStart = Instant.parse("2026-09-27T10:00:00Z");
+        HistoryRollupStore.Scope scope = HistoryRollupStore.Scope.incarnation("inc-coarse");
+        HistoryRollupStore.Key coarse = new HistoryRollupStore.Key("orders", scope,
+                HistoryRollupStore.Resolution.PT30M, bucketStart);
+        Clock clock = Clock.fixed(bucketStart.plus(Duration.ofMinutes(31)), ZoneOffset.UTC);
+        try (MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
+                MONGO.getReplicaSetUrl("history_rollup_coarse_worker_it"), null, Duration.ofSeconds(5)))) {
+            connection.verify();
+            MongoStorePort store = new MongoStorePort(connection, "operator_rollup_coarse_it");
+            ObservationStore.Scope owner = new ObservationStore.Scope("inc-coarse", 1);
+            store.rateHistory().appendScoped(sample(bucketStart, 0), owner);
+            store.rateHistory().appendScoped(sample(bucketStart.plusSeconds(60), 10), owner);
+            store.rateHistory().appendScoped(sample(bucketStart.plusSeconds(120), 20), owner);
+
+            try (HistoryRollupWorker worker = worker(store, clock,
+                    List.of(new HistoryRollupWorker.Work("orders", scope)), 16)) {
+                worker.runOneBatch();
+            }
+
+            HistoryRollupStore.Bucket persisted = store.historyRollups().read(coarse).orElseThrow();
+            assertThat(persisted.requiresFinerResolution()).isFalse();
+            assertThat(persisted.inWindowSamples()).isEqualTo(3);
+            assertThat(persisted.validUntil())
+                    .isEqualTo(persisted.inputReadStartedAt().plus(Duration.ofMinutes(5)));
+            assertThat(persisted.fragments()).singleElement().satisfies(fragment -> {
+                assertThat(fragment.recordsOut().delta()).isEqualByComparingTo("20");
+                assertThat(fragment.recordsOutStats()).isNotNull();
+                assertThat(fragment.resumeAfter()).isNotNull();
+                assertThat(fragment.resumeAt()).isNotNull();
+            });
+        }
+    }
+
     private static HistoryRollupWorker worker(MongoStorePort store, Clock clock,
             List<HistoryRollupWorker.Work> work) {
+        return worker(store, clock, work, 1);
+    }
+
+    private static HistoryRollupWorker worker(MongoStorePort store, Clock clock,
+            List<HistoryRollupWorker.Work> work, int batchSize) {
         return new HistoryRollupWorker(store.rateHistory(), store.historyRollups(), clock,
-                Duration.ofMinutes(1), 1, Duration.ofSeconds(5), () -> work, ignored -> true, false);
+                Duration.ofMinutes(1), batchSize, Duration.ofSeconds(5), () -> work, ignored -> true, false);
     }
 
     private static RateSample sample(Instant at, long records) {
