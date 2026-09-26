@@ -76,6 +76,16 @@ class PdkTypeMappingTest {
         assertThat(PdkTypeMapping.declaredDecimal("decimal(10,11)")).isNull();
     }
 
+    @Test
+    void incompleteOrOutOfDomainDecimalSpellingCannotInventSourceBounds() {
+        assertThat(PdkTypeMapping.declaredDecimal(null)).isNull();
+        assertThat(PdkTypeMapping.declaredDecimal("decimal(0,0)")).isNull();
+        assertThat(PdkTypeMapping.declaredDecimal("decimal(66,2)")).isNull();
+        assertThat(PdkTypeMapping.declaredDecimal("decimal(31,31)")).isNull();
+        assertThat(PdkTypeMapping.declaredDecimal("decimal(999999999999,2)")).isNull();
+        assertThat(PdkTypeMapping.declaredDecimal("decimal(65,30)")).isNotNull();
+    }
+
     /** The mysql connector's own declaration for its widest integer column type, verbatim from its spec. */
     private static final String BIGINT_SPEC = """
             {"dataTypes": {"bigint[($zerofill)]": {"to": "TapNumber", "bit": 64, "precision": 19,\
