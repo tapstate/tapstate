@@ -125,6 +125,28 @@ final class Workspaces {
     }
 
     /**
+     * A pipeline carrying every change of {@code tables} from several sources to one target, each into its own table.
+     * Every table name has to belong to one of the sources alone, since a bare name is resolved across all of them.
+     */
+    static String pipelineYaml(String pipelineId, List<String> sourceIds, String targetId, List<String> tables) {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: [ %s ]
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - { id: %s_step, from: [ %s ], type: filter, expr: "op != 'x'" }
+                serve:
+                  from: %s_step
+                  sync:
+                    - source: %s
+                """
+                .formatted(pipelineId, String.join(", ", sourceIds), pipelineId, String.join(", ", tables),
+                        pipelineId, targetId);
+    }
+
+    /**
      * The same pipeline with its target written by {@code writers} writers across the cluster, for a case whose
      * subject is how wide a run is planned and where its writers run.
      */

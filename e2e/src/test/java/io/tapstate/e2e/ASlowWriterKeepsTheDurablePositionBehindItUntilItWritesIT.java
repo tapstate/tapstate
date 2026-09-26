@@ -30,9 +30,13 @@ import org.junit.jupiter.api.io.TempDir;
  *
  * <p>One change moves the durable position by one, which the case measures before it relies on it: two changes are
  * confirmed one at a time first, and the case reads positions from where they left it.
+ *
+ * <p>The source is a real one because the durable position is kept only for a source that says where each change
+ * sits in its stream; the harness's own source says nothing of the kind, so no position would be kept to read.
  */
 class ASlowWriterKeepsTheDurablePositionBehindItUntilItWritesIT {
 
+    private static final String CONNECTOR = "mongodb";
     private static final String TABLE = "orders";
     private static final String PIPELINE = "slow_writer_pipe";
     private static final String SOURCE = "slow_writer_src";
@@ -40,30 +44,40 @@ class ASlowWriterKeepsTheDurablePositionBehindItUntilItWritesIT {
     private static final long SEEDED_ROWS = 6;
 
     @BeforeAll
-    static void requireDocker() {
+    static void requireDockerAndTheRealConnector() {
         DockerGate.require();
+        RealConnectorGate.require(CONNECTOR);
     }
 
     @Test
     void theDurablePositionWaitsForTheSlowWriterAndMovesOnOnceItWrites(@TempDir Path directory) throws IOException {
-        byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
-        Path source = Files.createDirectories(directory.resolve("src"));
+        byte[] files = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
+        String sourceUri = SharedMongo.replicaSetUrl("e2e_slow_writer_src");
         Path target = Files.createDirectories(directory.resolve("tgt"));
-        EndpointAddress sourceAddress = EndpointAddress.uri(source.toString());
+        EndpointAddress sourceAddress = EndpointAddress.uri(sourceUri);
         EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
         Holds holds = new Holds(directory.resolve("holds"));
         WriteWitness written = new WriteWitness(directory.resolve("written"));
 
-        try (FileEndpoints files = new FileEndpoints()) {
+        try (MongoEndpoints mongo = new MongoEndpoints(); FileEndpoints file = new FileEndpoints()) {
+            mongo.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
             String store = SharedMongo.replicaSetUrl("e2e_slow_writer_cluster");
             try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-slow-writer")) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
-                control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
-                files.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
-                control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+                control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
+                control.registerConnector(E2eConnectorJar.CONNECTOR_ID, files);
+                control.discoverSchema(SOURCE, CONNECTOR, Map.of("uri", sourceUri));
                 Map<String, String> resources = new LinkedHashMap<>();
-                resources.put(SOURCE + ".tap.yml", Workspaces.cdcSourceYaml(SOURCE, source));
+                resources.put(SOURCE + ".tap.yml", """
+                        version: tapstate/v1
+                        kind: source
+                        id: %s
+                        connector: %s
+                        config: { uri: "%s" }
+                        mode: cdc
+                        tables: [ %s ]
+                        """.formatted(SOURCE, CONNECTOR, sourceUri, TABLE));
                 resources.put(TARGET + ".tap.yml", Workspaces.targetYaml(TARGET, target, Map.of(
                         "hold", holds.directory().toString(), "write_witness", written.directory().toString())));
                 resources.put(PIPELINE + ".tap.yml", Workspaces.pipelineYaml(PIPELINE, SOURCE, TARGET, TABLE));
@@ -73,11 +87,11 @@ class ASlowWriterKeepsTheDurablePositionBehindItUntilItWritesIT {
                         () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> control.state(PIPELINE) + ", failure " + control.failure(PIPELINE));
                 Await.until("the seeded rows to cross", Duration.ofMinutes(1),
-                        () -> files.count(targetAddress, TABLE) == SEEDED_ROWS,
-                        () -> "rows at the target = " + files.count(targetAddress, TABLE));
+                        () -> file.countRows(targetAddress, TABLE) == SEEDED_ROWS,
+                        () -> "rows at the target = " + file.countRows(targetAddress, TABLE));
 
-                long first = confirmOneChange(control, files, sourceAddress, targetAddress, SEEDED_ROWS + 1);
-                long second = confirmOneChange(control, files, sourceAddress, targetAddress, SEEDED_ROWS + 2);
+                long first = confirmOneChange(control, mongo, file, sourceAddress, targetAddress, SEEDED_ROWS + 1);
+                long second = confirmOneChange(control, mongo, file, sourceAddress, targetAddress, SEEDED_ROWS + 2);
                 assertThat(second)
                         .as("one change moves the durable position by one, which the positions below rely on")
                         .isEqualTo(first + 1);
@@ -88,7 +102,7 @@ class ASlowWriterKeepsTheDurablePositionBehindItUntilItWritesIT {
                 // Changes 9 to 14; the writer that takes 10 holds before writing it.
                 long held = SEEDED_ROWS + 4;
                 holds.before(TABLE, held);
-                files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 6);
+                mongo.cdc(sourceAddress, TABLE, CdcOp.INSERT, 6);
                 Await.answered("a writer to hold change " + held + " before writing it", Duration.ofMinutes(1),
                         () -> holds.holderBefore(TABLE, held));
                 Await.until("other writers to write changes after the held one and have them confirmed",
@@ -106,8 +120,8 @@ class ASlowWriterKeepsTheDurablePositionBehindItUntilItWritesIT {
 
                 holds.releaseBefore(TABLE, held);
                 Await.until("every change to arrive once the writer is let go", Duration.ofMinutes(1),
-                        () -> files.count(targetAddress, TABLE) == SEEDED_ROWS + 2 + 6,
-                        () -> "rows at the target = " + files.count(targetAddress, TABLE));
+                        () -> file.countRows(targetAddress, TABLE) == SEEDED_ROWS + 2 + 6,
+                        () -> "rows at the target = " + file.countRows(targetAddress, TABLE));
                 Await.until("the durable position to move past every change", Duration.ofMinutes(1),
                         () -> control.ackedChangeSeq(PIPELINE).filter(seq -> seq >= second + 6).isPresent(),
                         () -> "the durable position is " + control.ackedChangeSeq(PIPELINE));
@@ -116,15 +130,21 @@ class ASlowWriterKeepsTheDurablePositionBehindItUntilItWritesIT {
     }
 
     /** Makes change {@code id}, waits for it to be confirmed, and answers the durable position it left. */
-    private static long confirmOneChange(ControlPlane control, FileEndpoints files, EndpointAddress source,
-            EndpointAddress target, long id) {
+    private static long confirmOneChange(ControlPlane control, MongoEndpoints mongo, FileEndpoints file,
+            EndpointAddress source, EndpointAddress target, long id) {
         long before = control.ackedChangeSeq(PIPELINE).orElse(-1L);
-        files.cdc(source, TABLE, CdcOp.INSERT, 1);
+        mongo.cdc(source, TABLE, CdcOp.INSERT, 1);
         Await.until("change " + id + " to reach the target", Duration.ofMinutes(1),
-                () -> files.count(target, TABLE) == id,
-                () -> "rows at the target = " + files.count(target, TABLE));
-        return Await.answered("change " + id + " to be confirmed", Duration.ofMinutes(1),
-                () -> control.ackedChangeSeq(PIPELINE).filter(seq -> seq > before));
+                () -> file.countRows(target, TABLE) == id,
+                () -> "rows at the target = " + file.countRows(target, TABLE));
+        long[] confirmed = {-1L};
+        Await.until("change " + id + " to be confirmed", Duration.ofMinutes(1),
+                () -> {
+                    control.ackedChangeSeq(PIPELINE).filter(seq -> seq > before).ifPresent(seq -> confirmed[0] = seq);
+                    return confirmed[0] > before;
+                },
+                () -> "the position face reads " + control.positionReading(PIPELINE));
+        return confirmed[0];
     }
 
     /** The changes after {@code held} written so far - by other writers, since the held one writes nothing. */

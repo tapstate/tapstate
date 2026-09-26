@@ -34,13 +34,18 @@ import org.junit.jupiter.api.io.TempDir;
  * caught behind it; then a writer is held after writing one of the loading table's rows and before answering, and
  * the member that writer runs on is killed. How often each table was read is taken from the connector, which notes
  * every load it reads in a file of its process's own, so a read on the member that died is counted too.
+ *
+ * <p>Each table is read by a source of its own. A source hands its tables' loads over once it has read all of them,
+ * so two tables of one source are handed over together, and the read held on the loading table would hold the other
+ * table's load back from landing as well.
  */
 class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
 
     private static final String LANDED = "landed_first";
     private static final String LOADING = "loading";
     private static final String PIPELINE = "lost_mid_load_pipe";
-    private static final String SOURCE = "lost_mid_load_src";
+    private static final String LANDED_SOURCE = "lost_mid_load_landed_src";
+    private static final String LOADING_SOURCE = "lost_mid_load_loading_src";
     private static final String TARGET = "lost_mid_load_tgt";
     private static final long LANDED_ROWS = 5;
     private static final long LOADING_ROWS = 30;
@@ -57,10 +62,12 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
     @Test
     void theLoadThatHadNotLandedIsReadAgainAndTheOneThatHadIsNot(@TempDir Path directory) throws IOException {
         byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
-        Path source = Files.createDirectories(directory.resolve("src"));
+        Path landedSource = Files.createDirectories(directory.resolve("src-landed"));
+        Path loadingSource = Files.createDirectories(directory.resolve("src-loading"));
         Path target = Files.createDirectories(directory.resolve("tgt"));
         Path reads = Files.createDirectories(directory.resolve("reads"));
-        EndpointAddress sourceAddress = EndpointAddress.uri(source.toString());
+        EndpointAddress landedAddress = EndpointAddress.uri(landedSource.toString());
+        EndpointAddress loadingAddress = EndpointAddress.uri(loadingSource.toString());
         EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
         Holds holds = new Holds(directory.resolve("holds"));
 
@@ -70,16 +77,23 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
-                files.seed(sourceAddress, LANDED, SeedRows.generated(LANDED_ROWS));
-                files.seed(sourceAddress, LOADING, SeedRows.generated(LOADING_ROWS));
-                control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+                files.seed(landedAddress, LANDED, SeedRows.generated(LANDED_ROWS));
+                files.seed(loadingAddress, LOADING, SeedRows.generated(LOADING_ROWS));
+                control.discoverSchema(LANDED_SOURCE, E2eConnectorJar.CONNECTOR_ID,
+                        Map.of("uri", landedSource.toString()));
+                control.discoverSchema(LOADING_SOURCE, E2eConnectorJar.CONNECTOR_ID,
+                        Map.of("uri", loadingSource.toString()));
+                Map<String, String> sourceSettings =
+                        Map.of("hold", holds.directory().toString(), "read_witness", reads.toString());
                 Map<String, String> resources = new LinkedHashMap<>();
-                resources.put(SOURCE + ".tap.yml", Workspaces.cdcSourceYaml(SOURCE, source, List.of(LANDED, LOADING),
-                        Map.of("hold", holds.directory().toString(), "read_witness", reads.toString())));
+                resources.put(LANDED_SOURCE + ".tap.yml",
+                        Workspaces.cdcSourceYaml(LANDED_SOURCE, landedSource, List.of(LANDED), sourceSettings));
+                resources.put(LOADING_SOURCE + ".tap.yml",
+                        Workspaces.cdcSourceYaml(LOADING_SOURCE, loadingSource, List.of(LOADING), sourceSettings));
                 resources.put(TARGET + ".tap.yml",
                         Workspaces.targetYaml(TARGET, target, Map.of("hold", holds.directory().toString())));
-                resources.put(PIPELINE + ".tap.yml",
-                        Workspaces.pipelineYaml(PIPELINE, SOURCE, TARGET, List.of(LANDED, LOADING)));
+                resources.put(PIPELINE + ".tap.yml", Workspaces.pipelineYaml(PIPELINE,
+                        List.of(LANDED_SOURCE, LOADING_SOURCE), TARGET, List.of(LANDED, LOADING)));
                 holds.read(LOADING);
                 control.apply(resources);
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -104,8 +118,8 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
                 holds.releaseAfter(LOADING, HELD);
 
                 // Nothing is asked of the product from here until the assertions below, bar the changes made after.
-                files.cdc(sourceAddress, LANDED, CdcOp.INSERT, 1);
-                files.cdc(sourceAddress, LOADING, CdcOp.INSERT, 1);
+                files.cdc(landedAddress, LANDED, CdcOp.INSERT, 1);
+                files.cdc(loadingAddress, LOADING, CdcOp.INSERT, 1);
                 Await.until("every row of both tables, and a change of each made after the kill, to arrive",
                         TAKEOVER,
                         () -> files.count(targetAddress, LANDED) == LANDED_ROWS + 1

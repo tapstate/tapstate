@@ -1881,6 +1881,12 @@ final class ControlPlane {
         return Optional.empty();
     }
 
+    /** The position face as it answers now, status and all, for a case to say what it last read. */
+    String positionReading(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
+        return response.statusCode() + " " + response.body();
+    }
+
     /**
      * Puts a chain back at a token, and answers what the product says the pipeline now stands at.
      *

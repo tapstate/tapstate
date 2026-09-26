@@ -30,13 +30,18 @@ import org.junit.jupiter.api.io.TempDir;
  * cannot be caught behind it; then one row of the late table's load is held before it is written. The late table's
  * changes are made first and the early table's after them, so the early table's arriving is proof enough that the
  * late table's would have arrived by then had nothing held them.
+ *
+ * <p>Each table is read by a source of its own. A source hands its tables' loads over once it has read all of them,
+ * so two tables of one source are handed over together and a read held on one holds the other's back as well:
+ * they could not land apart whatever the pipeline waited for.
  */
 class ATablesChangesWaitForItsOwnLoadAndNoOtherIT {
 
     private static final String EARLY = "early";
     private static final String LATE = "late";
     private static final String PIPELINE = "own_load_pipe";
-    private static final String SOURCE = "own_load_src";
+    private static final String EARLY_SOURCE = "own_load_early_src";
+    private static final String LATE_SOURCE = "own_load_late_src";
     private static final String TARGET = "own_load_tgt";
     private static final long SEEDED_ROWS = 5;
     private static final long CHANGES = 6;
@@ -50,9 +55,11 @@ class ATablesChangesWaitForItsOwnLoadAndNoOtherIT {
     void theLateTablesChangesWaitForItsLoadWhileTheEarlyTablesChangesArrive(@TempDir Path directory)
             throws IOException {
         byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
-        Path source = Files.createDirectories(directory.resolve("src"));
+        Path earlySource = Files.createDirectories(directory.resolve("src-early"));
+        Path lateSource = Files.createDirectories(directory.resolve("src-late"));
         Path target = Files.createDirectories(directory.resolve("tgt"));
-        EndpointAddress sourceAddress = EndpointAddress.uri(source.toString());
+        EndpointAddress earlyAddress = EndpointAddress.uri(earlySource.toString());
+        EndpointAddress lateAddress = EndpointAddress.uri(lateSource.toString());
         EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
         Holds holds = new Holds(directory.resolve("holds"));
         WriteWitness written = new WriteWitness(directory.resolve("written"));
@@ -63,16 +70,21 @@ class ATablesChangesWaitForItsOwnLoadAndNoOtherIT {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
-                files.seed(sourceAddress, EARLY, SeedRows.generated(SEEDED_ROWS));
-                files.seed(sourceAddress, LATE, SeedRows.generated(SEEDED_ROWS));
-                control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+                files.seed(earlyAddress, EARLY, SeedRows.generated(SEEDED_ROWS));
+                files.seed(lateAddress, LATE, SeedRows.generated(SEEDED_ROWS));
+                control.discoverSchema(EARLY_SOURCE, E2eConnectorJar.CONNECTOR_ID,
+                        Map.of("uri", earlySource.toString()));
+                control.discoverSchema(LATE_SOURCE, E2eConnectorJar.CONNECTOR_ID,
+                        Map.of("uri", lateSource.toString()));
                 Map<String, String> resources = new LinkedHashMap<>();
-                resources.put(SOURCE + ".tap.yml", Workspaces.cdcSourceYaml(SOURCE, source, List.of(EARLY, LATE),
-                        Map.of("hold", holds.directory().toString())));
+                resources.put(EARLY_SOURCE + ".tap.yml", Workspaces.cdcSourceYaml(EARLY_SOURCE, earlySource,
+                        List.of(EARLY), Map.of("hold", holds.directory().toString())));
+                resources.put(LATE_SOURCE + ".tap.yml", Workspaces.cdcSourceYaml(LATE_SOURCE, lateSource,
+                        List.of(LATE), Map.of("hold", holds.directory().toString())));
                 resources.put(TARGET + ".tap.yml", Workspaces.targetYaml(TARGET, target, Map.of(
                         "hold", holds.directory().toString(), "write_witness", written.directory().toString())));
-                resources.put(PIPELINE + ".tap.yml",
-                        Workspaces.pipelineYaml(PIPELINE, SOURCE, TARGET, List.of(EARLY, LATE)));
+                resources.put(PIPELINE + ".tap.yml", Workspaces.pipelineYaml(PIPELINE,
+                        List.of(EARLY_SOURCE, LATE_SOURCE), TARGET, List.of(EARLY, LATE)));
                 holds.read(LATE);
                 control.apply(resources);
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -90,8 +102,8 @@ class ATablesChangesWaitForItsOwnLoadAndNoOtherIT {
                 Await.answered("a writer to hold the late table's first load row before writing it",
                         Duration.ofMinutes(1), () -> holds.holderBefore(LATE, 1));
 
-                files.cdc(sourceAddress, LATE, CdcOp.INSERT, CHANGES);
-                files.cdc(sourceAddress, EARLY, CdcOp.INSERT, CHANGES);
+                files.cdc(lateAddress, LATE, CdcOp.INSERT, CHANGES);
+                files.cdc(earlyAddress, EARLY, CdcOp.INSERT, CHANGES);
                 Await.until("a change of the early table to arrive while the late table's load is held",
                         Duration.ofMinutes(1),
                         () -> files.count(targetAddress, EARLY) > SEEDED_ROWS,

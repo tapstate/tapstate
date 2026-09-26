@@ -618,9 +618,11 @@ public class CsvConnector implements TapConnector {
     /**
      * The name of the file the writes of the table in {@code tableFileName} meet on: fixed by the table's name, short
      * whatever that name's length - a table whose own name fills the filesystem's limit still has one - and neither
-     * ending the way a table does nor visible beside the tables.
+     * ending the way a table does nor visible beside the tables. Public so a case can tell the lock from anything
+     * left behind beside a table it replaced: the lock stays once released, since deleting it while another writer
+     * may have it open would leave two files to meet on.
      */
-    private static String lockNameOf(String tableFileName) {
+    public static String lockNameOf(String tableFileName) {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256").digest(tableFileName.getBytes(StandardCharsets.UTF_8));
             return "." + HexFormat.of().formatHex(digest, 0, 16) + LOCK_SUFFIX;
