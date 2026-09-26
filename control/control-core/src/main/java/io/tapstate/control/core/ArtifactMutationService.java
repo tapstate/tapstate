@@ -25,8 +25,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -82,6 +85,8 @@ public final class ArtifactMutationService {
     private final HistoryRollupStore rollups;
     private final PipelineEventStore events;
     private final Executor telemetryCleanup;
+    private final Function<String, Optional<ObservationStore.Scope>> currentScope;
+    private final TelemetryCleanupReporter cleanupReporter;
     private final LogSink logSink;
     private final SrsMetaStore srsMeta;
     private final DerivedSchemaStore derivedSchemas;
@@ -289,6 +294,28 @@ public final class ArtifactMutationService {
             LogSink logSink,
             PipelineEventStore events,
             HistoryRollupStore rollups) {
+        this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                auditGate, follows, telemetryCleanup, logSink, events, rollups,
+                ignored -> Optional.empty(), TelemetryCleanupReporter.NONE);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            PipelineLayoutStore layouts,
+            SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
+            RateHistoryStore rateHistory,
+            AuditGate auditGate,
+            DataBrowserFollows follows,
+            Executor telemetryCleanup,
+            LogSink logSink,
+            PipelineEventStore events,
+            HistoryRollupStore rollups,
+            Function<String, Optional<ObservationStore.Scope>> currentScope,
+            TelemetryCleanupReporter cleanupReporter) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
@@ -298,6 +325,8 @@ public final class ArtifactMutationService {
         this.rollups = rollups;
         this.events = events;
         this.telemetryCleanup = Objects.requireNonNull(telemetryCleanup, "telemetryCleanup");
+        this.currentScope = Objects.requireNonNull(currentScope, "currentScope");
+        this.cleanupReporter = Objects.requireNonNull(cleanupReporter, "cleanupReporter");
         this.logSink = logSink;
         this.srsMeta = Objects.requireNonNull(srsMeta, "srsMeta");
         this.derivedSchemas = Objects.requireNonNull(derivedSchemas, "derivedSchemas");
@@ -352,6 +381,8 @@ public final class ArtifactMutationService {
         // caller offered is the only one that describes the attempt.
         AuditContext audit = new AuditContext(principal, id, expectedContentHash);
         auditGate.dispatch(ControlOperations.ARTIFACT_DELETE, audit, () -> {
+            Optional<ObservationStore.Scope> cleanupScope = target instanceof PipelineResource
+                    ? localCleanupScope(id) : Optional.empty();
             ArtifactStore.Removal removal = store.deleteWithHistoryOwner(id, expectedContentHash);
             switch (removal.outcome()) {
                 case DELETED -> {
@@ -362,7 +393,12 @@ public final class ArtifactMutationService {
             }
 
             if (target instanceof PipelineResource) {
-                reclaim(id, removal.historyOwner().orElseThrow().visibility());
+                Visibility visibility = removal.historyOwner().orElseThrow().visibility();
+                OptionalLong cleanupGeneration = cleanupScope
+                        .filter(scope -> scope.pipelineIncarnationId().equals(visibility.incarnationId()))
+                        .map(scope -> OptionalLong.of(scope.executionGeneration()))
+                        .orElseGet(OptionalLong::empty);
+                reclaim(id, visibility, cleanupGeneration);
             }
             if (target instanceof SourceResource) {
                 // A follow is not in the reference graph, so neither refusal above ever sees one: a
@@ -374,6 +410,20 @@ public final class ArtifactMutationService {
             }
             return null;
         });
+    }
+
+    /**
+     * The local scope was established from an authorized durable execution generation. Reading it does
+     * not make artifact removal wait on a telemetry store; when this member never drove the pipeline,
+     * cleanup still runs but its event has no execution owner to claim.
+     */
+    private Optional<ObservationStore.Scope> localCleanupScope(String id) {
+        try {
+            return Objects.requireNonNull(currentScope.apply(id), "currentScope result");
+        } catch (RuntimeException failed) {
+            LOG.log(Level.WARNING, "Could not capture local execution owner before cleanup for " + id, failed);
+            return Optional.empty();
+        }
     }
 
     /**
@@ -411,8 +461,9 @@ public final class ArtifactMutationService {
      * closing it needs a lifecycle-aware conditional delete or a lock spanning the check and the write,
      * neither of which this store port offers.
      */
-    private void reclaim(String id, Visibility visibility) {
-        List<ReclaimStep> steps = reclaimStepsOf(id, visibility);
+    private void reclaim(String id, Visibility visibility, OptionalLong generation) {
+        CleanupIntent intent = new CleanupIntent(id, visibility, generation);
+        List<ReclaimStep> steps = reclaimStepsOf(intent);
         if (!isAtRest(id)) {
             throw reclaimIncomplete(id, "pipeline-live", steps.stream().map(ReclaimStep::name).toList(),
                     List.of());
@@ -436,17 +487,22 @@ public final class ArtifactMutationService {
     private record ReclaimStep(String name, Runnable action) {
     }
 
+    private record CleanupIntent(String pipelineId, Visibility visibility, OptionalLong generation) {
+    }
+
     /**
      * Everything a removed pipeline owns, in the order it is reclaimed. One list serves both the reclaim
      * and the report of what a live pipeline would have lost, so a step cannot be added to the one and
      * left out of the other. Nothing runs while the list is built.
      */
-    private List<ReclaimStep> reclaimStepsOf(String id, Visibility visibility) {
+    private List<ReclaimStep> reclaimStepsOf(CleanupIntent intent) {
+        String id = intent.pipelineId();
+        Visibility visibility = intent.visibility();
         List<ReclaimStep> steps = new ArrayList<>(List.of(
                 new ReclaimStep("mining-chain-consumer", () -> detachFromEveryChain(id)),
                 new ReclaimStep("desired", () -> desired.delete(id)),
                 new ReclaimStep("state", () -> state.delete(id)),
-                new ReclaimStep("observation", () -> submitObservationCleanup(id, visibility)),
+                new ReclaimStep("observation", () -> submitObservationCleanup(intent)),
                 new ReclaimStep("layout", () -> layouts.delete(id)),
                 // Left behind, this record would be read as the derivation history of whatever is applied
                 // under the id next, and would refuse to start it over a difference against a schema
@@ -454,121 +510,97 @@ public final class ArtifactMutationService {
                 new ReclaimStep("derived-schema", () -> derivedSchemas.delete(id)),
                 // The captured old owner protects a recreated resource from delayed cleanup. History
                 // visibility is already scoped, and expiry bounds any residue after a failed delete.
-                new ReclaimStep("rate-history", () -> submitHistoryCleanup(id, visibility))));
+                new ReclaimStep("rate-history", () -> submitHistoryCleanup(intent))));
         if (logSink != null) {
-            steps.add(new ReclaimStep("node-local-logs", () -> submitLogCleanup(id, visibility)));
+            steps.add(new ReclaimStep("node-local-logs", () -> submitLogCleanup(intent)));
         }
         if (events != null && visibility.incarnationId() != null) {
-            steps.add(new ReclaimStep("event-history", () -> submitEventCleanup(id, visibility)));
+            steps.add(new ReclaimStep("event-history", () -> submitEventCleanup(intent)));
         }
         if (rollups != null) {
-            steps.add(new ReclaimStep("history-rollup", () -> submitRollupCleanup(id, visibility)));
+            steps.add(new ReclaimStep("history-rollup", () -> submitRollupCleanup(intent)));
         }
         return List.copyOf(steps);
     }
 
-    private void submitRollupCleanup(String id, Visibility visibility) {
+    private void submitRollupCleanup(CleanupIntent intent) {
+        submitCleanup(intent, "history-rollup", () -> {
+            if (intent.visibility().incarnationId() != null) {
+                attemptCleanup(intent, "history-rollup", () -> rollups.deleteIncarnation(
+                        intent.pipelineId(), intent.visibility().incarnationId()));
+            }
+            if (intent.visibility().includeLegacy()) {
+                attemptCleanup(intent, "history-rollup", () -> rollups.deleteLegacy(intent.pipelineId()));
+            }
+        });
+    }
+
+    private void submitEventCleanup(CleanupIntent intent) {
+        submitCleanup(intent, "event-history", () -> attemptCleanup(intent, "event-history",
+                () -> events.deleteIncarnation(intent.pipelineId(), intent.visibility().incarnationId())));
+    }
+
+    private void submitObservationCleanup(CleanupIntent intent) {
+        submitCleanup(intent, "observation", () -> {
+            if (intent.visibility().incarnationId() != null) {
+                attemptCleanup(intent, "observation", () -> observations.deleteIncarnation(
+                        intent.pipelineId(), intent.visibility().incarnationId()));
+            }
+            if (intent.visibility().includeLegacy()) {
+                attemptCleanup(intent, "observation", () -> observations.deleteLegacy(intent.pipelineId()));
+            }
+        });
+    }
+
+    private void submitLogCleanup(CleanupIntent intent) {
+        submitCleanup(intent, "node-local-logs", () -> {
+            if (intent.visibility().incarnationId() != null) {
+                attemptCleanup(intent, "node-local-logs", () -> logSink.clearIncarnation(
+                        intent.pipelineId(), intent.visibility().incarnationId()));
+            }
+            if (intent.visibility().includeLegacy()) {
+                attemptCleanup(intent, "node-local-logs", () -> logSink.clearLegacy(intent.pipelineId()));
+            }
+        });
+    }
+
+    private void submitHistoryCleanup(CleanupIntent intent) {
+        submitCleanup(intent, "rate-history", () -> {
+            if (intent.visibility().incarnationId() != null) {
+                attemptCleanup(intent, "rate-history", () -> rateHistory.deleteIncarnation(
+                        intent.pipelineId(), intent.visibility().incarnationId()));
+            }
+            if (intent.visibility().includeLegacy()) {
+                attemptCleanup(intent, "rate-history", () -> rateHistory.deleteLegacy(intent.pipelineId()));
+            }
+        });
+    }
+
+    private void submitCleanup(CleanupIntent intent, String step, Runnable cleanup) {
         try {
-            telemetryCleanup.execute(() -> {
-                if (visibility.incarnationId() != null) {
-                    try {
-                        rollups.deleteIncarnation(id, visibility.incarnationId());
-                    } catch (RuntimeException failed) {
-                        LOG.log(Level.WARNING, "Could not clear scoped history rollups for " + id, failed);
-                    }
-                }
-                if (visibility.includeLegacy()) {
-                    try {
-                        rollups.deleteLegacy(id);
-                    } catch (RuntimeException failed) {
-                        LOG.log(Level.WARNING, "Could not clear legacy history rollups for " + id, failed);
-                    }
-                }
-            });
+            telemetryCleanup.execute(cleanup);
         } catch (RuntimeException rejected) {
-            LOG.log(Level.WARNING, "Could not schedule history rollup cleanup for " + id, rejected);
+            cleanupFailed(intent, step, true, rejected);
         }
     }
 
-    private void submitEventCleanup(String id, Visibility visibility) {
+    private void attemptCleanup(CleanupIntent intent, String step, Runnable cleanup) {
         try {
-            telemetryCleanup.execute(() -> {
-                try {
-                    events.deleteIncarnation(id, visibility.incarnationId());
-                } catch (RuntimeException failed) {
-                    LOG.log(Level.WARNING, "Could not clear scoped event history for " + id, failed);
-                }
-            });
-        } catch (RuntimeException rejected) {
-            LOG.log(Level.WARNING, "Could not schedule event history cleanup for " + id, rejected);
+            cleanup.run();
+        } catch (RuntimeException failed) {
+            cleanupFailed(intent, step, false, failed);
         }
     }
 
-    private void submitObservationCleanup(String id, Visibility visibility) {
+    private void cleanupFailed(CleanupIntent intent, String step, boolean rejected, RuntimeException failure) {
+        LOG.log(Level.WARNING, "Could not " + (rejected ? "schedule " : "complete ")
+                + step + " cleanup for " + intent.pipelineId(), failure);
         try {
-            telemetryCleanup.execute(() -> {
-                if (visibility.incarnationId() != null) {
-                    try {
-                        observations.deleteIncarnation(id, visibility.incarnationId());
-                    } catch (RuntimeException failed) {
-                        LOG.log(Level.WARNING, "Could not clear scoped observation for " + id, failed);
-                    }
-                }
-                if (visibility.includeLegacy()) {
-                    try {
-                        observations.deleteLegacy(id);
-                    } catch (RuntimeException failed) {
-                        LOG.log(Level.WARNING, "Could not clear legacy observation for " + id, failed);
-                    }
-                }
-            });
-        } catch (RuntimeException rejected) {
-            LOG.log(Level.WARNING, "Could not schedule observation cleanup for " + id, rejected);
-        }
-    }
-
-    private void submitLogCleanup(String id, Visibility visibility) {
-        if (logSink == null) {
-            return;
-        }
-        try {
-            telemetryCleanup.execute(() -> {
-                try {
-                    if (visibility.incarnationId() != null) {
-                        logSink.clearIncarnation(id, visibility.incarnationId());
-                    }
-                    if (visibility.includeLegacy()) {
-                        logSink.clearLegacy(id);
-                    }
-                } catch (RuntimeException failed) {
-                    LOG.log(Level.WARNING, "Could not clear node-local logs for " + id, failed);
-                }
-            });
-        } catch (RuntimeException rejected) {
-            LOG.log(Level.WARNING, "Could not schedule node-local log cleanup for " + id, rejected);
-        }
-    }
-
-    private void submitHistoryCleanup(String id, Visibility visibility) {
-        try {
-            telemetryCleanup.execute(() -> {
-                if (visibility.incarnationId() != null) {
-                    try {
-                        rateHistory.deleteIncarnation(id, visibility.incarnationId());
-                    } catch (RuntimeException failed) {
-                        LOG.log(Level.WARNING, "Could not clear scoped rate history for " + id, failed);
-                    }
-                }
-                if (visibility.includeLegacy()) {
-                    try {
-                        rateHistory.deleteLegacy(id);
-                    } catch (RuntimeException failed) {
-                        LOG.log(Level.WARNING, "Could not clear legacy rate history for " + id, failed);
-                    }
-                }
-            });
-        } catch (RuntimeException rejected) {
-            LOG.log(Level.WARNING, "Could not schedule rate history cleanup for " + id, rejected);
+            cleanupReporter.failed(new TelemetryCleanupReporter.Failure(intent.pipelineId(),
+                    intent.visibility().incarnationId(), intent.generation(), step, rejected));
+        } catch (RuntimeException reportingFailed) {
+            LOG.log(Level.WARNING, "Could not report telemetry cleanup failure for " + intent.pipelineId(),
+                    reportingFailed);
         }
     }
 

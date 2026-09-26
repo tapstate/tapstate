@@ -97,6 +97,7 @@ import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.CapabilityDeriver;
 import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
@@ -364,7 +365,8 @@ class ControlPlaneConfiguration {
     ArtifactMutationService artifactMutationService(
             ArtifactStore artifactStore, StorePort storePort, AuditGate auditGate,
             ObjectProvider<DataBrowserFollows> follows,
-            java.util.concurrent.ThreadPoolExecutor telemetryCleanupExecutor, LogSink logSink) {
+            java.util.concurrent.ThreadPoolExecutor telemetryCleanupExecutor, LogSink logSink,
+            TelemetryCleanupHealth cleanupHealth, ObjectProvider<ObservationScopeRegistry> scopes) {
         // The removal takes the same artifact store bean apply writes through, so both paths see one
         // view of a resource. The dependent bookkeeping a removed pipeline owns is reclaimed straight
         // off the store port: those facets have no service in front of them.
@@ -372,7 +374,21 @@ class ControlPlaneConfiguration {
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
                 storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), storePort.rateHistory(),
                 auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE), telemetryCleanupExecutor,
-                logSink, storePort.events(), storePort.historyRollups());
+                logSink, storePort.events(), storePort.historyRollups(), id -> {
+                    ObservationScopeRegistry local = scopes.getIfAvailable();
+                    return local == null ? java.util.Optional.empty() : local.current(id);
+                }, cleanupHealth);
+    }
+
+    @Bean
+    TelemetryCleanupHealth telemetryCleanupHealth(Clock clock,
+            ObjectProvider<MetricsExport> export, ObjectProvider<TelemetryDispatcher> telemetry) {
+        return new TelemetryCleanupHealth(clock, export.getIfAvailable(MetricsExport::none), event -> {
+            TelemetryDispatcher dispatcher = telemetry.getIfAvailable();
+            if (dispatcher != null) {
+                dispatcher.offerEvent(event);
+            }
+        });
     }
 
     @Bean(destroyMethod = "shutdownNow")

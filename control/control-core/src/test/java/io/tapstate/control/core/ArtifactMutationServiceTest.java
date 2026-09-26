@@ -53,6 +53,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -451,6 +453,79 @@ class ArtifactMutationServiceTest {
                 .contains(new ObservationStore.Scope("inc-old", 1));
     }
 
+    @Test
+    void cleanupRejectionReportsTheRemovedOwnerWithoutReversingDeletion() {
+        List<TelemetryCleanupReporter.Failure> failures = new ArrayList<>();
+        ArtifactMutationService rejecting = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add,
+                task -> { throw new java.util.concurrent.RejectedExecutionException("full"); },
+                null, null, null, id -> Optional.of(new ObservationStore.Scope("inc-old", 7)), failures::add);
+        PipelineResource old = pipeline("flow");
+        store.save(old);
+        store.assignIncarnation("flow", "inc-old");
+
+        rejecting.delete(PRINCIPAL, "flow", hash(old));
+        store.save(pipeline("flow"));
+        store.assignIncarnation("flow", "inc-new");
+
+        assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
+        assertThat(failures).extracting(TelemetryCleanupReporter.Failure::step)
+                .containsExactly("observation", "rate-history");
+        assertThat(failures).allSatisfy(failure -> {
+            assertThat(failure.pipelineId()).isEqualTo("flow");
+            assertThat(failure.incarnationId()).isEqualTo("inc-old");
+            assertThat(failure.executionGeneration()).isEqualTo(OptionalLong.of(7));
+            assertThat(failure.rejected()).isTrue();
+        });
+    }
+
+    @Test
+    void neverRunRecreationDoesNotBorrowItsPredecessorsDurableGeneration() {
+        List<TelemetryCleanupReporter.Failure> failures = new ArrayList<>();
+        ArtifactMutationService rejecting = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add,
+                task -> { throw new java.util.concurrent.RejectedExecutionException("full"); },
+                null, null, null,
+                id -> Optional.of(new ObservationStore.Scope("inc-old", 7)), failures::add);
+        PipelineResource current = pipeline("flow");
+        store.save(current);
+        store.assignIncarnation("flow", "inc-new");
+
+        rejecting.delete(PRINCIPAL, "flow", hash(current));
+
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(failures).hasSize(2).allSatisfy(failure -> {
+            assertThat(failure.incarnationId()).isEqualTo("inc-new");
+            assertThat(failure.executionGeneration()).isEmpty();
+        });
+    }
+
+    @Test
+    void remoteControlMemberWithoutLocalExecutionScopeStillReportsCleanupFailure() {
+        List<TelemetryCleanupReporter.Failure> failures = new ArrayList<>();
+        ArtifactMutationService remote = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add,
+                Runnable::run, null, null, null, id -> Optional.empty(), failures::add);
+        PipelineResource old = pipeline("flow");
+        store.save(old);
+        store.assignIncarnation("flow", "inc-old");
+        observations.saveScoped(new Observation("flow", PipelineState.STOPPED,
+                Map.of(), Map.of()), new ObservationStore.Scope("inc-old", 7));
+        observations.failDeleteWith(new IllegalStateException("observation store unavailable"));
+
+        remote.delete(PRINCIPAL, "flow", hash(old));
+
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(failures).singleElement().satisfies(failure -> {
+            assertThat(failure.incarnationId()).isEqualTo("inc-old");
+            assertThat(failure.executionGeneration()).isEmpty();
+            assertThat(failure.step()).isEqualTo("observation");
+        });
+    }
+
 
     @Test
     void delayedLogCleanupUsesTheRemovedIncarnationAfterSameIdRecreation() {
@@ -502,6 +577,45 @@ class ArtifactMutationServiceTest {
 
         assertThat(removed).containsExactly("inc-old");
         assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
+    }
+
+    @Test
+    void failedEventCleanupReportsTheOldOwnerAfterRecreation() {
+        List<Runnable> pending = new ArrayList<>();
+        List<TelemetryCleanupReporter.Failure> failures = new ArrayList<>();
+        AtomicReference<ObservationStore.Scope> localScope = new AtomicReference<>(
+                new ObservationStore.Scope("inc-old", 7));
+        PipelineEventStore failingEvents = new PipelineEventStore() {
+            @Override public void append(io.tapstate.core.lifecycle.PipelineEvent event) { }
+            @Override public Page readPage(String id, String incarnation, Instant from, Instant to,
+                    Key after, int limit) { return new Page(List.of(), false); }
+            @Override public void deleteIncarnation(String id, String incarnation) {
+                assertThat(incarnation).isEqualTo("inc-old");
+                throw new IllegalStateException("event store unavailable");
+            }
+            @Override public java.time.Duration retention() { return java.time.Duration.ofDays(15); }
+        };
+        ArtifactMutationService delayed = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add,
+                pending::add, null, failingEvents, null, id -> Optional.of(localScope.get()), failures::add);
+        PipelineResource old = pipeline("flow");
+        store.save(old);
+        store.assignIncarnation("flow", "inc-old");
+
+        delayed.delete(PRINCIPAL, "flow", hash(old));
+        store.save(pipeline("flow"));
+        store.assignIncarnation("flow", "inc-new");
+        localScope.set(new ObservationStore.Scope("inc-new", 8));
+        pending.forEach(Runnable::run);
+
+        assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
+        assertThat(failures).singleElement().satisfies(failure -> {
+            assertThat(failure.incarnationId()).isEqualTo("inc-old");
+            assertThat(failure.executionGeneration()).isEqualTo(OptionalLong.of(7));
+            assertThat(failure.step()).isEqualTo("event-history");
+            assertThat(failure.rejected()).isFalse();
+        });
     }
 
     @Test
