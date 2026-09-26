@@ -371,6 +371,10 @@ class PipelineDagBuilderTest {
                 Map.entry("j", List.of("j", "j:project")),
                 Map.entry("serve.sync_1", List.of("route.serve.sync_1", "serve.sync_1")));
         assertThat(narrow.byNode()).containsEntry("serve.sync_1", List.of("serve.sync_1"));
+        // What feeds the sink is the vertex the join emits from, however wide the sink runs: the queues into
+        // the sink are counted from it.
+        assertThat(drawn.feedingByNode()).containsExactly(Map.entry("serve.sync_1", List.of("j:project")));
+        assertThat(narrow.feedingByNode()).containsExactly(Map.entry("serve.sync_1", List.of("j:project")));
     }
 
     /**

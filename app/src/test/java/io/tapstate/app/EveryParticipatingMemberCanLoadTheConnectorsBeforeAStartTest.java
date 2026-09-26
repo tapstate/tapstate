@@ -15,8 +15,10 @@ import io.tapstate.adapters.pdk.ConnectorRef;
 import io.tapstate.adapters.pdk.RegistryConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.RegistrationOutcome;
@@ -29,6 +31,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -211,6 +214,34 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
     }
 
     @Test
+    void aSinksWritersShareAConnectorOnlyWhereEveryMemberLoadedItAsCertifiedToBeShared() {
+        bind(m1, new Loading("h1", true));
+        bind(m2, new Loading("h1", true));
+        bind(m3, new Loading("h1", false));
+
+        assertThat(readiness().requireEveryMemberCanLoad(pipe, Set.of("pg"))).isEmpty();
+
+        bind(m3, new Loading("h1", true));
+
+        assertThat(readiness().requireEveryMemberCanLoad(pipe, Set.of("pg"))).containsExactly("pg");
+    }
+
+    @Test
+    void theRunsPlanSaysItsSinksWritersShareTheConnectorEveryMemberLoadedAsCertified() {
+        bind(m1, new Loading("h1", true));
+        bind(m2, new Loading("h1", true));
+        bind(m3, new Loading("h1", true));
+        Started started = new Started();
+
+        started.actuator(readiness()).start(pipe);
+
+        assertThat(started.plans).singleElement().satisfies(plan -> assertThat(plan.nodes())
+                .filteredOn(node -> node.node().equals("serve.orders")).singleElement()
+                .extracting(node -> node.resources().connectorMode(), node -> node.resources().connectorInstances())
+                .containsExactly("shared", 3));
+    }
+
+    @Test
     void aPipelineWhoseSinksOpenNoConnectorAsksNoMember() {
         Loading one = new Loading("h1");
         bind(m1, one);
@@ -288,6 +319,17 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
                 public Map<String, String> sinkConnectors(String pipelineId) {
                     return sinkConnectors;
                 }
+
+                @Override
+                public PlannedDag plannedDagFor(String pipelineId, ExecutionFence fence) {
+                    // The idle stand-in topology, planned as sinks two per member on the three members: six
+                    // writers, so a connector per member reads differently from a connector per writer.
+                    Map<String, NodeParallelism> nodes = new LinkedHashMap<>();
+                    sinkConnectors.keySet().forEach(sink -> nodes.put(sink, new NodeParallelism(sink, 6,
+                            NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE, 3, 2, 6, List.of())));
+                    return new PlannedDag(dagFor(pipelineId), new ExecutionShape(3, nodes, Map.of()),
+                            List.of("m1", "m2", "m3"), Map.of(), Map.of());
+                }
             };
             PipelineCaptureCoordinator capture = new PipelineCaptureCoordinator() {
                 @Override
@@ -322,20 +364,29 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
         }
     }
 
-    /** Loads every connector as the artifact {@code contentHash}, remembering which it was asked for, in order. */
+    /**
+     * Loads every connector as the artifact {@code contentHash}, certified to be shared or not, remembering which
+     * it was asked for, in order.
+     */
     private static final class Loading implements ConnectorProvisioner {
 
         private final String contentHash;
+        private final boolean shareSafe;
         private final List<String> asked = Collections.synchronizedList(new ArrayList<>());
 
         Loading(String contentHash) {
+            this(contentHash, false);
+        }
+
+        Loading(String contentHash, boolean shareSafe) {
             this.contentHash = contentHash;
+            this.shareSafe = shareSafe;
         }
 
         @Override
         public ConnectorRef resolve(String connectorId) {
             asked.add(connectorId);
-            return new ConnectorRef(List.of(), "x", "1.0", null, null, contentHash, false);
+            return new ConnectorRef(List.of(), "x", "1.0", null, null, contentHash, shareSafe);
         }
     }
 
