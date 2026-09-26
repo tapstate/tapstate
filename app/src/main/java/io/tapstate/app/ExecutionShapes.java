@@ -48,7 +48,8 @@ import java.util.function.Function;
  * run, and every one of them runs as wide as the nest does, so they count against what a member may run of such
  * threads.
  *
- * <p>Every step and every sink is worked out here; a source runs as one processor, as it always has.
+ * <p>Every node is worked out here. A source always runs as one processor, and says so where its author asked
+ * for more.
  */
 final class ExecutionShapes {
 
@@ -71,15 +72,17 @@ final class ExecutionShapes {
     /**
      * What the walk needs to know about the graph: the producers a reference names, the stream each source
      * vertex emits, the key columns of each source table, the key columns of what each assembling step - a
-     * nest or a join - emits, and how many vertices holding a thread of their own each nest step draws. A table
-     * or step with no key maps to an empty list.
+     * nest or a join - emits, how many vertices holding a thread of their own each nest step draws, and the
+     * execution block written on the source each source vertex reads, where one was. A table or step with no key
+     * maps to an empty list.
      */
     record Graph(
             Function<FromRef, List<String>> upstreams,
             Map<String, String> streamOfSourceVertex,
             Map<String, List<String>> tableKeys,
             Map<String, List<String>> assembledKeys,
-            Map<String, Integer> blockingVertices) {
+            Map<String, Integer> blockingVertices,
+            Map<String, ExecutionSpec> sourceExecutions) {
 
         Graph {
             Objects.requireNonNull(upstreams, "upstreams");
@@ -87,6 +90,7 @@ final class ExecutionShapes {
             tableKeys = Map.copyOf(tableKeys);
             assembledKeys = Map.copyOf(assembledKeys);
             blockingVertices = Map.copyOf(blockingVertices);
+            sourceExecutions = Map.copyOf(sourceExecutions);
         }
     }
 
@@ -98,6 +102,16 @@ final class ExecutionShapes {
                 emitted.put(vertex, Map.of(stream, graph.tableKeys().getOrDefault(stream, List.of()))));
 
         Map<String, NodeParallelism> nodes = new LinkedHashMap<>();
+        // A source is read by one processor whatever its author wrote: splitting a read needs parts that never
+        // overlap and each keep their own progress, which no connector has declared. A wider target is held to
+        // one and says why, rather than refused - more readers would only be slower to reason about.
+        for (String vertex : graph.streamOfSourceVertex().keySet()) {
+            ExecutionSpec execution = graph.sourceExecutions().get(vertex);
+            ParallelismRequest request = new ParallelismRequest(vertex, ParallelismRequest.Kind.SOURCE,
+                    writtenIn(execution), ParallelismRequest.Singleton.SOURCE_READS_NOT_SPLIT, false,
+                    batchOf(execution).effectiveMaxRecords(), 0);
+            nodes.put(vertex, planned(pipelineId, ParallelismPlanner.plan(request, members, budget)));
+        }
         Map<String, Map<String, List<String>>> inputKeys = new LinkedHashMap<>();
         for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
             if (!(step instanceof Step.Inline inline)) {

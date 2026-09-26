@@ -90,7 +90,8 @@ class ANestOrAJoinIsWorkedOutLikeAnyStepTest {
                 Map.of("orders", "orders", "customers", "customers"),
                 Map.of("orders", List.of("id"), "customers", List.of("id")),
                 Map.of("doc", List.of("id"), "j", List.of("id")),
-                blocking);
+                blocking,
+                Map.of());
         return ExecutionShapes.of("p", pipeline, members, ParallelismBudget.DEFAULTS, graph, List.of());
     }
 }

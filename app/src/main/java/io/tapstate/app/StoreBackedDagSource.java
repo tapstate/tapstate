@@ -349,7 +349,8 @@ final class StoreBackedDagSource implements DagSource {
                         keyColumnsOf(bySourceTable),
                         keyColumnsOf(assembled),
                         PipelineDagBuilder.nestBlockingVertices(pipeline,
-                                nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get)),
+                                nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get),
+                        sourceExecutions(sourceVertices)),
                 sinksOf(pipeline, targets, serveStreams, viewStreams));
         return PipelineDagBuilder.build(
                 builtPipeline,
@@ -385,6 +386,18 @@ final class StoreBackedDagSource implements DagSource {
             }
         }
         return sinks;
+    }
+
+    /** The execution block written on the source each source vertex reads, for the vertices whose source has one. */
+    private Map<String, ExecutionSpec> sourceExecutions(Map<String, SourceVertex> sourceVertices) {
+        Map<String, ExecutionSpec> executions = new LinkedHashMap<>();
+        sourceVertices.forEach((key, vertex) -> {
+            ExecutionSpec execution = StoredArtifacts.requireSource(artifacts(), vertex.sourceId()).execution();
+            if (execution != null) {
+                executions.put(key, execution);
+            }
+        });
+        return executions;
     }
 
     /** The stream each source vertex emits: the table it reads, which is what its rows name as their stream. */

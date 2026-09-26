@@ -134,7 +134,7 @@ class ASinkRunsWideUnlessEveryRowLandsInOneKeylessTableTest {
         PipelineResource pipeline = new PipelineResource("p", null, List.of(SourceRef.bare("src")), List.of(),
                 null, null, null, null);
         ExecutionShapes.Graph graph = new ExecutionShapes.Graph(ref -> List.of(((FromRef.Literal) ref).ref()),
-                Map.of(), Map.of(), Map.of(), Map.of());
+                Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
         return ExecutionShapes.of("p", pipeline, members, ParallelismBudget.DEFAULTS, graph, List.of(sink));
     }
 

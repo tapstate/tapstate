@@ -373,6 +373,19 @@ class ValidatedPipelineBuildsTest {
         assertThat(dag.getVertex("serve.sync_1").getLocalParallelism()).isEqualTo(4);
     }
 
+    /** A source asked to be read by four processors is still read by one: its reader stays pinned to one. */
+    @Test
+    void aSourceAskedForMoreThanOneReaderIsStillReadByOne() {
+        InMemoryStorePort store = validated(SOURCE.replace("tables: [ orders ]\n",
+                "tables: [ orders ]\nexecution: { parallelism: 4 }\n"), TARGET, PIPELINE);
+        discovered(store, "orders_src", "orders", List.of("id"));
+
+        DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("p");
+
+        assertThat(dag.getVertex("orders_src").getMetaSupplier().preferredLocalParallelism())
+                .as("one reader for the whole cluster").isEqualTo(1);
+    }
+
     /**
      * A sync element whose author asked for one writer runs as one writer for the whole cluster, with nothing
      * in front of it to route by - the width written in the element, carried from the text to the graph.
