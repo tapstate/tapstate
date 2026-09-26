@@ -26,6 +26,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.tapstate.core.lifecycle.PipelineState.FAILED;
 import static io.tapstate.core.lifecycle.PipelineState.NEW;
@@ -40,6 +41,35 @@ import static org.assertj.core.api.Assertions.entry;
  * rest of the pass.
  */
 class ConvergenceDriverTest {
+
+    @Test
+    void aMissingPausedJobReachesTheStoreBackedStatusWithItsCodedReason() {
+        AtomicBoolean carrying = new AtomicBoolean(true);
+        LifecycleActuator job = new LifecycleActuator() {
+            @Override public void start(String id) { carrying.set(true); }
+            @Override public void pause(String id) { }
+            @Override public void resume(String id) { }
+            @Override public void stop(String id, boolean purgeState) { carrying.set(false); }
+            @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String id) { return carrying.get(); }
+        };
+        PipelineConverger loop = new PipelineConverger(desired, state, job, Clock.fixed(T0, ZoneOffset.UTC));
+        ConvergenceDriver observed = new ConvergenceDriver(
+                loop, desired, new ObservationPublisher(state, observations));
+        desired.save(new DesiredState("orders", RUNNING, "rev-1"));
+        observed.reconcile();
+        desired.save(new DesiredState("orders", io.tapstate.core.lifecycle.PipelineState.PAUSED, "rev-1"));
+        observed.reconcile();
+        carrying.set(false);
+
+        observed.reconcile();
+
+        Observation latest = observations.read("orders").orElseThrow();
+        assertThat(latest.state()).isEqualTo(FAILED);
+        assertThat(latest.failure().code()).isEqualTo("lifecycle.paused-job-missing");
+        assertThat(desired.read("orders").orElseThrow().targetState())
+                .isEqualTo(io.tapstate.core.lifecycle.PipelineState.PAUSED);
+    }
 
     private static final Instant T0 = Instant.parse("2026-07-01T00:00:00Z");
 

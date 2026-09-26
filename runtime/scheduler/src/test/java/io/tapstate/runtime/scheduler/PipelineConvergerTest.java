@@ -324,6 +324,29 @@ class PipelineConvergerTest {
     }
 
     @Test
+    void aPausedExecutionThatDisappearsBecomesACodedFailureWithoutChangingDesiredIntent() {
+        converge(RUNNING);
+        converge(PAUSED);
+        actuator.reset();
+        actuator.carryingNothing();
+
+        ConvergeResult lost = converger.converge("p1");
+
+        assertThat(lost.status()).isEqualTo(ConvergeStatus.FAILED);
+        assertThat(lost.failure()).hasValueSatisfying(cause -> {
+            assertThat(cause).isInstanceOf(TapstateException.class);
+            assertThat(((TapstateException) cause).code().code()).isEqualTo("lifecycle.paused-job-missing");
+        });
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+        assertThat(desired.read("p1").orElseThrow().targetState()).isEqualTo(PAUSED);
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+
+        actuator.reset();
+        converger.converge("p1");
+        assertThat(actuator.calls()).isEmpty();
+    }
+
+    @Test
     @DisplayName("stopping a pipeline cancels its job")
     void stoppingActuatesStop() {
         converge(RUNNING);

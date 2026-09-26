@@ -21,6 +21,7 @@ class LifecycleErrorTest {
                 "lifecycle.illegal-transition",
                 // start/resume refused because the pipeline's revision is not the latest applied one
                 "lifecycle.incompatible-revision",
+                "lifecycle.paused-job-missing",
                 // a stop that did not say whether to clear what the pipeline has accumulated
                 "lifecycle.purge-state-not-stated",
                 // a start or resume named a draft without an executable source-to-output path
@@ -43,6 +44,8 @@ class LifecycleErrorTest {
         assertThat(LifecycleError.PURGE_STATE_NOT_STATED.placeholders())
                 .containsExactlyInAnyOrder("pipeline");
         assertThat(LifecycleError.PIPELINE_NOT_RUNNABLE.placeholders())
+                .containsExactlyInAnyOrder("pipeline");
+        assertThat(LifecycleError.PAUSED_JOB_MISSING.placeholders())
                 .containsExactlyInAnyOrder("pipeline");
     }
 }

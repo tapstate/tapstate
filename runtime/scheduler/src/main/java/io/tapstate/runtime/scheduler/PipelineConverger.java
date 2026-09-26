@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.DesiredStore;
@@ -12,6 +13,7 @@ import io.tapstate.spi.store.StateStore;
 import java.time.Clock;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Map;
 
 /**
  * Converges a pipeline's actual state toward its desired intent. It reads the desired target, seeds
@@ -110,6 +112,26 @@ public final class PipelineConverger {
                 }
                 return ConvergeResult.converged(actualDoc.orElseThrow());
             }
+        }
+
+        if (target == PipelineState.PAUSED && actual == PipelineState.PAUSED) {
+            Optional<Throwable> failure = actuator.failure(pipelineId);
+            if (failure.isEmpty() && !actuator.isCarryingAJob(pipelineId)) {
+                failure = Optional.of(new TapstateException(LifecycleError.PAUSED_JOB_MISSING,
+                        Map.of("pipeline", pipelineId), null));
+            }
+            if (failure.isPresent()) {
+                ConvergeResult driven = driveTo(
+                        pipelineId, PipelineState.FAILED, false, actualDoc.orElse(null), false);
+                Throwable cause = failure.get();
+                return driven.checkpoint().map(checkpoint -> ConvergeResult.failed(checkpoint, cause))
+                        .orElse(driven);
+            }
+        }
+
+        if (target == PipelineState.PAUSED && actual == PipelineState.FAILED) {
+            // The intent stays paused; the failed execution is not a job that can be paused again.
+            return ConvergeResult.converged(actualDoc.orElseThrow());
         }
 
         if (target == PipelineState.RUNNING && actual == PipelineState.FAILED && !rebuildOwed) {

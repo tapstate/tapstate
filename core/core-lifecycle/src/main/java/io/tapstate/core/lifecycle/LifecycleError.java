@@ -37,6 +37,9 @@ public enum LifecycleError implements TapstateErrorCode {
     /** A persisted editor draft that does not yet have the source and output needed for a run. */
     PIPELINE_NOT_RUNNABLE("lifecycle.pipeline-not-runnable", Set.of("pipeline")),
 
+    /** A paused execution lost the job that a later resume would have to continue. */
+    PAUSED_JOB_MISSING("lifecycle.paused-job-missing", Set.of("pipeline")),
+
     /**
      * A lifecycle verb, or a status/metrics/snapshot read, named a pipeline that was never applied:
      * {@code pipeline} is the id the caller gave. Permanent -- unlike an applied pipeline with no
