@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
@@ -310,6 +311,54 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public OptionalLong ringGenerationStartAfter(String miningChainId, String table, long epoch) {
+        Objects.requireNonNull(table, "table");
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("epoch", "physicalRingStarts")).first());
+        if (root == null || readEpoch(root, "epoch") != epoch) {
+            return OptionalLong.empty();
+        }
+        Object rawStarts = root.get("physicalRingStarts");
+        if (rawStarts == null) {
+            return OptionalLong.empty();
+        }
+        if (!(rawStarts instanceof Document starts)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", miningChainId, "field", "physicalRingStarts"), null);
+        }
+        Object rawStart = starts.get(table);
+        if (rawStart == null) {
+            return OptionalLong.empty();
+        }
+        if (!(rawStart instanceof Document start)
+                || !(start.get("epoch") instanceof Number storedEpoch)
+                || !(start.get("seq") instanceof Number seq) || seq.longValue() < -1L) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", miningChainId, "field", "physicalRingStarts." + table), null);
+        }
+        return storedEpoch.longValue() == epoch ? OptionalLong.of(seq.longValue()) : OptionalLong.empty();
+    }
+
+    @Override
+    public OptionalLong establishRingGenerationStartAfter(
+            String miningChainId, String table, long epoch, long proposedSeq) {
+        if (table == null || table.isBlank() || epoch < 1 || proposedSeq < -1L) {
+            throw new IllegalArgumentException("ring generation start needs a table, epoch and valid sequence");
+        }
+        String path = "physicalRingStarts." + table;
+        Document filter = new Document("_id", miningChainId)
+                .append("epoch", epoch)
+                .append(path, new Document("$exists", false));
+        long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(filter,
+                new Document("$set", new Document(path,
+                        new Document("epoch", epoch).append("seq", proposedSeq)))).getMatchedCount());
+        if (matched == 0) {
+            requireSeeded(miningChainId);
+        }
+        return ringGenerationStartAfter(miningChainId, table, epoch);
+    }
+
+    @Override
     public void create(String miningChainId, String retention) {
         // Insert-only: insertOne fails on a duplicate _id, so an existing chain's accumulated offset /
         // cursor / schema truth is never discarded by a re-seed.
@@ -340,6 +389,26 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // mutators raise too -- or "this position does not move the chain forward", which is ordinary and
         // silent. Only a second look tells them apart, and it runs on the path that changed nothing.
         requireSeeded(miningChainId);
+    }
+
+    @Override
+    public boolean advancePhysicalSourceReadOffset(String miningChainId, long epoch, ChainPosition position) {
+        Objects.requireNonNull(position, "position");
+        if (position.order() == null || position.order().epoch() != epoch || position.token() == null) {
+            throw new IllegalArgumentException("a physical source advance needs this generation and a token");
+        }
+        Document filter = sourceReadAdvanceFilter(miningChainId, position.order()).append("epoch", epoch);
+        long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(filter,
+                new Document("$set", sourceReadFields(position, Instant.now(clock)))).getMatchedCount());
+        if (matched == 1) {
+            return true;
+        }
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("epoch")).first());
+        if (root == null) {
+            throw unseededChain(miningChainId);
+        }
+        return readEpoch(root, "epoch") == epoch;
     }
 
     @Override
@@ -560,6 +629,43 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public boolean advancePhysicalSinkAcked(
+            String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+        Objects.requireNonNull(position, "position");
+        if (position.order() == null || position.order().epoch() != epoch || position.token() == null) {
+            throw new IllegalArgumentException("a physical sink advance needs this generation and a token");
+        }
+        migrateLegacyConsumers(miningChainId, true);
+        AtomicBoolean currentGeneration = new AtomicBoolean();
+        StoreIo.run(miningChainId, () -> {
+            try (ClientSession session = client.startSession()) {
+                session.withTransaction(() -> {
+                    UpdateResult root = collection.updateOne(session,
+                            new Document("_id", miningChainId).append("epoch", epoch),
+                            new Document("$inc", new Document(CONSUMER_WRITE_REVISION, 1L)));
+                    currentGeneration.set(root.getMatchedCount() == 1);
+                    if (!currentGeneration.get()) {
+                        return null;
+                    }
+                    Document filter = new Document(consumerKey(miningChainId, pipelineId))
+                            .append("selectedTablesEpoch", epoch)
+                            .append("$or", List.of(
+                                    new Document("sinkAckedEpoch", new Document("$exists", false)),
+                                    new Document("sinkAckedEpoch", new Document("$lt", epoch)),
+                                    new Document("sinkAckedEpoch", epoch)
+                                            .append("sinkAckedSeq", new Document("$lt", position.order().seq()))));
+                    consumers.updateOne(session, filter, sinkAckedUpdate(pipelineId, position));
+                    return null;
+                });
+            }
+        });
+        if (!currentGeneration.get()) {
+            requireSeeded(miningChainId);
+        }
+        return currentGeneration.get();
+    }
+
+    @Override
     public void advanceSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {
         updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, table, position));
@@ -760,7 +866,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // written back. It touches only epoch, leaving every pinned pipeline snapshot generation where it is.
         Document updated = writeChainWithConsumerMigration(miningChainId, () -> collection.findOneAndUpdate(
                 new Document("_id", miningChainId),
-                new Document("$inc", new Document("epoch", 1L)),
+                new Document("$inc", new Document("epoch", 1L))
+                        .append("$unset", new Document("physicalRingStarts", "")),
                 new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)));
         if (updated == null) {
             throw unseededChain(miningChainId);

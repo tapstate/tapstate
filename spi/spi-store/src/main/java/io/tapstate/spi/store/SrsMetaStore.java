@@ -4,6 +4,7 @@ import io.tapstate.core.event.ChainPosition;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /**
  * The durable SRS coordination store: one {@link SrsMeta} record per mining chain — the offset, consumer
@@ -73,6 +74,17 @@ public interface SrsMetaStore {
         throw new UnsupportedOperationException("physical capture request cleanup is unavailable");
     }
 
+    /** The last sequence from before this table's current ring generation began admitting changes. */
+    default OptionalLong ringGenerationStartAfter(String miningChainId, String table, long epoch) {
+        return OptionalLong.empty();
+    }
+
+    /** Establishes that boundary once per table and generation, before the first source batch can append. */
+    default OptionalLong establishRingGenerationStartAfter(
+            String miningChainId, String table, long epoch, long proposedSeq) {
+        throw new UnsupportedOperationException("ring generation start boundaries are unavailable");
+    }
+
     /** Returns the meta record for a mining chain, or empty if the chain has not been seeded. */
     Optional<SrsMeta> read(String miningChainId);
 
@@ -118,6 +130,12 @@ public interface SrsMetaStore {
      * against anything.
      */
     void advanceSourceReadOffset(String miningChainId, ChainPosition position);
+
+    /** Advances a physical batch only while its owner still holds this ring generation. */
+    default boolean advancePhysicalSourceReadOffset(
+            String miningChainId, long epoch, ChainPosition position) {
+        throw new UnsupportedOperationException("generation-fenced physical source advances are unavailable");
+    }
 
     /**
      * Whether this chain's stored read position was established by a physical source boundary or an
@@ -211,6 +229,12 @@ public interface SrsMetaStore {
      * sink.
      */
     void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position);
+
+    /** Publishes a consumer's confirmed physical prefix without reviving a detached or newer reader. */
+    default boolean advancePhysicalSinkAcked(
+            String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+        throw new UnsupportedOperationException("generation-fenced physical sink acknowledgements are unavailable");
+    }
 
     /**
      * Advances the sink-acked position as {@link #advanceSinkAcked(String, String, ChainPosition)} does, and
