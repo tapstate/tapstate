@@ -114,6 +114,26 @@ class ClusterWorkloadClaimsTest {
         assertThat(raw.calls).hasValue(0);
     }
 
+    @Test
+    void aFailureIsNotRecordedAfterTheCommittedMajorityIsLost() {
+        ClusterMembershipGate gate = productionGate();
+        gate.install(new ClusterMembership("cluster-a", 1, Set.of("a", "b", "c")));
+        gate.canCommit(Set.of("a"));
+        RecordingClaims raw = new RecordingClaims();
+        ClusterWorkloadClaims claims = new ClusterWorkloadClaims(raw, gate);
+        WorkloadClaimKey key =
+                new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        WorkloadClaim running = new WorkloadClaim(key, OWNER, 1, 1, 1, Instant.now().plus(TTL),
+                1, 1, Set.of("a", "b", "c"), 0, false);
+
+        assertThat(claims.recordExecutionFailure(running, true)).isEmpty();
+        assertThat(raw.calls).hasValue(0);
+
+        gate.canCommit(Set.of("a", "b"));
+        assertThat(claims.recordExecutionFailure(running, true)).contains(running);
+        assertThat(raw.calls).hasValue(1);
+    }
+
     private static ClusterMembershipGate productionGate() {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
@@ -147,7 +167,15 @@ class ClusterWorkloadClaimsTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+        public Optional<WorkloadClaim> advanceExecution(
+                WorkloadClaim expected, long topologyRevision, Set<String> executionNodeIds) {
+            calls.incrementAndGet();
+            return Optional.of(expected);
+        }
+
+        @Override
+        public Optional<WorkloadClaim> recordExecutionFailure(
+                WorkloadClaim expected, boolean afterMemberLoss) {
             calls.incrementAndGet();
             return Optional.of(expected);
         }

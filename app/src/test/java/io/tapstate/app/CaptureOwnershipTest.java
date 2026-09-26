@@ -964,7 +964,13 @@ class CaptureOwnershipTest {
 
         @Override
         public synchronized Optional<WorkloadClaim> advanceExecution(
-                WorkloadClaim expected, long topologyRevision) {
+                WorkloadClaim expected, long topologyRevision, java.util.Set<String> executionNodeIds) {
+            return Optional.empty();
+        }
+
+        @Override
+        public synchronized Optional<WorkloadClaim> recordExecutionFailure(
+                WorkloadClaim expected, boolean afterMemberLoss) {
             return Optional.empty();
         }
 

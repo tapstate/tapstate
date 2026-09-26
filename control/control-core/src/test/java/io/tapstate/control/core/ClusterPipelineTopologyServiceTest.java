@@ -405,7 +405,14 @@ class ClusterPipelineTopologyServiceTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long revision) {
+        public Optional<WorkloadClaim> advanceExecution(
+                WorkloadClaim expected, long revision, java.util.Set<String> executionNodeIds) {
+            throw new UnsupportedOperationException("a read face takes nothing");
+        }
+
+        @Override
+        public Optional<WorkloadClaim> recordExecutionFailure(
+                WorkloadClaim expected, boolean afterMemberLoss) {
             throw new UnsupportedOperationException("a read face takes nothing");
         }
 
