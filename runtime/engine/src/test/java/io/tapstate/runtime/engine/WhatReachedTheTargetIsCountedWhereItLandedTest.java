@@ -184,7 +184,9 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         pump(processor, row("orders", now - 20L));
         pump(processor, row("orders", now - 30L), row("items", now - 40_000L));
 
-        Map<String, HistogramValue> latest = delivery.latestDurations();
+        // Each settle hands over the distributions of the tables it held rows of, and a batch holds one
+        // table's rows, so each table's latest distribution is the one its own last batch handed over.
+        Map<String, HistogramValue> latest = delivery.latestDurationPerTable();
         assertThat(latest).containsOnlyKeys("orders", "items");
         assertThat(latest.get("orders").count()).isEqualTo(2L);
         assertThat(latest.get("orders").sum()).isEqualTo(0.05);
@@ -408,6 +410,13 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
 
         Map<String, HistogramValue> latestDurations() {
             return durations.get(durations.size() - 1);
+        }
+
+        /** Each table's distribution as most recently handed over, whichever settle it came with. */
+        Map<String, HistogramValue> latestDurationPerTable() {
+            Map<String, HistogramValue> latest = new LinkedHashMap<>();
+            durations.forEach(latest::putAll);
+            return latest;
         }
 
         Map<String, Map<String, Long>> latestRows() {
