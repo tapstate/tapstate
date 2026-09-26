@@ -58,7 +58,7 @@ class AStepRunsWideOnlyWhereItsRowsCarryAKeyTest {
 
     private static ExecutionShape shape(Map<String, List<String>> tableKeys, Step... steps) {
         return ExecutionShapes.of("p", pipeline(steps), 2, ParallelismBudget.DEFAULTS,
-                graph(tableKeys, java.util.Arrays.stream(steps).map(Step::id).toList()));
+                graph(tableKeys, java.util.Arrays.stream(steps).map(Step::id).toList()), List.of());
     }
 
     @Test
@@ -116,7 +116,7 @@ class AStepRunsWideOnlyWhereItsRowsCarryAKeyTest {
                 new ExecutionSpec(100, null), null);
 
         assertThatThrownBy(() -> ExecutionShapes.of("p", pipeline(tooWide), 1, ParallelismBudget.DEFAULTS,
-                graph(Map.of("orders", List.of("id")), List.of("w"))))
+                graph(Map.of("orders", List.of("id")), List.of("w")), List.of()))
                 .isInstanceOfSatisfying(TapstateException.class, refused -> {
                     assertThat(refused.code()).isEqualTo(ActuationError.NO_SAFE_PARALLELISM);
                     assertThat(refused.args()).containsEntry("node", "w").containsEntry("requested", 100)

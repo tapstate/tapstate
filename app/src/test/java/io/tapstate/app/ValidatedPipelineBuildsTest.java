@@ -338,6 +338,25 @@ class ValidatedPipelineBuildsTest {
 
         DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("p");
 
+        // A sink its author wrote no width for runs four writers, and reads a keyed table through a router.
+        assertThat(vertexNames(dag))
+                .containsExactlyInAnyOrder("orders_src", "keep_even", "route.serve.sync_1", "serve.sync_1");
+        assertThat(dag.getVertex("serve.sync_1").getLocalParallelism()).isEqualTo(4);
+    }
+
+    /**
+     * A sync element whose author asked for one writer runs as one writer for the whole cluster, with nothing
+     * in front of it to route by - the width written in the element, carried from the text to the graph.
+     */
+    @Test
+    void aSyncElementAskingForOneWriterRunsItWithNoRouter() {
+        InMemoryStorePort store = validated(SOURCE, TARGET, PIPELINE.replace(
+                "sync: [ { id: sync_1, source: orders_dest } ]",
+                "sync: [ { id: sync_1, source: orders_dest, execution: { parallelism: 1 } } ]"));
+        discovered(store, "orders_src", "orders", List.of("id"));
+
+        DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("p");
+
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "keep_even", "serve.sync_1");
     }
 
@@ -352,7 +371,7 @@ class ValidatedPipelineBuildsTest {
 
         DAG dag = new StoreBackedDagSource(store, discardingBinder()).dagFor("direct");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "serve.sync_1");
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.serve.sync_1", "serve.sync_1");
     }
 
     // ---- fixtures ----------------------------------------------------------------------

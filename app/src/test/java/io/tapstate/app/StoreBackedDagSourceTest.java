@@ -9,6 +9,7 @@ import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceRef;
@@ -19,6 +20,7 @@ import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
+import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
@@ -414,8 +416,10 @@ class StoreBackedDagSourceTest {
 
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
-        assertThat(edges(dag)).containsExactly(edge("orders_src", "view.order_state"));
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.view.order_state",
+                "view.order_state");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("view.order_state",
+                edge("orders_src", "route.view.order_state")));
     }
 
     @Test
@@ -470,8 +474,10 @@ class StoreBackedDagSourceTest {
 
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
-        assertThat(edges(dag)).containsExactly(edge("orders_src", "view.order_state"));
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.view.order_state",
+                "view.order_state");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("view.order_state",
+                edge("orders_src", "route.view.order_state")));
     }
 
     @Test
@@ -610,7 +616,8 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(
                 store, StoreReachability.probing(passing, Duration.ofSeconds(5))).dagFor("p");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.view.order_state",
+                "view.order_state");
     }
 
     @Test
@@ -673,7 +680,8 @@ class StoreBackedDagSourceTest {
 
         DAG dag = new StoreBackedDagSource(store, StoreReachability.assumingReachable()).dagFor("p");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.view.order_state",
+                "view.order_state");
     }
 
     /** A pipeline whose only instruction is a view, with the managed store registered and plain. */
@@ -731,10 +739,48 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(store).dagFor("multi");
 
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
-                "multi_src.orders", "multi_src.customers", "serve.sync_1");
-        assertThat(edges(dag)).containsExactlyInAnyOrder(
-                edge("multi_src.orders", "serve.sync_1"),
-                "multi_src.customers->serve.sync_1#0,1");
+                "multi_src.orders", "multi_src.customers", "route.serve.sync_1", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("serve.sync_1",
+                edge("multi_src.orders", "route.serve.sync_1"),
+                "multi_src.customers->route.serve.sync_1#0,1"));
+    }
+
+    @Test
+    void two_keyless_tables_renamed_into_one_target_table_are_written_by_one_writer() {
+        // Written into one table, two keyless tables leave nothing to tell that table's rows apart by, so one
+        // writer writes them all. Written into two - as in the case above - each table's rows go to a writer of
+        // their own and the sink runs wide. What decides it is the table a stream lands in, not the stream.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders_eu"), TableRef.literal("orders_us")), null, null));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        RenameSpec intoOne = new RenameSpec(Map.of("orders_eu", "orders", "orders_us", "orders"), null, null, null);
+        store.artifacts().save(new PipelineResource(
+                "merged", null, List.of(SourceRef.spec("multi_src", true)), null, null,
+                serve(FromRef.literal("multi_src"), new SyncElement("sync_1", "orders_dest", null, intoOne, null)),
+                null, null));
+        discovered(store, "multi_src", "orders_eu", "orders_us");
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("merged");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "multi_src.orders_eu", "multi_src.orders_us", "serve.sync_1");
+    }
+
+    @Test
+    void a_view_asking_for_one_writer_runs_it_with_no_router() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
+        store.artifacts().save(new PipelineResource(
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null,
+                        new ExecutionSpec(1, null)),
+                null, null, null));
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
     }
 
     @Test
@@ -757,10 +803,10 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(store).dagFor("multi_subset");
 
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
-                "multi_src.orders", "multi_src.customers", "serve.sync_1");
-        assertThat(edges(dag)).containsExactlyInAnyOrder(
-                edge("multi_src.orders", "serve.sync_1"),
-                "multi_src.customers->serve.sync_1#0,1");
+                "multi_src.orders", "multi_src.customers", "route.serve.sync_1", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("serve.sync_1",
+                edge("multi_src.orders", "route.serve.sync_1"),
+                "multi_src.customers->route.serve.sync_1#0,1"));
     }
 
     @Test
@@ -778,10 +824,11 @@ class StoreBackedDagSourceTest {
 
         DAG dag = new StoreBackedDagSource(store).dagFor("all");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("all_src.orders", "all_src.customers", "serve.sync_1");
-        assertThat(edges(dag)).containsExactlyInAnyOrder(
-                edge("all_src.orders", "serve.sync_1"),
-                "all_src.customers->serve.sync_1#0,1");
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "all_src.orders", "all_src.customers", "route.serve.sync_1", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("serve.sync_1",
+                edge("all_src.orders", "route.serve.sync_1"),
+                "all_src.customers->route.serve.sync_1#0,1"));
     }
 
     @Test
@@ -799,10 +846,10 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(store).dagFor("players");
 
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
-                "players_src.Player", "players_src.PlayerCard", "serve.sync_1");
-        assertThat(edges(dag)).containsExactlyInAnyOrder(
-                edge("players_src.Player", "serve.sync_1"),
-                "players_src.PlayerCard->serve.sync_1#0,1");
+                "players_src.Player", "players_src.PlayerCard", "route.serve.sync_1", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("serve.sync_1",
+                edge("players_src.Player", "route.serve.sync_1"),
+                "players_src.PlayerCard->route.serve.sync_1#0,1"));
     }
 
     @Test
@@ -957,6 +1004,18 @@ class StoreBackedDagSourceTest {
 
     private static String edge(String src, String dest) {
         return src + "->" + dest + "#0,0";
+    }
+
+    /**
+     * {@code into} - the edges reaching the router in front of {@code sink} - and the two edges from that router
+     * into the sink: a sink running several writers reads through a router of its own, which spreads a keyed
+     * table's snapshot rows over the writers and sends everything else to the writer its key belongs to.
+     */
+    private static List<String> routed(String sink, String... into) {
+        List<String> all = new ArrayList<>(List.of(into));
+        all.add(edge("route." + sink, sink));
+        all.add("route." + sink + "->" + sink + "#1,1");
+        return all;
     }
 
     /** In-memory artifact store keyed by top-level id; the other sub-stores are not exercised. */

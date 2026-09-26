@@ -31,6 +31,7 @@ import io.tapstate.runtime.engine.FrontierBinding;
 import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.engine.PipelineDagBuilder;
 import io.tapstate.runtime.engine.SinkAckFactory;
+import io.tapstate.runtime.engine.SinkTarget;
 import io.tapstate.runtime.engine.ViewSinkWriters;
 import io.tapstate.runtime.engine.join.JoinBinding;
 import io.tapstate.runtime.engine.join.JoinStoresBinding;
@@ -344,12 +345,42 @@ final class StoreBackedDagSource implements DagSource {
                         ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                         streamOfSourceVertex(sourceVertices),
                         keyColumnsOf(bySourceTable),
-                        keyColumnsOf(assembled)));
+                        keyColumnsOf(assembled)),
+                sinksOf(pipeline, targets, serveStreams, viewStreams));
         return PipelineDagBuilder.build(
                 builtPipeline,
                 bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
                 FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier, shape);
+    }
+
+    /**
+     * Each sink the pipeline draws, with the table every stream reaching it lands in and that table's key - the
+     * tables its writers are handed. A view writes every stream into its one collection, keyed on the view's key;
+     * a {@code serve.sync} element writes each stream into the table its rename rules name, keyed as that
+     * table's model is.
+     */
+    private static List<ExecutionShapes.Sink> sinksOf(PipelineResource pipeline, Map<String, TargetTable> targets,
+            Set<String> serveStreams, Set<String> viewStreams) {
+        List<ExecutionShapes.Sink> sinks = new ArrayList<>();
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(view);
+            Map<String, SinkTarget> lands = new LinkedHashMap<>();
+            viewStreams.forEach(stream ->
+                    lands.put(stream, new SinkTarget(target.collection(), List.of(target.primaryKey()))));
+            sinks.add(new ExecutionShapes.Sink(PipelineDagBuilder.viewVertex(view), view.execution(), lands));
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            for (int index = 0; index < serve.sync().size(); index++) {
+                SyncElement element = serve.sync().get(index);
+                Map<String, SinkTarget> lands = new LinkedHashMap<>();
+                TargetModelResolver.renameAll(targets, serveStreams, element.rename()).forEach((stream, table) ->
+                        lands.put(stream, new SinkTarget(table.name(), keyColumnsOf(table))));
+                sinks.add(new ExecutionShapes.Sink(
+                        PipelineDagBuilder.serveVertex(element, index), element.execution(), lands));
+            }
+        }
+        return sinks;
     }
 
     /** The stream each source vertex emits: the table it reads, which is what its rows name as their stream. */
@@ -362,9 +393,12 @@ final class StoreBackedDagSource implements DagSource {
     /** The key columns of each target model, in key order; empty for a model with no key. */
     private static Map<String, List<String>> keyColumnsOf(Map<String, TargetTable> models) {
         Map<String, List<String>> keys = new LinkedHashMap<>();
-        models.forEach((name, model) -> keys.put(name, model == null ? List.of()
-                : model.fields().stream().filter(TargetField::primaryKey).map(TargetField::name).toList()));
+        models.forEach((name, model) -> keys.put(name, model == null ? List.of() : keyColumnsOf(model)));
         return keys;
+    }
+
+    private static List<String> keyColumnsOf(TargetTable model) {
+        return model.fields().stream().filter(TargetField::primaryKey).map(TargetField::name).toList();
     }
 
     /**

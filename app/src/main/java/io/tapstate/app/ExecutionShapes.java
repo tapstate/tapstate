@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.core.lifecycle.ParallelismPlanner;
 import io.tapstate.core.lifecycle.ParallelismRequest;
+import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
@@ -13,11 +14,15 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.ExecutionShape;
+import io.tapstate.runtime.engine.SinkTarget;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.StringJoiner;
 import java.util.function.Function;
 
@@ -32,12 +37,31 @@ import java.util.function.Function;
  * producer, the key columns of every stream it emits, and a node whose input has a stream without one can only
  * run as one processor - refused where its author explicitly asked for more.
  *
- * <p>Only the stateless steps and unions are worked out here. Every other node runs the way it ran before a
- * run had a shape.
+ * <p>A sink routes by where its rows land rather than by the streams they arrive on: each stream reaching it is
+ * written into a target table, and a row goes to the writer its key in that table belongs to. So a sink can run
+ * wider than one processor unless every row it writes lands in one table that has no key, or a stream reaches
+ * it that nothing says the landing of. A sink writing several tables is not held to one by a keyless table
+ * among them: that table's rows all go to one writer and only that table is written serially.
+ *
+ * <p>The stateless steps, the unions and the sinks are worked out here. Every other node runs the way it ran
+ * before a run had a shape.
  */
 final class ExecutionShapes {
 
     private ExecutionShapes() {
+    }
+
+    /**
+     * One sink a run draws: the vertex it is drawn as, the execution block its author wrote, if any, and the
+     * table each stream reaching it lands in, with that table's key there - the same tables its writers are
+     * handed. A stream nothing says the landing of maps to null.
+     */
+    record Sink(String vertex, ExecutionSpec execution, Map<String, SinkTarget> targets) {
+
+        Sink {
+            Objects.requireNonNull(vertex, "vertex");
+            targets = Collections.unmodifiableMap(new LinkedHashMap<>(targets));
+        }
     }
 
     /**
@@ -61,7 +85,7 @@ final class ExecutionShapes {
 
     /** The shape of {@code pipeline}'s run on {@code members} members within {@code budget}. */
     static ExecutionShape of(String pipelineId, PipelineResource pipeline, int members, ParallelismBudget budget,
-            Graph graph) {
+            Graph graph, List<Sink> sinks) {
         Map<String, Map<String, List<String>>> emitted = new LinkedHashMap<>();
         graph.streamOfSourceVertex().forEach((vertex, stream) ->
                 emitted.put(vertex, Map.of(stream, graph.tableKeys().getOrDefault(stream, List.of()))));
@@ -85,18 +109,53 @@ final class ExecutionShapes {
             });
 
             ExecutionSpec execution = step.execution();
-            Integer written = execution == null ? null : execution.parallelism();
-            int maxRecords = execution == null ? 1024 : execution.batchOrDefaults().effectiveMaxRecords();
             boolean keyed = !input.isEmpty() && input.values().stream().noneMatch(List::isEmpty);
             ParallelismRequest request = new ParallelismRequest(step.id(), ParallelismRequest.Kind.TRANSFORM,
-                    written, keyed ? null : ParallelismRequest.Singleton.KEY_NOT_DERIVABLE, false, maxRecords, 0);
+                    writtenIn(execution), keyed ? null : ParallelismRequest.Singleton.KEY_NOT_DERIVABLE, false,
+                    batchOf(execution).effectiveMaxRecords(), 0);
             NodeParallelism parallelism = planned(pipelineId, ParallelismPlanner.plan(request, members, budget));
             nodes.put(step.id(), parallelism);
             if (parallelism.scope() == NodeParallelism.Scope.NATIVE) {
                 inputKeys.put(step.id(), input);
             }
         }
-        return new ExecutionShape(members, nodes, inputKeys);
+
+        Map<String, Map<String, SinkTarget>> sinkTargets = new LinkedHashMap<>();
+        for (Sink sink : sinks) {
+            // Each writer opens a connector of its own: an artifact certified to share one is only known on
+            // the member that resolves it, so the budget is worked out for the instances that could open.
+            ParallelismRequest request = new ParallelismRequest(sink.vertex(), ParallelismRequest.Kind.SINK,
+                    writtenIn(sink.execution()), singletonOf(sink.targets()), false,
+                    batchOf(sink.execution()).effectiveMaxRecords(), 0);
+            NodeParallelism parallelism = planned(pipelineId, ParallelismPlanner.plan(request, members, budget));
+            nodes.put(sink.vertex(), parallelism);
+            if (parallelism.scope() == NodeParallelism.Scope.NATIVE) {
+                sinkTargets.put(sink.vertex(), sink.targets());
+            }
+        }
+        return new ExecutionShape(members, nodes, inputKeys, sinkTargets);
+    }
+
+    /**
+     * Why a sink can run as one processor only, or null where it can run wider: a stream reaches it that nothing
+     * says the landing of, or every row it writes lands in one table with no key to tell its rows apart by.
+     */
+    private static ParallelismRequest.Singleton singletonOf(Map<String, SinkTarget> targets) {
+        if (targets.isEmpty() || targets.containsValue(null)) {
+            return ParallelismRequest.Singleton.KEY_NOT_DERIVABLE;
+        }
+        Set<String> tables = new HashSet<>();
+        targets.values().forEach(target -> tables.add(target.table()));
+        boolean anyKeyless = targets.values().stream().anyMatch(target -> !target.keyed());
+        return tables.size() == 1 && anyKeyless ? ParallelismRequest.Singleton.SINGLE_TARGET_KEYLESS : null;
+    }
+
+    private static Integer writtenIn(ExecutionSpec execution) {
+        return execution == null ? null : execution.parallelism();
+    }
+
+    private static BatchSpec batchOf(ExecutionSpec execution) {
+        return execution == null ? BatchSpec.DEFAULTS : execution.batchOrDefaults();
     }
 
     /** Every stream reaching a step from its {@code from:} list, with the key each carries there. */

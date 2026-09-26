@@ -68,6 +68,19 @@ public final class PipelineDagBuilder {
     }
 
     /**
+     * The vertex a pipeline's view is drawn as - which is also the pipeline node a run works out its width
+     * under, so a shape naming this node is read by the sink it was worked out for.
+     */
+    public static String viewVertex(ViewBlock.Inline view) {
+        return VIEW_VERTEX_PREFIX + view.id();
+    }
+
+    /** The vertex the {@code index}th {@code serve.sync} element is drawn as, and the node its width is under. */
+    public static String serveVertex(SyncElement element, int index) {
+        return SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : index);
+    }
+
+    /**
      * Every namespace this pipeline's nests keep state in, empty for a pipeline that has none.
      *
      * <p>Answered by compiling the tree rather than by reading back anything a run left behind: the run
@@ -579,7 +592,7 @@ public final class PipelineDagBuilder {
             // A declared view IS its own instruction to materialize: the pipeline needs no serve block to reach
             // the state store, and the vertex is a terminal sink like any other.
             List<String> upstream = resolve(view.from(), bindings);
-            sinks.add(new SinkNode(VIEW_VERTEX_PREFIX + view.id(), upstream, bindings.viewSinks().apply(view),
+            sinks.add(new SinkNode(viewVertex(view), upstream, bindings.viewSinks().apply(view),
                     batchOf(view.execution())));
             readsAs.put(view.id(), upstream);
         }
@@ -588,7 +601,7 @@ public final class PipelineDagBuilder {
             List<SyncElement> sync = serve.sync();
             for (int i = 0; i < sync.size(); i++) {
                 SyncElement element = sync.get(i);
-                String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
+                String name = serveVertex(element, i);
                 sinks.add(new SinkNode(name, upstream, bindings.sinkWriters().apply(element),
                         batchOf(element.execution())));
             }
