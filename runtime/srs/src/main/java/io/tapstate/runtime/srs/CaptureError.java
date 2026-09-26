@@ -66,6 +66,15 @@ public enum CaptureError implements TapstateErrorCode {
     /** A connector emitted a table outside the selected capture streams; {@code table} is its name. */
     EVENT_TABLE_NOT_SELECTED("capture.event-table-not-selected", Set.of("table")),
 
+    /** A resumable CDC read could not obtain a connector position before its first change. */
+    RESUME_ANCHOR_UNAVAILABLE("capture.resume-anchor-unavailable", Set.of("chain")),
+
+    /** A pre-vector multi-table offset cannot prove that every earlier table change reached a sink. */
+    SHARED_POSITION_UNVERIFIED("capture.shared-position-unverified", Set.of("chain")),
+
+    /** A new table cannot attach to an already-open physical subscription without a new generation. */
+    SHARED_SELECTION_RESTART_REQUIRED("capture.shared-selection-restart-required", Set.of("chain")),
+
     /**
      * The snapshot read reported no position for its change tail to pick up from, so the run stops.
      * {@code chain} is the mining chain being snapshotted. Carrying on would put the tail somewhere the

@@ -15,6 +15,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.SrsMetaStore.PhysicalSelection;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -125,6 +126,65 @@ class MongoSrsMetaStoreIT {
             assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow()
                     .sinkAckedByTable()).containsOnlyKeys("orders");
             assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 0L);
+        });
+    }
+
+    @Test
+    void physicalStartAnchorSurvivesReopenAndAnUnverifiedOldOffsetRequiresRepair() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            ChainPosition anchor = new ChainPosition(new SourceOrder(epoch, -1L), "t0");
+            assertThat(store.establishPhysicalAnchor(CHAIN, anchor)).isTrue();
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("t0");
+
+            try (MongoClient reopened = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+                MongoSrsMetaStore recovered = new MongoSrsMetaStore(reopened,
+                        reopened.getDatabase("tapstate").getCollection("srs_meta"));
+                assertThat(recovered.physicalPrefixTrusted(CHAIN)).isTrue();
+                assertThat(recovered.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("t0");
+            }
+
+            String legacy = CHAIN + "-legacy";
+            store.create(legacy, null);
+            long oldEpoch = store.openEpoch(legacy);
+            store.advanceSourceReadOffset(legacy,
+                    new ChainPosition(new SourceOrder(oldEpoch, 4L), "possibly-past-pending-data"));
+            assertThat(store.physicalPrefixTrusted(legacy)).isFalse();
+            assertThat(store.establishPhysicalAnchor(legacy,
+                    new ChainPosition(new SourceOrder(oldEpoch, -1L), "new-present"))).isFalse();
+            assertThat(store.read(legacy).orElseThrow().sourceReadOffset())
+                    .isEqualTo("possibly-past-pending-data");
+            store.rewindSourceReadOffset(legacy, "verified-repair");
+            assertThat(store.physicalPrefixTrusted(legacy)).isTrue();
+            assertThat(store.establishPhysicalAnchor(legacy,
+                    new ChainPosition(new SourceOrder(oldEpoch, -1L), "verified-repair"))).isTrue();
+        });
+    }
+
+    @Test
+    void onePhysicalSelectionIsPublishedPerRingGeneration() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            PhysicalSelection orders = new PhysicalSelection(first, List.of("orders"));
+            assertThat(store.publishPhysicalSelection(CHAIN, orders)).isTrue();
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
+            assertThat(store.establishPhysicalAnchor(CHAIN,
+                    new ChainPosition(new SourceOrder(first, -1L), "first-safe-start"))).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("first-safe-start");
+            assertThat(store.physicalSelection(CHAIN)).contains(orders);
+            assertThat(store.publishPhysicalSelection(CHAIN, orders)).isTrue();
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new PhysicalSelection(first, List.of("orders", "customers")))).isFalse();
+            assertThat(store.physicalSelection(CHAIN)).contains(orders);
+
+            long second = store.openEpoch(CHAIN);
+            PhysicalSelection union = new PhysicalSelection(second, List.of("customers", "orders"));
+            assertThat(store.publishPhysicalSelection(CHAIN, union)).isTrue();
+            assertThat(store.physicalSelection(CHAIN)).contains(
+                    new PhysicalSelection(second, List.of("customers", "orders")));
         });
     }
 

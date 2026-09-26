@@ -451,6 +451,7 @@ public final class PdkCapturePort implements CapturePort {
                 // schema-only recovery with no stored offset to recover from. Which position it names is
                 // the instant it is handed: none for the present, the caller's for an instant start.
                 Object startOffset = resumeAt != null ? resumeAt : startOffset(connector, startAt);
+                listener.onStart(position(connector, startOffset));
                 Map<String, Map<String, String>> declared = declaredTypes(tables);
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
                     // A change stream also carries control events (heartbeats and the like) that signal

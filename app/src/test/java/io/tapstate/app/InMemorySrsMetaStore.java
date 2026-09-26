@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Objects;
+import java.util.Set;
+import java.util.LinkedHashSet;
 
 /**
  * A faithful in-memory {@link SrsMetaStore} for the data-plane tests, synchronized so a Jet worker's
@@ -23,12 +25,37 @@ import java.util.Objects;
 final class InMemorySrsMetaStore implements SrsMetaStore {
 
     private final Map<String, SrsMeta> records = new LinkedHashMap<>();
+    private final Set<String> trustedPhysicalPrefixes = new LinkedHashSet<>();
+    private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
     /** Per chain, per pipeline: the ring sequence of the last change each table's sink confirmed. */
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
 
     @Override
     public synchronized Optional<SrsMeta> read(String miningChainId) {
         return Optional.ofNullable(records.get(miningChainId));
+    }
+
+    @Override
+    public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+        return Optional.ofNullable(physicalSelections.get(miningChainId));
+    }
+
+    @Override
+    public synchronized boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
+        SrsMeta current = require(miningChainId);
+        if (current.epoch() != selection.epoch()) {
+            return false;
+        }
+        PhysicalSelection previous = physicalSelections.get(miningChainId);
+        if (previous != null && previous.epoch() == selection.epoch()
+                && !Set.copyOf(previous.tables()).equals(Set.copyOf(selection.tables()))) {
+            return false;
+        }
+        physicalSelections.put(miningChainId, selection);
+        if (selection.tables().size() == 1 && current.sourceRead() == null) {
+            trustedPhysicalPrefixes.add(miningChainId);
+        }
+        return true;
     }
 
     @Override
@@ -42,6 +69,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized void rewindSourceReadOffset(String miningChainId, String token) {
         SrsMeta m = require(miningChainId);
+        trustedPhysicalPrefixes.add(miningChainId);
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), new ChainPosition(null, token), m.consumerOffsets(),
                 m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
@@ -53,6 +81,28 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), position, m.consumerOffsets(),
                 m.schemaHistory(), m.retention(), m.epoch()));
+    }
+
+    @Override
+    public synchronized boolean physicalPrefixTrusted(String miningChainId) {
+        return trustedPhysicalPrefixes.contains(miningChainId);
+    }
+
+    @Override
+    public synchronized boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+        SrsMeta current = require(miningChainId);
+        if (current.epoch() != position.order().epoch()) {
+            return false;
+        }
+        if (current.sourceRead() != null) {
+            return physicalPrefixTrusted(miningChainId);
+        }
+        if (position.token() == null) {
+            return false;
+        }
+        advanceSourceReadOffset(miningChainId, position);
+        trustedPhysicalPrefixes.add(miningChainId);
+        return true;
     }
 
     @Override
@@ -293,6 +343,8 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     public synchronized void dropChain(String miningChainId) {
         // Idempotent for the same reason the detach below is: an absent chain already satisfies it.
         records.remove(miningChainId);
+        trustedPhysicalPrefixes.remove(miningChainId);
+        physicalSelections.remove(miningChainId);
         ringDone.remove(miningChainId);
     }
 

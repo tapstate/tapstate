@@ -759,7 +759,8 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     void aSlowSnapshotDoesNotBlockAnotherPipelinesCaptureStart() throws Exception {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("slow_src", "orders", null));
-        artifacts.save(cdcSource("fast_src", "customers", null));
+        // The fast source has a different physical chain; one shared chain must serialize its owner.
+        artifacts.save(cdcSource("fast_src", "customers", "fast-chain"));
         artifacts.save(pipelineWithReadMode("slow", "slow_src", ReadMode.SNAPSHOT_AND_CDC));
         artifacts.save(pipelineWithReadMode("fast", "fast_src", ReadMode.CDC_ONLY));
         CountDownLatch slowSnapshotEntered = new CountDownLatch(1);

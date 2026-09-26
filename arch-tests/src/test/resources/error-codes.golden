@@ -56,6 +56,9 @@ capture.cluster-refused-the-read
 capture.cluster-refused-writes
 capture.event-table-not-selected
 capture.no-ring-to-attach
+capture.resume-anchor-unavailable
+capture.shared-position-unverified
+capture.shared-selection-restart-required
 capture.snapshot-reports-no-seam
 capture.start-from-outside-window
 capture.start-from-unparsable

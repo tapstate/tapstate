@@ -68,6 +68,63 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class CdcPhaseTest {
 
+    @Test
+    void physicalPrefixWaitsForTheEarlierTableEvenWhenTheLaterTableAckedFirst() {
+        RecordingMeta meta = new RecordingMeta();
+        meta.consumers = List.of(prefixConsumer(Map.of()));
+        CaptureHealth health = new CaptureHealth();
+        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, "shared-chain", 1L, health)) {
+            prefix.anchor(Optional.of(new SourcePosition("t0")));
+            prefix.admitted(Map.of("orders", 4L), "t1");
+            prefix.admitted(Map.of("customers", 0L), "t2");
+
+            meta.consumers = List.of(prefixConsumer(Map.of(
+                    "customers", new ChainPosition(new SourceOrder(1L, 0L), "t2"))));
+            prefix.tick();
+            assertThat(meta.advances).isEmpty();
+            assertThat(meta.physicalAcks).isEmpty();
+
+            meta.consumers = List.of(prefixConsumer(Map.of(
+                    "orders", new ChainPosition(new SourceOrder(1L, 4L), "t1"),
+                    "customers", new ChainPosition(new SourceOrder(1L, 0L), "t2"))));
+            prefix.tick();
+            assertThat(meta.advances).containsExactly("t1", "t2");
+            assertThat(meta.physicalAcks).containsExactly(
+                    new ChainPosition(new SourceOrder(1L, 0L), "t1"),
+                    new ChainPosition(new SourceOrder(1L, 1L), "t2"));
+            assertThat(health.failure()).isEmpty();
+        }
+    }
+
+    @Test
+    void physicalPrefixRefusesAnUnanchoredStartAndAnOldUnverifiedScalar() {
+        RecordingMeta fresh = new RecordingMeta();
+        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(
+                fresh, "shared-chain", 1L, new CaptureHealth())) {
+            assertThatThrownBy(() -> prefix.anchor(Optional.empty()))
+                    .isInstanceOf(TapstateException.class)
+                    .extracting(error -> ((TapstateException) error).code())
+                    .isEqualTo(CaptureError.RESUME_ANCHOR_UNAVAILABLE);
+            assertThatThrownBy(() -> prefix.admitted(Map.of("orders", 0L), "t1"))
+                    .isInstanceOf(TapstateException.class)
+                    .extracting(error -> ((TapstateException) error).code())
+                    .isEqualTo(CaptureError.RESUME_ANCHOR_UNAVAILABLE);
+        }
+
+        RecordingMeta legacy = new RecordingMeta();
+        legacy.anchorPosition = new ChainPosition(new SourceOrder(1L, 4L), "possibly-unsafe");
+        assertThatThrownBy(() -> new PhysicalSourcePrefix(
+                legacy, "shared-chain", 1L, new CaptureHealth()))
+                .isInstanceOf(TapstateException.class)
+                .extracting(error -> ((TapstateException) error).code())
+                .isEqualTo(CaptureError.SHARED_POSITION_UNVERIFIED);
+    }
+
+    private static ConsumerOffset prefixConsumer(Map<String, ChainPosition> acks) {
+        return new ConsumerOffset("pipeline", Map.of(), null, List.of(), null, 0L,
+                List.of("orders", "customers"), 1L, "reader", acks);
+    }
+
     private static HazelcastInstance hz;
 
     /** Orders the mock positions {@code w1 < w2 < w3 < ...} by their numeric suffix; a source position is never ordered lexically. */
@@ -1080,7 +1137,30 @@ class CdcPhaseTest {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");
         }
 
-        final List<String> advances = new ArrayList<>();
+        final List<String> advances = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final List<ChainPosition> physicalAcks = new java.util.concurrent.CopyOnWriteArrayList<>();
+        volatile List<ConsumerOffset> consumers = List.of();
+        volatile ChainPosition anchorPosition;
+        volatile boolean trusted;
+
+        @Override
+        public boolean physicalPrefixTrusted(String miningChainId) {
+            return trusted;
+        }
+
+        @Override
+        public boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+            if (anchorPosition == null) {
+                anchorPosition = position;
+            }
+            trusted = true;
+            return true;
+        }
+
+        @Override
+        public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+            return consumers;
+        }
 
         @Override
         public void rewindSourceReadOffset(String miningChainId, String token) {
@@ -1095,7 +1175,7 @@ class CdcPhaseTest {
 
         @Override
         public Optional<SrsMeta> read(String miningChainId) {
-            throw new UnsupportedOperationException();
+            return Optional.of(new SrsMeta(miningChainId, anchorPosition, consumers, List.of(), null, 1L));
         }
 
         @Override
@@ -1115,7 +1195,7 @@ class CdcPhaseTest {
 
         @Override
         public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
-            throw new UnsupportedOperationException();
+            physicalAcks.add(position);
         }
 
         @Override

@@ -230,6 +230,33 @@ class PdkCapturePortTest {
 
     // ---- where the tail is told to begin ----------------------------------------------------------
 
+    @Test
+    void cdcReportsItsConnectorStartPositionBeforeTheFirstChange(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.TimestampEchoingSource", null));
+        List<String> callbacks = new CopyOnWriteArrayList<>();
+        AtomicReference<Optional<SourcePosition>> start = new AtomicReference<>();
+        CountDownLatch firstBatch = new CountDownLatch(1);
+        CaptureListener listener = new CaptureListener() {
+            @Override
+            public void onStart(Optional<SourcePosition> position) {
+                start.set(position);
+                callbacks.add("start");
+            }
+
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                callbacks.add("batch");
+                firstBatch.countDown();
+            }
+        };
+        try (Subscription ignored = port.cdc(config("t1"), CaptureStart.present(), listener)) {
+            assertThat(firstBatch.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(start.get()).isPresent();
+        assertThat(callbacks).startsWith("start", "batch");
+    }
+
     /**
      * The mark the echoing source stamps on the first row it emits: what it was asked to resolve, and so
      * what actually reached the connector rather than what the caller believed it had said.

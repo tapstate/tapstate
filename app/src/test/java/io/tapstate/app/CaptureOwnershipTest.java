@@ -154,6 +154,248 @@ class CaptureOwnershipTest {
     }
 
     @Test
+    void twoTableSubsetsOfOneMiningChainTakeOnlyOnePhysicalCaptureClaim() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("orders-reader", "orders-source.orders"));
+        artifacts.save(pipelineServing("customers-reader", "orders-source.customers"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        AtomicInteger physicalTails = new AtomicInteger();
+        CaptureAttacher attacher = (spec, passthrough, startTail) -> {
+            if (startTail) {
+                physicalTails.incrementAndGet();
+                opensTheRing(store);
+            }
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = managed(
+                store, attacher, eligibleGate(), new MemoryClaims(),
+                new WorkloadOwner("node-a", "boot-a"));
+
+        coordinator.startCapture("orders-reader");
+        coordinator.startCapture("customers-reader");
+        assertThat(physicalTails).hasValue(1);
+        assertThat(new StoreBackedPipelineCaptures(store).captureIds("orders-reader"))
+                .isEqualTo(new StoreBackedPipelineCaptures(store).captureIds("customers-reader"));
+        coordinator.stopCapture("orders-reader", false);
+        coordinator.stopCapture("customers-reader", false);
+    }
+
+    @Test
+    void aClaimIsRenewedWhileItsOwningSnapshotIsStillBlocked() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(
+                artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p"));
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        ClusterMembershipGate gate = eligibleGate();
+        Duration ttl = Duration.ofMillis(200);
+        CaptureOwnership first = new CaptureOwnership(
+                "cluster-a", Member.owner("node-a"), gate, new ClusterWorkloadClaims(claims, gate), ttl);
+        CaptureOwnership challenger = new CaptureOwnership(
+                "cluster-a", Member.owner("node-b"), gate, new ClusterWorkloadClaims(claims, gate), ttl);
+        CountDownLatch snapshotEntered = new CountDownLatch(1);
+        CountDownLatch releaseSnapshot = new CountDownLatch(1);
+        AtomicReference<Throwable> startFailure = new AtomicReference<>();
+        CaptureAttacher attacher = (spec, passthrough, startTail) -> {
+            assertThat(startTail).isTrue();
+            snapshotEntered.countDown();
+            try {
+                if (!releaseSnapshot.await(5, TimeUnit.SECONDS)) {
+                    throw new AssertionError("snapshot was not released");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("snapshot start was interrupted", interrupted);
+            }
+            opensTheRing(store);
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer(), first,
+                Duration.ofMillis(10));
+        CaptureId captureId = new CaptureId(captureKey(store, "p").resourceId());
+        Thread starting = Thread.ofPlatform().start(() -> {
+            try {
+                coordinator.startCapture("p");
+            } catch (Throwable failure) {
+                startFailure.set(failure);
+            }
+        });
+        try {
+            assertThat(snapshotEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            Instant initialLeaseUntil = claims.read(captureKey(store, "p"))
+                    .orElseThrow().claim().leaseUntil();
+            claims.elapse(ttl.dividedBy(2));
+            long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+            while (claims.read(captureKey(store, "p")).orElseThrow().claim().leaseUntil()
+                    .equals(initialLeaseUntil) && System.nanoTime() - deadline < 0) {
+                Thread.sleep(10);
+            }
+            claims.elapse(ttl.dividedBy(2).plusMillis(1));
+
+            assertThat(challenger.acquire(captureId).acquired())
+                    .as("another owner cannot take the capture while the first snapshot is blocked")
+                    .isFalse();
+        } finally {
+            releaseSnapshot.countDown();
+            starting.join(5_000);
+            if (starting.isAlive()) {
+                starting.interrupt();
+                starting.join(5_000);
+            }
+            coordinator.stopCapture("p", false);
+            coordinator.close();
+        }
+        assertThat(starting.isAlive()).isFalse();
+        assertThat(startFailure.get()).isNull();
+    }
+
+    @Test
+    void losingAClaimInterruptsTheBlockedStartWithoutReleasingTheNewOwner() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(
+                artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p"));
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        ClusterMembershipGate gate = eligibleGate();
+        Duration ttl = Duration.ofMillis(200);
+        CaptureOwnership first = new CaptureOwnership(
+                "cluster-a", Member.owner("node-a"), gate, new ClusterWorkloadClaims(claims, gate), ttl);
+        CaptureOwnership challenger = new CaptureOwnership(
+                "cluster-a", Member.owner("node-b"), gate, new ClusterWorkloadClaims(claims, gate), ttl);
+        CountDownLatch snapshotEntered = new CountDownLatch(1);
+        CountDownLatch snapshotInterrupted = new CountDownLatch(1);
+        CountDownLatch releaseSnapshot = new CountDownLatch(1);
+        AtomicReference<Throwable> startFailure = new AtomicReference<>();
+        CaptureAttacher attacher = (spec, passthrough, startTail) -> {
+            snapshotEntered.countDown();
+            try {
+                releaseSnapshot.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                snapshotInterrupted.countDown();
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("snapshot start was interrupted", interrupted);
+            }
+            opensTheRing(store);
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer(), first,
+                Duration.ofMillis(10));
+        WorkloadClaimKey key = captureKey(store, "p");
+        CaptureId captureId = new CaptureId(key.resourceId());
+        Thread starting = Thread.ofPlatform().start(() -> {
+            try {
+                coordinator.startCapture("p");
+            } catch (Throwable failure) {
+                startFailure.set(failure);
+            }
+        });
+        try {
+            assertThat(snapshotEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            WorkloadClaim initial = claims.read(key).orElseThrow().claim();
+            assertThat(claims.release(initial)).isTrue();
+            assertThat(challenger.acquire(captureId).acquired()).isTrue();
+
+            assertThat(snapshotInterrupted.await(5, TimeUnit.SECONDS))
+                    .as("claim loss interrupts the in-flight snapshot before it is manually released")
+                    .isTrue();
+            starting.join(5_000);
+            assertThat(starting.isAlive()).isFalse();
+            assertThat(startFailure.get()).isInstanceOf(RuntimeException.class);
+            assertThat(coordinator.capturedRows("p")).isEqualTo(CaptureReading.NONE);
+            assertThat(store.meta().read(CHAIN)).isEmpty();
+            assertThat(claims.read(key).orElseThrow().claim().owner())
+                    .isEqualTo(Member.owner("node-b"));
+        } finally {
+            releaseSnapshot.countDown();
+            starting.join(5_000);
+            if (starting.isAlive()) {
+                starting.interrupt();
+                starting.join(5_000);
+            }
+            coordinator.stopCapture("p", false);
+            coordinator.close();
+        }
+    }
+
+    @Test
+    void aFailedSourceStartClosesItsEarlyLeaseAndReleasesTheClaim() {
+        InMemoryStorePort store = new InMemoryStorePort(
+                artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p"));
+        InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
+        ClusterMembershipGate gate = eligibleGate();
+        Duration ttl = Duration.ofMillis(200);
+        CaptureOwnership first = new CaptureOwnership(
+                "cluster-a", Member.owner("node-a"), gate, new ClusterWorkloadClaims(claims, gate), ttl);
+        CaptureOwnership challenger = new CaptureOwnership(
+                "cluster-a", Member.owner("node-b"), gate, new ClusterWorkloadClaims(claims, gate), ttl);
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, (spec, passthrough, startTail) -> {
+                    throw new IllegalStateException("source refused to start");
+                }, new SrsCoordinator(store.meta()), new SnapshotBuffer(), first, Duration.ofMillis(10));
+        WorkloadClaimKey key = captureKey(store, "p");
+        try {
+            assertThatThrownBy(() -> coordinator.startCapture("p"))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessage("source refused to start");
+            assertThat(claims.read(key)).hasValueSatisfying(reading ->
+                    assertThat(reading.leased()).isFalse());
+            assertThat(challenger.acquire(new CaptureId(key.resourceId())).acquired()).isTrue();
+            assertThat(coordinator.capturedRows("p")).isEqualTo(CaptureReading.NONE);
+        } finally {
+            coordinator.stopCapture("p", false);
+            coordinator.close();
+        }
+    }
+
+    @Test
+    void aJoinedPipelineSeesClaimLossWhileItsSharedTailIsStillClosing() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q"));
+        MemoryClaims claims = new MemoryClaims();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate,
+                new ClusterWorkloadClaims(claims, gate), TTL);
+        CountDownLatch tailCloseEntered = new CountDownLatch(1);
+        CountDownLatch releaseTailClose = new CountDownLatch(1);
+        CaptureAttacher attacher = (spec, passthrough, startTail) -> run(() -> {
+            if (!startTail) {
+                return;
+            }
+            tailCloseEntered.countDown();
+            try {
+                if (!releaseTailClose.await(5, TimeUnit.SECONDS)) {
+                    throw new AssertionError("tail close was not released");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("tail close was interrupted", interrupted);
+            }
+        });
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer(),
+                ownership, Duration.ofMillis(20));
+        try {
+            coordinator.startCapture("p");
+            coordinator.startCapture("q");
+            synchronized (claims) {
+                claims.release(claims.current);
+            }
+
+            assertThat(tailCloseEntered.await(5, TimeUnit.SECONDS))
+                    .as("the renewal must detect claim loss and enter the slow tail close").isTrue();
+            assertThat(coordinator.captureFailure("q"))
+                    .as("the joined pipeline must see claim loss before tail close returns")
+                    .hasValueSatisfying(failure -> assertThat(failure)
+                            .isInstanceOfSatisfying(TapstateException.class,
+                                    coded -> assertThat(coded.code()).isEqualTo(CaptureError.CLAIM_LOST)));
+        } finally {
+            releaseTailClose.countDown();
+            coordinator.stopCapture("p", false);
+            coordinator.stopCapture("q", false);
+            coordinator.close();
+        }
+    }
+
+    @Test
     void theReadFaceNamesTheSameCaptureTheRunningCoordinatorClaimed() {
         // The topology says who owns a pipeline's captures, and it works the identities out from the
         // stored contract rather than asking whoever is running them -- so that every member answers the
