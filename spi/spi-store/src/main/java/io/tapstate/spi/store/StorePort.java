@@ -43,6 +43,11 @@ public interface StorePort {
      */
     RateHistoryStore rateHistory();
 
+    /** The disposable, bounded cache of closed rate-history buckets. */
+    default HistoryRollupStore historyRollups() {
+        throw new UnsupportedOperationException("history rollups are unavailable");
+    }
+
     /** The bounded, best-effort event history for each pipeline incarnation. */
     default PipelineEventStore events() {
         throw new UnsupportedOperationException("pipeline event history is unavailable");

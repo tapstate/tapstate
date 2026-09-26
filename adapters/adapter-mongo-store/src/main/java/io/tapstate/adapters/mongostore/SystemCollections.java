@@ -158,6 +158,15 @@ public enum SystemCollections {
             new IndexSpec(List.of("occurredAt"), false, MongoPipelineEventStore.DEFAULT_RETENTION.toSeconds()),
             new IndexSpec(List.of("pipelineId", "pipelineIncarnationId", "occurredAt", "_id"), false)),
 
+    /**
+     * Closed history buckets are replaceable cache entries. The age index bounds a stopped pipeline;
+     * the compound index reads only one incarnation, resolution and time range.
+     */
+    PIPELINE_HISTORY_ROLLUPS(MongoStorePort.PIPELINE_HISTORY_ROLLUPS, Database.STORE,
+            MongoHistoryRollupStore.class, Strategy.MIGRATED, 13,
+            new IndexSpec(List.of("bucketStart"), false, MongoHistoryRollupStore.DEFAULT_RETENTION.toSeconds()),
+            new IndexSpec(List.of("pipelineId", "scopeKey", "resolution", "bucketStart"), false)),
+
     // ---- the operator-state database: not versioned here, but still taken from here ----
 
     OPERATOR_STATE(MongoStorePort.OPERATOR_STATE, Database.NEST, MongoKeyedStateStore.class,

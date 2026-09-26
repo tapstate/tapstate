@@ -86,8 +86,8 @@ class SystemCollectionsReconciliationIT {
                 Set<String> declared = SystemCollections.physicalNamesIn(SystemCollections.Database.STORE);
 
                 // Positive control: a run that wrote nothing would satisfy the subset below and report
-                // a registry nobody checked. Sixteen of the seventeen store-side rows are written here;
-                // the seventeenth is created by the first changeset rather than by any store.
+                // a registry nobody checked. Most store-side rows are written here; the remaining
+                // collections are created by a changeset or a separately tested bounded store.
                 assertThat(live)
                         .as("positive control: the stores must actually have created their collections")
                         .hasSizeGreaterThanOrEqualTo(16);

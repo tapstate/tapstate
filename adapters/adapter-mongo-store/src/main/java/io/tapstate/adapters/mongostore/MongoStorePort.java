@@ -16,6 +16,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.spi.store.OperatorStateStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.PipelineEventStore;
@@ -65,6 +66,8 @@ public final class MongoStorePort implements StorePort {
     public static final String CLUSTER_MEMBERSHIP = "cluster_membership";
     /** One document per movement sample, left to expire by the server. */
     public static final String PIPELINE_RATE_HISTORY = "pipeline_rate_history";
+    /** One replaceable derived document per closed pipeline history bucket. */
+    public static final String PIPELINE_HISTORY_ROLLUPS = "pipeline_history_rollups";
     /** One low-frequency pipeline event per document, retained for a bounded time. */
     public static final String PIPELINE_EVENTS = "pipeline_events";
     /** The collection holding one editor-only canvas layout per pipeline. */
@@ -135,6 +138,7 @@ public final class MongoStorePort implements StorePort {
     private final ConnectionTestResultStore connectionTestResults;
     private final ObservationStore observations;
     private final RateHistoryStore rateHistory;
+    private final HistoryRollupStore historyRollups;
     private final PipelineEventStore events;
     private final PipelineLayoutStore layouts;
     private final WorkloadClaimStore workloadClaims;
@@ -177,6 +181,8 @@ public final class MongoStorePort implements StorePort {
         this.observations = new MongoObservationStore(SystemCollections.PIPELINE_OBSERVATION.on(database));
         this.rateHistory = new MongoRateHistoryStore(
                 database, SystemCollections.PIPELINE_RATE_HISTORY.on(database), rateHistoryRetention);
+        this.historyRollups = new MongoHistoryRollupStore(
+                database, SystemCollections.PIPELINE_HISTORY_ROLLUPS.on(database), rateHistoryRetention);
         this.events = new MongoPipelineEventStore(
                 database, SystemCollections.PIPELINE_EVENTS.on(database), MongoPipelineEventStore.DEFAULT_RETENTION);
         this.layouts = new MongoPipelineLayoutStore(SystemCollections.PIPELINE_LAYOUTS.on(database));
@@ -274,6 +280,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public RateHistoryStore rateHistory() {
         return rateHistory;
+    }
+
+    @Override
+    public HistoryRollupStore historyRollups() {
+        return historyRollups;
     }
 
     @Override

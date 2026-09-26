@@ -19,6 +19,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.NestDeadLetterRecord;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.SourceModel;
@@ -68,6 +69,28 @@ class MongoStorePortIT {
             config:
               host: localhost
             """;
+
+    @Test
+    void rollupPortWritesIntoItsOwnBoundedCollection() {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        try (MongoConnection connection = new MongoConnection(
+                new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)))) {
+            connection.verify();
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            HistoryRollupStore.Bucket bucket = MongoHistoryRollupStoreTest.bucket(
+                    HistoryRollupStore.Scope.incarnation("port-inc"));
+
+            port.historyRollups().upsert(bucket);
+
+            assertThat(port.historyRollups().read(bucket.key())).contains(bucket);
+            try (MongoClient raw = MongoClients.create(uri)) {
+                String databaseName = new ConnectionString(uri).getDatabase();
+                assertThat(raw.getDatabase(databaseName)
+                        .getCollection(MongoStorePort.PIPELINE_HISTORY_ROLLUPS)
+                        .countDocuments(new Document("pipelineIncarnationId", "port-inc"))).isEqualTo(1);
+            }
+        }
+    }
 
     @Test
     void eventPortWritesIntoItsOwnBoundedCollection() {

@@ -306,7 +306,7 @@ class MigrationRunnerIT {
                         "V4DiscardInventedPositions", "V5SplitSourceSchemas", "V6SplitDerivedSchemas",
                         "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
                         "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex",
-                        "V12PipelineEventIndexes");
+                        "V12PipelineEventIndexes", "V13HistoryRollupIndexes");
 
         MigrationRunner.migrate(database);
 

@@ -23,6 +23,7 @@ class MongoStorePortTest {
                 MongoStorePort.PIPELINE_DESIRED,
                 MongoStorePort.PIPELINE_OBSERVATION,
                 MongoStorePort.PIPELINE_EVENTS,
+                MongoStorePort.PIPELINE_HISTORY_ROLLUPS,
                 MongoStorePort.PIPELINE_LAYOUTS,
                 MongoStorePort.CONNECTIONS,
                 MongoStorePort.SOURCE_SCHEMAS,
@@ -35,7 +36,7 @@ class MongoStorePortTest {
                 MongoAuthStores.CLUSTER_IDENTITY))
                 .doesNotHaveDuplicates()
                 .containsExactly("artifacts", "pipeline_state", "pipeline_desired", "pipeline_observation",
-                        "pipeline_events", "pipeline_layouts",
+                        "pipeline_events", "pipeline_history_rollups", "pipeline_layouts",
                         "connections", "source_schemas", "connector_artifacts", "connector_catalog",
                         "connector_specs", "connection_test_results", "srs_meta", "srs_consumer_offsets",
                         "cluster_identity");
