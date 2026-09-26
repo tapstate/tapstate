@@ -6,6 +6,7 @@ import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.TableSnapshot;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -1535,32 +1536,53 @@ final class ControlPlane {
      * How many rows each selected table's full load has read <em>on the run that is live now</em>, keyed by
      * table. Empty when the pipeline has no live run.
      *
-     * <p>The per-run scope is the whole reason a witness reads this rather than the target: a resumed run
-     * that skips a table reports zero for it, while the target still holds every row the earlier run put
-     * there, so the target cannot tell a skipped table from a re-read one. Every selected table appears --
-     * one that was not read reports zero rather than going absent -- so a missing key is a broken reading
-     * and not a table that was skipped.
+     * <p>The per-run counter is read from the metrics face. The snapshot face reports completed load
+     * progress across replacement runs, so it cannot say whether the live run read a table again. A
+     * resumed run that skips a table reports zero here while the target still holds its earlier rows.
+     * Every selected table appears while its run is live; a missing key is a broken reading.
      */
     Map<String, Long> snapshotRowsRead(String pipelineId) {
-        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
         if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
             return Map.of();
+        }
+        if (response.statusCode() != 200) {
+            throw new AssertionError("could not read the run's snapshot rows of " + pipelineId
+                    + ": expected HTTP 200, got " + response.statusCode() + " - " + response.body());
+        }
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                || !(map.get("metrics") instanceof Map<?, ?> metrics)) {
+            throw new AssertionError("metrics answer carried no metrics: " + response.body());
+        }
+        Map<String, Long> read = new LinkedHashMap<>();
+        String prefix = "snapshot.rows.read.";
+        for (Map.Entry<?, ?> entry : metrics.entrySet()) {
+            String name = String.valueOf(entry.getKey());
+            if (name.startsWith(prefix) && entry.getValue() instanceof Number count) {
+                read.put(name.substring(prefix.length()), count.longValue());
+            }
+        }
+        return read;
+    }
+
+    Optional<TableSnapshot> snapshotTable(String pipelineId, String table) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Optional.empty();
         }
         if (response.statusCode() != 200) {
             throw new AssertionError("could not read the snapshot progress of " + pipelineId
                     + ": expected HTTP 200, got " + response.statusCode() + " - " + response.body());
         }
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
-                || !(map.get("snapshot") instanceof Map<?, ?> snapshot)) {
-            throw new AssertionError("snapshot answer carried no snapshot: " + response.body());
+                || !(map.get("snapshot") instanceof Map<?, ?> snapshot)
+                || !(snapshot.get(table) instanceof Map<?, ?> progress)
+                || !(progress.get("rowsDone") instanceof Number done)) {
+            throw new AssertionError("snapshot answer carried no progress for " + table + ": " + response.body());
         }
-        Map<String, Long> read = new LinkedHashMap<>();
-        for (Map.Entry<?, ?> entry : snapshot.entrySet()) {
-            if (entry.getValue() instanceof Map<?, ?> table && table.get("rowsDone") instanceof Number done) {
-                read.put(String.valueOf(entry.getKey()), done.longValue());
-            }
-        }
-        return read;
+        Long total = progress.get("rowsTotal") instanceof Number rows ? rows.longValue() : null;
+        Integer percent = progress.get("donePct") instanceof Number share ? share.intValue() : null;
+        return Optional.of(new TableSnapshot(done.longValue(), total, percent));
     }
 
     static Optional<Long> interpretRecordCount(int status, String body, String pipelineId) {

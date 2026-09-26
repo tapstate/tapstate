@@ -61,6 +61,8 @@ public enum CardinalityBudget {
     /** Broken down by stage only, and the stages are a closed set: nothing here can grow, so nothing folds. */
     PROCESS_DURATION("tapstate.pipeline.process.duration", null, Stage.values().length, Fold.ADDED),
     SNAPSHOT_ROWS("tapstate.pipeline.snapshot.rows", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
+    SNAPSHOT_ROWS_CURRENT_RUN("tapstate.pipeline.snapshot.rows.current_run",
+            MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
     SNAPSHOT_ROWS_TOTAL("tapstate.pipeline.snapshot.rows.total", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
     /** Codes come from a catalog and from connectors, not from rows, but a connector may contribute any number. */
     ERRORS("tapstate.pipeline.errors", MetricAttributes.CODE, 200, Fold.ADDED),
