@@ -83,6 +83,14 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.lag",
                         "tapstate.pipeline.record.delivery.duration",
                         "tapstate.pipeline.process.duration",
+                        "tapstate.pipeline.sink.batch.issued",
+                        "tapstate.pipeline.sink.batch.records",
+                        "tapstate.pipeline.sink.batch.records.max",
+                        "tapstate.pipeline.sink.batch.pending",
+                        "tapstate.pipeline.sink.batch.limit",
+                        "tapstate.pipeline.sink.backpressured",
+                        "tapstate.pipeline.sink.batch.write.duration",
+                        "tapstate.pipeline.sink.backpressure.duration",
                         "tapstate.pipeline.snapshot.rows",
                         "tapstate.pipeline.snapshot.rows.total",
                         "tapstate.pipeline.errors",
@@ -156,6 +164,14 @@ class WhatHappensPastTheCardinalityBudgetTest {
         assertThat(CardinalityBudget.ERRORS.distinctValues()).isEqualTo(200);
         assertThat(CardinalityBudget.PROCESS_DURATION.openDimension()).isEmpty();
         assertThat(CardinalityBudget.PROCESS_DURATION.distinctValues()).isEqualTo(Stage.values().length);
+        for (CardinalityBudget budget : List.of(CardinalityBudget.SINK_BATCH_ISSUED,
+                CardinalityBudget.SINK_BATCH_RECORDS, CardinalityBudget.SINK_BATCH_RECORDS_MAX,
+                CardinalityBudget.SINK_BATCH_PENDING, CardinalityBudget.SINK_BATCH_LIMIT,
+                CardinalityBudget.SINK_BACKPRESSURED, CardinalityBudget.SINK_BATCH_WRITE_DURATION,
+                CardinalityBudget.SINK_BACKPRESSURE_DURATION)) {
+            assertThat(budget.openDimension()).as(budget.name()).isEmpty();
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1);
+        }
         assertThat(CardinalityBudget.LIFECYCLE_WORK_DURATION.openDimension()).isEmpty();
         assertThat(CardinalityBudget.LIFECYCLE_WORK_DURATION.distinctValues()).isEqualTo(4);
         for (CardinalityBudget budget : List.of(CardinalityBudget.ROLLUP_QUERY_RAW_FALLBACK,
@@ -486,6 +502,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.pending.high_water",
                         "tapstate.pipeline.reconcile.failures.streak",
+                        "tapstate.pipeline.sink.batch.records.max",
                         "tapstate.process.telemetry.queue.depth",
                         "tapstate.process.telemetry.queue.high_water",
                         "tapstate.process.telemetry.in_flight",
