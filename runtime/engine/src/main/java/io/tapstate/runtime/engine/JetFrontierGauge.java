@@ -18,20 +18,6 @@ import java.util.Map;
  */
 final class JetFrontierGauge implements FrontierGauge {
 
-    /**
-     * What a per-chain reading is named, with the chain's own name appended. The chain is in the name
-     * because a run's statistics carry numbers and not the names of things: one number covering every chain
-     * would average a chain that is keeping up with one that has stalled and read as neither.
-     */
-    static final String METRIC_PREFIX = "frontierGap.";
-
-    /**
-     * What a per-chain pinned-for reading is named. Milliseconds are in the name because a run's
-     * statistics are bare numbers: a duration whose unit lives only in a document somewhere is a duration
-     * that gets read in seconds by whoever wires the first threshold against it.
-     */
-    static final String STALL_PREFIX = "frontierStalledMillis.";
-
     private final Map<String, Metric> gaugesByChain = new HashMap<>();
     private final Map<String, Metric> stallsByChain = new HashMap<>();
 
@@ -52,21 +38,16 @@ final class JetFrontierGauge implements FrontierGauge {
         return true;
     }
 
-    /** The chain a distance named {@code metric} concerns, or {@code null} when it is not one of these. */
-    static String chainOf(String metric) {
-        return metric.startsWith(METRIC_PREFIX) ? metric.substring(METRIC_PREFIX.length()) : null;
-    }
-
-    /** The chain a pinned-for reading named {@code metric} concerns, or {@code null} when it is not one. */
-    static String stalledChainOf(String metric) {
-        return metric.startsWith(STALL_PREFIX) ? metric.substring(STALL_PREFIX.length()) : null;
-    }
-
+    /**
+     * The chain is in each reading's name, as {@link FrontierMetricNames} spells it, because a run's statistics
+     * carry numbers and not the names of things: one number covering every chain would average a chain that is
+     * keeping up with one that has stalled and read as neither.
+     */
     private static Metric gapMetricFor(String chain) {
-        return Metrics.metric(METRIC_PREFIX + chain);
+        return Metrics.metric(FrontierMetricNames.gapNameOf(chain));
     }
 
     private static Metric stallMetricFor(String chain) {
-        return Metrics.metric(STALL_PREFIX + chain);
+        return Metrics.metric(FrontierMetricNames.stallNameOf(chain));
     }
 }

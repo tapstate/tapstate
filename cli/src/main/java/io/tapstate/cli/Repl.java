@@ -2887,7 +2887,7 @@ final class Repl {
                     out.println();
                     out.println(pipelineHeadline(pipeline, listed.members().size()));
                     for (RemoteVertex vertex : pipeline.vertices()) {
-                        out.println("  " + cell(vertex.name()) + "  " + where(vertex));
+                        out.println("  " + cell(vertex.name()) + "  " + where(vertex) + backlogOf(vertex));
                     }
                 }
             }
@@ -2968,6 +2968,18 @@ final class Repl {
         return line.toString();
     }
 
+    /**
+     * The rows queued into one vertex's processors between them, where any are: what a vertex that has fallen
+     * behind shows first. Nothing is printed where none are queued or nothing was read, so a line that says
+     * nothing about a backlog is a vertex keeping up or one not yet measured, as the headline's measured-from
+     * count says.
+     */
+    private static String backlogOf(RemoteVertex vertex) {
+        long queued = vertex.processors().stream()
+                .map(RemoteProcessor::backlog).filter(java.util.Objects::nonNull).mapToLong(Long::longValue).sum();
+        return queued > 0 ? "  backlog " + queued : "";
+    }
+
     /** Where one vertex's work is, by the node names a reader can act on; the count when it has none. */
     private static String where(RemoteVertex vertex) {
         List<String> nodes = new ArrayList<>();
@@ -3009,8 +3021,16 @@ final class Repl {
             for (RemoteProcessor processor : vertex.processors()) {
                 Map<String, Object> one = new LinkedHashMap<>();
                 putIfPresent(one, "index", processor.index());
+                putIfPresent(one, "localIndex", processor.localIndex());
                 putIfPresent(one, "memberUuid", processor.memberUuid());
                 putIfPresent(one, "nodeId", processor.nodeId());
+                putIfPresent(one, "backlog", processor.backlog());
+                if (!processor.frontierGaps().isEmpty()) {
+                    one.put("frontierGaps", new java.util.TreeMap<>(processor.frontierGaps()));
+                }
+                if (!processor.frontierStalledMillis().isEmpty()) {
+                    one.put("frontierStalledMillis", new java.util.TreeMap<>(processor.frontierStalledMillis()));
+                }
                 processors.add(one);
             }
             entry.put("processors", processors);

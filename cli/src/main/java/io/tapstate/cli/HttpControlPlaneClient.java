@@ -873,6 +873,19 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 claim.get("leased") instanceof Boolean b ? b : null);
     }
 
+    /** A map of names to whole numbers as the server sent it, keeping only the entries that are both. */
+    private static Map<String, Long> longsByName(Object raw) {
+        Map<String, Long> out = new java.util.TreeMap<>();
+        if (raw instanceof Map<?, ?> map) {
+            map.forEach((name, value) -> {
+                if (name instanceof String key && value instanceof Number number) {
+                    out.put(key, number.longValue());
+                }
+            });
+        }
+        return out;
+    }
+
     private static RemoteVertex vertex(Map<?, ?> vertex) {
         List<RemoteProcessor> processors = new ArrayList<>();
         if (vertex.get("processors") instanceof List<?> list) {
@@ -880,8 +893,12 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 if (processor instanceof Map<?, ?> p) {
                     processors.add(new RemoteProcessor(
                             p.get("index") instanceof Number n ? n.intValue() : null,
+                            p.get("localIndex") instanceof Number n ? n.intValue() : null,
                             stringOrNull(p.get("memberUuid")),
-                            stringOrNull(p.get("nodeId"))));
+                            stringOrNull(p.get("nodeId")),
+                            p.get("backlog") instanceof Number n ? n.longValue() : null,
+                            longsByName(p.get("frontierGaps")),
+                            longsByName(p.get("frontierStalledMillis"))));
                 }
             }
         }

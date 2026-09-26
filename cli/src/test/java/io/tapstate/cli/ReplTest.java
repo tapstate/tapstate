@@ -5569,13 +5569,41 @@ class ReplTest {
 
         String out = h.sink().toString().substring(mark);
         assertThat(out)
-                .as("nothing in the plan pins a vertex's parallelism yet; a reader given a number here "
-                        + "would read it as what was asked for")
+                .as("a vertex its run's plan names no target for asked for nothing; a reader given a "
+                        + "number here would read it as what was asked for")
                 .doesNotContain("requested").doesNotContain("computedLocal");
         assertThat(out)
                 .as("what is measured is published, so the two can be compared once there is something "
                         + "to compare")
                 .contains("effective").contains("executionId");
+    }
+
+    @Test
+    void clusterSaysHowManyRowsAreQueuedIntoAVertexAndWhichWriterIsBehind() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE")),
+                List.of(new RemotePipeline("orders",
+                        new RemoteClaim("orders", "node-a", "boot-a", 3L, 7L, true),
+                        List.of(), "2026-09-19T08:30:00Z", List.of("uuid-a"), List.of(),
+                        List.of(new RemoteVertex("serve-orders", 4, 2, 2, "exec-1", List.of(
+                                new RemoteProcessor(0, 0, "uuid-a", "node-a", 3L, Map.of(), Map.of()),
+                                new RemoteProcessor(1, 1, "uuid-a", "node-a", 4L, Map.of("shop", 40L),
+                                        Map.of("shop", 1200L))))))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("cluster")).isTrue();
+        assertThat(h.repl().dispatch("cluster -o json")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).as("the rows queued into the vertex's processors between them")
+                .contains("serve-orders  node-a  backlog 7");
+        assertThat(out).as("and per processor, on the machine surface, which of them is behind and on what")
+                .contains("\"localIndex\": 1").contains("\"backlog\": 4")
+                .contains("\"frontierGaps\": {").contains("\"shop\": 40")
+                .contains("\"frontierStalledMillis\": {").contains("\"shop\": 1200");
     }
 
     @Test

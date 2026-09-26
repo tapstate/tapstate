@@ -76,7 +76,9 @@ class HttpControlPlaneClientTest {
                    "vertices":[{"name":"serve-orders","requested":null,"effective":2,
                      "computedLocal":null,"executionId":"exec-1",
                      "processors":[{"index":0,"memberUuid":"uuid-a","nodeId":"node-a"},
-                                   {"index":1,"memberUuid":"uuid-b","nodeId":"node-b"}]}]}]}
+                                   {"index":1,"localIndex":0,"memberUuid":"uuid-b","nodeId":"node-b",
+                                    "backlog":12,"frontierGaps":{"shop":40},
+                                    "frontierStalledMillis":{"shop":1200}}]}]}]}
                 """);
         try {
             ClusterMembersOutcome outcome =
@@ -109,9 +111,12 @@ class HttpControlPlaneClientTest {
                             + "take for a parallelism somebody asked for")
                     .isNull();
             assertThat(vertex.processors())
+                    .as("what a processor carries arrives with it, and a processor the server said nothing "
+                            + "of that about arrives with nothing rather than with zeros")
                     .containsExactly(
                             new RemoteProcessor(0, "uuid-a", "node-a"),
-                            new RemoteProcessor(1, "uuid-b", "node-b"));
+                            new RemoteProcessor(1, 0, "uuid-b", "node-b", 12L, Map.of("shop", 40L),
+                                    Map.of("shop", 1200L)));
         } finally {
             server.stop(0);
         }

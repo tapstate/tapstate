@@ -762,16 +762,16 @@ class ControlApiTest {
         assertThat(pipeline.vertices().get(0).processors())
                 .as("and the processor names the stable node as well as the engine's identity for this "
                         + "run of it, because a claim names the stable one")
-                .containsExactly(new ClusterProcessorView(
-                        0, ClusterTopologyTestConfiguration.SECOND.memberUuid(), "node-b"));
+                .containsExactly(new ClusterProcessorView(0, 0,
+                        ClusterTopologyTestConfiguration.SECOND.memberUuid(), "node-b", null, Map.of(), Map.of()));
         assertThat(pipeline.awaitingRebalance())
                 .as("both members were planned into this run -- one doing the pinned vertex's work and "
                         + "one holding the instance that stands in for it -- so neither is waiting on "
                         + "anything, and a member holding only a placeholder must not read as idle")
                 .isEmpty();
         assertThat(pipeline.vertices().get(0).requested())
-                .as("nothing in the plan pins a vertex's parallelism yet, and absent is not the same as "
-                        + "the one processor that happened to run")
+                .as("a run with no plan recorded asked for nothing, and absent is not the same as the one "
+                        + "processor that happened to run")
                 .isNull();
     }
 
@@ -788,7 +788,8 @@ class ControlApiTest {
                 "\"controllerClaim\"", "\"captureClaims\"", "\"claimGeneration\"",
                 "\"executionGeneration\"", "\"leased\"", "\"measuredFrom\"",
                 "\"awaitingRebalance\"", "\"vertices\"", "\"effective\"", "\"executionId\"",
-                "\"processors\"", "\"memberUuid\"");
+                "\"processors\"", "\"memberUuid\"", "\"localIndex\"", "\"frontierGaps\"",
+                "\"frontierStalledMillis\"");
     }
 
     // ---- the endpoint table is a derivation of the registry ----

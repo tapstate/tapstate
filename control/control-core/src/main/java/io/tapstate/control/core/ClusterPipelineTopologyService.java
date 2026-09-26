@@ -260,17 +260,24 @@ public final class ClusterPipelineTopologyService {
             LivePipelineRun run, Map<String, String> nodeIdByMemberUuid, Map<String, ExecutionPlan.Node> planned) {
         List<ClusterVertexView> views = new ArrayList<>();
         for (LivePipelineVertex vertex : run.vertices()) {
+            List<LivePipelineProcessor> working = vertex.processors().stream()
+                    .filter(LivePipelineProcessor::working)
+                    .sorted((left, right) -> Integer.compare(left.index(), right.index()))
+                    .toList();
+            // A processor's index on its member is its place among the vertex's processors there, in the
+            // cluster-wide order: the engine numbers each member's processors of a vertex in one run.
+            Map<String, Integer> nextOnMember = new HashMap<>();
             List<ClusterProcessorView> processors = new ArrayList<>();
-            for (LivePipelineProcessor processor : vertex.processors()) {
-                if (!processor.working()) {
-                    continue;
-                }
+            for (LivePipelineProcessor processor : working) {
                 processors.add(new ClusterProcessorView(
                         processor.index(),
+                        nextOnMember.merge(String.valueOf(processor.memberUuid()), 1, Integer::sum) - 1,
                         processor.memberUuid(),
-                        nodeIdByMemberUuid.get(processor.memberUuid())));
+                        nodeIdByMemberUuid.get(processor.memberUuid()),
+                        processor.backlog(),
+                        processor.frontierGaps(),
+                        processor.frontierStalledMillis()));
             }
-            processors.sort((left, right) -> Integer.compare(left.index(), right.index()));
             // What the plan says of the vertex's node, where the vertex runs at its node's width: a vertex the plan
             // does not name - one gathering several producers into one, or any vertex of a run with no plan
             // recorded - asked for nothing, and says so by leaving both absent.
