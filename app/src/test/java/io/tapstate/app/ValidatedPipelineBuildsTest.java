@@ -15,6 +15,9 @@ import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.core.lifecycle.ParallelismBudget;
+import io.tapstate.runtime.srs.SourcePlacement;
+import io.tapstate.runtime.engine.nest.NestSettings;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -149,6 +152,32 @@ class ValidatedPipelineBuildsTest {
         // assembly root supplies no nest binding, which is exactly what it had until now.
         assertThat(vertexNames(dag)).contains("orders_src", "items_src", "serve.sync_1");
         assertThat(vertexNames(dag)).anyMatch(name -> name.startsWith("nest:"));
+    }
+
+    /**
+     * The threads a nest's vertices hold count against what a member may run of them, counted from the tree the
+     * nest compiles to: here one vertex, so two wide it holds two threads - past a member allowed one, and within
+     * one allowed two.
+     */
+    @Test
+    void aWideNestIsRefusedWhereItsVerticesWouldHoldMoreThreadsThanAMemberMay() {
+        InMemoryStorePort store = validated(SOURCE, ITEMS_SOURCE, TARGET, NEST_PIPELINE.replace(
+                "    type: nest\n", "    type: nest\n    execution: { parallelism: 2 }\n"));
+        discovered(store, "items_src", "order_items", List.of("id"));
+
+        assertThatThrownBy(() -> sourceAllowing(store, 1).dagFor("nested"))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ActuationError.NO_SAFE_PARALLELISM);
+                    assertThat(refused.args()).containsEntry("node", "doc").containsEntry("candidates",
+                            "2 per member breaks " + ParallelismBudget.MAX_BLOCKING_PROCESSORS_PER_MEMBER);
+                });
+        assertThat(sourceAllowing(store, 2).dagFor("nested")).isNotNull();
+    }
+
+    /** The assembled source on one member, allowed {@code threads} threads for vertices that hold one each. */
+    private static StoreBackedDagSource sourceAllowing(InMemoryStorePort store, int threads) {
+        return new StoreBackedDagSource(store, NestSettings.defaults(), StoreReachability.assumingReachable(),
+                SourcePlacement.anyMember(), () -> 1, new ParallelismBudget(16, 8, 262144, threads));
     }
 
     @Test

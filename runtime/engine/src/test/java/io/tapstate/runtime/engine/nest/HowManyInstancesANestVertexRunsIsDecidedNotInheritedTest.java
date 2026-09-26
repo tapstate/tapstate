@@ -11,6 +11,12 @@ import com.hazelcast.jet.core.processor.Processors;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.NodeWidth;
+import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.Step;
+import io.tapstate.core.model.SourceRef;
+import io.tapstate.runtime.engine.PipelineDagBuilder;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -89,6 +95,27 @@ class HowManyInstancesANestVertexRunsIsDecidedNotInheritedTest {
                                     edge.getSourceName(), name)
                             .isEqualTo(name));
         });
+    }
+
+    @Test
+    void aNestIsCountedAsHoldingAThreadForEveryVertexItDrawsThatKeepsState() {
+        NestTopology topology = NestTopology.compile("p", "doc", TREE, tables());
+        DAG dag = draw(topology, new NodeWidth("doc", 3, 1, null));
+        int drawnWide = 0;
+        for (Vertex vertex : dag) {
+            if (vertex.getLocalParallelism() == 3) {
+                drawnWide++;
+            }
+        }
+        PipelineResource pipeline = new PipelineResource("p", null, List.of(SourceRef.bare("order")),
+                List.of(Step.inline("doc", FromClause.aliases(Map.of("order", FromRef.literal("order"))), TREE, null)),
+                null, null, null, null);
+
+        assertThat(drawnWide).as("a resolver, the assembler and a lookup, each drawn at the node's width")
+                .isEqualTo(3);
+        assertThat(PipelineDagBuilder.nestBlockingVertices(pipeline, tables()))
+                .as("what a member is charged for the nest, per processor wide it runs")
+                .containsExactly(Map.entry("doc", drawnWide));
     }
 
     @Test
