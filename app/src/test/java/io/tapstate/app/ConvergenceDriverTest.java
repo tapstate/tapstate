@@ -45,6 +45,77 @@ import static org.assertj.core.api.Assertions.entry;
 class ConvergenceDriverTest {
 
     @Test
+    void aStopTeardownWaitingForItsFullBudgetLeavesAnotherPipelineConverging() throws Exception {
+        CountDownLatch slowStopEntered = new CountDownLatch(1);
+        CountDownLatch releaseSlowStop = new CountDownLatch(1);
+        LifecycleActuator blocking = new LifecycleActuator() {
+            @Override public void start(String pipelineId) { }
+            @Override public void pause(String pipelineId) { }
+            @Override public void resume(String pipelineId) { }
+            @Override public void stop(String pipelineId, boolean purgeState) {
+                if (pipelineId.equals("slow")) {
+                    slowStopEntered.countDown();
+                    try {
+                        if (!releaseSlowStop.await(30, TimeUnit.SECONDS)) {
+                            throw new AssertionError("slow teardown exceeded its thirty-second budget");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(interrupted);
+                    }
+                }
+            }
+            @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String pipelineId) { return true; }
+        };
+        desired.save(new DesiredState("slow", RUNNING, "rev-1"));
+        desired.save(new DesiredState("fast", RUNNING, "rev-1"));
+        PipelineConverger loop = new PipelineConverger(desired, state, blocking,
+                Clock.fixed(T0, ZoneOffset.UTC));
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(2, 2)) {
+            ConvergenceDriver isolated = new ConvergenceDriver(loop, desired,
+                    new ObservationPublisher(state, observations), null, MetricsExport.none(),
+                    () -> true, PipelineActuationOwnership.single(), work, null, null, pending);
+            awaitStateAndObservation(isolated, "slow", RUNNING);
+            awaitStateAndObservation(isolated, "fast", RUNNING);
+
+            desired.save(new DesiredState("slow", STOPPED, "rev-2"));
+            long stopDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (slowStopEntered.getCount() != 0 && System.nanoTime() - stopDeadline < 0) {
+                isolated.reconcile();
+                Thread.sleep(10);
+            }
+            assertThat(slowStopEntered.getCount()).isZero();
+            assertThat(pending.pending("slow").orElseThrow().reason()).isEqualTo(PendingReason.STOP_PENDING);
+
+            desired.save(new DesiredState("fast", io.tapstate.core.lifecycle.PipelineState.PAUSED, "rev-2"));
+            awaitStateAndObservation(isolated, "fast", io.tapstate.core.lifecycle.PipelineState.PAUSED);
+            desired.save(new DesiredState("fast", RUNNING, "rev-3"));
+            awaitStateAndObservation(isolated, "fast", RUNNING);
+            assertThat(releaseSlowStop.getCount()).isEqualTo(1L);
+        } finally {
+            releaseSlowStop.countDown();
+        }
+    }
+
+    private void awaitStateAndObservation(ConvergenceDriver driver, String pipelineId,
+            io.tapstate.core.lifecycle.PipelineState expected) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() - deadline < 0) {
+            driver.reconcile();
+            if (state.read(pipelineId).map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
+                    .filter(expected::equals).isPresent()
+                    && observations.read(pipelineId).map(Observation::state)
+                            .filter(expected::equals).isPresent()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("pipeline " + pipelineId + " did not reach " + expected);
+    }
+
+    @Test
     void aDeferredSnapshotStartKeepsItsCapacityReasonUntilAdmissionSucceeds() {
         AtomicBoolean hasSlot = new AtomicBoolean(false);
         LifecycleActuator actuator = new LifecycleActuator() {
