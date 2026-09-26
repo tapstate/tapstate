@@ -41,17 +41,22 @@ class StageConnectorsTest(unittest.TestCase):
         self.write_lock()
 
     def make_jar(self, connector_id: str, *, spec_id: str | None = None,
-                 pdk_version: str = "2.0.5-SNAPSHOT") -> None:
+                 pdk_version: str = "2.0.5-SNAPSHOT", spec_path: str | None = None,
+                 implementation_title: str | None = None) -> None:
         jar_path = self.jars / f"{connector_id}-connector.jar"
+        spec_path = spec_path or f"{connector_id}-spec.json"
+        title = implementation_title or (
+            "mssql-connector" if connector_id == "sqlserver" else f"{connector_id}-connector"
+        )
         manifest = (
             "Manifest-Version: 1.0\r\n"
-            f"Implementation-Title: {connector_id}-connector\r\n"
+            f"Implementation-Title: {title}\r\n"
             f"Git-Commit-Id: {'a' * 40}\r\n"
             f"PDK-API-Version: {pdk_version}\r\n\r\n"
         )
         with zipfile.ZipFile(jar_path, "w", compression=zipfile.ZIP_STORED) as jar:
             jar.writestr("META-INF/MANIFEST.MF", manifest)
-            jar.writestr(f"{connector_id}-spec.json", json.dumps({"properties": {"id": spec_id or connector_id}}))
+            jar.writestr(spec_path, json.dumps({"properties": {"id": spec_id or connector_id}}))
             jar.writestr("classes/Dependency.class", b"x" * 1_000_000)
         data = jar_path.read_bytes()
         entry = {
@@ -60,7 +65,7 @@ class StageConnectorsTest(unittest.TestCase):
             "sha256": hashlib.sha256(data).hexdigest(),
             "upstreamRevision": "a" * 40,
             "pdkApiVersion": "2.0.5-SNAPSHOT",
-            "specPath": f"{connector_id}-spec.json",
+            "specPath": spec_path,
         }
         self.entries = [old for old in self.entries if old["id"] != connector_id]
         self.entries.append(entry)
@@ -69,7 +74,7 @@ class StageConnectorsTest(unittest.TestCase):
         self.lock.write_text(json.dumps({"schemaVersion": 1, "connectors": self.entries}), encoding="utf-8")
 
     def make_oci(self, *, architectures: tuple[str, ...] = ("amd64", "arm64"),
-                 tamper: str | None = None) -> Path:
+                 tamper: str | None = None, license_label: str | None = "NOASSERTION") -> Path:
         MODULE.stage(self.lock, self.jars, self.staged)
         layout = self.root / "oci"
         (layout / "blobs/sha256").mkdir(parents=True)
@@ -98,12 +103,15 @@ class StageConnectorsTest(unittest.TestCase):
                     member.size = len(data)
                     archive.addfile(member, io.BytesIO(data))
             layer_digest = add_blob(layer_stream.getvalue())
-            config_digest = add_json({"config": {"Labels": {
+            labels = {
                 "org.opencontainers.image.version": "1.2.3",
                 "org.opencontainers.image.revision": "a" * 40,
                 "io.tapstate.web.revision": "b" * 40,
                 "io.tapstate.web.files.sha256": "c" * 64,
-            }}})
+            }
+            if license_label is not None:
+                labels["org.opencontainers.image.licenses"] = license_label
+            config_digest = add_json({"config": {"Labels": labels}})
             manifest_digest = add_json({
                 "config": {"digest": config_digest},
                 "layers": [{"digest": layer_digest}],
@@ -159,6 +167,27 @@ class StageConnectorsTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.StageError, "PDK-API-Version disagrees"):
             MODULE.stage(self.lock, self.jars, self.staged)
 
+    def test_published_spec_filenames_are_accepted(self) -> None:
+        self.make_jar("mongodb", spec_path="spec.json")
+        self.make_jar("oracle", spec_path="spec_oracle.json")
+        self.make_jar("postgres", spec_path="spec_postgres.json")
+        self.write_lock()
+        MODULE.stage(self.lock, self.jars, self.staged)
+        self.assertTrue((self.staged / "connectors/oracle-connector.jar").is_file())
+
+    def test_sqlserver_published_manifest_uses_mssql_module_title(self) -> None:
+        self.make_jar("sqlserver", spec_path="mssql-spec.json",
+                      implementation_title="mssql-connector")
+        self.write_lock()
+        MODULE.stage(self.lock, self.jars, self.staged)
+        self.assertTrue((self.staged / "connectors/sqlserver-connector.jar").is_file())
+
+    def test_unrelated_manifest_title_still_refuses(self) -> None:
+        self.make_jar("sqlserver", implementation_title="unrelated-connector")
+        self.write_lock()
+        with self.assertRaisesRegex(MODULE.StageError, "Implementation-Title disagrees"):
+            MODULE.stage(self.lock, self.jars, self.staged)
+
     def test_duplicate_id_and_duplicate_json_key_refuse(self) -> None:
         self.entries[1] = dict(self.entries[0])
         self.write_lock()
@@ -193,6 +222,11 @@ class StageConnectorsTest(unittest.TestCase):
     def test_oci_rejects_missing_architecture(self) -> None:
         layout = self.make_oci(architectures=("amd64",))
         with self.assertRaisesRegex(IMAGE.ImageError, "expected amd64 and arm64"):
+            IMAGE.verify(layout, self.lock)
+
+    def test_oci_requires_license_label(self) -> None:
+        layout = self.make_oci(license_label=None)
+        with self.assertRaisesRegex(IMAGE.ImageError, "missing image label org.opencontainers.image.licenses"):
             IMAGE.verify(layout, self.lock)
 
 

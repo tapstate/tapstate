@@ -96,9 +96,12 @@ CMD ["--role=all"]
 
 # Cloud release builds reuse the exact Boot JAR and runtime layers above. The connector context is
 # supplied only to this target, so ordinary server builds neither fetch nor bundle connector jars.
+# The connector seed has separate distribution terms, so this target does not inherit the server label's
+# Apache-2.0 assertion. Publication still requires a reviewed license inventory and permission.
 FROM runtime-base AS cloud
 LABEL org.opencontainers.image.title="Tapstate Cloud cluster" \
-      org.opencontainers.image.description="Tapstate Cloud cluster runtime with a verified connector seed"
+      org.opencontainers.image.description="Tapstate Cloud cluster runtime with a verified connector seed" \
+      org.opencontainers.image.licenses="NOASSERTION"
 COPY --from=cloud_connectors --chown=tapstate:tapstate /connectors/ /opt/tapstate/connectors/
 COPY --from=cloud_connectors --chown=tapstate:tapstate /release/ /opt/tapstate/release/
 ENV TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors

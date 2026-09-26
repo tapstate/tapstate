@@ -134,8 +134,10 @@ def verify_jar(path: Path, entry: dict[str, Any]) -> None:
             spec = json.loads(jar.read(entry["specPath"]).decode("utf-8"))
     except (OSError, zipfile.BadZipFile, UnicodeError, json.JSONDecodeError) as exc:
         raise StageError(f"{connector_id}: JAR manifest or spec is unreadable") from exc
+    # The published SQL Server JAR is built from the upstream mssql module, while its PDK id is sqlserver.
+    implementation_title = "mssql-connector" if connector_id == "sqlserver" else f"{connector_id}-connector"
     expected_headers = {
-        "Implementation-Title": f"{connector_id}-connector",
+        "Implementation-Title": implementation_title,
         "Git-Commit-Id": entry["upstreamRevision"],
         "PDK-API-Version": entry["pdkApiVersion"],
     }

@@ -96,7 +96,8 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
         raise ImageError(f"{platform} has no image labels")
     relevant_labels = {}
     for key in ("org.opencontainers.image.version", "org.opencontainers.image.revision",
-                "io.tapstate.web.revision", "io.tapstate.web.files.sha256"):
+                "org.opencontainers.image.licenses", "io.tapstate.web.revision",
+                "io.tapstate.web.files.sha256"):
         if not isinstance(labels.get(key), str) or not labels[key]:
             raise ImageError(f"{platform} is missing image label {key}")
         relevant_labels[key] = labels[key]
