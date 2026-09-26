@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.control.core.PipelineIncarnationService;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.StartDeferred;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.runtime.srs.SnapshotCapacityUnavailable;
@@ -55,6 +56,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final PipelineActuationOwnership actuation;
     private final PipelineIncarnationService incarnations;
     private final ObservationScopeRegistry observationScopes;
+    private final ObservationPublisher observationPublisher;
+    private final ObservationStore observations;
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown, PipelineActuationOwnership actuation) {
@@ -64,6 +67,14 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown, PipelineActuationOwnership actuation,
             PipelineIncarnationService incarnations, ObservationScopeRegistry observationScopes) {
+        this(engine, dagSource, captureCoordinator, stateTeardown, actuation, incarnations,
+                observationScopes, null, null);
+    }
+
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            NestStateTeardown stateTeardown, PipelineActuationOwnership actuation,
+            PipelineIncarnationService incarnations, ObservationScopeRegistry observationScopes,
+            ObservationPublisher observationPublisher, ObservationStore observations) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
@@ -71,6 +82,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         this.actuation = Objects.requireNonNull(actuation, "actuation");
         this.incarnations = incarnations;
         this.observationScopes = observationScopes;
+        this.observationPublisher = observationPublisher;
+        this.observations = observations;
     }
 
     @Override
@@ -274,7 +287,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     @Override
     public void resume(String pipelineId) {
         if (!captureCoordinator.loadDelivered(pipelineId)) {
-            stop(pipelineId, false);
+            stopForRebuildingResume(pipelineId, false);
             start(pipelineId);
             return;
         }
@@ -288,6 +301,54 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void stop(String pipelineId, boolean purgeState) {
+        if (observationScopes != null) {
+            observationScopes.clearContinuation(pipelineId);
+        }
+        if (observationPublisher != null) {
+            observationPublisher.clearRebuildingResume(pipelineId);
+        }
+        stopInternal(pipelineId, purgeState);
+    }
+
+    @Override
+    public void stopForRebuildingResume(String pipelineId, boolean purgeState) {
+        captureMetricsForResume(pipelineId);
+        stopInternal(pipelineId, purgeState);
+    }
+
+    private void captureMetricsForResume(String pipelineId) {
+        if (observationScopes == null) {
+            return;
+        }
+        Optional<ObservationStore.Scope> owner = observationScopes.current(pipelineId);
+        if (owner.isEmpty()) {
+            return;
+        }
+        if (observationPublisher != null) {
+            try {
+                observationPublisher.prepareScoped(pipelineId, null, owner.get())
+                        .ifPresent(frame -> observationScopes.continueFrame(frame, owner.get()));
+            } catch (RuntimeException unavailable) {
+                LOG.warn("Could not measure the final cumulative metrics for pipeline {}", pipelineId,
+                        unavailable);
+            }
+        }
+        Optional<ObservationStore.Stored> stored = Optional.empty();
+        if (observations != null && observationScopes.needsStoredFallback(pipelineId)) {
+            try {
+                stored = observations.readStored(pipelineId);
+            } catch (RuntimeException unavailable) {
+                LOG.warn("Could not read the last cumulative metrics for pipeline {}", pipelineId,
+                        unavailable);
+            }
+        }
+        observationScopes.prepareRebuildingResume(pipelineId, stored);
+        if (observationPublisher != null) {
+            observationPublisher.prepareRebuildingResume(pipelineId);
+        }
+    }
+
+    private void stopInternal(String pipelineId, boolean purgeState) {
         engine.cancel(pipelineId);
         if (purgeState) {
             // Noted before the job is even known to be over, and before the drop: a stop is driven once, on

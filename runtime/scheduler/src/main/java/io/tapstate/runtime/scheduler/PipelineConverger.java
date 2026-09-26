@@ -267,12 +267,17 @@ public final class PipelineConverger {
         boolean stoppedHere = false;
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS
                 && StateJson.parse(current.stateJson()) != PipelineState.STOPPED; attempt++) {
+            boolean continuingPausedRun = StateJson.parse(current.stateJson()) == PipelineState.PAUSED;
             CasOutcome outcome = state.compareAndSwap(
                     pipelineId, current.epoch(), StateJson.of(PipelineState.STOPPED), clock.instant());
             if (outcome instanceof CasOutcome.Applied applied) {
                 current = applied.next();
                 try {
-                    actuator.stop(pipelineId, purgeState);
+                    if (continuingPausedRun) {
+                        actuator.stopForRebuildingResume(pipelineId, purgeState);
+                    } else {
+                        actuator.stop(pipelineId, purgeState);
+                    }
                 } catch (TapstateException refused) {
                     return failedWith(pipelineId, refused);
                 }

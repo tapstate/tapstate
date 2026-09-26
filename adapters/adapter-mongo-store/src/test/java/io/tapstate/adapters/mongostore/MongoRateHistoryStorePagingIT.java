@@ -45,6 +45,10 @@ class MongoRateHistoryStorePagingIT {
             assertThat(firstIncarnation.entries())
                     .extracting(entry -> entry.sample().counters().get("records.out"))
                     .containsExactly(0L, 1L, 2L);
+            assertThat(firstIncarnation.entries()).extracting(Entry::scope)
+                    .containsExactly(java.util.Optional.empty(),
+                            java.util.Optional.of(new ObservationStore.Scope("inc-a", 41)),
+                            java.util.Optional.of(new ObservationStore.Scope("inc-a", 42)));
             assertThat(history.readVisible("orders", new Visibility("inc-b", false),
                     firstIncarnation.entries().get(1).key())).isEmpty();
             assertThat(history.predecessorVisible("orders", new Visibility("inc-b", false),

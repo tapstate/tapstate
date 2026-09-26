@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateWindow;
+import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestStateReading;
@@ -43,6 +44,48 @@ import static org.assertj.core.api.Assertions.entry;
  * left unobserved rather than published as an empty doc.
  */
 class ObservationPublisherTest {
+
+    @Test
+    void rebuildingResumeRetainsNamedMetricSeriesWhileFreshStartOpensANewBudget() {
+        state.seed("orders", PipelineState.RUNNING);
+        Map<String, Long> original = new LinkedHashMap<>();
+        for (int index = 0; index < 1_000; index++) {
+            original.put("chain-%04d".formatted(index), 1L);
+        }
+        AtomicReference<Map<String, Long>> gaps = new AtomicReference<>(original);
+        ObservationPublisher writer = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> gaps.get());
+        writer.prepareScoped("orders", null, new ObservationStore.Scope("inc-a", 1));
+
+        Map<String, Long> expanded = new LinkedHashMap<>();
+        expanded.put("chain-new", 11L);
+        expanded.putAll(original);
+        gaps.set(expanded);
+        writer.prepareRebuildingResume("orders");
+        Observation continued = writer.prepareScoped("orders", null,
+                new ObservationStore.Scope("inc-a", 2)).orElseThrow().observation();
+        assertThat(writer.prepareScoped("orders", null, new ObservationStore.Scope("inc-a", 1))).isEmpty();
+        List<io.tapstate.core.lifecycle.MetricPoint> named = continued.facts().stream()
+                .filter(fact -> fact.name().equals("tapstate.pipeline.frontier.gap"))
+                .findFirst().orElseThrow().points();
+        assertThat(named).anySatisfy(point ->
+                assertThat(point.attributes()).containsEntry(MetricAttributes.CHAIN_ID, "chain-0999"));
+        assertThat(named).anySatisfy(point -> {
+            assertThat(point.attributes()).containsEntry(MetricAttributes.OVERFLOW, "true");
+            assertThat(point.value()).isEqualTo(11);
+        });
+
+        writer.clearRebuildingResume("orders");
+        Observation fresh = writer.prepareScoped("orders", null,
+                new ObservationStore.Scope("inc-a", 3)).orElseThrow().observation();
+        List<io.tapstate.core.lifecycle.MetricPoint> reset = fresh.facts().stream()
+                .filter(fact -> fact.name().equals("tapstate.pipeline.frontier.gap"))
+                .findFirst().orElseThrow().points();
+        assertThat(reset).anySatisfy(point ->
+                assertThat(point.attributes()).containsEntry(MetricAttributes.CHAIN_ID, "chain-new"));
+        assertThat(reset).noneSatisfy(point ->
+                assertThat(point.attributes()).containsEntry(MetricAttributes.CHAIN_ID, "chain-0999"));
+    }
 
     private static final Instant T0 = Instant.parse("2026-07-01T00:00:00Z");
     private static final Instant OBSERVED_AT = Instant.parse("2026-07-01T12:34:56.789Z");

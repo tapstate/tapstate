@@ -149,7 +149,7 @@ public final class HistoryAggregator {
             throw new IllegalStateException("rate-history time moved backwards");
         }
 
-        StartReason boundary = boundary(a, b, elapsed);
+        StartReason boundary = boundary(left, right, elapsed);
         if (boundary != null) {
             if (active != null) {
                 flush(left.key(), min(to, max(resumeFrom, active.end)));
@@ -183,7 +183,9 @@ public final class HistoryAggregator {
         }
     }
 
-    private StartReason boundary(RateSample left, RateSample right, Duration elapsed) {
+    private StartReason boundary(Entry previous, Entry current, Duration elapsed) {
+        RateSample left = previous.sample();
+        RateSample right = current.sample();
         if (!elapsed.isZero() && elapsed.compareTo(gapThreshold) >= 0) {
             return StartReason.GAP;
         }
@@ -191,6 +193,10 @@ public final class HistoryAggregator {
                 || decreased(left, right, RECORDS_OUT)
                 || decreased(left, right, BYTES_OUT)) {
             return StartReason.COUNTER_RESET;
+        }
+        if (previous.scope().isPresent() && current.scope().isPresent()
+                && !previous.scope().equals(current.scope())) {
+            return StartReason.CONTINUATION;
         }
         return null;
     }

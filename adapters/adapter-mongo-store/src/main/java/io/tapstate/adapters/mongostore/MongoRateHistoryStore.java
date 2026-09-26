@@ -310,7 +310,20 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
             throw corrupt(String.valueOf(pipelineId), INTERNAL_ID);
         }
         RateSample sample = toSample(document);
-        return new Entry(new Key(sample.observedAt(), id.toHexString()), sample);
+        Object rawIncarnation = document.get(PIPELINE_INCARNATION_ID);
+        Object rawGeneration = document.get(EXECUTION_GENERATION);
+        Optional<ObservationStore.Scope> scope;
+        if (rawIncarnation == null && rawGeneration == null) {
+            scope = Optional.empty();
+        } else if (rawIncarnation instanceof String incarnation && !incarnation.isBlank()
+                && (rawGeneration instanceof Long || rawGeneration instanceof Integer)
+                && ((Number) rawGeneration).longValue() > 0) {
+            Number generation = (Number) rawGeneration;
+            scope = Optional.of(new ObservationStore.Scope(incarnation, generation.longValue()));
+        } else {
+            throw corrupt(sample.pipelineId(), EXECUTION_GENERATION);
+        }
+        return new Entry(new Key(sample.observedAt(), id.toHexString()), sample, scope);
     }
 
     private static ObjectId internalId(Key key) {

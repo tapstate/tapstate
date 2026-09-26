@@ -5,16 +5,45 @@ import io.tapstate.control.core.PipelineMetricsHistory.StartReason;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RateHistoryStore.Entry;
 import io.tapstate.spi.store.RateHistoryStore.Key;
+import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class HistoryAggregatorTest {
+
+    @Test
+    void executionChangeStartsANewSegmentWithoutCallingAContinuedCounterReset() {
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        HistoryAggregator aggregator = new HistoryAggregator(from, from.plusSeconds(180), from,
+                Duration.ofMinutes(1), Duration.ofSeconds(30), List.of(), StartReason.WINDOW_START, 10);
+        aggregator.add(scoped(1, from, 7, 41));
+        aggregator.add(scoped(2, from.plusSeconds(30), 9, 42));
+        aggregator.add(scoped(3, from.plusSeconds(60), 12, 42));
+
+        HistoryAggregator.Projection result = aggregator.finish(null);
+
+        assertThat(result.points()).extracting(Emitted::segment).containsExactly(0, 1, 1);
+        assertThat(result.points()).extracting(Emitted::startReason)
+                .containsExactly(StartReason.WINDOW_START, StartReason.CONTINUATION, StartReason.CONTINUATION);
+        assertThat(result.points()).anySatisfy(point -> {
+            assertThat(point.point().recordsOut()).isNotNull();
+            assertThat(point.point().recordsOut().delta()).isEqualByComparingTo("3");
+        });
+        assertThat(result.gaps()).isEmpty();
+    }
+
+    private static Entry scoped(int key, Instant at, long records, long generation) {
+        RateSample sample = new RateSample("orders", at, Map.of("records.out", records), Map.of(), START);
+        return new Entry(new Key(at, "%03d".formatted(key)), sample,
+                Optional.of(new ObservationStore.Scope("inc-a", generation)));
+    }
 
     private static final Instant START = Instant.parse("2026-09-21T00:00:00Z");
     private static final Instant FROM = Instant.parse("2026-09-21T10:07:00Z");

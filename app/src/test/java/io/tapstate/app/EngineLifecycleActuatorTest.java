@@ -10,6 +10,12 @@ import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.control.core.PipelineIncarnationService;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
+import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.FromRef;
@@ -25,6 +31,9 @@ import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.runtime.scheduler.ObservationPublisher;
+import io.tapstate.spi.metrics.MetricsExport;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRun;
@@ -47,12 +56,16 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -67,6 +80,115 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * pipeline id alone.
  */
 class EngineLifecycleActuatorTest {
+
+    @Test
+    void rebuildingResumeCarriesKnownCountersAndHistogramsButRemeasuresGauges() throws Exception {
+        List<String> events = new CopyOnWriteArrayList<>();
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        ArtifactStore artifacts = new ArtifactStore() {
+            @Override public void saveAll(List<io.tapstate.core.model.Resource> resources) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public Optional<io.tapstate.core.model.Resource> get(String id) { return Optional.empty(); }
+            @Override public List<io.tapstate.core.model.Resource> list() { return List.of(); }
+            @Override public Optional<String> ensurePipelineIncarnationId(String id, String candidate) {
+                return Optional.of("inc-a");
+            }
+        };
+        AtomicReference<ObservationStore.Stored> latest = new AtomicReference<>();
+        ObservationStore observations = new ObservationStore() {
+            @Override public void save(Observation observation) { throw new AssertionError("unscoped write"); }
+            @Override public boolean saveScoped(Observation observation, Scope scope) {
+                latest.set(new Stored(observation, Optional.of(scope)));
+                return true;
+            }
+            @Override public Optional<Observation> read(String id) {
+                return Optional.ofNullable(latest.get()).map(Stored::observation);
+            }
+            @Override public Optional<Stored> readStored(String id) { return Optional.ofNullable(latest.get()); }
+            @Override public void delete(String id) { latest.set(null); }
+        };
+        EngineLifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member),
+                new RecordingDagSource(events), coordinator, teardown(),
+                PipelineActuationOwnership.single("single", new InMemoryWorkloadClaimStore()),
+                new PipelineIncarnationService(artifacts), scopes);
+        Instant started = Instant.parse("2026-09-27T00:00:00Z");
+        Instant rebuiltAt = started.plusSeconds(30);
+
+        try (TelemetryDispatcher telemetry = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), observations), null,
+                MetricsExport.none(), scopes, 1, 4)) {
+            actuator.start(PIPE);
+            ObservationStore.Scope oldScope = scopes.current(PIPE).orElseThrow();
+            awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+            telemetry.offer(metricFrame(started.plusSeconds(10), started, 7, 3, 11), oldScope);
+            awaitObservation(latest, oldScope, started.plusSeconds(10));
+
+            actuator.pause(PIPE);
+            awaitStatus(member.getJet().getJob(PIPE), JobStatus.SUSPENDED);
+            coordinator.loadDelivered = false;
+            actuator.resume(PIPE);
+            ObservationStore.Scope newScope = scopes.current(PIPE).orElseThrow();
+            assertThat(newScope.executionGeneration()).isEqualTo(oldScope.executionGeneration() + 1);
+            telemetry.offer(metricFrame(rebuiltAt, rebuiltAt, 2, 1, 22), newScope);
+            Observation continued = awaitObservation(latest, newScope, rebuiltAt);
+
+            MetricPoint rows = point(continued, "tapstate.pipeline.records");
+            assertThat(rows.value()).isEqualTo(9);
+            assertThat(rows.startTime()).isEqualTo(started);
+            assertThat(continued.metrics()).containsEntry("records.out", 9L);
+            MetricPoint duration = point(continued, "tapstate.pipeline.record.delivery.duration");
+            assertThat(duration.histogram().count()).isEqualTo(4);
+            assertThat(duration.histogram().sum()).isEqualTo(4.0);
+            assertThat(duration.histogram().bucketCounts().getFirst()).isEqualTo(4);
+            assertThat(duration.startTime()).isEqualTo(started);
+            assertThat(point(continued, "tapstate.pipeline.lag").value()).isEqualTo(22);
+        }
+    }
+
+    private static ObservationPublisher.Prepared metricFrame(Instant at, Instant since,
+            long rows, long durationCount, long lag) {
+        Map<String, String> table = Map.of(MetricAttributes.PIPELINE_ID, PIPE,
+                MetricAttributes.TABLE_ID, "orders");
+        Map<String, String> delivered = Map.of(MetricAttributes.PIPELINE_ID, PIPE,
+                MetricAttributes.TABLE_ID, "orders", MetricAttributes.DIRECTION, "out",
+                MetricAttributes.OP, "insert");
+        List<Long> buckets = new ArrayList<>(java.util.Collections.nCopies(
+                HistogramBounds.RECORD_DELIVERY_DURATION.buckets(), 0L));
+        buckets.set(0, durationCount);
+        List<MetricFact> facts = List.of(
+                MetricFact.single("tapstate.pipeline.records", MetricType.COUNTER, "{record}",
+                        MetricPoint.accumulated(delivered, since, at, rows)),
+                MetricFact.single("tapstate.pipeline.record.delivery.duration", MetricType.HISTOGRAM,
+                        HistogramBounds.UNIT, MetricPoint.distribution(table, since, at,
+                                HistogramBounds.RECORD_DELIVERY_DURATION.value(
+                                        durationCount, durationCount, buckets))),
+                MetricFact.single("tapstate.pipeline.lag", MetricType.GAUGE, "s",
+                        MetricPoint.reading(table, at, lag)));
+        Observation observation = new Observation(PIPE, PipelineState.RUNNING,
+                Map.of("records.out", rows, "lag.orders", lag), Map.of(), Map.of(), null, at, facts);
+        return new ObservationPublisher.Prepared(observation, false, Map.of(), Map.of(), Map.of());
+    }
+
+    private static MetricPoint point(Observation observation, String name) {
+        return observation.facts().stream().filter(fact -> fact.name().equals(name))
+                .findFirst().orElseThrow().points().getFirst();
+    }
+
+    private static Observation awaitObservation(AtomicReference<ObservationStore.Stored> latest,
+            ObservationStore.Scope scope, Instant at) throws InterruptedException {
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < until) {
+            ObservationStore.Stored stored = latest.get();
+            if (stored != null && stored.scope().filter(scope::equals).isPresent()
+                    && at.equals(stored.observation().observedAt())) {
+                return stored.observation();
+            }
+            TimeUnit.MILLISECONDS.sleep(5);
+        }
+        throw new AssertionError("observation did not reach its scoped latest slot");
+    }
 
     @Test
     void startBindsTheArtifactIncarnationToItsDurableExecutionGenerationForObservations() {

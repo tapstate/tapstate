@@ -224,8 +224,13 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     void offer(ObservationPublisher.Prepared prepared, ObservationStore.Scope scope) {
         Objects.requireNonNull(prepared, "prepared");
-        Observation observation = prepared.observation();
-        offerLatest(observation.pipelineId(), new ObservationFrame(prepared, scope));
+        if (scopes != null && (scope == null || scopes.current(prepared.observation().pipelineId())
+                .filter(scope::equals).isEmpty())) {
+            return;
+        }
+        ObservationPublisher.Prepared frame = scopes == null ? prepared : scopes.continueFrame(prepared, scope);
+        Observation observation = frame.observation();
+        offerLatest(observation.pipelineId(), new ObservationFrame(frame, scope));
         if (sampler != null) {
             offerSide(historyWorker, historyStats, observation.pipelineId(), "history",
                     () -> stillCurrent(observation.pipelineId(), scope)

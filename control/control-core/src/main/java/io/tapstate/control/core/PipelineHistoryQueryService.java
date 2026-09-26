@@ -358,7 +358,7 @@ public final class PipelineHistoryQueryService {
         StartReason reason = initialReason;
         for (Entry current : entries) {
             Point point;
-            StartReason boundary = previous == null ? null : boundary(previous.sample(), current.sample());
+            StartReason boundary = previous == null ? null : boundary(previous, current);
             if (boundary != null) {
                 segment++;
                 reason = boundary;
@@ -388,7 +388,9 @@ public final class PipelineHistoryQueryService {
         return new Projection(points, gaps);
     }
 
-    private StartReason boundary(RateSample left, RateSample right) {
+    private StartReason boundary(Entry previous, Entry current) {
+        RateSample left = previous.sample();
+        RateSample right = current.sample();
         Duration elapsed = Duration.between(left.observedAt(), right.observedAt());
         if (!elapsed.isNegative() && !elapsed.isZero()
                 && elapsed.compareTo(sampleInterval.multipliedBy(2)) >= 0) {
@@ -398,6 +400,10 @@ public final class PipelineHistoryQueryService {
                 || decreased(left, right, HistoryAggregator.RECORDS_OUT)
                 || decreased(left, right, HistoryAggregator.BYTES_OUT)) {
             return StartReason.COUNTER_RESET;
+        }
+        if (previous.scope().isPresent() && current.scope().isPresent()
+                && !previous.scope().equals(current.scope())) {
+            return StartReason.CONTINUATION;
         }
         return null;
     }

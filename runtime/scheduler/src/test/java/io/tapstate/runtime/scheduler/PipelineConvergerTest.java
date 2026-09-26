@@ -394,6 +394,7 @@ class PipelineConvergerTest {
         converge(STOPPED);
 
         assertThat(actuator.calls()).containsExactly("start:p1", "stop:p1:keep");
+        assertThat(actuator.rebuildingStops()).isZero();
     }
 
     @Test
@@ -679,6 +680,7 @@ class PipelineConvergerTest {
         converger.converge("p1");
 
         assertThat(actuator.calls()).doesNotContain("stop:p1:purge");
+        assertThat(actuator.rebuildingStops()).isEqualTo(1);
     }
 
     /** Without it, a resume is still a resume -- the held job is continued, not rebuilt. */

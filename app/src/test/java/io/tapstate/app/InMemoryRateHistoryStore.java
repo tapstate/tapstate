@@ -34,7 +34,8 @@ final class InMemoryRateHistoryStore implements RateHistoryStore {
     }
 
     private void appendWithScope(RateSample sample, ObservationStore.Scope scope) {
-        samples.add(new Stored(new Entry(new Key(sample.observedAt(), "%020d".formatted(nextKey++)), sample), scope));
+        samples.add(new Stored(new Entry(new Key(sample.observedAt(), "%020d".formatted(nextKey++)), sample,
+                Optional.ofNullable(scope)), scope));
     }
 
     @Override

@@ -7,6 +7,7 @@ import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.RateHistoryStore;
+import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -25,6 +26,30 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 class PipelineHistoryQueryServiceTest {
+
+    @Test
+    void rawHistorySplitsARebuiltExecutionWithoutInventingACounterReset() {
+        RecordingHistory history = new RecordingHistory();
+        ObservationStore.Scope old = new ObservationStore.Scope("inc-a", 41);
+        ObservationStore.Scope rebuilt = new ObservationStore.Scope("inc-a", 42);
+        history.addScoped(sample("2026-09-21T10:00:00Z", 7, 70, 7, Map.of(), COUNTING_SINCE), old);
+        history.addScoped(sample("2026-09-21T10:01:00Z", 9, 90, 9, Map.of(), COUNTING_SINCE), rebuilt);
+        history.addScoped(sample("2026-09-21T10:02:00Z", 12, 120, 12, Map.of(), COUNTING_SINCE), rebuilt);
+        PipelineHistoryQueryService service = new PipelineHistoryQueryService(
+                artifactsWithOwner("inc-a", "orders"), history, Duration.ofMinutes(1), fixedClock(),
+                cursorCodec(), 10, 100);
+
+        PipelineMetricsHistory raw = service.query(query("2026-09-21T10:00:00Z",
+                "2026-09-21T10:03:00Z", HistoryResolution.RAW, 10, List.of(), null));
+
+        assertThat(raw.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                .containsExactly(PipelineMetricsHistory.StartReason.WINDOW_START,
+                        PipelineMetricsHistory.StartReason.CONTINUATION);
+        assertThat(raw.segments().get(1).points().getFirst().recordsOut()).isNull();
+        assertThat(raw.segments().get(1).points().getLast().recordsOut().delta())
+                .isEqualByComparingTo("3");
+        assertThat(raw.gaps()).isEmpty();
+    }
 
     private static final Instant NOW = Instant.parse("2026-09-21T12:00:00Z");
     private static final Instant COUNTING_SINCE = Instant.parse("2026-09-21T00:00:00Z");
@@ -273,6 +298,10 @@ class PipelineHistoryQueryServiceTest {
     }
 
     private static ArtifactQueryService artifactsWith(String... ids) {
+        return artifactsWithOwner(null, ids);
+    }
+
+    private static ArtifactQueryService artifactsWithOwner(String incarnation, String... ids) {
         Map<String, Resource> resources = new LinkedHashMap<>();
         for (String id : ids) {
             resources.put(id, new DslParser().parse("""
@@ -304,6 +333,14 @@ class PipelineHistoryQueryServiceTest {
             public List<Resource> list() {
                 return List.copyOf(resources.values());
             }
+
+            @Override
+            public Optional<HistoryOwner> pipelineHistoryOwner(String id) {
+                return resources.containsKey(id)
+                        ? Optional.of(new HistoryOwner(new RateHistoryStore.Visibility(
+                                incarnation, incarnation == null)))
+                        : Optional.empty();
+            }
         });
     }
 
@@ -320,9 +357,17 @@ class PipelineHistoryQueryServiceTest {
             append(sample);
         }
 
+        void addScoped(RateSample sample, ObservationStore.Scope scope) {
+            addEntry(sample, Optional.of(scope));
+        }
+
         @Override
         public void append(RateSample sample) {
-            Entry entry = new Entry(new Key(sample.observedAt(), "%020d".formatted(nextKey++)), sample);
+            addEntry(sample, Optional.empty());
+        }
+
+        private void addEntry(RateSample sample, Optional<ObservationStore.Scope> scope) {
+            Entry entry = new Entry(new Key(sample.observedAt(), "%020d".formatted(nextKey++)), sample, scope);
             boolean ordered = entries.isEmpty() || ORDER.compare(entries.getLast(), entry) <= 0;
             entries.add(entry);
             if (!ordered) {
@@ -332,8 +377,13 @@ class PipelineHistoryQueryServiceTest {
 
         @Override
         public Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit) {
+            return page(pipelineId, null, from, to, after, limit);
+        }
+
+        private Page page(String pipelineId, Visibility visibility, Instant from, Instant to, Key after, int limit) {
             requestedLimits.add(limit);
             List<Entry> found = entries.stream()
+                    .filter(entry -> visible(entry, visibility))
                     .filter(entry -> entry.sample().pipelineId().equals(pipelineId))
                     .filter(entry -> !entry.key().observedAt().isBefore(from)
                             && entry.key().observedAt().isBefore(to))
@@ -347,8 +397,7 @@ class PipelineHistoryQueryServiceTest {
         @Override
         public Page readPageVisible(String pipelineId, Visibility visibility,
                 Instant from, Instant to, Key after, int limit) {
-            requireLegacy(visibility);
-            return readPage(pipelineId, from, to, after, limit);
+            return page(pipelineId, visibility, from, to, after, limit);
         }
 
         @Override
@@ -359,8 +408,9 @@ class PipelineHistoryQueryServiceTest {
 
         @Override
         public Optional<Entry> readVisible(String pipelineId, Visibility visibility, Key key) {
-            requireLegacy(visibility);
-            return read(pipelineId, key);
+            return entries.stream().filter(entry -> visible(entry, visibility))
+                    .filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> entry.key().equals(key)).findFirst();
         }
 
         @Override
@@ -371,8 +421,9 @@ class PipelineHistoryQueryServiceTest {
 
         @Override
         public Optional<Entry> predecessorVisible(String pipelineId, Visibility visibility, Instant at) {
-            requireLegacy(visibility);
-            return predecessor(pipelineId, at);
+            return entries.stream().filter(entry -> visible(entry, visibility))
+                    .filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> entry.key().observedAt().isBefore(at)).max(ORDER);
         }
 
         @Override
@@ -383,14 +434,17 @@ class PipelineHistoryQueryServiceTest {
 
         @Override
         public Optional<Entry> successorVisible(String pipelineId, Visibility visibility, Instant at) {
-            requireLegacy(visibility);
-            return successor(pipelineId, at);
+            return entries.stream().filter(entry -> visible(entry, visibility))
+                    .filter(entry -> entry.sample().pipelineId().equals(pipelineId))
+                    .filter(entry -> !entry.key().observedAt().isBefore(at)).min(ORDER);
         }
 
-        private static void requireLegacy(Visibility visibility) {
-            if (!new Visibility(null, true).equals(visibility)) {
-                throw new AssertionError("this history fixture contains only legacy samples");
+        private static boolean visible(Entry entry, Visibility visibility) {
+            if (visibility == null) {
+                return true;
             }
+            return entry.scope().map(scope -> scope.pipelineIncarnationId().equals(visibility.incarnationId()))
+                    .orElseGet(visibility::includeLegacy);
         }
 
         @Override

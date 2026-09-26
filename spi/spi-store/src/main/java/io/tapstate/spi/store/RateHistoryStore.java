@@ -42,14 +42,20 @@ public interface RateHistoryStore {
         }
     }
 
-    /** One stored sample together with the opaque key that makes equal timestamps stable. */
-    record Entry(Key key, RateSample sample) {
+    /** One stored sample, its opaque ordering key and an optional internal execution owner. */
+    record Entry(Key key, RateSample sample, Optional<ObservationStore.Scope> scope) {
         public Entry {
             Objects.requireNonNull(key, "key");
             Objects.requireNonNull(sample, "sample");
+            Objects.requireNonNull(scope, "scope");
             if (!key.observedAt().equals(sample.observedAt())) {
                 throw new IllegalArgumentException("a rate-history key and sample name different instants");
             }
+        }
+
+        /** A legacy sample with no execution owner. */
+        public Entry(Key key, RateSample sample) {
+            this(key, sample, Optional.empty());
         }
     }
 

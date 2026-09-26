@@ -18,6 +18,7 @@ import java.util.Optional;
 final class RecordingActuator implements LifecycleActuator {
 
     private final List<String> calls = new ArrayList<>();
+    private int rebuildingStops;
     private Throwable failure;
 
     /**
@@ -54,6 +55,12 @@ final class RecordingActuator implements LifecycleActuator {
     }
 
     @Override
+    public void stopForRebuildingResume(String pipelineId, boolean purgeState) {
+        rebuildingStops++;
+        stop(pipelineId, purgeState);
+    }
+
+    @Override
     public Optional<Throwable> failure(String pipelineId) {
         return Optional.ofNullable(failure);
     }
@@ -66,6 +73,10 @@ final class RecordingActuator implements LifecycleActuator {
     /** The verbs actuated so far, in order. */
     List<String> calls() {
         return List.copyOf(calls);
+    }
+
+    int rebuildingStops() {
+        return rebuildingStops;
     }
 
     /**

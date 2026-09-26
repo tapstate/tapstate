@@ -387,6 +387,7 @@ public final class ObservationPublisher {
      * restarts visible cannot both be had, and every counter on this face has already chosen the second.
      */
     private final Map<String, Map<String, Long>> failuresByPipelineAndCode = new ConcurrentHashMap<>();
+    private final Set<String> rebuildingResumes = ConcurrentHashMap.newKeySet();
 
     /** When this publisher opened the failure account above; every failure point accumulates from it. */
     private final Instant countingFailuresSince;
@@ -705,14 +706,39 @@ public final class ObservationPublisher {
     public Optional<Prepared> prepareScoped(String pipelineId, ObservationFailure failure,
             ObservationStore.Scope scope) {
         Objects.requireNonNull(scope, "scope");
-        ObservationStore.Scope previous = currentScopes.put(pipelineId, scope);
+        ObservationStore.Scope previous;
+        while (true) {
+            previous = currentScopes.get(pipelineId);
+            if (previous != null && !scope.equals(previous)
+                    && scope.executionGeneration() <= previous.executionGeneration()) {
+                return Optional.empty();
+            }
+            if (scope.equals(previous)
+                    || (previous == null ? currentScopes.putIfAbsent(pipelineId, scope) == null
+                            : currentScopes.replace(pipelineId, previous, scope))) {
+                break;
+            }
+        }
         if (!scope.equals(previous)) {
             currentFailures.remove(pipelineId);
             failuresByPipelineAndCode.remove(pipelineId);
-            cardinality.forgetPipeline(pipelineId);
+            if (previous == null || !previous.pipelineIncarnationId().equals(scope.pipelineIncarnationId())
+                    || !rebuildingResumes.contains(pipelineId)) {
+                cardinality.forgetPipeline(pipelineId);
+            }
             failureCountingSinceByPipeline.put(pipelineId, observedNow());
         }
         return prepare(pipelineId, failure);
+    }
+
+    /** Keeps named series stable while a paused execution is replaced with the same resource. */
+    public void prepareRebuildingResume(String pipelineId) {
+        rebuildingResumes.add(Objects.requireNonNull(pipelineId, "pipelineId"));
+    }
+
+    /** A plain stop ends that continuation before a later start opens fresh series. */
+    public void clearRebuildingResume(String pipelineId) {
+        rebuildingResumes.remove(pipelineId);
     }
 
     /** A single immutable measurement and its local alert inputs, before any telemetry store call. */
@@ -723,6 +749,14 @@ public final class ObservationPublisher {
             nestReadings = Map.copyOf(nestReadings);
             pinned = Map.copyOf(pinned);
             gaps = Map.copyOf(gaps);
+        }
+
+        /** Reprojects one adjusted fact set onto the unchanged public flat metrics shape. */
+        public Prepared withFacts(List<MetricFact> facts) {
+            Observation changed = new Observation(observation.pipelineId(), observation.state(),
+                    FlatMetricProjection.of(facts, FLAT_REDUCTIONS).metrics(), observation.snapshot(),
+                    observation.positions(), observation.failure(), observation.observedAt(), facts);
+            return new Prepared(changed, inheritStoredFailure, nestReadings, pinned, gaps);
         }
     }
 
@@ -1038,6 +1072,7 @@ public final class ObservationPublisher {
         failuresByPipelineAndCode.keySet().retainAll(Set.copyOf(live));
         currentFailures.keySet().retainAll(Set.copyOf(live));
         currentScopes.keySet().retainAll(Set.copyOf(live));
+        rebuildingResumes.retainAll(Set.copyOf(live));
         failureCountingSinceByPipeline.keySet().retainAll(Set.copyOf(live));
         cardinality.forgetPipelinesOutside(live);
     }
