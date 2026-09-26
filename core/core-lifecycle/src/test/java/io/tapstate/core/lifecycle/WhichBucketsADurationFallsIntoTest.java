@@ -14,7 +14,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * The bucket bounds the two duration histograms publish with, as the design document lists them. The
+ * The bucket bounds duration histograms publish with, as the design document lists them. The
  * numbers here are a copy of that document's table on purpose: a bound changed in the code without the
  * document, or in the document without the code, reddens this rather than shipping two layouts.
  *
@@ -56,11 +56,17 @@ class WhichBucketsADurationFallsIntoTest {
     }
 
     @Test
-    @DisplayName("exactly the two histogram instruments have bounds, and both are in seconds")
-    void onlyTheTwoHistogramInstrumentsHaveBounds() {
+    @DisplayName("all registered histogram instruments have bounds in seconds")
+    void onlyRegisteredHistogramInstrumentsHaveBounds() {
         assertThat(Arrays.stream(HistogramBounds.values()).map(HistogramBounds::instrument))
                 .containsExactlyInAnyOrder("tapstate.pipeline.record.delivery.duration",
-                        "tapstate.pipeline.process.duration");
+                        "tapstate.pipeline.process.duration",
+                        "tapstate.process.lifecycle.capacity.wait.duration",
+                        "tapstate.process.lifecycle.work.duration");
+        assertThat(HistogramBounds.LIFECYCLE_CAPACITY_WAIT.bounds()).containsExactly(
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0);
+        assertThat(HistogramBounds.LIFECYCLE_WORK_DURATION.bounds())
+                .containsExactlyElementsOf(HistogramBounds.LIFECYCLE_CAPACITY_WAIT.bounds());
         assertThat(HistogramBounds.UNIT).isEqualTo("s");
         assertThat(HistogramBounds.forInstrument("tapstate.pipeline.lag")).isEmpty();
     }

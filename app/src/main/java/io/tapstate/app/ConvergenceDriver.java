@@ -189,7 +189,9 @@ final class ConvergenceDriver {
                         continue;
                     }
                     LifecycleWorkDispatcher.Submission submission = lifecycleWork.offer(
-                            pipelineId, intent, () -> converger.converge(pipelineId));
+                            pipelineId, intent, () -> converger.converge(pipelineId),
+                            pendingWork == null ? System.nanoTime()
+                                    : pendingWork.capacitySince(pipelineId, intent.targetState()));
                     notePending(pipelineId, intent, submission);
                     if (submission == LifecycleWorkDispatcher.Submission.CAPACITY) {
                         LOG.debug("Lifecycle work for pipeline {} is waiting for dispatcher capacity", pipelineId);
@@ -329,6 +331,8 @@ final class ConvergenceDriver {
         } else if (intent.targetState() == PipelineState.STOPPED) {
             pendingWork.put(pipelineId, submission == LifecycleWorkDispatcher.Submission.CAPACITY
                     ? PendingReason.STOP_CAPACITY : PendingReason.STOP_PENDING);
+        } else if (submission == LifecycleWorkDispatcher.Submission.CAPACITY) {
+            pendingWork.rememberCapacity(pipelineId, intent.targetState());
         } else {
             pendingWork.clear(pipelineId);
         }

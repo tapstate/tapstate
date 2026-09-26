@@ -257,10 +257,12 @@ class DataPlaneActuationConfiguration {
     LifecycleActuator lifecycleActuator(Engine engine, DagSource dagSource,
             PipelineCaptureCoordinator pipelineCaptureCoordinator, NestStateTeardown nestStateTeardown,
             PipelineActuationOwnership pipelineActuationOwnership, StorePort storePort,
-            ObservationScopeRegistry observationScopes, io.tapstate.runtime.scheduler.ObservationPublisher publisher) {
-        return new EngineLifecycleActuator(engine, dagSource, pipelineCaptureCoordinator, nestStateTeardown,
+            ObservationScopeRegistry observationScopes, io.tapstate.runtime.scheduler.ObservationPublisher publisher,
+            LifecycleWorkDispatcher lifecycleWork) {
+        return new MeasuredLifecycleActuator(new EngineLifecycleActuator(engine, dagSource,
+                pipelineCaptureCoordinator, nestStateTeardown,
                 pipelineActuationOwnership,
                 new io.tapstate.control.core.PipelineIncarnationService(storePort.artifacts()), observationScopes,
-                publisher, storePort.observations());
+                publisher, storePort.observations()), lifecycleWork);
     }
 }

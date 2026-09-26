@@ -5,11 +5,11 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * The attribute keys a metric point may be broken down by, and the closed value sets four of them are
+ * The attribute keys a metric point may be broken down by, and the closed value sets five of them are
  * held to. One place spells them so that a producer, a projection and an export all mean the same key by
  * the same name; a key typed out at each site drifts the day one of them is retyped.
  *
- * <p>Four keys are closed sets, and a point carrying a value outside its set is refused where the fact
+ * <p>Five keys are closed sets, and a point carrying a value outside its set is refused where the fact
  * is built ({@link MetricFact}). An open set would be one the data could add a value to: a symbol nobody
  * recognised would become a series of its own, named by whatever produced it, and the number of series a
  * metric holds would be decided by the data rather than by anybody. The sets are small on purpose and grow
@@ -24,6 +24,7 @@ import java.util.Set;
  *   <li>{@link #STAGE} — where in the graph a duration was spent: one value per family of processor the
  *       engine draws a vertex with, see {@link Stage}.</li>
  *   <li>{@link #TELEMETRY_SINK} — one of the fixed process telemetry workers.</li>
+ *   <li>{@link #LIFECYCLE_VERB} — one of the four fixed lifecycle operations.</li>
  * </ul>
  *
  * <p>Three more keys name a thing the pipeline's own definition draws: the chain a frontier reading is
@@ -54,18 +55,22 @@ public final class MetricAttributes {
     public static final String STAGE = "stage";
     /** The fixed telemetry sink whose local worker health a process instrument describes. */
     public static final String TELEMETRY_SINK = "sink";
+    /** The four lifecycle operations that may occupy the actuation worker. */
+    public static final String LIFECYCLE_VERB = "verb";
     /** The marker OpenTelemetry puts on the series that absorbs what a cardinality limit turned away. */
     public static final String OVERFLOW = "otel.metric.overflow";
 
     public static final Set<String> DIRECTIONS = Set.of("in", "out");
     public static final Set<String> OPS = Set.of("insert", "update", "delete", "read", "ddl", "other");
     public static final Set<String> TELEMETRY_SINKS = Set.of("latest", "history", "export", "event");
+    public static final Set<String> LIFECYCLE_VERBS = Set.of("start", "pause", "resume", "stop");
 
     private static final Map<String, Set<String>> CLOSED = Map.of(
             DIRECTION, DIRECTIONS,
             OP, OPS,
             STAGE, Stage.attributeValues(),
-            TELEMETRY_SINK, TELEMETRY_SINKS);
+            TELEMETRY_SINK, TELEMETRY_SINKS,
+            LIFECYCLE_VERB, LIFECYCLE_VERBS);
 
     private MetricAttributes() {
     }

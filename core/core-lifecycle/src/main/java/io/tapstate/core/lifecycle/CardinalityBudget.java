@@ -114,7 +114,9 @@ public enum CardinalityBudget {
             Fold.HIGHEST),
     OBSERVATION_JANITOR_LAST_SUCCESS_AGE("tapstate.process.observation_janitor.last_success.age", null, 1,
             Fold.HIGHEST),
-    OBSERVATION_JANITOR_DEGRADED("tapstate.process.observation_janitor.degraded", null, 1, Fold.HIGHEST);
+    OBSERVATION_JANITOR_DEGRADED("tapstate.process.observation_janitor.degraded", null, 1, Fold.HIGHEST),
+    /** Only the four fixed lifecycle verbs can create duration series. */
+    LIFECYCLE_WORK_DURATION("tapstate.process.lifecycle.work.duration", null, 4, Fold.ADDED);
 
     /**
      * What several series of one instrument make when they fold into one.

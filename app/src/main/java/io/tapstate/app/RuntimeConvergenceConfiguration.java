@@ -142,8 +142,12 @@ class RuntimeConvergenceConfiguration {
     @Bean(destroyMethod = "close")
     LifecycleWorkDispatcher lifecycleWorkDispatcher(
             @Value("${tapstate.lifecycle.max-concurrency:4}") int maxConcurrency,
-            @Value("${tapstate.lifecycle.queue-capacity:64}") int queueCapacity) {
-        return new LifecycleWorkDispatcher(maxConcurrency, queueCapacity);
+            @Value("${tapstate.lifecycle.queue-capacity:64}") int queueCapacity,
+            MetricsExport export, LifecyclePendingRegistry pending, Clock clock) {
+        LifecycleWorkDispatcher dispatcher = new LifecycleWorkDispatcher(maxConcurrency, queueCapacity);
+        export.observeProcess("lifecycle", () -> LifecycleProcessFacts.snapshot(dispatcher.health(),
+                pending.capacityCount(), dispatcher.startedAt(), clock.instant()));
+        return dispatcher;
     }
 
     @Bean(destroyMethod = "close")

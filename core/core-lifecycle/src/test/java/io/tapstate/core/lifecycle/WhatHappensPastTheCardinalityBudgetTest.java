@@ -98,7 +98,29 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.join.recompute.rows",
                         "tapstate.pipeline.join.recompute.rows.total",
                         "tapstate.pipeline.records.driven",
-                        "tapstate.pipeline.reconcile.failures.streak");
+                        "tapstate.pipeline.reconcile.failures.streak",
+                        "tapstate.process.telemetry.queue.depth",
+                        "tapstate.process.telemetry.queue.high_water",
+                        "tapstate.process.telemetry.in_flight",
+                        "tapstate.process.telemetry.coalesced",
+                        "tapstate.process.telemetry.dropped",
+                        "tapstate.process.telemetry.write.success",
+                        "tapstate.process.telemetry.write.failure",
+                        "tapstate.process.telemetry.write.timeout",
+                        "tapstate.process.telemetry.write.duration.max",
+                        "tapstate.process.telemetry.last_success.age",
+                        "tapstate.process.telemetry.degraded",
+                        "tapstate.process.telemetry.gap.open",
+                        "tapstate.process.telemetry.restoration.pending",
+                        "tapstate.process.telemetry.gap.opened",
+                        "tapstate.process.telemetry.gap.closed",
+                        "tapstate.process.observation_janitor.scanned",
+                        "tapstate.process.observation_janitor.deleted",
+                        "tapstate.process.observation_janitor.failure",
+                        "tapstate.process.observation_janitor.batch.duration.max",
+                        "tapstate.process.observation_janitor.last_success.age",
+                        "tapstate.process.observation_janitor.degraded",
+                        "tapstate.process.lifecycle.work.duration");
         for (CardinalityBudget budget : List.of(CardinalityBudget.RECORDS, CardinalityBudget.BYTES,
                 CardinalityBudget.LAG, CardinalityBudget.RECORD_DELIVERY_DURATION,
                 CardinalityBudget.SNAPSHOT_ROWS, CardinalityBudget.SNAPSHOT_ROWS_TOTAL)) {
@@ -126,6 +148,8 @@ class WhatHappensPastTheCardinalityBudgetTest {
         assertThat(CardinalityBudget.ERRORS.distinctValues()).isEqualTo(200);
         assertThat(CardinalityBudget.PROCESS_DURATION.openDimension()).isEmpty();
         assertThat(CardinalityBudget.PROCESS_DURATION.distinctValues()).isEqualTo(Stage.values().length);
+        assertThat(CardinalityBudget.LIFECYCLE_WORK_DURATION.openDimension()).isEmpty();
+        assertThat(CardinalityBudget.LIFECYCLE_WORK_DURATION.distinctValues()).isEqualTo(4);
         for (CardinalityBudget budget : List.of(CardinalityBudget.RECORDS_DRIVEN,
                 CardinalityBudget.RECONCILE_FAILURES_STREAK)) {
             assertThat(budget.openDimension()).as(budget.name()).isEmpty();
@@ -446,6 +470,17 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.frontier.gap",
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.pending.high_water",
-                        "tapstate.pipeline.reconcile.failures.streak");
+                        "tapstate.pipeline.reconcile.failures.streak",
+                        "tapstate.process.telemetry.queue.depth",
+                        "tapstate.process.telemetry.queue.high_water",
+                        "tapstate.process.telemetry.in_flight",
+                        "tapstate.process.telemetry.write.duration.max",
+                        "tapstate.process.telemetry.last_success.age",
+                        "tapstate.process.telemetry.degraded",
+                        "tapstate.process.telemetry.gap.open",
+                        "tapstate.process.telemetry.restoration.pending",
+                        "tapstate.process.observation_janitor.batch.duration.max",
+                        "tapstate.process.observation_janitor.last_success.age",
+                        "tapstate.process.observation_janitor.degraded");
     }
 }

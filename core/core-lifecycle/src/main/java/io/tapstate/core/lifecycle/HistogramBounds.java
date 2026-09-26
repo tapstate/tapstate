@@ -15,15 +15,13 @@ import java.util.Optional;
  * varies. So the bounds are decided here, per instrument, and a distribution built with any other set is
  * refused where its fact is built ({@link MetricFact}).
  *
- * <p>Two instruments, two sets, because their ranges differ by four orders of magnitude at the low end: a
- * stage processes one item in microseconds to milliseconds and a batch in milliseconds to seconds, while a
- * row's delivery is measured from the moment the source produced it. Sharing a set would leave one of the
- * two with its whole population in three buckets.
+ * <p>The pipeline instruments use separate sets because their ranges differ by four orders of magnitude at
+ * the low end: a stage processes one item in microseconds to milliseconds and a batch in milliseconds to
+ * seconds, while a row's delivery is measured from the moment the source produced it. Sharing a set would
+ * leave one of them with its whole population in three buckets. Lifecycle wait and work use a third range.
  *
- * <p>Both sets step by a factor of two to two and a half so that a percentile read off them is off by at
- * most that factor, and both end where the quantity stops being a distribution and starts being an
- * incident: a row an hour late and a stage ten seconds on one item are each something a gauge or an alert
- * should be reporting, not a bucket.
+ * <p>Pipeline bucket steps keep a percentile estimate close enough to locate the bottleneck. Lifecycle
+ * bounds span milliseconds through five minutes so one blocked provision or teardown stays visible.
  */
 public enum HistogramBounds {
 
@@ -34,7 +32,15 @@ public enum HistogramBounds {
     /** How long one stage of the graph spent on one unit of its work. */
     PROCESS_DURATION("tapstate.pipeline.process.duration", List.of(
             0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
-            5.0, 10.0));
+            5.0, 10.0)),
+
+    /** Time from an accepted or previously refused lifecycle intent until its worker starts. */
+    LIFECYCLE_CAPACITY_WAIT("tapstate.process.lifecycle.capacity.wait.duration", List.of(
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0)),
+
+    /** Time from invocation through completion of one actual lifecycle operation. */
+    LIFECYCLE_WORK_DURATION("tapstate.process.lifecycle.work.duration", List.of(
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0));
 
     /** The one unit every histogram here is measured in; the bounds above are in it. */
     public static final String UNIT = "s";

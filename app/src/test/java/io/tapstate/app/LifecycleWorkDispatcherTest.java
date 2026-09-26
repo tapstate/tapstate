@@ -9,6 +9,10 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import io.tapstate.control.core.PipelineExplanation.PendingReason;
+import io.tapstate.core.lifecycle.MetricFact;
+import java.time.Instant;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -108,6 +112,81 @@ class LifecycleWorkDispatcherTest {
         } finally {
             releaseFirst.countDown();
         }
+    }
+
+    @Test
+    void processFactsCountActiveQueuedRefusedAndCancelledWorkWithoutPipelineLabels() throws Exception {
+        CountDownLatch firstEntered = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        try (LifecycleWorkDispatcher dispatcher = new LifecycleWorkDispatcher(1, 1)) {
+            dispatcher.offer("first", desired("first", PipelineState.RUNNING), () -> {
+                firstEntered.countDown();
+                awaitLatch(releaseFirst);
+                return done();
+            });
+            assertThat(firstEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            dispatcher.offer("second", desired("second", PipelineState.RUNNING),
+                    LifecycleWorkDispatcherTest::done);
+            assertThat(dispatcher.offer("third", desired("third", PipelineState.RUNNING),
+                    LifecycleWorkDispatcherTest::done)).isEqualTo(LifecycleWorkDispatcher.Submission.CAPACITY);
+            pending.put("third", PendingReason.START_CAPACITY);
+
+            LifecycleWorkDispatcher.Health full = dispatcher.health();
+            assertThat(full.activeSlots()).isEqualTo(1);
+            assertThat(full.pendingPipelines()).isEqualTo(2);
+            assertThat(full.queueDepth()).isEqualTo(1);
+            assertThat(pending.capacityCount()).isEqualTo(1);
+            List<MetricFact> facts = LifecycleProcessFacts.snapshot(
+                    full, pending.capacityCount(), dispatcher.startedAt(), Instant.now());
+            assertThat(value(facts, "tapstate.process.lifecycle.pipelines.pending")).isEqualTo(3);
+            assertThat(value(facts, "tapstate.process.lifecycle.capacity.refused")).isEqualTo(1);
+            assertThat(facts).flatExtracting(MetricFact::points)
+                    .allSatisfy(point -> assertThat(point.attributes()).isEmpty());
+
+            assertThat(dispatcher.offer("second", desired("second", PipelineState.RUNNING),
+                    LifecycleWorkDispatcherTest::done)).isEqualTo(LifecycleWorkDispatcher.Submission.COALESCED);
+            dispatcher.cancel("second");
+            assertThat(awaitResult(dispatcher, "second").superseded()).isTrue();
+            assertThat(dispatcher.offer("third", desired("third", PipelineState.RUNNING),
+                    LifecycleWorkDispatcherTest::done,
+                    pending.capacitySince("third", PipelineState.RUNNING)))
+                    .isEqualTo(LifecycleWorkDispatcher.Submission.ACCEPTED);
+            pending.put("third", PendingReason.START_PENDING);
+
+            releaseFirst.countDown();
+            assertThat(awaitResult(dispatcher, "first").result()).isEqualTo(done());
+            assertThat(awaitResult(dispatcher, "third").result()).isEqualTo(done());
+            LifecycleWorkDispatcher.Health settled = dispatcher.health();
+            assertThat(settled.activeSlots()).isZero();
+            assertThat(settled.pendingPipelines()).isZero();
+            assertThat(settled.queueHighWater()).isEqualTo(1);
+            assertThat(settled.coalesced()).isEqualTo(1);
+            assertThat(settled.cancelled()).isEqualTo(1);
+            assertThat(settled.capacityRefusals()).isEqualTo(1);
+            assertThat(settled.capacityWait().orElseThrow().count()).isEqualTo(2);
+        } finally {
+            releaseFirst.countDown();
+        }
+    }
+
+    @Test
+    void aRefusedPauseRetainsItsWaitWithoutInventingAPublicPendingReason() {
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        pending.rememberCapacity("flow", PipelineState.PAUSED);
+        long firstRefusal = pending.capacitySince("flow", PipelineState.PAUSED);
+        pending.rememberCapacity("flow", PipelineState.PAUSED);
+
+        assertThat(pending.capacitySince("flow", PipelineState.PAUSED)).isEqualTo(firstRefusal);
+        assertThat(pending.pending("flow")).isEmpty();
+        assertThat(pending.capacityCount()).isEqualTo(1);
+        pending.clear("flow");
+        assertThat(pending.capacityCount()).isZero();
+    }
+
+    private static long value(List<MetricFact> facts, String name) {
+        return facts.stream().filter(fact -> fact.name().equals(name)).findFirst().orElseThrow()
+                .points().get(0).value();
     }
 
     private static DesiredState desired(String pipelineId, PipelineState target) {
