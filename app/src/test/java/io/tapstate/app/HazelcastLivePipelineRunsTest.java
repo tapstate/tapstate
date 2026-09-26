@@ -15,6 +15,7 @@ import io.tapstate.control.core.LivePipelineProcessor;
 import io.tapstate.control.core.LivePipelineRun;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.FrontierMetricNames;
+import io.tapstate.runtime.engine.SinkWaitingMetricNames;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -60,6 +61,15 @@ class HazelcastLivePipelineRunsTest {
                         processorReading(FrontierMetricNames.gapNameOf("shop"), 40, "serve.s", "1", "member-b")),
                 FrontierMetricNames.stallNameOf("shop"), List.of(
                         processorReading(FrontierMetricNames.stallNameOf("shop"), 1200, "serve.s", "1", "member-b")),
+                SinkWaitingMetricNames.queuedNameOf("shop.orders"), List.of(
+                        processorReading(SinkWaitingMetricNames.queuedNameOf("shop.orders"), 30, "serve.s", "1",
+                                "member-b")),
+                SinkWaitingMetricNames.queuedNameOf("shop.customers"), List.of(
+                        processorReading(SinkWaitingMetricNames.queuedNameOf("shop.customers"), 0, "serve.s", "1",
+                                "member-b")),
+                SinkWaitingMetricNames.inFlightNameOf("orders"), List.of(
+                        processorReading(SinkWaitingMetricNames.inFlightNameOf("orders"), 512, "serve.s", "1",
+                                "member-b")),
                 MetricNames.EMITTED_COUNT, List.of(Measurement.of(MetricNames.EMITTED_COUNT, 77, 1_000L,
                         Map.of(MetricTags.VERTEX, "serve.s", MetricTags.MEMBER, "member-a")))));
 
@@ -69,7 +79,9 @@ class HazelcastLivePipelineRunsTest {
                 .containsExactlyInAnyOrder(
                         new LivePipelineProcessor(0, "member-a", true, 5L, Map.of(), Map.of()),
                         new LivePipelineProcessor(1, "member-b", true, 9L, Map.of("shop", 40L),
-                                Map.of("shop", 1200L))));
+                                Map.of("shop", 1200L),
+                                // A stream that had rows waiting and has none now reads zero, and is left out.
+                                Map.of("shop.orders", 30L), Map.of("orders", 512L))));
     }
 
     private static Measurement processorReading(String metric, long value, String vertex, String processor,

@@ -54,6 +54,7 @@ final class JetDeliveryGauge implements DeliveryGauge {
     private final Map<String, JobStatistic> carriedByTable = new HashMap<>();
     private final Map<String, JobStatistic> reachedByTable = new HashMap<>();
     private final Map<String, JobStatistic> durationParts = new HashMap<>();
+    private final Map<String, JobStatistic> waitingByName = new HashMap<>();
     private JobStatistic since;
 
     @Override
@@ -61,6 +62,21 @@ final class JetDeliveryGauge implements DeliveryGauge {
         rowsByTableAndOp.forEach((table, byOp) -> byOp.forEach((op, rows) ->
                 deliveredByKey.computeIfAbsent(op + "." + table, JetDeliveryGauge::deliveredMetricFor)
                         .set(rows)));
+    }
+
+    @Override
+    public void waiting(Map<String, Long> queuedByStream, Map<String, Long> inFlightByTable) {
+        Map<String, Long> now = new HashMap<>();
+        queuedByStream.forEach((stream, rows) -> now.put(SinkWaitingMetricNames.queuedNameOf(stream), rows));
+        inFlightByTable.forEach((table, rows) -> now.put(SinkWaitingMetricNames.inFlightNameOf(table), rows));
+        // A stream or table with nothing waiting any more reads zero, not the last number it had: the statistics
+        // keep whatever was set under a name until something else is.
+        waitingByName.forEach((name, statistic) -> {
+            if (!now.containsKey(name)) {
+                statistic.set(0);
+            }
+        });
+        now.forEach((name, rows) -> waitingByName.computeIfAbsent(name, JobStatistic::new).set(rows));
     }
 
     @Override

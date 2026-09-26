@@ -26,14 +26,29 @@ import java.util.TreeMap;
  *                              reached, by chain; empty for any processor but a sink's writer
  * @param frontierStalledMillis how long each pinned chain's durable position has been where it is, by chain;
  *                              empty where none is pinned
+ * @param queuedByStream        the rows a sink's writer has taken in and not yet written, by the stream they
+ *                              came on; empty where none are waiting
+ * @param inFlightByTable       the rows a sink's writer is writing and has not had settled, by the table they
+ *                              go to; empty where none are in flight
  */
 public record ClusterProcessorView(int index, int localIndex, String memberUuid, String nodeId, Long backlog,
-        Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis) {
+        Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis, Map<String, Long> queuedByStream,
+        Map<String, Long> inFlightByTable) {
 
     public ClusterProcessorView {
-        frontierGaps = Collections.unmodifiableMap(
-                new TreeMap<>(Objects.requireNonNull(frontierGaps, "frontierGaps")));
-        frontierStalledMillis = Collections.unmodifiableMap(
-                new TreeMap<>(Objects.requireNonNull(frontierStalledMillis, "frontierStalledMillis")));
+        frontierGaps = sorted(frontierGaps, "frontierGaps");
+        frontierStalledMillis = sorted(frontierStalledMillis, "frontierStalledMillis");
+        queuedByStream = sorted(queuedByStream, "queuedByStream");
+        inFlightByTable = sorted(inFlightByTable, "inFlightByTable");
+    }
+
+    /** A processor with nothing read about what is waiting in it by stream or table. */
+    public ClusterProcessorView(int index, int localIndex, String memberUuid, String nodeId, Long backlog,
+            Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis) {
+        this(index, localIndex, memberUuid, nodeId, backlog, frontierGaps, frontierStalledMillis, Map.of(), Map.of());
+    }
+
+    private static Map<String, Long> sorted(Map<String, Long> readings, String name) {
+        return Collections.unmodifiableMap(new TreeMap<>(Objects.requireNonNull(readings, name)));
     }
 }

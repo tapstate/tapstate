@@ -65,6 +65,38 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         assertThat(delivery.latestBytes()).isEqualTo(Map.of("orders", 20L));
     }
 
+    /**
+     * What is waiting in a writer is reported beside what settled: the rows taken in and not yet handed to the
+     * writer, by the stream they came on, and the rows handed to it whose writes have not settled, by the table
+     * they go to. Each reading replaces the last, and what has settled is no longer in either.
+     */
+    @Test
+    void what_is_waiting_is_reported_by_stream_and_by_table_until_it_settles() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        SinkProcessor processor = init(writer, delivery);
+
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(row("orders", 1L), row("orders", 2L), row("customers", 3L)));
+        processor.process(0, inbox);
+
+        // One write at a time: the orders went to the writer, and the customer waits its turn.
+        assertThat(delivery.latestQueued()).isEqualTo(Map.of("customers", 1L));
+        assertThat(delivery.latestInFlight()).isEqualTo(Map.of("orders", 2L));
+
+        writer.completeAll();
+        processor.tryProcess();
+
+        assertThat(delivery.latestQueued()).isEmpty();
+        assertThat(delivery.latestInFlight()).isEqualTo(Map.of("customers", 1L));
+
+        writer.completeAll();
+        drain(processor);
+
+        assertThat(delivery.latestQueued()).isEmpty();
+        assertThat(delivery.latestInFlight()).isEmpty();
+    }
+
     @Test
     void counts_nothing_for_a_write_that_failed() throws Exception {
         RecordingDelivery delivery = new RecordingDelivery();
@@ -380,6 +412,22 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         private final List<Map<String, Long>> eventTimes = new ArrayList<>();
         private final List<Map<String, HistogramValue>> durations = new ArrayList<>();
         private final List<Long> starts = new ArrayList<>();
+        private final List<Map<String, Long>> queued = new ArrayList<>();
+        private final List<Map<String, Long>> inFlight = new ArrayList<>();
+
+        @Override
+        public void waiting(Map<String, Long> queuedByStream, Map<String, Long> inFlightByTable) {
+            queued.add(Map.copyOf(queuedByStream));
+            inFlight.add(Map.copyOf(inFlightByTable));
+        }
+
+        Map<String, Long> latestQueued() {
+            return queued.get(queued.size() - 1);
+        }
+
+        Map<String, Long> latestInFlight() {
+            return inFlight.get(inFlight.size() - 1);
+        }
 
         @Override
         public void delivered(Map<String, Map<String, Long>> rowsByTableAndOp) {

@@ -89,6 +89,16 @@ interface DeliveryGauge {
     }
 
     /**
+     * Takes the reading of what is waiting in the sink rather than settled: the rows taken in and not yet handed
+     * to the writer, by the stream they came on, and the rows handed to it whose writes have not settled, by the
+     * table they go to. Not cumulative: each reading replaces the last, and a stream or table with nothing
+     * waiting is absent from it. Read per writer, beside the queues into it, these say which table a writer that
+     * has fallen behind is behind on.
+     */
+    default void waiting(Map<String, Long> queuedByStream, Map<String, Long> inFlightByTable) {
+    }
+
+    /**
      * A gauge nothing reads, for a sink driven outside a running job. Never a way to opt a real sink out:
      * a delivery no one counts is the state this seam exists to end.
      */

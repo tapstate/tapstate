@@ -276,7 +276,9 @@ public final class ClusterPipelineTopologyService {
                         nodeIdByMemberUuid.get(processor.memberUuid()),
                         processor.backlog(),
                         processor.frontierGaps(),
-                        processor.frontierStalledMillis()));
+                        processor.frontierStalledMillis(),
+                        processor.queuedByStream(),
+                        processor.inFlightByTable()));
             }
             // What the plan says of the vertex's node, where the vertex runs at its node's width: a vertex the plan
             // does not name - one gathering several producers into one, or any vertex of a run with no plan

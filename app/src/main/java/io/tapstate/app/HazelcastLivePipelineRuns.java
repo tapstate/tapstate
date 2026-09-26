@@ -15,6 +15,7 @@ import io.tapstate.control.core.LivePipelineRuns;
 import io.tapstate.control.core.LivePipelineVertex;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.FrontierMetricNames;
+import io.tapstate.runtime.engine.SinkWaitingMetricNames;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -224,6 +225,8 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
         private Long backlog;
         private final Map<String, Long> frontierGaps = new TreeMap<>();
         private final Map<String, Long> frontierStalledMillis = new TreeMap<>();
+        private final Map<String, Long> queuedByStream = new TreeMap<>();
+        private final Map<String, Long> inFlightByTable = new TreeMap<>();
 
         Reading(int index, String memberUuid, boolean working) {
             this.index = index;
@@ -243,12 +246,21 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
             if (stalledChain != null) {
                 frontierStalledMillis.put(stalledChain, value);
             }
+            // Zero is a stream or table that had rows waiting and has none now; nothing waiting is absent.
+            String queuedStream = SinkWaitingMetricNames.streamOfQueued(metric);
+            if (queuedStream != null && value > 0) {
+                queuedByStream.put(queuedStream, value);
+            }
+            String inFlightTable = SinkWaitingMetricNames.tableOfInFlight(metric);
+            if (inFlightTable != null && value > 0) {
+                inFlightByTable.put(inFlightTable, value);
+            }
             return this;
         }
 
         LivePipelineProcessor processor() {
             return new LivePipelineProcessor(index, memberUuid, working, backlog, frontierGaps,
-                    frontierStalledMillis);
+                    frontierStalledMillis, queuedByStream, inFlightByTable);
         }
     }
 }

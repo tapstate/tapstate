@@ -12,17 +12,28 @@ import java.util.Map;
  * @param backlog               the rows queued into it at the last reading, or null when nothing was read
  * @param frontierGaps          how far each chain this writer writes trails its bound, by chain
  * @param frontierStalledMillis how long each pinned chain's durable position has stood, by chain
+ * @param queuedByStream        the rows a writer has taken in and not yet written, by stream
+ * @param inFlightByTable       the rows a writer is writing and has not had settled, by table
  */
 record RemoteProcessor(Integer index, Integer localIndex, String memberUuid, String nodeId, Long backlog,
-        Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis) {
+        Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis, Map<String, Long> queuedByStream,
+        Map<String, Long> inFlightByTable) {
 
     RemoteProcessor {
         frontierGaps = frontierGaps == null ? Map.of() : Map.copyOf(frontierGaps);
         frontierStalledMillis = frontierStalledMillis == null ? Map.of() : Map.copyOf(frontierStalledMillis);
+        queuedByStream = queuedByStream == null ? Map.of() : Map.copyOf(queuedByStream);
+        inFlightByTable = inFlightByTable == null ? Map.of() : Map.copyOf(inFlightByTable);
+    }
+
+    /** A processor the server said nothing about by stream or table. */
+    RemoteProcessor(Integer index, Integer localIndex, String memberUuid, String nodeId, Long backlog,
+            Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis) {
+        this(index, localIndex, memberUuid, nodeId, backlog, frontierGaps, frontierStalledMillis, Map.of(), Map.of());
     }
 
     /** A processor the server said nothing about but where it runs. */
     RemoteProcessor(Integer index, String memberUuid, String nodeId) {
-        this(index, null, memberUuid, nodeId, null, Map.of(), Map.of());
+        this(index, null, memberUuid, nodeId, null, Map.of(), Map.of(), Map.of(), Map.of());
     }
 }

@@ -3031,6 +3031,12 @@ final class Repl {
                 if (!processor.frontierStalledMillis().isEmpty()) {
                     one.put("frontierStalledMillis", new java.util.TreeMap<>(processor.frontierStalledMillis()));
                 }
+                if (!processor.queuedByStream().isEmpty()) {
+                    one.put("queuedByStream", new java.util.TreeMap<>(processor.queuedByStream()));
+                }
+                if (!processor.inFlightByTable().isEmpty()) {
+                    one.put("inFlightByTable", new java.util.TreeMap<>(processor.inFlightByTable()));
+                }
                 processors.add(one);
             }
             entry.put("processors", processors);

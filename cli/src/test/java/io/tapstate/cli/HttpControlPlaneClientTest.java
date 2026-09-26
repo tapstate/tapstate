@@ -78,7 +78,8 @@ class HttpControlPlaneClientTest {
                      "processors":[{"index":0,"memberUuid":"uuid-a","nodeId":"node-a"},
                                    {"index":1,"localIndex":0,"memberUuid":"uuid-b","nodeId":"node-b",
                                     "backlog":12,"frontierGaps":{"shop":40},
-                                    "frontierStalledMillis":{"shop":1200}}]}]}]}
+                                    "frontierStalledMillis":{"shop":1200},
+                                    "queuedByStream":{"shop.orders":30},"inFlightByTable":{"orders":512}}]}]}]}
                 """);
         try {
             ClusterMembersOutcome outcome =
@@ -116,7 +117,7 @@ class HttpControlPlaneClientTest {
                     .containsExactly(
                             new RemoteProcessor(0, "uuid-a", "node-a"),
                             new RemoteProcessor(1, 0, "uuid-b", "node-b", 12L, Map.of("shop", 40L),
-                                    Map.of("shop", 1200L)));
+                                    Map.of("shop", 1200L), Map.of("shop.orders", 30L), Map.of("orders", 512L)));
         } finally {
             server.stop(0);
         }

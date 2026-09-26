@@ -431,6 +431,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         do {
             takeIn(inbox);
         } while (writeWhatIsDue() && !inbox.isEmpty());
+        reportWaiting();
     }
 
     /**
@@ -536,6 +537,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         do {
             reapSettled();
         } while (writeWhatIsDue());
+        reportWaiting();
         return inFlight.isEmpty() && queued.isEmpty();
     }
 
@@ -553,7 +555,23 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         reapSettled();
         // And hands over what has waited as long as a batch waits: nothing else would, while the inbox is idle.
         writeWhatIsDue();
+        reportWaiting();
         return true;
+    }
+
+    /**
+     * Reports what is waiting here: the rows taken in and not yet handed to the writer, by stream, and the rows
+     * handed to it whose writes have not settled, by table.
+     */
+    private void reportWaiting() {
+        Map<String, Long> queuedByStream = new LinkedHashMap<>();
+        queued.forEach((stream, rows) -> queuedByStream.put(stream, (long) rows.size()));
+        Map<String, Long> inFlightByTable = new LinkedHashMap<>();
+        for (InFlightBatch batch : inFlight) {
+            batch.delivered().rows().forEach((table, byOp) -> inFlightByTable.merge(
+                    table, byOp.values().stream().mapToLong(Long::longValue).sum(), Long::sum));
+        }
+        delivery.waiting(queuedByStream, inFlightByTable);
     }
 
     /**

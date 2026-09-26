@@ -898,7 +898,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                             stringOrNull(p.get("nodeId")),
                             p.get("backlog") instanceof Number n ? n.longValue() : null,
                             longsByName(p.get("frontierGaps")),
-                            longsByName(p.get("frontierStalledMillis"))));
+                            longsByName(p.get("frontierStalledMillis")),
+                            longsByName(p.get("queuedByStream")),
+                            longsByName(p.get("inFlightByTable"))));
                 }
             }
         }

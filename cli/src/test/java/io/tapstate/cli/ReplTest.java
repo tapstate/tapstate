@@ -5595,7 +5595,8 @@ class ReplTest {
                         List.of(new RemoteVertex("serve-orders", 4, 2, 2, "exec-1", List.of(
                                 new RemoteProcessor(0, 0, "uuid-a", "node-a", 3L, Map.of(), Map.of()),
                                 new RemoteProcessor(1, 1, "uuid-a", "node-a", 4L, Map.of("shop", 40L),
-                                        Map.of("shop", 1200L))))))));
+                                        Map.of("shop", 1200L), Map.of("shop.orders", 30L),
+                                        Map.of("orders", 512L))))))));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
@@ -5608,7 +5609,9 @@ class ReplTest {
         assertThat(out).as("and per processor, on the machine surface, which of them is behind and on what")
                 .contains("\"localIndex\": 1").contains("\"backlog\": 4")
                 .contains("\"frontierGaps\": {").contains("\"shop\": 40")
-                .contains("\"frontierStalledMillis\": {").contains("\"shop\": 1200");
+                .contains("\"frontierStalledMillis\": {").contains("\"shop\": 1200")
+                .contains("\"queuedByStream\": {").contains("\"shop.orders\": 30")
+                .contains("\"inFlightByTable\": {").contains("\"orders\": 512");
     }
 
     @Test

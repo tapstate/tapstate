@@ -109,7 +109,8 @@ class ClusterPipelineTopologyServiceTest {
         // member's processors of a vertex in one run, so a processor's place on its member is its rank there.
         ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
                 runs(new LivePipelineVertex("serve.s", List.of(
-                        new LivePipelineProcessor(4, UUID_B, true, 7L, Map.of("shop", 12L), Map.of("shop", 900L)),
+                        new LivePipelineProcessor(4, UUID_B, true, 7L, Map.of("shop", 12L), Map.of("shop", 900L),
+                                Map.of("shop.orders", 30L), Map.of("orders", 512L)),
                         new LivePipelineProcessor(0, UUID_A, true, 0L, Map.of(), Map.of()),
                         new LivePipelineProcessor(3, UUID_B, true),
                         new LivePipelineProcessor(2, UUID_A, true),
@@ -127,6 +128,8 @@ class ClusterPipelineTopologyServiceTest {
                         tuple(3, 0, "node-b", null), tuple(4, 1, "node-b", 7L), tuple(5, 2, "node-b", null));
         assertThat(vertex.processors().get(4).frontierGaps()).containsExactly(Map.entry("shop", 12L));
         assertThat(vertex.processors().get(4).frontierStalledMillis()).containsExactly(Map.entry("shop", 900L));
+        assertThat(vertex.processors().get(4).queuedByStream()).containsExactly(Map.entry("shop.orders", 30L));
+        assertThat(vertex.processors().get(4).inFlightByTable()).containsExactly(Map.entry("orders", 512L));
     }
 
     @Test
