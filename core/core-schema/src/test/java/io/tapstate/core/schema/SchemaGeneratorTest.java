@@ -111,6 +111,18 @@ class SchemaGeneratorTest {
     }
 
     @Test
+    void aNodesExecutionTakesATargetForTheClusterAndNothingPerMember() {
+        // An author writes the target for the whole cluster and nothing else: how many run on each member is
+        // worked out when a run is planned, so a per-member count is a field the schema does not have, and the
+        // target is a whole number - "auto" and other words are not targets.
+        Json.Obj execution = (Json.Obj) ((Json.Obj) generator.generateTree().get("$defs")).get("ExecutionSpec");
+        assertThat(execution.get("additionalProperties")).isEqualTo(new Json.Bool(false));
+        Json.Obj properties = (Json.Obj) execution.get("properties");
+        assertThat(properties.entries()).extracting(Json.Entry::key).containsExactly("parallelism", "batch");
+        assertThat(((Json.Obj) properties.get("parallelism")).get("type")).isEqualTo(new Json.Str("integer"));
+    }
+
+    @Test
     void enumsCarryTypeAndPerValueDescriptions() {
         Json.Obj defs = (Json.Obj) generator.generateTree().get("$defs");
         Json.Obj mode = (Json.Obj) defs.get("SourceMode");
