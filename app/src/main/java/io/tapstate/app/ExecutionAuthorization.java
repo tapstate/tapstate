@@ -198,7 +198,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                     && claim.executionGeneration() == fence.executionGeneration()) {
                 claims.recordExecutionFailure(claim, false);
             }
-        } catch (TapstateException unreachable) {
+        } catch (RuntimeException unreachable) {
             // A coordination-store error must not replace the sink's own failure.
             LOG.debug("Could not record the sink failure for {}", fence.pipelineId(), unreachable);
         }

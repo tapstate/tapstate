@@ -126,6 +126,56 @@ class ExecutionAuthorizationTest {
     }
 
     @Test
+    void aSynchronousSinkFailureMarksItsRunBeforeTheWriteThrows() {
+        ExecutionFence fence = submittedRun();
+        TapstateException failure = new TapstateException(ConnectorError.WRITE_FAILED,
+                Map.of("connector", "e2e_file", "detail", "sink refused the write"), null);
+        SinkWriter sink = new SinkWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                throw failure;
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+
+        assertThatThrownBy(() -> FencedSinkWriterFactory.guarded(sink, fence, guard(claims)).write(List.of()))
+                .isSameAs(failure);
+        WorkloadClaim marked = claims.read(new WorkloadClaimKey(
+                "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow().claim();
+        assertThat(marked.failureClaimGeneration()).isEqualTo(fence.claimGeneration());
+        assertThat(marked.failureAfterMemberLoss()).isFalse();
+    }
+
+    @Test
+    void anUnreachableClaimStoreDoesNotReplaceASynchronousSinkFailure() {
+        ExecutionFence fence = submittedRun();
+        TapstateException failure = new TapstateException(ConnectorError.WRITE_FAILED,
+                Map.of("connector", "e2e_file", "detail", "sink refused the write"), null);
+        SinkWriter sink = new SinkWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                throw failure;
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        WorkloadClaimStore unreachableOnFailure = new UnreachableAfterFirstRead(claims);
+
+        assertThatThrownBy(() -> FencedSinkWriterFactory.guarded(sink, fence,
+                guard(unreachableOnFailure)).write(List.of()))
+                .as("the claim store cannot replace the connector's coded failure")
+                .isSameAs(failure);
+        WorkloadClaim unmarked = claims.read(new WorkloadClaimKey(
+                "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow().claim();
+        assertThat(unmarked.failureClaimGeneration()).isZero();
+    }
+
+    @Test
     void aLateSinkFailureCannotMarkTheExecutionThatReplacedIt() {
         ExecutionFence first = submittedRun();
         CompletableFuture<WriteResult> write = new CompletableFuture<>();
