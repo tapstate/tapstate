@@ -350,6 +350,40 @@ class EngineLifecycleActuatorTest {
         assertThat(actuator.isCarryingAJob(PIPE)).isTrue();
     }
 
+    @Test
+    void aClaimLostAfterCaptureAdmissionClosesCaptureAndSubmitsNoJob() {
+        ClusterProperties properties = new ClusterProperties();
+        properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+        ClusterMembershipGate gate = new ClusterMembershipGate(properties);
+        gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
+        gate.canCommit(Set.of("node-a", "node-b"));
+        InMemoryWorkloadClaimStore raw = new InMemoryWorkloadClaimStore();
+        PipelineActuationOwnership ownership = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate,
+                new ClusterWorkloadClaims(raw, gate), Duration.ofSeconds(30),
+                Duration.ofSeconds(10), () -> 0L);
+        assertThat(ownership.permit(PIPE).granted()).isTrue();
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, PIPE);
+        WorkloadClaim held = raw.read(key).orElseThrow().claim();
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        coordinator.afterStart = () -> assertThat(raw.release(held)).isTrue();
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
+                new Engine(member), new RecordingDagSource(events), coordinator, teardown(), ownership);
+        InMemoryDesiredStore desired = new InMemoryDesiredStore();
+        InMemoryStateStore state = new InMemoryStateStore();
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+
+        new PipelineConverger(desired, state, actuator, Clock.systemUTC()).converge(PIPE);
+
+        assertThat(StateJson.parse(state.read(PIPE).orElseThrow().stateJson())).isEqualTo(PipelineState.NEW);
+        assertThat(events).containsExactly("startCapture:" + PIPE,
+                "stopCapture:" + PIPE + "[keep][jobLive]");
+        assertThat(coordinator.activeCapture).isFalse();
+        assertThat(member.getJet().getJob(PIPE)).isNull();
+        assertThat(raw.executionGeneration(key)).isZero();
+    }
+
     private void assertDeferredStartKeepsActualNew(RecordingCaptureCoordinator coordinator) {
         InMemoryDesiredStore desired = new InMemoryDesiredStore();
         desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
@@ -686,6 +720,7 @@ class EngineLifecycleActuatorTest {
         private boolean jobWasAbsentAtStart;
         private boolean givesTheStartBack;
         private boolean snapshotCapacityUnavailable;
+        private Runnable afterStart = () -> { };
         private boolean interruptAfterStart;
         private boolean activeCapture;
         private final List<String> captureTokens = new CopyOnWriteArrayList<>();
@@ -706,6 +741,7 @@ class EngineLifecycleActuatorTest {
                 throw new SnapshotCapacityUnavailable();
             }
             activeCapture = true;
+            afterStart.run();
             if (interruptAfterStart) {
                 Thread.currentThread().interrupt();
             }
