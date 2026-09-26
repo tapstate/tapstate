@@ -364,7 +364,7 @@ class ControlPlaneConfiguration {
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
                 storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), storePort.rateHistory(),
                 auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE), telemetryCleanupExecutor,
-                logSink);
+                logSink, storePort.events());
     }
 
     @Bean(destroyMethod = "shutdownNow")

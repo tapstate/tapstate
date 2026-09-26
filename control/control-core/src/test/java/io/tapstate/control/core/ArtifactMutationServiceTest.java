@@ -33,6 +33,7 @@ import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineEventStore;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaVersion;
@@ -472,6 +473,36 @@ class ArtifactMutationServiceTest {
         assertThat(logs.tail("flow", newRun)).extracting(LogLine::message).containsExactly("new");
         assertThat(logs.tailIncarnation("flow", "inc-old")).isEmpty();
     }
+
+    @Test
+    void delayedEventCleanupKeepsTheRecreatedIncarnation() {
+        List<Runnable> pending = new ArrayList<>();
+        List<String> removed = new ArrayList<>();
+        PipelineEventStore events = new PipelineEventStore() {
+            @Override public void append(io.tapstate.core.lifecycle.PipelineEvent event) { }
+            @Override public Page readPage(String id, String incarnation, Instant from, Instant to,
+                    Key after, int limit) { return new Page(List.of(), false); }
+            @Override public void deleteIncarnation(String id, String incarnation) {
+                removed.add(incarnation);
+            }
+            @Override public java.time.Duration retention() { return java.time.Duration.ofDays(15); }
+        };
+        ArtifactMutationService delayed = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add, pending::add, null, events);
+        PipelineResource first = pipeline("flow");
+        store.save(first);
+        store.assignIncarnation("flow", "inc-old");
+
+        delayed.delete(PRINCIPAL, "flow", hash(first));
+        store.save(pipeline("flow"));
+        store.assignIncarnation("flow", "inc-new");
+        pending.forEach(Runnable::run);
+
+        assertThat(removed).containsExactly("inc-old");
+        assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
+    }
+
 
     @Test
     void aDerivedSchemaThatCannotBeReclaimedIsReportedAsResidueLikeEveryOtherStep() {
