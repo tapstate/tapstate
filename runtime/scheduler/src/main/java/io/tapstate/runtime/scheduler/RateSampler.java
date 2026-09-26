@@ -17,14 +17,14 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Keeps a history of a pipeline's movement by taking a sample off the observation it just published,
- * once per interval. The observation is published every convergence pass; a history at that cadence is
+ * Keeps a history of a pipeline's movement by taking a sample off one measured observation frame,
+ * once per interval. A frame is measured every convergence pass; a history at that cadence is
  * over a million documents per pipeline for the retention, and a line drawn over fifteen days needs
  * nothing like it. So the sampler is offered every observation and keeps one per interval.
  *
  * <p><strong>A sample is the observation's own numbers at the observation's own time.</strong> Nothing is
- * re-measured and nothing is re-timed: the same pass produced the latest state and the sample, so the
- * two can never describe different moments of the run. What is kept is the subset a line is drawn from —
+ * re-measured and nothing is re-timed: the latest store and history sink receive the same frame even if
+ * either sink is slow or unavailable. What is kept is the subset a line is drawn from —
  * the pipeline-level counters and the per-table delay — and what the counters accumulate from, read off
  * the facts beside the flat map.
  *

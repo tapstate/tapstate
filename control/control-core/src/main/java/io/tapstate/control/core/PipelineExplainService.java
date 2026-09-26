@@ -25,6 +25,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
+import java.util.Optional;
+import java.util.function.Function;
 
 /** The fixed five-rule explain projection over one current observation. */
 public final class PipelineExplainService {
@@ -37,12 +39,22 @@ public final class PipelineExplainService {
     private static final String STALLED_PREFIX = "frontierStalledMillis.";
 
     private final ArtifactQueryService artifacts;
-    private final ObservationStore observations;
+    private final Function<String, Optional<Observation>> observations;
     private final Clock clock;
     private final ExplanationMessages messages;
 
     public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
             Clock clock, ExplanationMessages messages) {
+        this(artifacts, observations::read, clock, messages);
+    }
+
+    public PipelineExplainService(ArtifactQueryService artifacts, CurrentObservationReader observations,
+            Clock clock, ExplanationMessages messages) {
+        this(artifacts, observations::read, clock, messages);
+    }
+
+    private PipelineExplainService(ArtifactQueryService artifacts,
+            Function<String, Optional<Observation>> observations, Clock clock, ExplanationMessages messages) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -52,7 +64,7 @@ public final class PipelineExplainService {
     /** Reads one observation once and applies the fixed first-match checklist without writing it back. */
     public PipelineExplanation explain(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        Observation observation = observations.read(pipelineId).orElseThrow(() -> unobserved(pipelineId));
+        Observation observation = observations.apply(pipelineId).orElseThrow(() -> unobserved(pipelineId));
         Time time = time(observation.observedAt());
         Facts facts = facts(observation);
 

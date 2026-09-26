@@ -8,6 +8,7 @@ import io.tapstate.spi.store.ObservationStore;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * The pipeline observation read side: the three store-backed read faces — status / metrics / snapshot —
@@ -30,9 +31,18 @@ public final class PipelineObservationQueryService {
     private static final String PIPELINE_KIND = "pipeline";
 
     private final ArtifactQueryService artifacts;
-    private final ObservationStore observations;
+    private final Function<String, Optional<Observation>> observations;
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations) {
+        this(artifacts, observations::read);
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, CurrentObservationReader observations) {
+        this(artifacts, observations::read);
+    }
+
+    private PipelineObservationQueryService(ArtifactQueryService artifacts,
+            Function<String, Optional<Observation>> observations) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
     }
@@ -47,7 +57,7 @@ public final class PipelineObservationQueryService {
     /** Returns the latest status when an observation exists, without turning an unobserved pipeline into an error. */
     public Optional<PipelineStatus> findStatus(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        return observations.read(pipelineId)
+        return observations.apply(pipelineId)
                 .map(observation -> new PipelineStatus(observation.pipelineId(), observation.state(),
                         observation.failure(), observation.observedAt()));
     }
@@ -72,7 +82,7 @@ public final class PipelineObservationQueryService {
 
     private Observation require(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        return observations.read(pipelineId).orElseThrow(() -> unobserved(pipelineId));
+        return observations.apply(pipelineId).orElseThrow(() -> unobserved(pipelineId));
     }
 
     /**

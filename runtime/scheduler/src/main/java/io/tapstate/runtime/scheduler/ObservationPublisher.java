@@ -2,6 +2,7 @@ package io.tapstate.runtime.scheduler;
 
 import io.tapstate.core.event.Op;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.CardinalityBudget;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FlatReduction;
@@ -310,7 +311,11 @@ public final class ObservationPublisher {
     private static FlatReduction keyed(String prefix, String dimension) {
         return attributes -> {
             String value = attributes.get(dimension);
-            return value == null ? null : prefix + value;
+            if (value == null) {
+                return "true".equals(attributes.get(MetricAttributes.OVERFLOW)) ? prefix + "~other" : null;
+            }
+            // A literal dimension beginning with '~' is escaped so the overflow key stays distinct.
+            return prefix + (value.startsWith("~") ? "~" + value : value);
         };
     }
 
@@ -364,6 +369,10 @@ public final class ObservationPublisher {
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
     private final Clock clock;
+    private final CardinalityBudget.Folder cardinality = CardinalityBudget.folder();
+    private final Map<String, ObservationFailure> currentFailures = new ConcurrentHashMap<>();
+    private final Map<String, ObservationStore.Scope> currentScopes = new ConcurrentHashMap<>();
+    private final Map<String, Instant> failureCountingSinceByPipeline = new ConcurrentHashMap<>();
 
     /**
      * How many failures each pipeline has had, by code, since this publisher opened its account.
@@ -682,13 +691,53 @@ public final class ObservationPublisher {
      * the reason its previous run died of the moment it leaves FAILED.
      */
     public Optional<Observation> publish(String pipelineId, ObservationFailure failure) {
+        return prepare(pipelineId, failure).flatMap(prepared -> commit(prepared, null));
+    }
+
+    /** Publishes only under the execution identity acquired before this member started the run. */
+    public Optional<Observation> publishScoped(String pipelineId, ObservationFailure failure,
+            ObservationStore.Scope scope) {
+        Objects.requireNonNull(scope, "scope");
+        return prepareScoped(pipelineId, failure, scope).flatMap(prepared -> commit(prepared, scope));
+    }
+
+    /** Takes one frame and resets local run accounts when an execution identity changes. */
+    public Optional<Prepared> prepareScoped(String pipelineId, ObservationFailure failure,
+            ObservationStore.Scope scope) {
+        Objects.requireNonNull(scope, "scope");
+        ObservationStore.Scope previous = currentScopes.put(pipelineId, scope);
+        if (!scope.equals(previous)) {
+            currentFailures.remove(pipelineId);
+            failuresByPipelineAndCode.remove(pipelineId);
+            cardinality.forgetPipeline(pipelineId);
+            failureCountingSinceByPipeline.put(pipelineId, observedNow());
+        }
+        return prepare(pipelineId, failure);
+    }
+
+    /** A single immutable measurement and its local alert inputs, before any telemetry store call. */
+    public record Prepared(Observation observation, boolean inheritStoredFailure,
+            Map<String, NestStateReading> nestReadings, Map<String, Long> pinned, Map<String, Long> gaps) {
+        public Prepared {
+            Objects.requireNonNull(observation, "observation");
+            nestReadings = Map.copyOf(nestReadings);
+            pinned = Map.copyOf(pinned);
+            gaps = Map.copyOf(gaps);
+        }
+    }
+
+    /** Takes the pipeline's current measurements without reading or writing any observation store. */
+    public Optional<Prepared> prepare(String pipelineId, ObservationFailure failure) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         return state.read(pipelineId).map(checkpoint -> {
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
-            ObservationFailure carried = failure;
-            if (carried == null && actual == PipelineState.FAILED) {
-                carried = observations.read(pipelineId).map(Observation::failure).orElse(null);
+            if (failure != null) {
+                currentFailures.put(pipelineId, failure);
+            } else if (actual != PipelineState.FAILED) {
+                currentFailures.remove(pipelineId);
             }
+            ObservationFailure carried = failure == null ? currentFailures.get(pipelineId) : failure;
+            boolean inheritStoredFailure = carried == null && actual == PipelineState.FAILED;
             // Counted on the pass that witnesses it, which is the only pass handed a cause. A later pass
             // over a pipeline still FAILED is handed null and adds nothing, so one death is one count.
             if (failure != null) {
@@ -720,20 +769,55 @@ public final class ObservationPublisher {
             SnapshotReading loaded = snapshots.apply(pipelineId);
             List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
                     nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                    joinRecomputeExpected.apply(pipelineId), loaded);
+                    joinRecomputeExpected.apply(pipelineId), loaded).stream().map(cardinality::fold).toList();
             Observation published = new Observation(pipelineId, actual,
                     FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                     loaded.byTable(), positions.apply(pipelineId), carried, at, measured);
-            observations.save(published);
+            return new Prepared(published, inheritStoredFailure, readings, pinned, gaps);
+        });
+    }
+
+    /** Persists one previously measured frame; a stale scoped write produces no published frame. */
+    public Optional<Observation> commit(Prepared prepared, ObservationStore.Scope scope) {
+        Objects.requireNonNull(prepared, "prepared");
+        Observation published = prepared.observation();
+        if (prepared.inheritStoredFailure()) {
+            ObservationFailure carried = previous(published.pipelineId(), scope)
+                    .map(Observation::failure).orElse(null);
+            if (carried != null) {
+                published = new Observation(published.pipelineId(), published.state(), published.metrics(),
+                        published.snapshot(), published.positions(), carried, published.observedAt(),
+                        published.facts());
+            }
+        }
+        if (!save(published, scope)) {
+            return Optional.empty();
+        }
             // Fed after the observation is written and never before. The observation is the contract and
             // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
             // cost a pipeline the read face that says it is alive at all.
-            coldLayer.saw(pipelineId, readings);
-            frontierStall.saw(pipelineId, pinned, gaps);
+            coldLayer.saw(published.pipelineId(), prepared.nestReadings());
+            frontierStall.saw(published.pipelineId(), prepared.pinned(), prepared.gaps());
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.
-            return published;
-        });
+            return Optional.of(published);
+    }
+
+    private Optional<Observation> previous(String pipelineId, ObservationStore.Scope scope) {
+        if (scope == null) {
+            return observations.read(pipelineId);
+        }
+        return observations.readStored(pipelineId)
+                .filter(stored -> stored.scope().filter(scope::equals).isPresent())
+                .map(ObservationStore.Stored::observation);
+    }
+
+    private boolean save(Observation observation, ObservationStore.Scope scope) {
+        if (scope != null) {
+            return observations.saveScoped(observation, scope);
+        }
+        observations.save(observation);
+        return true;
     }
 
     /**
@@ -746,17 +830,28 @@ public final class ObservationPublisher {
      * read it from, unlike positions and failure which are simply carried forward from the last observation.
      */
     public void publishReconcileFailure(String pipelineId, long consecutiveFailures) {
+        publishReconcileFailureInternal(pipelineId, consecutiveFailures, null);
+    }
+
+    /** Keeps an error projection from a failed pass within the same execution identity. */
+    public void publishReconcileFailureScoped(String pipelineId, long consecutiveFailures,
+            ObservationStore.Scope scope) {
+        publishReconcileFailureInternal(pipelineId, consecutiveFailures, Objects.requireNonNull(scope, "scope"));
+    }
+
+    private void publishReconcileFailureInternal(String pipelineId, long consecutiveFailures,
+            ObservationStore.Scope scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        Observation previous = observations.read(pipelineId).orElse(null);
+        Observation previous = previous(pipelineId, scope).orElse(null);
         PipelineState lastState = previous != null ? previous.state() : PipelineState.NEW;
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
         Instant at = observedNow();
         List<MetricFact> measured = List.of(
                 readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
-        observations.save(new Observation(pipelineId, lastState,
+        save(new Observation(pipelineId, lastState,
                 FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                null, lastPositions, lastFailure, at, measured));
+                null, lastPositions, lastFailure, at, measured), scope);
     }
 
     /**
@@ -917,9 +1012,10 @@ public final class ObservationPublisher {
             return Optional.empty();
         }
         List<MetricPoint> counted = new ArrayList<>();
+        Instant since = failureCountingSinceByPipeline.getOrDefault(pipelineId, countingFailuresSince);
         byCode.forEach((code, count) -> counted.add(MetricPoint.accumulated(
                 Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, CODE_ATTRIBUTE, code),
-                countingFailuresSince, at, count)));
+                since, at, count)));
         return Optional.of(new MetricFact(ERRORS_METRIC, MetricType.COUNTER, "{error}", counted));
     }
 
@@ -940,6 +1036,10 @@ public final class ObservationPublisher {
     public void forgetPipelinesOutside(Collection<String> live) {
         Objects.requireNonNull(live, "live");
         failuresByPipelineAndCode.keySet().retainAll(Set.copyOf(live));
+        currentFailures.keySet().retainAll(Set.copyOf(live));
+        currentScopes.keySet().retainAll(Set.copyOf(live));
+        failureCountingSinceByPipeline.keySet().retainAll(Set.copyOf(live));
+        cardinality.forgetPipelinesOutside(live);
     }
 
     /**

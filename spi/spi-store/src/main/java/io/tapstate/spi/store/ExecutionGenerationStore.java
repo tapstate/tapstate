@@ -11,4 +11,9 @@ public interface ExecutionGenerationStore {
 
     /** Advances the same coordination document without creating a lease in standalone mode. */
     OptionalLong advanceStandalone(String clusterId, String pipelineId);
+
+    /** Reads the current durable generation without requiring a live lease or advancing the sequence. */
+    default OptionalLong currentGeneration(String clusterId, String pipelineId) {
+        throw new UnsupportedOperationException("current execution generation reads are unavailable");
+    }
 }

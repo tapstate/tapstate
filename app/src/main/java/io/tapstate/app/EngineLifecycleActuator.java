@@ -1,7 +1,9 @@
 package io.tapstate.app;
 
+import io.tapstate.control.core.PipelineIncarnationService;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.spi.store.ObservationStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,14 +51,24 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final PipelineCaptureCoordinator captureCoordinator;
     private final NestStateTeardown stateTeardown;
     private final PipelineActuationOwnership actuation;
+    private final PipelineIncarnationService incarnations;
+    private final ObservationScopeRegistry observationScopes;
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown, PipelineActuationOwnership actuation) {
+        this(engine, dagSource, captureCoordinator, stateTeardown, actuation, null, null);
+    }
+
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            NestStateTeardown stateTeardown, PipelineActuationOwnership actuation,
+            PipelineIncarnationService incarnations, ObservationScopeRegistry observationScopes) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
         this.stateTeardown = Objects.requireNonNull(stateTeardown, "stateTeardown");
         this.actuation = Objects.requireNonNull(actuation, "actuation");
+        this.incarnations = incarnations;
+        this.observationScopes = observationScopes;
     }
 
     @Override
@@ -70,6 +82,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
         DagSource.StartPreparation prepared = dagSource.prepareStart(
                 pipelineId, stateTeardown.defaultDatabase());
+        String incarnation = incarnations == null ? null : incarnations.ensureCurrent(pipelineId)
+                .orElseThrow(() -> new IllegalStateException("validated pipeline lost its artifact before start"));
         // The run's own generation, taken before the first side effect for the same reason: a run this
         // member cannot fence is one nothing could later stop from writing, so it must not be half built.
         // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any
@@ -80,6 +94,20 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     + "execution generation", pipelineId);
             return;
         }
+        ObservationStore.Scope observationScope = observationScopes == null ? null
+                : observationScopes.begin(pipelineId, incarnation, execution.fence().executionGeneration());
+        try {
+            startPrepared(pipelineId, prepared, execution, observationScope);
+        } catch (RuntimeException | Error failed) {
+            if (observationScope != null) {
+                observationScopes.discard(pipelineId, observationScope);
+            }
+            throw failed;
+        }
+    }
+
+    private void startPrepared(String pipelineId, DagSource.StartPreparation prepared,
+            PipelineActuationOwnership.Execution execution, ObservationStore.Scope observationScope) {
         if (captureCoordinator.hasActiveCapture(pipelineId)) {
             // A prior job can die while its source capture remains open. Close that run before opening
             // another so its reader cursor is not reused by a new job that resumes from an earlier sink ACK.
@@ -109,12 +137,18 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
             // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
             // being opened on another member, and how long that may take is bounded where it is decided.
+            if (observationScope != null) {
+                observationScopes.discard(pipelineId, observationScope);
+            }
             return;
         }
         if (Thread.currentThread().isInterrupted()) {
             // A newer stop or delete cancelled this start while capture was opening. Delete can remove
             // the desired row before another stop task is queued, so this worker closes its own capture.
             closeCaptureAfterCancellation(pipelineId);
+            if (observationScope != null) {
+                observationScopes.discard(pipelineId, observationScope);
+            }
             return;
         }
         // Capture opens the SRS generation that source vertices compile into the DAG. Build only now, but
@@ -123,6 +157,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         DagSource.StartPlan plan = prepared.build(execution.fence());
         if (Thread.currentThread().isInterrupted()) {
             closeCaptureAfterCancellation(pipelineId);
+            if (observationScope != null) {
+                observationScopes.discard(pipelineId, observationScope);
+            }
             return;
         }
         // The capacity travels with the submission because the maps are made by the job: what a state map

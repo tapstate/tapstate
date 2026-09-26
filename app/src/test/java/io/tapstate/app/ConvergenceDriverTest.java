@@ -12,6 +12,7 @@ import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.spi.metrics.MetricsExport;
+import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -21,6 +22,9 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static io.tapstate.core.lifecycle.PipelineState.FAILED;
@@ -114,6 +118,63 @@ class ConvergenceDriverTest {
             assertThat(releaseSlow.getCount()).isEqualTo(1L);
         } finally {
             releaseSlow.countDown();
+        }
+    }
+
+    @Test
+    void aStalledObservationWriteDoesNotHoldTheNextPipelinesConvergence() throws Exception {
+        desired.save(new DesiredState("slow", RUNNING, "rev-1"));
+        desired.save(new DesiredState("fast", RUNNING, "rev-1"));
+        CountDownLatch slowWriteEntered = new CountDownLatch(1);
+        CountDownLatch releaseSlowWrite = new CountDownLatch(1);
+        ObservationStore blocked = new ObservationStore() {
+            @Override
+            public void save(Observation observation) {
+                if (observation.pipelineId().equals("slow")) {
+                    slowWriteEntered.countDown();
+                    try {
+                        if (!releaseSlowWrite.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("slow observation write was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("observation write was interrupted", interrupted);
+                    }
+                }
+                observations.save(observation);
+            }
+
+            @Override public Optional<Observation> read(String pipelineId) {
+                return observations.read(pipelineId);
+            }
+
+            @Override public void delete(String pipelineId) {
+                observations.delete(pipelineId);
+            }
+        };
+        ObservationPublisher writer = new ObservationPublisher(state, blocked);
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try (TelemetryDispatcher telemetry = new TelemetryDispatcher(writer, null, MetricsExport.none(), 2, 2)) {
+            ConvergenceDriver isolated = new ConvergenceDriver(
+                    converger, desired, writer, null, MetricsExport.none(), () -> true,
+                    PipelineActuationOwnership.single(), LifecycleWorkDispatcher.inline(), null, telemetry);
+            Future<?> pass = caller.submit(isolated::reconcile);
+            assertThat(slowWriteEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(releaseSlowWrite.getCount()).isEqualTo(1L);
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while ((state.read("fast").isEmpty() || observations.read("fast").isEmpty())
+                    && System.nanoTime() < until) {
+                TimeUnit.MILLISECONDS.sleep(5);
+            }
+            assertThat(state.read("fast")).as("the fast pipeline converges while telemetry is stalled")
+                    .isPresent();
+            assertThat(observations.read("fast")).as("the fast pipeline remains observable").isPresent();
+            releaseSlowWrite.countDown();
+            pass.get(5, TimeUnit.SECONDS);
+        } finally {
+            releaseSlowWrite.countDown();
+            caller.shutdownNow();
+            assertThat(caller.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
         }
     }
 

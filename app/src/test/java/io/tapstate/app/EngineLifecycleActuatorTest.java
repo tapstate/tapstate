@@ -8,6 +8,7 @@ import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.control.core.PipelineIncarnationService;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -60,6 +61,34 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * pipeline id alone.
  */
 class EngineLifecycleActuatorTest {
+
+    @Test
+    void startBindsTheArtifactIncarnationToItsDurableExecutionGenerationForObservations() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        ArtifactStore artifacts = new ArtifactStore() {
+            @Override public void saveAll(List<io.tapstate.core.model.Resource> resources) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public Optional<io.tapstate.core.model.Resource> get(String id) {
+                return Optional.empty();
+            }
+            @Override public List<io.tapstate.core.model.Resource> list() { return List.of(); }
+            @Override public Optional<String> ensurePipelineIncarnationId(String id, String candidate) {
+                assertThat(id).isEqualTo(PIPE);
+                return Optional.of("inc-a");
+            }
+        };
+        EngineLifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member),
+                new RecordingDagSource(events), new RecordingCaptureCoordinator(events), teardown(),
+                PipelineActuationOwnership.single("single", new InMemoryWorkloadClaimStore()),
+                new PipelineIncarnationService(artifacts), scopes);
+
+        actuator.start(PIPE);
+
+        assertThat(scopes.current(PIPE)).contains(new io.tapstate.spi.store.ObservationStore.Scope("inc-a", 1));
+        assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
+    }
 
     private static final String PIPE = "orders-pipe";
 

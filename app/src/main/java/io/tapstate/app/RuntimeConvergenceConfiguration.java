@@ -144,14 +144,23 @@ class RuntimeConvergenceConfiguration {
         return new LifecycleWorkDispatcher(maxConcurrency, queueCapacity);
     }
 
+    @Bean(destroyMethod = "close")
+    TelemetryDispatcher telemetryDispatcher(ObservationPublisher publisher, RateSampler sampler,
+            MetricsExport export, ObservationScopeRegistry scopes) {
+        return new TelemetryDispatcher(publisher, sampler, export, scopes,
+                TelemetryDispatcher.DEFAULT_LATEST_WORKERS, TelemetryDispatcher.DEFAULT_QUEUE_CAPACITY);
+    }
+
     @Bean
     ConvergenceDriver convergenceDriver(
             PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
             RateSampler rateSampler, MetricsExport metricsExport,
             ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership,
-            LifecycleWorkDispatcher lifecycleWorkDispatcher) {
+            LifecycleWorkDispatcher lifecycleWorkDispatcher, ObservationScopeRegistry observationScopes,
+            TelemetryDispatcher telemetryWork) {
         return new ConvergenceDriver(
                 pipelineConverger, storePort.desired(), observationPublisher, rateSampler, metricsExport,
-                membershipGate::businessEligible, pipelineActuationOwnership, lifecycleWorkDispatcher);
+                membershipGate::businessEligible, pipelineActuationOwnership, lifecycleWorkDispatcher,
+                observationScopes, telemetryWork);
     }
 }

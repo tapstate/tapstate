@@ -22,10 +22,12 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -48,6 +50,60 @@ class ObservationPublisherTest {
     private final MutableStateStore state = new MutableStateStore();
     private final RecordingObservationStore observations = new RecordingObservationStore();
     private final ObservationPublisher publisher = new ObservationPublisher(state, observations);
+
+    @Test
+    void aNewExecutionDoesNotCarryThePreviousExecutionsFailureIntoItsScopedObservation() {
+        state.seed("orders", PipelineState.FAILED);
+        ObservationFailure oldFailure = new ObservationFailure("engine.job-failed", Map.of("pipeline", "orders"));
+        Observation old = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                oldFailure, OBSERVED_AT);
+        AtomicReference<ObservationStore.Stored> slot = new AtomicReference<>(
+                new ObservationStore.Stored(old, Optional.of(new ObservationStore.Scope("inc-a", 41))));
+        ObservationStore scoped = new ObservationStore() {
+            @Override public void save(Observation observation) { throw new AssertionError("unscoped write"); }
+            @Override public boolean saveScoped(Observation observation, Scope scope) {
+                slot.set(new Stored(observation, Optional.of(scope)));
+                return true;
+            }
+            @Override public Optional<Observation> read(String id) { return Optional.of(slot.get().observation()); }
+            @Override public Optional<Stored> readStored(String id) { return Optional.of(slot.get()); }
+            @Override public void delete(String id) { throw new UnsupportedOperationException(); }
+        };
+        ObservationPublisher writer = new ObservationPublisher(state, scoped);
+
+        Observation published = writer.publishScoped("orders", null,
+                new ObservationStore.Scope("inc-a", 42)).orElseThrow();
+
+        assertThat(published.failure()).isNull();
+        assertThat(slot.get().scope()).contains(new ObservationStore.Scope("inc-a", 42));
+        writer.publishScoped("orders", oldFailure, new ObservationStore.Scope("inc-a", 42));
+        Observation restarted = writer.publishScoped("orders", null,
+                new ObservationStore.Scope("inc-a", 43)).orElseThrow();
+        assertThat(restarted.failure()).isNull();
+        assertThat(restarted.facts()).noneMatch(fact -> fact.name().equals("tapstate.pipeline.errors"));
+    }
+
+    @Test
+    void foldedChainFactsAndTheFlatViewKeepTheOverflowApartFromANamedChain() {
+        state.seed("orders", PipelineState.RUNNING);
+        Map<String, Long> gaps = new LinkedHashMap<>();
+        gaps.put("~other", 7L);
+        for (int index = 0; index < 999; index++) {
+            gaps.put("chain-" + index, 1L);
+        }
+        gaps.put("extra", 11L);
+        ObservationPublisher writer = new ObservationPublisher(
+                state, observations, id -> OptionalLong.empty(), id -> Map.of(),
+                id -> SnapshotReading.NONE, id -> gaps);
+
+        Observation published = writer.publish("orders").orElseThrow();
+
+        assertThat(published.metrics()).containsEntry("frontierGap.~~other", 7L)
+                .containsEntry("frontierGap.~other", 11L);
+        assertThat(published.facts().stream()
+                .filter(fact -> fact.name().equals("tapstate.pipeline.frontier.gap"))
+                .findFirst().orElseThrow().points()).hasSize(1001);
+    }
 
     /** A publisher whose only wired source is the nest readings, watching them through {@code alert}. */
     private ObservationPublisher withWatch(

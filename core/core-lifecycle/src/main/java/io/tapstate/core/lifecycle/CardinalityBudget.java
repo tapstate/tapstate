@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -192,6 +193,12 @@ public enum CardinalityBudget {
             Set<String> kept = Set.copyOf(pipelineIds);
             named.values().forEach(byPipeline ->
                     byPipeline.keySet().removeIf(pipeline -> !pipeline.isEmpty() && !kept.contains(pipeline)));
+        }
+
+        /** Clears the remembered dimension names when a new resource reuses one pipeline id. */
+        public void forgetPipeline(String pipelineId) {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            named.values().forEach(byPipeline -> byPipeline.remove(pipelineId));
         }
 
         /**

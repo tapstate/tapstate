@@ -12,6 +12,7 @@ import io.tapstate.spi.store.DesiredStore;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,6 +37,8 @@ final class ConvergenceDriver {
     private final BooleanSupplier businessEligible;
     private final PipelineActuationOwnership actuation;
     private final LifecycleWorkDispatcher lifecycleWork;
+    private final ObservationScopeRegistry observationScopes;
+    private final TelemetryDispatcher telemetryWork;
 
     // Consecutive failed-reconcile passes per pipeline, so a pipeline that keeps throwing surfaces as a
     // climbing errorCount rather than an empty read face. Reconcile runs on a single scheduler thread with a
@@ -88,6 +91,21 @@ final class ConvergenceDriver {
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
             RateSampler sampler, MetricsExport export, BooleanSupplier businessEligible,
             PipelineActuationOwnership actuation, LifecycleWorkDispatcher lifecycleWork) {
+        this(converger, desired, publisher, sampler, export, businessEligible, actuation, lifecycleWork, null);
+    }
+
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            RateSampler sampler, MetricsExport export, BooleanSupplier businessEligible,
+            PipelineActuationOwnership actuation, LifecycleWorkDispatcher lifecycleWork,
+            ObservationScopeRegistry observationScopes) {
+        this(converger, desired, publisher, sampler, export, businessEligible, actuation, lifecycleWork,
+                observationScopes, null);
+    }
+
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            RateSampler sampler, MetricsExport export, BooleanSupplier businessEligible,
+            PipelineActuationOwnership actuation, LifecycleWorkDispatcher lifecycleWork,
+            ObservationScopeRegistry observationScopes, TelemetryDispatcher telemetryWork) {
         this.converger = converger;
         this.desired = desired;
         this.publisher = publisher;
@@ -96,6 +114,8 @@ final class ConvergenceDriver {
         this.businessEligible = businessEligible;
         this.actuation = actuation;
         this.lifecycleWork = lifecycleWork;
+        this.observationScopes = observationScopes;
+        this.telemetryWork = telemetryWork;
     }
 
     @Scheduled(fixedDelayString = "${tapstate.converge.interval-ms:1000}")
@@ -117,7 +137,7 @@ final class ConvergenceDriver {
                     // This pipeline's execution generation is being advanced on a worker. Waiting for
                     // its per-pipeline lock would stall every later pipeline in this scheduler pass;
                     // treating that short wait as lost ownership would cancel the worker holding it.
-                    publisher.publish(pipelineId, null).ifPresent(published -> {
+                    publish(pipelineId, null).ifPresent(published -> {
                         sample(published);
                         export(published);
                     });
@@ -170,7 +190,7 @@ final class ConvergenceDriver {
                     LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
                             failure.code(), result.failure().orElse(null));
                 }
-                publisher.publish(pipelineId, failure).ifPresent(published -> {
+                publish(pipelineId, failure).ifPresent(published -> {
                     sample(published);
                     export(published);
                 });
@@ -188,7 +208,19 @@ final class ConvergenceDriver {
                 LOG.warn("Reconcile pass for pipeline {} failed {} time(s) in a row; retrying on the next tick",
                         pipelineId, failures, e);
                 try {
-                    publisher.publishReconcileFailure(pipelineId, failures);
+                    if (telemetryWork != null) {
+                        if (observationScopes == null) {
+                            telemetryWork.offerReconcileFailure(pipelineId, failures, null);
+                        } else {
+                            observationScopes.current(pipelineId).ifPresent(scope ->
+                                    telemetryWork.offerReconcileFailure(pipelineId, failures, scope));
+                        }
+                    } else if (observationScopes == null) {
+                        publisher.publishReconcileFailure(pipelineId, failures);
+                    } else {
+                        observationScopes.current(pipelineId).ifPresent(scope ->
+                                publisher.publishReconcileFailureScoped(pipelineId, failures, scope));
+                    }
                 } catch (RuntimeException unpublishable) {
                     // The read face is unreachable too (e.g. the same store backs both), so nothing can be
                     // surfaced this tick; the warning above is the only record.
@@ -211,18 +243,39 @@ final class ConvergenceDriver {
         // lease runs out, which delays nothing but reads as an owner over something that no longer exists.
         actuation.retain(pipelineIds);
         publisher.forgetPipelinesOutside(pipelineIds);
+        if (observationScopes != null) {
+            observationScopes.retain(pipelineIds);
+        }
+        if (telemetryWork != null) {
+            telemetryWork.retain(pipelineIds);
+        }
         if (sampler != null) {
             sampler.forgetPipelinesOutside(pipelineIds);
         }
         export.forgetPipelinesOutside(pipelineIds);
     }
 
-    /**
-     * Offers the facts just published to the export, which holds them for whatever backend it carries them
-     * to. The same facts the observation was stored from, offered after it: the two projections read one
-     * measurement, and neither reads the other. A backend that refuses is the export's to report; it does
-     * not fail the pass that measured.
-     */
+    private Optional<io.tapstate.core.lifecycle.Observation> publish(String pipelineId, ObservationFailure failure) {
+        if (telemetryWork != null) {
+            Optional<io.tapstate.spi.store.ObservationStore.Scope> scope = observationScopes == null
+                    ? Optional.empty() : observationScopes.current(pipelineId);
+            if (observationScopes != null && scope.isEmpty()) {
+                return Optional.empty();
+            }
+            (scope.isPresent()
+                    ? publisher.prepareScoped(pipelineId, failure, scope.get())
+                    : publisher.prepare(pipelineId, failure))
+                    .ifPresent(prepared -> telemetryWork.offer(prepared, scope.orElse(null)));
+            return Optional.empty();
+        }
+        if (observationScopes == null) {
+            return publisher.publish(pipelineId, failure);
+        }
+        return observationScopes.current(pipelineId)
+                .flatMap(scope -> publisher.publishScoped(pipelineId, failure, scope));
+    }
+
+    /** Offers the same measured facts to export on the inline compatibility path. */
     private void export(io.tapstate.core.lifecycle.Observation published) {
         try {
             export.offer(published.pipelineId(), published.state(), published.observedAt(), published.facts());
@@ -231,12 +284,7 @@ final class ConvergenceDriver {
         }
     }
 
-    /**
-     * Takes a sample off exactly what was published, at the time it was published, so the history and the
-     * latest state never describe different passes of the run. The observation is the contract and the
-     * history a record kept beside it: a history that cannot be written must not cost a pipeline the read
-     * face that says it is alive at all.
-     */
+    /** Takes a sample from the same frame on the inline compatibility path. */
     private void sample(io.tapstate.core.lifecycle.Observation published) {
         if (sampler == null) {
             return;

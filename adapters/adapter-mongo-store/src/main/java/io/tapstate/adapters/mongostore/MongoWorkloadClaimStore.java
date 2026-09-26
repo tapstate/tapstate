@@ -144,6 +144,19 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     @Override
+    public OptionalLong currentGeneration(String clusterId, String pipelineId) {
+        WorkloadClaimKey key = new WorkloadClaimKey(
+                clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
+        Document found = StoreIo.call(() -> collection.find(new Document("_id", id(key)))
+                .projection(new Document("executionGeneration", 1)).first());
+        if (found == null || found.get("executionGeneration") == null) {
+            return OptionalLong.empty();
+        }
+        long generation = number(found, "executionGeneration");
+        return generation > 0 ? OptionalLong.of(generation) : OptionalLong.empty();
+    }
+
+    @Override
     public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
         Objects.requireNonNull(key, "key");
         // An aggregation rather than a find, for one field: how long this lease still has to run has to be

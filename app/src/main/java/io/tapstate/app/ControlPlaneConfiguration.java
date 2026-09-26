@@ -45,6 +45,7 @@ import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.HistoryCursorCodec;
 import io.tapstate.control.core.PipelineExplainService;
+import io.tapstate.control.core.CurrentObservationReader;
 import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
@@ -586,9 +587,19 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    CurrentObservationReader currentObservationReader(StorePort storePort, ClusterProperties cluster,
+            ClusterIdentityStore clusterIdentities) {
+        String clusterId = cluster.getProfile() == ClusterProperties.Profile.SINGLE
+                ? DataPlaneActuationConfiguration.standaloneClusterId(cluster, clusterIdentities)
+                : cluster.getId();
+        return new CurrentObservationReader(storePort.artifacts(), storePort.workloadClaims(),
+                storePort.observations(), clusterId);
+    }
+
+    @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
-            ArtifactQueryService artifactQueryService, StorePort storePort) {
-        return new PipelineObservationQueryService(artifactQueryService, storePort.observations());
+            ArtifactQueryService artifactQueryService, CurrentObservationReader observations) {
+        return new PipelineObservationQueryService(artifactQueryService, observations);
     }
 
     @Bean
@@ -604,10 +615,10 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineExplainService pipelineExplainService(
-            ArtifactQueryService artifactQueryService, StorePort storePort, Clock clock) {
+            ArtifactQueryService artifactQueryService, CurrentObservationReader observations, Clock clock) {
         ExplanationCatalog messages = ExplanationCatalog.bundled();
         return new PipelineExplainService(
-                artifactQueryService, storePort.observations(), clock, messages::render);
+                artifactQueryService, observations, clock, messages::render);
     }
 
     /**

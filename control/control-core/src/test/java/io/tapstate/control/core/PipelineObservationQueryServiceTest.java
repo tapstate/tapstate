@@ -13,6 +13,8 @@ import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.ExecutionGenerationStore;
+import io.tapstate.spi.store.WorkloadClaim;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -20,6 +22,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -32,6 +37,74 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
  * so the same read serves a frontend with no stderr/exit channel.
  */
 class PipelineObservationQueryServiceTest {
+
+    @Test
+    void oldExecutionAndOldIncarnationRemainPendingUntilTheCurrentObservationArrives() {
+        Resource pipeline = new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_sync
+                source: src_x
+                serve:
+                  from: /.*/
+                  sync:
+                    - id: sink1
+                      source: tgt_x
+                      write_mode: upsert
+                      ddl: apply
+                """);
+        AtomicBoolean exists = new AtomicBoolean(true);
+        AtomicReference<Optional<String>> incarnation = new AtomicReference<>(Optional.of("inc-current"));
+        ArtifactStore artifacts = new ArtifactStore() {
+            @Override public void saveAll(List<Resource> resources) { throw new UnsupportedOperationException(); }
+            @Override public Optional<Resource> get(String id) {
+                return exists.get() && id.equals("orders_sync") ? Optional.of(pipeline) : Optional.empty();
+            }
+            @Override public List<Resource> list() { return exists.get() ? List.of(pipeline) : List.of(); }
+            @Override public Optional<String> pipelineIncarnationId(String id) { return incarnation.get(); }
+        };
+        ExecutionGenerationStore generations = new ExecutionGenerationStore() {
+            @Override public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long revision) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public OptionalLong advanceStandalone(String clusterId, String id) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public OptionalLong currentGeneration(String clusterId, String id) {
+                assertThat(clusterId).isEqualTo("cluster-a");
+                return OptionalLong.of(42);
+            }
+        };
+        Observation observed = running();
+        AtomicReference<ObservationStore.Stored> stored = new AtomicReference<>(
+                new ObservationStore.Stored(observed, Optional.of(new ObservationStore.Scope("inc-current", 41))));
+        ObservationStore latest = new ObservationStore() {
+            @Override public void save(Observation observation) { throw new UnsupportedOperationException(); }
+            @Override public Optional<Observation> read(String id) { return Optional.of(stored.get().observation()); }
+            @Override public Optional<Stored> readStored(String id) { return Optional.of(stored.get()); }
+            @Override public void delete(String id) { throw new UnsupportedOperationException(); }
+        };
+        CurrentObservationReader current = new CurrentObservationReader(artifacts, generations, latest, "cluster-a");
+        PipelineObservationQueryService service = new PipelineObservationQueryService(
+                new ArtifactQueryService(artifacts), current);
+
+        assertThat(service.findStatus("orders_sync")).isEmpty();
+        assertThatThrownBy(() -> service.status("orders_sync"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(MonitorError.NO_OBSERVATION));
+        stored.set(new ObservationStore.Stored(observed,
+                Optional.of(new ObservationStore.Scope("inc-old", 42))));
+        assertThat(service.findStatus("orders_sync")).isEmpty();
+        stored.set(new ObservationStore.Stored(observed,
+                Optional.of(new ObservationStore.Scope("inc-current", 42))));
+        assertThat(service.status("orders_sync").state()).isEqualTo(PipelineState.RUNNING);
+        stored.set(new ObservationStore.Stored(observed, Optional.empty()));
+        assertThat(service.findStatus("orders_sync")).isEmpty();
+        incarnation.set(Optional.empty());
+        assertThat(service.status("orders_sync").state()).isEqualTo(PipelineState.RUNNING);
+        exists.set(false);
+        assertThat(service.findStatus("orders_sync")).isEmpty();
+    }
 
     private static ObservationStore storeWith(Observation... published) {
         Map<String, Observation> map = new HashMap<>();

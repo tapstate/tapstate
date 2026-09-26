@@ -103,6 +103,7 @@ class WorkloadClaimStoreIT {
                     new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
             assertThat(store.advanceStandalone("cluster-a", "orders")).hasValue(1);
             assertThat(store.advanceStandalone("cluster-a", "orders")).hasValue(2);
+            assertThat(store.currentGeneration("cluster-a", "orders")).hasValue(2);
             assertThat(store.read(pipeline)).as("standalone allocation creates no claim or lease").isEmpty();
             assertThat(store.readAll(List.of(pipeline))).isEmpty();
             assertThat(collection.countDocuments()).isEqualTo(1);
@@ -116,6 +117,7 @@ class WorkloadClaimStoreIT {
             assertThat(first.executionGeneration()).isEqualTo(3);
             WorkloadClaim fourth = reopened.advanceUnderClaim(first, 7).orElseThrow();
             assertThat(fourth.executionGeneration()).isEqualTo(4);
+            assertThat(reopened.currentGeneration("cluster-a", "orders")).hasValue(4);
             assertThat(reopened.advanceUnderClaim(first, 7)).as("stale expected generation is refused").isEmpty();
             assertThat(reopened.advanceStandalone("cluster-a", "orders"))
                     .as("a live cluster claim blocks a standalone start").isEmpty();
@@ -124,6 +126,7 @@ class WorkloadClaimStoreIT {
             assertThat(reopened.release(fourth)).isTrue();
             assertThat(reopened.advanceStandalone("cluster-a", "orders"))
                     .as("standalone may continue after the previous lease has ended").hasValue(5);
+            assertThat(reopened.currentGeneration("cluster-a", "orders")).hasValue(5);
             WorkloadClaim successor = reopened.acquire(
                     pipeline, new WorkloadOwner("node-b", "boot-2"), 8, TTL).claim();
             assertThat(successor.claimGeneration()).isEqualTo(2);
