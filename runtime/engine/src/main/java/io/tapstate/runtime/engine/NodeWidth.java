@@ -6,6 +6,8 @@ import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.model.BatchSpec;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -53,11 +55,27 @@ public record NodeWidth(String node, int local, int plannedMembers, BatchSpec ba
         return local > 0;
     }
 
-    /** The meta-supplier of the node's vertex named {@code vertex}, whose processors {@code processors} makes. */
+    /**
+     * The meta-supplier of the node's vertex named {@code vertex}, whose processors {@code processors} makes, for a
+     * vertex whose processors work out no bounds edge by edge: where it runs once for the cluster, the engine's own
+     * stand-ins stand in for it, passing on what they combined across every edge as its processor does.
+     */
     public ProcessorMetaSupplier metaSupplier(String vertex, ProcessorSupplier processors) {
         ProcessorMetaSupplier meta = isNative()
                 ? PlannedMembersGuard.of(ProcessorMetaSupplier.of(processors), plannedMembers)
                 : ProcessorMetaSupplier.forceTotalParallelismOne(processors, vertex);
+        return InputBatches.around(meta, batch);
+    }
+
+    /**
+     * The same, for a vertex whose processors work out their bounds edge by edge over the chains
+     * {@code chainsByOrdinal} names, on {@code axes}: where it runs once for the cluster, its stand-ins do the same.
+     */
+    public ProcessorMetaSupplier metaSupplier(String vertex, ProcessorSupplier processors, ChainAxes axes,
+            Map<Integer, List<String>> chainsByOrdinal) {
+        ProcessorMetaSupplier meta = isNative()
+                ? PlannedMembersGuard.of(ProcessorMetaSupplier.of(processors), plannedMembers)
+                : TotalOne.passingBounds(processors, vertex, axes, chainsByOrdinal);
         return InputBatches.around(meta, batch);
     }
 

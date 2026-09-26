@@ -56,6 +56,12 @@ import org.junit.jupiter.api.Test;
  * wait on it for as long as the run lasts. On one member nothing is ever on another member, which is why this
  * runs on two.
  *
+ * <p>The same holds when what feeds the router is a step running once for the whole cluster over both tables. Such
+ * a step runs its one processor on one member and a stand-in on the other, and the router hears from both: every
+ * bound goes to every processor of a vertex, and every processor reading it waits for each of them. A stand-in
+ * that passed on only what it had combined across both of its edges would say nothing about either table - each
+ * arrives on one edge only - and every writer would wait on it for good.
+ *
  * <p>The sources never finish, as none do in a running pipeline, so nothing here is carried by an edge falling
  * silent by ending.
  */
@@ -73,6 +79,8 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
     /** Every table each named writer reported progress on. */
     private static final Map<String, Set<String>> REPORTED = new ConcurrentHashMap<>();
     private static final List<Map<String, List<String>>> STARTED = Collections.synchronizedList(new ArrayList<>());
+    /** How many ports the steps' processors made between them: one per processor that runs a step. */
+    private static final AtomicInteger PORTS = new AtomicInteger();
 
     private HazelcastInstance first;
     private HazelcastInstance second;
@@ -83,6 +91,7 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
         OPENED.set(0);
         REPORTED.clear();
         STARTED.clear();
+        PORTS.set(0);
         String cluster = "native-sink-two-members-" + System.nanoTime();
         first = Hazelcast.newHazelcastInstance(clustered(cluster));
         second = Hazelcast.newHazelcastInstance(clustered(cluster));
@@ -133,6 +142,30 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
         assertThat(WRITTEN.keySet()).as("the writers handed anything, on both members").hasSizeGreaterThan(1);
     }
 
+    @Test
+    void aStepRunningOnceForTheClusterOverBothTablesStillLetsEveryWriterHearThem() throws InterruptedException {
+        Job job = first.getJet().newJob(PipelineDagBuilder.build(
+                pipelineThroughOneMerge(), bindings(), new RecordingAcks(), FRONTIER, shapeWithTheMergeOnce()));
+        try {
+            long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+            while (!(everyWriterReportedBothTables() && everyUpdateWritten()) && System.nanoTime() < deadline) {
+                Thread.sleep(25);
+            }
+        } finally {
+            job.cancel();
+        }
+
+        assertThat(everyUpdateWritten()).as("every change reached a writer through the step's one processor")
+                .isTrue();
+        assertThat(PORTS.get()).as("the step ran one processor for the cluster, the other member a stand-in")
+                .isEqualTo(1);
+        for (int index = 0; index < WRITERS; index++) {
+            assertThat(REPORTED.getOrDefault("serve.s#" + index, Set.of()))
+                    .as("the tables writer serve.s#%d reported progress on", index)
+                    .containsExactlyInAnyOrder("orders", "logs");
+        }
+    }
+
     private static boolean everyWriterReportedBothTables() {
         for (int index = 0; index < WRITERS; index++) {
             Set<String> tables = REPORTED.get("serve.s#" + index);
@@ -178,6 +211,29 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
                 null, null);
     }
 
+    /** Both tables through one step, which runs a single processor for the whole cluster, into the sink. */
+    private static PipelineResource pipelineThroughOneMerge() {
+        return new PipelineResource("p", null,
+                List.of(SourceRef.bare("orders"), SourceRef.bare("logs")),
+                List.of(Step.inline("merge", FromClause.list(FromRef.literal("orders"), FromRef.literal("logs")),
+                        new TransformBody.Js("row"), null)),
+                null,
+                new ServeBlock.Inline(null, new FromClause.Flow(List.of(FromRef.literal("merge"))),
+                        List.of(new SyncElement("s", "dest", null, null, null)), null, null),
+                null, null);
+    }
+
+    /** The sink on both members as before; the step, given no width, runs once for the cluster. */
+    private static ExecutionShape shapeWithTheMergeOnce() {
+        return new ExecutionShape(2,
+                Map.of("serve.s", new NodeParallelism("serve.s", WRITERS, NodeParallelism.Origin.EXPLICIT,
+                        NodeParallelism.Scope.NATIVE, 2, PER_MEMBER, WRITERS, List.of())),
+                Map.of(),
+                Map.of("serve.s", Map.of(
+                        "orders", new SinkTarget("orders", List.of("id")),
+                        "logs", new SinkTarget("logs", List.of()))));
+    }
+
     private static ExecutionShape shape() {
         return new ExecutionShape(2,
                 Map.of("stamp", new NodeParallelism("stamp", WRITERS, NodeParallelism.Origin.EXPLICIT,
@@ -195,10 +251,14 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
         Map<FromRef, List<String>> upstreams = Map.of(
                 FromRef.literal("orders"), List.of("orders"),
                 FromRef.literal("logs"), List.of("logs"),
-                FromRef.literal("stamp"), List.of("stamp"));
+                FromRef.literal("stamp"), List.of("stamp"),
+                FromRef.literal("merge"), List.of("merge"));
         return new DagBindings(
                 sourceId -> endless(sourceId, axes.axisOf(sourceId)),
-                step -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
+                step -> (SupplierEx<TransformPort>) () -> {
+                    PORTS.incrementAndGet();
+                    return event -> List.of(event);
+                },
                 element -> (SupplierEx<SinkWriter>) RecordingWriter::new,
                 ref -> upstreams.getOrDefault(ref, List.of()));
     }

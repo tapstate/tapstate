@@ -71,7 +71,8 @@ public final class PassthroughProcessor extends AbstractProcessor {
                 // is exactly the lowest of what its edges promised.
                 : () -> new PassthroughProcessor(
                         new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
+        // Its stand-ins on the other members pass its bounds on as it does; see TotalOne.
+        return TotalOne.passingBounds(ProcessorSupplier.of(supplier), vertexName, axes, chainsByOrdinal);
     }
 
     /**

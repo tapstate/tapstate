@@ -75,9 +75,10 @@ public final class NestDag {
         Map<List<String>, List<String>> carried = new LinkedHashMap<>();
         Vertex assembler = null;
         for (NestVertex spec : topology.vertices()) {
+            Map<Integer, List<String>> chains = chainsInto(spec, carried, frontier);
             Vertex vertex = width.sized(dag.newVertex(spec.name(), width.metaSupplier(spec.name(),
-                    processorsFor(spec, topology, binding, outputStream, frontier,
-                            chainsInto(spec, carried, frontier)))));
+                    processorsFor(spec, topology, binding, outputStream, frontier, chains),
+                    frontier == null ? null : frontier.axes(), chains)));
             built.put(spec.pathId(), vertex);
             for (NestInbound edge : spec.inbound()) {
                 connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width);
@@ -120,10 +121,12 @@ public final class NestDag {
         if (sources == null || sources.isEmpty()) {
             throw new IllegalStateException("nest alias '" + lookup.alias() + "' resolved to no vertex");
         }
+        Map<Integer, List<String>> chains = chainsIntoLookup(lookup, frontier);
         Vertex vertex = width.sized(dag.newVertex(lookup.name(), width.metaSupplier(lookup.name(),
                 new NestLookupSupplier(lookup, binding.stores(),
                         binding.settings().referrersAllowedIn(lookup.mapName()),
-                        frontier == null ? null : frontier.axes(), chainsIntoLookup(lookup, frontier)))));
+                        frontier == null ? null : frontier.axes(), chains),
+                frontier == null ? null : frontier.axes(), chains)));
         Vertex source = sources.size() == 1
                 ? sources.get(0)
                 : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);
