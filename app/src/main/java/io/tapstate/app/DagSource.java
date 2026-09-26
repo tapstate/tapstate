@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import com.hazelcast.jet.core.DAG;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.spi.store.ArtifactStore;
 
@@ -35,7 +37,7 @@ interface DagSource {
         NestCapacity capacity = capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(
-                capacity, locations, Optional.empty(), fence -> dagFor(pipelineId, fence));
+                capacity, locations, Optional.empty(), fence -> plannedDagFor(pipelineId, fence));
     }
 
     /**
@@ -60,6 +62,32 @@ interface DagSource {
      */
     default DAG dagFor(String pipelineId, ExecutionFence fence) {
         return dagFor(pipelineId);
+    }
+
+    /**
+     * The topology to run, held to {@code fence}'s run as {@link #dagFor(String, ExecutionFence)} is, together
+     * with how wide it was planned to run: the width each node was worked out to run at, the members that was
+     * worked out for, and the batch each node takes its input in.
+     *
+     * <p>Defaulted, for the stand-ins a lifecycle test drives, to a topology planned over nothing: every node
+     * runs as one processor for the cluster, and there is no plan to say so.
+     */
+    default PlannedDag plannedDagFor(String pipelineId, ExecutionFence fence) {
+        return new PlannedDag(dagFor(pipelineId, fence), ExecutionShape.totalOne(), List.of(), Map.of());
+    }
+
+    /**
+     * A topology and the plan it was drawn from: {@code shape} holds each node's width, worked out for
+     * {@code members} - by stable id - and {@code batches} the batch each node takes its input in.
+     */
+    record PlannedDag(DAG dag, ExecutionShape shape, List<String> members, Map<String, BatchSpec> batches) {
+
+        public PlannedDag {
+            Objects.requireNonNull(dag, "dag");
+            Objects.requireNonNull(shape, "shape");
+            members = List.copyOf(Objects.requireNonNull(members, "members"));
+            batches = Map.copyOf(Objects.requireNonNull(batches, "batches"));
+        }
     }
 
     /**
@@ -129,7 +157,7 @@ interface DagSource {
             NestCapacity capacity,
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot,
-            Function<ExecutionFence, DAG> dagBuilder) {
+            Function<ExecutionFence, PlannedDag> dagBuilder) {
 
         public StartPreparation {
             Objects.requireNonNull(capacity, "capacity");
@@ -156,16 +184,21 @@ interface DagSource {
 
     /** Every artifact-derived input to one start, resolved from one immutable snapshot. */
     record StartPlan(
-            DAG dag,
+            PlannedDag planned,
             NestCapacity capacity,
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot) {
 
         public StartPlan {
-            Objects.requireNonNull(dag, "dag");
+            Objects.requireNonNull(planned, "planned");
             Objects.requireNonNull(capacity, "capacity");
             stateLocations = Set.copyOf(Objects.requireNonNull(stateLocations, "stateLocations"));
             Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
+        }
+
+        /** The topology to submit. */
+        DAG dag() {
+            return planned.dag();
         }
     }
 }

@@ -73,7 +73,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
-import java.util.function.IntSupplier;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -108,9 +108,11 @@ final class StoreBackedDagSource implements DagSource {
     private final SourceSchemaCopy sourceSchemaCopy;
     private final StepSchemaRecord stepSchemaRecord;
     private final SourcePlacement sourcePlacement;
-    // How many members a run built now takes part on, read at the moment it is built: the widths of its nodes
-    // are worked out for exactly that many.
-    private final IntSupplier memberCount;
+    // The members a run built now takes part on, by stable id, read at the moment it is built: the widths of its
+    // nodes are worked out for exactly these, and the plan the run records names them.
+    private final Supplier<List<String>> members;
+    // The one member a source built without a cluster plans over: no cluster names it, so it is named here.
+    private static final String LOCAL_MEMBER = "local";
     private final ParallelismBudget parallelismBudget;
 
     StoreBackedDagSource(StorePort storePort) {
@@ -141,13 +143,13 @@ final class StoreBackedDagSource implements DagSource {
 
     /**
      * The assembled source for a cluster: as above, with each run's node widths worked out for the members
-     * {@code memberCount} reports when the run is built, within {@code parallelismBudget}.
+     * {@code members} reports - by stable id - when the run is built, within {@code parallelismBudget}.
      */
     StoreBackedDagSource(
             StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability,
-            SourcePlacement sourcePlacement, IntSupplier memberCount, ParallelismBudget parallelismBudget) {
+            SourcePlacement sourcePlacement, Supplier<List<String>> members, ParallelismBudget parallelismBudget) {
         this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement,
-                Objects.requireNonNull(storePort, "storePort").artifacts(), memberCount, parallelismBudget);
+                Objects.requireNonNull(storePort, "storePort").artifacts(), members, parallelismBudget);
     }
 
     /**
@@ -172,13 +174,13 @@ final class StoreBackedDagSource implements DagSource {
         ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
-                memberCount, parallelismBudget);
+                members, parallelismBudget);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
-                fence -> captured.dagFor(pipelineId, fence));
+                fence -> captured.plannedDagFor(pipelineId, fence));
     }
 
     @Override
@@ -230,13 +232,14 @@ final class StoreBackedDagSource implements DagSource {
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement) {
         this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
-                Objects.requireNonNull(storePort, "storePort").artifacts(), () -> 1, ParallelismBudget.DEFAULTS);
+                Objects.requireNonNull(storePort, "storePort").artifacts(), () -> List.of(LOCAL_MEMBER),
+                ParallelismBudget.DEFAULTS);
     }
 
     private StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore,
-            IntSupplier memberCount, ParallelismBudget parallelismBudget) {
+            Supplier<List<String>> members, ParallelismBudget parallelismBudget) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
@@ -247,7 +250,7 @@ final class StoreBackedDagSource implements DagSource {
         this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
         this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
         this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
-        this.memberCount = Objects.requireNonNull(memberCount, "memberCount");
+        this.members = Objects.requireNonNull(members, "members");
         this.parallelismBudget = Objects.requireNonNull(parallelismBudget, "parallelismBudget");
     }
 
@@ -263,6 +266,15 @@ final class StoreBackedDagSource implements DagSource {
      */
     @Override
     public DAG dagFor(String pipelineId, ExecutionFence fence) {
+        return plannedDagFor(pipelineId, fence).dag();
+    }
+
+    /**
+     * The topology, held to {@code fence}'s run, together with how wide it was planned to run: each node's width,
+     * worked out for the members taking part as the run is built, and the batch each node takes its input in.
+     */
+    @Override
+    public PlannedDag plannedDagFor(String pipelineId, ExecutionFence fence) {
         // Expanded before anything reads the blocks, so every later step - target resolution included -
         // sees one shape rather than having to know a reference from a body.
         PipelineResource pipeline = PipelineInlining.inline(
@@ -342,7 +354,8 @@ final class StoreBackedDagSource implements DagSource {
                 pipeline.id(), pipeline.metadata(),
                 pipeline.sources().stream().filter(ref -> sourceKeysById.containsKey(ref.id())).toList(),
                 pipeline.transforms(), pipeline.view(), pipeline.serve(), pipeline.settings(), pipeline.experimental());
-        ExecutionShape shape = ExecutionShapes.of(pipelineId, pipeline, memberCount.getAsInt(), parallelismBudget,
+        List<String> planned = List.copyOf(members.get());
+        ExecutionShape shape = ExecutionShapes.of(pipelineId, pipeline, planned.size(), parallelismBudget,
                 new ExecutionShapes.Graph(
                         ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                         streamOfSourceVertex(sourceVertices),
@@ -352,11 +365,39 @@ final class StoreBackedDagSource implements DagSource {
                                 nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get),
                         sourceExecutions(sourceVertices)),
                 sinksOf(pipeline, targets, serveStreams, viewStreams));
-        return PipelineDagBuilder.build(
+        DAG dag = PipelineDagBuilder.build(
                 builtPipeline,
                 bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
                 FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier, shape);
+        return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices));
+    }
+
+    /**
+     * The batch each node takes its input in, by the node the run's shape names it: the batch written on it, or
+     * the default batch where none was. A source vertex takes its source's.
+     */
+    private Map<String, BatchSpec> nodeBatches(PipelineResource pipeline, Map<String, SourceVertex> sourceVertices) {
+        Map<String, BatchSpec> batches = new LinkedHashMap<>();
+        sourceVertices.forEach((key, vertex) -> batches.put(key,
+                batchOrDefaults(StoredArtifacts.requireSource(artifacts(), vertex.sourceId()).execution())));
+        if (pipeline.transforms() != null) {
+            pipeline.transforms().forEach(step -> batches.put(step.id(), batchOrDefaults(step.execution())));
+        }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            batches.put(PipelineDagBuilder.viewVertex(view), batchOrDefaults(view.execution()));
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            for (int index = 0; index < serve.sync().size(); index++) {
+                SyncElement element = serve.sync().get(index);
+                batches.put(PipelineDagBuilder.serveVertex(element, index), batchOrDefaults(element.execution()));
+            }
+        }
+        return batches;
+    }
+
+    private static BatchSpec batchOrDefaults(ExecutionSpec execution) {
+        return execution == null ? BatchSpec.DEFAULTS : execution.batchOrDefaults();
     }
 
     /**
@@ -2411,8 +2452,7 @@ final class StoreBackedDagSource implements DagSource {
      * the default batch where none was written. It says nothing about how many rows the connector fetches.
      */
     static int readBatchOf(SourceResource source) {
-        ExecutionSpec execution = source.execution();
-        return (execution == null ? BatchSpec.DEFAULTS : execution.batchOrDefaults()).effectiveMaxRecords();
+        return batchOrDefaults(source.execution()).effectiveMaxRecords();
     }
 
     /**

@@ -1,11 +1,17 @@
 package io.tapstate.app;
 
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -49,6 +55,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final PipelineCaptureCoordinator captureCoordinator;
     private final NestStateTeardown stateTeardown;
     private final PipelineActuationOwnership actuation;
+    private final ExecutionPlanRecorder plans;
+    private final Clock clock;
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown) {
@@ -57,11 +65,21 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown, PipelineActuationOwnership actuation) {
+        this(engine, dagSource, captureCoordinator, stateTeardown, actuation, ExecutionPlanRecorder.NONE,
+                Clock.systemUTC());
+    }
+
+    /** As above, writing each run's plan down through {@code plans} as the run is submitted. */
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            NestStateTeardown stateTeardown, PipelineActuationOwnership actuation, ExecutionPlanRecorder plans,
+            Clock clock) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
         this.stateTeardown = Objects.requireNonNull(stateTeardown, "stateTeardown");
         this.actuation = Objects.requireNonNull(actuation, "actuation");
+        this.plans = Objects.requireNonNull(plans, "plans");
+        this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     @Override
@@ -113,6 +131,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // from the same frozen artifacts used above; placement and teardown were already fixed, so any
         // shape record this writes remains named even if construction refuses the start.
         DagSource.StartPlan plan = prepared.build(execution.fence());
+        // Written down before the run is submitted, so a reader never finds a run executing on a plan nobody
+        // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
+        plans.record(planOf(pipelineId, execution, plan.planned(), clock.instant()));
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
@@ -153,6 +174,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     @Override
     public void stop(String pipelineId, boolean purgeState) {
         engine.cancel(pipelineId);
+        plans.forget(pipelineId);
         if (purgeState) {
             // Noted before the job is even known to be over, and before the drop: a stop is driven once, on
             // the transition, so a process that dies anywhere after this point leaves a note the next start
@@ -198,5 +220,22 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // is asked here is whether anything is running this pipeline at all, and a process that has just
         // come up to a checkpoint an earlier one wrote answers no.
         return engine.hasLiveJob(pipelineId);
+    }
+
+    /**
+     * The plan a run is submitted on: which run it is, the members its widths were worked out for, and each node's
+     * width and batch as {@code planned} worked them out.
+     */
+    static ExecutionPlan planOf(String pipelineId, PipelineActuationOwnership.Execution execution,
+            DagSource.PlannedDag planned, Instant plannedAt) {
+        ExecutionFence fence = execution.fence();
+        List<ExecutionPlan.Node> nodes = new ArrayList<>();
+        planned.shape().nodes().forEach((node, parallelism) -> {
+            BatchSpec batch = planned.batches().getOrDefault(node, BatchSpec.DEFAULTS);
+            nodes.add(ExecutionPlan.Node.of(parallelism, batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis()));
+        });
+        return new ExecutionPlan(pipelineId, fence == null ? null : fence.claimGeneration(),
+                fence == null ? null : fence.executionGeneration(), execution.topologyRevision(), planned.members(),
+                nodes, plannedAt);
     }
 }

@@ -20,7 +20,9 @@ import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimStore;
+import java.time.Clock;
 import java.time.Duration;
+import java.util.List;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -67,11 +69,25 @@ class DataPlaneActuationConfiguration {
     }
 
     /**
-     * How many members a run submitted now would take part on: every member that holds data, which in this
-     * product is every member - none joins as a lite member.
+     * The members a run submitted now would take part on, by stable id: every member that holds data, which in
+     * this product is every member - none joins as a lite member. A member that names no stable id is named by
+     * its engine identity instead.
      */
-    private static int dataMembers(HazelcastInstance member) {
-        return (int) member.getCluster().getMembers().stream().filter(m -> !m.isLiteMember()).count();
+    private static List<String> dataMembers(HazelcastInstance member) {
+        return member.getCluster().getMembers().stream()
+                .filter(m -> !m.isLiteMember())
+                .map(m -> {
+                    String nodeId = m.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE);
+                    return nodeId != null ? nodeId : m.getUuid().toString();
+                })
+                .sorted()
+                .toList();
+    }
+
+    /** The plans of the runs the cluster is executing, written by whichever member submits each. */
+    @Bean
+    HazelcastExecutionPlans executionPlans(HazelcastInstance hazelcastMember) {
+        return new HazelcastExecutionPlans(hazelcastMember);
     }
 
     /**
@@ -232,8 +248,8 @@ class DataPlaneActuationConfiguration {
     @Bean
     LifecycleActuator lifecycleActuator(Engine engine, DagSource dagSource,
             PipelineCaptureCoordinator pipelineCaptureCoordinator, NestStateTeardown nestStateTeardown,
-            PipelineActuationOwnership pipelineActuationOwnership) {
+            PipelineActuationOwnership pipelineActuationOwnership, HazelcastExecutionPlans executionPlans) {
         return new EngineLifecycleActuator(engine, dagSource, pipelineCaptureCoordinator, nestStateTeardown,
-                pipelineActuationOwnership);
+                pipelineActuationOwnership, executionPlans, Clock.systemUTC());
     }
 }

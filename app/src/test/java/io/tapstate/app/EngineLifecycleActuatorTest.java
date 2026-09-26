@@ -458,7 +458,7 @@ class EngineLifecycleActuatorTest {
             return new StartPreparation(
                     capacityOf(pipelineId), stateLocations(pipelineId, defaultDatabase),
                     Optional.of(artifactSnapshot),
-                    fence -> dagFor(pipelineId, fence));
+                    fence -> plannedDagFor(pipelineId, fence));
         }
 
         /** Keeps no state, so there is nothing for a budget to be applied to. */

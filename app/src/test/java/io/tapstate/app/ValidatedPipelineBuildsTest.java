@@ -18,6 +18,7 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.engine.nest.NestSettings;
+import io.tapstate.core.model.BatchSpec;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -174,10 +175,35 @@ class ValidatedPipelineBuildsTest {
         assertThat(sourceAllowing(store, 2).dagFor("nested")).isNotNull();
     }
 
+    /**
+     * A run is planned over the members read as it is built - the plan names them, and every node's width was
+     * worked out for exactly that many - and carries the batch each node takes its input in: the one written on
+     * it, or the default where none was.
+     */
+    @Test
+    void aRunIsPlannedOverTheMembersItWasBuiltForWithEveryNodesBatch() {
+        InMemoryStorePort store = validated(SOURCE, TARGET, PIPELINE.replace(
+                "sync: [ { id: sync_1, source: orders_dest } ]",
+                "sync: [ { id: sync_1, source: orders_dest, "
+                        + "execution: { batch: { max_records: 64, max_wait: 20ms } } } ]"));
+        discovered(store, "orders_src", "orders", List.of("id"));
+
+        DagSource.PlannedDag planned = sourceAllowing(store, 128).plannedDagFor("p", null);
+
+        assertThat(planned.members()).containsExactly("member-1");
+        assertThat(planned.shape().plannedMembers()).isEqualTo(planned.members().size());
+        assertThat(planned.shape().nodes()).containsKeys("orders_src", "keep_even", "serve.sync_1");
+        assertThat(planned.batches()).containsOnlyKeys("orders_src", "keep_even", "serve.sync_1");
+        assertThat(planned.batches().get("serve.sync_1").effectiveMaxRecords()).isEqualTo(64);
+        assertThat(planned.batches().get("serve.sync_1").effectiveMaxWaitMillis()).isEqualTo(20L);
+        assertThat(planned.batches().get("keep_even").effectiveMaxRecords())
+                .isEqualTo(BatchSpec.DEFAULT_MAX_RECORDS);
+    }
+
     /** The assembled source on one member, allowed {@code threads} threads for vertices that hold one each. */
     private static StoreBackedDagSource sourceAllowing(InMemoryStorePort store, int threads) {
         return new StoreBackedDagSource(store, NestSettings.defaults(), StoreReachability.assumingReachable(),
-                SourcePlacement.anyMember(), () -> 1, new ParallelismBudget(16, 8, 262144, threads));
+                SourcePlacement.anyMember(), () -> List.of("member-1"), new ParallelismBudget(16, 8, 262144, threads));
     }
 
     @Test

@@ -167,15 +167,18 @@ final class PipelineActuationOwnership {
         return due ? acquire(pipelineId, state, now) : Permit.denied();
     }
 
-    /** Whether a run may be submitted, and the generations that fence it (none on a single node). */
-    record Execution(boolean allowed, ExecutionFence fence) {
+    /**
+     * Whether a run may be submitted, the generations that fence it, and the committed topology the claim behind
+     * it was held under - none of either on a single node.
+     */
+    record Execution(boolean allowed, ExecutionFence fence, Long topologyRevision) {
 
         static Execution unfenced() {
-            return new Execution(true, null);
+            return new Execution(true, null, null);
         }
 
         static Execution refused() {
-            return new Execution(false, null);
+            return new Execution(false, null, null);
         }
     }
 
@@ -222,7 +225,8 @@ final class PipelineActuationOwnership {
         // submitted because a member went away, into a cluster that is still settling from it. Clearing
         // the moment here would make the very next death of this run read as the pipeline's own.
         return new Execution(true, new ExecutionFence(
-                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()));
+                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()),
+                state.claim.topologyRevision());
     }
 
     /**
