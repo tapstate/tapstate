@@ -8,7 +8,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** The unmeasured terminal checkpoint has exact physical writes for each target collection. */
+/** The unmeasured terminal checkpoint requires each final target and bounds optional Nest refinement. */
 class BenchmarkTerminalTargetChangesTest {
 
     @Test
@@ -24,13 +24,15 @@ class BenchmarkTerminalTargetChangesTest {
     }
 
     @Test
-    void statefulTerminalSeparatesJoinInsertFromNestedRootInsertAndUpdate() {
+    void statefulTerminalRequiresBothFinalTargetsAndAllowsOneNestedRefinement() {
         BenchmarkWorkloadDefinitions.Workload stateful = BenchmarkWorkloadDefinitions.byId("stateful");
         List<BenchmarkWorkloadDefinitions.TargetExpectation> targets = stateful.phase("terminal").targets();
         assertThat(BenchmarkTerminalTargetChanges.forTarget(stateful, targets.getFirst()))
                 .containsExactly(insert("900011"));
         assertThat(BenchmarkTerminalTargetChanges.forTarget(stateful, targets.get(1)))
-                .containsExactly(insert("900013"), update("900013"));
+                .containsExactly(insert("900013"));
+        assertThat(BenchmarkTerminalTargetChanges.optionalForTarget(stateful, targets.get(1)))
+                .containsExactly(update("900013"));
         assertThat(stateful.phase("terminal").expectedLogicalOutputChanges()).isEqualTo(2);
     }
 

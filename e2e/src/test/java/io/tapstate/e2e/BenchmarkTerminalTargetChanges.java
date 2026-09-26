@@ -5,10 +5,10 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Physical Mongo changes owed by the fixed terminal source rows. These are unmeasured checkpoint
- * events, registered before terminal SQL and checked after terminal target ACK. A nested root is first
- * inserted and then updated when its child arrives, so its two physical writes are distinct from the
- * workload phase's logical output count.
+ * Required Mongo changes owed by the fixed terminal source rows. These are unmeasured checkpoint
+ * events, registered before terminal SQL and checked after terminal target ACK. A nested root and child
+ * may arrive in either order: both produce one final target document, while a child arriving after the
+ * root adds one allowed update. The source ACK and final target content settle both cases.
  */
 final class BenchmarkTerminalTargetChanges {
 
@@ -66,10 +66,20 @@ final class BenchmarkTerminalTargetChanges {
                 requireTarget(target, "bench_stateful_nest", "bench_nest_orders",
                         BenchmarkWorkloadDefinitions.Projection.NEST,
                         BenchmarkWorkloadDefinitions.TargetLocation.EXTERNAL_MONGO);
-                yield List.of(insert("900013"), update("900013"));
+                yield List.of(insert("900013"));
             }
             default -> throw new IllegalArgumentException("unknown benchmark workload: " + workload.id());
         };
+    }
+
+    /** One optional physical refinement when a nested child arrives after its root. */
+    static List<BenchmarkMongoDeliveryObserver.ExpectedChange> optionalForTarget(
+            BenchmarkWorkloadDefinitions.Workload workload,
+            BenchmarkWorkloadDefinitions.TargetExpectation target) {
+        forTarget(workload, target); // Keep the target address, SQL and source-terminal checks identical.
+        return "stateful".equals(workload.id())
+                && target.projection() == BenchmarkWorkloadDefinitions.Projection.NEST
+                ? List.of(update("900013")) : List.of();
     }
 
     private static void requireSourceTerminals(BenchmarkWorkloadDefinitions.Workload workload,

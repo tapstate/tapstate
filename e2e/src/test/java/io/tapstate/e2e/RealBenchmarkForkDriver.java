@@ -35,6 +35,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         }
     }
 
+    /** Required target coverage excludes an optional terminal Nest update caused by arrival order. */
     record Evidence(String forkId, BenchmarkWorkloadDefinitions.Workload workload,
                     PipelineBenchmarkComparison.Arm arm, Path applicationJar,
                     List<MeasuredPhase> phases, BenchmarkResourceSampler.Summary resources,
@@ -404,6 +405,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             for (BenchmarkWorkloadDefinitions.TargetExpectation target : terminal.targets()) {
                 observer(target).expectUnmeasured(terminal.id(),
                         BenchmarkTerminalTargetChanges.forTarget(workload, target));
+                observer(target).allowOptionalUnmeasured(terminal.id(),
+                        BenchmarkTerminalTargetChanges.optionalForTarget(workload, target));
             }
         }
 
