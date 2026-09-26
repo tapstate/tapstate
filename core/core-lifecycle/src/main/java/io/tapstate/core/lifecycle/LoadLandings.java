@@ -1,10 +1,10 @@
-package io.tapstate.runtime.engine;
+package io.tapstate.core.lifecycle;
 
 import java.util.List;
 
 /**
- * Answers, from what the pipeline's writers have durably recorded, which of a set of initial loads are still
- * landing. Resolved on the member a source runs on, by the {@link SinkAckFactory} its sinks record through.
+ * Answers, from what a pipeline's writers have durably recorded, which of a set of initial loads are still
+ * landing. Resolved on the member a source runs on, from the same record its sinks write their progress to.
  */
 @FunctionalInterface
 public interface LoadLandings {

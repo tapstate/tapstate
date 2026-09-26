@@ -4,6 +4,8 @@ import com.hazelcast.cluster.Address;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
+import io.tapstate.core.lifecycle.HoldsChangesForLoads;
+import io.tapstate.core.lifecycle.LoadLandings;
 import java.security.Permission;
 import java.util.Collection;
 import java.util.List;
@@ -90,13 +92,18 @@ final class LoadGatedSource implements ProcessorMetaSupplier {
         return delegate.isReusable();
     }
 
-    /** One member's supplier of the source's processors, handing each the gate as it is made. */
+    /**
+     * One member's supplier of the source's processors, handing each the loads its changes wait for and where
+     * they stand, as read on this member.
+     */
     private static final class Gated implements ProcessorSupplier {
 
         private static final long serialVersionUID = 1L;
 
         private final ProcessorSupplier delegate;
         private final LoadGate gate;
+        // Resolved where the processors are made: the record it reads is bound on the member, not carried.
+        private transient LoadLandings landings;
 
         Gated(ProcessorSupplier delegate, LoadGate gate) {
             this.delegate = Objects.requireNonNull(delegate, "delegate");
@@ -105,6 +112,7 @@ final class LoadGatedSource implements ProcessorMetaSupplier {
 
         @Override
         public void init(Context context) throws Exception {
+            landings = gate.landingsOn(context.hazelcastInstance());
             delegate.init(context);
         }
 
@@ -118,7 +126,7 @@ final class LoadGatedSource implements ProcessorMetaSupplier {
             Collection<? extends Processor> processors = delegate.get(count);
             for (Processor processor : processors) {
                 if (processor instanceof HoldsChangesForLoads holder) {
-                    holder.holdChangesUntil(gate);
+                    holder.holdChangesUntil(gate.awaited(), landings);
                 }
             }
             return processors;

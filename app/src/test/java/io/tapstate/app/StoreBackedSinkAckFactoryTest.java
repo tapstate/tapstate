@@ -15,7 +15,7 @@ import static org.mockito.Mockito.when;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
-import io.tapstate.runtime.engine.AwaitedLoad;
+import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;

@@ -9,6 +9,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.processor.Processors;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;

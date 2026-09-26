@@ -3,7 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
-import io.tapstate.runtime.engine.LoadLandings;
+import io.tapstate.core.lifecycle.LoadLandings;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 

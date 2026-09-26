@@ -1,4 +1,4 @@
-package io.tapstate.runtime.engine;
+package io.tapstate.core.lifecycle;
 
 import java.io.Serializable;
 import java.util.List;
@@ -9,9 +9,9 @@ import java.util.Objects;
  * sink.
  *
  * <p>{@code sink} is the sink vertex the writers belong to, {@code table} the table whose load has to have
- * landed, and {@code writers} every writer of that sink, named as {@link SinkProcessor#writerId} names them.
- * The writers are the sink's own and not every writer the table reaches: what a change could overtake is a
- * load row still being written by a writer of the sink the change is about to reach.
+ * landed, and {@code writers} every writer of that sink, by the names the engine gives them. The writers are
+ * the sink's own and not every writer the table reaches: what a change could overtake is a load row still
+ * being written by a writer of the sink the change is about to reach.
  */
 public record AwaitedLoad(String sink, String table, List<String> writers) implements Serializable {
 

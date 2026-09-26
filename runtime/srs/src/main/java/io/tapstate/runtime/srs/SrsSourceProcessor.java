@@ -1,9 +1,5 @@
 package io.tapstate.runtime.srs;
 
-import io.tapstate.runtime.engine.AwaitedLoad;
-import io.tapstate.runtime.engine.HoldsChangesForLoads;
-import io.tapstate.runtime.engine.LoadGate;
-import io.tapstate.runtime.engine.LoadLandings;
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -15,6 +11,9 @@ import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.AwaitedLoad;
+import io.tapstate.core.lifecycle.HoldsChangesForLoads;
+import io.tapstate.core.lifecycle.LoadLandings;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.core.common.TapstateException;
@@ -51,9 +50,9 @@ import java.util.function.LongConsumer;
  *
  * <p><strong>Where a sink spreads loads over several writers, changes also wait for the loads to land.</strong>
  * Such a sink hands a load row to whichever writer has room and a change to the writer its key belongs to, so
- * a change leaving here could overtake a load row of the same key still being written elsewhere. Given a
- * {@link LoadGate}, this source holds its changes -- and every bound past its own load -- until each load the
- * gate awaits has landed at those writers, as the pipeline's durable record shows it.
+ * a change leaving here could overtake a load row of the same key still being written elsewhere. Given the
+ * loads it could overtake, this source holds its changes -- and every bound past its own load -- until each has
+ * landed at those writers, as the pipeline's durable record shows it.
  *
  * <p>Non-cooperative, exactly as Jet's own SourceBuilder-built source is: it runs on its own thread and backs
  * off between empty fills, so an idle input never spins a shared cooperative thread. It is not fault-tolerant -
@@ -111,9 +110,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     // instance has already taken some of it -- a job restarted mid-load -- cannot vouch for the rows that
     // instance took and never emitted, so it promises nothing about the load and leaves the table owed.
     private boolean vouchesForSnapshot = true;
-    // What this source's changes wait for, when a sink it reaches spreads loads over several writers; null for
-    // a source whose changes leave as soon as they are read.
-    private LoadGate gate;
+    // What this source's changes wait for, when a sink it reaches spreads loads over several writers, and where
+    // those loads stand; null for a source whose changes leave as soon as they are read.
+    private List<AwaitedLoad> awaited;
     private LoadLandings landings;
     // Whether changes are still being held for the gate. It opens once and stays open: a load that has landed
     // does not stop having landed.
@@ -136,8 +135,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private StageTimer timer = StageTimer.none(Stage.SOURCE);
 
     @Override
-    public void holdChangesUntil(LoadGate gate) {
-        this.gate = Objects.requireNonNull(gate, "gate");
+    public void holdChangesUntil(List<AwaitedLoad> awaited, LoadLandings landings) {
+        this.awaited = List.copyOf(awaited);
+        this.landings = Objects.requireNonNull(landings, "landings");
     }
 
     @Override
@@ -162,8 +162,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             awaitingSnapshot = !load.handedOver();
             vouchesForSnapshot = !load.begun();
         }
-        if (gate != null) {
-            landings = gate.landingsOn(context.hazelcastInstance());
+        if (awaited != null) {
             holding = true;
             nextLookNanos = System.nanoTime();
         }
@@ -384,7 +383,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             return;
         }
         nextLookNanos = now + LOOK_INTERVAL_NANOS;
-        List<AwaitedLoad> landing = landings.stillLanding(gate.awaited());
+        List<AwaitedLoad> landing = landings.stillLanding(awaited);
         if (!landing.isEmpty()) {
             if (!vouchesForSnapshot && landing.stream().anyMatch(load -> load.table().equals(src))) {
                 throw new IllegalStateException("source of '" + src + "' in pipeline '" + pipelineId
