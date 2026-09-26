@@ -102,7 +102,8 @@ public final class RateSampler {
                     prior == null ? null : prior.lastWrittenAt(), firstFailedAt));
             throw failed;
         }
-        Instant unresolved = prior == null || gapFrom != null ? null : prior.firstFailedAt();
+        Instant unresolved = prior != null && prior.firstFailedAt() != null
+                && prior.firstFailedAt().isAfter(sample.observedAt()) ? prior.firstFailedAt() : null;
         cadence.put(observation.pipelineId(), new Cadence(scope, sample.observedAt(), unresolved));
         return true;
     }

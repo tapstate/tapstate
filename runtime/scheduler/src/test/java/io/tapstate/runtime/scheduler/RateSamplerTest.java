@@ -226,6 +226,21 @@ class RateSamplerTest {
     }
 
     @Test
+    void aRetryAtTheSameSampleTimeDoesNotLeaveAFalseFutureGap() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        history.failuresRemaining = 1;
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> sampler.appendIfDue(moving(T0, 1)))
+                .hasMessage("injected append failure");
+        assertThat(sampler.appendIfDue(moving(T0, 1))).isTrue();
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(60), 2))).isTrue();
+
+        assertThat(history.gapStarts).containsExactly(null, null);
+    }
+
+
+    @Test
     void scopedRecoveryWritesTheGapInTheSameExecution() {
         RecordingHistory history = new RecordingHistory();
         RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
