@@ -115,14 +115,14 @@ class BenchmarkWorkloadDefinitionsTest {
     void measuredCdcAndColdReadsArePacedAsOneHundredRowBatches() {
         for (BenchmarkWorkloadDefinitions.Workload workload : BenchmarkWorkloadDefinitions.all()) {
             BenchmarkWorkloadDefinitions.Phase cdc = workload.phase("cdc-update");
-            assertThat(cdc.batchInterval()).isEqualTo(Duration.ofMillis(250));
+            assertThat(cdc.batchInterval()).isEqualTo(Duration.ofMillis(1));
             assertThat(cdc.batches()).hasSize(120);
             assertThat(cdc.batches()).allSatisfy(batch ->
                     assertThat(batch).hasSize(workload.id().equals("stateful") ? 2 : 1));
         }
         BenchmarkWorkloadDefinitions.Phase cold = BenchmarkWorkloadDefinitions.byId("stateful")
                 .phase("cold-read");
-        assertThat(cold.batchInterval()).isEqualTo(Duration.ofMillis(250));
+        assertThat(cold.batchInterval()).isEqualTo(Duration.ofMillis(1));
         assertThat(cold.batches()).hasSize(120);
         assertThat(cold.batches()).allSatisfy(batch -> assertThat(batch).hasSize(1));
     }

@@ -67,9 +67,17 @@ class RealBenchmarkForkDriverIT {
             evidence.phases().forEach(phase -> assertThat(phase.reportedRecordsOut())
                     .as("replayed sink work remains visible as a cost beside logical delivery")
                     .isGreaterThanOrEqualTo(phase.acknowledgedOutputs()));
+            long sourceChanges = evidence.phases().stream()
+                    .mapToLong(RealBenchmarkForkDriver.MeasuredPhase::expectedSourceChanges).sum();
+            long sourceIssueNanos = evidence.phases().stream().mapToLong(phase ->
+                    phase.sourceCompletedAtNanos() - phase.firstIssuedAtNanos()).sum();
+            assertThat(sourceIssueNanos).as("source issue time must be measured independently of target ACK")
+                    .isPositive();
             System.out.printf("benchmark-real-fork id=%s jar=%s throughput=%s"
-                            + " acked=%s reportedOut=%s samples=%s mongoCommands=%s observedKeys=%s checksum=%s%n",
+                            + " sourceIssueRate=%s acked=%s reportedOut=%s"
+                            + " samples=%s mongoCommands=%s observedKeys=%s checksum=%s%n",
                     evidence.forkId(), evidence.applicationJar(), result.measurement().recordsOutPerSecond(),
+                    sourceChanges * 1_000_000_000.0 / sourceIssueNanos,
                     evidence.phases().stream().mapToLong(
                             RealBenchmarkForkDriver.MeasuredPhase::acknowledgedOutputs).sum(),
                     evidence.phases().stream().mapToLong(
