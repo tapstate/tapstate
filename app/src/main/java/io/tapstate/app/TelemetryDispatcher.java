@@ -563,22 +563,6 @@ final class TelemetryDispatcher implements AutoCloseable {
                 .filter(scope::equals).isEmpty())) {
             return;
         }
-        if (scope != null && scopes != null) {
-            String pipelineId = prepared.observation().pipelineId();
-            ObservationStore.Scope prior = offeredScopes.put(pipelineId, scope);
-            if ((prior == null || !prior.equals(scope)) && !scopes.continuing(pipelineId, scope)) {
-                try {
-                    export.forgetPipeline(pipelineId);
-                } catch (RuntimeException failed) {
-                    if (prior == null) {
-                        offeredScopes.remove(pipelineId, scope);
-                    } else {
-                        offeredScopes.replace(pipelineId, scope, prior);
-                    }
-                    LOG.warn("Could not release old export series for pipeline {}", pipelineId, failed);
-                }
-            }
-        }
         ObservationPublisher.Prepared frame = scopes == null ? prepared : scopes.continueFrame(prepared, scope);
         Observation observation = frame.observation();
         offerLatest(observation.pipelineId(), new ObservationFrame(frame, scope));
@@ -592,8 +576,18 @@ final class TelemetryDispatcher implements AutoCloseable {
                 if (!stillCurrent(observation.pipelineId(), scope)) {
                     return false;
                 }
+                if (scope != null && scopes != null) {
+                    ObservationStore.Scope prior = offeredScopes.get(observation.pipelineId());
+                    if ((prior == null || !prior.equals(scope))
+                            && !scopes.continuing(observation.pipelineId(), scope)) {
+                        export.forgetPipeline(observation.pipelineId());
+                    }
+                }
                 export.offer(observation.pipelineId(), observation.state(),
                         observation.observedAt(), observation.facts());
+                if (scope != null && scopes != null) {
+                    offeredScopes.put(observation.pipelineId(), scope);
+                }
                 return true;
             });
         }

@@ -30,6 +30,62 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TelemetryDispatcherTest {
 
     @Test
+    void aBlockedExportResetCannotHoldAnotherPipelinesObservationOffer() throws Exception {
+        CountDownLatch resetEntered = new CountDownLatch(1);
+        CountDownLatch releaseReset = new CountDownLatch(1);
+        AtomicInteger fastSaved = new AtomicInteger();
+        MetricsExport export = new MetricsExport() {
+            @Override public void offer(String id, PipelineState state, Instant at, List<MetricFact> facts) { }
+            @Override public void forgetPipeline(String id) {
+                if (id.equals("orders")) {
+                    resetEntered.countDown();
+                    try {
+                        if (!releaseReset.await(5, TimeUnit.SECONDS)) {
+                            throw new IllegalStateException("export reset was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(interrupted);
+                    }
+                }
+            }
+            @Override public void forgetPipelinesOutside(java.util.Collection<String> ids) { }
+        };
+        ObservationStore store = new ObservationStore() {
+            @Override public void save(Observation observation) { }
+            @Override public boolean saveScoped(Observation observation, Scope scope) {
+                if (observation.pipelineId().equals("fast")) {
+                    fastSaved.incrementAndGet();
+                }
+                return true;
+            }
+            @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+            @Override public void delete(String id) { }
+        };
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), store), null,
+                export, scopes, 1, 2)) {
+            ObservationStore.Scope slowScope = scopes.begin("orders", "inc-a", 1);
+            dispatcher.offer(frame(1), slowScope);
+            assertThat(resetEntered.await(5, TimeUnit.SECONDS)).isTrue();
+
+            ObservationStore.Scope fastScope = scopes.begin("fast", "inc-b", 2);
+            Observation fastObservation = new Observation("fast", PipelineState.RUNNING,
+                    Map.of("sequence", 2L), Map.of(), Map.of(), null,
+                    Instant.parse("2026-09-27T10:00:00Z"));
+            ObservationPublisher.Prepared fast = new ObservationPublisher.Prepared(
+                    fastObservation, false, Map.of(), Map.of(), Map.of());
+            java.util.concurrent.CompletableFuture.runAsync(() -> dispatcher.offer(fast, fastScope))
+                    .get(1, TimeUnit.SECONDS);
+            await(() -> fastSaved.get() > 0);
+            releaseReset.countDown();
+        } finally {
+            releaseReset.countDown();
+        }
+    }
+
+    @Test
     void freshExecutionsForgetOnlyTheirOldExportSeriesWhileRebuildingResumeKeepsItsNames()
             throws Exception {
         ObservationScopeRegistry scopes = new ObservationScopeRegistry();
@@ -97,6 +153,7 @@ class TelemetryDispatcherTest {
             ObservationStore.Scope scope = scopes.begin("orders", "inc-a", 1);
             dispatcher.offer(frame(1), scope);
             dispatcher.offer(frame(2), scope);
+            await(() -> resets.get() == 2);
             await(() -> writes.get() > 0);
 
             assertThat(resets).hasValue(2);
