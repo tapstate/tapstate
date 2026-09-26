@@ -34,6 +34,14 @@ public enum HistogramBounds {
             0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
             5.0, 10.0)),
 
+    /** From handing one nonempty batch to the writer until its successful completion. */
+    SINK_BATCH_WRITE_DURATION("tapstate.pipeline.sink.batch.write.duration", List.of(
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0)),
+
+    /** A full sink's wait with unread inbox input, ending when a write frees a slot. */
+    SINK_BACKPRESSURE_DURATION("tapstate.pipeline.sink.backpressure.duration", List.of(
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0)),
+
     /** Time from an accepted or previously refused lifecycle intent until its worker starts. */
     LIFECYCLE_CAPACITY_WAIT("tapstate.process.lifecycle.capacity.wait.duration", List.of(
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0)),

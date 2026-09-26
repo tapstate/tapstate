@@ -7,6 +7,8 @@ import com.hazelcast.config.JoinConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
+import com.hazelcast.jet.Job;
+import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
@@ -17,6 +19,7 @@ import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceRef;
@@ -95,9 +98,16 @@ class PipelineDagRunTest {
                         FromRef.literal("keep_even"), List.of("keep_even")).getOrDefault(ref, List.of()));
 
         CollectingSinkWriter.reset("out");
-        member.getJet().newJob(PipelineDagBuilder.build(pipeline, bindings)).join();
+        Job job = member.getJet().newJob(PipelineDagBuilder.build(pipeline, bindings),
+                new JobConfig().setStoreMetricsAfterJobCompletion(true));
+        job.join();
 
         assertThat(CollectingSinkWriter.collected("out")).containsExactlyInAnyOrder(2, 4);
+        SinkBatchReading batches = Engine.sinkBatchReadingIn(job.getMetrics());
+        assertThat(batches.issuedRecords()).isEqualTo(2L);
+        assertThat(batches.issuedBatches()).isPositive();
+        assertThat(batches.pendingBatches()).isZero();
+        assertThat(batches.writeDuration()).isNotNull();
     }
 
     @Test

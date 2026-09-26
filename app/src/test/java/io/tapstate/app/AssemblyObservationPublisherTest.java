@@ -12,6 +12,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.JetService;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
@@ -92,5 +93,24 @@ class AssemblyObservationPublisherTest {
         assertThat(store.observations().read(PIPELINE).orElseThrow().metrics())
                 .as("the factory binds the frontier port and the publisher names each reading by its chain")
                 .containsEntry("frontierGap." + TABLE, 480L);
+    }
+
+    @Test
+    void projectsOnlyMeasuredSinkBatchesFromTheEnginePort() {
+        InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
+        store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
+        Engine engine = mock(Engine.class);
+        when(engine.sinkBatchReading(PIPELINE)).thenReturn(
+                new SinkBatchReading(1, 2, 2, 1, 1, null, null, null, T0));
+
+        ObservationPublisher publisher = new RuntimeConvergenceConfiguration()
+                .observationPublisher(store, engine, new NoOpCaptureCoordinator());
+        publisher.publish(PIPELINE);
+
+        Observation observed = store.observations().read(PIPELINE).orElseThrow();
+        assertThat(observed.facts()).anySatisfy(fact -> {
+            assertThat(fact.name()).isEqualTo("tapstate.pipeline.sink.batch.pending");
+            assertThat(fact.points().getFirst().value()).isEqualTo(1L);
+        });
     }
 }

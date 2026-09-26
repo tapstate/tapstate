@@ -15,6 +15,7 @@ import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
+import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
@@ -566,6 +567,68 @@ public final class Engine {
     public StageReading stageDurations(String pipelineId) {
         Job job = liveJob(pipelineId);
         return job == null ? StageReading.NONE : stageDurationsIn(job.getMetrics());
+    }
+
+    /** Batch handoff, write completion and sink-side backpressure measured by the live job. */
+    public SinkBatchReading sinkBatchReading(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? SinkBatchReading.NONE : sinkBatchReadingIn(job.getMetrics());
+    }
+
+    /** Reassembles only complete batch counts; a job without a submitted batch reports nothing. */
+    static SinkBatchReading sinkBatchReadingIn(JobMetrics collected) {
+        OptionalLong issued = sumIn(collected, JetSinkUseGauge.ISSUED);
+        OptionalLong records = sumIn(collected, JetSinkUseGauge.RECORDS);
+        OptionalLong pending = sumIn(collected, JetSinkUseGauge.PENDING);
+        OptionalLong limit = sumIn(collected, JetSinkUseGauge.LIMIT);
+        OptionalLong since = maximumIn(collected, JetSinkUseGauge.SINCE);
+        OptionalLong largest = maximumIn(collected, JetSinkUseGauge.LARGEST);
+        if (issued.isEmpty() || issued.getAsLong() == 0 || records.isEmpty() || pending.isEmpty()
+                || limit.isEmpty() || since.isEmpty() || largest.isEmpty()) {
+            return SinkBatchReading.NONE;
+        }
+        OptionalLong backpressured = sumIn(collected, JetSinkUseGauge.BACKPRESSURED);
+        return new SinkBatchReading(issued.getAsLong(), records.getAsLong(), largest.getAsLong(),
+                pending.getAsLong(), limit.getAsLong(),
+                backpressured.isPresent() ? backpressured.getAsLong() : null,
+                sinkDurationIn(collected, JetSinkUseGauge.WRITE, HistogramBounds.SINK_BATCH_WRITE_DURATION),
+                sinkDurationIn(collected, JetSinkUseGauge.WAIT, HistogramBounds.SINK_BACKPRESSURE_DURATION),
+                Instant.ofEpochMilli(since.getAsLong()));
+    }
+
+    private static OptionalLong sumIn(JobMetrics collected, String metric) {
+        long total = 0;
+        boolean seen = false;
+        for (Measurement measurement : collected.get(metric)) {
+            total += measurement.value();
+            seen = true;
+        }
+        return seen ? OptionalLong.of(total) : OptionalLong.empty();
+    }
+
+    private static OptionalLong maximumIn(JobMetrics collected, String metric) {
+        long maximum = Long.MIN_VALUE;
+        for (Measurement measurement : collected.get(metric)) {
+            maximum = Math.max(maximum, measurement.value());
+        }
+        return maximum == Long.MIN_VALUE ? OptionalLong.empty() : OptionalLong.of(maximum);
+    }
+
+    private static HistogramValue sinkDurationIn(JobMetrics collected, String prefix, HistogramBounds bounds) {
+        OptionalLong count = sumIn(collected, prefix + JetSinkUseGauge.COUNT);
+        OptionalLong sum = sumIn(collected, prefix + JetSinkUseGauge.SUM_MICROS);
+        if (count.isEmpty() || sum.isEmpty()) {
+            return null;
+        }
+        List<Long> buckets = new ArrayList<>(bounds.buckets());
+        for (int index = 0; index < bounds.buckets(); index++) {
+            OptionalLong bucket = sumIn(collected, prefix + JetSinkUseGauge.BUCKET + index);
+            if (bucket.isEmpty()) {
+                return null;
+            }
+            buckets.add(bucket.getAsLong());
+        }
+        return bounds.value(count.getAsLong(), sum.getAsLong() / 1_000_000.0, buckets);
     }
 
     /**

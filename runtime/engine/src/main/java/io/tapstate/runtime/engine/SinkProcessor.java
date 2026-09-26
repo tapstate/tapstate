@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.function.LongSupplier;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Drives a {@link SinkWriter} from a Jet vertex: it batches inbound events, keeps a bounded number of
@@ -75,9 +76,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     private final SinkFrontier frontier;
     private final FrontierGauge gauge;
     private final DeliveryGauge supplied;
+    private final SinkUseGauge suppliedUse;
     // Which of the two the readings actually go to, settled at init: the one supplied, or one that reads
     // nothing when this processor turns out not to be running inside a job. See init.
     private DeliveryGauge delivery;
+    private SinkUseGauge use;
     // What has settled since this processor started, kept here because the readings are cumulative and a
     // batch only knows its own rows. Keyed by table, then by the source operation within it.
     private final Map<String, Map<String, Long>> deliveredByTableAndOp = new LinkedHashMap<>();
@@ -97,11 +100,18 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // The clock a row's delivery is measured against, at the moment its write is confirmed. A seam so a
     // duration can be witnessed at a known instant rather than by waiting for real time to pass.
     private final LongSupplier clock;
+    private final LongSupplier nanoClock;
     // Times each batch this sink forms and issues, which is this stage's unit of work.
     private StageTimer timer = StageTimer.none(Stage.SINK);
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();
+    private long issuedBatches;
+    private long issuedRecords;
+    private long largestBatch;
+    private int pendingWrites;
+    private long backpressureFromNanos;
+    private boolean backpressureActive;
     // Bounds that arrived while writes were still in flight, held until they settle, one per axis. A bound
     // proves what is still coming, never what is durable: every event it covers has been taken in by the
     // time it arrives, but the ones sitting in an unsettled batch are not written yet. Handing it to the
@@ -150,11 +160,21 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
             int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock) {
+        this(writer, sinkAck, frontier, maxInFlight, maxBatchSize, gauge, delivery, SinkUseGauge.none(),
+                clock, System::nanoTime);
+    }
+
+    SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
+            int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery,
+            SinkUseGauge use, LongSupplier clock, LongSupplier nanoClock) {
         this.writer = Objects.requireNonNull(writer, "writer");
         this.gauge = Objects.requireNonNull(gauge, "gauge");
         this.supplied = Objects.requireNonNull(delivery, "delivery");
         this.delivery = this.supplied;
+        this.suppliedUse = Objects.requireNonNull(use, "use");
+        this.use = this.suppliedUse;
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.nanoClock = Objects.requireNonNull(nanoClock, "nanoClock");
         if (maxInFlight < 1) {
             throw new IllegalArgumentException("maxInFlight must be at least 1: " + maxInFlight);
         }
@@ -191,7 +211,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         SupplierEx<Processor> supplier = () -> new SinkProcessor(writerFactory.get(), null, null,
-                DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, FrontierGauge.none(), new JetDeliveryGauge());
+                DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, FrontierGauge.none(), new JetDeliveryGauge(),
+                new JetSinkUseGauge(), System::currentTimeMillis, System::nanoTime);
         return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 
@@ -239,6 +260,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         if (instance == null && supplied.readableOnlyOnAJobThread()) {
             this.delivery = DeliveryGauge.none();
         }
+        if (instance == null && suppliedUse.readableOnlyOnAJobThread()) {
+            this.use = SinkUseGauge.none();
+        }
     }
 
     /** What this stage has timed so far, for a witness driving it by hand. */
@@ -281,10 +305,30 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // Tallied while the rows are still here and counted only once the write settles. Holding the
             // envelopes themselves until then would keep a batch's worth of rows alive for the length of a
             // write; this keeps one number per table and operation in it instead.
-            inFlight.add(new InFlightBatch(settlementOf(batch), positions, DeliveredRows.of(batch)));
+            long issuedAt = batch.isEmpty() ? 0L : nanoClock.getAsLong();
+            CompletableFuture<WriteResult> future = settlementOf(batch);
+            AtomicLong completedAt = batch.isEmpty() ? null : new AtomicLong();
+            // The dependent future only becomes done after the completion timestamp is written. Reaping
+            // can be delayed by Jet scheduling, which is backpressure time, not target write time.
+            CompletableFuture<WriteResult> timed = completedAt == null ? future : future.whenComplete(
+                    (result, failure) -> completedAt.set(nanoClock.getAsLong()));
+            inFlight.add(new InFlightBatch(timed, positions, DeliveredRows.of(batch), issuedAt, completedAt));
+            if (!batch.isEmpty()) {
+                issuedBatches++;
+                issuedRecords += batch.size();
+                largestBatch = Math.max(largestBatch, batch.size());
+                pendingWrites++;
+                use.issued(issuedBatches, issuedRecords, largestBatch, pendingWrites, maxInFlight, countingSince);
+            }
         }
         // A saturated in-flight set leaves the rest of the inbox unread; Jet backpressures upstream
         // until reapSettled frees a slot on a later call.
+        if (!inbox.isEmpty() && inFlight.size() == maxInFlight && pendingWrites > 0
+                && !backpressureActive) {
+            backpressureFromNanos = nanoClock.getAsLong();
+            backpressureActive = true;
+            use.backpressured(true);
+        }
     }
 
     @Override
@@ -387,6 +431,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 }
                 throw failure;
             }
+            long writeNanos = batch.completedAtNanos() == null ? -1L
+                    : Math.max(0L, batch.completedAtNanos().get() - batch.issuedAtNanos());
             if (frontier != null) {
                 frontier.settled(batch.positions(), sinkAck);
             }
@@ -400,11 +446,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // this processor's queue and in flight at the target is part of that, not noise around it.
             batch.delivered().foldDurationsInto(settledDurations, clock.getAsLong());
             reportDelivered(batch.delivered().tables());
+            if (writeNanos >= 0) {
+                pendingWrites--;
+                use.settled(writeNanos, pendingWrites);
+            }
             return true;
         });
         if (frontier != null) {
             releaseHeldBounds();
             reportTrailing();
+        }
+        if (backpressureActive && inFlight.size() < maxInFlight) {
+            use.waited(Math.max(0L, nanoClock.getAsLong() - backpressureFromNanos));
+            backpressureActive = false;
+            use.backpressured(false);
         }
     }
 
@@ -487,7 +542,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     /** One outstanding write, what its batch contributes to the frontier, and what it delivers. */
     private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
-            DeliveredRows delivered) {
+            DeliveredRows delivered, long issuedAtNanos, AtomicLong completedAtNanos) {
     }
 
     /**
@@ -622,7 +677,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 // the reading, and a shared one would have each sink's readings land under the other's.
                 processors.add(new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
                         DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, new JetFrontierGauge(),
-                        new JetDeliveryGauge()));
+                        new JetDeliveryGauge(), new JetSinkUseGauge(),
+                        System::currentTimeMillis, System::nanoTime));
             }
             return processors;
         }

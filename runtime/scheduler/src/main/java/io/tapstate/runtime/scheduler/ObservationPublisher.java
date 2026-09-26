@@ -19,6 +19,7 @@ import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.StageReading;
+import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
@@ -181,6 +182,14 @@ public final class ObservationPublisher {
      * of the ring by a source.
      */
     private static final String PROCESS_DURATION_METRIC = "tapstate.pipeline.process.duration";
+    private static final String SINK_BATCH_ISSUED_METRIC = "tapstate.pipeline.sink.batch.issued";
+    private static final String SINK_BATCH_RECORDS_METRIC = "tapstate.pipeline.sink.batch.records";
+    private static final String SINK_BATCH_RECORDS_MAX_METRIC = "tapstate.pipeline.sink.batch.records.max";
+    private static final String SINK_BATCH_PENDING_METRIC = "tapstate.pipeline.sink.batch.pending";
+    private static final String SINK_BATCH_LIMIT_METRIC = "tapstate.pipeline.sink.batch.limit";
+    private static final String SINK_BACKPRESSURED_METRIC = "tapstate.pipeline.sink.backpressured";
+    private static final String SINK_BATCH_WRITE_DURATION_METRIC = "tapstate.pipeline.sink.batch.write.duration";
+    private static final String SINK_BACKPRESSURE_DURATION_METRIC = "tapstate.pipeline.sink.backpressure.duration";
     private static final String STAGE_ATTRIBUTE = MetricAttributes.STAGE;
 
     /**
@@ -366,6 +375,7 @@ public final class ObservationPublisher {
     private final Function<String, CaptureReading> captures;
     private final Function<String, DeliveryReading> deliveries;
     private final Function<String, StageReading> stages;
+    private final Function<String, SinkBatchReading> sinkBatches;
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
     private final Clock clock;
@@ -651,9 +661,32 @@ public final class ObservationPublisher {
             Function<String, DeliveryReading> deliveries,
             Function<String, StageReading> stages,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, stages, id -> SinkBatchReading.NONE, clock);
+    }
+
+    /** The full publisher, including measured sink batch and backpressure facts. */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries,
+            Function<String, StageReading> stages,
+            Function<String, SinkBatchReading> sinkBatches,
+            Clock clock) {
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
         this.stages = Objects.requireNonNull(stages, "stages");
+        this.sinkBatches = Objects.requireNonNull(sinkBatches, "sinkBatches");
         this.clock = Objects.requireNonNull(clock, "clock");
         // Read from the injected clock and not the system one, so a test that drives time can say what
         // the failure counter accumulates from instead of asserting against whenever it happened to run.
@@ -1012,6 +1045,7 @@ public final class ObservationPublisher {
         movement(pipelineId, at, captures.apply(pipelineId), deliveries.apply(pipelineId))
                 .forEach(facts::add);
         spent(pipelineId, at, stages.apply(pipelineId)).ifPresent(facts::add);
+        sinkBatchFacts(pipelineId, at, sinkBatches.apply(pipelineId)).forEach(facts::add);
         load(pipelineId, at, loaded).forEach(facts::add);
         return facts;
     }
@@ -1029,6 +1063,40 @@ public final class ObservationPublisher {
                 Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, STAGE_ATTRIBUTE, stage), spent.start().get(), at,
                 histogram)));
         return Optional.of(new MetricFact(PROCESS_DURATION_METRIC, MetricType.HISTOGRAM, HistogramBounds.UNIT, points));
+    }
+
+    private static List<MetricFact> sinkBatchFacts(String pipelineId, Instant at, SinkBatchReading reading) {
+        if (reading == null || reading.isEmpty()) {
+            return List.of();
+        }
+        Map<String, String> attributes = Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId);
+        Instant since = reading.countingSince();
+        List<MetricFact> facts = new ArrayList<>();
+        facts.add(MetricFact.single(SINK_BATCH_ISSUED_METRIC, MetricType.COUNTER, "{batch}",
+                MetricPoint.accumulated(attributes, since, at, reading.issuedBatches())));
+        facts.add(MetricFact.single(SINK_BATCH_RECORDS_METRIC, MetricType.COUNTER, "{record}",
+                MetricPoint.accumulated(attributes, since, at, reading.issuedRecords())));
+        facts.add(MetricFact.single(SINK_BATCH_RECORDS_MAX_METRIC, MetricType.GAUGE, "{record}",
+                MetricPoint.reading(attributes, at, reading.largestBatch())));
+        facts.add(MetricFact.single(SINK_BATCH_PENDING_METRIC, MetricType.GAUGE, "{batch}",
+                MetricPoint.reading(attributes, at, reading.pendingBatches())));
+        facts.add(MetricFact.single(SINK_BATCH_LIMIT_METRIC, MetricType.GAUGE, "{batch}",
+                MetricPoint.reading(attributes, at, reading.inFlightLimit())));
+        if (reading.backpressuredSinks() != null) {
+            facts.add(MetricFact.single(SINK_BACKPRESSURED_METRIC, MetricType.GAUGE, "{sink}",
+                    MetricPoint.reading(attributes, at, reading.backpressuredSinks())));
+        }
+        if (reading.writeDuration() != null) {
+            facts.add(MetricFact.single(SINK_BATCH_WRITE_DURATION_METRIC, MetricType.HISTOGRAM,
+                    HistogramBounds.UNIT,
+                    MetricPoint.distribution(attributes, since, at, reading.writeDuration())));
+        }
+        if (reading.backpressureDuration() != null) {
+            facts.add(MetricFact.single(SINK_BACKPRESSURE_DURATION_METRIC, MetricType.HISTOGRAM,
+                    HistogramBounds.UNIT,
+                    MetricPoint.distribution(attributes, since, at, reading.backpressureDuration())));
+        }
+        return facts;
     }
 
     /**

@@ -61,6 +61,15 @@ public enum CardinalityBudget {
             Fold.ADDED),
     /** Broken down by stage only, and the stages are a closed set: nothing here can grow, so nothing folds. */
     PROCESS_DURATION("tapstate.pipeline.process.duration", null, Stage.values().length, Fold.ADDED),
+    /** Each sink fact has only the stable pipeline id as a point attribute. */
+    SINK_BATCH_ISSUED("tapstate.pipeline.sink.batch.issued", null, 1, Fold.ADDED),
+    SINK_BATCH_RECORDS("tapstate.pipeline.sink.batch.records", null, 1, Fold.ADDED),
+    SINK_BATCH_RECORDS_MAX("tapstate.pipeline.sink.batch.records.max", null, 1, Fold.HIGHEST),
+    SINK_BATCH_PENDING("tapstate.pipeline.sink.batch.pending", null, 1, Fold.ADDED),
+    SINK_BATCH_LIMIT("tapstate.pipeline.sink.batch.limit", null, 1, Fold.ADDED),
+    SINK_BACKPRESSURED("tapstate.pipeline.sink.backpressured", null, 1, Fold.ADDED),
+    SINK_BATCH_WRITE_DURATION("tapstate.pipeline.sink.batch.write.duration", null, 1, Fold.ADDED),
+    SINK_BACKPRESSURE_DURATION("tapstate.pipeline.sink.backpressure.duration", null, 1, Fold.ADDED),
     SNAPSHOT_ROWS("tapstate.pipeline.snapshot.rows", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
     SNAPSHOT_ROWS_TOTAL("tapstate.pipeline.snapshot.rows.total", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
     /** Codes come from a catalog and from connectors, not from rows, but a connector may contribute any number. */

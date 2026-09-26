@@ -20,6 +20,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -113,6 +114,82 @@ class SinkProcessorTest {
         writer.completeAll();
         drain(processor);
         assertThat(writer.issued()).isEqualTo(5);
+    }
+
+    @Test
+    void a_stalled_batch_reports_pending_and_backpressure_without_acking_early() throws Exception {
+        ManualWriter writer = new ManualWriter();
+        RecordingAck ack = new RecordingAck();
+        RecordingSinkUseGauge use = new RecordingSinkUseGauge();
+        AtomicLong nanos = new AtomicLong();
+        SinkProcessor processor = init(new SinkProcessor(writer, ack, new ContiguousPrefix(), 1, 2,
+                FrontierGauge.none(), DeliveryGauge.none(), use, () -> 1_700_000_000_000L, nanos::get));
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(at("orders", "p1"), at("orders", "p2"), at("orders", "p3")));
+
+        processor.process(0, inbox);
+        assertThat(writer.issued()).isEqualTo(1);
+        assertThat(inbox).hasSize(1);
+        assertThat(ack.calls).isEmpty();
+        assertThat(use.issued).containsExactly("1/2/2/1/1");
+        assertThat(use.active).containsExactly(true);
+        assertThat(use.settled).isEmpty();
+
+        nanos.addAndGet(25_000_000L);
+        processor.tryProcess();
+        assertThat(ack.calls).isEmpty();
+        assertThat(use.waitNanos).isEmpty();
+
+        nanos.addAndGet(75_000_000L);
+        writer.completeOldest();
+        nanos.addAndGet(400_000_000L);
+        processor.tryProcess();
+        assertThat(ack.calls).isEmpty();
+        assertThat(use.settled).containsExactly("100000000/0");
+        assertThat(use.waitNanos).containsExactly(500_000_000L);
+        assertThat(use.active).containsExactly(true, false);
+
+        processor.process(0, inbox);
+        assertThat(use.issued).containsExactly("1/2/2/1/1", "2/3/2/1/1");
+        writer.completeOldest();
+        drain(processor);
+        assertThat(ack.calls).containsExactly("orders=p2");
+    }
+
+    @Test
+    void a_position_only_word_does_not_invent_a_sink_batch() throws Exception {
+        RecordingSinkUseGauge use = new RecordingSinkUseGauge();
+        SinkProcessor processor = init(new SinkProcessor(new RecordingWriter(), new RecordingAck(),
+                new ContiguousPrefix(), 1, 1, FrontierGauge.none(), DeliveryGauge.none(), use,
+                () -> 1_700_000_000_000L, System::nanoTime));
+        TestInbox inbox = new TestInbox();
+        inbox.add(new SettledPositions(Map.of("orders", new ChainPosition(new SourceOrder(1, 1), "p1"))));
+
+        processor.process(0, inbox);
+        drain(processor);
+
+        assertThat(use.issued).isEmpty();
+        assertThat(use.settled).isEmpty();
+        assertThat(use.active).isEmpty();
+    }
+
+    @Test
+    void a_failed_batch_never_reports_a_successful_write_duration_or_advances_the_ack() throws Exception {
+        RecordingSinkUseGauge use = new RecordingSinkUseGauge();
+        RecordingAck ack = new RecordingAck();
+        SinkFailure failure = new SinkFailure("target refused the batch");
+        SinkProcessor processor = init(new SinkProcessor(new FailingWriter(failure), ack,
+                new ContiguousPrefix(), 1, 1, FrontierGauge.none(), DeliveryGauge.none(), use,
+                () -> 1_700_000_000_000L, System::nanoTime));
+        TestInbox inbox = new TestInbox();
+        inbox.add(at("orders", "p1"));
+
+        processor.process(0, inbox);
+
+        assertThatThrownBy(processor::tryProcess).isSameAs(failure);
+        assertThat(use.issued).hasSize(1);
+        assertThat(use.settled).isEmpty();
+        assertThat(ack.calls).isEmpty();
     }
 
     @Test
@@ -776,6 +853,34 @@ class SinkProcessorTest {
         @Override
         public void pinned(Map<String, Long> millisByChain) {
             pinned.add(Map.copyOf(millisByChain));
+        }
+    }
+
+    private static final class RecordingSinkUseGauge implements SinkUseGauge {
+        private final List<String> issued = new ArrayList<>();
+        private final List<String> settled = new ArrayList<>();
+        private final List<Boolean> active = new ArrayList<>();
+        private final List<Long> waitNanos = new ArrayList<>();
+
+        @Override
+        public void issued(long batches, long records, long largestBatch, int pending, int limit,
+                long sinceMillis) {
+            issued.add(batches + "/" + records + "/" + largestBatch + "/" + pending + "/" + limit);
+        }
+
+        @Override
+        public void settled(long writeNanos, int pending) {
+            settled.add(writeNanos + "/" + pending);
+        }
+
+        @Override
+        public void backpressured(boolean value) {
+            active.add(value);
+        }
+
+        @Override
+        public void waited(long nanos) {
+            waitNanos.add(nanos);
         }
     }
 
