@@ -707,17 +707,33 @@ final class Synthetic {
      * writers apart from one instance each.
      */
     static Path lifecycleSink(Path dir, Path trace) {
-        String register = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\");"
-                + "  r.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>((long) e.size(), 0L, 0L)); });";
+        return lifecycleSink(dir, trace, "LifecycleSink", LIFECYCLE_WRITES, "mark(\"init\");");
+    }
+
+    /** As {@link #lifecycleSink}, but a sink that offers no write at all, so no writer of it can open. */
+    static Path lifecycleSinkThatCannotWrite(Path dir, Path trace) {
+        return lifecycleSink(dir, trace, "SilentLifecycleSink", "", "mark(\"init\");");
+    }
+
+    /** As {@link #lifecycleSink}, but one that fails as it starts, having written {@code init}. */
+    static Path lifecycleSinkThatFailsToStart(Path dir, Path trace) {
+        return lifecycleSink(dir, trace, "FailingLifecycleSink", LIFECYCLE_WRITES,
+                "mark(\"init\"); throw new IllegalStateException(\"the target refused the connection\");");
+    }
+
+    private static final String LIFECYCLE_WRITES = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\");"
+            + "  r.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>((long) e.size(), 0L, 0L)); });";
+
+    private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init) {
         String members = "private void mark(String value) throws Exception {"
                 + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
                 + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
-        String code = source("LifecycleSink", "", register, members)
+        String code = source(simpleName, "", register, members)
                 .replace("public void init(TapConnectionContext c) {}",
-                        "public void init(TapConnectionContext c) throws Throwable { mark(\"init\"); }")
+                        "public void init(TapConnectionContext c) throws Throwable { " + init + " }")
                 .replace("public void stop(TapConnectionContext c) {}",
                         "public void stop(TapConnectionContext c) throws Throwable { mark(\"stop\"); }");
-        return SyntheticJar.compileToJar(dir, "synthetic.LifecycleSink", code);
+        return SyntheticJar.compileToJar(dir, "synthetic." + simpleName, code);
     }
 
     /** A sink connector whose writeRecord counts events and reports them all inserted. */

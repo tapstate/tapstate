@@ -69,22 +69,26 @@ public final class PdkSinkPort implements SinkPort {
         PdkConnector connector = sharing.acquire(config.node(), config.connectorId(), ref,
                 () -> started(config, ref));
         Runnable letGo = () -> sharing.release(config.node(), config.connectorId(), ref);
-        WriteRecordFunction write;
         try {
-            write = requireWriteFunction(connector.functions().getWriteRecordFunction());
-        } catch (RuntimeException e) {
+            return writerOver(connector, config, targets, letGo);
+        } catch (Throwable t) {
+            // However the writer failed to open, it lets go of the hold it took: the last hold stops the connector.
             letGo.run();
-            throw e;
+            throw t;
         }
+    }
+
+    /** A writer over {@code connector}, which the writers of its sink share; closing it runs {@code letGo}. */
+    private PdkSinkWriter writerOver(PdkConnector connector, SinkConfig config, Map<String, TargetTable> targets,
+            Runnable letGo) {
+        WriteRecordFunction write = requireWriteFunction(connector.functions().getWriteRecordFunction());
         try {
             PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {
-            letGo.run();
             throw e;
         } catch (Throwable t) {
-            letGo.run();
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         }
     }
@@ -99,14 +103,11 @@ public final class PdkSinkPort implements SinkPort {
                 return null;
             });
             return connector;
-        } catch (TapstateException e) {
-            connector.stopQuietly();
-            connector.close();
-            throw e;
         } catch (Throwable t) {
             connector.stopQuietly();
             connector.close();
-            throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
+            throw t instanceof TapstateException coded
+                    ? coded : PdkSinkWriter.writeFailed(connector.connectorId(), t);
         }
     }
 
