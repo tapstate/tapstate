@@ -33,11 +33,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 class EveryProcessorDeclaresItsStageTest {
 
     /**
-     * The one vertex that runs no processing of its own. A union, and the merge that gives a nest one edge
-     * per stream, are topology: the vertex exists so ordinals downstream stay unique, and nothing is spent
-     * in it that a reader would want to see on its own.
+     * The vertices that run no processing of their own. A union, and the merge that gives a nest one edge
+     * per stream, are topology: the vertex exists so ordinals downstream stay unique. The router in front of
+     * a sink that runs several writers is topology too: all it does is pick which of two edges into those
+     * writers a row takes. Nothing is spent in either that a reader would want to see on its own, and a
+     * router timed under the sink's stage would fill it with units of next to nothing - the shape that hides
+     * a slow writer.
      */
-    private static final String PASSTHROUGH = "io.tapstate.runtime.engine.PassthroughProcessor";
+    private static final Set<String> TOPOLOGY = Set.of(
+            "io.tapstate.runtime.engine.PassthroughProcessor",
+            "io.tapstate.runtime.engine.SinkRouter");
 
     private static JavaClasses tapstateClasses;
 
@@ -58,19 +63,21 @@ class EveryProcessorDeclaresItsStageTest {
     }
 
     @Test
-    @DisplayName("every processor family the engine wires declares its stage, except the passthrough")
+    @DisplayName("every processor family the engine wires declares its stage, except the ones that are topology")
     void everyProcessorDeclaresItsStage() {
         List<JavaClass> processors = processors();
 
-        assertThat(processors).extracting(JavaClass::getName).contains(PASSTHROUGH);
+        assertThat(processors).extracting(JavaClass::getName).containsAll(TOPOLOGY);
         assertThat(processors)
-                .filteredOn(processor -> !processor.getName().equals(PASSTHROUGH))
+                .filteredOn(processor -> !TOPOLOGY.contains(processor.getName()))
                 .allSatisfy(processor -> assertThat(processor.isAssignableTo(Staged.class))
                         .as("%s declares the stage its time is measured under", processor.getName())
                         .isTrue());
-        assertThat(tapstateClasses.get(PASSTHROUGH).isAssignableTo(Staged.class))
-                .as("a passthrough spends no time a reader would want to see on its own")
-                .isFalse();
+        for (String topology : TOPOLOGY) {
+            assertThat(tapstateClasses.get(topology).isAssignableTo(Staged.class))
+                    .as("%s spends no time a reader would want to see on its own", topology)
+                    .isFalse();
+        }
     }
 
     @Test
