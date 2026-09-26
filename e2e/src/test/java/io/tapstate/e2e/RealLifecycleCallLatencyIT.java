@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -59,6 +60,7 @@ class RealLifecycleCallLatencyIT {
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.apply(resources(mysql, targetUri));
             control.discoverSchema(SOURCE, "mysql", mysql);
+            Instant eventWindowStart = Instant.now().minusSeconds(2);
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             awaitState(control, PipelineState.RUNNING);
             awaitCustomer(mongo, target, "snapshot", "the initial snapshot");
@@ -81,12 +83,38 @@ class RealLifecycleCallLatencyIT {
                 previous = pausedValue;
             }
 
+            Instant eventWindowEnd = Instant.now().plusSeconds(30);
+            Await.until("retained lifecycle transition events", WAIT,
+                    () -> stateChanges(control.events(PIPELINE, eventWindowStart, eventWindowEnd)) >= 11,
+                    () -> "events=" + control.events(PIPELINE, eventWindowStart, eventWindowEnd));
+            Map<?, ?> eventPage = control.events(PIPELINE, eventWindowStart, eventWindowEnd);
+            assertThat(eventPage.get("completeness")).isEqualTo("BEST_EFFORT");
+            assertThat(eventPage.get("nextCursor")).isNull();
+            List<?> emitted = (List<?>) eventPage.get("events");
+            assertThat(emitted).allSatisfy(event -> {
+                Map<?, ?> row = (Map<?, ?>) event;
+                assertThat(row.keySet().stream().map(String::valueOf).toList())
+                        .doesNotContain("pipelineIncarnationId", "executionGeneration");
+            });
+            assertThat(stateChanges(eventPage)).isGreaterThanOrEqualTo(11);
+            System.out.printf("lifecycle-event-trace jar=%s stateChanges=%d completeness=%s knownGaps=%d%n",
+                    jar, stateChanges(eventPage), eventPage.get("completeness"),
+                    ((List<?>) eventPage.get("knownGaps")).size());
+
             System.out.printf("lifecycle-call-fixture jar=%s version=%s source=mysql:8.0"
                             + " target=mongo:7.0 readMode=snapshot_and_cdc cycles=%d%n",
                     jar, control.version(), CYCLES);
             report("pause", pauses);
             report("resume", resumes);
         }
+    }
+
+    private static long stateChanges(Map<?, ?> page) {
+        if (!(page.get("events") instanceof List<?> events)) {
+            return 0;
+        }
+        return events.stream().filter(event -> event instanceof Map<?, ?> row
+                && "STATE_CHANGED".equals(row.get("kind"))).count();
     }
 
     private static Call measure(ControlPlane control, LifecycleVerb verb,

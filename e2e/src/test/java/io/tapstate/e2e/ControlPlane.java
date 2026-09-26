@@ -1180,6 +1180,18 @@ final class ControlPlane {
         return response.statusCode() + " " + response.body();
     }
 
+    /** Reads one authenticated, best-effort page of retained lifecycle events over a fixed window. */
+    Map<?, ?> events(String pipelineId, Instant from, Instant to) {
+        String path = "/api/pipelines/" + urlSegment(pipelineId) + "/events?from="
+                + urlSegment(from.toString()) + "&to=" + urlSegment(to.toString());
+        HttpResponse<String> response = send(authedGet(path));
+        expect(response, 200, "read retained pipeline events");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> page)) {
+            throw new AssertionError("pipeline events were not an object: " + response.body());
+        }
+        return page;
+    }
+
     /**
      * Runs the product's own connection test and answers the overall outcome with each check's status.
      *
