@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.ExecutionPlans;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -37,6 +39,7 @@ public final class ClusterPipelineTopologyService {
     private final WorkloadClaimStore claims;
     private final DesiredStore desired;
     private final String clusterId;
+    private final ExecutionPlans plans;
 
     /**
      * @param claims    the workload-claim store, or null on a build that fences nothing -- a single node
@@ -50,11 +53,26 @@ public final class ClusterPipelineTopologyService {
             WorkloadClaimStore claims,
             DesiredStore desired,
             String clusterId) {
+        this(runs, captures, claims, desired, clusterId, ExecutionPlans.NONE);
+    }
+
+    /**
+     * As above, reading how wide each run was planned to run from {@code plans}: a vertex that runs at its node's
+     * width then says the target that node was given and the per-member count worked out for it.
+     */
+    public ClusterPipelineTopologyService(
+            LivePipelineRuns runs,
+            PipelineCaptures captures,
+            WorkloadClaimStore claims,
+            DesiredStore desired,
+            String clusterId,
+            ExecutionPlans plans) {
         this.runs = Objects.requireNonNull(runs, "runs");
         this.captures = Objects.requireNonNull(captures, "captures");
         this.claims = claims;
         this.desired = desired;
         this.clusterId = clusterId;
+        this.plans = Objects.requireNonNull(plans, "plans");
     }
 
     /**
@@ -84,19 +102,45 @@ public final class ClusterPipelineTopologyService {
         Set<String> pipelineIds = new TreeSet<>(desired.pipelineIds());
         Map<String, Set<String>> captureIds = captureIds(pipelineIds);
         Map<WorkloadClaimKey, WorkloadClaimReading> readings = readings(pipelineIds, captureIds);
+        // Every pipeline's plan in one read, for the reason the claims are: a face listing every pipeline must
+        // not ask the cluster once per pipeline.
+        Map<String, ExecutionPlan> planById = runById.isEmpty() ? Map.of() : plans.current(runById.keySet());
         List<ClusterPipelineView> views = new ArrayList<>();
         for (String pipelineId : pipelineIds) {
             LivePipelineRun run = runById.get(pipelineId);
+            ClusterClaimView controller = claimOver(readings, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
             views.add(new ClusterPipelineView(
                     pipelineId,
-                    claimOver(readings, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId),
+                    controller,
                     captureClaims(readings, captureIds.getOrDefault(pipelineId, Set.of())),
                     run == null ? null : run.measuredAt(),
                     run == null ? List.of() : List.copyOf(new TreeSet<>(run.measuredFrom())),
                     run == null ? List.of() : awaitingRebalance(run, members),
-                    run == null ? List.of() : vertices(run, nodeIdByMemberUuid)));
+                    run == null ? List.of()
+                            : vertices(run, nodeIdByMemberUuid, plannedNodes(planById.get(pipelineId), controller))));
         }
         return views;
+    }
+
+    /**
+     * The node each vertex of a run runs the width of, from the plan the run was submitted on - and only that
+     * plan. One written for an earlier execution than the claim now names says nothing about the run executing:
+     * its widths were worked out for another run, and reporting them would put an old answer beside a new run.
+     */
+    private static Map<String, ExecutionPlan.Node> plannedNodes(ExecutionPlan plan, ClusterClaimView controller) {
+        if (plan == null) {
+            return Map.of();
+        }
+        if (controller != null && !Objects.equals(plan.executionGeneration(), controller.executionGeneration())) {
+            return Map.of();
+        }
+        Map<String, ExecutionPlan.Node> byVertex = new HashMap<>();
+        for (ExecutionPlan.Node node : plan.nodes()) {
+            for (String vertex : node.vertices()) {
+                byVertex.put(vertex, node);
+            }
+        }
+        return byVertex;
     }
 
     /**
@@ -213,7 +257,7 @@ public final class ClusterPipelineTopologyService {
     }
 
     private static List<ClusterVertexView> vertices(
-            LivePipelineRun run, Map<String, String> nodeIdByMemberUuid) {
+            LivePipelineRun run, Map<String, String> nodeIdByMemberUuid, Map<String, ExecutionPlan.Node> planned) {
         List<ClusterVertexView> views = new ArrayList<>();
         for (LivePipelineVertex vertex : run.vertices()) {
             List<ClusterProcessorView> processors = new ArrayList<>();
@@ -227,13 +271,15 @@ public final class ClusterPipelineTopologyService {
                         nodeIdByMemberUuid.get(processor.memberUuid())));
             }
             processors.sort((left, right) -> Integer.compare(left.index(), right.index()));
+            // What the plan says of the vertex's node, where the vertex runs at its node's width: a vertex the plan
+            // does not name - one gathering several producers into one, or any vertex of a run with no plan
+            // recorded - asked for nothing, and says so by leaving both absent.
+            ExecutionPlan.Node node = planned.get(vertex.name());
             views.add(new ClusterVertexView(
                     vertex.name(),
-                    // Nothing in the plan pins a vertex's parallelism yet, and nothing computes a
-                    // per-member one, so both are absent rather than reported as whatever ran.
-                    null,
+                    node == null ? null : node.requested(),
                     processors.size(),
-                    null,
+                    node == null ? null : node.computedLocal(),
                     run.executionId(),
                     processors));
         }

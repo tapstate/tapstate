@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.adapters.mongostore.MongoAuthStores;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
@@ -227,7 +228,8 @@ class ControlPlaneConfiguration {
                 new StoreBackedPipelineCaptures(storePort),
                 claims.getIfAvailable(),
                 storePort.desired(),
-                clusterProperties.getId());
+                clusterProperties.getId(),
+                engine == null ? ExecutionPlans.NONE : new HazelcastExecutionPlans(engine));
     }
 
     // ---- the framework-free primitives bound to their control-ring ports ----

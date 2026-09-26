@@ -1,6 +1,8 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.ExecutionPlans;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
@@ -117,13 +119,58 @@ class ClusterPipelineTopologyServiceTest {
                 .containsExactly(new ClusterProcessorView(0, UUID_B, "node-b"));
         assertThat(vertex.effective()).isEqualTo(1);
         assertThat(vertex.requested())
-                .as("what ran is not what was asked for: nothing in the plan pins a vertex's "
-                        + "parallelism yet, and reporting the one processor that happened to run as the "
-                        + "request would make the two impossible to compare once one exists")
+                .as("what ran is not what was asked for: a run with no plan recorded asked for nothing, and "
+                        + "reporting the one processor that happened to run as the request would make the two "
+                        + "impossible to compare")
                 .isNull();
         assertThat(vertex.computedLocal())
-                .as("and no planner has worked out a per-member value, for the same reason")
+                .as("and nothing worked out a per-member value for it, for the same reason")
                 .isNull();
+    }
+
+    @Test
+    void aVertexRunningAtItsNodesWidthSaysTheTargetAndTheCountItsPlanWorkedOut() {
+        claims.put(WorkloadClaimType.PIPELINE_ACTUATION, "orders", "node-b", "boot-b1", 3, 7, true);
+        ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
+                runs(working("route.serve.s"), working("serve.s"), working("serve.s:gather")),
+                PipelineCaptures.none(), claims, desired("orders"), CLUSTER, plannedAt(7L));
+
+        List<ClusterVertexView> vertices = topology.pipelines(MEMBERS).get(0).vertices();
+
+        assertThat(vertices).extracting(ClusterVertexView::name, ClusterVertexView::requested,
+                        ClusterVertexView::computedLocal)
+                .as("the sink and its router run at the sink's width; a vertex the plan does not name "
+                        + "asked for nothing")
+                .containsExactly(tuple("route.serve.s", 8, 3), tuple("serve.s", 8, 3),
+                        tuple("serve.s:gather", null, null));
+    }
+
+    @Test
+    void aPlanWrittenForAnEarlierRunSaysNothingAboutTheRunExecuting() {
+        claims.put(WorkloadClaimType.PIPELINE_ACTUATION, "orders", "node-b", "boot-b1", 3, 7, true);
+        ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
+                runs(working("serve.s")), PipelineCaptures.none(), claims, desired("orders"), CLUSTER,
+                plannedAt(6L));
+
+        ClusterVertexView vertex = topology.pipelines(MEMBERS).get(0).vertices().get(0);
+
+        assertThat(vertex.requested())
+                .as("its widths were worked out for another run, and would put an old answer beside a new one")
+                .isNull();
+        assertThat(vertex.computedLocal()).isNull();
+    }
+
+    /** One working processor of {@code name}, on the second member. */
+    private static LivePipelineVertex working(String name) {
+        return new LivePipelineVertex(name, List.of(new LivePipelineProcessor(0, UUID_B, true)));
+    }
+
+    /** The plan of an execution of {@code orders} with the given generation: its sink eight wide, three a member. */
+    private static ExecutionPlans plannedAt(Long executionGeneration) {
+        ExecutionPlan plan = new ExecutionPlan("orders", 3L, executionGeneration, 4L, List.of("node-a", "node-b",
+                "node-c"), List.of(new ExecutionPlan.Node("serve.s", 8, "explicit", "native", 3, 3, 9,
+                        List.of("rounded-up"), 1024, 0L, List.of("route.serve.s", "serve.s"))), MEASURED);
+        return pipelineIds -> pipelineIds.contains("orders") ? Map.of("orders", plan) : Map.of();
     }
 
     @Test
