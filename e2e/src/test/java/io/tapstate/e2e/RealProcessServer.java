@@ -112,8 +112,8 @@ final class RealProcessServer implements ServerHandle {
      *
      * <p>Only one witness needs this, and it needs it structurally: the reactor builds this build and
      * nothing else, so a case whose subject is what an <em>older</em> binary does when handed a store
-     * this build has migrated cannot get its subject from here. The jar is built beside the run and
-     * named to it.
+     * this build has migrated cannot get its subject from here. The lane supplies the published jar
+     * and names it to this run.
      */
     static RealProcessServer start(String storeUri, Path jar) {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);

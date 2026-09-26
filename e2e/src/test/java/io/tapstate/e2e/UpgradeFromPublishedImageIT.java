@@ -25,8 +25,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.UnaryOperator;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -67,15 +65,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class UpgradeFromPublishedImageIT {
 
-    /**
-     * The released build to upgrade from, taken from the stack that ships with this checkout rather
-     * than named here. A version written into a test is right until the next release and then quietly
-     * wrong; the shipped stack has to name the current release, and a gate on the release path fails
-     * when it does not, so reading it here cannot drift.
-     */
-    private static final Path SHIPPED_STACK = Path.of("..", "deploy", "quickstart", "docker-compose.yml");
-
-    private static final Pattern IMAGE = Pattern.compile("image:\\s*(ghcr\\.io/tapstate/tapstate:\\S+)");
+    /** The last published image before a store recorded its migration version. */
+    private static final String PRE_MIGRATION_IMAGE = "ghcr.io/tapstate/tapstate:0.4.5";
 
     /** The published example this drives. File-ended on purpose: see the class note about paths. */
     private static final String EXAMPLE = "rows-cross-from-a-source-file-to-a-target-file";
@@ -124,7 +115,6 @@ class UpgradeFromPublishedImageIT {
 
     @Test
     void aStoreTheReleasedBuildWroteBecomesWhatAFreshInstallOfThisBuildWouldHave() {
-        String released = releasedImage();
         Path connectorStage = directory("connectors");
         Path connectorJar = E2eConnectorJar.buildInto(connectorStage);
         previousConnectorsDirectory =
@@ -133,7 +123,8 @@ class UpgradeFromPublishedImageIT {
         try (NetworkedMongo mongo = NetworkedMongo.start()) {
             Example upgraded = new Example("upgraded");
             try (PublishedImageServer older = PublishedImageServer.start(
-                    released, mongo.network(), mongo.uriForContainers(UPGRADED), connectorJar, workspace)) {
+                    PRE_MIGRATION_IMAGE, mongo.network(), mongo.uriForContainers(UPGRADED),
+                    connectorJar, workspace)) {
                 upgraded.driveThrough(older);
             }
 
@@ -274,20 +265,6 @@ class UpgradeFromPublishedImageIT {
             return Files.readString(source.resolve("spec.e2e.yml"));
         } catch (IOException e) {
             throw new UncheckedIOException("could not read the example at " + source, e);
-        }
-    }
-
-    private String releasedImage() {
-        try {
-            Matcher found = IMAGE.matcher(Files.readString(SHIPPED_STACK));
-            if (!found.find()) {
-                throw new AssertionError(
-                        "the shipped stack at " + SHIPPED_STACK + " names no published image, so there is "
-                                + "no released build to upgrade from");
-            }
-            return found.group(1);
-        } catch (IOException e) {
-            throw new UncheckedIOException("could not read the shipped stack at " + SHIPPED_STACK, e);
         }
     }
 
