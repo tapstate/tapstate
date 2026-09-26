@@ -13,7 +13,7 @@ import java.util.Optional;
  * kept for a bounded time, so that a rate and a delay can be drawn as lines. A pure interface over the
  * sample model in the core ring (rule R2); it exposes the persistence surface only.
  *
- * <p>This is the one store here that is a series and not a latest state. Two things follow. Nothing is
+ * <p>This is a series and not a latest state. Two things follow. Nothing is
  * ever overwritten: {@link #append} adds and only adds. And nothing is ever trimmed by the writer:
  * samples leave by age, and the adapter behind this port is what makes them leave — a writer that trimmed
  * on its own way in would never trim the history of a pipeline that has stopped writing, which is exactly

@@ -1,17 +1,9 @@
 package io.tapstate.spi.store;
 
 /**
- * The persistence port: one store surface with ten concerns — the artifact truth layer, the pipeline
- * state store (whose transitions land only through the epoch-fencing compare-and-swap), the pipeline
- * desired-state store (plain upsert intent, the split counterpart to the state store), the connection
- * catalog, the discovered source-schema store, the connector distribution registry, the derived
- * connector catalog rows (one normalized capability row per registered connector), the latest
- * connection-test result per connection, the per-pipeline observation store (plain upsert latest
- * projection, read by the monitor read faces), the SRS meta store (one durable coordination
- * record per mining chain), the side record of the columns a step derives for itself, the editor-only
- * Pipeline canvas layout store, the cold layer under a stateful operator, and the channel holding what
- * such an operator could never assemble. A pure interface over the core ring only (rule R2); a store
- * backend (a database adapter) implements the sub-stores behind it.
+ * The persistence port groups the artifact truth, lifecycle state and intent, connector metadata,
+ * current observations, bounded history, coordination, editor layout and operator state. A pure
+ * interface over the core ring only (rule R2); a database adapter implements the sub-stores behind it.
  */
 public interface StorePort {
 
@@ -47,9 +39,14 @@ public interface StorePort {
 
     /**
      * The per-pipeline history of movement samples: appended on a cadence, kept for a bounded time, read by
-     * one pipeline and one time range. The one series among these stores; everything else is a latest state.
+     * one pipeline and one time range.
      */
     RateHistoryStore rateHistory();
+
+    /** The bounded, best-effort event history for each pipeline incarnation. */
+    default PipelineEventStore events() {
+        throw new UnsupportedOperationException("pipeline event history is unavailable");
+    }
 
     /** The SRS meta store: one durable offset / consumer-cursor / schema record per mining chain. */
     SrsMetaStore meta();

@@ -10,6 +10,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PipelineEvent;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.ConnectionTestItem;
@@ -67,6 +68,29 @@ class MongoStorePortIT {
             config:
               host: localhost
             """;
+
+    @Test
+    void eventPortWritesIntoItsOwnBoundedCollection() {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        try (MongoConnection connection = new MongoConnection(
+                new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)))) {
+            connection.verify();
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            Instant at = Instant.now();
+            PipelineEvent event = new PipelineEvent("port-event-1", "orders", "inc-a", 41,
+                    PipelineEvent.Kind.STATE_CHANGED, at, PipelineState.NEW, PipelineState.RUNNING,
+                    null, null, null);
+
+            port.events().append(event);
+            assertThat(port.events().readPage("orders", "inc-a", at.minusSeconds(1),
+                    at.plusSeconds(1), null, 10).events()).containsExactly(event);
+            try (MongoClient raw = MongoClients.create(uri)) {
+                String databaseName = new ConnectionString(uri).getDatabase();
+                assertThat(raw.getDatabase(databaseName).getCollection(MongoStorePort.PIPELINE_EVENTS)
+                        .countDocuments(new Document("_id", event.id()))).isEqualTo(1);
+            }
+        }
+    }
 
     @Test
     void scopedLatestRejectsDelayedExecutionsAndKeepsOneDocument() {

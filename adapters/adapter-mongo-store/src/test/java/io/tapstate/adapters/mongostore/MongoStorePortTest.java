@@ -22,6 +22,7 @@ class MongoStorePortTest {
                 MongoStorePort.PIPELINE_STATE,
                 MongoStorePort.PIPELINE_DESIRED,
                 MongoStorePort.PIPELINE_OBSERVATION,
+                MongoStorePort.PIPELINE_EVENTS,
                 MongoStorePort.PIPELINE_LAYOUTS,
                 MongoStorePort.CONNECTIONS,
                 MongoStorePort.SOURCE_SCHEMAS,
@@ -33,7 +34,8 @@ class MongoStorePortTest {
                 MongoStorePort.SRS_CONSUMER_OFFSETS,
                 MongoAuthStores.CLUSTER_IDENTITY))
                 .doesNotHaveDuplicates()
-                .containsExactly("artifacts", "pipeline_state", "pipeline_desired", "pipeline_observation", "pipeline_layouts",
+                .containsExactly("artifacts", "pipeline_state", "pipeline_desired", "pipeline_observation",
+                        "pipeline_events", "pipeline_layouts",
                         "connections", "source_schemas", "connector_artifacts", "connector_catalog",
                         "connector_specs", "connection_test_results", "srs_meta", "srs_consumer_offsets",
                         "cluster_identity");

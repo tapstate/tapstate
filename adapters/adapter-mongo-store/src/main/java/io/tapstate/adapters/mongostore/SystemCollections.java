@@ -149,6 +149,15 @@ public enum SystemCollections {
             new IndexSpec(List.of("miningChainId"), false),
             new IndexSpec(List.of("pipelineId"), false)),
 
+    /**
+     * Low-frequency pipeline events, one document per event. The age index bounds stopped pipelines too;
+     * the compound index pages one incarnation without scanning other resources or executions.
+     */
+    PIPELINE_EVENTS(MongoStorePort.PIPELINE_EVENTS, Database.STORE, MongoPipelineEventStore.class,
+            Strategy.MIGRATED, 12,
+            new IndexSpec(List.of("occurredAt"), false, MongoPipelineEventStore.DEFAULT_RETENTION.toSeconds()),
+            new IndexSpec(List.of("pipelineId", "pipelineIncarnationId", "occurredAt", "_id"), false)),
+
     // ---- the operator-state database: not versioned here, but still taken from here ----
 
     OPERATOR_STATE(MongoStorePort.OPERATOR_STATE, Database.NEST, MongoKeyedStateStore.class,
