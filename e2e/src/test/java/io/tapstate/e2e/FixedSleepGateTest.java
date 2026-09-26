@@ -124,7 +124,11 @@ class FixedSleepGateTest {
             // bounded loops - one waiting on the durable record naming the tables a sink confirmed,
             // one on per-table read counts that have stopped moving, one on rows in the target. Each
             // loop's condition decides the outcome; the sleep only spaces the reads out.
-            entry("test/java/io/tapstate/e2e/PauseInSnapshotResumesAtTheUnfinishedTableIT.java", 1L));
+            entry("test/java/io/tapstate/e2e/PauseInSnapshotResumesAtTheUnfinishedTableIT.java", 1L),
+            // Counts who is connected to a database while connector instances write to it: one sleep()
+            // spacing the counts out, in a loop the writers finishing ends. What it measures is the most
+            // connected at once, so the loop runs for as long as the writing does and no longer.
+            entry("test/java/io/tapstate/e2e/AConnectorInstanceHoldsTheConnectionsTheDocumentationGivesIT.java", 1L));
 
     private static final Pattern SLEEP = Pattern.compile(
             "Thread\\s*\\.\\s*sleep\\s*\\(|TimeUnit\\s*\\.\\s*[A-Z_]+\\s*\\.\\s*sleep\\s*\\(");

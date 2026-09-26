@@ -287,7 +287,7 @@ No explanation rule reads it; it answers beside the diagnosis.
 | `nodes[].reasons` | Stable ids for why the width is what it is: `requested-one`, `source-reads-not-split`, `single-target-keyless`, `key-not-derivable`, `rounded-up`, `rounded-down`, or `budget:<name>` |
 | `nodes[].batch` | `maxRecords` and `maxWaitMillis`: the batch the node takes its input in |
 | `nodes[].change` | How the node's width moved from the run before: `previousEffective`, and `causes` naming each input that moved it apart - `members-changed`, `target-changed`, `capability-changed`. Absent where the width did not move |
-| `nodes[].resources` | Sinks only: `writers`; `connectorMode` (`isolated`: a connector per writer, `shared`: one per member, used only for an artifact certified to be shared) and `connectorInstances`; `bufferedRecords`, two batches per writer; and `edgeQueueRecords`, a full queue from every processor sending into the sink to every processor it takes its input on. These are upper bounds worked out before anything opens. A connector's own connection pool is sized inside the connector and is not counted |
+| `nodes[].resources` | Sinks only: `writers`; `connectorMode` (`isolated`: a connector per writer, `shared`: one per member, used only for an artifact certified to be shared) and `connectorInstances`; `bufferedRecords`, two batches per writer; and `edgeQueueRecords`, a full queue from every processor sending into the sink to every processor it takes its input on. These are upper bounds worked out before anything opens. A connector's own connection pool is sized inside the connector and is not counted; see [Connections behind a connector instance](#connections-behind-a-connector-instance) |
 
 Beside the plan, both faces send `awaitingRebalance`: members of the cluster the plan was not worked
 out for, by stable id. A running pipeline keeps the members it was planned over, so a member that joins
@@ -296,6 +296,23 @@ run rebuilt after a member was lost, whose plan names the run it `replaces`.
 
 The status watch stream does not carry the plan. Read `status` again after a restart to see the new
 run's plan.
+
+### Connections behind a connector instance
+
+`connectorInstances` counts connector instances, not connections: how many connections an instance opens is
+decided inside the connector. Multiply the instances by the figure below for the most a sink's connectors hold
+at once. It is a ceiling: some connectors open a connection only for part of a write, and some share part of
+their pool among their instances in one server, so several instances can hold fewer, as the last column shows.
+None holds more.
+
+| Connector | Most connections one instance holds | Four instances in one server, most measured |
+|---|---|---|
+| MySQL | 2 | 5 |
+| PostgreSQL | 1 | 4 |
+| MongoDB | 3 | 12 |
+| SQL Server | 2 | 6 |
+
+Measured against each database, with one writer per instance writing batches of fifty rows at the same time.
 
 ## Coded errors and operator response
 
