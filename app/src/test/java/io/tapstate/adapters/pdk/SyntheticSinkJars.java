@@ -35,4 +35,12 @@ public final class SyntheticSinkJars {
     public static Path preparationSink(Path workDir, Path trace, boolean exists) {
         return Synthetic.preparationSink(workDir, trace, exists);
     }
+
+    /**
+     * A sink connector that writes one line to {@code trace} as it starts ({@code init}), as each write call
+     * reaches it ({@code write}) and as it stops ({@code stop}).
+     */
+    public static Path lifecycleSink(Path workDir, Path trace) {
+        return Synthetic.lifecycleSink(workDir, trace);
+    }
 }

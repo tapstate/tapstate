@@ -701,6 +701,25 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.PreparationSink", code);
     }
 
+    /**
+     * A sink connector that writes one line to {@code trace} as it starts ({@code init}), as each write call
+     * reaches it ({@code write}) and as it stops ({@code stop}) - which is what tells one instance serving several
+     * writers apart from one instance each.
+     */
+    static Path lifecycleSink(Path dir, Path trace) {
+        String register = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\");"
+                + "  r.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>((long) e.size(), 0L, 0L)); });";
+        String members = "private void mark(String value) throws Exception {"
+                + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
+                + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
+        String code = source("LifecycleSink", "", register, members)
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) throws Throwable { mark(\"init\"); }")
+                .replace("public void stop(TapConnectionContext c) {}",
+                        "public void stop(TapConnectionContext c) throws Throwable { mark(\"stop\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.LifecycleSink", code);
+    }
+
     /** A sink connector whose writeRecord counts events and reports them all inserted. */
     static Path countingSink(Path dir) {
         String register = "functions.supportWriteRecord((context, events, table, consumer) -> {"

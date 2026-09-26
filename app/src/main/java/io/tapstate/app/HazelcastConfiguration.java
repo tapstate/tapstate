@@ -14,6 +14,7 @@ import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.adapters.pdk.SharedSinkConnectors;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.EnvelopeSerializer;
@@ -162,6 +163,10 @@ class HazelcastConfiguration {
         if (connectorProvisioner != null) {
             member.getUserContext().put(
                     PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY, connectorProvisioner);
+            // One table of shared sink connectors per member. Only an artifact certified to serve several writers
+            // at once ever enters it; every other artifact runs a connector per writer, as it always has.
+            member.getUserContext().put(
+                    PdkSinkWriterFactory.SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY, new SharedSinkConnectors());
         }
         // Bind the layer a connector's own notes are kept in onto the member, for the same reason the
         // provisioner is: the sink-writer factory crosses to whichever member runs the sink vertex and a live

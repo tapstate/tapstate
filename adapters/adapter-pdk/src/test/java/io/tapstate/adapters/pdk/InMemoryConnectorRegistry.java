@@ -22,6 +22,8 @@ final class InMemoryConnectorRegistry implements ConnectorRegistry {
     private final List<ConnectorRegistration> registrations = new ArrayList<>();
     private final Map<String, byte[]> bytesByHash = new LinkedHashMap<>();
     int artifactCalls;
+    /** Certifications that one instance may serve several writers, by content hash. */
+    final Map<String, String> shareSafe = new java.util.HashMap<>();
 
     @Override
     public RegistrationOutcome register(
@@ -48,6 +50,11 @@ final class InMemoryConnectorRegistry implements ConnectorRegistry {
         artifactCalls++;
         byte[] bytes = bytesByHash.get(contentHash);
         return bytes == null ? Optional.empty() : Optional.of(bytes.clone());
+    }
+
+    @Override
+    public Optional<String> shareSafeCertification(String connectorId, String contentHash) {
+        return Optional.ofNullable(shareSafe.get(contentHash));
     }
 
     @Override

@@ -5,6 +5,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkSinkPort;
+import io.tapstate.adapters.pdk.SharedSinkConnectors;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.runtime.engine.PreparesTargets;
 import io.tapstate.spi.sink.DdlPolicy;
@@ -59,6 +60,13 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
      */
     static final String CONNECTOR_STATE_STORE_USER_CONTEXT_KEY = "tapstate.pdk.connector-state-store";
 
+    /**
+     * The member user-context key under which the member's table of shared sink connectors is bound: where an
+     * artifact is certified for it, the writers of one sink on the member share one connector through it. A
+     * member with none bound opens one connector per writer, whatever the artifact.
+     */
+    static final String SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY = "tapstate.pdk.shared-sink-connectors";
+
     private final String connectorId;
     private final Map<String, Object> settings;
     private final WriteMode writeMode;
@@ -111,7 +119,14 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     @Override
     public SinkWriter getEx() {
         HazelcastInstance member = localMember();
-        return new PdkSinkPort(provisioner(member), stateStore(member)).openPrepared(config(), targets);
+        return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member))
+                .openPrepared(config(), targets);
+    }
+
+    /** The member's table of shared sink connectors, or null where none is bound. */
+    private static SharedSinkConnectors sharing(HazelcastInstance member) {
+        Object bound = member.getUserContext().get(SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY);
+        return bound instanceof SharedSinkConnectors sharing ? sharing : null;
     }
 
     @Override

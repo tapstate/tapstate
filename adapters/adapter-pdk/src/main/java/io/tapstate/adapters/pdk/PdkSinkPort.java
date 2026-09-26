@@ -21,6 +21,7 @@ public final class PdkSinkPort implements SinkPort {
 
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
+    private final SharedSinkConnectors sharing;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkSinkPort(ConnectorProvisioner provisioner) {
@@ -28,8 +29,17 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore) {
+        this(provisioner, stateStore, null);
+    }
+
+    /**
+     * As above, sharing one connector among the writers of a sink where its artifact is certified for that, as
+     * {@code sharing} keeps them on this member; null opens one per writer whatever the artifact.
+     */
+    public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, SharedSinkConnectors sharing) {
         this.provisioner = provisioner;
         this.stateStore = stateStore;
+        this.sharing = sharing;
     }
 
     @Override
@@ -39,17 +49,65 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
-        return open(config, targets, false);
+        return open(config, provisioner.resolve(config.connectorId()), targets, false);
     }
 
     /**
      * A writer for tables prepared before it opened, by {@link #prepare}: refused, before any connector is opened,
      * unless each one was; then it only writes rows. Several writers of one sink open this way, and none of them
      * clears a table another has started writing.
+     *
+     * <p>Each opens a connector of its own, unless the artifact is certified to be shared: then the writers of a
+     * sink on this member share one, started by the first of them and stopped by the last.
      */
     public SinkWriter openPrepared(SinkConfig config, Map<String, TargetTable> targets) {
         PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values());
-        return open(config, targets, true);
+        ConnectorRef ref = provisioner.resolve(config.connectorId());
+        if (sharing == null || config.node() == null || !ref.shareSafe()) {
+            return open(config, ref, targets, true);
+        }
+        PdkConnector connector = sharing.acquire(config.node(), config.connectorId(), ref,
+                () -> started(config, ref));
+        Runnable letGo = () -> sharing.release(config.node(), config.connectorId(), ref);
+        WriteRecordFunction write;
+        try {
+            write = requireWriteFunction(connector.functions().getWriteRecordFunction());
+        } catch (RuntimeException e) {
+            letGo.run();
+            throw e;
+        }
+        try {
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo);
+            writer.prepareTargets();
+            return writer;
+        } catch (TapstateException e) {
+            letGo.run();
+            throw e;
+        } catch (Throwable t) {
+            letGo.run();
+            throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
+        }
+    }
+
+    /** A connector opened and started for the writers that will share it, stopped again if it fails to start. */
+    private PdkConnector started(SinkConfig config, ConnectorRef ref) {
+        PdkConnector connector = PdkConnector.open(
+                config.connectorId(), ref, config.settings(), config.node(), stateStore);
+        try {
+            connector.underLoader(() -> {
+                connector.connector().init(connector.context());
+                return null;
+            });
+            return connector;
+        } catch (TapstateException e) {
+            connector.stopQuietly();
+            connector.close();
+            throw e;
+        } catch (Throwable t) {
+            connector.stopQuietly();
+            connector.close();
+            throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
+        }
     }
 
     /**
@@ -84,10 +142,10 @@ public final class PdkSinkPort implements SinkPort {
         }
     }
 
-    private SinkWriter open(SinkConfig config, Map<String, TargetTable> targets, boolean preparedAhead) {
-        PdkConnector connector = PdkConnector.open(
-                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                config.node(), stateStore);
+    private SinkWriter open(SinkConfig config, ConnectorRef ref, Map<String, TargetTable> targets,
+            boolean preparedAhead) {
+        PdkConnector connector = PdkConnector.open(config.connectorId(), ref, config.settings(), config.node(),
+                stateStore);
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());

@@ -45,8 +45,9 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
         ConnectorRegistration registration = resolveRegistration(connectorId);
         Path staged = stage(connectorId, registration.contentHash());
         IntrospectedConnector introspected = introspector.introspect(List.of(staged));
+        boolean shareSafe = registry.shareSafeCertification(connectorId, registration.contentHash()).isPresent();
         return new ConnectorRef(List.of(staged), introspected.className(), introspected.pdkApiVersion(), null,
-                introspected.spec());
+                introspected.spec(), registration.contentHash(), shareSafe);
     }
 
     /** The single registration for the id, refusing with a code when none or more than one matches. */
