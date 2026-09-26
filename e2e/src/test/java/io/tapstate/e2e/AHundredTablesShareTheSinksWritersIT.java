@@ -27,8 +27,8 @@ import org.junit.jupiter.api.io.TempDir;
  * mixing the tables up is that a writer hands its connector one table at a time - a connector writes a batch into
  * the table the batch names, and a batch naming two would be one table's rows written into the other's.
  *
- * <p>Read from the connector's own account of what it wrote, which names the writer and the batch of every row, and
- * from the plan the run was submitted under.
+ * <p>Read from the connector's own account of what it wrote, which names the writer and the batch of every row and the
+ * table each row carries, and from the plan the run was submitted under.
  */
 class AHundredTablesShareTheSinksWritersIT {
 
@@ -74,25 +74,31 @@ class AHundredTablesShareTheSinksWritersIT {
                 Await.until(PIPELINE + " to reach " + PipelineState.RUNNING, Duration.ofMinutes(2),
                         () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> control.state(PIPELINE) + ", failure " + control.failure(PIPELINE));
-                Await.until("every table's rows to cross", Duration.ofMinutes(3),
-                        () -> tables.stream().allMatch(table -> files.count(targetAddress, table) == ROWS_EACH),
-                        () -> "tables not yet whole: " + tables.stream()
-                                .filter(table -> files.count(targetAddress, table) != ROWS_EACH).toList());
+                // Waited for on the connector's account rather than on the tables: a batch that mixed two tables
+                // puts one table's rows into the other's, so the tables would never both come out whole, and the
+                // wait would end on a timeout rather than on the batch that did it. Counted as distinct ids of
+                // each table, by the table each row carries: a row can be written more than once.
+                Await.until("every table's rows to be written", Duration.ofMinutes(3),
+                        () -> idsWrittenByTable(written).size() == TABLES && idsWrittenByTable(written).values()
+                                .stream().allMatch(ids -> ids.size() == ROWS_EACH),
+                        () -> "tables with every row written: " + idsWrittenByTable(written).values().stream()
+                                .filter(ids -> ids.size() == ROWS_EACH).count() + " of " + TABLES);
+
+                List<WriteWitness.Written> rows = written.rows();
+                Map<String, Set<String>> tablesByBatch = rows.stream().collect(Collectors.groupingBy(
+                        WriteWitness.Written::batchId, Collectors.mapping(WriteWitness.Written::rowTable,
+                                Collectors.toSet())));
+                assertThat(tablesByBatch.values())
+                        .as("every batch a writer handed its connector held rows of one table")
+                        .allSatisfy(inOneBatch -> assertThat(inOneBatch).hasSize(1));
+                assertThat(tables)
+                        .as("and every table came out whole")
+                        .allSatisfy(table -> assertThat(files.count(targetAddress, table)).isEqualTo(ROWS_EACH));
 
                 ControlPlane.Plan plan = Await.answered("the status to carry the run's plan",
                         () -> control.executionPlan(PIPELINE));
                 assertThat(plan.nodeRequested(WRITERS).effective())
                         .as("the sink's width is its writers for every table, not for each").isEqualTo(WRITERS);
-
-                List<WriteWitness.Written> rows = written.rows();
-                assertThat(rows).as("every row the tables hold was written").hasSizeGreaterThanOrEqualTo(
-                        (int) (TABLES * ROWS_EACH));
-                Map<String, Set<String>> tablesByBatch = rows.stream().collect(Collectors.groupingBy(
-                        WriteWitness.Written::batchId, Collectors.mapping(WriteWitness.Written::table,
-                                Collectors.toSet())));
-                assertThat(tablesByBatch.values())
-                        .as("every batch a writer handed its connector held one table")
-                        .allSatisfy(inOneBatch -> assertThat(inOneBatch).hasSize(1));
                 Set<String> writers = rows.stream().map(WriteWitness.Written::writerId).collect(Collectors.toSet());
                 assertThat(writers)
                         .as("the hundred tables were written by the sink's writers, no more of them than its width")
@@ -100,5 +106,11 @@ class AHundredTablesShareTheSinksWritersIT {
                 assertThat(writers).as("and shared between them").hasSizeGreaterThan(1);
             }
         }
+    }
+
+    /** The distinct ids written so far of each table, by the table each row carries. */
+    private static Map<String, Set<String>> idsWrittenByTable(WriteWitness written) {
+        return written.rows().stream().collect(Collectors.groupingBy(WriteWitness.Written::rowTable,
+                Collectors.mapping(WriteWitness.Written::id, Collectors.toSet())));
     }
 }

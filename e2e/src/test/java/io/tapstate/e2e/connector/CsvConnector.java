@@ -135,7 +135,9 @@ public class CsvConnector implements TapConnector {
 
     /**
      * A test affordance naming a directory this connector notes every row it writes into: which process and which
-     * writer wrote it, in which of that writer's batches, as what change, of which table, and its id and sequence.
+     * writer wrote it, in which of that writer's batches, as what change, into which table, its id and sequence, and
+     * the table the row itself carries. The last is what a batch mixing tables shows: a write call names one table and
+     * every row of it lands there, so the table written into cannot tell a mixed batch from a clean one.
      *
      * <p>The write-side mirror of {@link #READ_WITNESS}, for the same reason: which writer a row goes to is decided
      * inside the product, and the far end is the one witness the product cannot shape. A writer is a connector -
@@ -517,7 +519,9 @@ public class CsvConnector implements TapConnector {
             String op = event instanceof TapDeleteRecordEvent ? "d" : event instanceof TapUpdateRecordEvent ? "u" : "i";
             lines.append(pid).append('\t').append(writer).append('\t').append(batch).append('\t').append(op)
                     .append('\t').append(table).append('\t').append(image.get(ID_COLUMN))
-                    .append('\t').append(image.get(SEQ_COLUMN)).append(System.lineSeparator());
+                    .append('\t').append(image.get(SEQ_COLUMN))
+                    .append('\t').append(event.getTableId() == null ? "" : event.getTableId())
+                    .append(System.lineSeparator());
         }
         Path ledger = witness.resolve("writes-" + pid + ".tsv");
         try {

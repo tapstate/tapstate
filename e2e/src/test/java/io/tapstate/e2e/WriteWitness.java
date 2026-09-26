@@ -19,8 +19,13 @@ import java.util.stream.Stream;
  */
 final class WriteWitness {
 
-    /** One row one writer wrote: {@code op} is {@code i}, {@code u} or {@code d}; {@code seq} as the row carried it. */
-    record Written(long pid, String writer, long batch, String op, String table, String id, String seq) {
+    /**
+     * One row one writer wrote: {@code op} is {@code i}, {@code u} or {@code d}; {@code table} the table it was written
+     * into; {@code seq} as the row carried it; {@code rowTable} the table the row itself carries, the one it reached
+     * the sink as. One batch is made for one table, so every row of a batch carries the same one.
+     */
+    record Written(long pid, String writer, long batch, String op, String table, String id, String seq,
+            String rowTable) {
 
         /** The writer, told apart from every other writer in every process. */
         String writerId() {
@@ -55,9 +60,9 @@ final class WriteWitness {
                     .toList()) {
                 for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
                     String[] cells = line.split("\t", -1);
-                    if (cells.length == 7) {
+                    if (cells.length == 8) {
                         rows.add(new Written(Long.parseLong(cells[0]), cells[1], Long.parseLong(cells[2]), cells[3],
-                                cells[4], cells[5], cells[6]));
+                                cells[4], cells[5], cells[6], cells[7]));
                     }
                 }
             }
