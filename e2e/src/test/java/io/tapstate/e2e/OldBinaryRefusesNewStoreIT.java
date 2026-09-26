@@ -34,10 +34,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * compiled without ever seeing it. A migrator that started recording the version anywhere else would
  * leave every seeded case green and this one red.
  *
- * <p><b>Where the second binary comes from.</b> The lane builds it the way the patch release is made:
- * the release tag, plus the one commit that carries the gate, and nothing else. So it is not a fixture
- * standing in for an old build -- it is that build, assembled by the same recipe, and if that recipe
- * stops working the lane says so before anybody tries to ship by it.
+ * <p><b>Where the second binary comes from.</b> The lane takes the jar from the published 0.5.0
+ * image, the first release with the startup gate. That release supports fewer system-data changesets
+ * than this build, so handing it this build's store is a real rollback across a version boundary.
  *
  * <p><b>The control is load-bearing.</b> A binary that cannot start for some unrelated reason -- a bad
  * jar, a missing setting, a port already taken -- looks exactly like one that refused, and would pass
@@ -48,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class OldBinaryRefusesNewStoreIT {
 
-    /** Where the lane leaves the binary it built from the release line. Nothing else sets it. */
+    /** Where the lane leaves the jar it took from the published release image. */
     private static final String OLD_BINARY_JAR = "tapstate.e2e.old-binary-jar";
 
     /** A refusal happens during startup, before anything slow; this is slack, not an expectation. */
@@ -123,9 +122,8 @@ class OldBinaryRefusesNewStoreIT {
         String configured = System.getProperty(OLD_BINARY_JAR);
         if (configured == null || configured.isBlank()) {
             throw new AssertionError(
-                    "no " + OLD_BINARY_JAR + " system property: this witness needs a build of the product "
-                            + "from the release line -- the release tag plus the commit carrying the "
-                            + "startup gate -- and the lane is what builds it");
+                    "no " + OLD_BINARY_JAR + " system property: this witness needs the jar from the "
+                            + "published 0.5.0 image, supplied by the upgrade lane");
         }
         Path jar = Path.of(configured);
         if (!Files.isRegularFile(jar)) {

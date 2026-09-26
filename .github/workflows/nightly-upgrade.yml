@@ -12,12 +12,11 @@
 # carrying the risk by default. See the trigger block for why the alternative is no evidence at all
 # until after the merge.
 #
-# One witness needs a build of the product that is not the one this reactor makes, so the lane builds
-# it: the release line's tag plus the single commit carrying the startup gate, which is how the patch
-# release for that line is itself assembled. Both halves are derived from the repository rather than
-# written down here, because a pinned tag goes stale at the next release and a pinned commit goes stale
-# the moment history moves -- and neither staleness would turn this red, it would just quietly test
-# something else.
+# The rollback witness needs a binary that already shipped with the migration gate but predates the
+# changesets under test. The first such release is 0.5.0; its published image carries the exact jar
+# an operator could roll back to. The forward-upgrade witness starts the last pre-migration image,
+# 0.4.5, so its store really has no recorded migration version. These are historical boundaries,
+# rather than floating "latest" releases: later releases cannot stand in for either side of them.
 #
 # Which classes run is derived from the source rather than listed here. A witness asks for this lane
 # by calling the lane gate, and this reads those calls back. A hand-maintained list fails open: the
@@ -66,10 +65,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-        with:
-          # Tags and history. One witness here runs a build of the product other than this one, and that
-          # build is assembled below from a release tag plus one commit; a shallow checkout has neither.
-          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -90,44 +85,18 @@ jobs:
           echo "classes=$classes" >> "$GITHUB_OUTPUT"
           echo "running: $classes"
 
-      - name: the binary an older release line carries
+      - name: the published binary with the migration gate
         id: old-binary
-        # Assembled the way the patch release for an older line is made: that line's tag, plus the one
-        # commit carrying the startup gate, and nothing else. So the witness that rolls back to it is
-        # not pointed at a fixture standing in for an old build -- it is pointed at that build, made by
-        # that recipe. A recipe that has stopped working is red here, before somebody ships by it.
-        #
-        # Both halves are derived rather than written down. A tag pinned here goes stale at the next
-        # release and a commit pinned here goes stale the moment history moves, and in both cases the
-        # lane would go on testing something other than what it says it tests.
-        #
-        # This arrangement has a designed expiry, and reaching it is meant to be loud. Once a release
-        # ships carrying the gate, the newest tag already contains it, so the search below finds no
-        # commit and this step fails. That is correct: at that point "the binary from the release line"
-        # means a published build rather than one assembled here, and the witness wants rewriting to
-        # reach for that image the way the other one already does. Failing here is what makes somebody
-        # decide it, instead of the witness quietly testing a binary that is no longer older.
         run: |
           set -euo pipefail
-          marker=adapters/adapter-mongo-store/src/main/java/io/tapstate/adapters/mongostore/MigrationError.java
-          base="$(git describe --tags --abbrev=0 HEAD)"
-          gate="$(git log --diff-filter=A --format=%H "$base"..HEAD -- "$marker")"
-          if [ "$(printf '%s\n' "$gate" | grep -c .)" != "1" ]; then
-            echo "expected exactly one commit adding $marker since $base, found: ${gate:-none}." \
-                 "That commit is what a patch release for an older line cherry-picks, so without it" \
-                 "this lane cannot build the binary the rollback witness is supposed to be handed." \
-                 "If the answer is none, the most likely reason is that $base already carries the" \
-                 "gate -- a release has shipped it since this was written. That is this lane's" \
-                 "designed expiry, not a broken script: the witness should now reach for the" \
-                 "published image of a build older than $base rather than assembling one here." >&2
-            exit 1
-          fi
-          echo "building $base + $gate"
-          git worktree add --detach ../old-binary "$base"
-          git -C ../old-binary cherry-pick -n "$gate"
-          (cd ../old-binary && mvn -B -pl app -am -DskipTests package)
-          jar="$(ls ../old-binary/app/target/app-*-boot.jar)"
-          echo "jar=$(cd "$(dirname "$jar")" && pwd)/$(basename "$jar")" >> "$GITHUB_OUTPUT"
+          image=ghcr.io/tapstate/tapstate:0.5.0
+          docker pull "$image"
+          container="$(docker create "$image")"
+          trap 'docker rm "$container" >/dev/null' EXIT
+          jar="$RUNNER_TEMP/tapstate-0.5.0.jar"
+          docker cp "$container:/opt/tapstate/tapstate.jar" "$jar"
+          test -s "$jar"
+          echo "jar=$jar" >> "$GITHUB_OUTPUT"
 
       - name: run them against a published release
         run: >
