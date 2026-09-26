@@ -406,6 +406,12 @@ jobs:
           [[ "$files_sha256" =~ ^[0-9a-f]{64}$ ]]
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
           echo "files-sha256=$files_sha256" >> "$GITHUB_OUTPUT"
+      # The Cloud target consumes this exact Boot JAR. It does not rebuild Web or the server.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-boot-jar
+          path: app/target/app-*-boot.jar
+          if-no-files-found: error
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       # Into a local archive, not a registry. The completeness check reads both architectures out of
@@ -428,6 +434,79 @@ jobs:
         with:
           name: server-image
           path: ${{ runner.temp }}/server-image.tar
+          if-no-files-found: error
+
+  cloud-image:
+    # The image is built and verified before approval, without touching ECR. Its seven connector
+    # bytes and companion license texts must match the versioned lock in this release commit.
+    needs: [version, server-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-boot-jar
+          path: app/target
+      - name: stage the exact published connector and license bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cloud-jars"
+          gh release download connectors-preview --repo tapstate/tapstate \
+            --pattern '*-connector.jar' \
+            --pattern 'MICROSOFT-MIT-LICENSE.txt' \
+            --pattern 'ORACLE-FREE-USE-TERMS.txt' \
+            --dir "$RUNNER_TEMP/cloud-jars"
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-connectors.py \
+            --lock deploy/cloud/connectors.lock.json \
+            --jar-dir "$RUNNER_TEMP/cloud-jars" \
+            --stage-dir "$RUNNER_TEMP/cloud-stage"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: build the Cloud OCI archive from the verified server Boot JAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --progress=plain --target cloud \
+            --platform linux/amd64,linux/arm64 \
+            --build-context "cloud_connectors=$RUNNER_TEMP/cloud-stage" \
+            --build-arg "TAPSTATE_RELEASE_VERSION=${{ needs.version.outputs.version }}" \
+            --build-arg "TAPSTATE_REVISION=${{ needs.version.outputs.sha }}" \
+            --build-arg "TAPSTATE_WEB_REVISION=${{ needs.server-image.outputs.web_revision }}" \
+            --build-arg "TAPSTATE_WEB_FILES_SHA256=${{ needs.server-image.outputs.web_files_sha256 }}" \
+            --output "type=oci,dest=$RUNNER_TEMP/cloud-image.tar" .
+      - name: verify both platforms, Web provenance, and locked inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t boot_jars < <(find app/target -maxdepth 1 -type f -name 'app-*-boot.jar' -print)
+          if [ "${#boot_jars[@]}" -ne 1 ]; then
+            echo "expected exactly one downloaded server Boot JAR" >&2
+            exit 1
+          fi
+          mkdir "$RUNNER_TEMP/cloud-layout"
+          tar -xf "$RUNNER_TEMP/cloud-image.tar" -C "$RUNNER_TEMP/cloud-layout"
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/verify-image.py \
+            --oci-layout "$RUNNER_TEMP/cloud-layout" \
+            --lock deploy/cloud/connectors.lock.json \
+            --boot-jar "${boot_jars[0]}"
+          PYTHONDONTWRITEBYTECODE=1 python3 .github/scripts/web-provenance.py create \
+            --oci-layout "$RUNNER_TEMP/cloud-layout" \
+            --output "$RUNNER_TEMP/cloud-web-provenance-check.json" \
+            --version '${{ needs.version.outputs.version }}' \
+            --tapstate-revision '${{ needs.version.outputs.sha }}' \
+            --web-revision '${{ needs.server-image.outputs.web_revision }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloud-image
+          path: ${{ runner.temp }}/cloud-image.tar
           if-no-files-found: error
 
   connectors:
@@ -514,7 +593,7 @@ jobs:
     #                                          asset before the draft is assembled
     #
     # The six that are steps are the ones nothing else was asking.
-    needs: [version, connectors, join-perf, cli-native, server-image]
+    needs: [version, connectors, join-perf, cli-native, server-image, cloud-image]
     runs-on: ubuntu-latest
     permissions:
       contents: read

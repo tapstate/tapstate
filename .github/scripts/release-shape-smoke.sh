@@ -92,6 +92,21 @@ has   "and explicitly not pushed"               server-image 'push: false'
 has   "and the archive is what gets pushed"     publish      'oci-layout://'
 hasnt "the image is not rebuilt after approval" publish      'build-push-action'
 
+# The Cloud archive reuses the pinned server Boot JAR and rejects any connector, license, Web,
+# or cross-platform byte drift before approval. It must not turn into a second Web build.
+has   "the server exposes one Boot JAR to Cloud"       server-image 'name: server-boot-jar'
+has   "Cloud waits for that Boot JAR"                 cloud-image 'needs:.*server-image'
+has   "Cloud downloads that exact Boot JAR"          cloud-image 'name: server-boot-jar'
+has   "Cloud uses the checked-in connector lock"    cloud-image 'deploy/cloud/connectors.lock.json'
+has   "Cloud stages published connector bytes"      cloud-image 'stage-connectors[.]py'
+has   "Cloud builds its own OCI archive"             cloud-image 'type=oci'
+has   "Cloud verifies its Boot JAR and seed bytes"  cloud-image 'verify-image[.]py'
+has   "Cloud compares the server Boot JAR"           cloud-image '\-\-boot-jar'
+has   "Cloud checks Web files and revision"         cloud-image 'web-provenance[.]py create'
+has   "Cloud retains the checked archive"           cloud-image 'name: cloud-image'
+has   "a failed Cloud image blocks approval"         gates       'needs:.*cloud-image'
+hasnt "Cloud does not rebuild Web"                   cloud-image 'pnpm build|prepare-web-assets[.]sh|mvn .*package'
+
 # C6. The publish step edits the existing release; it never re-sends a body. Re-running the action
 # that assembled the draft would overwrite whatever the approver wrote, and nothing would say so.
 #
