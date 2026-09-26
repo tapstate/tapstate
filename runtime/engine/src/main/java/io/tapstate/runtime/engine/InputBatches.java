@@ -351,7 +351,9 @@ final class InputBatches implements Processor {
         public Collection<? extends Processor> get(int count) {
             List<Processor> processors = new ArrayList<>(count);
             for (Processor processor : delegate.get(count)) {
-                processors.add(new InputBatches(processor, maxRecords, maxWaitNanos, System::nanoTime));
+                // A stand-in takes no input to batch, and wrapped it would no longer be known for one.
+                processors.add(PinnedStandIns.isStandIn(processor)
+                        ? processor : new InputBatches(processor, maxRecords, maxWaitNanos, System::nanoTime));
             }
             return processors;
         }

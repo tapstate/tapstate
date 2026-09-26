@@ -135,7 +135,7 @@ final class TotalOne implements ProcessorMetaSupplier {
         public Collection<? extends Processor> get(int count) {
             List<Processor> made = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
-                made.add(new StandIn(vertex, new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING),
+                made.add(new BoundsStandIn(vertex, new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING),
                         chainsByOrdinal.keySet()));
             }
             return made;
@@ -143,13 +143,13 @@ final class TotalOne implements ProcessorMetaSupplier {
     }
 
     /** A processor where the vertex does not run: it takes no input, and passes on what each edge promised. */
-    static final class StandIn extends AbstractProcessor {
+    static final class BoundsStandIn extends AbstractProcessor {
 
         private final String vertex;
         private final LevelBounds bounds;
         private final Set<Integer> answered;
 
-        StandIn(String vertex, LevelBounds bounds, Set<Integer> answered) {
+        BoundsStandIn(String vertex, LevelBounds bounds, Set<Integer> answered) {
             this.vertex = vertex;
             this.bounds = bounds;
             this.answered = answered;

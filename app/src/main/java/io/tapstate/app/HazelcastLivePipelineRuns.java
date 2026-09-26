@@ -15,6 +15,7 @@ import io.tapstate.control.core.LivePipelineRuns;
 import io.tapstate.control.core.LivePipelineVertex;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.FrontierMetricNames;
+import io.tapstate.runtime.engine.PinnedStandIns;
 import io.tapstate.runtime.engine.SinkWaitingMetricNames;
 
 import java.time.Duration;
@@ -56,12 +57,6 @@ import java.util.concurrent.TimeoutException;
  * which members the picture was assembled from is reported with it.
  */
 final class HazelcastLivePipelineRuns implements LivePipelineRuns {
-
-    /**
-     * The types the engine gives the instances that stand in for a pinned vertex on the members that are
-     * not running it. Neither does any work, and neither is ours.
-     */
-    private static final Set<String> PLACEHOLDER_TYPES = Set.of("ExpectNothingP", "NoopP");
 
     /**
      * How long this member waits for the engine to list its jobs before saying it cannot answer.
@@ -203,7 +198,7 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
                 }
                 byVertex.computeIfAbsent(vertex, ignored -> new LinkedHashMap<>())
                         .computeIfAbsent(Integer.parseInt(index), processor -> new Reading(processor, memberUuid,
-                                !PLACEHOLDER_TYPES.contains(measurement.tag(MetricTags.PROCESSOR_TYPE))))
+                                !PinnedStandIns.isStandIn(measurement.tag(MetricTags.PROCESSOR_TYPE))))
                         .take(metric, measurement.value());
             }
         }
