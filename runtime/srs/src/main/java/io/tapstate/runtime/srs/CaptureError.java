@@ -72,7 +72,10 @@ public enum CaptureError implements TapstateErrorCode {
      * source never was, and every change made while the snapshot ran would be missed silently — which is
      * why this refuses rather than choosing a start of its own.
      */
-    SNAPSHOT_REPORTS_NO_SEAM("capture.snapshot-reports-no-seam", Set.of("chain"));
+    SNAPSHOT_REPORTS_NO_SEAM("capture.snapshot-reports-no-seam", Set.of("chain")),
+
+    /** One row alone exceeds the bounded hand-off's logical byte capacity. */
+    SNAPSHOT_ROW_TOO_LARGE("capture.snapshot-row-too-large", Set.of("pipeline", "bytes", "limitBytes"));
 
     private final String code;
     private final Set<String> placeholders;

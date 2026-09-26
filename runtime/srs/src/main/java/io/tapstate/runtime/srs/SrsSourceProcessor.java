@@ -15,6 +15,7 @@ import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.core.common.TapstateException;
 import java.util.ArrayDeque;
+import java.util.concurrent.CancellationException;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.LongConsumer;
@@ -59,6 +60,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final long epoch;
     private final SourceBoundStamp stamp;
     private final RingTail ringTail;
+    private final String snapshotToken;
     private final ArrayDeque<Envelope> pending = new ArrayDeque<>();
     private SnapshotBuffer buffered;
     private SrsRingbuffer ring;
@@ -78,15 +80,22 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private boolean announcedAny;
     // Whether this source still owes the bound covering the snapshot rows it was seeded with.
     private boolean snapshotBoundDue;
+    private boolean snapshotDone;
 
     private SrsSourceProcessor(String pipelineId, String ringName, String src, long epoch,
             SourceBoundStamp stamp, RingTail ringTail) {
+        this(pipelineId, ringName, src, epoch, stamp, ringTail, null);
+    }
+
+    private SrsSourceProcessor(String pipelineId, String ringName, String src, long epoch,
+            SourceBoundStamp stamp, RingTail ringTail, String snapshotToken) {
         this.pipelineId = pipelineId;
         this.ringName = ringName;
         this.src = src;
         this.epoch = epoch;
         this.stamp = stamp;
         this.ringTail = ringTail;
+        this.snapshotToken = snapshotToken;
     }
 
     // Times each read of the ring that produced something, which is this stage's unit of work.
@@ -107,7 +116,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // with the shared ring switched off never stops appending to it.
         Object bound = context.hazelcastInstance().getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY);
         buffered = bound instanceof SnapshotBuffer resolved ? resolved : null;
-        drainBuffered();
+        if (snapshotToken == null) {
+            drainBuffered();
+        }
         if (ringTail != null) {
             // Both of these are local lookups. Where the reader starts is not -- it is a guarded operation on
             // the ring -- and it is deliberately left to the first pass below. Asking for it here would put
@@ -133,6 +144,13 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // already recorded as announced, so it has to leave rather than be worked out afresh.
         if (!emitPending() || !announce()) {
             return false;
+        }
+        if (snapshotToken != null && !snapshotDone) {
+            drainSnapshotSession();
+            if (!emitPending() || !snapshotDone) {
+                // A temporarily empty active snapshot is still ahead of every CDC change and bound.
+                return false;
+            }
         }
         // Every seeded snapshot row has left, so the bound covering them can be promised now. Waiting for a
         // change to promise it with is waiting for something that does not exist while a load runs: every
@@ -274,6 +292,32 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         }
     }
 
+    private void drainSnapshotSession() {
+        if (buffered == null) {
+            throw new IllegalStateException("streaming snapshot source has no member-local buffer");
+        }
+        SnapshotBuffer.SessionDrain drained = buffered.drainSnapshot(
+                pipelineId, ringName, snapshotToken, FILL_BATCH);
+        if (drained.state() == SnapshotBuffer.SessionState.FAILED) {
+            Throwable failure = drained.failure();
+            if (failure instanceof Error defect) {
+                throw defect;
+            }
+            if (failure instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new IllegalStateException("snapshot producer failed", failure);
+        }
+        if (drained.state() == SnapshotBuffer.SessionState.CANCELLED) {
+            throw new CancellationException("snapshot hand-off was cancelled or replaced");
+        }
+        for (Envelope row : drained.rows()) {
+            pending.add(row);
+            snapshotBoundDue = true;
+        }
+        snapshotDone = drained.state() == SnapshotBuffer.SessionState.DONE;
+    }
+
     /**
      * The order for the change at ring sequence {@code seq}.
      *
@@ -390,6 +434,13 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
             StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
             SourceBoundStamp stamp, SourcePlacement placement) {
+        return metaSupplier(pipelineId, ringName, src, start, resumeAfter, epoch, publisherFactory,
+                stamp, placement, null);
+    }
+
+    public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
+            StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
+            SourceBoundStamp stamp, SourcePlacement placement, String snapshotToken) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
@@ -400,7 +451,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a ring generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(
-                pipelineId, ringName, src, epoch, stamp, new RingTail(start, resumeAfter, publisherFactory));
+                pipelineId, ringName, src, epoch, stamp,
+                new RingTail(start, resumeAfter, publisherFactory), snapshotToken);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
@@ -414,6 +466,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     public static ProcessorMetaSupplier snapshotOnlyMetaSupplier(
             String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
             SourcePlacement placement) {
+        return snapshotOnlyMetaSupplier(pipelineId, ringName, src, epoch, stamp, placement, null);
+    }
+
+    public static ProcessorMetaSupplier snapshotOnlyMetaSupplier(
+            String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
+            SourcePlacement placement, String snapshotToken) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
@@ -422,7 +480,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a snapshot generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier =
-                () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null);
+                () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null, snapshotToken);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 

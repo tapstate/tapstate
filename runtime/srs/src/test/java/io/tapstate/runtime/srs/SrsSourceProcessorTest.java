@@ -251,6 +251,41 @@ class SrsSourceProcessorTest {
     }
 
     @Test
+    void streamingSnapshotKeepsCdcAndItsBoundBehindTheDoneMarker() throws InterruptedException {
+        String ringName = "srs.chain.streaming-barrier";
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        buffer.beginSnapshot(PIPELINE, ringName, "run-a");
+        buffer.appendSnapshot(PIPELINE, ringName, "run-a",
+                snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        fill(ringName, 1);
+        SEEN.clear();
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(
+                ringName, "orders", "out-streaming-barrier", 1024, "run-a"));
+        try {
+            long until = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+            while (SEEN.isEmpty() && System.nanoTime() < until) {
+                Thread.sleep(10);
+            }
+            assertThat(SEEN).isNotEmpty();
+            assertThat(SEEN.getFirst()).isEqualTo("i:100");
+            Thread.sleep(100);
+            assertThat(SEEN).doesNotContain("i:0", "b:7:0", "b:7:1");
+
+            buffer.completeSnapshot(PIPELINE, ringName, "run-a");
+            awaitSeen("b:7:0");
+            awaitSeen("i:0");
+            awaitSeen("b:7:1");
+            assertThat(SEEN).containsSubsequence("i:100", "b:7:0", "i:0", "b:7:1");
+        } finally {
+            job.cancel();
+            buffer.release(PIPELINE);
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-streaming-barrier").destroy();
+        }
+    }
+
+    @Test
     void everyChangeOfAGenerationOutranksEverySnapshotRowOfIt() throws InterruptedException {
         // The snapshot phase stamps its rows with the generation the snapshot began in before they reach the
         // buffer; the ring's changes take the same generation and the sequence the ring assigned them.
@@ -574,12 +609,17 @@ class SrsSourceProcessorTest {
      * value that means "no bound" and so is one no source can send.
      */
     private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize) {
+        return recordingDag(ringName, src, sinkName, queueSize, null);
+    }
+
+    private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize,
+            String snapshotToken) {
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
-                PIPELINE, ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
+                PIPELINE, ringName, src, StartFrom.earliest(), null, 1L, SrsReadCursorPublisherFactory.NONE,
                 order -> new Watermark(
                         order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7),
-                SourcePlacement.anyMember()));
+                SourcePlacement.anyMember(), snapshotToken));
         Vertex record = dag.newVertex("record", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of(RecordingBounds::new)));
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(sinkName)).localParallelism(1);

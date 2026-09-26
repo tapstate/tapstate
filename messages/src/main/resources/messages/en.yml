@@ -165,6 +165,9 @@ capture.cluster-refused-writes:
 capture.snapshot-reports-no-seam:
   message: "The snapshot of chain `{chain}` reported no position for the change tail to resume from."
   solution: "This source cannot hand its full load over to an incremental tail; read it as snapshot only, or use a connector build that reports a stream position."
+capture.snapshot-row-too-large:
+  message: "A snapshot row for pipeline {pipeline} is {bytes} logical bytes, above the hand-off limit of {limitBytes}."
+  solution: "Reduce the source row size or split large payloads before restarting."
 cli.alias-install-dir-unknown:
   message: "No installed `tapstate` was found in `{path}`."
   solution: "Run this where tapstate is installed, or set TAPSTATE_INSTALL_DIR to that directory - the same variable the installer honours."

@@ -1,7 +1,9 @@
 package io.tapstate.runtime.srs;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import java.util.List;
 import java.util.Map;
@@ -12,6 +14,9 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -22,6 +27,103 @@ import org.junit.jupiter.api.Test;
  * and ring name, drains that consumer's rows once in append order, and isolates both coordinates.
  */
 class SnapshotBufferTest {
+
+    @Test
+    void anEmptyMomentDuringASnapshotCannotBeMistakenForItsDoneMarker() {
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        String ring = "srs.chain.orders";
+        buffer.beginSnapshot(PIPELINE, ring, "run-a");
+
+        assertThat(buffer.drainSnapshot(PIPELINE, ring, "run-a", 1).state())
+                .isEqualTo(SnapshotBuffer.SessionState.ACTIVE);
+        buffer.appendSnapshot(PIPELINE, ring, "run-a", row("orders", 1));
+        SnapshotBuffer.SessionDrain first = buffer.drainSnapshot(PIPELINE, ring, "run-a", 1);
+        assertThat(first.rows()).containsExactly(row("orders", 1));
+        assertThat(first.state()).isEqualTo(SnapshotBuffer.SessionState.ACTIVE);
+        buffer.completeSnapshot(PIPELINE, ring, "run-a");
+        SnapshotBuffer.SessionDrain finished = buffer.drainSnapshot(PIPELINE, ring, "run-a", 1);
+        assertThat(finished.rows()).isEmpty();
+        assertThat(finished.state()).isEqualTo(SnapshotBuffer.SessionState.DONE);
+    }
+
+    @Test
+    void aFailureMarkerFollowsRowsAlreadyAcceptedForThatSession() {
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        String ring = "srs.chain.orders";
+        IllegalStateException sourceFailure = new IllegalStateException("source stopped");
+        buffer.beginSnapshot(PIPELINE, ring, "run-a");
+        buffer.appendSnapshot(PIPELINE, ring, "run-a", row("orders", 1));
+        buffer.failSnapshot(PIPELINE, ring, "run-a", sourceFailure);
+
+        SnapshotBuffer.SessionDrain beforeMarker = buffer.drainSnapshot(PIPELINE, ring, "run-a", 1);
+        assertThat(beforeMarker.rows()).containsExactly(row("orders", 1));
+        assertThat(beforeMarker.state()).isEqualTo(SnapshotBuffer.SessionState.ACTIVE);
+        SnapshotBuffer.SessionDrain failure = buffer.drainSnapshot(PIPELINE, ring, "run-a", 1);
+        assertThat(failure.rows()).isEmpty();
+        assertThat(failure.state()).isEqualTo(SnapshotBuffer.SessionState.FAILED);
+        assertThat(failure.failure()).isSameAs(sourceFailure);
+    }
+
+    @Test
+    void releasingACompletedButUndrainedSessionReturnsItsGlobalCapacity() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer(1, 1, 512, 256);
+        String ring = "srs.chain.orders";
+        buffer.beginSnapshot(PIPELINE, ring, "run-a");
+        buffer.appendSnapshot(PIPELINE, ring, "run-a", row("orders", 1));
+        buffer.completeSnapshot(PIPELINE, ring, "run-a");
+        buffer.release(PIPELINE);
+        buffer.beginSnapshot("next-pipeline", ring, "run-b");
+
+        try (var producer = Executors.newSingleThreadExecutor()) {
+            var appended = producer.submit(() ->
+                    buffer.appendSnapshot("next-pipeline", ring, "run-b", row("orders", 2)));
+            appended.get(5, TimeUnit.SECONDS);
+        } finally {
+            buffer.release("next-pipeline");
+        }
+    }
+
+    @Test
+    void cancellingAFullSessionWakesTheProducerAndAnOldTokenCannotSeeTheReplacement() throws Exception {
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        String ring = "srs.chain.orders";
+        buffer.beginSnapshot(PIPELINE, ring, "run-a");
+        buffer.appendSnapshot(PIPELINE, ring, "run-a", row("orders", 1));
+        CountDownLatch attempted = new CountDownLatch(1);
+        try (var producer = Executors.newSingleThreadExecutor()) {
+            var second = producer.submit(() -> {
+                attempted.countDown();
+                buffer.appendSnapshot(PIPELINE, ring, "run-a", row("orders", 2));
+            });
+            assertThat(attempted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> second.get(100, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
+
+            buffer.cancelSnapshot(PIPELINE, ring, "run-a");
+            assertThatThrownBy(() -> second.get(5, TimeUnit.SECONDS))
+                    .isInstanceOfSatisfying(ExecutionException.class,
+                            failure -> assertThat(failure.getCause()).isInstanceOf(CancellationException.class));
+            assertThat(buffer.drainSnapshot(PIPELINE, ring, "run-a", 1).state())
+                    .isEqualTo(SnapshotBuffer.SessionState.CANCELLED);
+            buffer.beginSnapshot(PIPELINE, ring, "run-b");
+            buffer.appendSnapshot(PIPELINE, ring, "run-b", row("orders", 3));
+            assertThat(buffer.drainSnapshot(PIPELINE, ring, "run-a", 1).state())
+                    .isEqualTo(SnapshotBuffer.SessionState.CANCELLED);
+            assertThat(buffer.drainSnapshot(PIPELINE, ring, "run-b", 1).rows())
+                    .containsExactly(row("orders", 3));
+        }
+    }
+
+    @Test
+    void aSingleRowAboveTheLogicalByteBudgetFailsWithACodedSize() {
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 256, 128);
+        buffer.beginSnapshot(PIPELINE, "srs.chain.orders", "run-a");
+
+        assertThatThrownBy(() -> buffer.appendSnapshot(
+                PIPELINE, "srs.chain.orders", "run-a", row("orders", 1)))
+                .isInstanceOfSatisfying(TapstateException.class, failure ->
+                        assertThat(failure.code()).isEqualTo(CaptureError.SNAPSHOT_ROW_TOO_LARGE));
+    }
 
     private static final String PIPELINE = "orders_pipeline";
 
