@@ -42,6 +42,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.Consumer;
 
 /** The bounded, store-backed query service behind {@code pipeline.metrics.history}. */
 public final class PipelineHistoryQueryService {
@@ -54,6 +55,7 @@ public final class PipelineHistoryQueryService {
     private static final int MAX_ROLLUP_READS = 128;
     private static final int MAX_RAW_FALLBACK_BUCKETS = 64;
     private static final int MAX_CACHED_ITEMS = 16_384;
+    private static final int MAX_REFRESH_OFFERS_PER_QUERY = 64;
 
     private static final String PIPELINE_KIND = "pipeline";
     private static final BigDecimal NANOS_PER_SECOND = BigDecimal.valueOf(1_000_000_000L);
@@ -61,6 +63,7 @@ public final class PipelineHistoryQueryService {
     private final ArtifactQueryService artifacts;
     private final RateHistoryStore history;
     private final HistoryRollupStore rollups;
+    private final Consumer<HistoryRollupStore.Key> refreshHint;
     private final Duration sampleInterval;
     private final Clock clock;
     private final HistoryCursorCodec cursors;
@@ -75,7 +78,14 @@ public final class PipelineHistoryQueryService {
 
     public PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
             HistoryRollupStore rollups, Duration sampleInterval, Clock clock, HistoryCursorCodec cursors) {
-        this(artifacts, history, rollups, sampleInterval, clock, cursors,
+        this(artifacts, history, rollups, ignored -> { }, sampleInterval, clock, cursors,
+                DEFAULT_RAW_BATCH_SIZE, DEFAULT_RAW_SCAN_BUDGET);
+    }
+
+    public PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
+            HistoryRollupStore rollups, Consumer<HistoryRollupStore.Key> refreshHint,
+            Duration sampleInterval, Clock clock, HistoryCursorCodec cursors) {
+        this(artifacts, history, rollups, refreshHint, sampleInterval, clock, cursors,
                 DEFAULT_RAW_BATCH_SIZE, DEFAULT_RAW_SCAN_BUDGET);
     }
 
@@ -88,9 +98,18 @@ public final class PipelineHistoryQueryService {
     PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
             HistoryRollupStore rollups, Duration sampleInterval, Clock clock, HistoryCursorCodec cursors,
             int rawBatchSize, int rawScanBudget) {
+        this(artifacts, history, rollups, ignored -> { }, sampleInterval, clock, cursors,
+                rawBatchSize, rawScanBudget);
+    }
+
+    PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
+            HistoryRollupStore rollups, Consumer<HistoryRollupStore.Key> refreshHint,
+            Duration sampleInterval, Clock clock, HistoryCursorCodec cursors,
+            int rawBatchSize, int rawScanBudget) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.history = Objects.requireNonNull(history, "history");
         this.rollups = rollups;
+        this.refreshHint = Objects.requireNonNull(refreshHint, "refreshHint");
         this.sampleInterval = Objects.requireNonNull(sampleInterval, "sampleInterval");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.cursors = Objects.requireNonNull(cursors, "cursors");
@@ -201,17 +220,29 @@ public final class PipelineHistoryQueryService {
             batchFrom = batchTo;
         }
         if (cached.isEmpty()) {
+            int hinted = 0;
+            for (Instant at = first; at.isBefore(end) && hinted < MAX_REFRESH_OFFERS_PER_QUERY;
+                    at = at.plus(width), hinted++) {
+                offerRefresh(new HistoryRollupStore.Key(binding.pipelineId(), scope, resolution, at));
+            }
             return null;
         }
 
         List<BucketSlice> slices = new ArrayList<>();
         int fallbackBuckets = 0;
+        int hinted = 0;
         Instant checkedAt = clock.instant();
         HistoryCursorCodec.CachePosition resume = frozen.cachePosition();
         for (Instant at = first; at.isBefore(end); at = at.plus(width)) {
             Instant sliceFrom = max(at, frozen.from());
             Instant sliceTo = min(at.plus(width), frozen.to());
             Bucket bucket = cached.get(at);
+            if (hinted < MAX_REFRESH_OFFERS_PER_QUERY
+                    && (bucket == null || !bucket.validUntil().isAfter(checkedAt)
+                            || bucket.inWindowSamples() < 0)) {
+                offerRefresh(new HistoryRollupStore.Key(binding.pipelineId(), scope, resolution, at));
+                hinted++;
+            }
             boolean full = at.equals(sliceFrom) && at.plus(width).equals(sliceTo);
             if (!full || bucket == null || !bucket.usableAt(checkedAt)
                     || bucket.inWindowSamples() < 0
@@ -361,6 +392,14 @@ public final class PipelineHistoryQueryService {
         List<Gap> related = cachedGapsForPage(segments, observedGaps);
         return measured(response(normalized, frozen, effective, Status.OK,
                 segments, related, unavailable(segments, normalized.tables()), next), cost);
+    }
+
+    private void offerRefresh(HistoryRollupStore.Key key) {
+        try {
+            refreshHint.accept(key);
+        } catch (RuntimeException unavailable) {
+            // A hint is disposable; the same request still uses bounded raw history as its fallback.
+        }
     }
 
     private static List<Gap> cachedGapsForPage(List<Segment> segments, List<Gap> observed) {

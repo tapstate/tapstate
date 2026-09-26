@@ -129,6 +129,31 @@ class PipelineHistoryQueryServiceTest {
     }
 
     @Test
+    void missingAndExpiredBucketsOfferBoundedRefreshWithoutChangingTheRawAnswer() {
+        RecordingHistory raw = oneHourOfSamples();
+        RecordingRollups cache = new RecordingRollups();
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        cache.add(rollup(from, HistoryRollupStore.Resolution.PT30M, 1, NOW.minusSeconds(1)));
+        List<HistoryRollupStore.Key> hinted = new ArrayList<>();
+        PipelineHistoryQueryService service = new PipelineHistoryQueryService(
+                artifactsWith("orders"), raw, cache, key -> {
+                    hinted.add(key);
+                    if (hinted.size() == 2) {
+                        throw new IllegalStateException("refresh worker unavailable");
+                    }
+                }, Duration.ofMinutes(1), fixedClock(), cursorCodec(), 128, 25_000);
+        PipelineHistoryQuery request = new PipelineHistoryQuery("orders", from,
+                from.plusSeconds(3_600), HistoryResolution.PT30M, 100, List.of("orders"), null);
+
+        assertThat(service.query(request)).isEqualTo(service(raw, 128, 25_000).query(request));
+        assertThat(hinted).containsExactly(
+                new HistoryRollupStore.Key("orders", HistoryRollupStore.Scope.legacy(),
+                        HistoryRollupStore.Resolution.PT30M, from),
+                new HistoryRollupStore.Key("orders", HistoryRollupStore.Scope.legacy(),
+                        HistoryRollupStore.Resolution.PT30M, from.plusSeconds(1_800)));
+    }
+
+    @Test
     void cachedPagesResumeWithoutRawReadsAndRetainQueryBinding() {
         RecordingHistory raw = new RecordingHistory();
         RecordingRollups cache = new RecordingRollups();
