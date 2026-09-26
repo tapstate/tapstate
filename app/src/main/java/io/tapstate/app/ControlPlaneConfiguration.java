@@ -648,19 +648,29 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    HistoryRollupQueryHealth historyRollupQueryHealth(MetricsExport export, Clock clock) {
+        HistoryRollupQueryHealth health = new HistoryRollupQueryHealth();
+        java.time.Instant startedAt = clock.instant();
+        export.observeProcess("rollup-query", () -> HistoryRollupQueryFacts.snapshot(
+                health.snapshot(), startedAt, clock.instant()));
+        return health;
+    }
+
+    @Bean
     PipelineHistoryQueryService pipelineHistoryQueryService(
             ArtifactQueryService artifactQueryService,
             StorePort storePort,
             MetricsHistoryProperties history,
             Clock clock,
             HistoryCursorCodec cursors,
-            ObjectProvider<HistoryRollupWorker> rollupWorker) {
+            ObjectProvider<HistoryRollupWorker> rollupWorker,
+            HistoryRollupQueryHealth queryHealth) {
         HistoryRollupWorker worker = rollupWorker.getIfAvailable();
         Consumer<HistoryRollupStore.Key> refresh =
                 worker == null ? ignored -> { } : worker::requestRefresh;
         return new PipelineHistoryQueryService(
                 artifactQueryService, storePort.rateHistory(), storePort.historyRollups(),
-                refresh, history.getSampleInterval(), clock, cursors);
+                refresh, queryHealth, history.getSampleInterval(), clock, cursors);
     }
 
     @Bean

@@ -130,6 +130,9 @@ public enum CardinalityBudget {
     ROLLUP_BUCKET_RETRIED("tapstate.process.rollup.bucket.retried", null, 5, Fold.ADDED),
     ROLLUP_BUCKET_FAILED("tapstate.process.rollup.bucket.failed", null, 5, Fold.ADDED),
     ROLLUP_BUILD_RAW_FALLBACK("tapstate.process.rollup.build.raw_fallback", null, 5, Fold.ADDED),
+    ROLLUP_QUERY_RAW_FALLBACK("tapstate.process.rollup.query.raw_fallback", null, 5, Fold.ADDED),
+    ROLLUP_QUERY_FULL_RAW_FALLBACK("tapstate.process.rollup.query.full_raw_fallback", null, 5, Fold.ADDED),
+    ROLLUP_QUERY_BUCKET_DOWN_DRILLED("tapstate.process.rollup.query.bucket.down_drilled", null, 5, Fold.ADDED),
     /** Only the four fixed lifecycle verbs can create duration series. */
     LIFECYCLE_WORK_DURATION("tapstate.process.lifecycle.work.duration", null, 4, Fold.ADDED);
 

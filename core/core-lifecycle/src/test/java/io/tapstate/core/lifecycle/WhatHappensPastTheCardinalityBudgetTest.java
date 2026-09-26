@@ -120,6 +120,14 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.process.observation_janitor.batch.duration.max",
                         "tapstate.process.observation_janitor.last_success.age",
                         "tapstate.process.observation_janitor.degraded",
+                        "tapstate.process.rollup.closed_through.age",
+                        "tapstate.process.rollup.bucket.computed",
+                        "tapstate.process.rollup.bucket.retried",
+                        "tapstate.process.rollup.bucket.failed",
+                        "tapstate.process.rollup.build.raw_fallback",
+                        "tapstate.process.rollup.query.raw_fallback",
+                        "tapstate.process.rollup.query.full_raw_fallback",
+                        "tapstate.process.rollup.query.bucket.down_drilled",
                         "tapstate.process.lifecycle.work.duration");
         for (CardinalityBudget budget : List.of(CardinalityBudget.RECORDS, CardinalityBudget.BYTES,
                 CardinalityBudget.LAG, CardinalityBudget.RECORD_DELIVERY_DURATION,
@@ -150,6 +158,13 @@ class WhatHappensPastTheCardinalityBudgetTest {
         assertThat(CardinalityBudget.PROCESS_DURATION.distinctValues()).isEqualTo(Stage.values().length);
         assertThat(CardinalityBudget.LIFECYCLE_WORK_DURATION.openDimension()).isEmpty();
         assertThat(CardinalityBudget.LIFECYCLE_WORK_DURATION.distinctValues()).isEqualTo(4);
+        for (CardinalityBudget budget : List.of(CardinalityBudget.ROLLUP_QUERY_RAW_FALLBACK,
+                CardinalityBudget.ROLLUP_QUERY_FULL_RAW_FALLBACK,
+                CardinalityBudget.ROLLUP_QUERY_BUCKET_DOWN_DRILLED)) {
+            assertThat(budget.openDimension()).as(budget.name()).isEmpty();
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(5);
+            assertThat(budget.fold()).as(budget.name()).isEqualTo(CardinalityBudget.Fold.ADDED);
+        }
         for (CardinalityBudget budget : List.of(CardinalityBudget.RECORDS_DRIVEN,
                 CardinalityBudget.RECONCILE_FAILURES_STREAK)) {
             assertThat(budget.openDimension()).as(budget.name()).isEmpty();
@@ -481,6 +496,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.process.telemetry.restoration.pending",
                         "tapstate.process.observation_janitor.batch.duration.max",
                         "tapstate.process.observation_janitor.last_success.age",
-                        "tapstate.process.observation_janitor.degraded");
+                        "tapstate.process.observation_janitor.degraded",
+                        "tapstate.process.rollup.closed_through.age");
     }
 }

@@ -32,6 +32,141 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 class PipelineHistoryQueryServiceTest {
 
     @Test
+    void rollupFallbackObservationCountsOnlyRawBucketsUsedByCompletedQueries() {
+        RecordingHistory raw = oneHourOfSamples();
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        Instant second = from.plusSeconds(1_800);
+        PipelineHistoryQuery request = new PipelineHistoryQuery("orders", from,
+                from.plusSeconds(3_600), HistoryResolution.PT30M, 100, List.of("orders"), null);
+        List<PipelineHistoryQueryService.RollupFallback> observed = new ArrayList<>();
+        RecordingRollups cache = new RecordingRollups();
+        cache.add(projectRollup(raw, from));
+        cache.add(projectRollup(raw, second));
+        PipelineHistoryQueryService service = observedService(raw, cache, observed);
+
+        assertThat(service.query(request).status()).isEqualTo(PipelineMetricsHistory.Status.OK);
+        assertThat(observed).isEmpty();
+
+        cache.buckets.remove(new HistoryRollupStore.Key("orders", HistoryRollupStore.Scope.legacy(),
+                HistoryRollupStore.Resolution.PT30M, second));
+        raw.pageRanges.clear();
+        assertThat(service.query(request).status()).isEqualTo(PipelineMetricsHistory.Status.OK);
+        assertThat(observed).containsExactly(new PipelineHistoryQueryService.RollupFallback(
+                HistoryRollupStore.Resolution.PT30M, 1, false));
+        assertThat(raw.pageRanges).containsExactly(new TimeRange(second, second.plusSeconds(1_800)));
+
+        cache.add(projectRollup(raw, second));
+        HistoryRollupStore.Bucket old = cache.buckets.get(new HistoryRollupStore.Key("orders",
+                HistoryRollupStore.Scope.legacy(), HistoryRollupStore.Resolution.PT30M, from));
+        cache.add(new HistoryRollupStore.Bucket(old.key(), old.computedAt(), old.inputReadStartedAt(),
+                NOW.minusSeconds(1), false, old.fragments(), old.gaps(), old.inWindowSamples()));
+        raw.pageRanges.clear();
+        assertThat(service.query(request).status()).isEqualTo(PipelineMetricsHistory.Status.OK);
+        assertThat(observed).containsExactly(
+                new PipelineHistoryQueryService.RollupFallback(
+                        HistoryRollupStore.Resolution.PT30M, 1, false),
+                new PipelineHistoryQueryService.RollupFallback(
+                        HistoryRollupStore.Resolution.PT30M, 1, false));
+        assertThat(raw.pageRanges).containsExactly(new TimeRange(from, second));
+
+        cache.buckets.remove(new HistoryRollupStore.Key("orders", HistoryRollupStore.Scope.legacy(),
+                HistoryRollupStore.Resolution.PT30M, second));
+        raw.pageRanges.clear();
+        assertThat(service.query(request).status()).isEqualTo(PipelineMetricsHistory.Status.OK);
+        assertThat(observed.getLast()).isEqualTo(new PipelineHistoryQueryService.RollupFallback(
+                HistoryRollupStore.Resolution.PT30M, 2, false));
+        assertThat(raw.pageRanges).containsExactly(
+                new TimeRange(from, second), new TimeRange(second, second.plusSeconds(1_800)));
+    }
+
+    @Test
+    void noCacheOrStoreOutageCountsAWholeRawFallbackWithoutInventingBucketCount() {
+        RecordingHistory raw = oneHourOfSamples();
+        RecordingRollups cache = new RecordingRollups();
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        PipelineHistoryQuery request = new PipelineHistoryQuery("orders", from,
+                from.plusSeconds(3_600), HistoryResolution.PT30M, 100, List.of("orders"), null);
+        List<PipelineHistoryQueryService.RollupFallback> observed = new ArrayList<>();
+        PipelineHistoryQueryService service = observedService(raw, cache, observed);
+
+        assertThat(service.query(request).status()).isEqualTo(PipelineMetricsHistory.Status.OK);
+        cache.onRangeRead = () -> { throw new IllegalStateException("rollup store unavailable"); };
+        assertThat(service.query(request).status()).isEqualTo(PipelineMetricsHistory.Status.OK);
+
+        assertThat(observed).containsExactly(
+                new PipelineHistoryQueryService.RollupFallback(
+                        HistoryRollupStore.Resolution.PT30M, 0, true),
+                new PipelineHistoryQueryService.RollupFallback(
+                        HistoryRollupStore.Resolution.PT30M, 0, true));
+        assertThat(cache.rangeReads).isEqualTo(2);
+    }
+
+    @Test
+    void partialAndMarkedCacheBucketsEachCountOneDownDrill() {
+        RecordingHistory raw = oneHourOfSamples();
+        RecordingRollups cache = new RecordingRollups();
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        Instant second = from.plusSeconds(1_800);
+        cache.add(projectRollup(raw, from));
+        cache.add(projectRollup(raw, second));
+        List<PipelineHistoryQueryService.RollupFallback> observed = new ArrayList<>();
+        PipelineHistoryQueryService service = observedService(raw, cache, observed);
+
+        assertThat(service.query(new PipelineHistoryQuery("orders", from.plusSeconds(300),
+                from.plusSeconds(3_600), HistoryResolution.PT30M, 100, List.of("orders"), null))
+                .status()).isEqualTo(PipelineMetricsHistory.Status.OK);
+        assertThat(raw.pageRanges).containsExactly(new TimeRange(from.plusSeconds(300), second));
+
+        HistoryRollupStore.Bucket old = cache.buckets.get(new HistoryRollupStore.Key("orders",
+                HistoryRollupStore.Scope.legacy(), HistoryRollupStore.Resolution.PT30M, from));
+        cache.add(new HistoryRollupStore.Bucket(old.key(), old.computedAt(), old.inputReadStartedAt(),
+                old.validUntil(), true, List.of(), List.of(), old.inWindowSamples()));
+        raw.pageRanges.clear();
+        assertThat(service.query(new PipelineHistoryQuery("orders", from,
+                from.plusSeconds(3_600), HistoryResolution.PT30M, 100, List.of("orders"), null))
+                .status()).isEqualTo(PipelineMetricsHistory.Status.OK);
+        assertThat(raw.pageRanges).containsExactly(new TimeRange(from, second));
+        assertThat(observed).containsExactly(
+                new PipelineHistoryQueryService.RollupFallback(
+                        HistoryRollupStore.Resolution.PT30M, 1, false),
+                new PipelineHistoryQueryService.RollupFallback(
+                        HistoryRollupStore.Resolution.PT30M, 1, false));
+    }
+
+    @Test
+    void anUnwiredRollupDoesNotProduceFallbackObservations() {
+        RecordingHistory raw = oneHourOfSamples();
+        List<PipelineHistoryQueryService.RollupFallback> observed = new ArrayList<>();
+        PipelineHistoryQueryService service = new PipelineHistoryQueryService(
+                artifactsWith("orders"), raw, null, ignored -> { }, observed::add,
+                Duration.ofMinutes(1), fixedClock(), cursorCodec(), 128, 25_000);
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+
+        assertThat(service.query(new PipelineHistoryQuery("orders", from,
+                from.plusSeconds(3_600), HistoryResolution.PT30M, 100, List.of("orders"), null))
+                .status()).isEqualTo(PipelineMetricsHistory.Status.OK);
+        assertThat(observed).isEmpty();
+    }
+
+    @Test
+    void aRejectedRawFallbackDoesNotCountAsACompletedQuery() {
+        RecordingHistory raw = oneHourOfSamples();
+        RecordingRollups cache = new RecordingRollups();
+        List<PipelineHistoryQueryService.RollupFallback> observed = new ArrayList<>();
+        PipelineHistoryQueryService service = new PipelineHistoryQueryService(
+                artifactsWith("orders"), raw, cache, ignored -> { }, observed::add,
+                Duration.ofMinutes(1), fixedClock(), cursorCodec(), 2, 5);
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+
+        TapstateException failure = catchThrowableOfType(() -> service.query(new PipelineHistoryQuery(
+                "orders", from, from.plusSeconds(3_600), HistoryResolution.PT30M,
+                100, List.of("orders"), null)), TapstateException.class);
+
+        assertThat(failure.code()).isEqualTo(MonitorError.QUERY_BUDGET_EXCEEDED);
+        assertThat(observed).isEmpty();
+    }
+
+    @Test
     void completeDayRollupAnswersWithoutReadingRawHistory() {
         RecordingHistory raw = new RecordingHistory();
         RecordingRollups cache = new RecordingRollups();
@@ -348,8 +483,10 @@ class PipelineHistoryQueryServiceTest {
                 legacy.inputReadStartedAt(), legacy.validUntil(), false,
                 legacy.fragments(), legacy.gaps(), legacy.inWindowSamples()));
         cache.onRangeRead = () -> owner.set("inc-b");
+        List<PipelineHistoryQueryService.RollupFallback> observed = new ArrayList<>();
         PipelineHistoryQueryService service = new PipelineHistoryQueryService(
                 artifactsWithOwnerFrom(owner::get, "orders"), raw, cache,
+                ignored -> { }, observed::add,
                 Duration.ofMinutes(1), fixedClock(), cursorCodec());
 
         TapstateException mismatch = catchThrowableOfType(() -> service.query(
@@ -359,11 +496,19 @@ class PipelineHistoryQueryServiceTest {
         assertThat(mismatch.code()).isEqualTo(MonitorError.INVALID_CURSOR);
         assertThat(mismatch.args()).containsEntry("reason", "QUERY_MISMATCH");
         assertThat(raw.rawReads).isZero();
+        assertThat(observed).isEmpty();
     }
 
     private static PipelineHistoryQueryService cachedService(RecordingHistory raw, RecordingRollups cache) {
         return new PipelineHistoryQueryService(artifactsWith("orders"), raw, cache,
                 Duration.ofMinutes(1), fixedClock(), cursorCodec(), 128, 25_000);
+    }
+
+    private static PipelineHistoryQueryService observedService(RecordingHistory raw,
+            RecordingRollups cache, List<PipelineHistoryQueryService.RollupFallback> observed) {
+        return new PipelineHistoryQueryService(artifactsWith("orders"), raw, cache,
+                ignored -> { }, observed::add, Duration.ofMinutes(1), fixedClock(),
+                cursorCodec(), 128, 25_000);
     }
 
     private static HistoryRollupStore.Bucket rollup(Instant at,

@@ -64,6 +64,7 @@ public final class PipelineHistoryQueryService {
     private final RateHistoryStore history;
     private final HistoryRollupStore rollups;
     private final Consumer<HistoryRollupStore.Key> refreshHint;
+    private final Consumer<RollupFallback> fallbackObserver;
     private final Duration sampleInterval;
     private final Clock clock;
     private final HistoryCursorCodec cursors;
@@ -85,7 +86,15 @@ public final class PipelineHistoryQueryService {
     public PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
             HistoryRollupStore rollups, Consumer<HistoryRollupStore.Key> refreshHint,
             Duration sampleInterval, Clock clock, HistoryCursorCodec cursors) {
-        this(artifacts, history, rollups, refreshHint, sampleInterval, clock, cursors,
+        this(artifacts, history, rollups, refreshHint, ignored -> { }, sampleInterval, clock, cursors,
+                DEFAULT_RAW_BATCH_SIZE, DEFAULT_RAW_SCAN_BUDGET);
+    }
+
+    public PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
+            HistoryRollupStore rollups, Consumer<HistoryRollupStore.Key> refreshHint,
+            Consumer<RollupFallback> fallbackObserver,
+            Duration sampleInterval, Clock clock, HistoryCursorCodec cursors) {
+        this(artifacts, history, rollups, refreshHint, fallbackObserver, sampleInterval, clock, cursors,
                 DEFAULT_RAW_BATCH_SIZE, DEFAULT_RAW_SCAN_BUDGET);
     }
 
@@ -106,10 +115,20 @@ public final class PipelineHistoryQueryService {
             HistoryRollupStore rollups, Consumer<HistoryRollupStore.Key> refreshHint,
             Duration sampleInterval, Clock clock, HistoryCursorCodec cursors,
             int rawBatchSize, int rawScanBudget) {
+        this(artifacts, history, rollups, refreshHint, ignored -> { }, sampleInterval, clock, cursors,
+                rawBatchSize, rawScanBudget);
+    }
+
+    PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
+            HistoryRollupStore rollups, Consumer<HistoryRollupStore.Key> refreshHint,
+            Consumer<RollupFallback> fallbackObserver,
+            Duration sampleInterval, Clock clock, HistoryCursorCodec cursors,
+            int rawBatchSize, int rawScanBudget) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.history = Objects.requireNonNull(history, "history");
         this.rollups = rollups;
         this.refreshHint = Objects.requireNonNull(refreshHint, "refreshHint");
+        this.fallbackObserver = Objects.requireNonNull(fallbackObserver, "fallbackObserver");
         this.sampleInterval = Objects.requireNonNull(sampleInterval, "sampleInterval");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.cursors = Objects.requireNonNull(cursors, "cursors");
@@ -136,6 +155,17 @@ public final class PipelineHistoryQueryService {
     }
 
     record QueryRun(PipelineMetricsHistory history, QueryCost cost) {
+    }
+
+    /** One completed query that used raw history in place of a selected rollup resolution. */
+    public record RollupFallback(Resolution resolution, int downDrilledBuckets, boolean fullRaw) {
+        public RollupFallback {
+            Objects.requireNonNull(resolution, "resolution");
+            if (downDrilledBuckets < 0 || fullRaw && downDrilledBuckets != 0
+                    || !fullRaw && downDrilledBuckets == 0) {
+                throw new IllegalArgumentException("a rollup fallback is either full raw or counted raw buckets");
+            }
+        }
     }
 
     QueryRun execute(PipelineHistoryQuery request) {
@@ -168,6 +198,14 @@ public final class PipelineHistoryQueryService {
         if (!visibility.equals(requirePipeline(normalized.binding().pipelineId()))) {
             throw new TapstateException(MonitorError.INVALID_CURSOR,
                     Map.of("operation", "pipeline.metrics.history", "reason", "QUERY_MISMATCH"), null);
+        }
+        if (rollups != null && !effective.raw() && (cached == null || cost.rollupRawBuckets > 0)) {
+            try {
+                fallbackObserver.accept(new RollupFallback(Resolution.valueOf(effective.name()),
+                        cached == null ? 0 : cost.rollupRawBuckets, cached == null));
+            } catch (RuntimeException unavailable) {
+                // Process health is best-effort and cannot fail an otherwise completed history read.
+            }
         }
         return run;
     }
@@ -454,6 +492,7 @@ public final class PipelineHistoryQueryService {
 
     private SliceProjection rawSlice(Normalized normalized, Frozen frozen,
             EffectiveHistoryResolution effective, BucketSlice slice, Cost cost) {
+        cost.rollupRawBuckets++;
         QueryBinding binding = normalized.binding();
         cost.storeReads++;
         Optional<Entry> boundary = history.predecessorVisible(binding.pipelineId(), binding.visibility(),
@@ -964,6 +1003,7 @@ public final class PipelineHistoryQueryService {
         private int storeReads;
         private int rawDocumentsScanned;
         private int peakRawEntriesHeld;
+        private int rollupRawBuckets;
 
         void page(Page page, int boundaryHeld) {
             storeReads++;
