@@ -308,11 +308,13 @@ None holds more.
 | Connector | Most connections one instance holds | Four instances in one server, most measured |
 |---|---|---|
 | MySQL | 2 | 5 |
-| PostgreSQL | 1 | 4 |
+| PostgreSQL | 2 | 5 |
 | MongoDB | 3 | 12 |
 | SQL Server | 2 | 6 |
+| Oracle | 3 | 12 |
 
-Measured against each database, with one writer per instance writing batches of fifty rows at the same time.
+Measured against each database, with one writer per instance writing batches of fifty rows at the same time, and
+given as the most any run saw: how many an instance holds at a given moment varies between runs.
 
 ## Coded errors and operator response
 

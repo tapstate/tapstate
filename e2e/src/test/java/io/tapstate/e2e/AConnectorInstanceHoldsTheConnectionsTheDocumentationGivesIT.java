@@ -84,7 +84,7 @@ class AConnectorInstanceHoldsTheConnectionsTheDocumentationGivesIT {
      * to be written down.
      */
     private static final Map<String, Long> DOCUMENTED =
-            Map.of("mysql", 2L, "postgres", 1L, "mongodb", 3L, "sqlserver", 2L);
+            Map.of("mysql", 2L, "postgres", 2L, "mongodb", 3L, "sqlserver", 2L, "oracle", 3L);
 
     @BeforeAll
     static void requireDocker() {
