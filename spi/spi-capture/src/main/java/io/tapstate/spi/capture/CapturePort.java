@@ -1,5 +1,9 @@
 package io.tapstate.spi.capture;
 
+import io.tapstate.core.event.Envelope;
+import java.util.Objects;
+import java.util.Optional;
+
 /**
  * The read side of a connector: bounded snapshot reads, an unbounded CDC stream, a connection test
  * and schema discovery. A pure interface over the standard event envelope; it depends on the core
@@ -23,11 +27,33 @@ package io.tapstate.spi.capture;
  */
 public interface CapturePort {
 
+    /** Receives the source's seam before the first row and each snapshot row as it is read. */
+    interface SnapshotListener {
+        void seam(Optional<SourcePosition> position);
+
+        void row(Envelope row);
+    }
+
     /**
      * Reads the configured streams once, as a bounded batch of snapshot-read events. The returned
      * batch holds a source resource and must be closed.
      */
     CaptureBatch snapshot(CaptureConfig config);
+
+    /**
+     * Delivers one snapshot without requiring the caller to retain its rows. The default preserves ports
+     * that only implement the batch contract; adapters with a callback-based source override it to avoid
+     * materializing the whole snapshot before the first row is delivered.
+     */
+    default void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
+        Objects.requireNonNull(listener, "listener");
+        try (CaptureBatch batch = snapshot(config)) {
+            listener.seam(batch.seam());
+            while (batch.hasNext()) {
+                listener.row(batch.next());
+            }
+        }
+    }
 
     /**
      * Starts an unbounded CDC stream at {@code start}, delivering each change event to {@code listener}.

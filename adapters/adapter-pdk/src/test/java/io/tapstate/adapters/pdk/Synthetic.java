@@ -376,6 +376,25 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.EmittingSource", source("EmittingSource", "", register));
     }
 
+    /** Emits one snapshot callback, waits for the host, then emits the second callback. */
+    static Path pacedSnapshotSource(Path dir, Path resume) {
+        String path = resume.toString().replace("\\", "\\\\").replace("\"", "\\\"");
+        String register = "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + row("first", 1)
+                + "  consumer.accept(List.of(TapInsertRecordEvent.create().table(\"t1\")"
+                + "    .referenceTime(100L).after(first)), null);"
+                + "  while (!java.nio.file.Files.exists(java.nio.file.Path.of(\"" + path + "\"))) {"
+                + "    if (Thread.currentThread().isInterrupted()) throw new IllegalStateException(\"cancelled\");"
+                + "    java.util.concurrent.locks.LockSupport.parkNanos(1000000L);"
+                + "  }"
+                + row("second", 2)
+                + "  consumer.accept(List.of(TapInsertRecordEvent.create().table(\"t1\")"
+                + "    .referenceTime(101L).after(second)), null);"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.PacedSnapshot",
+                source("PacedSnapshot", "", register));
+    }
+
     /**
      * Reads its own state map, writes to it, and reports on every row it emits what it read there.
      *

@@ -37,6 +37,37 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class SnapshotPhaseTest {
 
+    @Test
+    void chainlessSnapshotUsesTheStreamingPortWithoutMaterializingABatch() {
+        CapturePort streamed = new CapturePort() {
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("the whole snapshot must not be materialized");
+            }
+            @Override public void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
+                listener.seam(Optional.empty());
+                listener.row(row(1));
+                listener.row(row(2));
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        List<Envelope> delivered = new ArrayList<>();
+
+        long count = SnapshotPhase.drain(streamed, config(), 17L, delivered::add);
+
+        assertThat(count).isEqualTo(2);
+        assertThat(delivered).containsExactly(
+                row(1).withOrder(SourceOrder.snapshotRow(17)),
+                row(2).withOrder(SourceOrder.snapshotRow(17)));
+    }
+
     /** The consumer pipeline these runs belong to: snapshot completion is recorded against it. */
     private static final String PIPE = "pipe";
 

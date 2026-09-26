@@ -52,7 +52,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * for a read capability it does not provide is a caller invariant violation (the DSL validated the
  * connector's modes upstream) and crashes bare rather than being laundered into a code.
  *
- * <p>Snapshot reads are collected eagerly as a bounded batch. The cdc stream runs on a background
+ * <p>The legacy snapshot batch is collected eagerly; the streaming entry delivers connector callbacks
+ * as they arrive, without a second whole-snapshot list. The cdc stream runs on a background
  * thread that delivers each decoded change to the listener; how a stream failure reaches the caller
  * and the backpressure that bounds the stream belong to the runtime that owns stream execution, not
  * to this port.
@@ -111,6 +112,62 @@ public final class PdkCapturePort implements CapturePort {
             connector.stopQuietly();
             connector.close();
             throw e;
+        }
+    }
+
+    @Override
+    public void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
+        Objects.requireNonNull(listener, "listener");
+        PdkConnector connector = open(config);
+        try {
+            BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
+            read(connector, () -> {
+                SnapshotSetup setup = prepareSnapshot(connector, config);
+                try {
+                    listener.seam(position(connector, setup.seam()));
+                } catch (RuntimeException | Error downstream) {
+                    throw new SnapshotListenerFailure(downstream);
+                }
+                Map<String, Map<String, String>> declared = declaredTypes(setup.tables());
+                for (String stream : setup.streams()) {
+                    TapTable table = setup.tables().get(stream);
+                    if (table == null) {
+                        throw new IllegalStateException(
+                                "stream " + stream + " was requested but the connector did not discover it");
+                    }
+                    batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
+                        for (TapEvent event : events) {
+                            Envelope row;
+                            try {
+                                row = TapEventCodec.decodeSnapshotRow(
+                                        event, connector.codecs(), declaredTypes(declared, event));
+                            } catch (RuntimeException projection) {
+                                throw new TapstateException(ConnectorError.PROJECTION_FAILED,
+                                        Map.of("connector", connector.connectorId(), "detail", detail(projection)),
+                                        projection);
+                            }
+                            try {
+                                listener.row(row);
+                            } catch (RuntimeException | Error downstream) {
+                                throw new SnapshotListenerFailure(downstream);
+                            }
+                        }
+                    });
+                }
+                return null;
+            });
+        } finally {
+            connector.stopQuietly();
+            connector.close();
+        }
+    }
+
+    /** Keeps a downstream refusal from being misreported as a connector read failure. */
+    private static final class SnapshotListenerFailure extends RuntimeException {
+        private final Throwable original;
+
+        private SnapshotListenerFailure(Throwable original) {
+            this.original = original;
         }
     }
 
@@ -286,6 +343,20 @@ public final class PdkCapturePort implements CapturePort {
      * all -- the same shape of loss, but silent.
      */
     private Read batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) throws Throwable {
+        SnapshotSetup setup = prepareSnapshot(connector, config);
+        List<TapEvent> raw = new ArrayList<>();
+        for (String stream : setup.streams()) {
+            TapTable table = setup.tables().get(stream);
+            if (table == null) {
+                throw new IllegalStateException(
+                        "stream " + stream + " was requested but the connector did not discover it");
+            }
+            batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> raw.addAll(events));
+        }
+        return new Read(raw, setup.tables(), setup.seam());
+    }
+
+    private SnapshotSetup prepareSnapshot(PdkConnector connector, CaptureConfig config) throws Throwable {
         connector.connector().init(connector.context());
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
@@ -297,16 +368,10 @@ public final class PdkCapturePort implements CapturePort {
         Object seam = startOffset(connector, null);
         List<String> streams = config.streams().isEmpty()
                 ? new ArrayList<>(discovered.keySet()) : config.streams();
-        List<TapEvent> raw = new ArrayList<>();
-        for (String stream : streams) {
-            TapTable table = discovered.get(stream);
-            if (table == null) {
-                throw new IllegalStateException(
-                        "stream " + stream + " was requested but the connector did not discover it");
-            }
-            batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> raw.addAll(events));
-        }
-        return new Read(raw, discovered, seam);
+        return new SnapshotSetup(discovered, streams, seam);
+    }
+
+    private record SnapshotSetup(Map<String, TapTable> tables, List<String> streams, Object seam) {
     }
 
     /**
@@ -605,6 +670,11 @@ public final class PdkCapturePort implements CapturePort {
     private static <T> T read(PdkConnector connector, PdkConnector.Action<T> action) {
         try {
             return connector.underLoader(action);
+        } catch (SnapshotListenerFailure downstream) {
+            if (downstream.original instanceof Error defect) {
+                throw defect;
+            }
+            throw (RuntimeException) downstream.original;
         } catch (TapstateException e) {
             throw e;
         } catch (Throwable t) {

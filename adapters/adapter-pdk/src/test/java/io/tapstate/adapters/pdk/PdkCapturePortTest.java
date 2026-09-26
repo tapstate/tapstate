@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -24,6 +25,9 @@ import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -38,6 +42,39 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * deterministically without any real connector jar.
  */
 class PdkCapturePortTest {
+
+    @Test
+    void firstSnapshotBatchReachesTheRuntimeBeforeTheConnectorFinishesLaterBatches(@TempDir Path dir)
+            throws Exception {
+        Path resume = dir.resolve("resume-snapshot");
+        Path jar = Synthetic.pacedSnapshotSource(dir, resume);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PacedSnapshot", null));
+        List<Envelope> rows = new CopyOnWriteArrayList<>();
+        CountDownLatch firstRow = new CountDownLatch(1);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> read = worker.submit(() -> port.streamSnapshot(config("t1"),
+                    new io.tapstate.spi.capture.CapturePort.SnapshotListener() {
+                        @Override public void seam(Optional<SourcePosition> position) { }
+                        @Override public void row(Envelope row) {
+                            rows.add(row);
+                            firstRow.countDown();
+                        }
+                    }));
+            assertThat(firstRow.await(5, TimeUnit.SECONDS))
+                    .as("the first callback arrives before the connector may produce its second batch")
+                    .isTrue();
+            assertThat(read.isDone()).isFalse();
+            assertThat(rows).singleElement().satisfies(row -> assertThat(row.after()).containsEntry("id", 1L));
+            Files.writeString(resume, "continue");
+            read.get(5, TimeUnit.SECONDS);
+            assertThat(rows).extracting(row -> row.after().get("id")).containsExactly(1L, 2L);
+        } finally {
+            Files.writeString(resume, "continue");
+            worker.shutdownNow();
+            assertThat(worker.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
+    }
 
     /** A provisioner that hands back one fixed connector ref, whatever id is asked for. */
     private static ConnectorProvisioner provisioner(Path jar, String className, String requiredLevel) {

@@ -3,7 +3,6 @@ package io.tapstate.runtime.srs;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
-import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.SourcePosition;
@@ -103,30 +102,44 @@ public final class SnapshotPhase {
         // question, so one of them moving on its own is the state that has no meaning: rows pinned to a
         // generation whose seam is somewhere else.
         String resumedStart = resumed.map(ConsumerOffset::cdcStartPosition).orElse(null);
-        String tailSeam = null;
-        long count = 0;
+        final class Progress {
+            private String tailSeam;
+            private long rows;
+        }
+        Progress progress = new Progress();
         for (String table : owed) {
-            try (CaptureBatch batch = port.snapshot(readOf(config, table))) {
-                // The seam comes from the batch, which sampled it at the source before reading its first
-                // row. A source that reports none leaves the tail nothing to join to, and the run stops
-                // here rather than proceeding: a snapshot whose tail then begins wherever it likes drops
-                // every change made while the snapshot ran, with nothing thrown and nothing logged.
-                SourcePosition seam = batch.seam().orElseThrow(() -> new TapstateException(
-                        CaptureError.SNAPSHOT_REPORTS_NO_SEAM, Map.of("chain", miningChainId), null));
-                if (tailSeam == null) {
-                    tailSeam = resumedStart != null ? resumedStart : seam.token();
-                    // A resume writes back the pair it read, unchanged; a new load writes the pair it
-                    // sampled. Both are scoped to this pipeline, so neither can move another pipeline's
-                    // tail or generation.
-                    meta.setCdcStart(miningChainId, pipelineId, tailSeam, epoch);
+            boolean[] seamSeen = {false};
+            port.streamSnapshot(readOf(config, table), new CapturePort.SnapshotListener() {
+                @Override
+                public void seam(Optional<SourcePosition> reported) {
+                    if (seamSeen[0]) {
+                        throw new IllegalStateException("a snapshot reports one seam per table");
+                    }
+                    seamSeen[0] = true;
+                    // The source samples before its first row. A missing seam cannot join a tail without
+                    // dropping every change made while the snapshot was in progress.
+                    SourcePosition found = reported.orElseThrow(() -> new TapstateException(
+                            CaptureError.SNAPSHOT_REPORTS_NO_SEAM, Map.of("chain", miningChainId), null));
+                    if (progress.tailSeam == null) {
+                        progress.tailSeam = resumedStart != null ? resumedStart : found.token();
+                        meta.setCdcStart(miningChainId, pipelineId, progress.tailSeam, epoch);
+                    }
                 }
-                while (batch.hasNext()) {
-                    sink.accept(batch.next().withOrder(order));
-                    count++;
+
+                @Override
+                public void row(Envelope row) {
+                    if (!seamSeen[0]) {
+                        throw new IllegalStateException("a snapshot row arrived before its seam");
+                    }
+                    sink.accept(row.withOrder(order));
+                    progress.rows++;
                 }
+            });
+            if (!seamSeen[0]) {
+                throw new IllegalStateException("a snapshot returned without reporting its seam");
             }
         }
-        return new Outcome(count, tailSeam);
+        return new Outcome(progress.rows, progress.tailSeam);
     }
 
     /**
@@ -222,7 +235,7 @@ public final class SnapshotPhase {
      * stamped with the generation assigned to this bounded run before it leaves: a stateful node needs an
      * order even where there will never be a later change, and a later run needs a higher generation to beat
      * state the earlier one left behind. Events go one by one, never buffered in the change ring, and the
-     * batch is always closed.
+     * source is always closed by the capture port.
      */
     public static long drain(
             CapturePort port, CaptureConfig config, long snapshotEpoch, Consumer<Envelope> sink) {
@@ -235,13 +248,29 @@ public final class SnapshotPhase {
         }
 
         SourceOrder order = SourceOrder.snapshotRow(snapshotEpoch);
-        long count = 0;
-        try (CaptureBatch batch = port.snapshot(config)) {
-            while (batch.hasNext()) {
-                sink.accept(batch.next().withOrder(order));
-                count++;
+        long[] count = {0};
+        boolean[] seamSeen = {false};
+        port.streamSnapshot(config, new CapturePort.SnapshotListener() {
+            @Override
+            public void seam(Optional<SourcePosition> ignored) {
+                if (seamSeen[0]) {
+                    throw new IllegalStateException("a snapshot reports one seam");
+                }
+                seamSeen[0] = true;
             }
+
+            @Override
+            public void row(Envelope row) {
+                if (!seamSeen[0]) {
+                    throw new IllegalStateException("a snapshot row arrived before its seam");
+                }
+                sink.accept(row.withOrder(order));
+                count[0]++;
+            }
+        });
+        if (!seamSeen[0]) {
+            throw new IllegalStateException("a snapshot returned without reporting its seam");
         }
-        return count;
+        return count[0];
     }
 }
