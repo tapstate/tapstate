@@ -6,6 +6,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * Where the facts a convergence pass measured are offered for export. The second projection of the
@@ -25,6 +26,10 @@ public interface MetricsExport extends AutoCloseable {
      * state on the metrics side: as a gauge per state, never encoded into the facts themselves.
      */
     void offer(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts);
+
+    /** Registers a cheap, store-independent process reading sampled by the exporter's own pull cadence. */
+    default void observeProcess(Supplier<List<MetricFact>> facts) {
+    }
 
     /** Drops what is held for every pipeline outside {@code pipelineIds}, which is the set that still exists. */
     void forgetPipelinesOutside(Collection<String> pipelineIds);

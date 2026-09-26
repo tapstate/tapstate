@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.spi.metrics.MetricsExport;
@@ -17,10 +19,64 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class TelemetryDispatcherTest {
+
+    @Test
+    void processHealthRemainsReadableWhenTheLatestStoreFails() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        ObservationStore store = new ObservationStore() {
+            @Override public void save(Observation observation) {
+                throw new IllegalStateException("latest store unavailable");
+            }
+            @Override public Optional<Observation> read(String id) {
+                reads.incrementAndGet();
+                return Optional.empty();
+            }
+            @Override public void delete(String id) { }
+        };
+        AtomicReference<Supplier<List<MetricFact>>> exportedProcess = new AtomicReference<>();
+        MetricsExport export = new MetricsExport() {
+            @Override public void observeProcess(Supplier<List<MetricFact>> facts) {
+                exportedProcess.set(facts);
+            }
+            @Override public void offer(String id, PipelineState state, Instant at, List<MetricFact> facts) { }
+            @Override public void forgetPipelinesOutside(java.util.Collection<String> ids) { }
+        };
+        try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), store), null, export, 1, 2)) {
+            assertThat(exportedProcess.get()).isNotNull();
+            assertThat(exportedProcess.get().get()).as("wired sinks report zero readings before work")
+                    .anyMatch(fact -> fact.name().equals("tapstate.process.telemetry.degraded")
+                            && fact.points().stream().anyMatch(point ->
+                                    "latest".equals(point.attributes().get(MetricAttributes.TELEMETRY_SINK))
+                                            && point.value() == 0));
+            dispatcher.offer(frame(1), null);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (dispatcher.health().get(TelemetryDispatcher.Sink.LATEST).failures() == 0
+                    && System.nanoTime() - deadline < 0) {
+                Thread.sleep(5);
+            }
+            List<MetricFact> health = exportedProcess.get().get();
+            MetricFact degraded = health.stream()
+                    .filter(fact -> fact.name().equals("tapstate.process.telemetry.degraded"))
+                    .findFirst().orElseThrow();
+            assertThat(degraded.points()).anySatisfy(point -> {
+                assertThat(point.attributes()).containsEntry(MetricAttributes.TELEMETRY_SINK, "latest");
+                assertThat(point.value()).isEqualTo(1L);
+            });
+            assertThat(health.stream().flatMap(fact -> fact.points().stream())
+                    .map(point -> point.attributes().get(MetricAttributes.TELEMETRY_SINK)))
+                    .doesNotContain("history");
+            assertThat(health).noneMatch(fact -> fact.name().equals(
+                    "tapstate.process.telemetry.last_success.age"));
+            assertThat(reads).hasValue(0);
+        }
+    }
 
     @Test
     void historyWorkerRetainsTheExecutionScopeOfTheOfferedFrame() throws Exception {

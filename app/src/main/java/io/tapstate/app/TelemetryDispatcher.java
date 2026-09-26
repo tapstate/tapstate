@@ -9,8 +9,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
@@ -172,6 +175,7 @@ final class TelemetryDispatcher implements AutoCloseable {
     private final Stats exportStats = new Stats();
     private final ConcurrentHashMap<String, LatestSlot> latestByPipeline = new ConcurrentHashMap<>();
     private final ScheduledExecutorService watchdog;
+    private final Instant startedAt = Instant.now();
 
     TelemetryDispatcher(ObservationPublisher publisher, RateSampler sampler, MetricsExport export,
             int latestConcurrency, int queueCapacity) {
@@ -210,6 +214,15 @@ final class TelemetryDispatcher implements AutoCloseable {
             historyStats.watch("history", writeDeadline);
             exportStats.watch("export", writeDeadline);
         }, periodMillis, periodMillis, TimeUnit.MILLISECONDS);
+        EnumSet<Sink> wired = EnumSet.of(Sink.LATEST);
+        if (sampler != null) {
+            wired.add(Sink.HISTORY);
+        }
+        if (export != MetricsExport.none()) {
+            wired.add(Sink.EXPORT);
+        }
+        Set<Sink> enabled = Set.copyOf(wired);
+        export.observeProcess(() -> TelemetryProcessFacts.snapshot(health(), enabled, startedAt, Instant.now()));
     }
 
     private static ThreadPoolExecutor workers(String sink, int count, int queueCapacity) {

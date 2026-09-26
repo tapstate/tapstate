@@ -51,16 +51,20 @@ public final class MetricAttributes {
     public static final String OP = "op";
     public static final String CODE = "code";
     public static final String STAGE = "stage";
+    /** The fixed telemetry sink whose local worker health a process instrument describes. */
+    public static final String TELEMETRY_SINK = "sink";
     /** The marker OpenTelemetry puts on the series that absorbs what a cardinality limit turned away. */
     public static final String OVERFLOW = "otel.metric.overflow";
 
     public static final Set<String> DIRECTIONS = Set.of("in", "out");
     public static final Set<String> OPS = Set.of("insert", "update", "delete", "read", "ddl", "other");
+    public static final Set<String> TELEMETRY_SINKS = Set.of("latest", "history", "export");
 
     private static final Map<String, Set<String>> CLOSED = Map.of(
             DIRECTION, DIRECTIONS,
             OP, OPS,
-            STAGE, Stage.attributeValues());
+            STAGE, Stage.attributeValues(),
+            TELEMETRY_SINK, TELEMETRY_SINKS);
 
     private MetricAttributes() {
     }

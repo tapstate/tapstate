@@ -10,11 +10,16 @@ import io.opentelemetry.sdk.metrics.data.PointData;
 import io.opentelemetry.sdk.metrics.data.SumData;
 import io.opentelemetry.sdk.resources.Resource;
 import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static io.tapstate.adapters.otel.Facts.AT;
 import static io.tapstate.adapters.otel.Facts.DELIVERY;
@@ -31,6 +36,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 class FactsBecomeMetricDataTest {
 
     private final FactsMetricProducer producer = new FactsMetricProducer(START.minusSeconds(5));
+
+    @Test
+    void processHealthIsPulledWithoutAnyPipelineObservationOrStoreWrite() {
+        AtomicLong degraded = new AtomicLong(1);
+        producer.observeProcess(() -> List.of(MetricFact.single(
+                "tapstate.process.telemetry.degraded", MetricType.GAUGE, "1",
+                MetricPoint.reading(Map.of(MetricAttributes.TELEMETRY_SINK, "latest"), AT,
+                        degraded.get()))));
+
+        MetricData first = only(producer.produce(Resource.empty()),
+                "tapstate.process.telemetry.degraded");
+        assertThat(first.getType()).isEqualTo(MetricDataType.LONG_GAUGE);
+        LongPointData point = first.getLongGaugeData().getPoints().iterator().next();
+        assertThat(point.getValue()).isEqualTo(1L);
+        assertThat(point.getAttributes().get(AttributeKey.stringKey(MetricAttributes.TELEMETRY_SINK)))
+                .isEqualTo("latest");
+        assertThat(point.getAttributes().get(AttributeKey.stringKey(MetricAttributes.PIPELINE_ID))).isNull();
+
+        degraded.set(0);
+        assertThat(only(producer.produce(Resource.empty()), "tapstate.process.telemetry.degraded")
+                .getLongGaugeData().getPoints()).extracting(LongPointData::getValue).containsExactly(0L);
+    }
 
     private static MetricData only(Collection<MetricData> produced, String name) {
         List<MetricData> named = produced.stream().filter(metric -> metric.getName().equals(name)).toList();

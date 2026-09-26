@@ -22,6 +22,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * The metrics export port carried out by the OpenTelemetry SDK: the facts each pipeline last reported are
@@ -95,6 +96,11 @@ public final class OtelMetricsExport implements MetricsExport {
     @Override
     public void offer(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
         producer.offer(pipelineId, state, observedAt, facts);
+    }
+
+    @Override
+    public void observeProcess(Supplier<List<MetricFact>> facts) {
+        producer.observeProcess(facts);
     }
 
     @Override

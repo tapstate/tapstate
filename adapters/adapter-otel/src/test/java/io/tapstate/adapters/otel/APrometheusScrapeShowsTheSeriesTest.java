@@ -1,5 +1,9 @@
 package io.tapstate.adapters.otel;
 
+import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
 
@@ -10,6 +14,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.List;
+import java.util.Map;
 
 import static io.tapstate.adapters.otel.Facts.AT;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -25,6 +30,25 @@ class APrometheusScrapeShowsTheSeriesTest {
     private static int freePort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
+        }
+    }
+
+    @Test
+    void aScrapeReadsProcessHealthWithoutAnyPipelineObservation() throws Exception {
+        int port = freePort();
+        try (OtelMetricsExport export = OtelMetricsExport.start(ExportSettings.prometheusOn("127.0.0.1", port))) {
+            export.observeProcess(() -> List.of(MetricFact.single(
+                    "tapstate.process.telemetry.degraded", MetricType.GAUGE, "1",
+                    MetricPoint.reading(Map.of(MetricAttributes.TELEMETRY_SINK, "latest"), AT, 1))));
+
+            HttpResponse<String> response = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/metrics")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.body())
+                    .containsPattern("tapstate_process_telemetry_degraded\\{[^}]*sink=\\\"latest\\\"[^}]*\\} 1")
+                    .doesNotContain("tapstate_pipeline_state");
         }
     }
 

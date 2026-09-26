@@ -20,6 +20,8 @@ import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -33,6 +35,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 /**
  * The facts of every pipeline, as the SDK's readers ask for them. Holds the latest facts offered for
@@ -60,6 +63,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * for a state.
  */
 final class FactsMetricProducer implements MetricProducer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FactsMetricProducer.class);
 
     /** The gauge that projects each pipeline's state: one series per state, 1 where the pipeline is. */
     static final String STATE_METRIC = "tapstate.pipeline.state";
@@ -89,6 +94,7 @@ final class FactsMetricProducer implements MetricProducer {
     private final Instant started;
     private final CardinalityBudget.Folder folder = CardinalityBudget.folder();
     private final Map<String, Offered> latest = new ConcurrentHashMap<>();
+    private volatile Supplier<List<MetricFact>> processFacts = List::of;
 
     /** Per instrument, the attribute sets that hold a series of their own past the export limit, in first-seen order. */
     private final Map<String, Set<Map<String, String>>> named = new HashMap<>();
@@ -109,6 +115,11 @@ final class FactsMetricProducer implements MetricProducer {
             }
         }
         latest.put(pipelineId, new Offered(state, observedAt, List.copyOf(folded)));
+    }
+
+    /** Process facts are read on collection, independently of observation and store worker success. */
+    void observeProcess(Supplier<List<MetricFact>> facts) {
+        processFacts = Objects.requireNonNull(facts, "facts");
     }
 
     /** Drops what is held for every pipeline outside {@code pipelineIds}; their series stop with the next collection. */
@@ -151,6 +162,14 @@ final class FactsMetricProducer implements MetricProducer {
                 byInstrument.computeIfAbsent(fact.name(), name -> new Series(fact.type(), fact.unit()))
                         .points.addAll(fact.points());
             }
+        }
+        try {
+            for (MetricFact fact : Objects.requireNonNull(processFacts.get(), "process facts")) {
+                byInstrument.computeIfAbsent(fact.name(), name -> new Series(fact.type(), fact.unit()))
+                        .points.addAll(fact.points());
+            }
+        } catch (RuntimeException unreadable) {
+            LOG.warn("Could not read process telemetry health for metrics export", unreadable);
         }
         List<MetricData> out = new ArrayList<>();
         byInstrument.forEach((name, series) ->
