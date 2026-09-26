@@ -17,6 +17,7 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.NestDeadLetterRecord;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.SourceModel;
@@ -66,6 +67,49 @@ class MongoStorePortIT {
             config:
               host: localhost
             """;
+
+    @Test
+    void scopedLatestRejectsDelayedExecutionsAndKeepsOneDocument() {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+        try (MongoConnection connection = new MongoConnection(settings)) {
+            connection.verify();
+            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            dropLifecycleStorage(uri);
+            ObservationStore latest = port.observations();
+            ObservationStore.Scope first = new ObservationStore.Scope("inc-a", 41);
+            ObservationStore.Scope next = new ObservationStore.Scope("inc-a", 42);
+            ObservationStore.Scope recreated = new ObservationStore.Scope("inc-b", 43);
+            Instant at = Instant.parse("2026-09-26T10:00:00Z");
+
+            latest.save(new Observation("flow", PipelineState.NEW, Map.of(), Map.of()));
+            assertThat(latest.readStored("flow").orElseThrow().scope()).isEmpty();
+            assertThat(latest.saveScoped(scopedObservation(at, 1), first)).isTrue();
+            assertThat(latest.saveScoped(scopedObservation(at.minusSeconds(1), 2), first)).isFalse();
+            assertThat(latest.saveScoped(scopedObservation(at.plusSeconds(1), 3), first)).isTrue();
+            assertThat(latest.saveScoped(scopedObservation(at.plusSeconds(2), 4), next)).isTrue();
+            assertThat(latest.saveScoped(scopedObservation(at.plusSeconds(3), 5), first)).isFalse();
+            assertThat(latest.saveScoped(scopedObservation(at.plusSeconds(3), 6),
+                    new ObservationStore.Scope("inc-b", 42))).isFalse();
+            assertThat(latest.saveScoped(scopedObservation(at.plusSeconds(3), 7), recreated)).isTrue();
+            assertThat(latest.saveScoped(scopedObservation(at.plusSeconds(4), 8), next)).isFalse();
+            assertThat(latest.readStored("flow").orElseThrow())
+                    .satisfies(stored -> {
+                        assertThat(stored.scope()).contains(recreated);
+                        assertThat(stored.observation().metrics()).containsEntry("recordCount", 7L);
+                    });
+            String databaseName = new ConnectionString(uri).getDatabase();
+            try (MongoClient raw = MongoClients.create(uri)) {
+                assertThat(raw.getDatabase(databaseName)
+                        .getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isEqualTo(1);
+            }
+        }
+    }
+
+    private static Observation scopedObservation(Instant at, long count) {
+        return new Observation("flow", PipelineState.RUNNING, Map.of("recordCount", count),
+                Map.of(), Map.of(), null, at);
+    }
 
     @Test
     void aggregatesTheElevenSubStoresEachOnItsOwnStorage() {

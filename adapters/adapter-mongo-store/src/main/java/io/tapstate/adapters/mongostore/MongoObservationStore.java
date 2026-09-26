@@ -1,7 +1,9 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoException;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.result.UpdateResult;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.MetricFact;
@@ -28,9 +30,8 @@ import java.util.TreeMap;
 /**
  * The MongoDB per-pipeline observation store: one observation document per pipeline, keyed by the
  * pipeline id (as {@code _id}), carrying the lifecycle state and the metrics / per-table snapshot
- * progress / per-table position sub-documents. An observation is the latest projection, not fenced: it is
- * a straight upsert by pipeline id (last write wins), not the epoch-fencing compare-and-swap the actual
- * state store uses.
+ * progress / per-table position sub-documents. Scoped writes compare the execution owner and observation
+ * time in the same Mongo operation; the legacy save method remains an unfenced upsert.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A stored document whose state is missing or unrecognized, or whose metric / snapshot / position
@@ -64,10 +65,73 @@ public final class MongoObservationStore implements ObservationStore {
     }
 
     @Override
+    public boolean saveScoped(Observation observation, Scope scope) {
+        Objects.requireNonNull(observation, "observation");
+        Objects.requireNonNull(scope, "scope");
+        Instant observedAt = Objects.requireNonNull(observation.observedAt(), "observedAt");
+        if (observedAt.getNano() % 1_000_000 != 0) {
+            throw new IllegalArgumentException("a scoped observation time must have millisecond precision");
+        }
+        String id = observation.pipelineId();
+        Document legacy = new Document("pipelineIncarnationId", new Document("$exists", false))
+                .append("executionGeneration", new Document("$exists", false));
+        Document newerGeneration = new Document("executionGeneration",
+                new Document("$lt", scope.executionGeneration()));
+        Document newerTimeInSameExecution = new Document("pipelineIncarnationId", scope.pipelineIncarnationId())
+                .append("executionGeneration", scope.executionGeneration())
+                .append("observedAt", new Document("$lt", Date.from(observedAt)));
+        Document filter = new Document("_id", id)
+                .append("$or", List.of(legacy, newerGeneration, newerTimeInSameExecution));
+        Document replacement = toDocument(observation)
+                .append("pipelineIncarnationId", scope.pipelineIncarnationId())
+                .append("executionGeneration", scope.executionGeneration());
+        return StoreIo.call(id, () -> {
+            try {
+                UpdateResult result = collection.replaceOne(filter, replacement, new ReplaceOptions().upsert(true));
+                return result.getModifiedCount() != 0 || result.getUpsertedId() != null;
+            } catch (MongoException conflict) {
+                // An existing _id whose scope or time did not match makes the upsert attempt collide.
+                // A concurrent insert may also win first; the next observation may retry with fresh facts.
+                if (duplicateKey(conflict)) {
+                    return false;
+                }
+                throw conflict;
+            }
+        });
+    }
+
+    private static boolean duplicateKey(MongoException failure) {
+        return failure instanceof com.mongodb.MongoWriteException write
+                ? write.getError().getCode() == 11000 : failure.getCode() == 11000;
+    }
+
+    @Override
     public Optional<Observation> read(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Document document = StoreIo.call(() -> collection.find(new Document("_id", pipelineId)).first());
         return document == null ? Optional.empty() : Optional.of(toObservation(document));
+    }
+
+    @Override
+    public Optional<Stored> readStored(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Document document = StoreIo.call(() -> collection.find(new Document("_id", pipelineId)).first());
+        if (document == null) {
+            return Optional.empty();
+        }
+        Object rawIncarnation = document.get("pipelineIncarnationId");
+        Object rawGeneration = document.get("executionGeneration");
+        Optional<Scope> scope;
+        if (rawIncarnation == null && rawGeneration == null) {
+            scope = Optional.empty();
+        } else if (rawIncarnation instanceof String incarnation
+                && (rawGeneration instanceof Long || rawGeneration instanceof Integer)
+                && !incarnation.isBlank() && ((Number) rawGeneration).longValue() > 0) {
+            scope = Optional.of(new Scope(incarnation, ((Number) rawGeneration).longValue()));
+        } else {
+            throw corrupt(pipelineId, "observation scope");
+        }
+        return Optional.of(new Stored(toObservation(document), scope));
     }
 
     @Override
