@@ -648,10 +648,11 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    HistoryRollupQueryHealth historyRollupQueryHealth(MetricsExport export, Clock clock) {
+    HistoryRollupQueryHealth historyRollupQueryHealth(ObjectProvider<MetricsExport> export, Clock clock) {
         HistoryRollupQueryHealth health = new HistoryRollupQueryHealth();
         java.time.Instant startedAt = clock.instant();
-        export.observeProcess("rollup-query", () -> HistoryRollupQueryFacts.snapshot(
+        MetricsExport metrics = export.getIfAvailable(MetricsExport::none);
+        metrics.observeProcess("rollup-query", () -> HistoryRollupQueryFacts.snapshot(
                 health.snapshot(), startedAt, clock.instant()));
         return health;
     }

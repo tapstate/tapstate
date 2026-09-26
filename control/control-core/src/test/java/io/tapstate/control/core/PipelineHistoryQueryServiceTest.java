@@ -102,6 +102,24 @@ class PipelineHistoryQueryServiceTest {
     }
 
     @Test
+    void tooManyMissingBucketsCountOneWholeRawFallbackWithoutCountingPlannedBuckets() {
+        RecordingHistory raw = oneHourOfSamples();
+        RecordingRollups cache = new RecordingRollups();
+        Instant from = NOW.minus(Duration.ofHours(6));
+        cache.add(rollup(from, HistoryRollupStore.Resolution.PT5M, 1, NOW.plusSeconds(120)));
+        List<PipelineHistoryQueryService.RollupFallback> observed = new ArrayList<>();
+        PipelineHistoryQueryService service = observedService(raw, cache, observed);
+
+        assertThat(service.query(new PipelineHistoryQuery("orders", from, NOW,
+                HistoryResolution.PT5M, 100, List.of("orders"), null)).status())
+                .isEqualTo(PipelineMetricsHistory.Status.OK);
+
+        assertThat(observed).containsExactly(new PipelineHistoryQueryService.RollupFallback(
+                HistoryRollupStore.Resolution.PT5M, 0, true));
+        assertThat(raw.pageRanges).containsExactly(new TimeRange(from, NOW));
+    }
+
+    @Test
     void partialAndMarkedCacheBucketsEachCountOneDownDrill() {
         RecordingHistory raw = oneHourOfSamples();
         RecordingRollups cache = new RecordingRollups();
