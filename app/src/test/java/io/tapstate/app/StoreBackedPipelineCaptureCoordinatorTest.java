@@ -3,6 +3,11 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.SourceRef;
@@ -38,9 +43,12 @@ import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
+import io.tapstate.runtime.srs.SnapshotPhase;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.CaptureBatch;
+import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceModel;
@@ -57,6 +65,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -1031,6 +1040,154 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
+    void aCompletedLoadStillReadsAsCompleteAfterTheRunIsReplaced() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        InMemoryStorePort store = discoveredAs(artifacts, "orders", 5L);
+        CapturePort source = mock(CapturePort.class);
+        CaptureBatch batch = mock(CaptureBatch.class);
+        AtomicInteger row = new AtomicInteger();
+        when(source.snapshot(any())).thenReturn(batch);
+        when(batch.seam()).thenReturn(Optional.of(new SourcePosition("after-load")));
+        when(batch.hasNext()).thenReturn(true, true, true, true, true, false);
+        when(batch.next()).thenAnswer(ignored -> Envelope.read(
+                row.incrementAndGet(), "orders", Map.of("id", row.get()), Map.of()));
+
+        AtomicReference<MiningChainId> chain = new AtomicReference<>();
+        for (int member = 0; member < 2; member++) {
+            SrsCoordinator srs = new SrsCoordinator(store.meta());
+            CaptureStarter starter = (spec, passthrough) -> {
+                MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+                chain.set(chainId);
+                long epoch = srs.provisionSource(
+                        spec.sourceId(), chainId, spec.config().streams(), spec.retention()).epoch();
+                srs.attachConsumer(chainId, spec.pipelineId());
+                long rows = SnapshotPhase.run(source, spec.config(), chainId.value(), spec.pipelineId(),
+                        spec.config().streams(), epoch, store.meta(), passthrough).rows();
+                return new CaptureRun(Optional.of(chainId), false, rows, Map.of("orders", rows),
+                        Optional.empty(), Optional.empty(), new CaptureHealth());
+            };
+            StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                    store, starter, srs, new SnapshotBuffer());
+            coordinator.startCapture("p");
+
+            if (member == 0) {
+                assertThat(coordinator.snapshotProgress("p").byTable())
+                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
+                store.meta().markSnapshotComplete(chain.get().value(), "p", "orders");
+                assertThat(coordinator.loadDelivered("p")).isTrue();
+            } else {
+                verify(source, times(1)).snapshot(any());
+                assertThat(coordinator.loadDelivered("p")).isTrue();
+                assertThat(coordinator.snapshotProgress("p").byTable())
+                        .as("a replacement that skips the confirmed load still reports its five rows")
+                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
+            }
+        }
+    }
+
+    @Test
+    void aReplacedRunReportsConfirmedRowsWhileAnotherTableIsStillLoading() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"), SourceMode.CDC,
+                List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
+        artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", false)), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"),
+                        List.of(new SyncElement("sync_1", "orders_src", null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srs = new SrsCoordinator(store.meta());
+        CountDownLatch secondCustomerRead = new CountDownLatch(1);
+        CountDownLatch releaseSecondRead = new CountDownLatch(1);
+        AtomicInteger customerReads = new AtomicInteger();
+        CapturePort source = mock(CapturePort.class);
+        when(source.snapshot(any())).thenAnswer(invocation -> {
+            String table = ((CaptureConfig) invocation.getArgument(0)).streams().getFirst();
+            if (table.equals("orders")) {
+                return snapshotBatch(table, 5, null, null);
+            }
+            int read = customerReads.incrementAndGet();
+            return snapshotBatch(table, read == 1 ? 1 : 2,
+                    read == 1 ? null : releaseSecondRead,
+                    read == 1 ? null : secondCustomerRead);
+        });
+        when(source.cdc(any(), any(), any())).thenReturn(mock(Subscription.class));
+        CaptureRunUnit unit = new CaptureRunUnit(source, srs, store.meta(), mock(HazelcastInstance.class));
+        AtomicReference<CaptureRun> latest = new AtomicReference<>();
+        CaptureStarter starter = (spec, handoff) -> {
+            CaptureRun run = unit.begin(spec, handoff);
+            latest.set(run);
+            return run;
+        };
+
+        StoreBackedPipelineCaptureCoordinator first = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, srs, new SnapshotBuffer());
+        first.startCapture("p");
+        assertThat(latest.get().awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(first.captureFailure("p")).isEmpty();
+        assertThat(first.snapshotProgress("p").byTable().get("orders").rowsDone()).isEqualTo(5L);
+        MiningChainId chain = latest.get().chainId().orElseThrow();
+        store.meta().markSnapshotComplete(chain.value(), "p", "orders");
+        first.stopCapture("p", false);
+
+        StoreBackedPipelineCaptureCoordinator replacement = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, srs, new SnapshotBuffer());
+        try {
+            replacement.startCapture("p");
+            assertThat(secondCustomerRead.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(replacement.runSnapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
+            assertThat(replacement.snapshotProgress("p").byTable())
+                    .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
+            verify(source, times(1)).snapshot(org.mockito.ArgumentMatchers.argThat(
+                    config -> config.streams().equals(List.of("orders"))));
+        } finally {
+            releaseSecondRead.countDown();
+            replacement.stopCapture("p", false);
+        }
+    }
+
+    private static CaptureBatch snapshotBatch(
+            String table, int rows, CountDownLatch release, CountDownLatch entered) {
+        return new CaptureBatch() {
+            private int next = 1;
+
+            @Override
+            public boolean hasNext() {
+                if (release != null) {
+                    entered.countDown();
+                    try {
+                        if (!release.await(10, TimeUnit.SECONDS)) {
+                            throw new AssertionError("the held snapshot was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new CancellationException("the held snapshot was interrupted");
+                    }
+                }
+                return next <= rows;
+            }
+
+            @Override
+            public Envelope next() {
+                return Envelope.read(next, table, Map.of("id", next++), Map.of());
+            }
+
+            @Override
+            public Optional<SourcePosition> seam() {
+                return Optional.of(new SourcePosition("before-load"));
+            }
+
+            @Override
+            public void close() {
+                if (release != null) {
+                    release.countDown();
+                }
+            }
+        };
+    }
+
+    @Test
     void aTableNobodyCountedLeavesBothTheTotalAndThePercentageAbsent() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("orders_src", "orders", null));
@@ -1061,6 +1218,42 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         assertThat(coordinator.snapshotProgress("p").byTable())
                 .containsOnly(entry("orders", new TableSnapshot(1_500L, 1_000L, 100)));
+    }
+
+    @Test
+    void aConfirmedLoadRetainsItsMeasuredRowsAndReplacesTheStaleTotalOnResume() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        InMemoryStorePort store = discoveredAs(artifacts, "orders", 5L);
+        SrsCoordinator srs = new SrsCoordinator(store.meta());
+        AtomicReference<MiningChainId> chain = new AtomicReference<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            chain.set(chainId);
+            srs.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srs.attachConsumer(chainId, spec.pipelineId());
+            long rows = SnapshotPhase.stillOwed(
+                    store.meta().read(chainId.value()), spec.pipelineId(), spec.config().streams())
+                    .isEmpty() ? 0L : 8L;
+            return new CaptureRun(Optional.of(chainId), false, rows, Map.of("orders", rows),
+                    Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, srs, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+        Map<String, TableSnapshot> first = coordinator.snapshotProgress("p").byTable();
+        assertThat(first).containsOnly(entry("orders", new TableSnapshot(8L, 5L, 100)));
+        store.meta().markSnapshotComplete(chain.get().value(), "p", "orders");
+        coordinator.stopCapture("p", false);
+        coordinator.startCapture("p");
+
+        assertThat(coordinator.snapshotProgress("p").byTable())
+                .containsOnly(entry("orders", new TableSnapshot(8L, 8L, 100)));
+
+        coordinator.stopCapture("p", true);
+        assertThat(store.keyedState().count(SnapshotLoadCounts.namespaceOf("p"))).isZero();
     }
 
     @Test

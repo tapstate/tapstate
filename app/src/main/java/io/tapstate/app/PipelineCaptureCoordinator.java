@@ -96,6 +96,11 @@ interface PipelineCaptureCoordinator {
         return SnapshotReading.NONE;
     }
 
+    /** The rows this run itself read during its bounded snapshot, without earlier completed loads. */
+    default SnapshotReading runSnapshotProgress(String pipelineId) {
+        return SnapshotReading.NONE;
+    }
+
     /**
      * How many rows the pipeline's capture has taken from its sources, by table and source operation, with
      * the moment it began counting; nothing for a pipeline with no capture running. A coordinator that runs
