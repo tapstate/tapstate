@@ -2,7 +2,6 @@ package io.tapstate.app;
 
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
-import io.tapstate.runtime.srs.SnapshotCapacityUnavailable;
 import io.tapstate.runtime.srs.PhysicalRingNotReady;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -112,7 +111,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     snapshot -> captureCoordinator.startCapture(
                             pipelineId, snapshot, prepared.cursorWriterToken()),
                     () -> captureCoordinator.startCapture(pipelineId));
-        } catch (RingNotOpenYet | SnapshotCapacityUnavailable | PhysicalRingNotReady notYet) {
+        } catch (RingNotOpenYet | PhysicalRingNotReady notYet) {
             // Nothing was submitted: the physical ring or its generation boundary is not ready, or the
             // bounded snapshot pool has no slot. A later pass retries without a data-plane failure.
             return;

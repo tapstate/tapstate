@@ -26,7 +26,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -262,38 +261,8 @@ public final class CaptureRunUnit {
                             Optional.of(chainId), merged, snapshotCount, snapshotCounts,
                             ringSource, Optional.empty(), health);
                 }
-                // The cursors alone, not the whole record: this is read on every run of changes, and the
-                // record also carries a schema history that grows per DDL and is never read here.
-                Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
-                // What the acked position can be attributed to decides whether this chain's log can be
-                // cut at all. A chain records one acked position for the whole chain, and the sequence in
-                // it came from whichever table's ring held that change -- on a chain of one table there is
-                // only one ring it could be, so the frontier bounds that log exactly; on a chain of several
-                // there is no way to tell which, and cutting the wrong ring deletes changes that still have
-                // to be replayed. So a multi-table chain keeps everything, and will until an acked position
-                // is recorded per table. That is not a smaller version of this cut, it is a different
-                // record, and it belongs with the work that makes a table recoverable on its own.
-                SrsLogStore log = hz.getUserContext().get(SRS_LOG_USER_CONTEXT_KEY) instanceof SrsLogStore
-                        bound ? bound : null;
-                boolean cuttable = log != null && tables.size() == 1;
-                Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
-                for (String table : tables) {
-                    String ringName = SrsRingbuffer.ringName(cid, table);
-                    SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ringName)));
-                    // One generation across the chain's tables: they are rebuilt together, so a sequence of
-                    // one ring is comparable with a sequence of another exactly when both were opened by the
-                    // same provisioning.
-                    CdcChain chain = new CdcChain(
-                            gate, meta, cid, ringEpoch, spec.schemaVer(), spec.captureFence());
-                    LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
-                    routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
-                }
-                CaptureStart minerStart = tailStart(
-                        meta, cid, spec.pipelineId(), ownSeam, CaptureStart.present());
-                refuseAnInstantThisBufferWillNeverReach(
-                        spec.startFrom(), minerStart, spec.retention());
-                subscription = Optional.of(CdcPhase.run(
-                        port, spec.config(), minerStart, routes, health));
+                subscription = Optional.of(startSharedTail(
+                        spec, chainId, ringEpoch, ownSeam, tables, health, false));
             } else if (plan.directTail() && startTail) {
                 // srs.enabled:false: the tail streams straight to the consumer with no shared ring. The ring
                 // is the whole of what the flag decides -- the chain is open and its record is kept either
@@ -310,17 +279,8 @@ public final class CaptureRunUnit {
                         Objects.requireNonNull(chainId, "a tail resolves its chain before it runs");
                 coordinator.attachConsumer(directChainId, spec.pipelineId());
                 consumerAttached = true;
-                String directChain = directChainId.value();
-                long directEpoch = epoch;
-                Supplier<Collection<ConsumerOffset>> directConsumers = () -> meta.consumerOffsets(directChain);
-                AtomicLong forwarded = new AtomicLong();
-                AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
-                subscription = Optional.of(port.cdc(
-                        spec.config(), tailStart(
-                                meta, directChain, spec.pipelineId(), ownSeam, sourceStart(spec.startFrom())),
-                        health.recording((events, position) -> forwardDirect(
-                                events, position, directChain, directEpoch, forwarded,
-                                directConsumers, directLastWritten, passthrough))));
+                subscription = Optional.of(startDirectTail(
+                        spec, directChainId, epoch, ownSeam, health, passthrough));
             }
 
             return new CaptureRun(
@@ -469,163 +429,6 @@ public final class CaptureRunUnit {
                 failure.addSuppressed(unclosed);
             }
             throw failure;
-        }
-    }
-
-    private CaptureRun startDeferredSnapshot(CaptureRunSpec spec, Consumer<Envelope> passthrough,
-            boolean startTail, ConsumptionPlan plan, MiningChainId chainId, boolean merged, long epoch,
-            String cursorWriterToken, List<String> tables, CaptureHealth health,
-            SnapshotWorkers.Reservation reservation, boolean[] consumerAttached) {
-        MiningChainId rings = chainId != null ? chainId : MiningChainId.resolve(spec.config(), spec.srsKey());
-        String token = spec.cursorWriterToken() != null ? spec.cursorWriterToken()
-                : cursorWriterToken != null ? cursorWriterToken : java.util.UUID.randomUUID().toString();
-        Map<String, String> ringByTable = new LinkedHashMap<>();
-        for (String table : tables) {
-            String ringName = SrsRingbuffer.ringName(rings.value(), table);
-            snapshotBuffer.beginSnapshot(spec.pipelineId(), ringName, token);
-            ringByTable.put(table, ringName);
-        }
-        try {
-            Optional<StreamSource<SrsItem>> ringSource = Optional.empty();
-            if (plan.sharedRing()) {
-                coordinator.attachConsumer(chainId, spec.pipelineId());
-                consumerAttached[0] = true;
-                String cid = chainId.value();
-                ringSource = Optional.of(SrsRingSource.create(
-                        ringByTable.get(tables.getFirst()), spec.startFrom(),
-                        readCursorPublisher(cid, spec.pipelineId(), tables.getFirst(), epoch, cursorWriterToken),
-                        spec.retention()));
-            } else if (plan.directTail() && startTail) {
-                coordinator.attachConsumer(chainId, spec.pipelineId());
-                consumerAttached[0] = true;
-            }
-            DeferredCapture deferred = new DeferredCapture(
-                    reservation, snapshotBuffer, spec.pipelineId(), ringByTable.values(), token, health);
-            deferred.prepare(() -> {
-                Consumer<Envelope> receive = event -> {
-                    if (!ringByTable.containsKey(event.src())) {
-                        throw new TapstateException(CaptureError.EVENT_TABLE_NOT_SELECTED,
-                                Map.of("table", event.src()), null);
-                    }
-                    health.received(event);
-                    snapshotBuffer.appendSnapshot(
-                            spec.pipelineId(), ringByTable.get(event.src()), token, event);
-                    passthrough.accept(event);
-                };
-                String ownSeam;
-                if (chainId != null) {
-                    ownSeam = SnapshotPhase.run(port, spec.config(), chainId.value(), spec.pipelineId(),
-                            tables, epoch, meta, token, receive).tailSeam();
-                } else {
-                    long snapshotEpoch = spec.snapshotEpoch() > 0
-                            ? spec.snapshotEpoch() : chainlessSnapshotEpoch.incrementAndGet();
-                    SnapshotPhase.drain(port, spec.config(), snapshotEpoch, receive);
-                    ownSeam = null;
-                }
-                for (String ringName : ringByTable.values()) {
-                    snapshotBuffer.completeSnapshot(spec.pipelineId(), ringName, token);
-                }
-                if (plan.sharedRing() && startTail) {
-                    deferred.attach(startSharedTail(spec, chainId, epoch, ownSeam, tables, health, false));
-                } else if (plan.directTail() && startTail) {
-                    deferred.attach(startDirectTail(spec, chainId, epoch, ownSeam, health, passthrough));
-                }
-            });
-            return new CaptureRun(Optional.ofNullable(chainId), merged, 0L, Map.of(),
-                    ringSource, Optional.of(deferred), health);
-        } catch (RuntimeException | Error failure) {
-            for (String ringName : ringByTable.values()) {
-                snapshotBuffer.releaseSnapshot(spec.pipelineId(), ringName, token);
-            }
-            throw failure;
-        }
-    }
-
-    private static final class DeferredCapture implements SnapshotActivation {
-        private final SnapshotWorkers.Reservation reservation;
-        private final SnapshotBuffer buffer;
-        private final String pipelineId;
-        private final List<String> ringNames;
-        private final String token;
-        private final CaptureHealth health;
-        private final AtomicBoolean activated = new AtomicBoolean();
-        private final AtomicBoolean closed = new AtomicBoolean();
-        private final AtomicReference<Subscription> tail = new AtomicReference<>();
-        private Runnable read;
-
-        private DeferredCapture(SnapshotWorkers.Reservation reservation, SnapshotBuffer buffer,
-                String pipelineId, Collection<String> ringNames, String token, CaptureHealth health) {
-            this.reservation = reservation;
-            this.buffer = buffer;
-            this.pipelineId = pipelineId;
-            this.ringNames = List.copyOf(ringNames);
-            this.token = token;
-            this.health = health;
-        }
-
-        private void prepare(Runnable read) {
-            this.read = Objects.requireNonNull(read, "read");
-        }
-
-        @Override
-        public void activateSnapshot() {
-            if (closed.get() || !activated.compareAndSet(false, true)) {
-                return;
-            }
-            reservation.activate(() -> {
-                if (closed.get()) {
-                    return;
-                }
-                try {
-                    read.run();
-                } catch (RuntimeException | Error failure) {
-                    if (!closed.get() && !(failure instanceof CancellationException)) {
-                        health.fail(failure);
-                        for (String ringName : ringNames) {
-                            try {
-                                buffer.failSnapshot(pipelineId, ringName, token, failure);
-                            } catch (CancellationException replaced) {
-                                // A newer run owns the ring; its session must not inherit this failure.
-                            }
-                        }
-                    }
-                    if (failure instanceof Error defect) {
-                        throw defect;
-                    }
-                }
-            });
-        }
-
-        private void attach(Subscription started) {
-            if (closed.get()) {
-                started.close();
-                return;
-            }
-            if (!tail.compareAndSet(null, started)) {
-                started.close();
-                throw new IllegalStateException("a snapshot run opened more than one CDC tail");
-            }
-            if (closed.get()) {
-                Subscription late = tail.getAndSet(null);
-                if (late != null) {
-                    late.close();
-                }
-            }
-        }
-
-        @Override
-        public void close() {
-            if (!closed.compareAndSet(false, true)) {
-                return;
-            }
-            for (String ringName : ringNames) {
-                buffer.releaseSnapshot(pipelineId, ringName, token);
-            }
-            reservation.close();
-            Subscription started = tail.getAndSet(null);
-            if (started != null) {
-                started.close();
-            }
         }
     }
 
