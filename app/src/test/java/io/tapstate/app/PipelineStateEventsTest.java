@@ -71,6 +71,17 @@ class PipelineStateEventsTest {
                 .containsExactly(PipelineEvent.Kind.STATE_CHANGED);
     }
 
+    @Test
+    void explicitStopThenStartAfterFailureStillEmitsRecovery() {
+        List<PipelineEvent> events = PipelineStateEvents.of("flow",
+                new ObservationStore.Scope("inc-a", 2),
+                transition(PipelineState.STOPPED, PipelineState.RUNNING, 11), null, true);
+
+        assertThat(events).extracting(PipelineEvent::kind).containsExactly(
+                PipelineEvent.Kind.STATE_CHANGED, PipelineEvent.Kind.EXECUTION_RECOVERED,
+                PipelineEvent.Kind.EXECUTION_RESTARTED);
+    }
+
     private static ConvergeResult transition(PipelineState from, PipelineState to, long epoch) {
         return new ConvergeResult(ConvergeStatus.CONVERGED,
                 Optional.of(new CheckpointDoc("flow", StateJson.of(to), epoch, AT)),

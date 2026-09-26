@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Logger;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.PipelineEvent;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.control.core.PipelineExplanation.PendingReason;
 import io.tapstate.core.logging.LogLine;
@@ -15,14 +16,18 @@ import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.runtime.scheduler.StartDeferred;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineEventStore;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.time.Duration;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -44,6 +49,75 @@ import static org.assertj.core.api.Assertions.entry;
  * rest of the pass.
  */
 class ConvergenceDriverTest {
+
+    @Test
+    void completedTransitionsOfferOneScopedFailureAndRecoveryTrace() throws Exception {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        FailingActuator actuator = new FailingActuator();
+        PipelineConverger loop = new PipelineConverger(desired, state, actuator,
+                Clock.fixed(T0, ZoneOffset.UTC));
+        ObservationStore latest = new ObservationStore() {
+            @Override public void save(Observation observation) { observations.save(observation); }
+            @Override public boolean saveScoped(Observation observation, Scope scope) {
+                observations.save(observation);
+                return true;
+            }
+            @Override public Optional<Observation> read(String id) { return observations.read(id); }
+            @Override public void delete(String id) { observations.delete(id); }
+        };
+        List<PipelineEvent> persisted = new CopyOnWriteArrayList<>();
+        PipelineEventStore events = new PipelineEventStore() {
+            @Override public void append(PipelineEvent event) { persisted.add(event); }
+            @Override public Page readPage(String id, String incarnation, Instant from, Instant to,
+                    Key after, int limit) { return new Page(List.of(), false); }
+            @Override public void deleteIncarnation(String id, String incarnation) { }
+            @Override public Duration retention() { return Duration.ofDays(15); }
+        };
+        ObservationPublisher publisher = new ObservationPublisher(state, latest);
+        try (TelemetryDispatcher telemetry = new TelemetryDispatcher(
+                publisher, null, MetricsExport.none(), scopes, events, 1, 8)) {
+            ConvergenceDriver driver = new ConvergenceDriver(loop, desired, publisher, null,
+                    MetricsExport.none(), () -> true, PipelineActuationOwnership.single(),
+                    LifecycleWorkDispatcher.inline(), scopes, telemetry);
+            scopes.begin("orders", "inc-a", 1);
+            desired.save(new DesiredState("orders", RUNNING, "rev-1"));
+            driver.reconcile();
+            awaitEvents(persisted, 1);
+
+            actuator.failWith(new IllegalStateException("sink write failed"));
+            driver.reconcile();
+            awaitEvents(persisted, 3);
+            actuator.failWith(null);
+            desired.save(new DesiredState("orders", STOPPED, "rev-2"));
+            driver.reconcile();
+            awaitEvents(persisted, 4);
+            scopes.begin("orders", "inc-a", 2);
+            desired.save(new DesiredState("orders", RUNNING, "rev-3"));
+            driver.reconcile();
+            awaitEvents(persisted, 7);
+            driver.reconcile();
+
+            assertThat(persisted).extracting(PipelineEvent::kind).containsExactly(
+                    PipelineEvent.Kind.STATE_CHANGED,
+                    PipelineEvent.Kind.STATE_CHANGED, PipelineEvent.Kind.FAILURE,
+                    PipelineEvent.Kind.STATE_CHANGED,
+                    PipelineEvent.Kind.STATE_CHANGED, PipelineEvent.Kind.EXECUTION_RECOVERED,
+                    PipelineEvent.Kind.EXECUTION_RESTARTED);
+            assertThat(persisted.get(2).failure()).isNotNull();
+            assertThat(persisted.get(2).failure().code()).isEqualTo("engine.job-failed");
+            assertThat(persisted).extracting(PipelineEvent::pipelineIncarnationId).containsOnly("inc-a");
+            assertThat(persisted.subList(4, 7)).extracting(PipelineEvent::executionGeneration)
+                    .containsOnly(2L);
+        }
+    }
+
+    private static void awaitEvents(List<PipelineEvent> events, int count) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (events.size() < count && System.nanoTime() - deadline < 0) {
+            TimeUnit.MILLISECONDS.sleep(5);
+        }
+        assertThat(events).hasSize(count);
+    }
 
     @Test
     void aStopTeardownWaitingForItsFullBudgetLeavesAnotherPipelineConverging() throws Exception {

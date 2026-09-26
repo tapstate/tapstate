@@ -30,6 +30,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TelemetryDispatcherTest {
 
     @Test
+    void anUnwiredEventSinkDoesNotTurnAStateTransitionIntoAConvergenceFailure() {
+        try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), new InMemoryObservationStore()),
+                null, MetricsExport.none(), 1, 1)) {
+            dispatcher.offerEvent(event("transition", Instant.now()));
+            assertThat(dispatcher.health()).doesNotContainKey(TelemetryDispatcher.Sink.EVENT);
+        }
+    }
+
+    @Test
     void distinctPipelineLossesNeverGrowPastTheGlobalGapBudget() throws Exception {
         CountDownLatch firstEntered = new CountDownLatch(1);
         CountDownLatch releaseFirst = new CountDownLatch(1);

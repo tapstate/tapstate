@@ -336,7 +336,7 @@ final class TelemetryDispatcher implements AutoCloseable {
     void offerEvent(PipelineEvent event) {
         Objects.requireNonNull(event, "event");
         if (eventWorker == null) {
-            throw new IllegalStateException("event history is not wired");
+            return;
         }
         if (event.kind() == PipelineEvent.Kind.TELEMETRY_GAP
                 || event.kind() == PipelineEvent.Kind.TELEMETRY_RESTORED) {

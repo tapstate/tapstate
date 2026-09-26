@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.control.core.PipelineExplanation.PendingReason;
 import io.tapstate.runtime.scheduler.ConvergeResult;
 import io.tapstate.runtime.scheduler.ConvergeStatus;
@@ -47,6 +48,8 @@ final class ConvergenceDriver {
     // climbing errorCount rather than an empty read face. Reconcile runs on a single scheduler thread with a
     // fixed delay (passes never overlap), so a plain map needs no synchronization.
     private final Map<String, Long> reconcileFailures = new HashMap<>();
+    /** A failure observed in this process survives an explicit stop before its next successful start. */
+    private final Map<String, String> failedIncarnations = new HashMap<>();
     // The queue is bounded. Rotate the first pipeline each tick so a stable list of quick jobs cannot
     // refill every slot before a later pipeline in that same list is ever offered one.
     private long dispatchTurn;
@@ -218,6 +221,7 @@ final class ConvergenceDriver {
                     LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
                             failure.code(), result.failure().orElse(null));
                 }
+                offerEvents(pipelineId, result, failure);
                 publish(pipelineId, failure).ifPresent(published -> {
                     sample(published);
                     export(published);
@@ -270,6 +274,7 @@ final class ConvergenceDriver {
         // pipeline: the control ring's synchronous surface into the runtime is a closed set, and this set
         // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
+        failedIncarnations.keySet().retainAll(pipelineIds);
         lifecycleWork.retain(pipelineIds);
         if (pendingWork != null) {
             pendingWork.retain(pipelineIds);
@@ -288,6 +293,30 @@ final class ConvergenceDriver {
             sampler.forgetPipelinesOutside(pipelineIds);
         }
         export.forgetPipelinesOutside(pipelineIds);
+    }
+
+    private void offerEvents(String pipelineId, ConvergeResult result, ObservationFailure failure) {
+        if (telemetryWork == null || observationScopes == null || result == null) {
+            return;
+        }
+        var scope = observationScopes.current(pipelineId).orElse(null);
+        if (scope == null || result.checkpoint().isEmpty()) {
+            return;
+        }
+        PipelineState after = StateJson.parse(result.checkpoint().orElseThrow().stateJson());
+        boolean recovering = after == PipelineState.RUNNING && result.transitionFrom().isPresent()
+                && scope.pipelineIncarnationId().equals(failedIncarnations.get(pipelineId));
+        try {
+            PipelineStateEvents.of(pipelineId, scope, result, failure, recovering)
+                    .forEach(telemetryWork::offerEvent);
+            if (after == PipelineState.FAILED && failure != null) {
+                failedIncarnations.put(pipelineId, scope.pipelineIncarnationId());
+            } else if (recovering) {
+                failedIncarnations.remove(pipelineId);
+            }
+        } catch (RuntimeException unrecordable) {
+            LOG.warn("Could not offer lifecycle events for pipeline {}", pipelineId, unrecordable);
+        }
     }
 
     private void notePending(String pipelineId, DesiredState intent, LifecycleWorkDispatcher.Submission submission) {

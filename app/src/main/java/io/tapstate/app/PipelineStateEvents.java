@@ -20,6 +20,11 @@ final class PipelineStateEvents {
 
     static List<PipelineEvent> of(String pipelineId, ObservationStore.Scope scope,
             ConvergeResult result, ObservationFailure failure) {
+        return of(pipelineId, scope, result, failure, false);
+    }
+
+    static List<PipelineEvent> of(String pipelineId, ObservationStore.Scope scope,
+            ConvergeResult result, ObservationFailure failure, boolean recovering) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (scope == null || result == null || result.transitionFrom().isEmpty()
                 || result.checkpoint().isEmpty()) {
@@ -38,7 +43,7 @@ final class PipelineStateEvents {
             events.add(event(pipelineId, scope, checkpoint, PipelineEvent.Kind.FAILURE,
                     from, to, failure));
         }
-        if (to == PipelineState.RUNNING && from == PipelineState.FAILED) {
+        if (to == PipelineState.RUNNING && (from == PipelineState.FAILED || recovering)) {
             events.add(event(pipelineId, scope, checkpoint, PipelineEvent.Kind.EXECUTION_RECOVERED,
                     from, to, null));
         }
