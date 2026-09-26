@@ -75,10 +75,12 @@ public final class OtelMetricsExport implements MetricsExport {
                     .build());
         }
         if (settings.otlpEndpoint() != null) {
-            MetricExporter exporter = switch (settings.otlpProtocol()) {
+            MetricExporter delegate = switch (settings.otlpProtocol()) {
                 case GRPC -> OtlpGrpcMetricExporter.builder().setEndpoint(settings.otlpEndpoint()).build();
                 case HTTP_PROTOBUF -> OtlpHttpMetricExporter.builder().setEndpoint(settings.otlpEndpoint()).build();
             };
+            ObservedMetricExporter exporter = new ObservedMetricExporter(delegate);
+            producer.observeProcess("otlp-export", exporter::healthFacts);
             builder.registerMetricReader(PeriodicMetricReader.builder(exporter)
                     .setInterval(settings.otlpInterval())
                     .build());
@@ -88,7 +90,7 @@ public final class OtelMetricsExport implements MetricsExport {
                 settings.prometheusPort() == null ? "off"
                         : (settings.prometheusHost() == null ? "0.0.0.0" : settings.prometheusHost())
                                 + ":" + settings.prometheusPort(),
-                settings.otlpEndpoint() == null ? "off" : settings.otlpEndpoint(),
+                settings.otlpEndpoint() == null ? "off" : "configured",
                 settings.otlpProtocol(), settings.otlpInterval());
         return new OtelMetricsExport(provider, producer, settings);
     }
@@ -118,7 +120,7 @@ public final class OtelMetricsExport implements MetricsExport {
         producer.forgetPipeline(pipelineId);
     }
 
-    /** Pushes what is held to every push reader now, for a caller that cannot wait for the cadence; true when every push completed. */
+    /** Requests an immediate reader flush; collector delivery is reported by process export health. */
     public boolean flush(Duration within) {
         return provider.forceFlush().join(within.toMillis(), TimeUnit.MILLISECONDS).isSuccess();
     }
