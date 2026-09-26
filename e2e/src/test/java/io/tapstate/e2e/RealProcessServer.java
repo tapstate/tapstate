@@ -119,6 +119,11 @@ final class RealProcessServer implements ServerHandle {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);
     }
 
+    /** Launches one explicit build with additional settings for a focused real-process witness. */
+    static RealProcessServer start(String storeUri, Path jar, List<String> additionalArguments) {
+        return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar, additionalArguments);
+    }
+
     static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar) {
         return start(storeUri, operatorStateDatabase, jar, List.of());
     }

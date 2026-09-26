@@ -1192,6 +1192,19 @@ final class ControlPlane {
         return page;
     }
 
+    /** Reads the public raw history page and its explicit sample gaps. */
+    Map<?, ?> history(String pipelineId, Instant from, Instant to) {
+        String path = "/api/pipelines/" + urlSegment(pipelineId) + "/metrics/history?from="
+                + urlSegment(from.toString()) + "&to=" + urlSegment(to.toString())
+                + "&resolution=raw&limit=100";
+        HttpResponse<String> response = send(authedGet(path));
+        expect(response, 200, "read retained pipeline history");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> page)) {
+            throw new AssertionError("pipeline history was not an object: " + response.body());
+        }
+        return page;
+    }
+
     /**
      * Runs the product's own connection test and answers the overall outcome with each check's status.
      *
