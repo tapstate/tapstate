@@ -38,13 +38,15 @@ connector is loaded through the same plugin interface.
 
 ## Connector support boundary
 
-This preview certifies the following database kinds, with certification scoped by direction:
+This preview certifies the following database kinds and one managed variant, with certification
+scoped by direction:
 
 | Database | Connector kind | Certified use |
 |---|---|---|
 | MySQL | `mysql` | Read |
 | PostgreSQL | `postgres` | Read |
 | MongoDB | `mongodb` | Read and write |
+| MongoDB Atlas | `mongodb-atlas` | Read and write in the existing on-prem runtime |
 | Oracle | `oracle` | Read |
 | SQL Server | `sqlserver` | Read |
 
@@ -59,7 +61,10 @@ kinds, with snapshot and CDC inserts, updates and deletes. Decimal validation in
 negative fractions and CDC updates. This is not an exhaustive cross-version or
 all-data-type matrix. The default accepted set contains 16 connector ids
 across these five database kinds, including existing managed variants of MySQL,
-PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
+PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
+live-verified individually. The Atlas connector was verified with snapshot and change-stream
+reads, restart continuation, and target writes against a real Atlas deployment in the existing
+on-prem runtime; Cloud-mode verification is pending.
 Other managed variants of Oracle and SQL Server are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
@@ -86,6 +91,11 @@ Tapstate's Apache-2.0 license. The Oracle and SQL Server implementations are pai
 implementations; their use remains subject to the applicable Tapdata agreement. The upstream
 enterprise connector repository has no LICENSE file;
 publishing these binary assets does not relicense that source repository.
+
+The `mongodb-atlas` jar is a separate asset on the same floating release. It is not part of the
+three-database quickstart download; use `register mongodb-atlas` to install the verified bytes
+explicitly. The jar carries bundled third-party license and notice texts under `META-INF/`;
+publishing the binary does not grant a license to the upstream connector source repository.
 
 The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
 miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
@@ -294,12 +304,13 @@ The jars are shaded and carry their own drivers on an isolated loader;
 `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
 FOSS Exception (see [`NOTICE`](../NOTICE)).
 
-The same release carries Oracle and SQL Server for an explicit registration. From an
+The same release carries Oracle, SQL Server and MongoDB Atlas for explicit registration. From an
 authenticated CLI session, give `register` the published connector id instead of a local path:
 
 ```console
 tapstate(admin@127.0.0.1:8080)> register oracle
 tapstate(admin@127.0.0.1:8080)> register sqlserver
+tapstate(admin@127.0.0.1:8080)> register mongodb-atlas
 ```
 
 The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to

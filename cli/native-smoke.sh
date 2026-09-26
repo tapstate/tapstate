@@ -478,6 +478,25 @@ else
   echo "stderr:"; cat "$STUB_DIR/oneline.err" 2>/dev/null || true
 fi
 
+# A release operator opts in after publishing the pinned Atlas asset. The native downloader verifies
+# the exact public bytes before the one-line register path can send them to the control API stub.
+if [[ "${TAPSTATE_NATIVE_SMOKE_PUBLIC_ATLAS:-0}" == "1" ]]; then
+  ATLAS_OUT=$(env -u TAPSTATE_CONNECTORS_URL -u TAPSTATE_BASE_URL TAPSTATE_PASSWORD=smoke-pw \
+                "$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin register mongodb-atlas \
+                2>"$STUB_DIR/atlas.err") && ATLAS_RC=0 || ATLAS_RC=$?
+  ATLAS_CLEAN=$(printf '%s' "$ATLAS_OUT" | strip_ansi)
+  ATLAS_ERR=$(<"$STUB_DIR/atlas.err")
+  if (( ATLAS_RC == 0 )) \
+     && printf '%s' "$ATLAS_ERR" | grep -q 'downloading mongodb-atlas-connector.jar from github.com' \
+     && printf '%s' "$ATLAS_ERR" | grep -q 'uploading mongodb-atlas-connector.jar' \
+     && printf '%s' "$ATLAS_CLEAN" | grep -qE 'registered[[:space:]]+smoke'; then
+    ok "native register downloaded and uploaded the pinned public Atlas JAR"
+  else
+    bad "native public Atlas registration failed (rc=$ATLAS_RC); stdout:"; echo "$ATLAS_OUT"
+    echo "stderr:"; cat "$STUB_DIR/atlas.err" 2>/dev/null || true
+  fi
+fi
+
 # a command that fails must fail the process: the whole point of running one from a script
 TAPSTATE_PASSWORD=smoke-pw "$BINARY" -c "127.0.0.1:$STUB_PORT" -u admin start >/dev/null 2>&1 && BADRC=0 || BADRC=$?
 if (( BADRC != 0 )); then

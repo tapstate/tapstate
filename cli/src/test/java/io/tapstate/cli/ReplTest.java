@@ -3192,6 +3192,25 @@ class ReplTest {
     }
 
     @Test
+    void registerPublishedAtlasFromPublicReleaseWhenEnabled(@TempDir Path workdir) {
+        assumeTrue(Boolean.getBoolean("tapstate.it.published-connectors"),
+                "requires the live public connector release");
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("mongodb-atlas", "hash-atlas", "2.0.5-SNAPSHOT", true));
+        Harness h = onlineSession(workdir, client);
+
+        assertThat(h.repl().dispatch("register mongodb-atlas")).isTrue();
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x19764088");
+        assertThat(h.sink().toString())
+                .contains("downloading mongodb-atlas-connector.jar from github.com")
+                .contains("uploading mongodb-atlas-connector.jar")
+                .contains("registered  mongodb-atlas  hash-atlas");
+    }
+
+    @Test
     void registerDownloadsFromTheConfiguredMirrorWithoutPollutingJson(@TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Registered(
