@@ -40,12 +40,15 @@ class EveryProcessorDeclaresItsStageTest {
      * router timed under the sink's stage would fill it with units of next to nothing - the shape that hides
      * a slow writer. The processor that takes a step's input in the batches its author asked for only decides
      * when the processor it wraps is handed its rows; that one times its own stage, and timing the wrapper too
-     * would count the same work twice.
+     * would count the same work twice. And a vertex that runs one processor for the whole cluster keeps a stand-in
+     * on every other member that takes no rows and only passes the vertex's bounds on: the processor it stands in
+     * for times the stage, on the one member where the work is done.
      */
     private static final Set<String> TOPOLOGY = Set.of(
             "io.tapstate.runtime.engine.PassthroughProcessor",
             "io.tapstate.runtime.engine.SinkRouter",
-            "io.tapstate.runtime.engine.InputBatches");
+            "io.tapstate.runtime.engine.InputBatches",
+            "io.tapstate.runtime.engine.TotalOne$BoundsStandIn");
 
     private static JavaClasses tapstateClasses;
 
