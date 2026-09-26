@@ -13,6 +13,7 @@ import java.util.Objects;
  * the log's key rather than a field of the record -- the ring assigns it, and the store writes it as
  * half of the key. A clustered record also carries the capture fence copied from the hot-buffer item;
  * the store validates it in the same transaction as the append instead of trusting an old process to stop.
+ * New records also carry the ring epoch; legacy records have none and are retained by generation-scoped cuts.
  *
  * <p>The position travels as its opaque token, never as a connector object. A record written by one run
  * is read back by another, possibly a later build, and only the connector that issued the offset can
@@ -31,7 +32,14 @@ public record SrsLogRecord(
         Map<String, Object> before,
         Map<String, Object> after,
         long schemaVer,
-        WorkloadClaimFence captureFence) {
+        WorkloadClaimFence captureFence,
+        Long ringEpoch) {
+
+    public SrsLogRecord(
+            String srcToken, Op op, long ts, Map<String, Object> before,
+            Map<String, Object> after, long schemaVer, WorkloadClaimFence captureFence) {
+        this(srcToken, op, ts, before, after, schemaVer, captureFence, null);
+    }
 
     public SrsLogRecord(
             String srcToken,
@@ -40,7 +48,7 @@ public record SrsLogRecord(
             Map<String, Object> before,
             Map<String, Object> after,
             long schemaVer) {
-        this(srcToken, op, ts, before, after, schemaVer, null);
+        this(srcToken, op, ts, before, after, schemaVer, null, null);
     }
 
     public SrsLogRecord {
@@ -50,6 +58,9 @@ public record SrsLogRecord(
         }
         if (schemaVer < 0) {
             throw new IllegalArgumentException("schemaVer must be non-negative");
+        }
+        if (ringEpoch != null && ringEpoch < 1) {
+            throw new IllegalArgumentException("ringEpoch must be positive when present");
         }
         before = copyOrNull(before);
         after = copyOrNull(after);

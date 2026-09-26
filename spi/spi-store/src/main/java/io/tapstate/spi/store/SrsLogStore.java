@@ -42,10 +42,9 @@ public interface SrsLogStore {
     long largestSequence(String ring);
 
     /**
-     * Drops every change of {@code ring} at or below {@code throughSeq}. Without it the log grows without
-     * bound; a change that every consumer of the chain has durably landed has no replay value left, and
-     * that is the cut this performs. Which sequence is safe to cut at is the caller's to resolve -- this
-     * store applies the resolved one.
+     * Drops confirmed changes of one ring generation at or below {@code throughSeq}. Untagged legacy
+     * records are retained. The store also retains the ring's highest sequence as a high-water marker,
+     * so a rebuilt ring cannot reuse a trimmed sequence in the same generation.
      */
-    void trim(String ring, long throughSeq);
+    void trim(String ring, long throughSeq, long ringEpoch);
 }

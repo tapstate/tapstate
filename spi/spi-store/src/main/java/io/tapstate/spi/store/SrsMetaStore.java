@@ -269,6 +269,16 @@ public interface SrsMetaStore {
     }
 
     /**
+     * Records an arrival marker only while this pipeline still selects the table in {@code epoch}. A
+     * delayed marker from a replaced reader must not seed completion in a newer ring generation, where
+     * it could authorize a cut of changes the new reader has not seen.
+     */
+    default void startRingAfter(
+            String miningChainId, String pipelineId, String table, long epoch, long seq) {
+        throw new UnsupportedOperationException("generation-fenced ring arrival is unavailable");
+    }
+
+    /**
      * Records one pipeline's snapshot-to-cdc seam: the opaque position its cdc tail starts from, together
      * with the ring generation that pipeline's snapshot began in. A mutate on an unseeded chain is a
      * caller ordering error. The consumer entry is created when the pipeline has none yet, and only these

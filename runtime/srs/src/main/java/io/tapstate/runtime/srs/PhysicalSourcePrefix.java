@@ -22,6 +22,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 
 /**
  * One capture owner's bounded account of the physical source batches it has admitted. Each table still
@@ -50,6 +51,7 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     private final String chainId;
     private final long epoch;
     private final CaptureHealth health;
+    private final Consumer<Collection<ConsumerOffset>> trim;
     private final Deque<Batch> pending = new ArrayDeque<>();
     private long nextBatch;
     private boolean anchored;
@@ -57,9 +59,15 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     private RuntimeException failure;
 
     PhysicalSourcePrefix(SrsMetaStore meta, String chainId, long epoch, CaptureHealth health) {
+        this(meta, chainId, epoch, health, offsets -> { });
+    }
+
+    PhysicalSourcePrefix(SrsMetaStore meta, String chainId, long epoch, CaptureHealth health,
+            Consumer<Collection<ConsumerOffset>> trim) {
         this.meta = Objects.requireNonNull(meta, "meta");
         this.chainId = Objects.requireNonNull(chainId, "chainId");
         this.health = Objects.requireNonNull(health, "health");
+        this.trim = Objects.requireNonNull(trim, "trim");
         if (epoch < 1) {
             throw new IllegalArgumentException("a physical source prefix needs an open generation");
         }
@@ -144,7 +152,15 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     synchronized void tick() {
         if (!closed && !pending.isEmpty()) {
             checkOpen();
-            drain(meta.consumerOffsets(chainId));
+            Collection<ConsumerOffset> current = meta.consumerOffsets(chainId);
+            drain(current);
+            trim.accept(current);
+        }
+    }
+
+    synchronized void trimIfDrained() {
+        if (!closed && pending.isEmpty()) {
+            trim.accept(meta.consumerOffsets(chainId));
         }
     }
 

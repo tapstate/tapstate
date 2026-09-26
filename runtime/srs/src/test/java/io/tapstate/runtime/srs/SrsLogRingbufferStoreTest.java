@@ -115,10 +115,12 @@ class SrsLogRingbufferStoreTest {
                 new WorkloadOwner("node-a", "boot-a"), 3, 0, 2);
         withMember(log, member -> {
             member.getRingbuffer(RING).add(new SrsItem(
-                    new SourcePosition("a"), Op.INSERT, 1L, null, Map.of("id", 1), 0L, fence));
+                    new SourcePosition("a"), Op.INSERT, 1L, null, Map.of("id", 1), 0L, fence, 4L));
 
             assertThat(log.load(RING, 0L).orElseThrow().captureFence()).isEqualTo(fence);
+            assertThat(log.load(RING, 0L).orElseThrow().ringEpoch()).isEqualTo(4L);
             assertThat(new SrsRingbuffer(member.getRingbuffer(RING)).readOne(0).captureFence()).isEqualTo(fence);
+            assertThat(new SrsRingbuffer(member.getRingbuffer(RING)).readOne(0).ringEpoch()).isEqualTo(4L);
         });
     }
 
@@ -280,10 +282,12 @@ class SrsLogRingbufferStoreTest {
         }
 
         @Override
-        public void trim(String ring, long throughSeq) {
+        public void trim(String ring, long throughSeq, long ringEpoch) {
             NavigableMap<Long, SrsLogRecord> entries = rings.get(ring);
-            if (entries != null) {
-                entries.headMap(throughSeq, true).clear();
+            if (entries != null && !entries.isEmpty()) {
+                long last = entries.lastKey();
+                entries.headMap(Math.min(throughSeq, last - 1), true).entrySet()
+                        .removeIf(entry -> Long.valueOf(ringEpoch).equals(entry.getValue().ringEpoch()));
             }
         }
     }

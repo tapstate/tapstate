@@ -753,7 +753,7 @@ class HazelcastMemberTest {
         }
 
         @Override
-        public void trim(String ring, long throughSeq) {
+        public void trim(String ring, long throughSeq, long ringEpoch) {
         }
     }
 

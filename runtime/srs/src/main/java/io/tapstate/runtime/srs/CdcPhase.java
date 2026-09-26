@@ -226,12 +226,9 @@ public final class CdcPhase {
      * One table's wiring: its ring, the slowest consumer's cursor in it, the chain's consumer offsets, and
      * a cut of the durable log behind it.
      *
-     * <p>{@code trimThrough} is handed the sequence every consumer has durably landed, and drops the log
-     * at or below it -- a change every consumer has landed has no replay value left, and without the cut
-     * the log grows without bound. <strong>Whether that sequence can be attributed to this ring at all is
-     * the caller's to know</strong>, not this phase's: a chain carrying several tables records one acked
-     * position for the whole chain, and its sequence came from whichever ring held that change. A caller
-     * that cannot attribute it passes a cut that does nothing, and says why where it does so.
+     * <p>{@code trimThrough} is handed this table's admitted sequence. The caller may record it and cut
+     * only after every consumer selecting this table in the same ring generation has persisted a completion
+     * at or beyond it. The chain-level source prefix is not a per-table ring completion.
      */
     public record TableRoute(
             CdcChain chain,
@@ -307,7 +304,7 @@ public final class CdcPhase {
             SourcePosition pos = i == last ? position.orElse(null) : null;
             byTable.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(new SrsItem(
                     pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer(),
-                    route.chain().captureFence()));
+                    route.chain().captureFence(), route.chain().epoch()));
         }
         String closingTable = events.get(last).src();
         long closingSeq = -1;
@@ -326,6 +323,8 @@ public final class CdcPhase {
         }
         if (prefix != null) {
             prefix.admitted(lastRingSeqByTable, position.map(SourcePosition::token).orElse(null));
+            lastRingSeqByTable.forEach((table, seq) -> routes.apply(table).trimThrough().accept(seq));
+            prefix.trimIfDrained();
             return;
         }
         // The run is in the rings; advance the durable read offset to the position that closes it, clamped

@@ -97,6 +97,46 @@ class CdcPhaseTest {
     }
 
     @Test
+    void multiTableAdmissionReportsEachTablesOwnRingSequenceForTrimming() {
+        RecordingMeta meta = new RecordingMeta();
+        meta.consumers = List.of(prefixConsumer(Map.of()));
+        CaptureHealth health = new CaptureHealth();
+        List<Long> orders = new ArrayList<>();
+        List<Long> customers = new ArrayList<>();
+        Map<String, CdcPhase.TableRoute> routes = Map.of(
+                "orders", new CdcPhase.TableRoute(new CdcChain(
+                        new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.trim.orders"))),
+                        meta, "shared-chain", 1L, 0L), () -> meta.consumers, orders::add),
+                "customers", new CdcPhase.TableRoute(new CdcChain(
+                        new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.trim.customers"))),
+                        meta, "shared-chain", 1L, 0L), () -> meta.consumers, customers::add));
+        FakeCdcPort port = new FakeCdcPort(List.of(
+                Envelope.insert(1L, "orders", Map.of("id", 1), Map.of()),
+                Envelope.insert(2L, "customers", Map.of("id", 2), Map.of())));
+
+        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, "shared-chain", 1L, health)) {
+            CdcPhase.run(port, config(), CaptureStart.present(), routes, health, prefix).close();
+        }
+
+        assertThat(orders).containsExactly(0L);
+        assertThat(customers).containsExactly(0L);
+    }
+
+    @Test
+    void aQuietSourceStillInvokesTableTrimmingWhenAcknowledgementsArrive() {
+        RecordingMeta meta = new RecordingMeta();
+        meta.consumers = List.of(prefixConsumer(Map.of()));
+        AtomicInteger trims = new AtomicInteger();
+        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(
+                meta, "shared-chain", 1L, new CaptureHealth(), offsets -> trims.incrementAndGet())) {
+            prefix.anchor(Optional.of(new SourcePosition("t0")));
+            prefix.admitted(Map.of("orders", 0L), "t1");
+            prefix.tick();
+            assertThat(trims.get()).isEqualTo(1);
+        }
+    }
+
+    @Test
     void physicalPrefixRefusesAnUnanchoredStartAndAnOldUnverifiedScalar() {
         RecordingMeta fresh = new RecordingMeta();
         try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(
@@ -967,6 +1007,7 @@ class CdcPhaseTest {
                 listener.onError(error);
                 return () -> closed = true;
             }
+            listener.onStart(Optional.of(new SourcePosition("t0")));
             // Each change is handed over as a run of its own, each with its own position -- the shape a
             // source that names a position per change produces.
             for (Envelope e : events) {

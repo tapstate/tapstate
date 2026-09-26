@@ -112,6 +112,8 @@ class MongoSrsMetaStoreIT {
                     "customers", new ChainPosition(new SourceOrder(first, 0), "t2")));
             assertThat(store.ringDoneThrough(CHAIN, "pipe"))
                     .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 4L, "customers", 0L));
+            assertThat(store.consumerOffsets(CHAIN).getFirst().ringDoneThrough())
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 4L, "customers", 0L));
 
             long second = store.openEpoch(CHAIN);
             store.selectConsumerTables(CHAIN, "pipe", List.of("orders", "customers"), second, "reader-two");
@@ -120,11 +122,33 @@ class MongoSrsMetaStoreIT {
             assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow()
                     .sinkAckedByTable()).isEmpty();
             assertThat(store.ringDoneThrough(CHAIN, "pipe")).isEmpty();
+            assertThat(store.consumerOffsets(CHAIN).getFirst().ringDoneThrough()).isEmpty();
 
             store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
                     new ChainPosition(new SourceOrder(second, 0), "replayed"));
             assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow()
                     .sinkAckedByTable()).containsOnlyKeys("orders");
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 0L);
+        });
+    }
+
+    @Test
+    void delayedArrivalMarkerCannotSeedTheNextRingGeneration() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), first, "reader-one");
+            store.startRingAfter(CHAIN, "pipe", "orders", first, 7L);
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 7L);
+
+            long second = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), second, "reader-two");
+            store.startRingAfter(CHAIN, "pipe", "orders", first, 99L);
+            store.startRingAfter(CHAIN, "pipe", "orders", 999L);
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).isEmpty();
+
+            store.startRingAfter(CHAIN, "pipe", "orders", second, 0L);
+            store.startRingAfter(CHAIN, "pipe", "orders", second, 50L);
             assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 0L);
         });
     }

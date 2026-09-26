@@ -35,8 +35,9 @@ import java.util.Optional;
  * this store adds none of its own. BSON compares documents field by field in declaration order, so every
  * key of one ring forms a contiguous run of the {@code _id} index ordered by sequence, and a bounded
  * range over {@code _id} selects exactly that run: the largest sequence is its last entry, and a trim is
- * a range delete over its front. This holds only while every key is built with {@code ring} before
- * {@code seq}, so exactly one place builds one.
+ * a range delete over its confirmed front within one ring generation. It keeps the highest entry as a
+ * sequence high-water marker, even when all changes are confirmed. This holds only while every key is
+ * built with {@code ring} before {@code seq}, so exactly one place builds one.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A stored document that cannot be read back into its model is coded
@@ -148,9 +149,21 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     @Override
-    public void trim(String ring, long throughSeq) {
+    public void trim(String ring, long throughSeq, long ringEpoch) {
         Objects.requireNonNull(ring, "ring");
-        StoreIo.run(() -> collection.deleteMany(ringRange(ring, throughSeq)));
+        if (ringEpoch < 1) {
+            throw new IllegalArgumentException("ringEpoch must be positive");
+        }
+        long highest = largestSequence(ring);
+        if (highest < 0) {
+            return;
+        }
+        long safeThrough = Math.min(throughSeq, highest - 1);
+        if (safeThrough < 0) {
+            return;
+        }
+        Document filter = ringRange(ring, safeThrough).append("ringEpoch", ringEpoch);
+        StoreIo.run(() -> collection.deleteMany(filter));
     }
 
     /**
@@ -179,6 +192,9 @@ public final class MongoSrsLogStore implements SrsLogStore {
         if (record.captureFence() != null) {
             document.append("captureFence", fenceDocument(record.captureFence()));
         }
+        if (record.ringEpoch() != null) {
+            document.append("ringEpoch", record.ringEpoch());
+        }
         // The nullable fields are written only when present, never as explicit nulls -- the same shape the
         // meta store uses, so a reader tells "no position" from "a position that is the empty string".
         if (record.srcToken() != null) {
@@ -195,6 +211,10 @@ public final class MongoSrsLogStore implements SrsLogStore {
 
     private static SrsLogRecord toRecord(Document document) {
         try {
+            Object rawEpoch = document.get("ringEpoch");
+            if (rawEpoch != null && !(rawEpoch instanceof Number)) {
+                throw new IllegalArgumentException("ringEpoch must be numeric when present");
+            }
             return new SrsLogRecord(
                     document.getString("srcToken"),
                     Op.fromSymbol(document.getString("op")),
@@ -202,7 +222,8 @@ public final class MongoSrsLogStore implements SrsLogStore {
                     rowImage(document, "before"),
                     rowImage(document, "after"),
                     document.getLong("schemaVer"),
-                    readFence(document.get("captureFence", Document.class)));
+                    readFence(document.get("captureFence", Document.class)),
+                    rawEpoch == null ? null : ((Number) rawEpoch).longValue());
         } catch (RuntimeException e) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                     Map.of("id", String.valueOf(document.get("_id"))), e);
