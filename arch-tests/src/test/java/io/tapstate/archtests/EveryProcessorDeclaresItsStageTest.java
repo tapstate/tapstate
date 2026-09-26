@@ -38,11 +38,14 @@ class EveryProcessorDeclaresItsStageTest {
      * a sink that runs several writers is topology too: all it does is pick which of two edges into those
      * writers a row takes. Nothing is spent in either that a reader would want to see on its own, and a
      * router timed under the sink's stage would fill it with units of next to nothing - the shape that hides
-     * a slow writer.
+     * a slow writer. The processor that takes a step's input in the batches its author asked for only decides
+     * when the processor it wraps is handed its rows; that one times its own stage, and timing the wrapper too
+     * would count the same work twice.
      */
     private static final Set<String> TOPOLOGY = Set.of(
             "io.tapstate.runtime.engine.PassthroughProcessor",
-            "io.tapstate.runtime.engine.SinkRouter");
+            "io.tapstate.runtime.engine.SinkRouter",
+            "io.tapstate.runtime.engine.InputBatches");
 
     private static JavaClasses tapstateClasses;
 

@@ -704,22 +704,28 @@ public final class PipelineDagBuilder {
         }
         TransformBody body = inline.body();
         boolean wide = shape.isNative(step.id());
+        // A step whose author asked for batches takes its input in them; any other takes it as it arrives.
+        BatchSpec batch = step.execution() == null ? null : step.execution().batch();
         if (body instanceof TransformBody.Union) {
             // The merge is the topology, so nothing is transformed here - but the frontier still has to be
             // worked out per edge. The combined bound the engine would forward is never delivered at all
             // for a chain only one of the merged streams carries, which is the whole shape a union is.
-            return wide
-                    ? dag.newVertex(step.id(), PassthroughProcessor.nativeMetaSupplier(
-                            step.id(), axes, chainsByOrdinal, shape.plannedMembers()))
-                            .localParallelism(shape.localOf(step.id()))
-                    : dag.newVertex(step.id(), PassthroughProcessor.metaSupplier(step.id(), axes, chainsByOrdinal));
+            ProcessorMetaSupplier merge = wide
+                    ? PassthroughProcessor.nativeMetaSupplier(step.id(), axes, chainsByOrdinal, shape.plannedMembers())
+                    : PassthroughProcessor.metaSupplier(step.id(), axes, chainsByOrdinal);
+            return stepVertex(dag, step.id(), InputBatches.around(merge, batch), shape);
         }
-        return wide
-                ? dag.newVertex(step.id(), TransformProcessor.nativeMetaSupplier(step.id(),
-                        bindings.transformPorts().apply(step), axes, chainsByOrdinal, shape.plannedMembers()))
-                        .localParallelism(shape.localOf(step.id()))
-                : dag.newVertex(step.id(), TransformProcessor.metaSupplier(step.id(),
-                        bindings.transformPorts().apply(step), axes, chainsByOrdinal));
+        var port = bindings.transformPorts().apply(step);
+        ProcessorMetaSupplier transform = wide
+                ? TransformProcessor.nativeMetaSupplier(step.id(), port, axes, chainsByOrdinal, shape.plannedMembers())
+                : TransformProcessor.metaSupplier(step.id(), port, axes, chainsByOrdinal);
+        return stepVertex(dag, step.id(), InputBatches.around(transform, batch), shape);
+    }
+
+    /** A step's vertex, as many processors per member as its shape says where it runs natively. */
+    private static Vertex stepVertex(DAG dag, String name, ProcessorMetaSupplier supplier, ExecutionShape shape) {
+        Vertex vertex = dag.newVertex(name, supplier);
+        return shape.isNative(name) ? vertex.localParallelism(shape.localOf(name)) : vertex;
     }
 
     /**
