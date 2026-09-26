@@ -46,7 +46,7 @@ final class ConnectorJars {
         }
     }
 
-    /** The bytes of the jar whose file name begins with the connector id. */
+    /** The bytes of the jar whose file name identifies the connector id. */
     static byte[] bytesFor(String connectorId) {
         Path directory = directory();
         Path jar = find(directory, connectorId);
@@ -74,8 +74,12 @@ final class ConnectorJars {
     private static Path find(Path directory, String connectorId) {
         try (var entries = Files.list(directory)) {
             List<Path> matches = entries
-                    .filter(path -> path.getFileName().toString().startsWith(connectorId))
-                    .filter(path -> path.getFileName().toString().endsWith(".jar"))
+                    .filter(path -> {
+                        String name = path.getFileName().toString();
+                        return name.equals(connectorId + ".jar")
+                                || name.equals(connectorId + "-connector.jar")
+                                || (name.startsWith(connectorId + "-connector-") && name.endsWith(".jar"));
+                    })
                     .sorted()
                     .toList();
             if (matches.isEmpty()) {
