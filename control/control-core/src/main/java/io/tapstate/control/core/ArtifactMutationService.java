@@ -16,12 +16,16 @@ import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.RateHistoryStore.Visibility;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Executor;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Removal of an applied resource, one path for every kind. Deletion is real: the document leaves the
@@ -57,6 +61,8 @@ import java.util.Set;
  */
 public final class ArtifactMutationService {
 
+    private static final Logger LOG = Logger.getLogger(ArtifactMutationService.class.getName());
+
     private final ArtifactStore store;
     /**
      * The one reading of "is this pipeline at rest". Held rather than re-derived so this refusal and
@@ -70,6 +76,7 @@ public final class ArtifactMutationService {
     private final ObservationStore observations;
     private final PipelineLayoutStore layouts;
     private final RateHistoryStore rateHistory;
+    private final Executor historyCleanup;
     private final SrsMetaStore srsMeta;
     private final DerivedSchemaStore derivedSchemas;
     private final AuditGate auditGate;
@@ -206,12 +213,29 @@ public final class ArtifactMutationService {
             RateHistoryStore rateHistory,
             AuditGate auditGate,
             DataBrowserFollows follows) {
+        this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                auditGate, follows, Runnable::run);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            PipelineLayoutStore layouts,
+            SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
+            RateHistoryStore rateHistory,
+            AuditGate auditGate,
+            DataBrowserFollows follows,
+            Executor historyCleanup) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.layouts = Objects.requireNonNull(layouts, "layouts");
         this.rateHistory = Objects.requireNonNull(rateHistory, "rateHistory");
+        this.historyCleanup = Objects.requireNonNull(historyCleanup, "historyCleanup");
         this.srsMeta = Objects.requireNonNull(srsMeta, "srsMeta");
         this.derivedSchemas = Objects.requireNonNull(derivedSchemas, "derivedSchemas");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -224,10 +248,9 @@ public final class ArtifactMutationService {
      * caller read and neither refusal ground holds, then reclaims a pipeline's dependent bookkeeping.
      * {@code principal} is the identity the removal is attributed to.
      *
-     * <p>A refusal happens before anything is written. A failure to reclaim happens after the artifact is
-     * already gone and is reported rather than swallowed, so the residue is visible to whoever has to
-     * clear it; it never puts the artifact back, because a removal the caller was told succeeded must not
-     * silently undo itself.
+     * <p>A refusal happens before anything is written. A failure in required pipeline bookkeeping
+     * reclamation is reported after the artifact is gone. Rate-history cleanup is scheduled separately:
+     * its failure is logged and age-based expiry remains its final bound.
      *
      * <p>The two are told apart by their code, not only by their text. A refusal means nothing happened
      * and the caller may retry; {@code artifact.reclaim-incomplete} means the artifact is gone and
@@ -265,7 +288,8 @@ public final class ArtifactMutationService {
         // caller offered is the only one that describes the attempt.
         AuditContext audit = new AuditContext(principal, id, expectedContentHash);
         auditGate.dispatch(ControlOperations.ARTIFACT_DELETE, audit, () -> {
-            switch (store.delete(id, expectedContentHash)) {
+            ArtifactStore.Removal removal = store.deleteWithHistoryOwner(id, expectedContentHash);
+            switch (removal.outcome()) {
                 case DELETED -> {
                 }
                 case NOT_FOUND -> throw error(ArtifactError.NOT_FOUND, Map.of("id", id));
@@ -274,7 +298,7 @@ public final class ArtifactMutationService {
             }
 
             if (target instanceof PipelineResource) {
-                reclaim(id);
+                reclaim(id, removal.historyOwner().orElseThrow().visibility());
             }
             if (target instanceof SourceResource) {
                 // A follow is not in the reference graph, so neither refusal above ever sees one: a
@@ -307,10 +331,8 @@ public final class ArtifactMutationService {
     }
 
     /**
-     * Reclaims everything a removed pipeline owns. Every step is attempted even after one fails, and the
-     * failures are reported together at the end: aborting at the first would leave the untouched steps'
-     * residue behind on top of the failure, and the artifact is already gone by now so no caller can
-     * simply run the removal again to finish the job.
+     * Reclaims a removed pipeline's required bookkeeping and submits its best-effort history cleanup.
+     * Every step is attempted even after one fails; required-step failures are reported together.
      *
      * <p>The shared chains are detached first because theirs is the only residue that harms a
      * <em>different</em> pipeline; if the process dies mid-reclaim, the damage that has been contained is
@@ -325,8 +347,8 @@ public final class ArtifactMutationService {
      * closing it needs a lifecycle-aware conditional delete or a lock spanning the check and the write,
      * neither of which this store port offers.
      */
-    private void reclaim(String id) {
-        List<ReclaimStep> steps = reclaimStepsOf(id);
+    private void reclaim(String id, Visibility visibility) {
+        List<ReclaimStep> steps = reclaimStepsOf(id, visibility);
         if (!isAtRest(id)) {
             throw reclaimIncomplete(id, "pipeline-live", steps.stream().map(ReclaimStep::name).toList(),
                     List.of());
@@ -355,7 +377,7 @@ public final class ArtifactMutationService {
      * and the report of what a live pipeline would have lost, so a step cannot be added to the one and
      * left out of the other. Nothing runs while the list is built.
      */
-    private List<ReclaimStep> reclaimStepsOf(String id) {
+    private List<ReclaimStep> reclaimStepsOf(String id, Visibility visibility) {
         return List.of(
                 new ReclaimStep("mining-chain-consumer", () -> detachFromEveryChain(id)),
                 new ReclaimStep("desired", () -> desired.delete(id)),
@@ -366,9 +388,32 @@ public final class ArtifactMutationService {
                 // under the id next, and would refuse to start it over a difference against a schema
                 // belonging to something that no longer exists.
                 new ReclaimStep("derived-schema", () -> derivedSchemas.delete(id)),
-                // The samples the pipeline took while it ran. Nothing else bounds them but their age, and
-                // a history left behind would be read as the past of whatever is applied under the id next.
-                new ReclaimStep("rate-history", () -> rateHistory.deleteAll(id)));
+                // The captured old owner protects a recreated resource from delayed cleanup. History
+                // visibility is already scoped, and expiry bounds any residue after a failed delete.
+                new ReclaimStep("rate-history", () -> submitHistoryCleanup(id, visibility)));
+    }
+
+    private void submitHistoryCleanup(String id, Visibility visibility) {
+        try {
+            historyCleanup.execute(() -> {
+                if (visibility.incarnationId() != null) {
+                    try {
+                        rateHistory.deleteIncarnation(id, visibility.incarnationId());
+                    } catch (RuntimeException failed) {
+                        LOG.log(Level.WARNING, "Could not clear scoped rate history for " + id, failed);
+                    }
+                }
+                if (visibility.includeLegacy()) {
+                    try {
+                        rateHistory.deleteLegacy(id);
+                    } catch (RuntimeException failed) {
+                        LOG.log(Level.WARNING, "Could not clear legacy rate history for " + id, failed);
+                    }
+                }
+            });
+        } catch (RuntimeException rejected) {
+            LOG.log(Level.WARNING, "Could not schedule rate history cleanup for " + id, rejected);
+        }
     }
 
     /**

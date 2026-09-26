@@ -355,14 +355,27 @@ class ControlPlaneConfiguration {
     @Bean
     ArtifactMutationService artifactMutationService(
             ArtifactStore artifactStore, StorePort storePort, AuditGate auditGate,
-            ObjectProvider<DataBrowserFollows> follows) {
+            ObjectProvider<DataBrowserFollows> follows,
+            java.util.concurrent.ThreadPoolExecutor rateHistoryCleanupExecutor) {
         // The removal takes the same artifact store bean apply writes through, so both paths see one
         // view of a resource. The dependent bookkeeping a removed pipeline owns is reclaimed straight
         // off the store port: those facets have no service in front of them.
         return new ArtifactMutationService(
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
                 storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), storePort.rateHistory(),
-                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE), rateHistoryCleanupExecutor);
+    }
+
+    @Bean(destroyMethod = "shutdownNow")
+    java.util.concurrent.ThreadPoolExecutor rateHistoryCleanupExecutor() {
+        java.util.concurrent.atomic.AtomicInteger next = new java.util.concurrent.atomic.AtomicInteger();
+        return new java.util.concurrent.ThreadPoolExecutor(1, 1, 0L,
+                java.util.concurrent.TimeUnit.MILLISECONDS, new java.util.concurrent.ArrayBlockingQueue<>(64),
+                task -> {
+                    Thread worker = new Thread(task, "tapstate-history-cleanup-" + next.incrementAndGet());
+                    worker.setDaemon(true);
+                    return worker;
+                }, new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
     }
 
     @Bean

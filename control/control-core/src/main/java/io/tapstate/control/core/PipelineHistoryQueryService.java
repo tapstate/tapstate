@@ -21,6 +21,7 @@ import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.RateHistoryStore.Entry;
 import io.tapstate.spi.store.RateHistoryStore.Key;
 import io.tapstate.spi.store.RateHistoryStore.Page;
+import io.tapstate.spi.store.RateHistoryStore.Visibility;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -96,7 +97,11 @@ public final class PipelineHistoryQueryService {
 
     QueryRun execute(PipelineHistoryQuery request) {
         Normalized normalized = validate(request);
-        requirePipeline(normalized.binding().pipelineId());
+        Visibility visibility = requirePipeline(normalized.binding().pipelineId());
+        QueryBinding unscoped = normalized.binding();
+        normalized = new Normalized(new QueryBinding(unscoped.pipelineId(), unscoped.from(),
+                unscoped.to(), unscoped.resolution(), unscoped.limit(), unscoped.tables(), visibility),
+                normalized.tables(), normalized.cursor());
 
         Frozen frozen = freeze(normalized);
         EffectiveHistoryResolution effective = effectiveResolution(normalized.binding());
@@ -111,13 +116,18 @@ public final class PipelineHistoryQueryService {
         QueryRun run = effective.raw()
                 ? raw(normalized, frozen, effective, predecessor, cost)
                 : aggregate(normalized, frozen, effective, predecessor, cost);
+        if (!visibility.equals(requirePipeline(normalized.binding().pipelineId()))) {
+            throw new TapstateException(MonitorError.INVALID_CURSOR,
+                    Map.of("operation", "pipeline.metrics.history", "reason", "QUERY_MISMATCH"), null);
+        }
         return run;
     }
 
     private QueryRun raw(Normalized normalized, Frozen frozen, EffectiveHistoryResolution effective,
             Entry predecessor, Cost cost) {
         QueryBinding binding = normalized.binding();
-        Page page = history.readPage(binding.pipelineId(), frozen.from(), frozen.to(), frozen.afterKey(),
+        Page page = history.readPageVisible(binding.pipelineId(), binding.visibility(),
+                frozen.from(), frozen.to(), frozen.afterKey(),
                 binding.limit());
         cost.page(page, predecessor == null ? 0 : 1);
         requireScanBudget(cost);
@@ -158,7 +168,8 @@ public final class PipelineHistoryQueryService {
         boolean storeHasMore = true;
         int inWindowSamples = 0;
         while (storeHasMore && !aggregator.full()) {
-            Page page = history.readPage(binding.pipelineId(), frozen.from(), frozen.to(), after, rawBatchSize);
+            Page page = history.readPageVisible(binding.pipelineId(), binding.visibility(),
+                    frozen.from(), frozen.to(), after, rawBatchSize);
             cost.page(page, predecessor == null ? 0 : 1);
             predecessor = null;
             requireScanBudget(cost);
@@ -185,7 +196,8 @@ public final class PipelineHistoryQueryService {
         Entry successor = null;
         if (!aggregator.full() && !storeHasMore) {
             cost.storeReads++;
-            Optional<Entry> found = history.successor(binding.pipelineId(), frozen.to());
+            Optional<Entry> found = history.successorVisible(binding.pipelineId(), binding.visibility(),
+                    frozen.to());
             if (found.isPresent()) {
                 successor = found.orElseThrow();
                 cost.rawDocumentsScanned++;
@@ -216,7 +228,8 @@ public final class PipelineHistoryQueryService {
         QueryBinding binding = normalized.binding();
         if (frozen.afterKey() != null) {
             cost.storeReads++;
-            Optional<Entry> exact = history.read(binding.pipelineId(), frozen.afterKey());
+            Optional<Entry> exact = history.readVisible(binding.pipelineId(), binding.visibility(),
+                    frozen.afterKey());
             if (exact.isPresent()) {
                 cost.rawDocumentsScanned++;
                 cost.peakRawEntriesHeld = 1;
@@ -224,7 +237,8 @@ public final class PipelineHistoryQueryService {
                 return exact.orElseThrow();
             }
             cost.storeReads++;
-            Optional<Entry> read = history.predecessor(binding.pipelineId(), frozen.resumeAt());
+            Optional<Entry> read = history.predecessorVisible(binding.pipelineId(), binding.visibility(),
+                    frozen.resumeAt());
             read.ifPresent(ignored -> cost.rawDocumentsScanned++);
             Optional<Entry> fallback = retained(read, frozen);
             cost.peakRawEntriesHeld = read.isPresent() ? 1 : 0;
@@ -232,7 +246,8 @@ public final class PipelineHistoryQueryService {
             return fallback.orElse(null);
         }
         cost.storeReads++;
-        Optional<Entry> read = history.predecessor(binding.pipelineId(), frozen.from());
+        Optional<Entry> read = history.predecessorVisible(binding.pipelineId(), binding.visibility(),
+                frozen.from());
         read.ifPresent(ignored -> cost.rawDocumentsScanned++);
         Optional<Entry> predecessor = retained(read, frozen);
         cost.peakRawEntriesHeld = read.isPresent() ? 1 : 0;
@@ -291,13 +306,16 @@ public final class PipelineHistoryQueryService {
         return new Frozen(effectiveFrom, effectiveTo, cutoff, null, effectiveFrom);
     }
 
-    private void requirePipeline(String pipelineId) {
+    private Visibility requirePipeline(String pipelineId) {
         boolean exists = artifacts.get(pipelineId)
                 .map(artifact -> PIPELINE_KIND.equals(artifact.kind()))
                 .orElse(false);
         if (!exists) {
             throw new TapstateException(LifecycleError.UNKNOWN_PIPELINE, Map.of("pipeline", pipelineId), null);
         }
+        return artifacts.historyVisibilityOf(pipelineId)
+                .orElseThrow(() -> new TapstateException(LifecycleError.UNKNOWN_PIPELINE,
+                        Map.of("pipeline", pipelineId), null));
     }
 
     private static EffectiveHistoryResolution effectiveResolution(QueryBinding binding) {

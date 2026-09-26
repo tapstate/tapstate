@@ -74,8 +74,14 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
 
     @Override
     public synchronized ArtifactMutation delete(String id, String expectedContentHash) {
-        ArtifactMutation result = delegate.delete(id, expectedContentHash);
-        if (result == ArtifactMutation.DELETED) {
+        ArtifactMutation result = deleteWithHistoryOwner(id, expectedContentHash).outcome();
+        return result;
+    }
+
+    @Override
+    public synchronized Removal deleteWithHistoryOwner(String id, String expectedContentHash) {
+        Removal result = delegate.deleteWithHistoryOwner(id, expectedContentHash);
+        if (result.outcome() == ArtifactMutation.DELETED) {
             redactor.remove(id);
         }
         return result;
@@ -142,6 +148,11 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     @Override
     public Optional<String> pipelineIncarnationId(String pipelineId) {
         return delegate.pipelineIncarnationId(pipelineId);
+    }
+
+    @Override
+    public Optional<HistoryOwner> pipelineHistoryOwner(String pipelineId) {
+        return delegate.pipelineHistoryOwner(pipelineId);
     }
 
     @Override

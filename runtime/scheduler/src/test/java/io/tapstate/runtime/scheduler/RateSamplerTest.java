@@ -7,6 +7,7 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RateHistoryStore;
+import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -32,10 +33,17 @@ class RateSamplerTest {
     /** Appends only, like the real store; keeps what it was handed so a case can read it back. */
     private static final class RecordingHistory implements RateHistoryStore {
         private final List<RateSample> appended = new ArrayList<>();
+        private final List<ObservationStore.Scope> scopes = new ArrayList<>();
 
         @Override
         public void append(RateSample sample) {
             appended.add(sample);
+        }
+
+        @Override
+        public void appendScoped(RateSample sample, ObservationStore.Scope scope) {
+            appended.add(sample);
+            scopes.add(scope);
         }
 
         @Override
@@ -165,5 +173,23 @@ class RateSamplerTest {
         sampler.offer(moving(T0.plusSeconds(1), 101L));
 
         assertThat(history.appended).hasSize(2);
+    }
+
+    @Test
+    void aNewExecutionStartsItsOwnCadenceAndWritesTheOwnerWithTheSample() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope first = new ObservationStore.Scope("inc-old", 41);
+        ObservationStore.Scope recreated = new ObservationStore.Scope("inc-new", 42);
+        ObservationStore.Scope restarted = new ObservationStore.Scope("inc-new", 43);
+
+        assertThat(sampler.appendIfDue(moving(T0, 1), first)).isTrue();
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(1), 2), first)).isFalse();
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(2), 3), recreated)).isTrue();
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(3), 4), restarted)).isTrue();
+
+        assertThat(history.scopes).containsExactly(first, recreated, restarted);
+        assertThat(history.appended).extracting(sample -> sample.counters().get("records.out"))
+                .containsExactly(1L, 3L, 4L);
     }
 }

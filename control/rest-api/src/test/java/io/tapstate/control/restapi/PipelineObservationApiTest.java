@@ -723,9 +723,22 @@ class PipelineObservationApiTest {
         }
 
         @Override
+        public Page readPageVisible(String pipelineId, Visibility visibility,
+                Instant from, Instant to, Key after, int limit) {
+            requireLegacy(visibility);
+            return readPage(pipelineId, from, to, after, limit);
+        }
+
+        @Override
         public Optional<Entry> read(String pipelineId, Key key) {
             return entries.stream().filter(entry -> entry.sample().pipelineId().equals(pipelineId))
                     .filter(entry -> entry.key().equals(key)).findFirst();
+        }
+
+        @Override
+        public Optional<Entry> readVisible(String pipelineId, Visibility visibility, Key key) {
+            requireLegacy(visibility);
+            return read(pipelineId, key);
         }
 
         @Override
@@ -736,10 +749,28 @@ class PipelineObservationApiTest {
         }
 
         @Override
+        public Optional<Entry> predecessorVisible(String pipelineId, Visibility visibility, Instant at) {
+            requireLegacy(visibility);
+            return predecessor(pipelineId, at);
+        }
+
+        @Override
         public Optional<Entry> successor(String pipelineId, Instant at) {
             return entries.stream().filter(entry -> entry.sample().pipelineId().equals(pipelineId))
                     .filter(entry -> !entry.sample().observedAt().isBefore(at))
                     .min(FakeRateHistoryStore::compare);
+        }
+
+        @Override
+        public Optional<Entry> successorVisible(String pipelineId, Visibility visibility, Instant at) {
+            requireLegacy(visibility);
+            return successor(pipelineId, at);
+        }
+
+        private static void requireLegacy(Visibility visibility) {
+            if (!new Visibility(null, true).equals(visibility)) {
+                throw new AssertionError("this REST fixture contains only legacy samples");
+            }
         }
 
         @Override

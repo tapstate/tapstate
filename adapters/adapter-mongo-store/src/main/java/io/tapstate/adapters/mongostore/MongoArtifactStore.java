@@ -22,6 +22,7 @@ import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.StoredArtifactRecord;
 import org.bson.Document;
 import org.bson.conversions.Bson;
@@ -112,16 +113,25 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     @Override
     public ArtifactMutation delete(String id, String expectedContentHash) {
+        return deleteWithHistoryOwner(id, expectedContentHash).outcome();
+    }
+
+    @Override
+    public Removal deleteWithHistoryOwner(String id, String expectedContentHash) {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(expectedContentHash, "expectedContentHash");
         return StoreIo.call(() -> {
             Document filter = new Document("_id", id).append("contentHash", expectedContentHash);
-            if (collection.findOneAndDelete(filter) != null) {
-                return ArtifactMutation.DELETED;
+            Document removed = collection.findOneAndDelete(filter);
+            if (removed != null) {
+                Optional<HistoryOwner> owner = "pipeline".equals(removed.getString("kind"))
+                        ? Optional.of(new HistoryOwner(historyVisibilityFrom(removed, id)))
+                        : Optional.empty();
+                return new Removal(ArtifactMutation.DELETED, owner);
             }
-            return collection.find(new Document("_id", id)).first() == null
-                    ? ArtifactMutation.NOT_FOUND
-                    : ArtifactMutation.VERSION_CONFLICT;
+            ArtifactMutation outcome = collection.find(new Document("_id", id)).first() == null
+                    ? ArtifactMutation.NOT_FOUND : ArtifactMutation.VERSION_CONFLICT;
+            return new Removal(outcome, Optional.empty());
         });
     }
 
@@ -328,6 +338,15 @@ public final class MongoArtifactStore implements ArtifactStore {
     }
 
     @Override
+    public Optional<HistoryOwner> pipelineHistoryOwner(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return StoreIo.call(() -> Optional.ofNullable(collection.find(pipelineFilter(pipelineId))
+                .projection(new Document("pipelineIncarnationId", 1)
+                        .append("legacyHistoryVisible", 1)).first())
+                .map(document -> new HistoryOwner(historyVisibilityFrom(document, pipelineId))));
+    }
+
+    @Override
     public Optional<String> ensurePipelineIncarnationId(String pipelineId, String candidate) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(candidate, "candidate");
@@ -338,7 +357,8 @@ public final class MongoArtifactStore implements ArtifactStore {
             Document missing = pipelineFilter(pipelineId)
                     .append("pipelineIncarnationId", new Document("$exists", false));
             Document inserted = collection.findOneAndUpdate(missing,
-                    new Document("$set", new Document("pipelineIncarnationId", candidate)),
+                    new Document("$set", new Document("pipelineIncarnationId", candidate)
+                            .append("legacyHistoryVisible", true)),
                     new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)
                             .projection(new Document("pipelineIncarnationId", 1)));
             if (inserted != null) {
@@ -418,7 +438,8 @@ public final class MongoArtifactStore implements ArtifactStore {
                 .append("body", new Document("$literal", new Document(WRITER.tree(artifact))))
                 .append("contentHash", CanonicalHash.of(artifact));
         if (candidate == null) {
-            return List.of(new Document("$set", fields), new Document("$unset", "pipelineIncarnationId"));
+            return List.of(new Document("$set", fields), new Document("$unset",
+                    List.of("pipelineIncarnationId", "legacyHistoryVisible")));
         }
         // Existing pipelines retain their sibling, including its absence on pre-identity documents.
         // Inserts and kind changes assign the candidate in the same atomic document write.
@@ -454,6 +475,16 @@ public final class MongoArtifactStore implements ArtifactStore {
             throw unreadable(pipelineId, "pipelineIncarnationId", null);
         }
         return Optional.of(incarnation);
+    }
+
+    private static RateHistoryStore.Visibility historyVisibilityFrom(Document document, String pipelineId) {
+        Optional<String> incarnation = incarnationFrom(document, pipelineId);
+        Object marker = document.get("legacyHistoryVisible");
+        if (marker != null && !(marker instanceof Boolean)) {
+            throw unreadable(pipelineId, "legacyHistoryVisible", null);
+        }
+        return new RateHistoryStore.Visibility(incarnation.orElse(null),
+                incarnation.isEmpty() || Boolean.TRUE.equals(marker));
     }
 
     /** Binds a resource back out of its stored document's structure, parsing no text. */

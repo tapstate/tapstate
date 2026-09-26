@@ -150,7 +150,16 @@ class PipelineHistoryMongoCostIT {
 
         @Override
         public Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit) {
-            Page page = delegate.readPage(pipelineId, from, to, after, limit);
+            return countPage(delegate.readPage(pipelineId, from, to, after, limit));
+        }
+
+        @Override
+        public Page readPageVisible(String pipelineId, Visibility visibility,
+                Instant from, Instant to, Key after, int limit) {
+            return countPage(delegate.readPageVisible(pipelineId, visibility, from, to, after, limit));
+        }
+
+        private Page countPage(Page page) {
             pageReads++;
             scanned += page.entries().size() + (page.hasMore() ? 1 : 0);
             largestPage = Math.max(largestPage, page.entries().size());
@@ -165,6 +174,13 @@ class PipelineHistoryMongoCostIT {
         }
 
         @Override
+        public Optional<Entry> readVisible(String pipelineId, Visibility visibility, Key key) {
+            Optional<Entry> entry = delegate.readVisible(pipelineId, visibility, key);
+            entry.ifPresent(ignored -> scanned++);
+            return entry;
+        }
+
+        @Override
         public Optional<Entry> predecessor(String pipelineId, Instant at) {
             Optional<Entry> entry = delegate.predecessor(pipelineId, at);
             entry.ifPresent(ignored -> scanned++);
@@ -172,8 +188,22 @@ class PipelineHistoryMongoCostIT {
         }
 
         @Override
+        public Optional<Entry> predecessorVisible(String pipelineId, Visibility visibility, Instant at) {
+            Optional<Entry> entry = delegate.predecessorVisible(pipelineId, visibility, at);
+            entry.ifPresent(ignored -> scanned++);
+            return entry;
+        }
+
+        @Override
         public Optional<Entry> successor(String pipelineId, Instant at) {
             Optional<Entry> entry = delegate.successor(pipelineId, at);
+            entry.ifPresent(ignored -> scanned++);
+            return entry;
+        }
+
+        @Override
+        public Optional<Entry> successorVisible(String pipelineId, Visibility visibility, Instant at) {
+            Optional<Entry> entry = delegate.successorVisible(pipelineId, visibility, at);
             entry.ifPresent(ignored -> scanned++);
             return entry;
         }

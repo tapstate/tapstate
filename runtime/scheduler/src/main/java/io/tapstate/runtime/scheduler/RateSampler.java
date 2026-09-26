@@ -6,6 +6,7 @@ import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RateHistoryStore;
+import io.tapstate.spi.store.ObservationStore;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -43,7 +44,9 @@ public final class RateSampler {
 
     private final RateHistoryStore history;
     private final Duration interval;
-    private final Map<String, Instant> lastSampledAt = new ConcurrentHashMap<>();
+    private record LastSample(ObservationStore.Scope scope, Instant at) { }
+
+    private final Map<String, LastSample> lastSampledAt = new ConcurrentHashMap<>();
 
     public RateSampler(RateHistoryStore history, Duration interval) {
         this.history = Objects.requireNonNull(history, "history");
@@ -63,6 +66,11 @@ public final class RateSampler {
 
     /** Returns whether this frame appended a retained sample. */
     public boolean appendIfDue(Observation observation) {
+        return appendIfDue(observation, null);
+    }
+
+    /** Samples one execution without letting the preceding execution suppress its first frame. */
+    public boolean appendIfDue(Observation observation, ObservationStore.Scope scope) {
         Objects.requireNonNull(observation, "observation");
         if (observation.observedAt() == null) {
             return false;
@@ -71,12 +79,17 @@ public final class RateSampler {
         if (sample == null) {
             return false;
         }
-        Instant last = lastSampledAt.get(observation.pipelineId());
-        if (last != null && observation.observedAt().isBefore(last.plus(interval))) {
+        LastSample last = lastSampledAt.get(observation.pipelineId());
+        if (last != null && Objects.equals(last.scope(), scope)
+                && observation.observedAt().isBefore(last.at().plus(interval))) {
             return false;
         }
-        history.append(sample);
-        lastSampledAt.put(observation.pipelineId(), observation.observedAt());
+        if (scope == null) {
+            history.append(sample);
+        } else {
+            history.appendScoped(sample, scope);
+        }
+        lastSampledAt.put(observation.pipelineId(), new LastSample(scope, observation.observedAt()));
         return true;
     }
 

@@ -228,7 +228,8 @@ final class TelemetryDispatcher implements AutoCloseable {
         offerLatest(observation.pipelineId(), new ObservationFrame(prepared, scope));
         if (sampler != null) {
             offerSide(historyWorker, historyStats, observation.pipelineId(), "history",
-                    () -> stillCurrent(observation.pipelineId(), scope) && sampler.appendIfDue(observation));
+                    () -> stillCurrent(observation.pipelineId(), scope)
+                            && sampler.appendIfDue(observation, scope));
         }
         if (export != MetricsExport.none()) {
             offerSide(exportWorker, exportStats, observation.pipelineId(), "export", () -> {

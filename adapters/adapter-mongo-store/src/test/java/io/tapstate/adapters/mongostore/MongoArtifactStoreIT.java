@@ -12,10 +12,14 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.adapters.mongostore.migration.V1BaselineIndexes;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StoredArtifactRecord;
+import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.RateHistoryStore;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.testsupport.RequiresDocker;
 import io.tapstate.adapters.mongostore.ChangeSet;
 import org.bson.Document;
@@ -29,6 +33,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -49,6 +55,55 @@ import static org.assertj.core.api.Assertions.catchThrowable;
  */
 @RequiresDocker
 class MongoArtifactStoreIT {
+
+    @Test
+    void removedHistoryOwnerSurvivesRecreationAndDelayedCleanupCannotDeleteTheNewSamples() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("history_owner_recreate_it");
+            database.drop();
+            MongoCollection<Document> artifacts = database.getCollection("artifacts");
+            MongoArtifactStore store = new MongoArtifactStore(client, artifacts);
+            MongoRateHistoryStore history = new MongoRateHistoryStore(database,
+                    database.getCollection("pipeline_rate_history"), Duration.ofDays(15));
+            Resource pipeline = PARSER.parse(ORDERS_SYNC);
+            Instant at = Instant.parse("2026-09-26T10:00:00Z");
+
+            artifacts.insertOne(MongoArtifactStore.toDocument(pipeline));
+            history.append(historySample(pipeline.id(), at, 1));
+            assertThat(store.ensurePipelineIncarnationId(pipeline.id(), "inc-old")).contains("inc-old");
+            RateHistoryStore.Visibility old = store.pipelineHistoryOwner(pipeline.id())
+                    .orElseThrow().visibility();
+            assertThat(old).isEqualTo(new RateHistoryStore.Visibility("inc-old", true));
+            history.appendScoped(historySample(pipeline.id(), at.plusSeconds(60), 2),
+                    new ObservationStore.Scope("inc-old", 41));
+            assertThat(history.readPageVisible(pipeline.id(), old, at, at.plusSeconds(180), null, 10)
+                    .entries()).extracting(entry -> entry.sample().counters().get("records.out"))
+                    .containsExactly(1L, 2L);
+
+            ArtifactStore.Removal removed = store.deleteWithHistoryOwner(pipeline.id(), CanonicalHash.of(pipeline));
+            assertThat(removed.outcome()).isEqualTo(ArtifactMutation.DELETED);
+            assertThat(removed.historyOwner().orElseThrow().visibility()).isEqualTo(old);
+            assertThat(store.create(pipeline)).isEqualTo(ArtifactMutation.CREATED);
+            String next = store.pipelineIncarnationId(pipeline.id()).orElseThrow();
+            assertThat(next).isNotEqualTo("inc-old");
+            RateHistoryStore.Visibility current = store.pipelineHistoryOwner(pipeline.id())
+                    .orElseThrow().visibility();
+            assertThat(current).isEqualTo(new RateHistoryStore.Visibility(next, false));
+            history.appendScoped(historySample(pipeline.id(), at.plusSeconds(120), 3),
+                    new ObservationStore.Scope(next, 42));
+
+            history.deleteIncarnation(pipeline.id(), old.incarnationId());
+            history.deleteLegacy(pipeline.id());
+
+            assertThat(history.readPageVisible(pipeline.id(), current, at, at.plusSeconds(180), null, 10)
+                    .entries()).extracting(entry -> entry.sample().counters().get("records.out"))
+                    .containsExactly(3L);
+        }
+    }
+
+    private static RateSample historySample(String pipelineId, Instant at, long count) {
+        return new RateSample(pipelineId, at, Map.of("records.out", count), Map.of(), at.minusSeconds(3600));
+    }
 
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final CanonicalWriter WRITER = new CanonicalWriter();

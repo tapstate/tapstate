@@ -36,7 +36,18 @@ class ObservabilityTestConfiguration {
             }
 
             @Override
+            public Page readPageVisible(String pipelineId, Visibility visibility,
+                    Instant from, Instant to, Key after, int limit) {
+                return new Page(List.of(), false);
+            }
+
+            @Override
             public Optional<Entry> read(String pipelineId, Key key) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<Entry> readVisible(String pipelineId, Visibility visibility, Key key) {
                 return Optional.empty();
             }
 
@@ -46,7 +57,17 @@ class ObservabilityTestConfiguration {
             }
 
             @Override
+            public Optional<Entry> predecessorVisible(String pipelineId, Visibility visibility, Instant at) {
+                return Optional.empty();
+            }
+
+            @Override
             public Optional<Entry> successor(String pipelineId, Instant at) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<Entry> successorVisible(String pipelineId, Visibility visibility, Instant at) {
                 return Optional.empty();
             }
 

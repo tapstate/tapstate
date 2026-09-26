@@ -3,11 +3,13 @@ package io.tapstate.app;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
+import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -19,6 +21,42 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class TelemetryDispatcherTest {
+
+    @Test
+    void historyWorkerRetainsTheExecutionScopeOfTheOfferedFrame() throws Exception {
+        InMemoryRateHistoryStore history = new InMemoryRateHistoryStore();
+        ObservationStore latest = new ObservationStore() {
+            @Override public void save(Observation observation) { }
+            @Override public boolean saveScoped(Observation observation, Scope scope) { return true; }
+            @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+            @Override public void delete(String id) { }
+        };
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        ObservationStore.Scope owner = scopes.begin("orders", "inc-current", 42);
+        Observation observation = new Observation("orders", PipelineState.RUNNING,
+                Map.of("records.out", 7L), Map.of(), Map.of(), null,
+                Instant.parse("2026-09-26T10:00:00Z"));
+        ObservationPublisher.Prepared prepared = new ObservationPublisher.Prepared(observation, false,
+                Map.of(), Map.of(), Map.of());
+
+        try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), latest),
+                new RateSampler(history, Duration.ofMinutes(1)), MetricsExport.none(), scopes, 1, 4)) {
+            dispatcher.offer(prepared, owner);
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).successes() == 0
+                    && System.nanoTime() < until) {
+                TimeUnit.MILLISECONDS.sleep(5);
+            }
+            assertThat(dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).successes()).isEqualTo(1);
+            assertThat(history.readPageVisible("orders", new io.tapstate.spi.store.RateHistoryStore.Visibility(
+                    "inc-current", false), observation.observedAt(),
+                    observation.observedAt().plusSeconds(1), null, 10).entries()).hasSize(1);
+            assertThat(history.readPageVisible("orders", new io.tapstate.spi.store.RateHistoryStore.Visibility(
+                    null, true), observation.observedAt(), observation.observedAt().plusSeconds(1),
+                    null, 10).entries()).isEmpty();
+        }
+    }
 
     @Test
     void aTimedOutWriteOpensTheBreakerWithoutStartingUnboundedReplacementWorkers() throws Exception {

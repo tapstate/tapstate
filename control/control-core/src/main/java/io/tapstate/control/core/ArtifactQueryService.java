@@ -6,6 +6,7 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StoredArtifactRecord;
+import io.tapstate.spi.store.RateHistoryStore;
 
 import java.util.List;
 import java.util.Objects;
@@ -58,6 +59,12 @@ public final class ArtifactQueryService {
     public Optional<StoredResource> getResource(String id) {
         Objects.requireNonNull(id, "id");
         return store.get(id).map(this::typedView);
+    }
+
+    /** The current artifact's internal history owner; absent for a missing or non-pipeline resource. */
+    public Optional<RateHistoryStore.Visibility> historyVisibilityOf(String id) {
+        Objects.requireNonNull(id, "id");
+        return store.pipelineHistoryOwner(id).map(ArtifactStore.HistoryOwner::visibility);
     }
 
     /** Lists typed stored resources and their canonical hashes without exposing canonical text. */

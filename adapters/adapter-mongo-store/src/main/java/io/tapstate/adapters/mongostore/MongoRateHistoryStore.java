@@ -26,7 +26,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * The MongoDB history of movement samples: one document per sample, appended and never overwritten,
- * left to expire by the server. Samples leave by age and by nothing else: the collection carries an
+ * left to expire by the server or removed by owner-scoped lifecycle cleanup. The collection carries an
  * expiring index on {@code observedAt}, so a document older than the retention is dropped by the server's
  * own sweep — which runs whether or not anything is still writing, and that is the property this store
  * exists for. A writer trimming on its way in would never trim the history of a pipeline that has stopped.

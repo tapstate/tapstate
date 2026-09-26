@@ -13,7 +13,7 @@ import java.util.Locale;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The samples a pipeline took while it ran leave with the pipeline, and with nothing else.
+ * The samples a pipeline took while it ran remain after stop and are cleared after removal.
  *
  * <p>Two verbs are driven against one history and asked opposite things. A stop - the one that clears
  * the run's state, which is the verb that takes the most - leaves the history standing: the samples are
@@ -21,9 +21,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * stopped, which is every time someone changed it. A removal takes them: a history left behind would be
  * read as the past of whatever is applied under the id next.
  *
- * <p>The history is read off the store's own collection, because it has no read face, and it is asserted
- * present before the stop as well as absent after the removal. A pipeline that was never sampled would
- * satisfy "nothing left" on every implementation, including one that reclaims nothing at all.
+ * <p>The history is read off the store's own collection and is asserted present before the stop as
+ * well as eventually absent after removal. A pipeline that was never sampled would satisfy "nothing
+ * left" on every implementation, including one that reclaims nothing at all.
  *
  * <p>Runs on the harness's own connector, so it needs Docker for the store and nothing else.
  */
@@ -61,10 +61,9 @@ class DeletingAPipelineTakesItsRateHistoryWithItIT {
             control.deleteArtifact(pipelineId, control.contentHash(pipelineId));
 
             assertThat(control.artifact(pipelineId)).as("the artifact itself").isEmpty();
-            assertThat(documents.rateSamplesOf(pipelineId))
-                    .as("the samples of a removed pipeline - left behind, they are the past of whatever is "
-                            + "applied under the id next")
-                    .isZero();
+            Await.until("removed pipeline history cleanup",
+                    () -> documents.rateSamplesOf(pipelineId) == 0,
+                    () -> "samples=" + documents.rateSamplesOf(pipelineId));
         }
     }
 

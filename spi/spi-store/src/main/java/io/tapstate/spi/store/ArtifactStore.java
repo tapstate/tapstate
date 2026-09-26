@@ -20,6 +20,24 @@ import java.util.Optional;
  */
 public interface ArtifactStore {
 
+    /** The identity captured from a pipeline artifact, including its pre-identity history compatibility. */
+    record HistoryOwner(RateHistoryStore.Visibility visibility) {
+        public HistoryOwner {
+            Objects.requireNonNull(visibility, "visibility");
+        }
+    }
+
+    /** The conditional removal result and, on success, the owner from the removed artifact document. */
+    record Removal(ArtifactMutation outcome, Optional<HistoryOwner> historyOwner) {
+        public Removal {
+            Objects.requireNonNull(outcome, "outcome");
+            Objects.requireNonNull(historyOwner, "historyOwner");
+            if (outcome != ArtifactMutation.DELETED && historyOwner.isPresent()) {
+                throw new IllegalArgumentException("only a removed artifact can carry its history owner");
+            }
+        }
+    }
+
     /**
      * Atomically applies every requested resource write while evaluating each write's condition in the
      * same store operation. A refused condition leaves the entire batch unchanged and identifies the
@@ -130,6 +148,16 @@ public interface ArtifactStore {
     }
 
     /**
+     * Returns the identity from the document actually removed by the conditional delete. Persistent
+     * stores override this atomically; the default preserves legacy in-memory stores' behavior.
+     */
+    default Removal deleteWithHistoryOwner(String id, String expectedContentHash) {
+        Optional<HistoryOwner> owner = pipelineHistoryOwner(id);
+        ArtifactMutation outcome = delete(id, expectedContentHash);
+        return new Removal(outcome, outcome == ArtifactMutation.DELETED ? owner : Optional.empty());
+    }
+
+    /**
      * Atomically upserts every resource in {@code artifacts} by its top-level id: either all are
      * stored or, on any failure, none is — there is no partial batch. The stored form is canonical, and
      * an empty batch writes nothing. Ordering follows the list, though the atomic outcome does not
@@ -205,6 +233,15 @@ public interface ArtifactStore {
     /** Returns the system-owned identity of an existing pipeline, if one has been assigned. */
     default Optional<String> pipelineIncarnationId(String pipelineId) {
         throw new UnsupportedOperationException("pipeline incarnation reads are not implemented");
+    }
+
+    /**
+     * Reads the current pipeline's history scope in one operation. Legacy-only stores may use the
+     * pipeline id; persistent stores must distinguish lazily upgraded resources from new creations.
+     */
+    default Optional<HistoryOwner> pipelineHistoryOwner(String pipelineId) {
+        return get(pipelineId).filter(resource -> "pipeline".equals(resource.kind()))
+                .map(ignored -> new HistoryOwner(new RateHistoryStore.Visibility(null, true)));
     }
 
     /**

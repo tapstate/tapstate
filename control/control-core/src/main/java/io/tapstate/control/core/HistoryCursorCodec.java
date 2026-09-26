@@ -2,6 +2,7 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.RateHistoryStore.Key;
+import io.tapstate.spi.store.RateHistoryStore.Visibility;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -50,13 +51,19 @@ public final class HistoryCursorCodec {
 
     /** Everything a cursor binds that a caller must repeat unchanged. */
     public record QueryBinding(String pipelineId, Instant from, Instant to,
-            HistoryResolution resolution, int limit, List<String> tables) {
+            HistoryResolution resolution, int limit, List<String> tables, Visibility visibility) {
         public QueryBinding {
             Objects.requireNonNull(pipelineId, "pipelineId");
             Objects.requireNonNull(from, "from");
             Objects.requireNonNull(to, "to");
             Objects.requireNonNull(resolution, "resolution");
             tables = List.copyOf(Objects.requireNonNull(tables, "tables"));
+            Objects.requireNonNull(visibility, "visibility");
+        }
+
+        public QueryBinding(String pipelineId, Instant from, Instant to,
+                HistoryResolution resolution, int limit, List<String> tables) {
+            this(pipelineId, from, to, resolution, limit, tables, new Visibility(null, true));
         }
     }
 
@@ -130,7 +137,7 @@ public final class HistoryCursorCodec {
     private String claims(State state) {
         QueryBinding binding = state.binding();
         StringBuilder out = new StringBuilder();
-        line(out, "v", "1");
+        line(out, "v", "2");
         line(out, "op", "pipeline.metrics.history");
         line(out, "pipeline", text(binding.pipelineId()));
         line(out, "from", instant(binding.from()));
@@ -141,6 +148,9 @@ public final class HistoryCursorCodec {
         for (String table : binding.tables()) {
             line(out, "table", text(table));
         }
+        line(out, "incarnation", binding.visibility().incarnationId() == null
+                ? "" : text(binding.visibility().incarnationId()));
+        line(out, "includeLegacy", Boolean.toString(binding.visibility().includeLegacy()));
         line(out, "effectiveFrom", instant(state.effectiveFrom()));
         line(out, "effectiveTo", instant(state.effectiveTo()));
         line(out, "retentionCutoff", instant(state.retentionCutoff()));
@@ -166,7 +176,8 @@ public final class HistoryCursorCodec {
             values.computeIfAbsent(line.substring(0, split), ignored -> new ArrayList<>())
                     .add(line.substring(split + 1));
         }
-        if (!"1".equals(one(values, "v"))
+        String version = one(values, "v");
+        if (!("1".equals(version) || "2".equals(version))
                 || !"pipeline.metrics.history".equals(one(values, "op"))) {
             throw new IllegalArgumentException("unsupported cursor claims");
         }
@@ -176,13 +187,25 @@ public final class HistoryCursorCodec {
             throw new IllegalArgumentException("table count differs");
         }
         List<String> tables = encodedTables.stream().map(HistoryCursorCodec::plain).toList();
+        Visibility visibility;
+        if ("2".equals(version)) {
+            String includeLegacy = one(values, "includeLegacy");
+            if (!("true".equals(includeLegacy) || "false".equals(includeLegacy))) {
+                throw new IllegalArgumentException("invalid history visibility flag");
+            }
+            String incarnation = one(values, "incarnation");
+            visibility = new Visibility(incarnation.isEmpty() ? null : plain(incarnation),
+                    Boolean.parseBoolean(includeLegacy));
+        } else {
+            visibility = new Visibility(null, true);
+        }
         QueryBinding binding = new QueryBinding(
                 plain(one(values, "pipeline")),
                 parsedInstant(one(values, "from")),
                 parsedInstant(one(values, "to")),
                 HistoryResolution.valueOf(one(values, "resolution")),
                 Integer.parseInt(one(values, "limit")),
-                tables);
+                tables, visibility);
         Key key = new Key(parsedInstant(one(values, "afterAt")), plain(one(values, "afterKey")));
         State state = new State(binding,
                 parsedInstant(one(values, "effectiveFrom")),
@@ -193,8 +216,8 @@ public final class HistoryCursorCodec {
                 parsedInstant(one(values, "issuedAt")),
                 parsedInstant(one(values, "expiresAt")));
         List<String> expectedNames = List.of("v", "op", "pipeline", "from", "to", "resolution", "limit",
-                "tables", "table", "effectiveFrom", "effectiveTo", "retentionCutoff", "afterAt", "afterKey",
-                "resumeAt", "issuedAt", "expiresAt");
+                "tables", "table", "incarnation", "includeLegacy", "effectiveFrom", "effectiveTo",
+                "retentionCutoff", "afterAt", "afterKey", "resumeAt", "issuedAt", "expiresAt");
         if (values.keySet().stream().anyMatch(name -> !expectedNames.contains(name))) {
             throw new IllegalArgumentException("unknown cursor claim");
         }

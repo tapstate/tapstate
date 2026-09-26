@@ -367,21 +367,38 @@ class ArtifactMutationServiceTest {
     }
 
     @Test
-    void aServiceBuiltWithoutARateHistoryStoreReportsThatStepRatherThanACleanSweep() {
-        // The shape that keeps an older call site working substitutes a store for the one it was not
-        // given. A substitute that deletes nothing and says nothing has the reclaim run every step and
-        // report the pipeline reclaimed whole, while every sample it ever took stays in the collection to
-        // be read as the past of whatever is applied under that id next.
+    void aServiceBuiltWithoutARateHistoryStoreStillRemovesTheArtifact() {
+        // A missing optional history store may leave samples until expiry, but cannot turn a completed
+        // artifact removal into an apparent refusal.
         ArtifactMutationService withoutHistory = new ArtifactMutationService(
                 store, desired, state, observations, layouts, srsMeta, derivedSchemas,
                 new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add);
         PipelineResource flow = pipeline("flow");
         store.save(flow);
 
-        assertThatThrownBy(() -> withoutHistory.delete(PRINCIPAL, "flow", hash(flow)))
-                .isInstanceOfSatisfying(TapstateException.class, error ->
-                        assertThat(error.args()).containsEntry("residue", List.of("rate-history")));
+        withoutHistory.delete(PRINCIPAL, "flow", hash(flow));
         assertThat(store.get("flow")).isEmpty();
+    }
+
+    @Test
+    void delayedHistoryCleanupUsesTheRemovedIncarnationAfterSameIdRecreation() {
+        List<Runnable> pending = new ArrayList<>();
+        ArtifactMutationService delayed = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add, pending::add);
+        PipelineResource first = pipeline("flow");
+        store.save(first);
+        store.assignIncarnation("flow", "inc-old");
+
+        delayed.delete(PRINCIPAL, "flow", hash(first));
+        store.save(pipeline("flow"));
+        store.assignIncarnation("flow", "inc-new");
+        assertThat(pending).hasSize(1);
+        pending.getFirst().run();
+
+        assertThat(rateHistory.deletedIncarnations).containsExactly("inc-old");
+        assertThat(rateHistory.deleted).doesNotContain("inc-new");
+        assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
     }
 
     @Test
@@ -790,6 +807,7 @@ class ArtifactMutationServiceTest {
     private static final class InMemoryArtifactStore implements ArtifactStore {
 
         private final Map<String, Resource> artifacts = new LinkedHashMap<>();
+        private final Map<String, String> incarnations = new LinkedHashMap<>();
         private final List<String> unreadable = new ArrayList<>();
         /** Another caller acting in the window between the removal and the reclaim that follows it. */
         private Runnable afterDelete = null;
@@ -804,6 +822,7 @@ class ArtifactMutationServiceTest {
                 return ArtifactMutation.VERSION_CONFLICT;
             }
             artifacts.remove(id);
+            incarnations.remove(id);
             if (afterDelete != null) {
                 Runnable other = afterDelete;
                 afterDelete = null;
@@ -834,6 +853,25 @@ class ArtifactMutationServiceTest {
                 throw unreadable(unreadable.getFirst());
             }
             return new ArrayList<>(artifacts.values());
+        }
+
+        @Override
+        public synchronized Optional<String> pipelineIncarnationId(String id) {
+            return Optional.ofNullable(incarnations.get(id));
+        }
+
+        @Override
+        public synchronized Optional<HistoryOwner> pipelineHistoryOwner(String id) {
+            if (!artifacts.containsKey(id) || !"pipeline".equals(artifacts.get(id).kind())) {
+                return Optional.empty();
+            }
+            String incarnation = incarnations.get(id);
+            return Optional.of(new HistoryOwner(new io.tapstate.spi.store.RateHistoryStore.Visibility(
+                    incarnation, incarnation == null)));
+        }
+
+        synchronized void assignIncarnation(String id, String incarnation) {
+            incarnations.put(id, incarnation);
         }
 
         @Override
@@ -875,6 +913,7 @@ class ArtifactMutationServiceTest {
     /** The samples a pipeline left behind, reclaimed last: nothing else bounds them but their age. */
     private final class RecordingRateHistory implements io.tapstate.spi.store.RateHistoryStore {
         private final List<String> deleted = new ArrayList<>();
+        private final List<String> deletedIncarnations = new ArrayList<>();
 
         @Override
         public void append(io.tapstate.core.lifecycle.RateSample sample) {
@@ -904,8 +943,19 @@ class ArtifactMutationServiceTest {
 
         @Override
         public void deleteAll(String pipelineId) {
+            throw new AssertionError("history cleanup must retain the removed owner's scope");
+        }
+
+        @Override
+        public void deleteLegacy(String pipelineId) {
             step("rate-history", null);
             deleted.add(pipelineId);
+        }
+
+        @Override
+        public void deleteIncarnation(String pipelineId, String incarnationId) {
+            step("rate-history", null);
+            deletedIncarnations.add(incarnationId);
         }
 
         @Override
