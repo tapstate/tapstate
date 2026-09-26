@@ -75,7 +75,8 @@ class ObservationPublisherTest {
             assertThat(point.value()).isEqualTo(11);
         });
 
-        writer.clearRebuildingResume("orders");
+        // A later jobless recovery can start without an explicit stop verb. The one rebuilding-resume
+        // permission must already be spent when the continued execution first publishes.
         Observation fresh = writer.prepareScoped("orders", null,
                 new ObservationStore.Scope("inc-a", 3)).orElseThrow().observation();
         List<io.tapstate.core.lifecycle.MetricPoint> reset = fresh.facts().stream()

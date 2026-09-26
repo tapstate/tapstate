@@ -722,8 +722,9 @@ public final class ObservationPublisher {
         if (!scope.equals(previous)) {
             currentFailures.remove(pipelineId);
             failuresByPipelineAndCode.remove(pipelineId);
+            boolean continuing = rebuildingResumes.remove(pipelineId);
             if (previous == null || !previous.pipelineIncarnationId().equals(scope.pipelineIncarnationId())
-                    || !rebuildingResumes.contains(pipelineId)) {
+                    || !continuing) {
                 cardinality.forgetPipeline(pipelineId);
             }
             failureCountingSinceByPipeline.put(pipelineId, observedNow());
