@@ -143,7 +143,8 @@ class ASlowWriterKeepsTheDurablePositionBehindItUntilItWritesIT {
                     control.ackedChangeSeq(PIPELINE).filter(seq -> seq > before).ifPresent(seq -> confirmed[0] = seq);
                     return confirmed[0] > before;
                 },
-                () -> "the position face reads " + control.positionReading(PIPELINE));
+                () -> "the position face reads " + control.positionReading(PIPELINE) + "; the cluster reads "
+                        + control.clusterReading());
         return confirmed[0];
     }
 

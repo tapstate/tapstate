@@ -1881,6 +1881,12 @@ final class ControlPlane {
         return Optional.empty();
     }
 
+    /** The cluster read as it answers now, status and all, for a case to say what it last read. */
+    String clusterReading() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        return response.statusCode() + " " + response.body();
+    }
+
     /** The position face as it answers now, status and all, for a case to say what it last read. */
     String positionReading(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
