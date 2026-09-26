@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
@@ -9,6 +10,11 @@ import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.processor.Processors;
+import com.hazelcast.config.Config;
+import com.hazelcast.config.JoinConfig;
+import com.hazelcast.core.Hazelcast;
+import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.jet.config.JobConfig;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
@@ -31,6 +37,7 @@ import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.transform.TransformPort;
+import io.tapstate.core.common.TapstateException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -80,6 +87,40 @@ class ANestRunsAtTheWidthItsNodeWasWorkedOutForTest {
                     .as("%s runs one processor for the whole cluster", name).isEqualTo(1);
             assertThat(InputBatches.takesInputInBatches(vertex.getMetaSupplier())).isFalse();
         });
+    }
+
+    /**
+     * A wide nest is held to the member count its width was worked out for: a run that starts on any other count
+     * is refused before a single processor runs, like any node run wide, rather than running a number of them
+     * nobody worked out.
+     */
+    @Test
+    void aWideNestStartingOnAMemberCountOtherThanItsPlanIsRefusedBeforeAnyProcessorRuns() {
+        ExecutionShape forTwo = new ExecutionShape(2, Map.of("doc", new NodeParallelism("doc", 4,
+                NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE, 2, 2, 4, List.of())), Map.of());
+        DAG dag = PipelineDagBuilder.build(pipeline(new ExecutionSpec(4, null)), bindings(), null, null, forTwo);
+        Config config = new Config();
+        config.setClusterName("nest-width-" + System.nanoTime());
+        config.getJetConfig().setEnabled(true);
+        config.setProperty("hazelcast.phone.home.enabled", "false");
+        config.setProperty("hazelcast.shutdownhook.enabled", "false");
+        JoinConfig join = config.getNetworkConfig().getJoin();
+        join.getMulticastConfig().setEnabled(false);
+        join.getAutoDetectionConfig().setEnabled(false);
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        HazelcastInstance member = Hazelcast.newHazelcastInstance(config);
+        try {
+            Throwable failure = catchThrowable(() -> member.getJet().newJob(dag, new JobConfig().setName("p")).join());
+
+            assertThat(failure).isNotNull();
+            assertThat(JobFailureRegistry.of(member).get("p")).hasValueSatisfying(recorded ->
+                    assertThat(recorded).isInstanceOfSatisfying(TapstateException.class, refused -> {
+                        assertThat(refused.code()).isEqualTo(EngineError.MEMBERSHIP_CHANGED_BEFORE_START);
+                        assertThat(refused.args()).containsEntry("planned", 2).containsEntry("actual", 1);
+                    }));
+        } finally {
+            member.shutdown();
+        }
     }
 
     private static List<String> keepingState() {
