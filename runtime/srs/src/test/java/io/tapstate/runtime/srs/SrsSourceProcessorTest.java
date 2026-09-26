@@ -31,6 +31,7 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.runtime.engine.LoadGate;
 import io.tapstate.core.lifecycle.LoadLandings;
+import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.spi.capture.SourcePosition;
@@ -410,6 +411,34 @@ class SrsSourceProcessorTest {
         }
     }
 
+    /**
+     * A source hands its changes on in the batch its author asked for: at most that many are read from the ring
+     * and sent on in one pass, each pass followed by the bound for what it sent. Without one it sends on what
+     * the ring holds, up to the default batch, in one go.
+     */
+    @Test
+    void readsAndSendsOnAtMostTheBatchItsAuthorAskedForAtATime() throws InterruptedException {
+        SEEN.clear();
+        fill("srs.chain.readbatch", 5);
+        Job job = hz.getJet().newJob(recordingDag("srs.chain.readbatch", "orders", "out-readbatch", 1024, null, 2));
+        try {
+            awaitSeen("b:7:5");
+            assertThat(SEEN).containsExactly("i:0", "i:1", "b:7:2", "i:2", "i:3", "b:7:4", "i:4", "b:7:5");
+        } finally {
+            job.cancel();
+        }
+
+        SEEN.clear();
+        fill("srs.chain.readall", 5);
+        Job whole = hz.getJet().newJob(recordingDag("srs.chain.readall", "orders", "out-readall", 1024));
+        try {
+            awaitSeen("b:7:5");
+            assertThat(SEEN).containsExactly("i:0", "i:1", "i:2", "i:3", "i:4", "b:7:5");
+        } finally {
+            whole.cancel();
+        }
+    }
+
     @Test
     void pins_the_source_vertex_to_a_single_instance_across_the_cluster() throws Exception {
         // One reader per ring is what keeps the change stream in order; a per-member instance would re-lane it.
@@ -785,12 +814,18 @@ class SrsSourceProcessorTest {
 
     /** The same graph with the source's changes held at {@code gate}, or not held at all where it is null. */
     private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize, LoadGate gate) {
+        return recordingDag(ringName, src, sinkName, queueSize, gate, BatchSpec.DEFAULT_MAX_RECORDS);
+    }
+
+    /** The same graph with the source reading at most {@code readBatch} changes a pass. */
+    private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize, LoadGate gate,
+            int readBatch) {
         DAG dag = new DAG();
         ProcessorMetaSupplier reading = SrsSourceProcessor.metaSupplier(
-                PIPELINE, ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
+                PIPELINE, ringName, src, StartFrom.earliest(), null, 1L, SrsReadCursorPublisherFactory.NONE,
                 order -> new Watermark(
                         order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7),
-                SourcePlacement.anyMember());
+                SourcePlacement.anyMember(), readBatch);
         Vertex source = dag.newVertex("source", gate == null ? reading : gate.appliedTo(reading));
         Vertex record = dag.newVertex("record", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of(RecordingBounds::new)));

@@ -24,6 +24,8 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.DagBindings;
 import io.tapstate.runtime.engine.ExecutionShape;
@@ -2387,7 +2389,17 @@ final class StoreBackedDagSource implements DagSource {
                 doneThrough, ringGeneration(vertex.resolution()),
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),
-                order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
+                order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
+                readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.sourceId())));
+    }
+
+    /**
+     * How many changes {@code source}'s reader hands on at a time: the batch its author wrote on the source, or
+     * the default batch where none was written. It says nothing about how many rows the connector fetches.
+     */
+    static int readBatchOf(SourceResource source) {
+        ExecutionSpec execution = source.execution();
+        return (execution == null ? BatchSpec.DEFAULTS : execution.batchOrDefaults()).effectiveMaxRecords();
     }
 
     /**

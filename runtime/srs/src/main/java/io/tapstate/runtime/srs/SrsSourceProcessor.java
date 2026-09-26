@@ -17,6 +17,7 @@ import io.tapstate.core.lifecycle.LoadLandings;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.BatchSpec;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Map;
@@ -67,8 +68,6 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         return Stage.SOURCE;
     }
 
-    /** The most changes one fill drains before yielding - a bounded batch that lets Jet pace the source. */
-    private static final int FILL_BATCH = 256;
 
     /**
      * How often a source holding its changes looks at whether the loads they wait for have landed. Each look is
@@ -83,6 +82,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final long epoch;
     private final SourceBoundStamp stamp;
     private final RingTail ringTail;
+    // The most changes one pass reads from the ring and sends on before yielding: the batch the source's author
+    // asked for, which is how many rows it hands on at a time - never how many the connector fetches.
+    private final int readBatch;
     private final ArrayDeque<Envelope> pending = new ArrayDeque<>();
     private SnapshotBuffer buffered;
     private SrsRingbuffer ring;
@@ -122,13 +124,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private long nextLookNanos;
 
     private SrsSourceProcessor(String pipelineId, String ringName, String src, long epoch,
-            SourceBoundStamp stamp, RingTail ringTail) {
+            SourceBoundStamp stamp, RingTail ringTail, int readBatch) {
         this.pipelineId = pipelineId;
         this.ringName = ringName;
         this.src = src;
         this.epoch = epoch;
         this.stamp = stamp;
         this.ringTail = ringTail;
+        this.readBatch = readBatch;
     }
 
     // Times each read of the ring that produced something, which is this stage's unit of work.
@@ -230,7 +233,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                     SourceOrder order = orderOf(seq);
                     pending.add(SrsProjection.toEnvelope(item, src, order));
                     read = order;
-                }, FILL_BATCH);
+                }, readBatch);
                 refused = false;
             } catch (RingWriteRefusedException refusal) {
                 // Whatever this pass read before the refusal is already pending, and the reader stands at
@@ -518,6 +521,18 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
             StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
             SourceBoundStamp stamp, SourcePlacement placement) {
+        return metaSupplier(pipelineId, ringName, src, start, resumeAfter, epoch, publisherFactory, stamp, placement,
+                BatchSpec.DEFAULT_MAX_RECORDS);
+    }
+
+    /**
+     * The same source vertex, reading at most {@code readBatch} changes from its ring in one pass and sending
+     * them on together: the batch the source's author asked for, which says how many rows the source hands on
+     * at a time and nothing about how many its connector fetches.
+     */
+    public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
+            StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
+            SourceBoundStamp stamp, SourcePlacement placement, int readBatch) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
@@ -527,8 +542,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         if (epoch < 0) {
             throw new IllegalArgumentException("a ring generation is never negative, got " + epoch);
         }
-        SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(
-                pipelineId, ringName, src, epoch, stamp, new RingTail(start, resumeAfter, publisherFactory));
+        if (readBatch < 1) {
+            throw new IllegalArgumentException("a source reads at least one change a pass, got " + readBatch);
+        }
+        SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp,
+                new RingTail(start, resumeAfter, publisherFactory), readBatch);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
@@ -549,8 +567,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         if (epoch < 0) {
             throw new IllegalArgumentException("a snapshot generation is never negative, got " + epoch);
         }
-        SupplierEx<Processor> supplier =
-                () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null);
+        SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null,
+                BatchSpec.DEFAULT_MAX_RECORDS);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
