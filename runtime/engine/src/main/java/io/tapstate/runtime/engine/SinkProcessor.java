@@ -362,7 +362,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         ProcessorSupplier supplier = sinkAckFactory == null
-                ? ProcessorSupplier.of((SupplierEx<Processor>) () -> new SinkProcessor(writerFactory.get(), null,
+                ? (ProcessorSupplier) count -> openedTogether(count, () -> new SinkProcessor(writerFactory.get(), null,
                         null, DEFAULT_MAX_IN_FLIGHT, maxRecords, FrontierGauge.none(), new JetDeliveryGauge(),
                         System::currentTimeMillis, null, false, null, maxWaitMillis, System::nanoTime))
                 : new AckSinkSupplier(writerFactory, sinkAckFactory,
@@ -930,16 +930,38 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
         @Override
         public Collection<? extends Processor> get(int count) {
-            List<Processor> processors = new ArrayList<>(count);
-            for (int i = 0; i < count; i++) {
-                // A gauge per processor, not one shared: the handles it keeps belong to the sink that took
-                // the reading, and a shared one would have each sink's readings land under the other's.
-                processors.add(new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
-                        DEFAULT_MAX_IN_FLIGHT, maxRecords, new JetFrontierGauge(),
-                        new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
-                        edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime));
-            }
-            return processors;
+            // A gauge per processor, not one shared: the handles it keeps belong to the sink that took the
+            // reading, and a shared one would have each sink's readings land under the other's.
+            return openedTogether(count, () -> new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
+                    DEFAULT_MAX_IN_FLIGHT, maxRecords, new JetFrontierGauge(),
+                    new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
+                    edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime));
         }
+    }
+
+    /**
+     * {@code count} processors, each with a writer of its own, made together or not at all: a writer that fails
+     * to open fails the lot, and every writer already opened for it is closed first. The engine only ever closes
+     * processors it was handed, and these never would be - so each connector one of them opened would stay open,
+     * and a retry would open as many again beside it. None of them has written anything: a processor writes only
+     * once the engine runs it.
+     */
+    private static List<Processor> openedTogether(int count, SupplierEx<SinkProcessor> processor) {
+        List<Processor> processors = new ArrayList<>(count);
+        try {
+            for (int i = 0; i < count; i++) {
+                processors.add(processor.get());
+            }
+        } catch (Throwable failure) {
+            for (Processor opened : processors) {
+                try {
+                    opened.close();
+                } catch (Exception closing) {
+                    failure.addSuppressed(closing);
+                }
+            }
+            throw failure;
+        }
+        return processors;
     }
 }
