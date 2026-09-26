@@ -377,62 +377,70 @@ class CaptureRunUnitTest {
      * every change before its own seam is already covered by that read.
      */
     @Test
-    void aPipelineNewToAChainBeginsItsTailAtItsOwnSeamNotTheOneTheChainWasCreatedAt() {
+    void aPipelineNewToAChainKeepsItsOwnSeamWithoutOpeningAnotherPhysicalTail() {
         InMemoryMeta meta = new InMemoryMeta();
+        SrsCoordinator coordinator = new SrsCoordinator(meta);
         FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-chain-began-at");
-        CaptureRun firstRun = runUnit(first, meta)
+        CaptureRun firstRun = new CaptureRunUnit(first, coordinator, meta, hz)
                 .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { });
         String chainId = firstRun.chainId().orElseThrow().value();
         // Stands in for pipe-a's sink confirming the table -- the only thing that ever marks one done.
         meta.markSnapshotComplete(chainId, "pipe-a", "orders");
 
         FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-joiner-began-at");
-        runUnit(joiner, meta)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { });
+        new CaptureRunUnit(joiner, coordinator, meta, hz)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { }, false);
 
-        assertThat(joiner.cdcStart)
-                .as("the joiner's tail begins where its own load began, not where the chain did")
-                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-joiner-began-at")));
+        assertThat(joiner.cdcStarted).as("the joiner reads the existing physical tail").isFalse();
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-b").orElseThrow().cdcStartPosition())
+                .as("the joiner's load retains its own seam for recovery")
+                .isEqualTo("seam-the-joiner-began-at");
     }
 
     @Test
     void aPipelineWhoseCompletedLoadSamplesNoSeamRestartsAtItsOwnSeam() {
         InMemoryMeta meta = new InMemoryMeta();
+        SrsCoordinator coordinator = new SrsCoordinator(meta);
         FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-chain-birth");
-        CaptureRun firstRun = runUnit(first, meta)
+        CaptureRun firstRun = new CaptureRunUnit(first, coordinator, meta, hz)
                 .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
         String chainId = firstRun.chainId().orElseThrow().value();
         meta.markSnapshotComplete(chainId, "pipe-a", "orders");
 
         FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-join");
-        runUnit(joiner, meta)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
+        new CaptureRunUnit(joiner, coordinator, meta, hz)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { }, false);
         meta.markSnapshotComplete(chainId, "pipe-b", "orders");
 
         FakeSource restarted = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-not-sampled");
-        runUnit(restarted, meta)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
+        CaptureRun resumed = new CaptureRunUnit(restarted, coordinator, meta, hz)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { }, false);
 
-        assertThat(restarted.cdcStart)
-                .as("pipe-b owes no table on restart, so its tail must not adopt pipe-a's older seam")
-                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-join")));
+        assertThat(resumed.snapshotCount()).as("pipe-b owes no second load").isZero();
+        assertThat(restarted.cdcStarted).as("the existing physical tail stays unique").isFalse();
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-b").orElseThrow().cdcStartPosition())
+                .as("pipe-b keeps its own seam instead of adopting pipe-a's")
+                .isEqualTo("seam-join");
     }
 
     @Test
     void aCdcOnlyPipelineDoesNotAdoptAnotherPipelinesSnapshotSeam() {
         InMemoryMeta meta = new InMemoryMeta();
+        SrsCoordinator coordinator = new SrsCoordinator(meta);
         FakeSource loader = new FakeSource(List.of(row(1)), List.of(), "seam-loader");
-        runUnit(loader, meta)
+        CaptureRun first = new CaptureRunUnit(loader, coordinator, meta, hz)
                 .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-cdc-only-join"), e -> { });
 
         FakeSource cdcOnly = new FakeSource(List.of(), List.of(), "seam-never-sampled");
-        CaptureRun run = runUnit(cdcOnly, meta)
-                .start(specFor("pipe-b", ReadMode.CDC_ONLY, "chain-cdc-only-join"), e -> { });
+        CaptureRun run = new CaptureRunUnit(cdcOnly, coordinator, meta, hz)
+                .start(specFor("pipe-b", ReadMode.CDC_ONLY, "chain-cdc-only-join"), e -> { }, false);
 
         assertThat(run.snapshotCount()).as("cdc_only has no load from which to sample a seam").isZero();
-        assertThat(cdcOnly.cdcStart)
-                .as("with no shared read or seam of its own, pipe-b uses the start for this run")
-                .isEqualTo(CaptureStart.present());
+        assertThat(cdcOnly.cdcStarted).as("joining does not open another physical reader").isFalse();
+        assertThat(meta.read(first.chainId().orElseThrow().value()).orElseThrow()
+                .consumerOffset("pipe-b").orElseThrow().cdcStartPosition())
+                .as("cdc_only does not inherit another pipeline's load seam")
+                .isNull();
     }
 
     /**
@@ -617,7 +625,8 @@ class CaptureRunUnitTest {
     }
 
     /**
-     * The case above with its stand-in removed: no consumer has landed anything, so nothing is written down.
+     * The case above with its stand-in removed: no consumer has landed a change, so only the connector's
+     * safe start boundary is written down.
      *
      * <p>The two are one rule seen from both sides, and only together do they discriminate. An offset is a
      * claim that everything below it is safely out of the source's reach -- true only once a sink has taken
@@ -626,7 +635,7 @@ class CaptureRunUnitTest {
      * and fails here, which is the only place that difference is visible.
      */
     @Test
-    void aDirectTailRecordsNothingWhileNoSinkHasLandedAnything() {
+    void aDirectTailKeepsOnlyItsSafeStartUntilASinkLandsAnything() {
         InMemoryMeta meta = new InMemoryMeta();
         MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-unacked");
 
@@ -634,8 +643,8 @@ class CaptureRunUnitTest {
         runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-unacked"), e -> { });
 
         assertThat(meta.read(chainId.value()).orElseThrow().sourceReadOffset())
-                .as("read is not written: an offset ahead of the sink would skip changes on the way back")
-                .isNull();
+                .as("the start boundary precedes every forwarded change and remains safe for replay")
+                .isEqualTo("src-start");
     }
 
     /**
@@ -869,6 +878,8 @@ class CaptureRunUnitTest {
         meta.create(chain, null);
         long earlier = meta.openEpoch(chain);
         meta.selectConsumerTables(chain, "customer-reader", List.of("customers"), earlier, "old-reader");
+        assertThat(meta.establishPhysicalAnchor(chain,
+                new ChainPosition(new SourceOrder(earlier, -1L), "previous-safe-start"))).isTrue();
         FakeSource source = new FakeSource(List.of(), List.of());
         CaptureRunSpec spec = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "shared-union", true,
                 "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
@@ -900,6 +911,71 @@ class CaptureRunUnitTest {
                                     .isEqualTo(CaptureError.SHARED_SELECTION_RESTART_REQUIRED));
             assertThat(source.cdcStarts).isEqualTo(1);
         }
+    }
+
+    @Test
+    void aReopenedChainWithoutAProvenStartCannotResumeAtThePresent() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
+        String chain = MiningChainId.resolve(orders, "legacy-no-anchor").value();
+        meta.create(chain, null);
+        meta.openEpoch(chain);
+        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunSpec spec = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "legacy-no-anchor", true,
+                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
+
+        assertThatThrownBy(() -> runUnit(source, meta).start(spec, event -> { }))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        refused -> assertThat(refused.code()).isEqualTo(CaptureError.SHARED_POSITION_UNVERIFIED));
+        assertThat(source.cdcStarted).as("a present start would skip previously forwarded work").isFalse();
+    }
+
+    @Test
+    void aPhysicalTableExpansionClosesTheOldSubscriptionBeforeOpeningTheUnion() {
+        InMemoryMeta meta = new InMemoryMeta();
+        java.util.concurrent.atomic.AtomicInteger active = new java.util.concurrent.atomic.AtomicInteger();
+        List<List<String>> opened = new ArrayList<>();
+        CapturePort source = new CapturePort() {
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("this case opens only CDC subscriptions");
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                assertThat(active.incrementAndGet()).as("only one physical subscription may read this chain")
+                        .isEqualTo(1);
+                opened.add(config.streams());
+                listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
+                        ? resume.position() : new SourcePosition("safe-start")));
+                return active::decrementAndGet;
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
+        CaptureRunSpec spec = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "expand-live", true,
+                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
+        CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz);
+
+        CaptureRun first = unit.start(spec, event -> { });
+        String chain = first.chainId().orElseThrow().value();
+        long epoch = meta.read(chain).orElseThrow().epoch();
+        assertThat(meta.requestPhysicalTables(chain, epoch, List.of("customers"))).isTrue();
+        CaptureRun expanded = unit.reopenPhysicalTail(spec, first);
+        try {
+            assertThat(opened).containsExactly(List.of("orders"), List.of("customers", "orders"));
+            assertThat(active).hasValue(1);
+            assertThat(meta.read(chain).orElseThrow().epoch()).isEqualTo(epoch);
+            assertThat(meta.physicalSelection(chain)).contains(
+                    new SrsMetaStore.PhysicalSelection(epoch, 2L, List.of("customers", "orders")));
+            assertThat(meta.requestedPhysicalTables(chain)).isEmpty();
+            assertThat(meta.read(chain).orElseThrow().sourceReadOffset()).isEqualTo("safe-start");
+        } finally {
+            expanded.close();
+        }
+        assertThat(active).hasValue(0);
     }
 
     @Test
@@ -1290,6 +1366,7 @@ class CaptureRunUnitTest {
         private final Map<String, SrsMeta> records = new LinkedHashMap<>();
         private final java.util.Set<String> trustedPhysicalPrefixes = new java.util.HashSet<>();
         private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
+        private final Map<String, java.util.Set<String>> physicalRequests = new LinkedHashMap<>();
 
         @Override
         public Optional<PhysicalSelection> physicalSelection(String miningChainId) {
@@ -1298,7 +1375,8 @@ class CaptureRunUnitTest {
 
         @Override
         public boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
-            if (require(miningChainId).epoch() != selection.epoch()) {
+            if (require(miningChainId).epoch() != selection.epoch()
+                    || !selection.tables().containsAll(requestedPhysicalTables(miningChainId))) {
                 return false;
             }
             PhysicalSelection previous = physicalSelections.get(miningChainId);
@@ -1308,6 +1386,45 @@ class CaptureRunUnitTest {
             }
             physicalSelections.put(miningChainId, selection);
             return true;
+        }
+
+        @Override
+        public List<String> requestedPhysicalTables(String miningChainId) {
+            return physicalRequests.getOrDefault(miningChainId, java.util.Set.of()).stream().sorted().toList();
+        }
+
+        @Override
+        public boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+            if (require(miningChainId).epoch() != epoch) {
+                return false;
+            }
+            physicalRequests.computeIfAbsent(miningChainId, ignored -> new java.util.LinkedHashSet<>())
+                    .addAll(tables);
+            return true;
+        }
+
+        @Override
+        public boolean replacePhysicalSelection(
+                String miningChainId, PhysicalSelection expected, PhysicalSelection replacement) {
+            if (require(miningChainId).epoch() != expected.epoch()
+                    || !Objects.equals(physicalSelections.get(miningChainId), expected)
+                    || replacement.revision() != expected.revision() + 1L
+                    || !replacement.tables().containsAll(expected.tables())
+                    || !replacement.tables().containsAll(requestedPhysicalTables(miningChainId))) {
+                return false;
+            }
+            physicalSelections.put(miningChainId, replacement);
+            return true;
+        }
+
+        @Override
+        public void clearPhysicalRequests(String miningChainId, long epoch, List<String> tables) {
+            if (require(miningChainId).epoch() == epoch) {
+                java.util.Set<String> requested = physicalRequests.get(miningChainId);
+                if (requested != null) {
+                    requested.removeAll(tables);
+                }
+            }
         }
 
         @Override

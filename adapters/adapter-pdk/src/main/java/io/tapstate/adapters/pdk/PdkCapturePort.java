@@ -180,6 +180,11 @@ public final class PdkCapturePort implements CapturePort {
             connector.stopQuietly();
             joinQuietly(thread);
             connector.close();
+            if (thread.isAlive()) {
+                throw new TapstateException(ConnectorError.CAPTURE_FAILED,
+                        Map.of("connector", connector.connectorId(),
+                                "detail", "stream did not stop within " + SHUTDOWN_JOIN_MILLIS + "ms"), null);
+            }
         };
     }
 

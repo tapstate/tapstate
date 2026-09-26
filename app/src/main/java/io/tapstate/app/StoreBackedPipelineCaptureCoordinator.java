@@ -99,6 +99,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** Looks for captures pipelines here read and nobody tails; started with the first capture joined. */
     private ScheduledExecutorService takeovers;
 
+    /** One member-wide poll of durable expansion requests for captures this member owns. */
+    private volatile ScheduledExecutorService physicalReconfigurations;
+
     /** What each running pipeline's load read, keyed by pipeline; dropped when it stops. */
     private final Map<String, SnapshotReading> snapshotsByPipeline = new ConcurrentHashMap<>();
 
@@ -361,15 +364,21 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     private static final class OwnedCapture {
-        private final CaptureRun run;
+        private volatile CaptureRun run;
         private final CaptureOwnership.Permit permit;
         private final Set<String> pipelines = new LinkedHashSet<>();
+        private final CaptureRunSpec spec;
+        private final Consumer<Envelope> receive;
         private CaptureClaimLease lease;
+        private volatile Thread reconfiguring;
 
-        private OwnedCapture(CaptureRun run, CaptureOwnership.Permit permit, Collection<String> pipelines) {
+        private OwnedCapture(CaptureRun run, CaptureOwnership.Permit permit, Collection<String> pipelines,
+                CaptureRunSpec spec, Consumer<Envelope> receive) {
             this.run = run;
             this.permit = permit;
             this.pipelines.addAll(pipelines);
+            this.spec = spec;
+            this.receive = receive;
         }
     }
 
@@ -469,6 +478,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (takeovers != null) {
             takeovers.shutdownNow();
             takeovers = null;
+        }
+        if (physicalReconfigurations != null) {
+            physicalReconfigurations.shutdownNow();
+            physicalReconfigurations = null;
         }
     }
 

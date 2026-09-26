@@ -26,9 +26,13 @@ import java.util.Optional;
 public interface SrsMetaStore {
 
     /** The selected streams of the one physical CDC reader in this ring generation. */
-    record PhysicalSelection(long epoch, List<String> tables) {
+    record PhysicalSelection(long epoch, long revision, List<String> tables) {
+        public PhysicalSelection(long epoch, List<String> tables) {
+            this(epoch, 1L, tables);
+        }
+
         public PhysicalSelection {
-            if (epoch < 1 || tables == null || tables.isEmpty()) {
+            if (epoch < 1 || revision < 1 || tables == null || tables.isEmpty()) {
                 throw new IllegalArgumentException("physical capture selection needs a generation and tables");
             }
             if (tables.stream().anyMatch(table -> table == null || table.isBlank())) {
@@ -46,6 +50,27 @@ public interface SrsMetaStore {
     /** Publishes that union only while this chain still has the generation the owner opened. */
     default boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
         throw new UnsupportedOperationException("physical capture selection is unavailable");
+    }
+
+    /** Tables requested by attachments while the current physical subscription does not include them. */
+    default List<String> requestedPhysicalTables(String miningChainId) {
+        return List.of();
+    }
+
+    /** Persists an expansion request before a new attachment begins a snapshot or a Jet reader. */
+    default boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+        throw new UnsupportedOperationException("physical capture expansion requests are unavailable");
+    }
+
+    /** Publishes a later subscription in the same ring generation after the earlier one has closed. */
+    default boolean replacePhysicalSelection(
+            String miningChainId, PhysicalSelection expected, PhysicalSelection replacement) {
+        throw new UnsupportedOperationException("physical capture expansion is unavailable");
+    }
+
+    /** Removes requests satisfied by a published physical subscription without dropping newer requests. */
+    default void clearPhysicalRequests(String miningChainId, long epoch, List<String> tables) {
+        throw new UnsupportedOperationException("physical capture request cleanup is unavailable");
     }
 
     /** Returns the meta record for a mining chain, or empty if the chain has not been seeded. */

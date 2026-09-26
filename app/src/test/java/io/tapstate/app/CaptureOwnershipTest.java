@@ -30,6 +30,7 @@ import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.SrsMetaStore;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -179,6 +180,151 @@ class CaptureOwnershipTest {
                 .isEqualTo(new StoreBackedPipelineCaptures(store).captureIds("customers-reader"));
         coordinator.stopCapture("orders-reader", false);
         coordinator.stopCapture("customers-reader", false);
+    }
+
+    @Test
+    void aLocalLateTableClosesTheOldPhysicalTailBeforeItsUnionOpens() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("orders-reader", "orders-source.orders"));
+        artifacts.save(pipelineServing("customers-reader", "orders-source.customers"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        AtomicInteger active = new AtomicInteger();
+        List<List<String>> opened = new ArrayList<>();
+        SrsCoordinator chains = new SrsCoordinator(store.meta());
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership("cluster-a", new WorkloadOwner("node-a", "boot-a"),
+                gate, new ClusterWorkloadClaims(new MemoryClaims(), gate), TTL);
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, new PhysicalTailProbe(store, chains, active, opened), chains,
+                new SnapshotBuffer(), ownership, RENEW);
+        try {
+            coordinator.startCapture("orders-reader");
+            coordinator.startCapture("customers-reader");
+
+            assertThat(opened).containsExactly(List.of("orders"), List.of("customers", "orders"));
+            assertThat(active).hasValue(1);
+            assertThat(store.meta().physicalSelection(CHAIN)).contains(
+                    new SrsMetaStore.PhysicalSelection(1L, 2L, List.of("customers", "orders")));
+            assertThat(coordinator.isActive("customers-reader")).isTrue();
+            coordinator.stopCapture("orders-reader", false);
+            assertThat(active).as("the remaining pipeline still reads the shared tail").hasValue(1);
+            coordinator.stopCapture("customers-reader", false);
+            assertThat(active).hasValue(0);
+        } finally {
+            coordinator.close();
+        }
+    }
+
+    @Test
+    void aRemoteLateTableWaitsUntilTheOwnerPublishesTheUnion() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("orders-reader", "orders-source.orders"));
+        artifacts.save(pipelineServing("customers-reader", "orders-source.customers"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        MemoryClaims claims = new MemoryClaims();
+        AtomicInteger active = new AtomicInteger();
+        List<List<String>> opened = new ArrayList<>();
+        ClusterMembershipGate gate = eligibleGate();
+        SrsCoordinator ownerChains = new SrsCoordinator(store.meta());
+        SrsCoordinator joinerChains = new SrsCoordinator(store.meta());
+        StoreBackedPipelineCaptureCoordinator owner = new StoreBackedPipelineCaptureCoordinator(
+                store, new PhysicalTailProbe(store, ownerChains, active, opened), ownerChains,
+                new SnapshotBuffer(), new CaptureOwnership("cluster-a", new WorkloadOwner("node-a", "boot-a"),
+                        gate, new ClusterWorkloadClaims(claims, gate), TTL), RENEW);
+        StoreBackedPipelineCaptureCoordinator joiner = new StoreBackedPipelineCaptureCoordinator(
+                store, new PhysicalTailProbe(store, joinerChains, active, opened), joinerChains,
+                new SnapshotBuffer(), new CaptureOwnership("cluster-a", new WorkloadOwner("node-b", "boot-b"),
+                        gate, new ClusterWorkloadClaims(claims, gate), TTL), RENEW);
+        try {
+            owner.startCapture("orders-reader");
+            assertThatThrownBy(() -> joiner.startCapture("customers-reader"))
+                    .as("the new pipeline starts no reader before its table is in the physical subscription")
+                    .isInstanceOf(RingNotOpenYet.class);
+            assertThat(joiner.isActive("customers-reader")).isFalse();
+            assertThat(store.meta().requestedPhysicalTables(CHAIN)).containsExactly("customers");
+
+            owner.reconfigureRequestedCaptures();
+            joiner.startCapture("customers-reader");
+            assertThat(joiner.isActive("customers-reader")).isTrue();
+            assertThat(opened).containsExactly(List.of("orders"), List.of("customers", "orders"));
+            assertThat(active).hasValue(1);
+            assertThat(store.meta().requestedPhysicalTables(CHAIN)).isEmpty();
+        } finally {
+            joiner.stopCapture("customers-reader", false);
+            owner.stopCapture("orders-reader", false);
+            joiner.close();
+            owner.close();
+        }
+        assertThat(active).hasValue(0);
+    }
+
+    /** A physical CDC probe that exercises coordinator ordering without a Jet member or connector. */
+    private static final class PhysicalTailProbe implements CaptureAttacher {
+        private final InMemoryStorePort store;
+        private final SrsCoordinator chains;
+        private final AtomicInteger active;
+        private final List<List<String>> opened;
+
+        private PhysicalTailProbe(InMemoryStorePort store, SrsCoordinator chains,
+                AtomicInteger active, List<List<String>> opened) {
+            this.store = store;
+            this.chains = chains;
+            this.active = active;
+            this.opened = opened;
+        }
+
+        @Override
+        public CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> receive, boolean startTail) {
+            MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
+            if (startTail) {
+                chains.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention());
+            } else {
+                chains.joinSource(spec.sourceId(), chain, spec.config().streams());
+            }
+            chains.attachConsumer(chain, spec.pipelineId());
+            if (!startTail) {
+                return new CaptureRun(Optional.of(chain), true, 0L,
+                        Optional.empty(), Optional.empty(), new CaptureHealth());
+            }
+            long epoch = store.meta().read(chain.value()).orElseThrow().epoch();
+            if (!store.meta().publishPhysicalSelection(chain.value(),
+                    new SrsMetaStore.PhysicalSelection(epoch, spec.config().streams()))) {
+                throw new AssertionError("the first physical selection was not published");
+            }
+            return opened(chain, spec.config().streams(), new CaptureHealth());
+        }
+
+        @Override
+        public CaptureRun reopenPhysicalTail(CaptureRunSpec spec, CaptureRun previous) {
+            MiningChainId chain = previous.chainId().orElseThrow();
+            SrsMetaStore.PhysicalSelection current = store.meta().physicalSelection(chain.value()).orElseThrow();
+            List<String> requested = store.meta().requestedPhysicalTables(chain.value());
+            java.util.Set<String> union = new java.util.LinkedHashSet<>(current.tables());
+            union.addAll(requested);
+            List<String> tables = union.stream().sorted().toList();
+            previous.close();
+            if (!store.meta().replacePhysicalSelection(chain.value(), current,
+                    new SrsMetaStore.PhysicalSelection(current.epoch(), current.revision() + 1L, tables))) {
+                throw new AssertionError("the physical selection replacement was not published");
+            }
+            store.meta().clearPhysicalRequests(chain.value(), current.epoch(), tables);
+            return opened(chain, tables, previous.health());
+        }
+
+        private CaptureRun opened(MiningChainId chain, List<String> tables, CaptureHealth health) {
+            if (active.incrementAndGet() != 1) {
+                throw new AssertionError("two physical subscriptions opened for one mining chain");
+            }
+            opened.add(List.copyOf(tables));
+            java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+            return new CaptureRun(Optional.of(chain), false, 0L, Optional.empty(), Optional.of(() -> {
+                if (closed.compareAndSet(false, true)) {
+                    active.decrementAndGet();
+                }
+            }), health);
+        }
     }
 
     @Test

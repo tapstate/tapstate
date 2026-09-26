@@ -27,6 +27,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     private final Map<String, SrsMeta> records = new LinkedHashMap<>();
     private final Set<String> trustedPhysicalPrefixes = new LinkedHashSet<>();
     private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
+    private final Map<String, Set<String>> physicalRequests = new LinkedHashMap<>();
     /** Per chain, per pipeline: the ring sequence of the last change each table's sink confirmed. */
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
 
@@ -43,7 +44,8 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
         SrsMeta current = require(miningChainId);
-        if (current.epoch() != selection.epoch()) {
+        if (current.epoch() != selection.epoch()
+                || !selection.tables().containsAll(requestedPhysicalTables(miningChainId))) {
             return false;
         }
         PhysicalSelection previous = physicalSelections.get(miningChainId);
@@ -52,10 +54,50 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             return false;
         }
         physicalSelections.put(miningChainId, selection);
-        if (selection.tables().size() == 1 && current.sourceRead() == null) {
-            trustedPhysicalPrefixes.add(miningChainId);
-        }
         return true;
+    }
+
+    @Override
+    public synchronized List<String> requestedPhysicalTables(String miningChainId) {
+        return physicalRequests.getOrDefault(miningChainId, Set.of()).stream().sorted().toList();
+    }
+
+    @Override
+    public synchronized boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+        if (require(miningChainId).epoch() != epoch) {
+            return false;
+        }
+        physicalRequests.computeIfAbsent(miningChainId, ignored -> new LinkedHashSet<>()).addAll(tables);
+        return true;
+    }
+
+    @Override
+    public synchronized boolean replacePhysicalSelection(
+            String miningChainId, PhysicalSelection expected, PhysicalSelection replacement) {
+        if (require(miningChainId).epoch() != expected.epoch()
+                || !Objects.equals(physicalSelections.get(miningChainId), expected)
+                || replacement.epoch() != expected.epoch()
+                || replacement.revision() != expected.revision() + 1
+                || !replacement.tables().containsAll(expected.tables())
+                || !replacement.tables().containsAll(requestedPhysicalTables(miningChainId))) {
+            return false;
+        }
+        physicalSelections.put(miningChainId, replacement);
+        return true;
+    }
+
+    @Override
+    public synchronized void clearPhysicalRequests(String miningChainId, long epoch, List<String> tables) {
+        if (require(miningChainId).epoch() != epoch) {
+            return;
+        }
+        Set<String> requested = physicalRequests.get(miningChainId);
+        if (requested != null) {
+            requested.removeAll(tables);
+            if (requested.isEmpty()) {
+                physicalRequests.remove(miningChainId);
+            }
+        }
     }
 
     @Override
@@ -345,6 +387,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         records.remove(miningChainId);
         trustedPhysicalPrefixes.remove(miningChainId);
         physicalSelections.remove(miningChainId);
+        physicalRequests.remove(miningChainId);
         ringDone.remove(miningChainId);
     }
 

@@ -66,7 +66,8 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         this.epoch = epoch;
         SrsMeta stored = meta.read(chainId)
                 .orElseThrow(() -> new IllegalStateException("physical prefix has no chain: " + chainId));
-        if (stored.sourceRead() != null && !meta.physicalPrefixTrusted(chainId)) {
+        if (stored.epoch() != epoch || ((stored.sourceRead() != null || epoch > 1)
+                && !meta.physicalPrefixTrusted(chainId))) {
             throw new TapstateException(CaptureError.SHARED_POSITION_UNVERIFIED,
                     Map.of("chain", chainId), null);
         }

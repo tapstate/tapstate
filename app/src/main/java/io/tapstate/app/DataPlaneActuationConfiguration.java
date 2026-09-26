@@ -8,6 +8,9 @@ import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.runtime.srs.CaptureRun;
+import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.srs.SrsCoordinator;
@@ -184,13 +187,22 @@ class DataPlaneActuationConfiguration {
             StorePort storePort, CaptureRunUnit captureRunUnit, SrsCoordinator srsCoordinator,
             SnapshotBuffer snapshotBuffer, CaptureOwnership captureOwnership,
             ClusterProperties clusterProperties) {
-        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
-            return new StoreBackedPipelineCaptureCoordinator(
-                    storePort, captureRunUnit::start, srsCoordinator, snapshotBuffer);
-        }
+        CaptureAttacher attacher = new CaptureAttacher() {
+            @Override
+            public CaptureRun start(CaptureRunSpec spec, java.util.function.Consumer<Envelope> receive,
+                    boolean startTail) {
+                return captureRunUnit.start(spec, receive, startTail);
+            }
+
+            @Override
+            public CaptureRun reopenPhysicalTail(CaptureRunSpec spec, CaptureRun previous) {
+                return captureRunUnit.reopenPhysicalTail(spec, previous);
+            }
+        };
         return new StoreBackedPipelineCaptureCoordinator(
-                storePort, captureRunUnit::start, srsCoordinator, snapshotBuffer,
-                captureOwnership, clusterProperties.getWorkloadClaimRenewInterval());
+                storePort, attacher, srsCoordinator, snapshotBuffer, captureOwnership,
+                clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE
+                        ? Duration.ZERO : clusterProperties.getWorkloadClaimRenewInterval());
     }
 
     @Bean
