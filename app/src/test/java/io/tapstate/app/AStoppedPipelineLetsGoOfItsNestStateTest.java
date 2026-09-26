@@ -92,6 +92,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
     /** Where this pipeline's outstanding drop, and the record of where its runs keep state, are written. */
     private static final String TEARDOWN_NAMESPACE = "nest.teardown." + PIPELINE;
+    private static final String SNAPSHOT_COUNT_NAMESPACE = "snapshot.load.counts." + PIPELINE;
 
     /** A namespace belonging to some other pipeline, which no stop of this one may touch. */
     private static final String OTHER_PIPELINE_NAMESPACE = "nest.other_pipe.some_step.$root";
@@ -151,7 +152,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         // under a name no run afterwards looks at.
         assertThat(namespaces).containsExactlyInAnyOrder(ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE,
                 ROOT_NAMESPACE + ".parking", ITEMS_NAMESPACE + ".parking", SOURCE_CONNECTOR_NAMESPACE,
-                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE, SINK_PREPARATION_NAMESPACE);
+                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE,
+                SINK_PREPARATION_NAMESPACE, SNAPSHOT_COUNT_NAMESPACE);
     }
 
     @Test
@@ -180,7 +182,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.artifacts().save(pipelineWithoutNest());
 
         assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
-                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE, SINK_PREPARATION_NAMESPACE);
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE,
+                        SINK_PREPARATION_NAMESPACE, SNAPSHOT_COUNT_NAMESPACE);
     }
 
     @Test
@@ -189,7 +192,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.artifacts().save(pipelineWithView());
 
         assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
-                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE, VIEW_PREPARATION_NAMESPACE);
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE,
+                        VIEW_PREPARATION_NAMESPACE, SNAPSHOT_COUNT_NAMESPACE);
     }
 
     @Test

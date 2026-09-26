@@ -396,6 +396,7 @@ final class StoreBackedDagSource implements DagSource {
             holdings.add(PipelineStateInventory.OPERATOR_STATE.in(operatorNamespaces));
         }
         Set<String> driveNamespaces = new LinkedHashSet<>(connectorStateNamespaces(pipeline));
+        driveNamespaces.add(SnapshotLoadCounts.namespaceOf(pipelineId));
         if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
             // This is capture-side state kept for the next drive, just as a connector's own notes are.
             // Clearing that state clears the generation too; keeping it lets a reread outrank operator

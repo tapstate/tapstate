@@ -40,6 +40,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -105,9 +106,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * The tables each running pipeline's snapshot covers, per chain; dropped when it stops. Only the
      * durable record can say whether a load reached the target, and it answers per pipeline, per chain,
      * per table -- so what is kept here is the question rather than the answer: which tables to ask about
-     * and on which chain to ask. The map above cannot stand in for it. That one is keyed by table name
-     * alone, qualified on collision, and carries no chain; and it holds an entry for every selected table
-     * from the moment a run starts, so a set covering it is covered from the start.
+     * and on which chain to ask. The load above cannot stand in for it. Its published tables are keyed by
+     * table name, qualified on collision, and a table still being read has no entry yet.
      */
     private final Map<String, List<SnapshotOnChain>> snapshotTablesByPipeline = new ConcurrentHashMap<>();
 
@@ -241,7 +241,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     // is what would let the table be recorded as written short.
                     loadOver(pipelineId, plan, run, observedSnapshotCounts, load);
                 }
-                snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
+                snapshotOnChain(plan.sourceId(), spec, run).ifPresent(snapshotTables::add);
             }
         } catch (RuntimeException | Error failure) {
             // A start that fell over releases what it took and nothing else. It is an abandoned attempt,
@@ -277,12 +277,25 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         List<String> streams = spec.config().streams();
         Map<String, Long> counts = run.snapshotCounts().isEmpty() ? observedSnapshotCounts : run.snapshotCounts();
         for (String table : streams) {
-            snapshotBuffer.endSnapshot(pipelineId, plan.resolution().ringName(table));
             long count = streams.size() == 1
                     ? counts.getOrDefault(table, run.snapshotCount())
                     : counts.getOrDefault(table, 0L);
+            saveLoadCountIfOwed(spec, run.chainId().map(MiningChainId::value), table, count);
+            snapshotBuffer.endSnapshot(pipelineId, plan.resolution().ringName(table));
             load.loaded(plan.sourceId(), table, count, estimatedRows(plan.discovered(), table));
         }
+    }
+
+    /** Keep each measured load until its target confirms it, including across a replacement run. */
+    private void saveLoadCountIfOwed(CaptureRunSpec spec, Optional<String> chainId, String table, long count) {
+        chainId.ifPresent(chain -> {
+            boolean completed = storePort.meta().read(chain)
+                    .map(record -> record.snapshotCompletedTables(spec.pipelineId()).contains(table))
+                    .orElse(false);
+            if (!completed) {
+                SnapshotLoadCounts.save(storePort.keyedState(), spec.pipelineId(), chain, table, count);
+            }
+        });
     }
 
     /** One source of a start as it was settled before anything was opened: what to open and for what. */
@@ -581,7 +594,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /** One source run's snapshot: its completion chain, if any, and the tables it covers. */
-    private record SnapshotOnChain(Optional<String> chainId, List<String> tables) {
+    private record SnapshotOnChain(String sourceId, Optional<String> chainId, List<String> tables) {
     }
 
     /**
@@ -592,11 +605,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * for it. Keep its tables with an absent chain so they remain owed: without delivery evidence, a
      * resume must re-read the load rather than restart a vertex over an empty snapshot hand-off.
      */
-    private static Optional<SnapshotOnChain> snapshotOnChain(CaptureRunSpec spec, CaptureRun run) {
+    private static Optional<SnapshotOnChain> snapshotOnChain(String sourceId, CaptureRunSpec spec, CaptureRun run) {
         if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
             return Optional.empty();
         }
-        return Optional.of(new SnapshotOnChain(run.chainId().map(MiningChainId::value), spec.config().streams()));
+        return Optional.of(new SnapshotOnChain(
+                sourceId, run.chainId().map(MiningChainId::value), spec.config().streams()));
     }
 
     /**
@@ -621,20 +635,28 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
         private final Instant began;
         private final Map<CoveredTable, String> keys;
+        private final Map<CoveredTable, Long> estimates;
         private final Map<String, TableSnapshot> through = new ConcurrentHashMap<>();
 
-        private PipelineLoad(Instant began, Map<CoveredTable, String> keys) {
+        private PipelineLoad(Instant began, Map<CoveredTable, String> keys, Map<CoveredTable, Long> estimates) {
             this.began = began;
             this.keys = keys;
+            this.estimates = estimates;
         }
 
         /** The load of every source among {@code plans} that reads one; a cdc-only source covers nothing. */
         static PipelineLoad of(List<SourcePlan> plans, Instant began) {
             List<CoveredTable> covered = new ArrayList<>();
+            Map<CoveredTable, Long> estimates = new LinkedHashMap<>();
             for (SourcePlan plan : plans) {
                 if (CapturePlan.forReadMode(plan.spec().readMode()).snapshot()) {
                     for (String table : plan.spec().config().streams()) {
-                        covered.add(new CoveredTable(plan.sourceId(), table));
+                        CoveredTable entry = new CoveredTable(plan.sourceId(), table);
+                        covered.add(entry);
+                        Long total = StoreBackedPipelineCaptureCoordinator.estimatedRows(plan.discovered(), table);
+                        if (total != null) {
+                            estimates.put(entry, total);
+                        }
                     }
                 }
             }
@@ -645,7 +667,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 keys.put(entry, occurrences.get(entry.table()) > 1
                         ? entry.sourceId() + "." + entry.table() : entry.table());
             }
-            return new PipelineLoad(began, Map.copyOf(keys));
+            return new PipelineLoad(began, Map.copyOf(keys), Map.copyOf(estimates));
         }
 
         /** {@code table} of {@code sourceId} is through, having read {@code rows} out of about {@code total}. */
@@ -663,6 +685,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
          */
         SnapshotReading reading() {
             return through.isEmpty() ? SnapshotReading.NONE : new SnapshotReading(Map.copyOf(through), began);
+        }
+
+        Long estimatedRows(String sourceId, String table) {
+            return estimates.get(new CoveredTable(sourceId, table));
+        }
+
+        String keyOf(String sourceId, String table) {
+            return keys.get(new CoveredTable(sourceId, table));
         }
     }
 
@@ -714,6 +744,54 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public SnapshotReading snapshotProgress(String pipelineId) {
+        PipelineLoad load = loadsByPipeline.get(pipelineId);
+        if (load == null) {
+            return SnapshotReading.NONE;
+        }
+        // A table this run skipped may not have been published by its hand-off yet, because another
+        // table is still being read. Its sink's durable completion mark already answers for it. The
+        // measured count was saved before that sink could confirm the load; discovery's estimate is the
+        // fallback for an older completed record without one.
+        SnapshotReading current = load.reading();
+        List<SnapshotOnChain> covered = snapshotTablesByPipeline.getOrDefault(pipelineId, List.of());
+        if (covered.isEmpty()) {
+            return current;
+        }
+        Map<String, TableSnapshot> completed = new LinkedHashMap<>(current.byTable());
+        boolean changed = false;
+        for (SnapshotOnChain source : covered) {
+            if (source.chainId().isEmpty()) {
+                continue;
+            }
+            List<String> confirmed = storePort.meta().read(source.chainId().orElseThrow())
+                    .map(record -> record.snapshotCompletedTables(pipelineId)).orElse(List.of());
+            for (String table : source.tables()) {
+                if (!confirmed.contains(table)) {
+                    continue;
+                }
+                String key = load.keyOf(source.sourceId(), table);
+                if (key == null) {
+                    continue;
+                }
+                TableSnapshot reading = completed.get(key);
+                OptionalLong saved = SnapshotLoadCounts.read(storePort.keyedState(), pipelineId,
+                        source.chainId().orElseThrow(), table);
+                Long rows = saved.isPresent() ? saved.getAsLong()
+                        : reading != null && reading.rowsDone() > 0L ? reading.rowsDone()
+                        : reading != null && reading.rowsTotal() != null ? reading.rowsTotal()
+                        : load.estimatedRows(source.sourceId(), table);
+                if (rows == null) {
+                    continue;
+                }
+                completed.put(key, new TableSnapshot(rows, rows, 100));
+                changed = true;
+            }
+        }
+        return changed ? new SnapshotReading(completed, load.began) : current;
+    }
+
+    @Override
+    public SnapshotReading runSnapshotProgress(String pipelineId) {
         PipelineLoad load = loadsByPipeline.get(pipelineId);
         return load == null ? SnapshotReading.NONE : load.reading();
     }
@@ -914,6 +992,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             for (String chainId : storePort.meta().miningChainIdsWithConsumer(pipelineId)) {
                 firstFailure = purgeWhatTheRecordStillHolds(chainId, pipelineId, firstFailure);
             }
+            firstFailure = runCleanup(
+                    () -> storePort.keyedState().dropNamespace(SnapshotLoadCounts.namespaceOf(pipelineId)),
+                    firstFailure);
         }
         return firstFailure;
     }
@@ -1127,6 +1208,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             String pipelineId, SourcePlan plan, Map<String, Long> observedSnapshotCounts, PipelineLoad load) {
         SourceCaptureResolution resolution = plan.resolution();
         Set<String> selectedTables = Set.copyOf(resolution.tables());
+        CaptureRunSpec spec = plan.spec();
+        CapturePlan phases = CapturePlan.forReadMode(spec.readMode());
+        Optional<String> chainId = phases.snapshot() && phases.cdc()
+                ? Optional.of(MiningChainId.resolve(spec.config(), spec.srsKey()).value()) : Optional.empty();
         return new CaptureHandoff() {
             @Override
             public void accept(Envelope event) {
@@ -1140,6 +1225,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
             @Override
             public void loaded(String table) {
+                saveLoadCountIfOwed(spec, chainId, table, observedSnapshotCounts.getOrDefault(table, 0L));
                 snapshotBuffer.endSnapshot(pipelineId, resolution.ringName(table));
                 load.loaded(plan.sourceId(), table, observedSnapshotCounts.getOrDefault(table, 0L),
                         estimatedRows(plan.discovered(), table));
