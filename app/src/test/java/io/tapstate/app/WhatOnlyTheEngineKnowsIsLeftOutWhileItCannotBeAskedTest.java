@@ -1,6 +1,10 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
@@ -56,6 +60,21 @@ class WhatOnlyTheEngineKnowsIsLeftOutWhileItCannotBeAskedTest {
         member.shutdown();
 
         assertThat(ClusterMembershipGate.dataMembersIfReadable(member)).as("not known here while it is down").isEmpty();
+    }
+
+    /**
+     * Only the engine going away is let off. Anything else coming out of it is a defect, and a defect read as "not
+     * known here" is one nobody goes looking for.
+     */
+    @Test
+    void aFaultThatIsNotTheEngineGoingAwayStillFailsTheRead() {
+        HazelcastInstance broken = mock(HazelcastInstance.class);
+        IllegalStateException defect = new IllegalStateException("a defect, not the engine going away");
+        when(broken.getMap(anyString())).thenThrow(defect);
+        when(broken.getCluster()).thenThrow(defect);
+
+        assertThatThrownBy(() -> new HazelcastExecutionPlans(broken).current(List.of("p"))).isSameAs(defect);
+        assertThatThrownBy(() -> ClusterMembershipGate.dataMembersIfReadable(broken)).isSameAs(defect);
     }
 
     private static ExecutionPlan plan(String pipelineId) {

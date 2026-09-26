@@ -49,6 +49,10 @@ class EveryChangeOfARowIsRoutedByTheRowItChangesTest {
                 .as("the same id in another region is another row")
                 .isNotEqualTo(RoutingKeys.keyOf("step", keys,
                         Envelope.insert(1L, "orders", row("us", 7, "new"), null)));
+        assertThat(RoutingKeys.keyOf("step", keys, Envelope.insert(1L, "orders", row("eu", 7, "new"), null)))
+                .as("and another id in the same region is another row too: every column of the key counts")
+                .isNotEqualTo(RoutingKeys.keyOf("step", keys,
+                        Envelope.insert(1L, "orders", row("eu", 8, "new"), null)));
         Map<String, Object> runTogether = new LinkedHashMap<>(Map.of("region", "e", "id", "u7"));
         Map<String, Object> apart = new LinkedHashMap<>(Map.of("region", "eu", "id", "7"));
         assertThat(RoutingKeys.keyOf("step", keys, Envelope.insert(1L, "orders", runTogether, null)))

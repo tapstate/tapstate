@@ -144,8 +144,21 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
 
     @Test
     void aStepRunningOnceForTheClusterOverBothTablesStillLetsEveryWriterHearThem() throws InterruptedException {
+        runThroughOneMerge(new TransformBody.Js("row"));
+
+        assertThat(PORTS.get()).as("the step ran one processor for the cluster, the other member a stand-in")
+                .isEqualTo(1);
+    }
+
+    @Test
+    void aUnionRunningOnceForTheClusterOverBothTablesStillLetsEveryWriterHearThem() throws InterruptedException {
+        runThroughOneMerge(new TransformBody.Union());
+    }
+
+    /** Runs both tables through one {@code body} running once for the cluster, and holds every writer to both. */
+    private void runThroughOneMerge(TransformBody body) throws InterruptedException {
         Job job = first.getJet().newJob(PipelineDagBuilder.build(
-                pipelineThroughOneMerge(), bindings(), new RecordingAcks(), FRONTIER, shapeWithTheMergeOnce()));
+                pipelineThroughOneMerge(body), bindings(), new RecordingAcks(), FRONTIER, shapeWithTheMergeOnce()));
         try {
             long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
             while (!(everyWriterReportedBothTables() && everyUpdateWritten()) && System.nanoTime() < deadline) {
@@ -155,10 +168,8 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
             job.cancel();
         }
 
-        assertThat(everyUpdateWritten()).as("every change reached a writer through the step's one processor")
+        assertThat(everyUpdateWritten()).as("every change reached a writer through the merge's one processor")
                 .isTrue();
-        assertThat(PORTS.get()).as("the step ran one processor for the cluster, the other member a stand-in")
-                .isEqualTo(1);
         for (int index = 0; index < WRITERS; index++) {
             assertThat(REPORTED.getOrDefault("serve.s#" + index, Set.of()))
                     .as("the tables writer serve.s#%d reported progress on", index)
@@ -212,11 +223,11 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
     }
 
     /** Both tables through one step, which runs a single processor for the whole cluster, into the sink. */
-    private static PipelineResource pipelineThroughOneMerge() {
+    private static PipelineResource pipelineThroughOneMerge(TransformBody body) {
         return new PipelineResource("p", null,
                 List.of(SourceRef.bare("orders"), SourceRef.bare("logs")),
                 List.of(Step.inline("merge", FromClause.list(FromRef.literal("orders"), FromRef.literal("logs")),
-                        new TransformBody.Js("row"), null)),
+                        body, null)),
                 null,
                 new ServeBlock.Inline(null, new FromClause.Flow(List.of(FromRef.literal("merge"))),
                         List.of(new SyncElement("s", "dest", null, null, null)), null, null),

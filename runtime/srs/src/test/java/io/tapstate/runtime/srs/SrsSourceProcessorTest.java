@@ -457,6 +457,25 @@ class SrsSourceProcessorTest {
     }
 
     /**
+     * A source placed on a member the cluster running its job does not have is refused as the job starts, rather than
+     * started nowhere.
+     *
+     * <p>The one instance runs only on the member its placement names, so on a cluster without that member it runs on
+     * none: the job would run with its source reading nothing and nothing thrown. The engine's own pinning refuses such
+     * a job as it starts, and a placement carried in a form of its own has to hand that check on too.
+     */
+    @Test
+    void a_source_placed_on_a_member_the_cluster_does_not_have_is_refused_as_its_job_starts() {
+        SourcePlacement placement = SourcePlacement.on(Address.createUnresolvedAddress("10.9.9.9", 5799));
+        ProcessorMetaSupplier meta = SrsSourceProcessor.metaSupplier(PIPELINE, "srs.chain.absent", "orders",
+                StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE, placement);
+
+        assertThatThrownBy(() -> meta.init(new TestProcessorMetaSupplierContext()
+                        .setHazelcastInstance(hz).setTotalParallelism(1).setLocalParallelism(1)))
+                .hasMessageContaining("does not contain the required member");
+    }
+
+    /**
      * The one instance runs on the member its placement names, and on no other, for both shapes of source.
      *
      * <p>A source drains a hand-off the capture fills on the member that started it, so an instance anywhere
