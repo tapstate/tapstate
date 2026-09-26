@@ -247,6 +247,7 @@ final class TelemetryDispatcher implements AutoCloseable {
     private final Stats exportStats = new Stats();
     private final Stats eventStats = new Stats();
     private final ConcurrentHashMap<String, LatestSlot> latestByPipeline = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ObservationStore.Scope> offeredScopes = new ConcurrentHashMap<>();
     private final Object eventGapLock = new Object();
     private final LinkedHashMap<EventKey, OpenGap> eventGaps = new LinkedHashMap<>();
     private final LinkedHashMap<EventKey, PipelineEvent> pendingRestorations = new LinkedHashMap<>();
@@ -562,6 +563,22 @@ final class TelemetryDispatcher implements AutoCloseable {
                 .filter(scope::equals).isEmpty())) {
             return;
         }
+        if (scope != null && scopes != null) {
+            String pipelineId = prepared.observation().pipelineId();
+            ObservationStore.Scope prior = offeredScopes.put(pipelineId, scope);
+            if ((prior == null || !prior.equals(scope)) && !scopes.continuing(pipelineId, scope)) {
+                try {
+                    export.forgetPipeline(pipelineId);
+                } catch (RuntimeException failed) {
+                    if (prior == null) {
+                        offeredScopes.remove(pipelineId, scope);
+                    } else {
+                        offeredScopes.replace(pipelineId, scope, prior);
+                    }
+                    LOG.warn("Could not release old export series for pipeline {}", pipelineId, failed);
+                }
+            }
+        }
         ObservationPublisher.Prepared frame = scopes == null ? prepared : scopes.continueFrame(prepared, scope);
         Observation observation = frame.observation();
         offerLatest(observation.pipelineId(), new ObservationFrame(frame, scope));
@@ -683,6 +700,7 @@ final class TelemetryDispatcher implements AutoCloseable {
     }
 
     void retain(Collection<String> pipelineIds) {
+        offeredScopes.keySet().retainAll(pipelineIds);
         for (String id : latestByPipeline.keySet()) {
             if (!pipelineIds.contains(id)) {
                 LatestSlot slot = latestByPipeline.get(id);

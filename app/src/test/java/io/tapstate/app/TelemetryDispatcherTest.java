@@ -30,6 +30,82 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TelemetryDispatcherTest {
 
     @Test
+    void freshExecutionsForgetOnlyTheirOldExportSeriesWhileRebuildingResumeKeepsItsNames()
+            throws Exception {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        List<String> actions = java.util.Collections.synchronizedList(new ArrayList<>());
+        MetricsExport export = new MetricsExport() {
+            @Override public void offer(String id, PipelineState state, Instant at, List<MetricFact> facts) {
+                actions.add("offer");
+            }
+            @Override public void forgetPipeline(String id) { actions.add("forget"); }
+            @Override public void forgetPipelinesOutside(java.util.Collection<String> ids) { }
+        };
+        ObservationStore store = new ObservationStore() {
+            @Override public void save(Observation observation) { }
+            @Override public boolean saveScoped(Observation observation, Scope scope) { return true; }
+            @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+            @Override public void delete(String id) { }
+        };
+        try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), store), null,
+                export, scopes, 1, 2)) {
+            ObservationStore.Scope first = scopes.begin("orders", "inc-a", 1);
+            dispatcher.offer(frame(1), first);
+            await(() -> actions.stream().filter("offer"::equals).count() == 1);
+            ObservationStore.Scope restarted = scopes.begin("orders", "inc-a", 2);
+            dispatcher.offer(frame(2), restarted);
+            await(() -> actions.stream().filter("offer"::equals).count() == 2);
+            scopes.prepareRebuildingResume("orders", Optional.empty());
+            ObservationStore.Scope continued = scopes.begin("orders", "inc-a", 3);
+            dispatcher.offer(frame(3), continued);
+            await(() -> actions.stream().filter("offer"::equals).count() == 3);
+            ObservationStore.Scope recreated = scopes.begin("orders", "inc-b", 4);
+            dispatcher.offer(frame(4), recreated);
+            await(() -> actions.stream().filter("offer"::equals).count() == 4);
+
+            assertThat(actions).containsExactly("forget", "offer", "forget", "offer", "offer",
+                    "forget", "offer");
+        }
+    }
+
+    @Test
+    void aFailedLocalExportResetNeverStopsLatestAndIsRetried() throws Exception {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        AtomicInteger resets = new AtomicInteger();
+        AtomicInteger writes = new AtomicInteger();
+        MetricsExport export = new MetricsExport() {
+            @Override public void offer(String id, PipelineState state, Instant at, List<MetricFact> facts) { }
+            @Override public void forgetPipeline(String id) {
+                if (resets.incrementAndGet() == 1) {
+                    throw new IllegalStateException("exporter unavailable");
+                }
+            }
+            @Override public void forgetPipelinesOutside(java.util.Collection<String> ids) { }
+        };
+        ObservationStore store = new ObservationStore() {
+            @Override public void save(Observation observation) { }
+            @Override public boolean saveScoped(Observation observation, Scope scope) {
+                writes.incrementAndGet();
+                return true;
+            }
+            @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+            @Override public void delete(String id) { }
+        };
+        try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), store), null, export, scopes, 1, 2)) {
+            ObservationStore.Scope scope = scopes.begin("orders", "inc-a", 1);
+            dispatcher.offer(frame(1), scope);
+            dispatcher.offer(frame(2), scope);
+            await(() -> writes.get() > 0);
+
+            assertThat(resets).hasValue(2);
+            assertThat(writes.get()).isPositive();
+        }
+    }
+
+
+    @Test
     void anUnwiredEventSinkDoesNotTurnAStateTransitionIntoAConvergenceFailure() {
         try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
                 new ObservationPublisher(new InMemoryStateStore(), new InMemoryObservationStore()),

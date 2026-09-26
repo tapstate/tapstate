@@ -54,6 +54,17 @@ final class ObservationScopeRegistry {
         return entry == null ? Optional.empty() : Optional.ofNullable(entry.current);
     }
 
+    /** Whether this execution is carrying a bounded cumulative baseline from its predecessor. */
+    boolean continuing(String pipelineId, ObservationStore.Scope scope) {
+        Entry entry = entries.get(pipelineId);
+        if (entry == null) {
+            return false;
+        }
+        synchronized (entry) {
+            return scope.equals(entry.current) && entry.active != null;
+        }
+    }
+
     boolean needsStoredFallback(String pipelineId) {
         Entry entry = entries.get(pipelineId);
         if (entry == null) {
