@@ -64,6 +64,7 @@ public final class OtelMetricsExport implements MetricsExport {
                             + "or offer through MetricsExport.none()");
         }
         FactsMetricProducer producer = new FactsMetricProducer(Instant.now());
+        producer.observeProcess("jdk-resources", new JdkProcessFacts()::snapshot);
         SdkMeterProviderBuilder builder = SdkMeterProvider.builder()
                 .setResource(Resource.getDefault().merge(Resource.create(
                         Attributes.of(AttributeKey.stringKey("service.name"), SERVICE_NAME))))
