@@ -12,7 +12,10 @@ import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -117,6 +120,44 @@ class PipelineConvergerTest {
         assertThat(state.swapAttempts()).isEqualTo(2); // one fenced, one applied
         // The rebased write it won was PAUSED -> RUNNING, so the actuation it drove is a resume.
         assertThat(actuator.calls()).containsExactly("resume:p1");
+    }
+
+    @Test
+    void aFencedPreparedStartReleasesItsAdmissionBeforeRetrying() {
+        state.create("p1", StateJson.of(NEW), T0);
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        AtomicBoolean competitorMoved = new AtomicBoolean();
+        state.onBeforeSwap(() -> {
+            if (competitorMoved.compareAndSet(false, true)) {
+                state.applySwap("p1", 0L, StateJson.of(STOPPED), T0);
+            }
+        });
+        List<String> steps = new ArrayList<>();
+        LifecycleActuator preparing = new LifecycleActuator() {
+            @Override public PreparedStart prepareStart(String pipelineId) {
+                steps.add("prepare");
+                return new PreparedStart() {
+                    private boolean submitted;
+                    @Override public void submit() { submitted = true; steps.add("submit"); }
+                    @Override public void close() {
+                        steps.add(submitted ? "close-submitted" : "abandon");
+                    }
+                };
+            }
+            @Override public void start(String pipelineId) { throw new AssertionError("unprepared start"); }
+            @Override public void pause(String pipelineId) { }
+            @Override public void resume(String pipelineId) { }
+            @Override public void stop(String pipelineId, boolean purgeState) { }
+            @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String pipelineId) { return true; }
+        };
+
+        ConvergeResult result = new PipelineConverger(desired, state, preparing,
+                Clock.fixed(T0, ZoneOffset.UTC)).converge("p1");
+
+        assertThat(result.status()).isEqualTo(CONVERGED);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+        assertThat(steps).containsExactly("prepare", "abandon", "prepare", "submit", "close-submitted");
     }
 
     @Test

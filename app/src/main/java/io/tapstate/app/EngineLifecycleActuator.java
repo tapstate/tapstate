@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.control.core.PipelineIncarnationService;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.StartDeferred;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.runtime.srs.SnapshotCapacityUnavailable;
 import io.tapstate.runtime.srs.PhysicalRingNotReady;
@@ -74,31 +75,40 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void start(String pipelineId) {
-        // Submitting by name is idempotent, but preparing another execution before that check would move
-        // its fence while the existing Jet job and capture still use the previous one.
-        if (engine.hasLiveJob(pipelineId)) {
-            return;
+        try (PreparedStart prepared = prepareStart(pipelineId)) {
+            prepared.submit();
+        } catch (StartDeferred waiting) {
+            // Direct callers retain the existing retry behavior. Convergence uses prepareStart itself
+            // so a deferred start never advances the actual checkpoint to RUNNING.
         }
-        // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
-        // prerequisite must leave no data-plane component running and no start-side state mutation behind.
+    }
+
+    @Override
+    public PreparedStart prepareStart(String pipelineId) {
+        // Submitting by name is idempotent, but preparing another execution before this check would
+        // move its fence while the existing Jet job and capture still use the previous one.
+        if (engine.hasLiveJob(pipelineId)) {
+            return new PreparedStart() {
+                @Override public void submit() { }
+                @Override public void close() { }
+            };
+        }
+        // Validation precedes teardown, capture, and submission. An unmet source prerequisite leaves
+        // no data-plane component running and no start-side state mutation behind.
         DagSource.StartPreparation prepared = dagSource.prepareStart(
                 pipelineId, stateTeardown.defaultDatabase());
         String incarnation = incarnations == null ? null : incarnations.ensureCurrent(pipelineId)
                 .orElseThrow(() -> new IllegalStateException("validated pipeline lost its artifact before start"));
-        // The run's own generation, taken before the first side effect for the same reason: a run this
-        // member cannot fence is one nothing could later stop from writing, so it must not be half built.
-        // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any
-        // more (or cannot prove it is), and the member that is will put a run behind it.
         PipelineActuationOwnership.Execution execution = actuation.beginExecution(pipelineId);
         if (!execution.allowed()) {
             LOG.warn("Not starting pipeline {} on this member: its run could not be fenced to a new "
                     + "execution generation", pipelineId);
-            return;
+            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
         ObservationStore.Scope observationScope = observationScopes == null ? null
                 : observationScopes.begin(pipelineId, incarnation, execution.fence().executionGeneration());
         try {
-            startPrepared(pipelineId, prepared, execution, observationScope);
+            return startPrepared(pipelineId, prepared, execution, observationScope);
         } catch (RuntimeException | Error failed) {
             if (observationScope != null) {
                 observationScopes.discard(pipelineId, observationScope);
@@ -107,16 +117,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         }
     }
 
-    private void startPrepared(String pipelineId, DagSource.StartPreparation prepared,
+    private PreparedStart startPrepared(String pipelineId, DagSource.StartPreparation prepared,
             PipelineActuationOwnership.Execution execution, ObservationStore.Scope observationScope) {
         if (captureCoordinator.hasActiveCapture(pipelineId)) {
             // A prior job can die while its source capture remains open. Close that run before opening
             // another so its reader cursor is not reused by a new job that resumes from an earlier sink ACK.
             captureCoordinator.stopCapture(pipelineId, false);
         }
-        // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
-        // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
-        // what leaves a run that died without a stop with its state - and so with a shape to be held to.
         stateTeardown.finishPending(pipelineId);
         DagSource.NestCapacity capacity = prepared.capacity();
         engine.configureNestState(capacity.mapDatabases(), capacity.settings());
@@ -124,58 +131,27 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             LOG.info("Nest state placement resolved before pipeline '{}' starts: {}",
                     pipelineId, capacity.mapDatabases());
         }
-        // Where this run keeps state, said before anything can write any: the pipeline is only certainly
-        // the one this run is built from now. The locations and DAG came from the same immutable artifact
-        // snapshot, so an apply cannot move one without the others. Said after the drop above, which is the
-        // one thing entitled to clear what earlier runs said.
         stateTeardown.willKeepStateAt(pipelineId, prepared.stateLocations());
         try {
             prepared.artifactSnapshot().ifPresentOrElse(
                     snapshot -> captureCoordinator.startCapture(
                             pipelineId, snapshot, prepared.cursorWriterToken()),
                     () -> captureCoordinator.startCapture(pipelineId));
-        } catch (RingNotOpenYet | SnapshotCapacityUnavailable | PhysicalRingNotReady notYet) {
-            // Nothing was submitted: the physical ring or its generation boundary is not ready, or the
-            // bounded snapshot pool has no slot. A later pass retries without a data-plane failure.
-            if (observationScope != null) {
-                observationScopes.discard(pipelineId, observationScope);
-            }
-            return;
+        } catch (SnapshotCapacityUnavailable unavailable) {
+            throw new StartDeferred(StartDeferred.Reason.CAPACITY);
+        } catch (RingNotOpenYet | PhysicalRingNotReady notYet) {
+            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
         if (Thread.currentThread().isInterrupted()) {
-            // A newer stop or delete cancelled this start while capture was opening. Delete can remove
-            // the desired row before another stop task is queued, so this worker closes its own capture.
             closeCaptureAfterCancellation(pipelineId);
-            if (observationScope != null) {
-                observationScopes.discard(pipelineId, observationScope);
-            }
-            return;
+            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
-        // Capture opens the SRS generation that source vertices compile into the DAG. Build only now, but
-        // from the same frozen artifacts used above; placement and teardown were already fixed, so any
-        // shape record this writes remains named even if construction refuses the start.
-        DagSource.StartPlan plan = prepared.build(execution.fence());
-        if (Thread.currentThread().isInterrupted()) {
-            closeCaptureAfterCancellation(pipelineId);
-            if (observationScope != null) {
-                observationScopes.discard(pipelineId, observationScope);
-            }
-            return;
-        }
-        // The capacity travels with the submission because the maps are made by the job: what a state map
-        // holds is fixed as it is created, so a number applied after the job started would be accepted and
-        // change nothing.
+        // Capture opens the SRS generation that source vertices compile into the DAG. Build from the
+        // same frozen artifacts after provisioning, but submit only when the checkpoint CAS succeeds.
+        DagSource.StartPlan plan;
         try {
-            engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
-            captureCoordinator.activateSnapshot(pipelineId);
+            plan = prepared.build(execution.fence());
         } catch (RuntimeException | Error failure) {
-            // A submitted job or reserved snapshot may already exist. Give both back before another
-            // convergence pass retries, so a failed activation cannot leave a producer with no consumer.
-            try {
-                engine.cancel(pipelineId);
-            } catch (RuntimeException cleanup) {
-                failure.addSuppressed(cleanup);
-            }
             try {
                 captureCoordinator.stopCapture(pipelineId, false);
             } catch (RuntimeException cleanup) {
@@ -183,6 +159,60 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             }
             throw failure;
         }
+        if (Thread.currentThread().isInterrupted()) {
+            closeCaptureAfterCancellation(pipelineId);
+            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
+        }
+        return new PreparedStart() {
+            private boolean submitted;
+            private boolean closed;
+
+            @Override
+            public void submit() {
+                if (closed || submitted) {
+                    throw new IllegalStateException("prepared pipeline start was closed or already submitted");
+                }
+                submitted = true;
+                try {
+                    engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+                    captureCoordinator.activateSnapshot(pipelineId);
+                } catch (RuntimeException | Error failure) {
+                    // A submitted job or reserved snapshot may already exist. Give both back before
+                    // another convergence pass retries.
+                    try {
+                        engine.cancel(pipelineId);
+                    } catch (RuntimeException cleanup) {
+                        failure.addSuppressed(cleanup);
+                    }
+                    try {
+                        captureCoordinator.stopCapture(pipelineId, false);
+                    } catch (RuntimeException cleanup) {
+                        failure.addSuppressed(cleanup);
+                    }
+                    if (observationScope != null) {
+                        observationScopes.discard(pipelineId, observationScope);
+                    }
+                    throw failure;
+                }
+            }
+
+            @Override
+            public void close() {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                if (!submitted) {
+                    try {
+                        captureCoordinator.stopCapture(pipelineId, false);
+                    } finally {
+                        if (observationScope != null) {
+                            observationScopes.discard(pipelineId, observationScope);
+                        }
+                    }
+                }
+            }
+        };
     }
 
     private void closeCaptureAfterCancellation(String pipelineId) {

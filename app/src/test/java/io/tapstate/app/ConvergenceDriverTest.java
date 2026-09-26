@@ -12,6 +12,7 @@ import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.scheduler.RateSampler;
+import io.tapstate.runtime.scheduler.StartDeferred;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
@@ -42,6 +43,41 @@ import static org.assertj.core.api.Assertions.entry;
  * rest of the pass.
  */
 class ConvergenceDriverTest {
+
+    @Test
+    void aDeferredSnapshotStartKeepsItsCapacityReasonUntilAdmissionSucceeds() {
+        AtomicBoolean hasSlot = new AtomicBoolean(false);
+        LifecycleActuator actuator = new LifecycleActuator() {
+            @Override public PreparedStart prepareStart(String pipelineId) {
+                if (!hasSlot.get()) {
+                    throw new StartDeferred(StartDeferred.Reason.CAPACITY);
+                }
+                return LifecycleActuator.super.prepareStart(pipelineId);
+            }
+            @Override public void start(String pipelineId) { }
+            @Override public void pause(String pipelineId) { }
+            @Override public void resume(String pipelineId) { }
+            @Override public void stop(String pipelineId, boolean purgeState) { }
+            @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String pipelineId) { return hasSlot.get(); }
+        };
+        desired.save(new DesiredState("orders", RUNNING, "rev-1"));
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        ConvergenceDriver isolated = new ConvergenceDriver(
+                new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC)),
+                desired, new ObservationPublisher(state, observations), null, MetricsExport.none(),
+                () -> true, PipelineActuationOwnership.single(), LifecycleWorkDispatcher.inline(),
+                null, null, pending);
+
+        isolated.reconcile();
+        assertThat(state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(NEW));
+        assertThat(pending.pending("orders").orElseThrow().reason()).isEqualTo(PendingReason.START_CAPACITY);
+
+        hasSlot.set(true);
+        isolated.reconcile();
+        assertThat(state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+        assertThat(pending.pending("orders")).isEmpty();
+    }
 
     @Test
     void acceptedWorkAndCapacityWaitingHaveDistinctPendingReasonsWithoutFabricatingActualState()

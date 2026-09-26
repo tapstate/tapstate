@@ -8,7 +8,7 @@ import java.util.Optional;
 /**
  * The result of one convergence pass: its {@link ConvergeStatus}, the resulting checkpoint when the
  * pass ended at a state, and the job failure cause when the pass drove a dead job to FAILED. The
- * checkpoint is present for {@link ConvergeStatus#CONVERGED} and {@link ConvergeStatus#FAILED}; the
+ * checkpoint is present for converged, failed and deferred starts; the
  * failure is present only for {@link ConvergeStatus#FAILED}.
  */
 public record ConvergeResult(
@@ -30,6 +30,12 @@ public record ConvergeResult(
 
     static ConvergeResult superseded() {
         return new ConvergeResult(ConvergeStatus.SUPERSEDED, Optional.empty(), Optional.empty());
+    }
+
+    static ConvergeResult startDeferred(CheckpointDoc checkpoint, StartDeferred.Reason reason) {
+        return new ConvergeResult(reason == StartDeferred.Reason.CAPACITY
+                ? ConvergeStatus.START_CAPACITY : ConvergeStatus.START_PENDING,
+                Optional.of(checkpoint), Optional.empty());
     }
 
     static ConvergeResult failed(CheckpointDoc checkpoint, Throwable cause) {

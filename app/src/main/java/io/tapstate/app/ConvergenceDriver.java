@@ -172,9 +172,7 @@ final class ConvergenceDriver {
                     continue;
                 }
                 LifecycleWorkDispatcher.Outcome completed = lifecycleWork.take(pipelineId);
-                if (completed != null && pendingWork != null) {
-                    pendingWork.clear(pipelineId);
-                }
+                noteCompleted(pipelineId, completed);
                 if (completed == null || completed.superseded()) {
                     DesiredState intent = desired.read(pipelineId).orElse(null);
                     if (intent == null) {
@@ -193,9 +191,7 @@ final class ConvergenceDriver {
                     // Inline fixtures finish now; a real worker normally leaves this empty until a later
                     // tick. In both cases the same result path publishes the reconciled state.
                     completed = lifecycleWork.take(pipelineId);
-                    if (completed != null && pendingWork != null) {
-                        pendingWork.clear(pipelineId);
-                    }
+                    noteCompleted(pipelineId, completed);
                 }
                 ObservationFailure failure = null;
                 if (completed != null && completed.failure() != null) {
@@ -225,7 +221,8 @@ final class ConvergenceDriver {
                 });
                 // A completed clean reconciliation, rather than an idle tick while work is pending,
                 // ends the failure streak. Pending work has not yet shown it can succeed.
-                if (result != null) {
+                if (result != null && result.status() != ConvergeStatus.START_CAPACITY
+                        && result.status() != ConvergeStatus.START_PENDING) {
                     reconcileFailures.remove(pipelineId);
                 }
             } catch (RuntimeException e) {
@@ -300,6 +297,20 @@ final class ConvergenceDriver {
         } else if (intent.targetState() == PipelineState.STOPPED) {
             pendingWork.put(pipelineId, submission == LifecycleWorkDispatcher.Submission.CAPACITY
                     ? PendingReason.STOP_CAPACITY : PendingReason.STOP_PENDING);
+        } else {
+            pendingWork.clear(pipelineId);
+        }
+    }
+
+    private void noteCompleted(String pipelineId, LifecycleWorkDispatcher.Outcome completed) {
+        if (completed == null || pendingWork == null) {
+            return;
+        }
+        ConvergeResult result = completed.result();
+        if (result != null && result.status() == ConvergeStatus.START_CAPACITY) {
+            pendingWork.put(pipelineId, PendingReason.START_CAPACITY);
+        } else if (result != null && result.status() == ConvergeStatus.START_PENDING) {
+            pendingWork.put(pipelineId, PendingReason.START_PENDING);
         } else {
             pendingWork.clear(pipelineId);
         }

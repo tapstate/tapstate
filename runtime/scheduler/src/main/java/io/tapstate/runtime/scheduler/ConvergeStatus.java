@@ -15,6 +15,12 @@ public enum ConvergeStatus {
      */
     SUPERSEDED,
 
+    /** Start admission is waiting on another capture or ring generation; actual state has not advanced. */
+    START_PENDING,
+
+    /** Start admission has no bounded worker slot; actual state has not advanced. */
+    START_CAPACITY,
+
     /**
      * The pass found a pipeline it believed running had a dead job and drove it to the observable
      * FAILED state. The result carries the job's failure cause so the caller can surface it.

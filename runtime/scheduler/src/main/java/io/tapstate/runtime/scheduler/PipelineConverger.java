@@ -100,8 +100,10 @@ public final class PipelineConverger {
             // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
             // rather than "this process did not start it", so the next tick actuates nothing.
             if (!actuator.isCarryingAJob(pipelineId)) {
-                try {
-                    actuator.start(pipelineId);
+                try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(pipelineId)) {
+                    prepared.submit();
+                } catch (StartDeferred waiting) {
+                    return ConvergeResult.startDeferred(actualDoc.orElseThrow(), waiting.reason());
                 } catch (TapstateException refused) {
                     // Same refusal, third road. This one is the worst of the three to let escape: the
                     // checkpoint already says RUNNING, so an escaping throw leaves every read face
@@ -203,42 +205,50 @@ public final class PipelineConverger {
         }
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
             PipelineState from = StateJson.parse(current.stateJson());
-            CasOutcome outcome = state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant());
-            if (outcome instanceof CasOutcome.Applied applied) {
-                // Record first, then actuate: the store is the source of truth and Jet is subordinate, so the
-                // fenced write lands the intent durably before the job side is driven to match it.
-                try {
-                    actuate(pipelineId, from, target, purgeState, rebuild);
-                } catch (TapstateException refused) {
-                    // The job side refused with a diagnosis. Record it the way a job that died is recorded,
-                    // because to everyone reading the product they are the same event: the pipeline is not
-                    // going to run, and here is why. Letting it escape instead leaves the pass to abort
-                    // before anything is published, so the read face keeps whatever state it last saw while
-                    // the loop retries every tick -- a pipeline stuck at NEW, and the reason for it in the
-                    // server log alone.
-                    //
-                    // Only coded refusals. An uncoded throw is a defect in this process rather than a
-                    // condition of this pipeline, and recording it here would file it under the user's name
-                    // and stop it crashing anything -- which is what makes a defect visible.
-                    return failedWith(pipelineId, refused);
+            LifecycleActuator.PreparedStart prepared = null;
+            try {
+                // Admission that can refuse without a job must finish before RUNNING is made durable.
+                // A prepared run still submits only after the fenced checkpoint write succeeds.
+                if (target == PipelineState.RUNNING && from != PipelineState.PAUSED && !rebuild) {
+                    try {
+                        prepared = actuator.prepareStart(pipelineId);
+                    } catch (StartDeferred waiting) {
+                        return ConvergeResult.startDeferred(current, waiting.reason());
+                    } catch (TapstateException refused) {
+                        return failedWith(pipelineId, refused);
+                    }
                 }
-                return ConvergeResult.converged(applied.next());
-            }
-            // Fenced: another writer moved the epoch on. Re-read it and rebase before retrying.
-            current = requireCheckpoint(pipelineId);
-            if (current.stateJson().equals(targetJson)) {
-                return ConvergeResult.converged(current);
-            }
-            if (target == PipelineState.FAILED) {
-                // Every other target is an intent, and an intent survives being fenced: it is still what
-                // is wanted, so rebasing onto the fresh epoch and asking again is right. FAILED is not an
-                // intent -- it is a conclusion about the state that was read, and being fenced means that
-                // state is no longer there. Re-driving it would record a failure over whatever the other
-                // writer just landed (a user's stop, most often), actuate a second stop for it, and be
-                // corrected by the next pass: one tick of a pipeline reading failed that nothing failed,
-                // which no reader can tell from one that did. Conceding costs nothing, because a job that
-                // really is dead is still dead on the next pass and is failed then.
-                return ConvergeResult.superseded();
+                CasOutcome outcome = state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant());
+                if (outcome instanceof CasOutcome.Applied applied) {
+                    // The store remains the state truth. A prepared start may reserve bounded inputs
+                    // before this CAS, but submits its Jet job only after the CAS has landed.
+                    try {
+                        if (prepared != null) {
+                            prepared.submit();
+                        } else {
+                            actuate(pipelineId, from, target, purgeState, rebuild);
+                        }
+                    } catch (TapstateException refused) {
+                        // A coded refusal after a transition is an observable pipeline failure. Internal
+                        // admission waits are handled above, before the transition.
+                        return failedWith(pipelineId, refused);
+                    }
+                    return ConvergeResult.converged(applied.next());
+                }
+                // Fenced: another writer moved the epoch on. Re-read and rebase before retrying.
+                current = requireCheckpoint(pipelineId);
+                if (current.stateJson().equals(targetJson)) {
+                    return ConvergeResult.converged(current);
+                }
+                if (target == PipelineState.FAILED) {
+                    // FAILED is a conclusion about a state just read, not an intent to retry over a
+                    // newer checkpoint written by somebody else.
+                    return ConvergeResult.superseded();
+                }
+            } finally {
+                if (prepared != null) {
+                    prepared.close();
+                }
             }
         }
         return ConvergeResult.superseded();

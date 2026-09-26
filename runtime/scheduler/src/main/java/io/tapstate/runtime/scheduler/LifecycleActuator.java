@@ -16,6 +16,31 @@ import java.util.Optional;
  */
 public interface LifecycleActuator {
 
+    /** Holds admitted start work until the checkpoint transition has been recorded. */
+    interface PreparedStart extends AutoCloseable {
+        void submit();
+
+        @Override
+        void close();
+    }
+
+    /**
+     * Prepares a start before its RUNNING checkpoint is written. Actuators without bounded admission
+     * retain their existing start behavior after the checkpoint transition.
+     */
+    default PreparedStart prepareStart(String pipelineId) {
+        return new PreparedStart() {
+            @Override
+            public void submit() {
+                start(pipelineId);
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+    }
+
     /** Begins a fresh run of the pipeline: submits its topology as the pipeline's one job. */
     void start(String pipelineId);
 

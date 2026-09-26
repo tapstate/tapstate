@@ -9,6 +9,9 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.control.core.PipelineIncarnationService;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -21,11 +24,13 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
+import io.tapstate.runtime.srs.SnapshotCapacityUnavailable;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ClusterMembership;
@@ -40,6 +45,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -282,6 +288,55 @@ class EngineLifecycleActuatorTest {
 
         assertThat(events).containsExactly("startCapture:" + PIPE);
         assertThat(member.getJet().getJob(PIPE)).as("no job was submitted").isNull();
+        assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
+    }
+
+    @Test
+    void aPreparedStartAbandonedByACasLossClosesCaptureBeforeAnyJobIsSubmitted() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
+                new Engine(member), new RecordingDagSource(events), coordinator, teardown());
+
+        try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(PIPE)) {
+            assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
+            assertThat(coordinator.activeCapture).isTrue();
+            assertThat(member.getJet().getJob(PIPE)).isNull();
+        }
+
+        assertThat(coordinator.activeCapture).isFalse();
+        assertThat(member.getJet().getJob(PIPE)).isNull();
+        assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE,
+                "stopCapture:" + PIPE + "[keep][jobLive]");
+    }
+
+    @Test
+    void aRingThatIsNotReadyDoesNotRecordRunningBeforeAJobExists() {
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
+        coordinator.givesTheStartBack = true;
+        assertDeferredStartKeepsActualNew(coordinator);
+    }
+
+    @Test
+    void anExhaustedSnapshotPoolDoesNotRecordRunningBeforeAJobExists() {
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
+        coordinator.snapshotCapacityUnavailable = true;
+        assertDeferredStartKeepsActualNew(coordinator);
+    }
+
+    private void assertDeferredStartKeepsActualNew(RecordingCaptureCoordinator coordinator) {
+        InMemoryDesiredStore desired = new InMemoryDesiredStore();
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+        InMemoryStateStore state = new InMemoryStateStore();
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
+                new Engine(member), new RecordingDagSource(new CopyOnWriteArrayList<>()),
+                coordinator, teardown());
+
+        new PipelineConverger(desired, state, actuator, Clock.systemUTC()).converge(PIPE);
+
+        assertThat(state.read(PIPE)).hasValueSatisfying(checkpoint ->
+                assertThat(StateJson.parse(checkpoint.stateJson()))
+                        .as("capacity waits must not become a running actual state").isEqualTo(PipelineState.NEW));
         assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
     }
 
@@ -548,6 +603,7 @@ class EngineLifecycleActuatorTest {
         private Supplier<Boolean> jobAbsentProbe = () -> true;
         private boolean jobWasAbsentAtStart;
         private boolean givesTheStartBack;
+        private boolean snapshotCapacityUnavailable;
         private boolean interruptAfterStart;
         private boolean activeCapture;
         private final List<String> captureTokens = new CopyOnWriteArrayList<>();
@@ -563,6 +619,9 @@ class EngineLifecycleActuatorTest {
             if (givesTheStartBack) {
                 throw new RingNotOpenYet(CaptureId.of(
                         new CaptureConfig("mysql", Map.of("host", "h"), List.of("orders")), null));
+            }
+            if (snapshotCapacityUnavailable) {
+                throw new SnapshotCapacityUnavailable();
             }
             activeCapture = true;
             if (interruptAfterStart) {
