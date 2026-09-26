@@ -32,9 +32,8 @@ import org.slf4j.LoggerFactory;
  * the count and the spacing below are spent.
  *
  * <p>The count resets by itself, once the stretch is over and nothing is missing: the departure has
- * stopped being the answer, and whatever ends a run after that is the pipeline's own. A pipeline that
- * changes hands to another member is refused here for a different reason: this member is not driving
- * it, so no run of its own is recorded against it.
+ * stopped being the answer, and whatever ends a run after that is the pipeline's own. A failure already
+ * recorded as the pipeline's own keeps that answer across a claim handover.
  *
  * <p>Not synchronized: one convergence pass at a time asks this, on a single scheduler thread with a
  * fixed delay, so passes never overlap.
@@ -73,8 +72,16 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     }
 
     @Override
+    public void recordFailure(String pipelineId) {
+        actuation.recordFailure(pipelineId, MAX_ATTEMPTS * backoffNanos);
+    }
+
+    @Override
     public boolean admits(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        // Only admission is asked for a FAILED checkpoint. Ownership's membership query is also used
+        // before a run fails, so recording its answer there would manufacture an earlier failure.
+        actuation.recordFailure(pipelineId, MAX_ATTEMPTS * backoffNanos);
         if (!actuation.aMemberLeftUnderTheRun(pipelineId, MAX_ATTEMPTS * backoffNanos)) {
             // Either no member it was planned over is gone, and none went recently enough to still be
             // answering for this death -- so it is the pipeline's own and stays its own -- or this member

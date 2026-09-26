@@ -17,6 +17,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.LongSupplier;
+import org.springframework.context.event.ContextClosedEvent;
+import org.springframework.context.event.EventListener;
 
 /**
  * Decides which member drives one pipeline's convergence, by holding one durable actuation claim per
@@ -36,8 +38,8 @@ import java.util.function.LongSupplier;
  * shorter than the lease, so the window closes before the lease it was cut from could expire. The
  * interval is measured on the monotonic clock, so moving the node's wall clock cannot widen it.
  *
- * <p>Not synchronized: one convergence pass at a time drives this, on a single scheduler thread with a
- * fixed delay, so passes never overlap.
+ * <p>One scheduler thread drives the claims. Failure recording and shutdown alone synchronize so a
+ * close that starts first cannot be followed by a durable verdict that calls its dying run independent.
  */
 final class PipelineActuationOwnership {
 
@@ -62,6 +64,7 @@ final class PipelineActuationOwnership {
     private final LongSupplier nanoTime;
     private final boolean fenced;
     private final Map<String, Held> held = new HashMap<>();
+    private volatile boolean closing;
 
     /** One pipeline's local view: the claim this member proved, and when the next round trip is due. */
     private static final class Held {
@@ -145,6 +148,9 @@ final class PipelineActuationOwnership {
     /** Answers whether this member drives {@code pipelineId} right now, renewing or acquiring when due. */
     Permit permit(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        if (closing) {
+            return Permit.denied();
+        }
         if (!fenced) {
             return Permit.unfenced();
         }
@@ -192,6 +198,9 @@ final class PipelineActuationOwnership {
      */
     Execution beginExecution(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        if (closing) {
+            return Execution.refused();
+        }
         if (!fenced) {
             return Execution.unfenced();
         }
@@ -199,11 +208,13 @@ final class PipelineActuationOwnership {
         if (state == null || state.claim == null) {
             return Execution.refused();
         }
+        ClusterMembership planned = membership.committed();
+        Set<String> runMembers = planned == null ? Set.of() : plannedOver(planned);
         Optional<WorkloadClaim> advanced;
         try {
             // At the claim's own topology revision, which is the committed one: a revision change refuses
             // the renew above, so a claim still held is a claim granted under the current topology.
-            advanced = claims.advanceExecution(state.claim, state.claim.topologyRevision());
+            advanced = claims.advanceExecution(state.claim, state.claim.topologyRevision(), runMembers);
         } catch (RuntimeException unreachable) {
             advanced = Optional.empty();
         }
@@ -215,8 +226,7 @@ final class PipelineActuationOwnership {
         // What this run is planned over. Null rather than empty when nothing is committed -- which the
         // eligibility gate above makes unreachable -- because an empty set would read as "planned over
         // nobody", and nobody can never go missing.
-        ClusterMembership planned = membership.committed();
-        state.runMembers = planned == null ? null : plannedOver(planned);
+        state.runMembers = planned == null ? null : runMembers;
         // The departure is deliberately not forgotten here. This run is planned over members that are
         // all present, so the comparison below will find nothing missing from it -- and the run is being
         // submitted because a member went away, into a cluster that is still settling from it. Clearing
@@ -257,41 +267,31 @@ final class PipelineActuationOwnership {
      * <p>False while nothing is committed and on a single node -- one member cannot lose a member, it
      * can only be the one that went.
      *
-     * <p><b>A run this member inherited is the one case it cannot answer this way</b>, and it is the
-     * case that matters most: the member that submitted the run is the member that went away, so
-     * nothing here remembers what that run was planned over. Holding a pipeline whose claim already
-     * carries an execution, with no run of this member's own behind it, is itself the answer - a claim
-     * only changes hands when its holder stops renewing, and what it left behind is a run nothing is
-     * driving. Such a run is admitted for rebuilding, once; the attempt budget and backoff above the
-     * caller bound it, and the first rebuild makes this member the submitter, after which the ordinary
-     * reading applies again.
-     *
-     * <p>This is narrower than the design's own words, which have the new holder verify the topology
-     * the failed execution ran under. That verification is not available to it: a claim's topology
-     * revision is overwritten by whoever acquires it next, so the revision the dead run was submitted
-     * under is gone by the time anybody could compare it. Recording it durably is the fuller answer and
-     * is written down as owed; what is here delivers the behaviour that matters - a pipeline whose
-     * driver was killed is picked up rather than left failed - without pretending to a check it cannot
-     * make.
+     * <p>The claim carries the run's planned members and the first holder that recorded its failure.
+     * If the submitting holder saw FAILED while no member was lost, a later handover cannot make that
+     * earlier death recoverable. If a member was lost when failure was recorded, that fact survives a
+     * takeover even if the member has returned. An inherited run with no recorded failure is admitted:
+     * its driver may have gone away before it could record why the run ended.
      */
     boolean aMemberLeftUnderTheRun(String pipelineId, long settlingNanos) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        if (!fenced) {
+        if (!fenced || closing) {
             return false;
         }
         Held state = held.get(pipelineId);
-        if (state == null) {
+        if (state == null || state.claim == null || state.claim.executionGeneration() == 0) {
+            return false;
+        }
+        // A failure the submitting holder saw before any member loss remains that same failure when
+        // the claim changes hands. A later departure cannot turn it into a cluster-caused death.
+        if (state.claim.contextExecutionGeneration() == state.claim.executionGeneration()
+                && state.claim.failureClaimGeneration() == state.claim.executionClaimGeneration()
+                && !state.claim.failureAfterMemberLoss()) {
             return false;
         }
         if (state.runMembers == null) {
-            if (!inheritedARunNobodyIsDriving(state)) {
-                return false;
-            }
-            // The member that submitted this run is the member that went away, so this one never saw the
-            // absence itself and has nothing to compare against. Take the moment here, or the stretch
-            // below would have nothing to run from: the replacement about to be submitted is planned
-            // over the members that are here, and its own death would read as the pipeline's own. Taken
-            // again on every look, like the comparison below, until a run of this member's own exists.
+            // The submitting holder is gone and this member has no local run snapshot. Take the moment
+            // here so a replacement that fails while the handover settles can spend the remaining budget.
             state.lostAMemberAtNanos = nanoTime.getAsLong();
             return true;
         }
@@ -302,16 +302,48 @@ final class PipelineActuationOwnership {
         return nanoTime.getAsLong() - (state.lostAMemberAtNanos + settlingNanos) < 0;
     }
 
-    /**
-     * Whether this member holds a pipeline whose claim carries a run it did not submit.
-     *
-     * <p>The execution generation is what says a run was ever submitted under this claim at all: it
-     * survives the claim changing hands, and it is zero on a pipeline nobody has started. Paired with
-     * this member having no run of its own, it is exactly "somebody else's run, and they are no longer
-     * holding it".
-     */
-    private static boolean inheritedARunNobodyIsDriving(Held state) {
-        return state.claim != null && state.claim.executionGeneration() > 0;
+    /** Records the first FAILED observation with the execution before another holder can inherit it. */
+    synchronized void recordFailure(String pipelineId, long settlingNanos) {
+        if (!fenced || closing) {
+            return;
+        }
+        Held state = held.get(pipelineId);
+        if (state == null || state.claim == null || state.claim.executionGeneration() == 0) {
+            return;
+        }
+        // A prior version could advance the execution while leaving newer context fields untouched.
+        // Such a claim carries no reliable failure order until this version allocates another run.
+        if (state.claim.contextExecutionGeneration() != state.claim.executionGeneration()) {
+            return;
+        }
+        if (state.claim.failureClaimGeneration() != 0) {
+            return;
+        }
+        observeMembership(state);
+        long now = nanoTime.getAsLong();
+        boolean memberLoss = state.lostAMemberAtNanos != NEVER
+                && now - (state.lostAMemberAtNanos + settlingNanos) < 0;
+        // A new holder has no local run snapshot. The execution's durable members are the snapshot
+        // it can use if its first sight of FAILED is after a handover.
+        memberLoss |= !state.claim.executionNodeIds().isEmpty()
+                && !membership.visibleNodeIds().containsAll(state.claim.executionNodeIds());
+        Optional<WorkloadClaim> recorded;
+        try {
+            recorded = claims.recordExecutionFailure(state.claim, memberLoss);
+        } catch (RuntimeException unreachable) {
+            recorded = Optional.empty();
+        }
+        if (recorded.isEmpty()) {
+            state.claim = null;
+            return;
+        }
+        state.claim = recorded.get();
+    }
+
+    /** A shutting-down member must leave its dying run unclassified for the next holder to recover. */
+    @EventListener(ContextClosedEvent.class)
+    synchronized void stopForShutdown() {
+        closing = true;
     }
 
     /**

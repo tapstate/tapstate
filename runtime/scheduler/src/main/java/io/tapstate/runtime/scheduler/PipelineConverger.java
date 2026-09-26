@@ -198,6 +198,9 @@ public final class PipelineConverger {
             PipelineState from = StateJson.parse(current.stateJson());
             CasOutcome outcome = state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant());
             if (outcome instanceof CasOutcome.Applied applied) {
+                if (target == PipelineState.FAILED) {
+                    rebuilds.recordFailure(pipelineId);
+                }
                 // Record first, then actuate: the store is the source of truth and Jet is subordinate, so the
                 // fenced write lands the intent durably before the job side is driven to match it.
                 try {
