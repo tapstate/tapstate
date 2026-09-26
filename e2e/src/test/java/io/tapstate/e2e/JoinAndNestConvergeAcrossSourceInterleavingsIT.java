@@ -17,6 +17,8 @@ import java.util.TreeMap;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
@@ -35,9 +37,11 @@ import org.testcontainers.utility.DockerImageName;
  * an order whose customer has not arrived is no row of an inner join. That is watched before the missing side is
  * written, bounded rather than proved, and it is the other half's result that carries the weight.
  *
- * <p>The nest runs once for the cluster, as a node given no width does, with stand-ins on the other members; so the
- * nest case also holds its loads to landing, which a level fed by two tables can do on more than one member only if
- * every member of it says how far each table has got.
+ * <p>The nest runs twice. Once for the cluster, as a node given no width does, with stand-ins on the other members:
+ * so it also holds its loads to landing, which a level fed by two tables can do on more than one member only if every
+ * member of it says how far each table has got. And three wide, one state owner on each member, as the join always
+ * runs: each side's rows then have to reach the owner of their key, whichever member read them, and a join's updates
+ * cross to the member shaping them.
  */
 class JoinAndNestConvergeAcrossSourceInterleavingsIT {
 
@@ -51,9 +55,10 @@ class JoinAndNestConvergeAcrossSourceInterleavingsIT {
         RealConnectorGate.require("mysql", "mongodb");
     }
 
-    @Test
-    void aNestReachesTheSameDocumentsWhicheverOfItsTablesArrivesFirst() throws Exception {
-        String pipeline = "interleaved_nest";
+    @ParameterizedTest(name = "{0} wide")
+    @ValueSource(ints = {1, 3})
+    void aNestReachesTheSameDocumentsWhicheverOfItsTablesArrivesFirst(int width) throws Exception {
+        String pipeline = "interleaved_nest_w" + width;
         try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))) {
             mysql.start();
             grantReplication(mysql);
@@ -65,9 +70,9 @@ class JoinAndNestConvergeAcrossSourceInterleavingsIT {
                     "INSERT INTO orders VALUES (1, 'order-1'), (3, 'order-3')",
                     "INSERT INTO order_items VALUES (11, 1, 'sku-11'), (12, 1, 'sku-12'), (21, 2, 'sku-21'),"
                             + " (22, 2, 'sku-22')");
-            String store = SharedMongo.replicaSetUrl("e2e_interleaved_nest_cluster");
-            String target = SharedMongo.replicaSetUrl("e2e_interleaved_nest_target");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-interleaved-nest");
+            String store = SharedMongo.replicaSetUrl("e2e_interleaved_nest_cluster_w" + width);
+            String target = SharedMongo.replicaSetUrl("e2e_interleaved_nest_target_w" + width);
+            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-interleaved-nest-w" + width);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 RealProcessServer third = threeMembers(cluster);
                 try {
@@ -96,12 +101,14 @@ class JoinAndNestConvergeAcrossSourceInterleavingsIT {
                                   key: [ id ]
                                   embed:
                                     - { from: i, on: { order_id: id }, as: array, path: items, arrayKey: [ id ] }
+                            %s
                             serve:
                               from: order_doc
                               sync:
                                 - source: tgt_mongo
-                            """.formatted(pipeline));
+                            """.formatted(pipeline, width == 1 ? "" : "    execution: { parallelism: " + width + " }"));
                     start(control, config, resources, pipeline, "src_orders", "src_order_items");
+                    requireTheWidth(control, pipeline, "order_doc", width);
                     EndpointAddress documents = EndpointAddress.uri(target);
 
                     Map<Long, List<Long>> expected = new TreeMap<>(Map.of(1L, List.of(11L, 12L), 3L, List.of()));
@@ -176,12 +183,14 @@ class JoinAndNestConvergeAcrossSourceInterleavingsIT {
                                 sql: |
                                   SELECT o.id AS order_id, c.name AS customer_name
                                   FROM o JOIN c ON o.customer_id = c.id
+                                execution: { parallelism: 3 }
                             view:
                               id: interleaved_order_state
                               from: widen
                               primary_key: order_id
                             """.formatted(pipeline));
                     start(control, config, resources, pipeline, "src_orders", "src_customers");
+                    requireTheWidth(control, pipeline, "widen", 3);
                     EndpointAddress rows = EndpointAddress.uri(store);
 
                     Map<Long, String> expected = new TreeMap<>(Map.of(100L, "ada"));
@@ -238,6 +247,19 @@ class JoinAndNestConvergeAcrossSourceInterleavingsIT {
         Await.until(pipeline + " to reach " + PipelineState.RUNNING, Duration.ofMinutes(2),
                 () -> control.state(pipeline).filter(PipelineState.RUNNING::equals).isPresent(),
                 () -> control.state(pipeline) + ", failure " + control.failure(pipeline));
+    }
+
+    /**
+     * Holds the run to the width the case is about: three wide is one state owner on each member, and once for the
+     * cluster is one owner with stand-ins on the others. Read off the plan the run was submitted on.
+     */
+    private static void requireTheWidth(ControlPlane control, String pipeline, String node, int width) {
+        ControlPlane.PlannedNode planned = Await.answered("the status to carry the plan of " + pipeline,
+                        () -> control.executionPlan(pipeline)).nodes().stream()
+                .filter(each -> each.node().equals(node)).findFirst().orElseThrow();
+        assertThat(planned.effective()).as("%s runs %d processors for the cluster", node, width).isEqualTo(width);
+        assertThat(planned.scope()).as("%s runs %s", node, width == 1 ? "once for the cluster" : "on every member")
+                .isEqualTo(width == 1 ? "total-one" : "native");
     }
 
     /**
