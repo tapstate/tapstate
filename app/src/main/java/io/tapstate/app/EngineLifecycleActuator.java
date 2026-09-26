@@ -198,7 +198,12 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     @Override
     public void stop(String pipelineId, boolean purgeState) {
         engine.cancel(pipelineId);
-        plans.forget(pipelineId);
+        if (!engine.isLost()) {
+            // A plan is kept on the engine's member, and a member shut down for want of memory refuses to be asked
+            // about it - uncoded, and on every pass, which would keep the failure that took it down from ever being
+            // recorded. What it held went with it; the start that follows the restart records the plan it runs.
+            plans.forget(pipelineId);
+        }
         if (purgeState) {
             // Noted before the job is even known to be over, and before the drop: a stop is driven once, on
             // the transition, so a process that dies anywhere after this point leaves a note the next start
