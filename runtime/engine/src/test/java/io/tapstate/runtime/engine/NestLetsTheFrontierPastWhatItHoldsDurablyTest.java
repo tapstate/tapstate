@@ -183,7 +183,8 @@ class NestLetsTheFrontierPastWhatItHoldsDurablyTest {
                 new NestBinding(tables::get, HeapNestStores.onHeap(),
                         (from, released) -> LET_GO.add(from + ":" + released)),
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
-                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))));
+                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))),
+                new NodeWidth("doc", 4, 1, null));
 
         Vertex collector = dag.newVertex("collector", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of((SupplierEx<Processor>) Collector::new)));

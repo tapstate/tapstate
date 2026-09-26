@@ -137,6 +137,28 @@ public final class PipelineDagBuilder {
         return Map.copyOf(databases);
     }
 
+    /**
+     * How many vertices each nest step draws that hold a thread of their own for the life of a run - every vertex
+     * that keeps state - by step id. Each of them runs as wide as its step does, so a member runs this many times
+     * the step's per-member width of such threads; a nest that assembles nothing draws none.
+     */
+    public static Map<String, Integer> nestBlockingVertices(PipelineResource pipeline,
+            Function<String, NestTable> tables) {
+        if (pipeline.transforms() == null) {
+            return Map.of();
+        }
+        Map<String, Integer> byStep = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms()) {
+            TransformBody.Nest nest = nestOf(step);
+            if (nest != null) {
+                NestTopology topology = NestTopology.compile(pipeline.id(), step.id(), nest, tables);
+                byStep.put(step.id(), topology.isPassthrough() ? 0
+                        : topology.vertices().size() + topology.lookups().size());
+            }
+        }
+        return Map.copyOf(byStep);
+    }
+
     /** Each nest step's resolved state database, used by the shape ledger beside that step's state. */
     public static Map<String, String> nestStateDatabasesByStep(
             PipelineResource pipeline, String defaultDatabase) {
@@ -373,7 +395,8 @@ public final class PipelineDagBuilder {
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             chains == null ? null : new NestFrontier(axes,
                                     alias -> chains.perProducer(
-                                            aliasUpstream(inline.from(), alias, bindings)))));
+                                            aliasUpstream(inline.from(), alias, bindings))),
+                            shape.widthOf(step.id(), writtenBatch(step))));
                     if (chains != null) {
                         chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
@@ -394,7 +417,8 @@ public final class PipelineDagBuilder {
                             bindings.join().dimensionRowKeyColumns().apply(step),
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
-                            bindings.join().stores(), bindings.join().displaced()));
+                            bindings.join().stores(), bindings.join().displaced(),
+                            shape.widthOf(step.id(), writtenBatch(step))));
                     if (chains != null) {
                         chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
@@ -704,8 +728,7 @@ public final class PipelineDagBuilder {
         }
         TransformBody body = inline.body();
         boolean wide = shape.isNative(step.id());
-        // A step whose author asked for batches takes its input in them; any other takes it as it arrives.
-        BatchSpec batch = step.execution() == null ? null : step.execution().batch();
+        BatchSpec batch = writtenBatch(step);
         if (body instanceof TransformBody.Union) {
             // The merge is the topology, so nothing is transformed here - but the frontier still has to be
             // worked out per edge. The combined bound the engine would forward is never delivered at all
@@ -720,6 +743,14 @@ public final class PipelineDagBuilder {
                 ? TransformProcessor.nativeMetaSupplier(step.id(), port, axes, chainsByOrdinal, shape.plannedMembers())
                 : TransformProcessor.metaSupplier(step.id(), port, axes, chainsByOrdinal);
         return stepVertex(dag, step.id(), InputBatches.around(transform, batch), shape);
+    }
+
+    /**
+     * The batch a step's author asked for, which its vertices then take their input in; null where none was, and
+     * the step takes its input as the engine delivers it.
+     */
+    private static BatchSpec writtenBatch(Step step) {
+        return step.execution() == null ? null : step.execution().batch();
     }
 
     /** A step's vertex, as many processors per member as its shape says where it runs natively. */

@@ -345,7 +345,9 @@ final class StoreBackedDagSource implements DagSource {
                         ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                         streamOfSourceVertex(sourceVertices),
                         keyColumnsOf(bySourceTable),
-                        keyColumnsOf(assembled)),
+                        keyColumnsOf(assembled),
+                        PipelineDagBuilder.nestBlockingVertices(pipeline,
+                                nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get)),
                 sinksOf(pipeline, targets, serveStreams, viewStreams));
         return PipelineDagBuilder.build(
                 builtPipeline,

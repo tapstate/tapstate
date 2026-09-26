@@ -43,8 +43,12 @@ import java.util.function.Function;
  * it that nothing says the landing of. A sink writing several tables is not held to one by a keyless table
  * among them: that table's rows all go to one writer and only that table is written serially.
  *
- * <p>The stateless steps, the unions and the sinks are worked out here. Every other node runs the way it ran
- * before a run had a shape.
+ * <p>A nest or a join routes by the keys its own state is kept under, so it can always run wider than one
+ * processor; what bounds it is what it costs. A nest's vertices each hold a thread of their own for the life of a
+ * run, and every one of them runs as wide as the nest does, so they count against what a member may run of such
+ * threads.
+ *
+ * <p>Every step and every sink is worked out here; a source runs as one processor, as it always has.
  */
 final class ExecutionShapes {
 
@@ -66,20 +70,23 @@ final class ExecutionShapes {
 
     /**
      * What the walk needs to know about the graph: the producers a reference names, the stream each source
-     * vertex emits, the key columns of each source table, and the key columns of what each assembling step -
-     * a nest or a join - emits. A table or step with no key maps to an empty list.
+     * vertex emits, the key columns of each source table, the key columns of what each assembling step - a
+     * nest or a join - emits, and how many vertices holding a thread of their own each nest step draws. A table
+     * or step with no key maps to an empty list.
      */
     record Graph(
             Function<FromRef, List<String>> upstreams,
             Map<String, String> streamOfSourceVertex,
             Map<String, List<String>> tableKeys,
-            Map<String, List<String>> assembledKeys) {
+            Map<String, List<String>> assembledKeys,
+            Map<String, Integer> blockingVertices) {
 
         Graph {
             Objects.requireNonNull(upstreams, "upstreams");
             streamOfSourceVertex = Map.copyOf(streamOfSourceVertex);
             tableKeys = Map.copyOf(tableKeys);
             assembledKeys = Map.copyOf(assembledKeys);
+            blockingVertices = Map.copyOf(blockingVertices);
         }
     }
 
@@ -99,6 +106,11 @@ final class ExecutionShapes {
             TransformBody body = inline.body();
             if (body instanceof TransformBody.Nest || body instanceof TransformBody.Join) {
                 emitted.put(step.id(), Map.of(step.id(), graph.assembledKeys().getOrDefault(step.id(), List.of())));
+                ExecutionSpec execution = step.execution();
+                ParallelismRequest request = new ParallelismRequest(step.id(), ParallelismRequest.Kind.TRANSFORM,
+                        writtenIn(execution), null, false, batchOf(execution).effectiveMaxRecords(),
+                        graph.blockingVertices().getOrDefault(step.id(), 0));
+                nodes.put(step.id(), planned(pipelineId, ParallelismPlanner.plan(request, members, budget)));
                 continue;
             }
             Map<String, List<String>> input = inputOf(inline.from(), graph, emitted);

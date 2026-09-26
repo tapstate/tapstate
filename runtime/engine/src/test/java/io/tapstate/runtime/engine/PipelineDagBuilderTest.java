@@ -10,6 +10,7 @@ import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.processor.Processors;
+import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
@@ -304,8 +305,68 @@ class PipelineDagBuilderTest {
     }
 
     /**
+     * A join its author wrote no width for runs as one processor for the whole cluster, as any step does: both of
+     * its vertices are pinned to one member, and every edge into them - from its sources, and from the join into
+     * its projection - is delivered there, since every other member runs only a stand-in that refuses input.
+     */
+    @Test
+    void a_join_run_as_one_processor_pins_both_its_vertices_and_sends_every_edge_into_them_there() {
+        DAG dag = PipelineDagBuilder.build(joinPipeline(null), joinBindings());
+
+        for (String vertex : List.of("j", "j:project")) {
+            assertThat(dag.getVertex(vertex).getLocalParallelism())
+                    .isEqualTo(com.hazelcast.jet.core.Vertex.LOCAL_PARALLELISM_USE_DEFAULT);
+            assertThat(dag.getVertex(vertex).getMetaSupplier().preferredLocalParallelism()).as(vertex).isEqualTo(1);
+            assertThat(dag.getInboundEdges(vertex)).isNotEmpty().allSatisfy(edge ->
+                    assertThat(edge.getPartitioner().getConstantPartitioningKey())
+                            .as("%s -> %s", edge.getSourceName(), vertex).isEqualTo(vertex));
+        }
+    }
+
+    /**
+     * A join run wide runs its width on every member in both of its vertices, each edge into them routed by the
+     * key of the state it is about to change; and where its author asked for batches, both take their input in
+     * them.
+     */
+    @Test
+    void a_wide_join_runs_its_width_in_both_vertices_and_takes_its_input_in_its_batches() {
+        ExecutionShape wide = new ExecutionShape(1, Map.of("j", new NodeParallelism("j", 3,
+                NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE, 1, 3, 3, List.of())), Map.of());
+
+        DAG dag = PipelineDagBuilder.build(joinPipeline(new io.tapstate.core.model.ExecutionSpec(3,
+                new io.tapstate.core.model.BatchSpec(8, null))), joinBindings(), null, null, wide);
+
+        for (String vertex : List.of("j", "j:project")) {
+            assertThat(dag.getVertex(vertex).getLocalParallelism()).as(vertex).isEqualTo(3);
+            assertThat(InputBatches.takesInputInBatches(dag.getVertex(vertex).getMetaSupplier()))
+                    .as(vertex).isTrue();
+            assertThat(dag.getInboundEdges(vertex)).isNotEmpty().allSatisfy(edge ->
+                    assertThat(edge.getPartitioner().getConstantPartitioningKey())
+                            .as("%s -> %s", edge.getSourceName(), vertex).isNull());
+        }
+    }
+
+    private static PipelineResource joinPipeline(io.tapstate.core.model.ExecutionSpec execution) {
+        return new PipelineResource(
+                "p", null,
+                List.of(SourceRef.bare("orders_src"), SourceRef.bare("customers_src")),
+                List.of(joinStep("j", FromRef.literal("orders_src"), FromRef.literal("customers_src"), execution)),
+                null,
+                serve(FromRef.literal("j"), sync("sync_1", "orders_dest")),
+                null, null);
+    }
+
+    private static DagBindings joinBindings() {
+        return bindings(Map.of(
+                FromRef.literal("orders_src"), List.of("orders_src"),
+                FromRef.literal("customers_src"), List.of("customers_src"),
+                FromRef.literal("j"), List.of("j"))).withJoin(joinBinding());
+    }
+
+    /**
      * The positive control for the case below: with the binding supplied, the join is drawn rather than
-     * refused. Source changes keep their own ordinals, and final projection meets at the output key.
+     * refused. Source changes keep their own ordinals, and final projection - where the join runs on several
+     * processors - meets at the output key.
      */
     @Test
     void join_step_routes_final_projection_by_the_fact_key() {
@@ -316,11 +377,13 @@ class PipelineDagBuilderTest {
                 null,
                 serve(FromRef.literal("j"), sync("sync_1", "orders_dest")),
                 null, null);
+        ExecutionShape wide = new ExecutionShape(1, Map.of("j", new NodeParallelism("j", 4,
+                NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE, 1, 4, 4, List.of())), Map.of());
 
         DAG dag = PipelineDagBuilder.build(pipeline, bindings(Map.of(
                 FromRef.literal("orders_src"), List.of("orders_src"),
                 FromRef.literal("customers_src"), List.of("customers_src"),
-                FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()));
+                FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()), null, null, wide);
 
         assertThat(vertexNames(dag))
                 .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "j:project", "serve.sync_1");
@@ -542,10 +605,15 @@ class PipelineDagBuilderTest {
 
     /** A join step reading two sources, under the alias names the plan below calls them by. */
     private static Step joinStep(String id, FromRef fact, FromRef dimension) {
+        return joinStep(id, fact, dimension, null);
+    }
+
+    private static Step joinStep(String id, FromRef fact, FromRef dimension,
+            io.tapstate.core.model.ExecutionSpec execution) {
         TransformBody body = new TransformBody.Join(JoinEngine.BUILTIN,
                 "SELECT o.id FROM orders o JOIN customers c ON o.cust_id = c.id");
         return Step.inline(id, FromClause.aliases(new java.util.LinkedHashMap<>(
-                Map.of("o", fact, "c", dimension))), body, null);
+                Map.of("o", fact, "c", dimension))), body, execution, null);
     }
 
     /**

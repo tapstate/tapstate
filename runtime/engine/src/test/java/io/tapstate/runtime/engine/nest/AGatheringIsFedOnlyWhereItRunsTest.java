@@ -8,6 +8,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.processor.Processors;
+import io.tapstate.runtime.engine.NodeWidth;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
@@ -36,7 +37,7 @@ class AGatheringIsFedOnlyWhereItRunsTest {
                 NestTopology.compile("p", "doc", nest("customer", List.of("customer_id")), tables());
 
         NestDag.attach(dag, topology, "doc", "customer", "doc",
-                alias -> List.of(left, right), null, vertex -> 0, null);
+                alias -> List.of(left, right), null, vertex -> 0, null, new NodeWidth("doc", 4, 1, null));
 
         List<Edge> into = dag.getInboundEdges("doc");
         assertThat(into)

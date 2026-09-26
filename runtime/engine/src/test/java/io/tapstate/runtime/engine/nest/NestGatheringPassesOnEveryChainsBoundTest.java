@@ -19,6 +19,7 @@ import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.runtime.engine.JobWatch;
 import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.NodeWidth;
 import java.io.Serializable;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -89,7 +90,8 @@ class NestGatheringPassesOnEveryChainsBoundTest {
                 nest("customer", List.of("customer_id")), tables());
         Vertex gathered = NestDag.attach(dag, topology, "doc", "customer", "doc",
                 alias -> List.of(left, right), null, vertex -> 0,
-                new NestFrontier(AXES, alias -> List.of(List.of(LEFT), List.of(RIGHT))));
+                new NestFrontier(AXES, alias -> List.of(List.of(LEFT), List.of(RIGHT))),
+                new NodeWidth("doc", 4, 1, null));
 
         Vertex collector = dag.newVertex("collector",
                 ProcessorSupplier.of((SupplierEx<Processor>) Collector::new)).localParallelism(1);

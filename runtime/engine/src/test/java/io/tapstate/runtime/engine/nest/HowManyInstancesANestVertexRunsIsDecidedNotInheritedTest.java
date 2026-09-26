@@ -10,6 +10,7 @@ import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.processor.Processors;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.runtime.engine.NodeWidth;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -17,8 +18,8 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
- * How many instances of a state-carrying nest vertex a member runs is written down, not taken from the
- * engine.
+ * How many processors a state-carrying nest vertex runs is the width its node was worked out to run at, not the
+ * engine's own answer.
  *
  * <p>The engine's answer is the member's core count, which is the budget for work that computes. These
  * vertices do not compute; each of them declares itself non-cooperative and holds a thread of its own for
@@ -26,17 +27,15 @@ import org.junit.jupiter.api.Test;
  * vertex per core - and since one tree may compile to as many state-carrying vertices as the limit on them
  * allows, the two numbers multiply, giving a worst case that grows with the box rather than with the work.
  *
- * <p><b>Nothing observable goes wrong when this is left off, which is why it is asserted rather than
- * reviewed.</b> Every document still assembles and every count is still right; what changes is a thread
+ * <p><b>Nothing observable goes wrong when a vertex is left to the engine, which is why it is asserted rather
+ * than reviewed.</b> Every document still assembles and every count is still right; what changes is a thread
  * count nobody is looking at, on a machine that is not the one the author was using.
  *
- * <p>Two things beyond the number itself are pinned here. It is above one, because a member running a
- * single instance of each vertex puts both sides of every hand-over between instances inside one of them,
- * where releasing what is held and merely forgetting it locally stop being distinguishable - so the paths
- * that carry a subtree from one key to another would go on being written and stop being reachable on a
- * single machine. And it does not reach the vertices that gather an alias's several producers into one:
- * those exist to be a single lane and are pinned to one instance in the whole cluster, so a second answer
- * for them is not a slower job but a refused one.
+ * <p>A node run as one processor for the whole cluster pins each of its state-carrying vertices to one member and
+ * routes every edge into them there, because every other member runs only a stand-in that refuses input. And the
+ * node's width never reaches the vertices that gather an alias's several producers into one: those exist to be a
+ * single lane and are pinned to one instance in the whole cluster, so a second answer for them is not a slower
+ * job but a refused one.
  */
 class HowManyInstancesANestVertexRunsIsDecidedNotInheritedTest {
 
@@ -49,40 +48,58 @@ class HowManyInstancesANestVertexRunsIsDecidedNotInheritedTest {
     private static final List<String> SOURCES = List.of("order", "item", "claim", "claim-2", "customer");
 
     @Test
-    void everyVertexThatKeepsStateRunsTheNumberOfInstancesThisDecidedOn() {
+    void everyVertexThatKeepsStateRunsTheWidthItsNodeWasWorkedOutFor() {
         NestTopology topology = NestTopology.compile("p", "doc", TREE, tables());
-        DAG dag = draw(topology);
+        DAG dag = draw(topology, new NodeWidth("doc", 3, 1, null));
 
-        List<String> keepingState = new ArrayList<>();
-        topology.vertices().forEach(vertex -> keepingState.add(vertex.name()));
-        topology.lookups().forEach(lookup -> keepingState.add(lookup.name()));
-
-        assertThat(keepingState)
+        assertThat(keepingState(topology))
                 .describedAs("all three kinds are in the tree - a resolver, the assembler, and the vertex "
                         + "filing the rows the root points at - so none of them is covered by an "
                         + "assertion that had nothing to walk")
-                .hasSize(3);
-        assertThat(keepingState).allSatisfy(name -> assertThat(dag.getVertex(name).getLocalParallelism())
-                .describedAs("%s says how many instances of it a member runs, rather than inheriting the "
-                        + "count meant for work that computes", name)
-                .isEqualTo(NestDag.STATE_VERTEX_LOCAL_PARALLELISM));
+                .hasSize(3)
+                .allSatisfy(name -> {
+                    assertThat(dag.getVertex(name).getLocalParallelism())
+                            .describedAs("%s runs the node's width on each member, rather than inheriting "
+                                    + "the count meant for work that computes", name)
+                            .isEqualTo(3);
+                    assertThat(dag.getInboundEdges(name)).isNotEmpty().allSatisfy(edge ->
+                            assertThat(edge.getPartitioner().getConstantPartitioningKey())
+                                    .describedAs("%s -> %s is routed by the key of the state it changes",
+                                            edge.getSourceName(), name)
+                                    .isNull());
+                });
+    }
 
-        assertThat(NestDag.STATE_VERTEX_LOCAL_PARALLELISM)
-                .describedAs("above one, so that what one instance hands to another still happens between "
-                        + "two of them on a single machine rather than inside one")
-                .isGreaterThan(1);
+    @Test
+    void aNodeRunAsOneProcessorPinsEveryVertexThatKeepsStateAndSendsEveryEdgeThere() {
+        NestTopology topology = NestTopology.compile("p", "doc", TREE, tables());
+        DAG dag = draw(topology, NodeWidth.totalOne("doc", null));
+
+        assertThat(keepingState(topology)).hasSize(3).allSatisfy(name -> {
+            Vertex vertex = dag.getVertex(name);
+            assertThat(vertex.getLocalParallelism())
+                    .describedAs("%s leaves its count to the one-processor pin", name)
+                    .isEqualTo(Vertex.LOCAL_PARALLELISM_USE_DEFAULT);
+            assertThat(vertex.getMetaSupplier().preferredLocalParallelism())
+                    .describedAs("%s runs one processor for the whole cluster", name)
+                    .isEqualTo(1);
+            assertThat(dag.getInboundEdges(name)).isNotEmpty().allSatisfy(edge ->
+                    assertThat(edge.getPartitioner().getConstantPartitioningKey())
+                            .describedAs("%s -> %s delivers to the member the vertex is pinned to",
+                                    edge.getSourceName(), name)
+                            .isEqualTo(name));
+        });
     }
 
     @Test
     void theVertexThatGathersAnAliasIsLeftAtTheOneInstanceItMustRun() {
         NestTopology topology = NestTopology.compile("p", "doc", TREE, tables());
-        DAG dag = draw(topology);
+        DAG dag = draw(topology, new NodeWidth("doc", 3, 1, null));
 
         // Whatever the nest drew that is neither one of its state-carrying vertices nor a source: named
         // after the vertex it feeds and the alias it gathers, which is not a name to match on.
         List<String> known = new ArrayList<>(SOURCES);
-        topology.vertices().forEach(vertex -> known.add(vertex.name()));
-        topology.lookups().forEach(lookup -> known.add(lookup.name()));
+        known.addAll(keepingState(topology));
         List<Vertex> gathering = new ArrayList<>();
         dag.forEach(vertex -> {
             if (!known.contains(vertex.getName())) {
@@ -100,7 +117,14 @@ class HowManyInstancesANestVertexRunsIsDecidedNotInheritedTest {
                 .isEqualTo(Vertex.LOCAL_PARALLELISM_USE_DEFAULT));
     }
 
-    private static DAG draw(NestTopology topology) {
+    private static List<String> keepingState(NestTopology topology) {
+        List<String> names = new ArrayList<>();
+        topology.vertices().forEach(vertex -> names.add(vertex.name()));
+        topology.lookups().forEach(lookup -> names.add(lookup.name()));
+        return names;
+    }
+
+    private static DAG draw(NestTopology topology, NodeWidth width) {
         DAG dag = new DAG();
         Map<String, List<Vertex>> sources = new LinkedHashMap<>();
         for (String alias : SOURCES) {
@@ -114,7 +138,7 @@ class HowManyInstancesANestVertexRunsIsDecidedNotInheritedTest {
         Map<Vertex, Integer> handedOut = new java.util.HashMap<>();
         NestDag.attach(dag, topology, "doc", "order", "doc", sources::get,
                 new NestBinding(tables(), HeapNestStores.onHeap(), (from, released) -> { }),
-                vertex -> handedOut.merge(vertex, 1, Integer::sum) - 1, null);
+                vertex -> handedOut.merge(vertex, 1, Integer::sum) - 1, null, width);
         return dag;
     }
 }

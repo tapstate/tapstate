@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import io.tapstate.core.lifecycle.NodeParallelism;
+import io.tapstate.core.model.BatchSpec;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -109,6 +110,16 @@ public record ExecutionShape(
             throw new IllegalStateException("node '" + node + "' runs natively but no input keys were worked out");
         }
         return keys;
+    }
+
+    /**
+     * How wide {@code node} runs, for a node that draws several vertices of its own and so has to draw each of
+     * them, and each edge into them, to match; {@code batch} is the batch its author asked for, if any.
+     */
+    public NodeWidth widthOf(String node, BatchSpec batch) {
+        return isNative(node)
+                ? new NodeWidth(node, localOf(node), plannedMembers, batch)
+                : NodeWidth.totalOne(node, batch);
     }
 
     /** Whether any node runs natively, which is what decides how a sink below it reads its input. */

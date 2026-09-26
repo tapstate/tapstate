@@ -10,6 +10,7 @@ import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
+import io.tapstate.runtime.engine.NodeWidth;
 import io.tapstate.runtime.engine.PassthroughProcessor;
 import io.tapstate.runtime.engine.ReplayFloor;
 import io.tapstate.runtime.engine.ReplayFloorFactory;
@@ -42,29 +43,6 @@ import java.util.function.ToIntFunction;
  */
 public final class NestDag {
 
-    /**
-     * How many instances of each state-carrying vertex one member runs.
-     *
-     * <p>Pinned rather than defaulted, and the number is an IO one. These vertices declare themselves
-     * non-cooperative, so every instance holds a thread of its own for the life of the job, outside the
-     * pool the rest of the graph shares. Left to the engine, the count is the member's core count - the
-     * budget for work that computes, where what these do is wait on a state map. A wider machine
-     * therefore buys nothing here and costs a thread per vertex per core, and since a tree may compile to
-     * as many state-carrying vertices as {@link NestTopology#DEFAULT_RESOLVER_VERTEX_LIMIT} allows, the
-     * two numbers multiply. Pinned, the worst case is the same on every machine.
-     *
-     * <p>Above one, deliberately. At one there is a single instance of each vertex per member, and
-     * everything a nest does between instances - a subtree handed from the key leaving it to the key
-     * gaining it - would happen inside one of them, where releasing what is held and merely forgetting it
-     * locally look the same. Those paths would still be written and would stop being reachable on a
-     * single machine.
-     *
-     * <p>A staged number rather than a tuned one: nothing has yet measured what concurrency the layer
-     * behind these maps rewards. It is the one place the count is decided, so whatever later works it out
-     * per member replaces this and nothing else.
-     */
-    static final int STATE_VERTEX_LOCAL_PARALLELISM = 4;
-
     private NestDag() {
     }
 
@@ -72,10 +50,16 @@ public final class NestDag {
      * Builds the node into {@code dag} and returns the vertex the rest of the pipeline reads from. A
      * passthrough nest builds one identity vertex fed by the root stream: it assembles nothing, so it
      * takes no state, no map and no thread of its own.
+     *
+     * <p>Every vertex that keeps state runs as {@code width} says - one processor for the cluster, or the same
+     * number on every member - and so does every edge into one of them. The width is the node's, worked out for
+     * the run like any other node's; nothing here takes the engine's own answer, which is the member's core
+     * count, the budget for work that computes rather than for vertices that each hold a thread of their own
+     * waiting on a state map.
      */
     public static Vertex attach(DAG dag, NestTopology topology, String nodeId, String rootAlias,
             String outputStream, Function<String, List<Vertex>> upstream, NestBinding binding,
-            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
+            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier, NodeWidth width) {
         if (topology.isPassthrough()) {
             List<Vertex> sources = upstream.apply(rootAlias);
             Vertex passthrough =
@@ -91,19 +75,19 @@ public final class NestDag {
         Map<List<String>, List<String>> carried = new LinkedHashMap<>();
         Vertex assembler = null;
         for (NestVertex spec : topology.vertices()) {
-            Vertex vertex = dag.newVertex(spec.name(), processorFor(spec, topology, binding, outputStream,
-                    frontier, chainsInto(spec, carried, frontier)))
-                    .localParallelism(STATE_VERTEX_LOCAL_PARALLELISM);
+            Vertex vertex = width.sized(dag.newVertex(spec.name(), width.metaSupplier(spec.name(),
+                    processorsFor(spec, topology, binding, outputStream, frontier,
+                            chainsInto(spec, carried, frontier)))));
             built.put(spec.pathId(), vertex);
             for (NestInbound edge : spec.inbound()) {
-                connect(dag, vertex, edge, built, upstream, nextOutbound, frontier);
+                connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width);
             }
             assembler = vertex;
         }
         // Drawn after the assembler and never mistaken for it: a lookup takes no part in assembly, and the
         // vertex the rest of the pipeline reads from is the one that renders documents.
         for (NestLookup lookup : topology.lookups()) {
-            attachLookup(dag, lookup, built, upstream, binding, nextOutbound, frontier);
+            attachLookup(dag, lookup, built, upstream, binding, nextOutbound, frontier, width);
         }
         return assembler;
     }
@@ -131,20 +115,19 @@ public final class NestDag {
      */
     private static void attachLookup(DAG dag, NestLookup lookup, Map<List<String>, Vertex> built,
             Function<String, List<Vertex>> upstream, NestBinding binding,
-            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier) {
+            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier, NodeWidth width) {
         List<Vertex> sources = upstream.apply(lookup.alias());
         if (sources == null || sources.isEmpty()) {
             throw new IllegalStateException("nest alias '" + lookup.alias() + "' resolved to no vertex");
         }
-        Vertex vertex = dag.newVertex(lookup.name(), ProcessorMetaSupplier.of(
+        Vertex vertex = width.sized(dag.newVertex(lookup.name(), width.metaSupplier(lookup.name(),
                 new NestLookupSupplier(lookup, binding.stores(),
                         binding.settings().referrersAllowedIn(lookup.mapName()),
-                        frontier == null ? null : frontier.axes(), chainsIntoLookup(lookup, frontier))))
-                .localParallelism(STATE_VERTEX_LOCAL_PARALLELISM);
+                        frontier == null ? null : frontier.axes(), chainsIntoLookup(lookup, frontier)))));
         Vertex source = sources.size() == 1
                 ? sources.get(0)
                 : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);
-        draw(dag, source, vertex, LookupProcessor.ROWS, fieldKey(lookup.partitionKey()), nextOutbound);
+        draw(dag, source, vertex, LookupProcessor.ROWS, fieldKey(lookup.partitionKey()), nextOutbound, width);
 
         List<Vertex> referrers = upstream.apply(lookup.referrerAlias());
         if (referrers == null || referrers.isEmpty()) {
@@ -155,7 +138,7 @@ public final class NestDag {
                 ? referrers.get(0)
                 : gatheredInto(dag, vertex, lookup.referrerAlias(), referrers, nextOutbound, frontier);
         draw(dag, referrer, vertex, LookupProcessor.REGISTRATIONS,
-                fieldKey(lookup.referenceFields()), nextOutbound);
+                fieldKey(lookup.referenceFields()), nextOutbound, width);
         // The same rows a second time, keyed by what they pointed at before, so a row that now names
         // something else lands where the entry recording the old one is held. Drawn for every referenced
         // embed rather than only where structural key changes are followed: that switch is about a
@@ -163,14 +146,14 @@ public final class NestDag {
         // this on it threw away an earlier row the source had already sent. A row carrying none is keyed
         // by what it carries, which lands it beside its twin, and is refused there rather than passed over.
         draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
-                leavingKey(lookup.referenceFields()), nextOutbound);
+                leavingKey(lookup.referenceFields()), nextOutbound, width);
 
         Vertex pointing = built.get(lookup.referrerPathId());
         if (pointing == null) {
             throw new IllegalStateException("nothing was built for the level pointing at "
                     + lookup.pathId() + ", so word of an edit has nowhere to go");
         }
-        draw(dag, vertex, pointing, lookup.touchOrdinal(), routedKey(), nextOutbound);
+        draw(dag, vertex, pointing, lookup.touchOrdinal(), routedKey(), nextOutbound, width);
     }
 
     /**
@@ -231,7 +214,7 @@ public final class NestDag {
 
     private static void connect(DAG dag, Vertex destination, NestInbound edge, Map<List<String>, Vertex> built,
             Function<String, List<Vertex>> upstream, ToIntFunction<Vertex> nextOutbound,
-            NestFrontier frontier) {
+            NestFrontier frontier, NodeWidth width) {
         if (edge.carriesTouches()) {
             // Drawn with the vertex that sends it, which does not exist yet: lookups are built after every
             // assembly vertex, so that the vertex a word of an edit lands on is already there to draw to.
@@ -243,7 +226,7 @@ public final class NestDag {
                 throw new IllegalStateException("cascade into " + destination.getName()
                         + " has no vertex for " + edge.pathId());
             }
-            draw(dag, source, destination, edge.ordinal(), routedKey(), nextOutbound);
+            draw(dag, source, destination, edge.ordinal(), routedKey(), nextOutbound, width);
             return;
         }
         List<Vertex> sources = upstream.apply(edge.alias());
@@ -255,7 +238,7 @@ public final class NestDag {
                 : merged(dag, destination, edge, sources, nextOutbound, frontier);
         draw(dag, source, destination, edge.ordinal(),
                 edge.carriesDepartures() ? leavingKey(edge.keyFields()) : fieldKey(edge.keyFields()),
-                nextOutbound);
+                nextOutbound, width);
     }
 
     /**
@@ -316,13 +299,17 @@ public final class NestDag {
                 .distributed().allToOne(destination.getName()));
     }
 
+    /**
+     * Draws one edge into a vertex that keeps state: routed by {@code key}, the key the state it is about to
+     * change is filed under, where the node runs on every member; to its one processor where it runs one.
+     */
     private static void draw(DAG dag, Vertex source, Vertex destination, int ordinal,
-            FunctionEx<Object, Object> key, ToIntFunction<Vertex> nextOutbound) {
-        dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(destination, ordinal)
-                .partitioned(key).distributed());
+            FunctionEx<Object, Object> key, ToIntFunction<Vertex> nextOutbound, NodeWidth width) {
+        dag.edge(width.into(Edge.from(source, nextOutbound.applyAsInt(source)).to(destination, ordinal),
+                destination.getName(), key));
     }
 
-    private static ProcessorMetaSupplier processorFor(NestVertex spec, NestTopology topology,
+    private static ProcessorSupplier processorsFor(NestVertex spec, NestTopology topology,
             NestBinding binding, String outputStream, NestFrontier frontier,
             Map<Integer, List<String>> chainsByOrdinal) {
         NestBinding.NestStores stores = binding.stores();
@@ -336,9 +323,9 @@ public final class NestDag {
         NestSendPolicy sending = topology.foldingAllowed() && windowMillis > 0
                 ? NestSendPolicy.within(windowMillis)
                 : NestSendPolicy.everyChange();
-        return ProcessorMetaSupplier.of(new NestVertexSupplier(spec, slots, stores, deadLetter, outputStream,
+        return new NestVertexSupplier(spec, slots, stores, deadLetter, outputStream,
                 axes, chainsByOrdinal, binding.replayFloor(), binding.settings(), binding.clock(), sending,
-                topology.lookups()));
+                topology.lookups());
     }
 
     /**

@@ -53,6 +53,7 @@ class AStepRunsWideOnlyWhereItsRowsCarryAKeyTest {
                 },
                 Map.of("src", "orders"),
                 tableKeys,
+                Map.of(),
                 Map.of());
     }
 

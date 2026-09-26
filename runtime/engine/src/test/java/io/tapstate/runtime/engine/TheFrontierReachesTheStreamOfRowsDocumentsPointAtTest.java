@@ -170,7 +170,8 @@ class TheFrontierReachesTheStreamOfRowsDocumentsPointAtTest {
                 alias -> List.of(byAlias.get(alias)),
                 new NestBinding(tables::get, HeapNestStores.onHeap(), (from, released) -> { }),
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
-                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))));
+                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))),
+                new NodeWidth("doc", 4, 1, null));
 
         Vertex sink = dag.newVertex("sink", SinkProcessor.metaSupplier("sink",
                 (SupplierEx<SinkWriter>) TakesEverything::new,
