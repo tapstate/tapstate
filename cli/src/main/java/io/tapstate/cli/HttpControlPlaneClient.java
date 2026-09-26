@@ -1388,12 +1388,25 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             return null;
         }
         List<String> reasons = strings(node.get("reasons"));
-        if (reasons == null) {
+        ExplainOutcome.PlanResources resources = explanationPlanResources(node.get("resources"));
+        if (reasons == null || node.get("resources") != null && resources == null) {
             return null;
         }
         return new ExplainOutcome.PlanNode(id, requested.intValue(), origin, scope, memberCount.intValue(),
                 node.get("computedLocal") instanceof Number local ? local.intValue() : null, effective.intValue(),
-                reasons, maxRecords.intValue(), maxWaitMillis.longValue());
+                reasons, maxRecords.intValue(), maxWaitMillis.longValue(), resources);
+    }
+
+    private static ExplainOutcome.PlanResources explanationPlanResources(Object raw) {
+        return raw instanceof Map<?, ?> resources
+                && resources.get("writers") instanceof Number writers
+                && resources.get("connectorMode") instanceof String mode
+                && resources.get("connectorInstances") instanceof Number instances
+                && resources.get("bufferedRecords") instanceof Number buffered
+                && resources.get("edgeQueueRecords") instanceof Number queued
+                ? new ExplainOutcome.PlanResources(writers.intValue(), mode, instances.intValue(),
+                        buffered.longValue(), queued.longValue())
+                : null;
     }
 
     private static boolean absentOrNumber(Object raw) {

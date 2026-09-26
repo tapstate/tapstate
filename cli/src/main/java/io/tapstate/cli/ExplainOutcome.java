@@ -56,13 +56,26 @@ sealed interface ExplainOutcome {
         }
     }
 
-    /** One node of a plan, with the batch it takes its input in. */
+    /** One node of a plan, with the batch it takes its input in and, for a sink, what it holds open and buffers. */
     record PlanNode(String node, int requested, String requestedOrigin, String scope, int memberCount,
-            Integer computedLocal, int effective, List<String> reasons, int maxRecords, long maxWaitMillis) {
+            Integer computedLocal, int effective, List<String> reasons, int maxRecords, long maxWaitMillis,
+            PlanResources resources) {
 
         public PlanNode {
             reasons = List.copyOf(reasons);
         }
+
+        /** A node that is not a sink. */
+        PlanNode(String node, int requested, String requestedOrigin, String scope, int memberCount,
+                Integer computedLocal, int effective, List<String> reasons, int maxRecords, long maxWaitMillis) {
+            this(node, requested, requestedOrigin, scope, memberCount, computedLocal, effective, reasons, maxRecords,
+                    maxWaitMillis, null);
+        }
+    }
+
+    /** What a sink holds open and buffers at its width, as the server worked it out. */
+    record PlanResources(int writers, String connectorMode, int connectorInstances, long bufferedRecords,
+            long edgeQueueRecords) {
     }
 
     record Rejected(String code, String message) implements ExplainOutcome {

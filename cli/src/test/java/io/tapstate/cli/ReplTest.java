@@ -4450,7 +4450,8 @@ class ReplTest {
                         new ExplainOutcome.PlanNode("orders_src", 1, "node-default", "total-one", 3, null, 1,
                                 List.of("requested-one", "source-reads-not-split"), 1024, 0L),
                         new ExplainOutcome.PlanNode("orders_sink", 8, "explicit", "native", 3, 3, 9,
-                                List.of("rounded-up"), 512, 50L)),
+                                List.of("rounded-up"), 512, 50L,
+                                new ExplainOutcome.PlanResources(9, "isolated", 9, 9_216L, 175_104L))),
                         "2026-09-17T09:58:00Z"));
     }
 
@@ -5117,7 +5118,11 @@ class ReplTest {
                 .contains("  width      orders_src  1 in all (one processor for the cluster), requested 1"
                         + " (node-default) -- requested-one, source-reads-not-split; batch 1024 records, 0ms wait\n")
                 .contains("  width      orders_sink  9 in all (3 per member on 3 members), requested 8 (explicit)"
-                        + " -- rounded-up; batch 512 records, 50ms wait\n");
+                        + " -- rounded-up; batch 512 records, 50ms wait\n")
+                .contains("  resources  orders_sink  9 writers, 9 isolated connectors;"
+                        + " at most 9216 records buffered and 175104 queued\n");
+        // Only a sink holds connectors and batches that are worked out; a source says nothing of them.
+        assertThat(out).doesNotContain("resources  orders_src");
     }
 
     @Test

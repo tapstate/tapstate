@@ -18,6 +18,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -77,13 +78,51 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
                     new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
                             List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src")),
                     new ExecutionPlan.Node("serve.s", 8, "explicit", "native", 3, 3, 9, List.of("rounded-up"),
-                            512, 50L, List.of("route.serve.s", "serve.s")));
+                            512, 50L, List.of("route.serve.s", "serve.s"))
+                            // Nine writers, a connector each; two batches of 512 each; and a full queue from the
+                            // one source processor to each of nine routers, and from each router to each writer
+                            // over its two edges: (1 x 9 + 2 x 9 x 9) queues of 1024.
+                            .withResources(new ExecutionPlan.Resources(9, "isolated", 9, 9_216L, 175_104L)));
         });
         assertThat(plans.forgotten).isEmpty();
 
         actuator.stop(PIPE, false);
 
         assertThat(plans.forgotten).containsExactly(PIPE);
+    }
+
+    @Test
+    void writersSharingACertifiedConnectorOpenOnePerMemberRunningThem() {
+        ExecutionPlan plan = EngineLifecycleActuator.planOf(PIPE, PipelineActuationOwnership.Execution.unfenced(),
+                new PlannedIdle().planned(), T0, Map.of("serve.s", "pg"), Set.of("pg"));
+
+        assertThat(plan.nodes()).filteredOn(node -> node.node().equals("serve.s")).singleElement()
+                .extracting(ExecutionPlan.Node::resources)
+                .isEqualTo(new ExecutionPlan.Resources(9, "shared", 3, 9_216L, 175_104L));
+    }
+
+    @Test
+    void aSinkRunAsOneProcessorForTheClusterOpensOneConnectorAndTakesItsInputOnOneQueuePerSender() {
+        Map<String, NodeParallelism> nodes = new java.util.LinkedHashMap<>();
+        nodes.put("step", new NodeParallelism("step", 4, NodeParallelism.Origin.EXPLICIT,
+                NodeParallelism.Scope.NATIVE, 2, 2, 4, List.of()));
+        nodes.put("serve.s", new NodeParallelism("serve.s", 1, NodeParallelism.Origin.EXPLICIT,
+                NodeParallelism.Scope.TOTAL_ONE, 2, null, 1, List.of("requested-one")));
+        DagSource.PlannedDag planned = new DagSource.PlannedDag(new DAG(), new ExecutionShape(2, nodes, Map.of()),
+                List.of("m1", "m2"), Map.of("serve.s", new BatchSpec(100, "0ms")),
+                Map.of("step", List.of("step"), "serve.s", List.of("serve.s")),
+                Map.of("serve.s", List.of("step", "gather")));
+
+        ExecutionPlan plan = EngineLifecycleActuator.planOf(PIPE, PipelineActuationOwnership.Execution.unfenced(),
+                planned, T0, Map.of("serve.s", "pg"), Set.of("pg"));
+
+        // Four step processors and a gathering vertex no node runs the width of, each with a queue to the one
+        // writer: (4 + 1) queues of 1024.
+        assertThat(plan.nodes()).filteredOn(node -> node.node().equals("serve.s")).singleElement()
+                .extracting(ExecutionPlan.Node::resources)
+                .isEqualTo(new ExecutionPlan.Resources(1, "shared", 1, 200L, 5_120L));
+        assertThat(plan.nodes()).filteredOn(node -> node.node().equals("step")).singleElement()
+                .extracting(ExecutionPlan.Node::resources).as("only a sink is worked out resources for").isNull();
     }
 
     @Test
@@ -137,7 +176,7 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
         public PlannedDag plannedDagFor(String pipelineId, ExecutionFence fence) {
             PlannedDag planned = planned();
             return new PlannedDag(dagFor(pipelineId), planned.shape(), planned.members(), planned.batches(),
-                    planned.vertices());
+                    planned.vertices(), planned.feeding());
         }
 
         PlannedDag planned() {
@@ -148,7 +187,13 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
                     NodeParallelism.Scope.NATIVE, 3, 3, 9, List.of("rounded-up")));
             return new PlannedDag(new DAG(), new ExecutionShape(3, nodes, Map.of()), List.of("m1", "m2", "m3"),
                     Map.of("serve.s", new BatchSpec(512, "50ms")),
-                    Map.of("orders_src", List.of("orders_src"), "serve.s", List.of("route.serve.s", "serve.s")));
+                    Map.of("orders_src", List.of("orders_src"), "serve.s", List.of("route.serve.s", "serve.s")),
+                    Map.of("serve.s", List.of("orders_src")));
+        }
+
+        @Override
+        public Map<String, String> sinkConnectors(String pipelineId) {
+            return Map.of("serve.s", "pg");
         }
 
         @Override

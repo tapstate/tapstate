@@ -5141,7 +5141,20 @@ final class Repl {
         }
         out.println("  planned    " + plan.plannedAt() + " on " + String.join(", ", plan.members())
                 + (run.isEmpty() ? "" : " (" + String.join(", ", run) + ")"));
-        plan.nodes().forEach(node -> out.println("  width      " + node.node() + "  " + width(node)));
+        plan.nodes().forEach(node -> {
+            out.println("  width      " + node.node() + "  " + width(node));
+            if (node.resources() != null) {
+                out.println("  resources  " + node.node() + "  " + resources(node.resources()));
+            }
+        });
+    }
+
+    private static String resources(ExplainOutcome.PlanResources resources) {
+        return resources.writers() + (resources.writers() == 1 ? " writer, " : " writers, ")
+                + resources.connectorInstances() + " " + resources.connectorMode()
+                + (resources.connectorInstances() == 1 ? " connector" : " connectors")
+                + "; at most " + resources.bufferedRecords() + " records buffered and "
+                + resources.edgeQueueRecords() + " queued";
     }
 
     private static String width(ExplainOutcome.PlanNode node) {

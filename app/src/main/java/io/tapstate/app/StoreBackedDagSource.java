@@ -72,7 +72,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.TreeSet;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -186,25 +186,27 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /**
-     * The connectors the pipeline's sinks open: each serve.sync element's target source's, and that of the managed
-     * store a view materializes into. A view whose store is not configured contributes none here; building its
-     * sink refuses it with the code that names the missing store.
+     * The connector each of the pipeline's sinks opens: each serve.sync element's target source's, and that of the
+     * managed store a view materializes into, keyed by the sink's node. A view whose store is not configured has
+     * none here; building its sink refuses it with the code that names the missing store.
      */
     @Override
-    public Set<String> sinkConnectors(String pipelineId) {
+    public Map<String, String> sinkConnectors(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
-        Set<String> connectors = new TreeSet<>();
-        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
-            for (SyncElement element : serve.sync()) {
-                connectors.add(StoredArtifacts.requireSource(artifacts(), element.source()).connector());
-            }
-        }
+        Map<String, String> connectors = new TreeMap<>();
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             artifacts().get(ViewTargetResolver.resolve(view).sourceId())
                     .filter(SourceResource.class::isInstance)
                     .map(SourceResource.class::cast)
-                    .ifPresent(store -> connectors.add(store.connector()));
+                    .ifPresent(store -> connectors.put(PipelineDagBuilder.viewVertex(view), store.connector()));
+        }
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            for (int index = 0; index < serve.sync().size(); index++) {
+                SyncElement element = serve.sync().get(index);
+                connectors.put(PipelineDagBuilder.serveVertex(element, index),
+                        StoredArtifacts.requireSource(artifacts(), element.source()).connector());
+            }
         }
         return connectors;
     }
@@ -398,7 +400,8 @@ final class StoreBackedDagSource implements DagSource {
                         serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
                 FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier, shape,
                 drawn);
-        return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode());
+        return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
+                drawn.feedingByNode());
     }
 
     /**

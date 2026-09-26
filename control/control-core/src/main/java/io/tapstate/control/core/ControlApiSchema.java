@@ -411,6 +411,21 @@ public final class ControlApiSchema {
         node.put("reasons", array(string("Why the width is what it is: requested-one, source-reads-not-split, "
                 + "single-target-keyless, key-not-derivable, rounded-up, rounded-down, or budget:<name>")));
         node.put("batch", object(List.of("maxRecords", "maxWaitMillis"), batch, false));
+        Map<String, Object> resources = new LinkedHashMap<>();
+        resources.put("writers", positiveInteger("Processors writing the sink's rows, across the run"));
+        resources.put("connectorMode", withDescription(enumString("isolated", "shared"),
+                "Whether each writer opens a connector of its own, or the writers on one member share one"));
+        resources.put("connectorInstances", positiveInteger("Connectors the writers open, across the run"));
+        resources.put("bufferedRecords", withDescription(nonNegativeInteger(),
+                "Most records the writers hold between them: two batches each, one forming and one being written"));
+        resources.put("edgeQueueRecords", withDescription(nonNegativeInteger(),
+                "Most records the queues of the edges into the sink hold: one full queue from every processor "
+                        + "sending into it to every processor it takes its input on"));
+        node.put("resources", withDescription(object(List.of(
+                "writers", "connectorMode", "connectorInstances", "bufferedRecords", "edgeQueueRecords"),
+                resources, false), "What a sink holds open and buffers at its width, as upper bounds; absent for "
+                + "any node but a sink. A connector's own connection pool is sized inside the connector and is "
+                + "not counted"));
         Map<String, Object> properties = new LinkedHashMap<>();
         properties.put("claimGeneration", withDescription(nonNegativeInteger(),
                 "Generation of the claim the run was submitted under; absent where nothing fences the run"));

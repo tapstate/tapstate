@@ -18,16 +18,35 @@ import java.util.Map;
 public final class NodeVertices {
 
     private final Map<String, List<String>> byNode = new LinkedHashMap<>();
+    private final Map<String, List<String>> feeding = new LinkedHashMap<>();
 
     /** Notes that {@code vertex} runs at {@code node}'s width. */
     void add(String node, String vertex) {
         byNode.computeIfAbsent(node, ignored -> new ArrayList<>()).add(vertex);
     }
 
+    /** Notes that {@code vertex}, drawn for another node or for none, sends its rows into {@code node}. */
+    void feeds(String node, String vertex) {
+        feeding.computeIfAbsent(node, ignored -> new ArrayList<>()).add(vertex);
+    }
+
     /** Every node's vertices that run at its width, in the order they were drawn. */
     public Map<String, List<String>> byNode() {
+        return copyOf(byNode);
+    }
+
+    /**
+     * The vertices sending their rows into each sink, in the order they were connected: what the queues of the
+     * edges carrying a sink's input are sized by, since there is one from every processor of each of them to
+     * every processor the sink takes its input on.
+     */
+    public Map<String, List<String>> feedingByNode() {
+        return copyOf(feeding);
+    }
+
+    private static Map<String, List<String>> copyOf(Map<String, List<String>> source) {
         Map<String, List<String>> copy = new LinkedHashMap<>();
-        byNode.forEach((node, vertices) -> copy.put(node, List.copyOf(vertices)));
+        source.forEach((node, vertices) -> copy.put(node, List.copyOf(vertices)));
         return Collections.unmodifiableMap(copy);
     }
 }

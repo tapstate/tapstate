@@ -279,6 +279,7 @@ No explanation rule reads it; it answers beside the diagnosis.
 | `nodes[].memberCount`, `nodes[].computedLocal`, `nodes[].effective` | The member count and per-member count the width was worked out for, and the processors that makes in total. `computedLocal` is absent for `total-one` |
 | `nodes[].reasons` | Stable ids for why the width is what it is: `requested-one`, `source-reads-not-split`, `single-target-keyless`, `key-not-derivable`, `rounded-up`, `rounded-down`, or `budget:<name>` |
 | `nodes[].batch` | `maxRecords` and `maxWaitMillis`: the batch the node takes its input in |
+| `nodes[].resources` | Sinks only: `writers`; `connectorMode` (`isolated`: a connector per writer, `shared`: one per member, used only for an artifact certified to be shared) and `connectorInstances`; `bufferedRecords`, two batches per writer; and `edgeQueueRecords`, a full queue from every processor sending into the sink to every processor it takes its input on. These are upper bounds worked out before anything opens. A connector's own connection pool is sized inside the connector and is not counted |
 
 The status watch stream does not carry the plan. Read `status` again after a restart to see the new
 run's plan.

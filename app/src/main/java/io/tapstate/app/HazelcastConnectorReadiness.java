@@ -5,6 +5,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceAware;
 import com.hazelcast.core.MemberLeftException;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.adapters.pdk.ConnectorRef;
 import io.tapstate.core.common.TapstateException;
 
 import java.io.Serializable;
@@ -50,9 +51,9 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
     }
 
     @Override
-    public void requireEveryMemberCanLoad(String pipelineId, Set<String> connectors) {
+    public Set<String> requireEveryMemberCanLoad(String pipelineId, Set<String> connectors) {
         if (connectors.isEmpty()) {
-            return;
+            return Set.of();
         }
         List<String> asked = List.copyOf(new TreeSet<>(connectors));
         Map<String, Member> dataMembers = new TreeMap<>();
@@ -65,6 +66,7 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
                 member.getExecutorService(EXECUTOR).submitToMembers(new LoadConnectors(asked), dataMembers.values());
         long deadline = System.nanoTime() + timeout.toNanos();
         Map<String, Map<String, String>> loadedBy = new TreeMap<>();
+        Set<String> shared = new TreeSet<>(asked);
         for (Map.Entry<String, Member> asking : dataMembers.entrySet()) {
             String memberId = asking.getKey();
             for (Loaded loaded : answerOf(pipelineId, memberId, asked, answers.get(asking.getValue()), deadline)) {
@@ -73,6 +75,9 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
                 }
                 loadedBy.computeIfAbsent(loaded.connector(), ignored -> new TreeMap<>())
                         .put(memberId, loaded.contentHash());
+                if (!loaded.shareSafe()) {
+                    shared.remove(loaded.connector());
+                }
             }
         }
         loadedBy.forEach((connector, hashByMember) -> {
@@ -84,6 +89,7 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
                                 .collect(Collectors.joining(", "))), null);
             }
         });
+        return Set.copyOf(shared);
     }
 
     /**
@@ -121,19 +127,20 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
     }
 
     /**
-     * One connector as a member loaded it: the content hash of the artifact it staged, or why it could not. Plain
-     * text rather than an exception, because an error code does not cross members as an enum.
+     * One connector as a member loaded it: the content hash of the artifact it staged and whether that artifact is
+     * certified to be shared by the writers on one member, or why it could not load it. Plain text rather than an
+     * exception, because an error code does not cross members as an enum.
      */
-    record Loaded(String connector, String contentHash, String failure) implements Serializable {
+    record Loaded(String connector, String contentHash, boolean shareSafe, String failure) implements Serializable {
 
         private static final long serialVersionUID = 1L;
 
-        static Loaded of(String connector, String contentHash) {
-            return new Loaded(connector, contentHash, null);
+        static Loaded of(ConnectorRef loaded, String connector) {
+            return new Loaded(connector, loaded.contentHash(), loaded.shareSafe(), null);
         }
 
         static Loaded failed(String connector, String failure) {
-            return new Loaded(connector, null, failure);
+            return new Loaded(connector, null, false, failure);
         }
     }
 
@@ -168,7 +175,7 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
                     continue;
                 }
                 try {
-                    loaded.add(Loaded.of(connector, provisioner.resolve(connector).contentHash()));
+                    loaded.add(Loaded.of(provisioner.resolve(connector), connector));
                 } catch (RuntimeException failed) {
                     loaded.add(Loaded.failed(connector, reasonOf(failed)));
                 }

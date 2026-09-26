@@ -14,14 +14,14 @@ import java.util.Set;
  */
 interface ConnectorReadiness {
 
-    /** Asks no member: a server that is no cluster member has no other member to ask. */
-    ConnectorReadiness NONE = (pipelineId, connectors) -> {
-    };
+    /** Asks no member, and so knows of no connector certified to be shared. */
+    ConnectorReadiness NONE = (pipelineId, connectors) -> Set.of();
 
     /**
      * Returns once every member the run would take part on has loaded each of {@code connectors}, the same
-     * artifact on every member; otherwise refuses the start with a code naming the member and connector that
+     * artifact on every member, with those of them every member loaded as an artifact certified to be shared by
+     * the writers on one member; otherwise refuses the start with a code naming the member and connector that
      * could not, and why.
      */
-    void requireEveryMemberCanLoad(String pipelineId, Set<String> connectors);
+    Set<String> requireEveryMemberCanLoad(String pipelineId, Set<String> connectors);
 }

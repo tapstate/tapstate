@@ -253,7 +253,8 @@ class ObservabilityConsumerContractTest {
                 List.of(new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
                                 List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src")),
                         new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 3, 3, 9,
-                                List.of("rounded-up"), 512, 50L, List.of("route.orders_sink", "orders_sink"))),
+                                List.of("rounded-up"), 512, 50L, List.of("route.orders_sink", "orders_sink"))
+                                .withResources(new ExecutionPlan.Resources(9, "isolated", 9, 9_216L, 175_104L))),
                 Instant.parse("2026-09-20T09:58:00Z")));
         assertGolden(PipelineExplanationResponse.of(planned), "explain-with-plan.golden.json");
     }

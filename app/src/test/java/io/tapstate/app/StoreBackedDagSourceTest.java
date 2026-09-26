@@ -976,9 +976,10 @@ class StoreBackedDagSourceTest {
                         List.of(new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
         StoreBackedDagSource source = new StoreBackedDagSource(store);
 
-        assertThat(source.sinkConnectors("p")).containsExactly("mongodb", "oracle", "postgres");
-        assertThat(source.prepareStart("p", "tapstate").sinkConnectors())
-                .containsExactlyInAnyOrder("mongodb", "oracle", "postgres");
+        Map<String, String> bySink = Map.of(
+                "view.order_state", "mongodb", "serve.sync_1", "postgres", "serve.sync_2", "oracle");
+        assertThat(source.sinkConnectors("p")).containsExactlyInAnyOrderEntriesOf(bySink);
+        assertThat(source.prepareStart("p", "tapstate").sinkConnectors()).isEqualTo(bySink);
     }
 
     // ---- fixtures ----------------------------------------------------------------------

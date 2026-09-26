@@ -42,12 +42,12 @@ interface DagSource {
     }
 
     /**
-     * The connectors the pipeline's sinks open, by id. A sink opens its connector on whichever member runs it, so
-     * these are what every member a run takes part on has to be able to load. A source with no store-backed sinks
-     * opens none.
+     * The connector each of the pipeline's sinks opens, by id, keyed by the sink's node. A sink opens its connector
+     * on whichever member runs it, so these are what every member a run takes part on has to be able to load. A
+     * source with no store-backed sinks opens none.
      */
-    default Set<String> sinkConnectors(String pipelineId) {
-        return Set.of();
+    default Map<String, String> sinkConnectors(String pipelineId) {
+        return Map.of();
     }
 
     /**
@@ -88,11 +88,12 @@ interface DagSource {
 
     /**
      * A topology and the plan it was drawn from: {@code shape} holds each node's width, worked out for
-     * {@code members} - by stable id - {@code batches} the batch each node takes its input in, and
-     * {@code vertices} which of the topology's vertices run at each node's width.
+     * {@code members} - by stable id - {@code batches} the batch each node takes its input in,
+     * {@code vertices} which of the topology's vertices run at each node's width, and {@code feeding} which
+     * vertices send their rows into each sink.
      */
     record PlannedDag(DAG dag, ExecutionShape shape, List<String> members, Map<String, BatchSpec> batches,
-            Map<String, List<String>> vertices) {
+            Map<String, List<String>> vertices, Map<String, List<String>> feeding) {
 
         public PlannedDag {
             Objects.requireNonNull(dag, "dag");
@@ -100,6 +101,13 @@ interface DagSource {
             members = List.copyOf(Objects.requireNonNull(members, "members"));
             batches = Map.copyOf(Objects.requireNonNull(batches, "batches"));
             vertices = Map.copyOf(Objects.requireNonNull(vertices, "vertices"));
+            feeding = Map.copyOf(Objects.requireNonNull(feeding, "feeding"));
+        }
+
+        /** A plan that says nothing of what feeds its sinks. */
+        PlannedDag(DAG dag, ExecutionShape shape, List<String> members, Map<String, BatchSpec> batches,
+                Map<String, List<String>> vertices) {
+            this(dag, shape, members, batches, vertices, Map.of());
         }
     }
 
@@ -171,20 +179,20 @@ interface DagSource {
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot,
             Function<ExecutionFence, PlannedDag> dagBuilder,
-            Set<String> sinkConnectors) {
+            Map<String, String> sinkConnectors) {
 
         public StartPreparation {
             Objects.requireNonNull(capacity, "capacity");
             stateLocations = Set.copyOf(Objects.requireNonNull(stateLocations, "stateLocations"));
             Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
             Objects.requireNonNull(dagBuilder, "dagBuilder");
-            sinkConnectors = Set.copyOf(Objects.requireNonNull(sinkConnectors, "sinkConnectors"));
+            sinkConnectors = Map.copyOf(Objects.requireNonNull(sinkConnectors, "sinkConnectors"));
         }
 
         /** A preparation whose sinks open no connector. */
         StartPreparation(NestCapacity capacity, Set<OperatorStateLocation> stateLocations,
                 Optional<ArtifactStore> artifactSnapshot, Function<ExecutionFence, PlannedDag> dagBuilder) {
-            this(capacity, stateLocations, artifactSnapshot, dagBuilder, Set.of());
+            this(capacity, stateLocations, artifactSnapshot, dagBuilder, Map.of());
         }
 
         /**

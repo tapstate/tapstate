@@ -455,6 +455,7 @@ public final class PipelineDagBuilder {
         Map<String, List<String>> writersByChain = chains == null ? null : writersByChain(sinks, chains, shape);
         boolean startsTheRun = sinkAck != null && writersByChain != null;
         for (SinkNode sink : sinks) {
+            verticesOf(sink.upstream(), byKey).forEach(upstream -> drawn.feeds(sink.name(), upstream.getName()));
             if (shape.isNative(sink.name())) {
                 drawNativeSink(dag, sink, sinkAck, axes, chains, shape, byKey, outboundOrdinal, inboundOrdinal,
                         startsTheRun ? writersByChain : null);

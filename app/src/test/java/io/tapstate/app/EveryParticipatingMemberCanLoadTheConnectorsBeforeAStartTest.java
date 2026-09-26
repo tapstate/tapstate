@@ -198,7 +198,7 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
         bind(m1, one);
         bind(m2, two);
         bind(m3, three);
-        Started started = new Started(Set.of("pg", "mongodb"));
+        Started started = new Started(Map.of("serve.orders", "pg", "view.order_state", "mongodb"));
 
         started.actuator(readiness()).start(pipe);
 
@@ -214,7 +214,7 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
     void aPipelineWhoseSinksOpenNoConnectorAsksNoMember() {
         Loading one = new Loading("h1");
         bind(m1, one);
-        Started started = new Started(Set.of());
+        Started started = new Started(Map.of());
 
         started.actuator(readiness()).start(pipe);
 
@@ -254,15 +254,15 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
     /** What a start started: the captures it opened and the plans it wrote, over the idle stand-in topology. */
     private final class Started {
 
-        private final Set<String> sinkConnectors;
+        private final Map<String, String> sinkConnectors;
         private final List<String> captures = Collections.synchronizedList(new ArrayList<>());
         private final List<ExecutionPlan> plans = Collections.synchronizedList(new ArrayList<>());
 
         Started() {
-            this(Set.of("pg"));
+            this(Map.of("serve.orders", "pg"));
         }
 
-        Started(Set<String> sinkConnectors) {
+        Started(Map<String, String> sinkConnectors) {
             this.sinkConnectors = sinkConnectors;
         }
 
@@ -285,7 +285,7 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
                 }
 
                 @Override
-                public Set<String> sinkConnectors(String pipelineId) {
+                public Map<String, String> sinkConnectors(String pipelineId) {
                     return sinkConnectors;
                 }
             };

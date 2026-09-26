@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
@@ -11,9 +12,12 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Binds the converge loop's lifecycle actuator seam to the Jet execution engine and the source-side capture
@@ -107,7 +111,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // Every member the run would take part on loads the connectors its sinks open, asked before the run is
         // fenced or anything is opened: a member that finds out only as its sink opens fails a run that is
         // already reading, and its reason stays on that member.
-        connectors.requireEveryMemberCanLoad(pipelineId, prepared.sinkConnectors());
+        Set<String> sharedConnectors = connectors.requireEveryMemberCanLoad(
+                pipelineId, Set.copyOf(prepared.sinkConnectors().values()));
         // The run's own generation, taken before the first side effect for the same reason: a run this
         // member cannot fence is one nothing could later stop from writing, so it must not be half built.
         // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any
@@ -149,7 +154,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         DagSource.StartPlan plan = prepared.build(execution.fence());
         // Written down before the run is submitted, so a reader never finds a run executing on a plan nobody
         // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
-        plans.record(planOf(pipelineId, execution, plan.planned(), clock.instant()));
+        plans.record(planOf(pipelineId, execution, plan.planned(), clock.instant(), prepared.sinkConnectors(),
+                sharedConnectors));
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
@@ -238,18 +244,38 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         return engine.hasLiveJob(pipelineId);
     }
 
-    /**
-     * The plan a run is submitted on: which run it is, the members its widths were worked out for, and each node's
-     * width and batch as {@code planned} worked them out.
-     */
+    /** As below, for a run none of whose sinks opens a connector named here. */
     static ExecutionPlan planOf(String pipelineId, PipelineActuationOwnership.Execution execution,
             DagSource.PlannedDag planned, Instant plannedAt) {
+        return planOf(pipelineId, execution, planned, plannedAt, Map.of(), Set.of());
+    }
+
+    /**
+     * The plan a run is submitted on: which run it is, the members its widths were worked out for, and each node's
+     * width and batch as {@code planned} worked them out - with, for each sink in {@code sinkConnectors}, what it
+     * holds open and buffers at that width, its writers sharing a connector per member only where
+     * {@code sharedConnectors} names the connector it opens.
+     */
+    static ExecutionPlan planOf(String pipelineId, PipelineActuationOwnership.Execution execution,
+            DagSource.PlannedDag planned, Instant plannedAt, Map<String, String> sinkConnectors,
+            Set<String> sharedConnectors) {
         ExecutionFence fence = execution.fence();
+        Map<String, Integer> processorsByVertex = new HashMap<>();
+        planned.vertices().forEach((node, vertices) -> {
+            NodeParallelism parallelism = planned.shape().nodes().get(node);
+            if (parallelism != null) {
+                vertices.forEach(vertex -> processorsByVertex.put(vertex, parallelism.effective()));
+            }
+        });
         List<ExecutionPlan.Node> nodes = new ArrayList<>();
         planned.shape().nodes().forEach((node, parallelism) -> {
             BatchSpec batch = planned.batches().getOrDefault(node, BatchSpec.DEFAULTS);
-            nodes.add(ExecutionPlan.Node.of(parallelism, batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis(),
-                    planned.vertices().getOrDefault(node, List.of())));
+            ExecutionPlan.Node planning = ExecutionPlan.Node.of(parallelism, batch.effectiveMaxRecords(),
+                    batch.effectiveMaxWaitMillis(), planned.vertices().getOrDefault(node, List.of()));
+            String connector = sinkConnectors.get(node);
+            nodes.add(connector == null ? planning : planning.withResources(PlannedSinkResources.of(parallelism,
+                    batch.effectiveMaxRecords(), sharedConnectors.contains(connector),
+                    planned.feeding().getOrDefault(node, List.of()), processorsByVertex)));
         });
         return new ExecutionPlan(pipelineId, fence == null ? null : fence.claimGeneration(),
                 fence == null ? null : fence.executionGeneration(), execution.topologyRevision(), planned.members(),

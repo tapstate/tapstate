@@ -103,6 +103,14 @@ class PipelineExplainParityTest {
             item.put("effective", (long) node.effective());
             item.put("reasons", node.reasons());
             item.put("batch", Map.of("maxRecords", (long) node.maxRecords(), "maxWaitMillis", node.maxWaitMillis()));
+            if (node.resources() != null) {
+                item.put("resources", Map.of(
+                        "writers", (long) node.resources().writers(),
+                        "connectorMode", node.resources().connectorMode(),
+                        "connectorInstances", (long) node.resources().connectorInstances(),
+                        "bufferedRecords", node.resources().bufferedRecords(),
+                        "edgeQueueRecords", node.resources().edgeQueueRecords()));
+            }
             return item;
         }).toList());
         value.put("plannedAt", plan.plannedAt());

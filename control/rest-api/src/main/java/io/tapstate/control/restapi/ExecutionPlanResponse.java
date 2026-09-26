@@ -25,18 +25,32 @@ record ExecutionPlanResponse(Long claimGeneration, Long executionGeneration, Lon
     /**
      * One node of a plan: the target it was given and where that came from, whether it runs as one processor for
      * the cluster or the same number on every member, the member count and per-member count it was worked out
-     * for, the width that makes, why that is not the target where it is not, and the batch it takes its input
-     * in. {@code computedLocal} is omitted for a node run as one processor for the cluster, which has none.
+     * for, the width that makes, why that is not the target where it is not, the batch it takes its input in, and
+     * for a sink what it holds open and buffers at that width. {@code computedLocal} is omitted for a node run as
+     * one processor for the cluster, which has none, and {@code resources} for any node but a sink.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     record Node(String node, int requested, String requestedOrigin, String scope, int memberCount,
-            Integer computedLocal, int effective, List<String> reasons, Batch batch) {
+            Integer computedLocal, int effective, List<String> reasons, Batch batch, Resources resources) {
 
         static Node of(ExecutionPlan.Node node) {
+            ExecutionPlan.Resources resources = node.resources();
             return new Node(node.node(), node.requested(), node.origin(), node.scope(), node.memberCount(),
                     node.computedLocal(), node.effective(), node.reasons(),
-                    new Batch(node.maxRecords(), node.maxWaitMillis()));
+                    new Batch(node.maxRecords(), node.maxWaitMillis()),
+                    resources == null ? null : new Resources(resources.writers(), resources.connectorMode(),
+                            resources.connectorInstances(), resources.bufferedRecords(),
+                            resources.edgeQueueRecords()));
         }
+    }
+
+    /**
+     * What a sink holds open and buffers at its width, as upper bounds: its writers, whether each opens a connector
+     * of its own or the writers on one member share one and how many that opens, the most records the writers
+     * hold, and the most the queues of the edges into it hold.
+     */
+    record Resources(int writers, String connectorMode, int connectorInstances, long bufferedRecords,
+            long edgeQueueRecords) {
     }
 
     /** The most records a node takes its input in at once, and the longest it waits for them. */
