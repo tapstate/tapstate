@@ -9,7 +9,7 @@ import java.util.Set;
  * held to. One place spells them so that a producer, a projection and an export all mean the same key by
  * the same name; a key typed out at each site drifts the day one of them is retyped.
  *
- * <p>Five keys are closed sets, and a point carrying a value outside its set is refused where the fact
+ * <p>Six keys are closed sets, and a point carrying a value outside its set is refused where the fact
  * is built ({@link MetricFact}). An open set would be one the data could add a value to: a symbol nobody
  * recognised would become a series of its own, named by whatever produced it, and the number of series a
  * metric holds would be decided by the data rather than by anybody. The sets are small on purpose and grow
@@ -25,6 +25,7 @@ import java.util.Set;
  *       engine draws a vertex with, see {@link Stage}.</li>
  *   <li>{@link #TELEMETRY_SINK} — one of the fixed process telemetry workers.</li>
  *   <li>{@link #LIFECYCLE_VERB} — one of the four fixed lifecycle operations.</li>
+ *   <li>{@link #ROLLUP_RESOLUTION} — one of the five persisted history cache widths.</li>
  * </ul>
  *
  * <p>Three more keys name a thing the pipeline's own definition draws: the chain a frontier reading is
@@ -57,6 +58,8 @@ public final class MetricAttributes {
     public static final String TELEMETRY_SINK = "sink";
     /** The four lifecycle operations that may occupy the actuation worker. */
     public static final String LIFECYCLE_VERB = "verb";
+    /** One of the five persisted history bucket widths. */
+    public static final String ROLLUP_RESOLUTION = "resolution";
     /** The marker OpenTelemetry puts on the series that absorbs what a cardinality limit turned away. */
     public static final String OVERFLOW = "otel.metric.overflow";
 
@@ -64,13 +67,15 @@ public final class MetricAttributes {
     public static final Set<String> OPS = Set.of("insert", "update", "delete", "read", "ddl", "other");
     public static final Set<String> TELEMETRY_SINKS = Set.of("latest", "history", "export", "event");
     public static final Set<String> LIFECYCLE_VERBS = Set.of("start", "pause", "resume", "stop");
+    public static final Set<String> ROLLUP_RESOLUTIONS = Set.of("5m", "30m", "1h", "3h", "6h");
 
     private static final Map<String, Set<String>> CLOSED = Map.of(
             DIRECTION, DIRECTIONS,
             OP, OPS,
             STAGE, Stage.attributeValues(),
             TELEMETRY_SINK, TELEMETRY_SINKS,
-            LIFECYCLE_VERB, LIFECYCLE_VERBS);
+            LIFECYCLE_VERB, LIFECYCLE_VERBS,
+            ROLLUP_RESOLUTION, ROLLUP_RESOLUTIONS);
 
     private MetricAttributes() {
     }

@@ -115,6 +115,12 @@ public enum CardinalityBudget {
     OBSERVATION_JANITOR_LAST_SUCCESS_AGE("tapstate.process.observation_janitor.last_success.age", null, 1,
             Fold.HIGHEST),
     OBSERVATION_JANITOR_DEGRADED("tapstate.process.observation_janitor.degraded", null, 1, Fold.HIGHEST),
+    /** History cache health has only five fixed resolutions and no pipeline or bucket label. */
+    ROLLUP_CLOSED_THROUGH_AGE("tapstate.process.rollup.closed_through.age", null, 5, Fold.HIGHEST),
+    ROLLUP_BUCKET_COMPUTED("tapstate.process.rollup.bucket.computed", null, 5, Fold.ADDED),
+    ROLLUP_BUCKET_RETRIED("tapstate.process.rollup.bucket.retried", null, 5, Fold.ADDED),
+    ROLLUP_BUCKET_FAILED("tapstate.process.rollup.bucket.failed", null, 5, Fold.ADDED),
+    ROLLUP_BUILD_RAW_FALLBACK("tapstate.process.rollup.build.raw_fallback", null, 5, Fold.ADDED),
     /** Only the four fixed lifecycle verbs can create duration series. */
     LIFECYCLE_WORK_DURATION("tapstate.process.lifecycle.work.duration", null, 4, Fold.ADDED);
 

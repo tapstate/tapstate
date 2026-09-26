@@ -27,6 +27,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -34,11 +35,16 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
@@ -62,6 +68,12 @@ final class HistoryRollupWorker implements AutoCloseable {
 
     private enum BuildResult { WRITTEN, NO_INPUT, OWNER_LOST }
 
+    record LevelHealth(long computed, long retried, long failed, long rawFallback,
+            OptionalLong closedThroughAgeMillis) { }
+
+    record Health(Map<Resolution, LevelHealth> levels, OptionalLong maxBatchDurationMillis,
+            OptionalLong inFlightAgeMillis, boolean degraded) { }
+
     record Work(String pipelineId, Scope scope) {
         Work {
             Objects.requireNonNull(pipelineId, "pipelineId");
@@ -77,20 +89,35 @@ final class HistoryRollupWorker implements AutoCloseable {
     private final RateHistoryStore raw;
     private final HistoryRollupStore rollups;
     private final Clock clock;
+    private final Duration rawRetention;
     private final Duration sampleInterval;
     private final int batchSize;
     private final Supplier<List<Work>> current;
     private final Predicate<Work> permitted;
     private final ScheduledExecutorService scheduler;
+    private final long stalledAfterNanos;
     private final Map<LevelWork, Instant> nextBucket = new HashMap<>();
     private final Map<LevelWork, Instant> emptyRetryAt = new HashMap<>();
-    private final LinkedHashSet<Key> refreshHints = new LinkedHashSet<>();
+    private final Set<LevelWork> coveredLevels = new HashSet<>();
+    private final Set<Key> refreshHints = ConcurrentHashMap.newKeySet();
+    private final Semaphore refreshSlots = new Semaphore(MAX_REFRESH_HINTS);
+    private final Set<LevelWork> pendingRetries = new HashSet<>();
+    private final AtomicLongArray computed = new AtomicLongArray(LEVELS.size());
+    private final AtomicLongArray retried = new AtomicLongArray(LEVELS.size());
+    private final AtomicLongArray failed = new AtomicLongArray(LEVELS.size());
+    private final AtomicLongArray rawFallback = new AtomicLongArray(LEVELS.size());
+    private final AtomicLong inFlightSinceNanos = new AtomicLong();
+    private final AtomicLong maxBatchDurationNanos = new AtomicLong();
+    private volatile Map<Resolution, Instant> closedThrough = Map.of();
+    private volatile boolean hasWork;
+    private volatile boolean pendingFailure;
     private int nextWorkIndex;
 
     HistoryRollupWorker(RateHistoryStore raw, HistoryRollupStore rollups, Clock clock,
             Duration sampleInterval, int batchSize, Duration interval,
             Supplier<List<Work>> current, Predicate<Work> permitted, boolean schedule) {
         this.raw = Objects.requireNonNull(raw, "raw");
+        this.rawRetention = raw.retention();
         this.rollups = Objects.requireNonNull(rollups, "rollups");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.sampleInterval = Objects.requireNonNull(sampleInterval, "sampleInterval");
@@ -103,6 +130,8 @@ final class HistoryRollupWorker implements AutoCloseable {
             throw new IllegalArgumentException("rollup worker budgets are positive and bounded");
         }
         this.batchSize = batchSize;
+        stalledAfterNanos = TimeUnit.MILLISECONDS.toNanos(
+                Math.max(100L, Math.min(300_000L, interval.toMillis()) * 2));
         if (schedule) {
             scheduler = Executors.newSingleThreadScheduledExecutor(task -> {
                 Thread thread = new Thread(task, "tapstate-history-rollup");
@@ -119,17 +148,36 @@ final class HistoryRollupWorker implements AutoCloseable {
 
     /** One global batch, with at most one key per scope before moving to the next. */
     synchronized void runOneBatch() {
+        long started = System.nanoTime();
+        inFlightSinceNanos.set(started);
+        try {
+            runBatchContents();
+        } finally {
+            maxBatchDurationNanos.accumulateAndGet(System.nanoTime() - started, Math::max);
+            inFlightSinceNanos.set(0);
+        }
+    }
+
+    private void runBatchContents() {
         List<Work> currentWork;
         try {
             currentWork = List.copyOf(new LinkedHashSet<>(current.get()));
         } catch (RuntimeException failure) {
+            pendingFailure = true;
             LOG.warn("Could not enumerate history rollup work; retrying", failure);
             return;
         }
+        hasWork = !currentWork.isEmpty();
         if (currentWork.isEmpty()) {
             nextBucket.clear();
             emptyRetryAt.clear();
-            refreshHints.clear();
+            coveredLevels.clear();
+            for (Key hint : refreshHints) {
+                removeHint(hint);
+            }
+            pendingRetries.clear();
+            closedThrough = Map.of();
+            pendingFailure = false;
             return;
         }
         List<LevelWork> live = new ArrayList<>();
@@ -141,8 +189,13 @@ final class HistoryRollupWorker implements AutoCloseable {
         Set<LevelWork> liveSet = new HashSet<>(live);
         nextBucket.keySet().retainAll(liveSet);
         emptyRetryAt.keySet().retainAll(liveSet);
-        refreshHints.removeIf(key -> !liveSet.contains(new LevelWork(
-                new Work(key.pipelineId(), key.scope()), key.resolution())));
+        coveredLevels.retainAll(liveSet);
+        pendingRetries.retainAll(liveSet);
+        for (Key hint : refreshHints) {
+            if (!liveSet.contains(new LevelWork(new Work(hint.pipelineId(), hint.scope()), hint.resolution()))) {
+                removeHint(hint);
+            }
+        }
         int idle = 0;
         Set<LevelWork> failedThisPass = new HashSet<>();
         for (int attempts = 0; attempts < batchSize && idle < live.size();) {
@@ -152,37 +205,112 @@ final class HistoryRollupWorker implements AutoCloseable {
                 continue;
             }
             try {
-                if (!permitted.test(level.work()) || !processOne(level)) {
+                if (!permitted.test(level.work())) {
+                    pendingRetries.remove(level);
                     idle++;
                 } else {
-                    attempts++;
-                    idle = 0;
+                    if (pendingRetries.remove(level)) {
+                        retried.incrementAndGet(level.resolution().ordinal());
+                    }
+                    if (processOne(level)) {
+                        attempts++;
+                        idle = 0;
+                    } else {
+                        idle++;
+                    }
                 }
             } catch (RuntimeException failure) {
                 attempts++;
                 idle++;
                 failedThisPass.add(level);
+                pendingRetries.add(level);
+                failed.incrementAndGet(level.resolution().ordinal());
+                pendingFailure = true;
                 LOG.warn("Could not build a closed history rollup bucket for pipeline {}; retrying",
                         level.work().pipelineId(), failure);
             }
         }
+        publishClosedThrough(live);
+        pendingFailure = !pendingRetries.isEmpty();
     }
 
-    /** A lost hint never extends cache freshness; callers still descend when the old entry expires. */
-    synchronized boolean requestRefresh(Key key) {
+    private void publishClosedThrough(List<LevelWork> live) {
+        Map<Resolution, Instant> snapshot = new EnumMap<>(Resolution.class);
+        for (Resolution resolution : LEVELS) {
+            Instant oldest = null;
+            boolean complete = true;
+            for (LevelWork level : live) {
+                if (level.resolution() != resolution) {
+                    continue;
+                }
+                Instant frontier = coveredLevels.contains(level) ? nextBucket.get(level) : null;
+                if (frontier == null) {
+                    complete = false;
+                    break;
+                }
+                if (oldest == null || frontier.isBefore(oldest)) {
+                    oldest = frontier;
+                }
+            }
+            if (complete && oldest != null) {
+                snapshot.put(resolution, oldest);
+            }
+        }
+        closedThrough = Map.copyOf(snapshot);
+    }
+
+    /** Reads only atomics and the last published frontier, never the worker's monitor or a store. */
+    Health health() {
+        long nowNanos = System.nanoTime();
+        long started = inFlightSinceNanos.get();
+        OptionalLong inFlightAge = started == 0 ? OptionalLong.empty()
+                : OptionalLong.of(TimeUnit.NANOSECONDS.toMillis(nowNanos - started));
+        long maximum = maxBatchDurationNanos.get();
+        OptionalLong maximumAge = maximum == 0 ? OptionalLong.empty()
+                : OptionalLong.of(TimeUnit.NANOSECONDS.toMillis(maximum));
+        Map<Resolution, LevelHealth> levels = new EnumMap<>(Resolution.class);
+        if (hasWork) {
+            Map<Resolution, Instant> frontiers = closedThrough;
+            Instant now = clock.instant();
+            for (Resolution resolution : LEVELS) {
+                Instant frontier = frontiers.get(resolution);
+                levels.put(resolution, new LevelHealth(computed.get(resolution.ordinal()),
+                        retried.get(resolution.ordinal()), failed.get(resolution.ordinal()),
+                        rawFallback.get(resolution.ordinal()),
+                        frontier == null ? OptionalLong.empty()
+                                : OptionalLong.of(Math.max(0L,
+                                        Duration.between(frontier, now).toMillis()))));
+            }
+        }
+        return new Health(Map.copyOf(levels), maximumAge, inFlightAge,
+                pendingFailure || (started != 0 && nowNanos - started >= stalledAfterNanos));
+    }
+
+    /** A lost hint never extends cache freshness; this offer never waits for worker I/O. */
+    boolean requestRefresh(Key key) {
         Objects.requireNonNull(key, "key");
         Instant now = clock.instant();
         if (key.bucketEnd().isAfter(now)
-                || key.bucketStart().isBefore(ceil(now.minus(raw.retention()), key.resolution()))) {
+                || key.bucketStart().isBefore(ceil(now.minus(rawRetention), key.resolution()))) {
             return false;
         }
         if (refreshHints.contains(key)) {
             return true;
         }
-        if (refreshHints.size() >= MAX_REFRESH_HINTS) {
-            return false;
+        if (!refreshSlots.tryAcquire()) {
+            return refreshHints.contains(key);
         }
-        return refreshHints.add(key);
+        if (refreshHints.add(key)) {
+            return true;
+        }
+        refreshSlots.release();
+        return true;
+    }
+
+    private void removeHint(Key key) {
+        if (refreshHints.remove(key)) {
+            refreshSlots.release();
+        }
     }
 
     private boolean processOne(LevelWork level) {
@@ -193,13 +321,13 @@ final class HistoryRollupWorker implements AutoCloseable {
                         && key.resolution() == resolution)
                 .findFirst().orElse(null);
         if (hinted != null) {
-            if (hinted.bucketStart().isBefore(ceil(clock.instant().minus(raw.retention()), resolution))) {
-                refreshHints.remove(hinted);
+            if (hinted.bucketStart().isBefore(ceil(clock.instant().minus(rawRetention), resolution))) {
+                removeHint(hinted);
                 return true;
             }
             BuildResult result = upsert(hinted);
             if (result != BuildResult.OWNER_LOST) {
-                refreshHints.remove(hinted);
+                removeHint(hinted);
             }
             if (result == BuildResult.WRITTEN) {
                 emptyRetryAt.remove(level);
@@ -214,7 +342,7 @@ final class HistoryRollupWorker implements AutoCloseable {
 
         Instant from = nextBucket.get(level);
         if (from == null) {
-            Instant cutoff = ceil(clock.instant().minus(raw.retention()), resolution);
+            Instant cutoff = ceil(clock.instant().minus(rawRetention), resolution);
             Page first = raw.readPageVisible(work.pipelineId(), visibility(work.scope()),
                     cutoff, clock.instant(), null, 1);
             if (first.entries().isEmpty()) {
@@ -223,7 +351,7 @@ final class HistoryRollupWorker implements AutoCloseable {
             from = floor(first.entries().getFirst().key().observedAt(), resolution);
             nextBucket.put(level, from);
         }
-        Instant cutoff = ceil(clock.instant().minus(raw.retention()), resolution);
+        Instant cutoff = ceil(clock.instant().minus(rawRetention), resolution);
         if (from.isBefore(cutoff)) {
             from = cutoff;
             nextBucket.put(level, from);
@@ -244,6 +372,7 @@ final class HistoryRollupWorker implements AutoCloseable {
         }
         emptyRetryAt.remove(level);
         nextBucket.put(level, key.bucketEnd());
+        coveredLevels.add(level);
         return true;
     }
 
@@ -254,7 +383,11 @@ final class HistoryRollupWorker implements AutoCloseable {
                 return BuildResult.OWNER_LOST;
             }
             rollups.upsert(cascaded);
+            computed.incrementAndGet(key.resolution().ordinal());
             return BuildResult.WRITTEN;
+        }
+        if (key.resolution() != Resolution.PT5M) {
+            rawFallback.incrementAndGet(key.resolution().ordinal());
         }
         return upsertFromRaw(key);
     }
@@ -263,7 +396,7 @@ final class HistoryRollupWorker implements AutoCloseable {
         Instant readStartedAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
         Visibility visibility = visibility(key.scope());
         Entry predecessor = raw.predecessorVisible(key.pipelineId(), visibility, key.bucketStart())
-                .filter(entry -> !entry.key().observedAt().isBefore(readStartedAt.minus(raw.retention())))
+                .filter(entry -> !entry.key().observedAt().isBefore(readStartedAt.minus(rawRetention)))
                 .orElse(null);
         List<Entry> entries = new ArrayList<>();
         TreeSet<String> tables = new TreeSet<>();
@@ -331,6 +464,7 @@ final class HistoryRollupWorker implements AutoCloseable {
         }
         rollups.upsert(new Bucket(key, computedAt, readStartedAt, validUntil, tooLarge,
                 tooLarge ? List.of() : fragments, tooLarge ? List.of() : gaps, entries.size()));
+        computed.incrementAndGet(key.resolution().ordinal());
         return BuildResult.WRITTEN;
     }
 

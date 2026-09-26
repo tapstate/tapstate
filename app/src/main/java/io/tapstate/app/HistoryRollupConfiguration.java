@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.HistoryRollupStore.Scope;
 import io.tapstate.spi.store.RateHistoryStore.Visibility;
@@ -9,6 +10,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -20,14 +22,20 @@ class HistoryRollupConfiguration {
 
     @Bean(destroyMethod = "close")
     HistoryRollupWorker historyRollupWorker(StorePort storePort, MetricsHistoryProperties history,
-            ClusterMembershipGate membership, PipelineActuationOwnership actuation, Clock clock) {
+            ClusterMembershipGate membership, PipelineActuationOwnership actuation, Clock clock,
+            MetricsExport export) {
         ArtifactStore artifacts = storePort.artifacts();
-        return new HistoryRollupWorker(storePort.rateHistory(), storePort.historyRollups(), clock,
+        HistoryRollupWorker worker = new HistoryRollupWorker(
+                storePort.rateHistory(), storePort.historyRollups(), clock,
                 history.getSampleInterval(), HistoryRollupWorker.DEFAULT_BATCH_SIZE,
                 HistoryRollupWorker.DEFAULT_INTERVAL,
                 () -> currentWork(storePort.desired().pipelineIds(), artifacts),
                 work -> membership.businessEligible() && currentOwner(artifacts, work)
                         && actuation.permit(work.pipelineId()).granted(), true);
+        Instant startedAt = clock.instant();
+        export.observeProcess("rollup", () -> HistoryRollupFacts.snapshot(
+                worker.health(), startedAt, clock.instant()));
+        return worker;
     }
 
     static List<HistoryRollupWorker.Work> currentWork(List<String> pipelineIds, ArtifactStore artifacts) {

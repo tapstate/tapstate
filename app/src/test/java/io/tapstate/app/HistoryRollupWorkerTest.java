@@ -1,6 +1,9 @@
 package io.tapstate.app;
 
+import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.spi.store.HistoryRollupStore.Bucket;
 import io.tapstate.spi.store.HistoryRollupStore.Key;
@@ -13,6 +16,11 @@ import io.tapstate.core.model.Resource;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
+import java.net.ServerSocket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -23,6 +31,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -34,6 +47,111 @@ class HistoryRollupWorkerTest {
     private static final Instant START = TEN.minus(Duration.ofHours(1));
     private static final Scope SCOPED = Scope.incarnation("inc-a");
     private static final Key FIRST = new Key(ID, SCOPED, Resolution.PT5M, TEN);
+
+    @Test
+    void processHealthReportsFiveClosedResolutionsAndRecoveryWithoutIdentityLabels() {
+        MutableClock clock = new MutableClock(TEN.plus(Duration.ofMinutes(6)));
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        raw.appendScoped(sample(TEN.plusSeconds(60), 10, 1), owner(1));
+        MemoryRollups rollups = new MemoryRollups();
+        rollups.failNextUpsert = true;
+
+        try (HistoryRollupWorker worker = worker(raw, rollups, clock, 1,
+                List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+            assertThat(HistoryRollupFacts.snapshot(worker.health(), START, clock.instant())).isEmpty();
+
+            worker.runOneBatch();
+            HistoryRollupWorker.Health failedHealth = worker.health();
+            assertThat(failedHealth.degraded()).isTrue();
+            assertThat(failedHealth.levels().get(Resolution.PT5M).failed()).isEqualTo(1);
+            assertThat(failedHealth.levels().get(Resolution.PT5M).closedThroughAgeMillis()).isEmpty();
+
+            worker.runOneBatch();
+            HistoryRollupWorker.Health recovered = worker.health();
+            assertThat(recovered.degraded()).isFalse();
+            assertThat(recovered.levels()).hasSize(5);
+            assertThat(recovered.levels().get(Resolution.PT5M).computed()).isEqualTo(1);
+            assertThat(recovered.levels().get(Resolution.PT5M).retried()).isEqualTo(1);
+            assertThat(recovered.levels().get(Resolution.PT5M).closedThroughAgeMillis())
+                    .hasValue(Duration.ofMinutes(1).toMillis());
+            assertThat(recovered.maxBatchDurationMillis()).isPresent();
+
+            List<MetricFact> facts = HistoryRollupFacts.snapshot(recovered, START, clock.instant());
+            assertThat(facts).extracting(MetricFact::name).contains(
+                    "tapstate.process.rollup.closed_through.age",
+                    "tapstate.process.rollup.bucket.computed",
+                    "tapstate.process.rollup.bucket.retried",
+                    "tapstate.process.rollup.bucket.failed",
+                    "tapstate.process.rollup.build.raw_fallback",
+                    "tapstate.process.rollup.batch.duration.max",
+                    "tapstate.process.rollup.degraded");
+            assertThat(facts.stream().flatMap(fact -> fact.points().stream()))
+                    .allSatisfy(point -> assertThat(point.attributes().keySet())
+                            .isSubsetOf(MetricAttributes.ROLLUP_RESOLUTION));
+            assertThat(facts.stream().flatMap(fact -> fact.points().stream())
+                    .map(point -> point.attributes().get(MetricAttributes.ROLLUP_RESOLUTION))
+                    .filter(java.util.Objects::nonNull).distinct())
+                    .containsExactlyInAnyOrderElementsOf(MetricAttributes.ROLLUP_RESOLUTIONS);
+        }
+    }
+
+    @Test
+    void blockedRollupStoreCannotBlockHealthScrapeOrBoundedRefreshOffer() throws Exception {
+        MutableClock clock = new MutableClock(TEN.plus(Duration.ofMinutes(6)));
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        raw.appendScoped(sample(TEN.plusSeconds(60), 10, 1), owner(1));
+        MemoryRollups rollups = new MemoryRollups();
+        rollups.readEntered = new CountDownLatch(1);
+        rollups.releaseRead = new CountDownLatch(1);
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
+        MetricsExportProperties properties = new MetricsExportProperties();
+        properties.getPrometheus().setPort(port);
+        ExecutorService threads = Executors.newFixedThreadPool(2);
+        try (HistoryRollupWorker worker = new HistoryRollupWorker(raw, rollups, clock,
+                Duration.ofMinutes(1), 1, Duration.ofMillis(20),
+                () -> List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true, false);
+             MetricsExport export = RuntimeConvergenceConfiguration.metricsExportFor(properties)) {
+            export.observeProcess("rollup", () -> HistoryRollupFacts.snapshot(
+                    worker.health(), START, clock.instant()));
+            Future<?> blocked = threads.submit(worker::runOneBatch);
+            assertThat(rollups.readEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (!worker.health().degraded() && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            Future<HttpResponse<String>> scrape = threads.submit(() -> {
+                HistoryRollupWorker.Health health = worker.health();
+                assertThat(health.degraded()).isTrue();
+                assertThat(health.inFlightAgeMillis()).isPresent();
+                for (int index = 0; index < HistoryRollupWorker.MAX_REFRESH_HINTS; index++) {
+                    assertThat(worker.requestRefresh(new Key(ID, SCOPED, Resolution.PT5M,
+                            TEN.minus(Duration.ofMinutes(5L * index))))).isTrue();
+                }
+                assertThat(worker.requestRefresh(FIRST)).isTrue();
+                assertThat(worker.requestRefresh(new Key(ID, SCOPED, Resolution.PT5M,
+                        TEN.minus(Duration.ofMinutes(5L * HistoryRollupWorker.MAX_REFRESH_HINTS)))))
+                        .isFalse();
+                return HttpClient.newHttpClient().send(
+                        HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/metrics"))
+                                .GET().build(), HttpResponse.BodyHandlers.ofString());
+            });
+            HttpResponse<String> response = scrape.get(2, TimeUnit.SECONDS);
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.body()).containsPattern("tapstate_process_rollup_degraded\\{[^}]*\\} 1")
+                    .contains("tapstate_process_rollup_batch_in_flight_age_milliseconds")
+                    .doesNotContain("tapstate_pipeline_id=")
+                    .doesNotContain("bucketStart=");
+            rollups.releaseRead.countDown();
+            blocked.get(5, TimeUnit.SECONDS);
+            assertThat(worker.health().degraded()).isFalse();
+        } finally {
+            rollups.releaseRead.countDown();
+            threads.shutdownNow();
+        }
+    }
 
     @Test
     void closedFiveMinuteBucketUsesRawAggregatorAndKeepsIncarnationsSeparate() {
@@ -480,6 +598,8 @@ class HistoryRollupWorkerTest {
         private final List<Key> attempts = new ArrayList<>();
         private boolean failNextUpsert;
         private boolean alwaysFail;
+        private CountDownLatch readEntered;
+        private CountDownLatch releaseRead;
 
         @Override public void upsert(Bucket bucket) {
             attempts.add(bucket.key());
@@ -489,7 +609,20 @@ class HistoryRollupWorkerTest {
             }
             rows.put(bucket.key(), bucket);
         }
-        @Override public Optional<Bucket> read(Key key) { return Optional.ofNullable(rows.get(key)); }
+        @Override public Optional<Bucket> read(Key key) {
+            if (readEntered != null) {
+                readEntered.countDown();
+                try {
+                    if (!releaseRead.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("injected rollup read did not resume");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("injected rollup read was interrupted", interrupted);
+                }
+            }
+            return Optional.ofNullable(rows.get(key));
+        }
         @Override public List<Bucket> readRange(String pipelineId, Scope scope, Resolution resolution,
                 Instant from, Instant to, int limit) {
             return rows.values().stream().filter(bucket -> bucket.key().pipelineId().equals(pipelineId))
