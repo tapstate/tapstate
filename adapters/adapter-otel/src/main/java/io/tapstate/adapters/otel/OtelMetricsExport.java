@@ -104,6 +104,11 @@ public final class OtelMetricsExport implements MetricsExport {
     }
 
     @Override
+    public void observeProcess(String source, Supplier<List<MetricFact>> facts) {
+        producer.observeProcess(source, facts);
+    }
+
+    @Override
     public void forgetPipelinesOutside(Collection<String> pipelineIds) {
         producer.forgetPipelinesOutside(pipelineIds);
     }

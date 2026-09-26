@@ -36,6 +36,9 @@ enum BootError implements TapstateErrorCode {
     /** The selected cluster profile and bootstrap member count cannot provide its promised safety. */
     CLUSTER_PROFILE_INVALID("boot.cluster-profile-invalid", Set.of()),
 
+    /** The cold observation cleanup budget or cadence is outside its bounded range. */
+    OBSERVABILITY_JANITOR_CONFIG_INVALID("boot.observability-janitor-config-invalid", Set.of()),
+
     /** Member heartbeats require positive whole-second values and a longer failure-detection window. */
     HEARTBEAT_CONFIG_INVALID("boot.heartbeat-config-invalid", Set.of()),
 

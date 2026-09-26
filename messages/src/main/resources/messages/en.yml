@@ -135,6 +135,9 @@ boot.node-session-renew-interval-invalid:
 boot.node-session-ttl-invalid:
   message: "The node-session lease lifetime must be positive."
   solution: "Set tapstate.cluster.node-session-ttl to a positive duration."
+boot.observability-janitor-config-invalid:
+  message: "The observability janitor settings are invalid."
+  solution: "Set the batch size between 1 and 256 and the interval to at least 1 millisecond."
 boot.workload-claim-renew-interval-invalid:
   message: "The workload-claim renewal interval must be positive and shorter than its lease."
   solution: "Set tapstate.cluster.workload-claim-renew-interval below tapstate.cluster.workload-claim-ttl."

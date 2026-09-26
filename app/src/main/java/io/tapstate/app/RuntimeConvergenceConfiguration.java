@@ -16,6 +16,7 @@ import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.adapters.otel.OtelMetricsExport;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.ClusterIdentityStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.beans.factory.annotation.Value;
@@ -24,6 +25,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 import java.time.Clock;
+import java.time.Duration;
 
 /**
  * Wires the runtime convergence loop into the assembly root — the first runtime-ring module the server
@@ -149,6 +151,23 @@ class RuntimeConvergenceConfiguration {
             MetricsExport export, ObservationScopeRegistry scopes, StorePort storePort) {
         return new TelemetryDispatcher(publisher, sampler, export, scopes, storePort.events(),
                 TelemetryDispatcher.DEFAULT_LATEST_WORKERS, TelemetryDispatcher.DEFAULT_QUEUE_CAPACITY);
+    }
+
+    /** Orphan cleanup has its own cold worker and never runs on the convergence scheduler. */
+    @Bean(destroyMethod = "close")
+    ObservationJanitor observationJanitor(StorePort storePort, ClusterProperties cluster,
+            ClusterIdentityStore identities, MetricsExport export, Clock clock,
+            @Value("${tapstate.observability.janitor.batch-size:16}") int batchSize,
+            @Value("${tapstate.observability.janitor.interval:PT1M}") Duration interval) {
+        String clusterId = cluster.getProfile() == ClusterProperties.Profile.SINGLE
+                ? DataPlaneActuationConfiguration.standaloneClusterId(cluster, identities)
+                : cluster.getId();
+        ObservationJanitor janitor = new ObservationJanitor(storePort.observations(), storePort.artifacts(),
+                storePort.workloadClaims(), clusterId, batchSize, interval);
+        Instant startedAt = clock.instant();
+        export.observeProcess("janitor", () -> ObservationJanitorFacts.snapshot(
+                janitor.health(), startedAt, clock.instant()));
+        return janitor;
     }
 
     @Bean

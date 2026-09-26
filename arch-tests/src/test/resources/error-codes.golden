@@ -51,6 +51,7 @@ boot.node-id-in-use
 boot.node-id-required
 boot.node-session-renew-interval-invalid
 boot.node-session-ttl-invalid
+boot.observability-janitor-config-invalid
 boot.workload-claim-renew-interval-invalid
 boot.workload-claim-ttl-invalid
 capture.claim-lost

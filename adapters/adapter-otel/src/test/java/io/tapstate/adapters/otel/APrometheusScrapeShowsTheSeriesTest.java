@@ -37,9 +37,12 @@ class APrometheusScrapeShowsTheSeriesTest {
     void aScrapeReadsProcessHealthWithoutAnyPipelineObservation() throws Exception {
         int port = freePort();
         try (OtelMetricsExport export = OtelMetricsExport.start(ExportSettings.prometheusOn("127.0.0.1", port))) {
-            export.observeProcess(() -> List.of(MetricFact.single(
+            export.observeProcess("telemetry", () -> List.of(MetricFact.single(
                     "tapstate.process.telemetry.degraded", MetricType.GAUGE, "1",
                     MetricPoint.reading(Map.of(MetricAttributes.TELEMETRY_SINK, "latest"), AT, 1))));
+            export.observeProcess("janitor", () -> List.of(MetricFact.single(
+                    "tapstate.process.observation_janitor.degraded", MetricType.GAUGE, "1",
+                    MetricPoint.reading(Map.of(), AT, 0))));
 
             HttpResponse<String> response = HttpClient.newHttpClient().send(
                     HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/metrics")).GET().build(),
@@ -48,6 +51,7 @@ class APrometheusScrapeShowsTheSeriesTest {
             assertThat(response.statusCode()).isEqualTo(200);
             assertThat(response.body())
                     .containsPattern("tapstate_process_telemetry_degraded\\{[^}]*sink=\\\"latest\\\"[^}]*\\} 1")
+                    .containsPattern("tapstate_process_observation_janitor_degraded\\{[^}]*\\} 0")
                     .doesNotContain("tapstate_pipeline_state");
         }
     }

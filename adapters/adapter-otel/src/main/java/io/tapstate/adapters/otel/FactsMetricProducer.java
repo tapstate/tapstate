@@ -94,7 +94,7 @@ final class FactsMetricProducer implements MetricProducer {
     private final Instant started;
     private final CardinalityBudget.Folder folder = CardinalityBudget.folder();
     private final Map<String, Offered> latest = new ConcurrentHashMap<>();
-    private volatile Supplier<List<MetricFact>> processFacts = List::of;
+    private final Map<String, Supplier<List<MetricFact>>> processFacts = new ConcurrentHashMap<>();
 
     /** Per instrument, the attribute sets that hold a series of their own past the export limit, in first-seen order. */
     private final Map<String, Set<Map<String, String>>> named = new HashMap<>();
@@ -119,7 +119,11 @@ final class FactsMetricProducer implements MetricProducer {
 
     /** Process facts are read on collection, independently of observation and store worker success. */
     void observeProcess(Supplier<List<MetricFact>> facts) {
-        processFacts = Objects.requireNonNull(facts, "facts");
+        observeProcess("default", facts);
+    }
+
+    void observeProcess(String source, Supplier<List<MetricFact>> facts) {
+        processFacts.put(Objects.requireNonNull(source, "source"), Objects.requireNonNull(facts, "facts"));
     }
 
     /** Drops what is held for every pipeline outside {@code pipelineIds}; their series stop with the next collection. */
@@ -176,13 +180,15 @@ final class FactsMetricProducer implements MetricProducer {
                         .points.addAll(fact.points());
             }
         }
-        try {
-            for (MetricFact fact : Objects.requireNonNull(processFacts.get(), "process facts")) {
-                byInstrument.computeIfAbsent(fact.name(), name -> new Series(fact.type(), fact.unit()))
-                        .points.addAll(fact.points());
+        for (Map.Entry<String, Supplier<List<MetricFact>>> source : new TreeMap<>(processFacts).entrySet()) {
+            try {
+                for (MetricFact fact : Objects.requireNonNull(source.getValue().get(), "process facts")) {
+                    byInstrument.computeIfAbsent(fact.name(), name -> new Series(fact.type(), fact.unit()))
+                            .points.addAll(fact.points());
+                }
+            } catch (RuntimeException unreadable) {
+                LOG.warn("Could not read {} process health for metrics export", source.getKey(), unreadable);
             }
-        } catch (RuntimeException unreadable) {
-            LOG.warn("Could not read process telemetry health for metrics export", unreadable);
         }
         List<MetricData> out = new ArrayList<>();
         byInstrument.forEach((name, series) ->

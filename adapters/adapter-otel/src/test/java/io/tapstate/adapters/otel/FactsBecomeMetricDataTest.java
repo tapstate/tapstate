@@ -59,6 +59,22 @@ class FactsBecomeMetricDataTest {
                 .getLongGaugeData().getPoints()).extracting(LongPointData::getValue).containsExactly(0L);
     }
 
+    @Test
+    void oneUnreadableProcessSourceDoesNotSuppressAnotherSourcesHealth() {
+        producer.observeProcess("telemetry", () -> {
+            throw new IllegalStateException("telemetry supplier unavailable");
+        });
+        producer.observeProcess("janitor", () -> List.of(MetricFact.single(
+                "tapstate.process.observation_janitor.degraded", MetricType.GAUGE, "1",
+                MetricPoint.reading(Map.of(), AT, 1))));
+
+        MetricData metric = only(producer.produce(Resource.empty()),
+                "tapstate.process.observation_janitor.degraded");
+        assertThat(metric.getLongGaugeData().getPoints()).extracting(LongPointData::getValue)
+                .containsExactly(1L);
+    }
+
+
     private static MetricData only(Collection<MetricData> produced, String name) {
         List<MetricData> named = produced.stream().filter(metric -> metric.getName().equals(name)).toList();
         assertThat(named).as("one metric named %s", name).hasSize(1);

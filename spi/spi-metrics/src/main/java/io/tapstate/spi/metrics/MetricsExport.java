@@ -31,6 +31,11 @@ public interface MetricsExport extends AutoCloseable {
     default void observeProcess(Supplier<List<MetricFact>> facts) {
     }
 
+    /** Replaces one named process reading without replacing other local health sources. */
+    default void observeProcess(String source, Supplier<List<MetricFact>> facts) {
+        observeProcess(facts);
+    }
+
     /** Drops what is held for every pipeline outside {@code pipelineIds}, which is the set that still exists. */
     void forgetPipelinesOutside(Collection<String> pipelineIds);
 

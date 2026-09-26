@@ -331,7 +331,8 @@ final class TelemetryDispatcher implements AutoCloseable {
             wired.add(Sink.EVENT);
         }
         Set<Sink> enabled = Set.copyOf(wired);
-        export.observeProcess(() -> TelemetryProcessFacts.snapshot(health(), enabled, startedAt, Instant.now()));
+        export.observeProcess("telemetry",
+                () -> TelemetryProcessFacts.snapshot(health(), enabled, startedAt, Instant.now()));
     }
 
     void offerEvent(PipelineEvent event) {
