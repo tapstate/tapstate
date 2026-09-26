@@ -6,6 +6,7 @@ import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.Frontend;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.HistoryCursorCodec;
+import io.tapstate.control.core.EventsCursorCodec;
 import io.tapstate.control.core.Operation;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PipelineMetrics;
@@ -14,6 +15,7 @@ import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.PipelineExplainService;
 import io.tapstate.control.core.PipelineHistoryQueryService;
+import io.tapstate.control.core.PipelineEventsQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineSnapshot;
@@ -34,6 +36,7 @@ import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.PipelineEvent;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -43,6 +46,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.RateHistoryStore;
+import io.tapstate.spi.store.PipelineEventStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -54,6 +58,7 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
 import io.tapstate.messages.ExplanationCatalog;
+import io.tapstate.messages.EventCatalog;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -183,6 +188,7 @@ class PipelineObservationApiTest {
                 Map.of("records.out", 100L, "bytes.out", 1_000L), Map.of("orders", 5L), COUNTING_SINCE));
         history.append(new RateSample("pl1", NOW.minusSeconds(60),
                 Map.of("records.out", 700L, "bytes.out", 13_000L), Map.of("orders", 2L), COUNTING_SINCE));
+        context.getBean(FakePipelineEventStore.class).clear();
         context.getBean(FakeChainStore.class).reset();
         context.getBean(FakeStoppedPipelines.class).reset();
     }
@@ -490,6 +496,99 @@ class PipelineObservationApiTest {
         assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
     }
 
+    @Test
+    void eventsAreAuthenticatedPagedAndReadableWithoutCurrentObservation() {
+        FakePipelineEventStore events = context.getBean(FakePipelineEventStore.class);
+        Instant from = NOW.minusSeconds(3600);
+        events.append(new PipelineEvent("ev-old", "pl1", "old-inc", 1,
+                PipelineEvent.Kind.STATE_CHANGED, from.plusSeconds(1), null, null, null, null, null));
+        events.append(new PipelineEvent("ev-a", "pl1", "inc-test", 1,
+                PipelineEvent.Kind.FAILURE, from.plusSeconds(600), PipelineState.RUNNING, PipelineState.FAILED,
+                new ObservationFailure("engine.job-failed",
+                        Map.of("pipeline", "pl1", "cause", "sink refused the batch")), null, null));
+        events.append(new PipelineEvent("ev-b", "pl1", "inc-test", 2,
+                PipelineEvent.Kind.EXECUTION_RECOVERED, from.plusSeconds(720),
+                PipelineState.FAILED, PipelineState.RUNNING, null, null, null));
+        PipelineEvent.Gap lost = new PipelineEvent.Gap(from.minusSeconds(60), from.plusSeconds(900),
+                List.of(PipelineEvent.GapReason.QUEUE_FULL, PipelineEvent.GapReason.WRITE_FAILURE));
+        events.append(new PipelineEvent("ev-g", "pl1", "inc-test", 2,
+                PipelineEvent.Kind.TELEMETRY_GAP, from.plusSeconds(1000),
+                null, null, null, null, lost));
+        context.getBean(FakeObservationStore.class).clear();
+        String bearer = "Bearer " + machineToken(Scope.READ);
+
+        ResponseEntity<Map<String, Object>> first = client().get().uri(uri -> uri
+                        .path("/api/pipelines/pl1/events")
+                        .queryParam("from", from.toString()).queryParam("to", NOW.toString())
+                        .queryParam("limit", 1).build())
+                .header("Authorization", bearer)
+                .retrieve().toEntity(new ParameterizedTypeReference<Map<String, Object>>() {});
+        assertThat(first.getHeaders().getCacheControl()).isEqualTo("no-store");
+        assertThat(first.getBody()).containsEntry("completeness", "BEST_EFFORT");
+        assertThat((List<?>) first.getBody().get("knownGaps")).isEmpty();
+        assertThat(((List<Map<String, Object>>) first.getBody().get("events"))).singleElement()
+                .satisfies(event -> {
+                    assertThat(event).containsEntry("id", "ev-a")
+                            .containsEntry("kind", "FAILURE")
+                            .doesNotContainKeys("pipelineIncarnationId", "executionGeneration");
+                    assertThat(((Map<?, ?>) event.get("failure")).get("code"))
+                            .isEqualTo("engine.job-failed");
+                });
+        String cursor = (String) first.getBody().get("nextCursor");
+        assertThat(cursor).isNotBlank();
+
+        Map<String, Object> second = eventPage("pl1", from, NOW, 1, cursor, bearer);
+        Map<String, Object> third = eventPage("pl1", from, NOW, 1,
+                (String) second.get("nextCursor"), bearer);
+        assertThat(((List<Map<String, Object>>) second.get("events")).getFirst().get("kind"))
+                .isEqualTo("EXECUTION_RECOVERED");
+        assertThat(((List<Map<String, Object>>) third.get("events")).getFirst().get("kind"))
+                .isEqualTo("TELEMETRY_GAP");
+        assertThat((List<Map<String, Object>>) third.get("knownGaps")).singleElement()
+                .satisfies(gap -> assertThat(gap).containsEntry("eventId", "ev-g"));
+        assertThat(third.get("nextCursor")).isNull();
+        assertThat(events.reads).isEqualTo(3);
+    }
+
+    @Test
+    void eventsRejectMissingTimeAndUnknownPipelineWithCodedErrors() {
+        String bearer = "Bearer " + machineToken(Scope.READ);
+        ApiError malformed = client().get().uri(uri -> uri.path("/api/pipelines/pl1/events")
+                        .queryParam("to", NOW.toString()).build())
+                .header("Authorization", bearer)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(malformed.code()).isEqualTo("control.malformed-request");
+        ApiError missing = client().get().uri(uri -> uri.path("/api/pipelines/ghost/events")
+                        .queryParam("from", NOW.minusSeconds(60).toString())
+                        .queryParam("to", NOW.toString()).build())
+                .header("Authorization", bearer)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(missing.code()).isEqualTo("lifecycle.unknown-pipeline");
+        ApiError unauthenticated = client().get().uri(uri -> uri.path("/api/pipelines/pl1/events")
+                        .queryParam("from", NOW.minusSeconds(60).toString())
+                        .queryParam("to", NOW.toString()).build())
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(unauthenticated.code()).isEqualTo("control.unauthenticated");
+    }
+
+    private Map<String, Object> eventPage(String id, Instant from, Instant to, int limit,
+            String cursor, String bearer) {
+        return client().get().uri(uri -> uri.path("/api/pipelines/" + id + "/events")
+                        .queryParam("from", from.toString()).queryParam("to", to.toString())
+                        .queryParam("limit", limit).queryParam("cursor", cursor).build())
+                .header("Authorization", bearer)
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+    }
+
     // ---- a read of a pipeline with no published observation is a 404 coded body, never a bare 500 ----
 
     @Test
@@ -561,7 +660,7 @@ class PipelineObservationApiTest {
         assertThat(projectedReadFaces)
                 .as("every pipeline face imported here projects onto the authenticated /api surface")
                 .containsExactlyInAnyOrder("pipeline.status", "pipeline.metrics", "pipeline.snapshot",
-                        "pipeline.metrics.history", "pipeline.explain",
+                        "pipeline.metrics.history", "pipeline.events", "pipeline.explain",
                         "pipeline.position", "pipeline.set-position");
     }
 
@@ -575,6 +674,7 @@ class PipelineObservationApiTest {
     @EnableAutoConfiguration
     @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class,
             PipelineObservationController.class, PipelineObservabilityController.class,
+            PipelineEventsController.class,
             PipelinePositionController.class,
             ApiExceptionHandler.class})
     static class TestApp {
@@ -612,6 +712,28 @@ class PipelineObservationApiTest {
                 FakeRateHistoryStore history, Clock clock) {
             return new PipelineHistoryQueryService(new ArtifactQueryService(appliedPipelines()), history,
                     Duration.ofMinutes(1), clock, new HistoryCursorCodec("test-history-secret".getBytes(), clock));
+        }
+
+        @Bean
+        FakePipelineEventStore pipelineEventStore() {
+            return new FakePipelineEventStore();
+        }
+
+        @Bean
+        PipelineEventsQueryService pipelineEventsQueryService(FakePipelineEventStore events, Clock clock) {
+            ArtifactStore base = appliedPipelines();
+            ArtifactStore scoped = new ArtifactStore() {
+                @Override public void saveAll(List<Resource> resources) { base.saveAll(resources); }
+                @Override public Optional<Resource> get(String id) { return base.get(id); }
+                @Override public List<Resource> list() { return base.list(); }
+                @Override public Optional<HistoryOwner> pipelineHistoryOwner(String id) {
+                    return base.get(id).map(ignored -> new HistoryOwner(
+                            new RateHistoryStore.Visibility("inc-test", false)));
+                }
+            };
+            EventCatalog messages = EventCatalog.bundled();
+            return new PipelineEventsQueryService(new ArtifactQueryService(scoped), events,
+                    new EventsCursorCodec("test-events-secret".getBytes(), clock), clock, messages::render);
         }
 
         @Bean
@@ -691,6 +813,32 @@ class PipelineObservationApiTest {
         @Override
         public Optional<Observation> read(String pipelineId) {
             return Optional.ofNullable(byId.get(pipelineId));
+        }
+    }
+
+    static final class FakePipelineEventStore implements PipelineEventStore {
+        private final List<PipelineEvent> rows = new ArrayList<>();
+        private int reads;
+
+        void clear() { rows.clear(); reads = 0; }
+
+        @Override public void append(PipelineEvent event) { rows.add(event); }
+        @Override public void deleteIncarnation(String pipelineId, String incarnationId) { }
+        @Override public Duration retention() { return Duration.ofDays(15); }
+
+        @Override
+        public Page readPage(String pipelineId, String incarnationId, Instant from, Instant to, Key after, int limit) {
+            reads++;
+            List<PipelineEvent> matching = rows.stream()
+                    .filter(event -> event.pipelineId().equals(pipelineId)
+                            && event.pipelineIncarnationId().equals(incarnationId)
+                            && !event.occurredAt().isBefore(from) && event.occurredAt().isBefore(to)
+                            && (after == null || event.occurredAt().isAfter(after.occurredAt())
+                            || event.occurredAt().equals(after.occurredAt()) && event.id().compareTo(after.id()) > 0))
+                    .sorted(java.util.Comparator.comparing(PipelineEvent::occurredAt)
+                            .thenComparing(PipelineEvent::id))
+                    .toList();
+            return new Page(matching.subList(0, Math.min(limit, matching.size())), matching.size() > limit);
         }
     }
 

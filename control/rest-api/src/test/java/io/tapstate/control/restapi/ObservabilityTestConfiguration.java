@@ -2,12 +2,17 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.HistoryCursorCodec;
+import io.tapstate.control.core.EventsCursorCodec;
+import io.tapstate.control.core.PipelineEventsQueryService;
 import io.tapstate.control.core.PipelineExplainService;
 import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.core.lifecycle.PipelineEvent;
+import io.tapstate.messages.EventCatalog;
 import io.tapstate.messages.ExplanationCatalog;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.RateHistoryStore;
+import io.tapstate.spi.store.PipelineEventStore;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -88,6 +93,23 @@ class ObservabilityTestConfiguration {
             ArtifactQueryService artifacts, RateHistoryStore history, Clock clock) {
         return new PipelineHistoryQueryService(artifacts, history, Duration.ofMinutes(1), clock,
                 new HistoryCursorCodec("test-history-secret".getBytes(StandardCharsets.UTF_8), clock));
+    }
+
+    @Bean
+    PipelineEventsQueryService pipelineEventsQueryService(ArtifactQueryService artifacts, Clock clock) {
+        PipelineEventStore empty = new PipelineEventStore() {
+            @Override public void append(PipelineEvent event) { throw new AssertionError("no event write expected"); }
+            @Override public Page readPage(String pipelineId, String incarnationId, Instant from, Instant to,
+                    Key after, int limit) { return new Page(List.of(), false); }
+            @Override public void deleteIncarnation(String pipelineId, String incarnationId) {
+                throw new AssertionError("no event delete expected");
+            }
+            @Override public Duration retention() { return Duration.ofDays(15); }
+        };
+        EventCatalog messages = EventCatalog.bundled();
+        return new PipelineEventsQueryService(artifacts, empty,
+                new EventsCursorCodec("test-events-secret".getBytes(StandardCharsets.UTF_8), clock),
+                clock, messages::render);
     }
 
     @Bean

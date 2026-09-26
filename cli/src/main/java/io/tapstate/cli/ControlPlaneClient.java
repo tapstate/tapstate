@@ -238,6 +238,12 @@ interface ControlPlaneClient extends AutoCloseable {
         return new HistoryOutcome.Unreachable();
     }
 
+    /** Reads one retained, best-effort page from {@code pipeline.events}. */
+    default EventsOutcome events(
+            URI baseUrl, String credential, String pipelineId, EventsRequest request) {
+        return new EventsOutcome.Unreachable();
+    }
+
     /** Reads the server-owned explanation projected from one current observation. */
     default ExplainOutcome explain(URI baseUrl, String credential, String pipelineId) {
         return new ExplainOutcome.Unreachable();

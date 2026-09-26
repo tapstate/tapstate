@@ -73,6 +73,7 @@ public final class ControlApiSchema {
         bind(refs, "pipeline.snapshot", "PipelineSnapshot");
         bind(refs, "pipeline.logs", "PipelineLogs");
         bind(refs, "pipeline.metrics.history", "PipelineMetricsHistory");
+        bind(refs, "pipeline.events", "PipelineEvents");
         bind(refs, "pipeline.explain", "PipelineExplain");
         bind(refs, "data-browser.collections", "DataBrowserCollections");
         bind(refs, "data-browser.find", "DataBrowserFind");
@@ -233,7 +234,6 @@ public final class ControlApiSchema {
         pair(defs, "PipelineLogs", logsRequest, opaque);
         pair(defs, "PipelineMetricsHistory", historyRequest(id), historyResult());
         pair(defs, "PipelineExplain", pipelineId, explanationResult());
-        // The event contract is prepared here before the operation is exposed by a protocol face.
         pair(defs, "PipelineEvents", eventsRequest(id), eventsResult());
 
         Map<String, Object> sourceId = string("Declared Source whose own database is read");
@@ -287,9 +287,9 @@ public final class ControlApiSchema {
     }
 
     private static Map<String, Object> eventsRequest(Map<String, Object> id) {
-        Map<String, Object> limit = new LinkedHashMap<>(integer(1, 500,
-                "Maximum events in this response page; defaults to 100"));
-        limit.put("default", 100);
+        Map<String, Object> limit = new LinkedHashMap<>(integer(1, PipelineEventsQuery.MAX_LIMIT,
+                "Maximum events in this response page; defaults to " + PipelineEventsQuery.DEFAULT_LIMIT));
+        limit.put("default", PipelineEventsQuery.DEFAULT_LIMIT);
         return object(List.of("id", "from", "to"), Map.of(
                 "id", id,
                 "from", instant("Inclusive beginning of the requested retained window"),

@@ -1156,6 +1156,31 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public EventsOutcome events(
+            URI baseUrl, String credential, String pipelineId, EventsRequest request) {
+        StringBuilder path = new StringBuilder("/api/pipelines/")
+                .append(urlSegment(pipelineId))
+                .append("/events?from=").append(encode(request.from()))
+                .append("&to=").append(encode(request.to()));
+        if (request.limit() != null) {
+            path.append("&limit=").append(request.limit());
+        }
+        if (request.cursor() != null) {
+            path.append("&cursor=").append(encode(request.cursor()));
+        }
+        return switch (sharedClient.get(baseUrl, credential, path.toString())) {
+            case ControlResponse.Success success -> {
+                EventsOutcome.Found found = eventsFound(success.body());
+                yield found == null ? new EventsOutcome.Unreachable() : found;
+            }
+            case ControlResponse.Rejected rejected ->
+                    new EventsOutcome.Rejected(rejected.code(), rejected.message());
+            case ControlResponse.Unreachable ignored -> new EventsOutcome.Unreachable();
+            default -> new EventsOutcome.Unreachable();
+        };
+    }
+
+    @Override
     public ExplainOutcome explain(URI baseUrl, String credential, String pipelineId) {
         ControlResponse response = sharedClient.get(
                 baseUrl, credential, "/api/pipelines/" + urlSegment(pipelineId) + "/explain");
@@ -1169,6 +1194,102 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             case ControlResponse.Unreachable ignored -> new ExplainOutcome.Unreachable();
             default -> new ExplainOutcome.Unreachable();
         };
+    }
+
+    private static EventsOutcome.Found eventsFound(Object body) {
+        if (!(body instanceof Map<?, ?> map)
+                || !(map.get("pipelineId") instanceof String pipelineId)
+                || !(map.get("from") instanceof String from)
+                || !(map.get("to") instanceof String to)
+                || !(map.get("effectiveFrom") instanceof String effectiveFrom)
+                || !(map.get("effectiveTo") instanceof String effectiveTo)
+                || !(map.get("retentionCutoff") instanceof String cutoff)
+                || !"BEST_EFFORT".equals(map.get("completeness"))
+                || !map.containsKey("nextCursor")) {
+            return null;
+        }
+        List<EventsOutcome.Event> events = eventItems(map.get("events"));
+        List<EventsOutcome.KnownGap> gaps = eventGaps(map.get("knownGaps"));
+        Object cursor = map.get("nextCursor");
+        if (events == null || gaps == null || cursor != null && !(cursor instanceof String)) {
+            return null;
+        }
+        return new EventsOutcome.Found(pipelineId, from, to, effectiveFrom, effectiveTo,
+                cutoff, "BEST_EFFORT", events, gaps, (String) cursor);
+    }
+
+    private static List<EventsOutcome.Event> eventItems(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<EventsOutcome.Event> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> event)
+                    || !(event.get("id") instanceof String id)
+                    || !(event.get("occurredAt") instanceof String at)
+                    || !(event.get("kind") instanceof String kind)
+                    || !(event.get("message") instanceof String message)) {
+                return null;
+            }
+            String before = eventOptional(event, "beforeState");
+            String after = eventOptional(event, "afterState");
+            String reason = eventOptional(event, "reason");
+            if (before == null && event.containsKey("beforeState")
+                    || after == null && event.containsKey("afterState")
+                    || reason == null && event.containsKey("reason")) {
+                return null;
+            }
+            EventsOutcome.Failure failure = null;
+            if (event.containsKey("failure")) {
+                Object rawFailure = event.get("failure");
+                if (!(rawFailure instanceof Map<?, ?> value)
+                        || !(value.get("code") instanceof String code)
+                        || !(value.get("message") instanceof String rendered)
+                        || !(value.get("params") instanceof Map<?, ?> params)) {
+                    return null;
+                }
+                Map<String, String> named = new LinkedHashMap<>();
+                for (Map.Entry<?, ?> param : params.entrySet()) {
+                    if (!(param.getKey() instanceof String name)
+                            || !(param.getValue() instanceof String text)) {
+                        return null;
+                    }
+                    named.put(name, text);
+                }
+                failure = new EventsOutcome.Failure(code, named, rendered);
+            }
+            out.add(new EventsOutcome.Event(id, at, kind, message, before, after, failure, reason));
+        }
+        return List.copyOf(out);
+    }
+
+    private static String eventOptional(Map<?, ?> event, String name) {
+        return event.get(name) instanceof String value ? value : null;
+    }
+
+    private static List<EventsOutcome.KnownGap> eventGaps(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<EventsOutcome.KnownGap> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> gap)
+                    || !(gap.get("eventId") instanceof String id)
+                    || !(gap.get("from") instanceof String from)
+                    || !(gap.get("to") instanceof String to)
+                    || !(gap.get("reasons") instanceof List<?> reasons)) {
+                return null;
+            }
+            List<String> named = new ArrayList<>();
+            for (Object reason : reasons) {
+                if (!(reason instanceof String value)) {
+                    return null;
+                }
+                named.add(value);
+            }
+            out.add(new EventsOutcome.KnownGap(id, from, to, named));
+        }
+        return List.copyOf(out);
     }
 
     private static HistoryOutcome.Found historyFound(Object body) {

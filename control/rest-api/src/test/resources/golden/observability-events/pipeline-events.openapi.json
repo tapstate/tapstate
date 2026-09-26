@@ -2,18 +2,16 @@
   "openapi": "3.1.0",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
-    "title": "Pipeline events prepared contract",
-    "version": "prepared-v1",
-    "description": "This operation is planned and is not exposed by the server yet."
+    "title": "Pipeline events API",
+    "version": "v1",
+    "description": "Authenticated best-effort pipeline event history."
   },
-  "x-tapstate-availability": "planned-unexposed",
   "paths": {
     "/api/pipelines/{id}/events": {
       "get": {
         "operationId": "pipeline.events",
         "summary": "Read a bounded page of pipeline run events",
-        "description": "Planned, unexposed READ operation. Events are best effort, ordered by occurredAt and opaque id. The requested window is half open and at most 15 days; a cursor is bound to the original query and expires after 10 minutes.",
-        "x-tapstate-availability": "planned-unexposed",
+        "description": "Authenticated READ operation. Events are best effort, ordered by occurredAt and opaque id. The requested window is half open and at most 15 days; a cursor is bound to the original query and expires after 10 minutes.",
         "x-tapstate-required-scope": "READ",
         "security": [
           {"bearerAuth": []}

@@ -44,9 +44,11 @@ import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.HistoryCursorCodec;
+import io.tapstate.control.core.EventsCursorCodec;
 import io.tapstate.control.core.PipelineExplainService;
 import io.tapstate.control.core.CurrentObservationReader;
 import io.tapstate.control.core.PipelineHistoryQueryService;
+import io.tapstate.control.core.PipelineEventsQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineProjectionService;
@@ -89,6 +91,7 @@ import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.DataBrowser;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.messages.ExplanationCatalog;
+import io.tapstate.messages.EventCatalog;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
@@ -260,6 +263,11 @@ class ControlPlaneConfiguration {
     @Bean
     HistoryCursorCodec historyCursorCodec(SigningSecret secret, Clock clock) {
         return new HistoryCursorCodec(secret.bytes(), clock);
+    }
+
+    @Bean
+    EventsCursorCodec eventsCursorCodec(SigningSecret secret, Clock clock) {
+        return new EventsCursorCodec(secret.bytes(), clock);
     }
 
     // ---- the control-core services (stateless, composed over the ports above) ----
@@ -630,6 +638,14 @@ class ControlPlaneConfiguration {
             HistoryCursorCodec cursors) {
         return new PipelineHistoryQueryService(
                 artifactQueryService, storePort.rateHistory(), history.getSampleInterval(), clock, cursors);
+    }
+
+    @Bean
+    PipelineEventsQueryService pipelineEventsQueryService(
+            ArtifactQueryService artifacts, StorePort storePort, EventsCursorCodec cursors, Clock clock) {
+        EventCatalog messages = EventCatalog.bundled();
+        return new PipelineEventsQueryService(artifacts, storePort.events(), cursors,
+                clock, messages::render);
     }
 
     @Bean

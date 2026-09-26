@@ -13,7 +13,7 @@ import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Consumer examples for the prepared event contract, before the event operation is exposed. */
+/** Consumer examples for the exposed event contract. */
 class PipelineEventsConsumerContractTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();

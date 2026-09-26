@@ -238,6 +238,10 @@ public final class ControlOperations {
             "Read a bounded, reset-aware page of target-acknowledged output rates and selected table lag "
                     + "over a retained time range. The result is eventually consistent; follow nextCursor "
                     + "with every other argument unchanged.");
+    public static final Operation PIPELINE_EVENTS = mcp(
+            "pipeline.events", Scope.READ, false,
+            "Read one bounded page of retained lifecycle and telemetry events. The result is best-effort "
+                    + "and eventually consistent; follow nextCursor with every other argument unchanged.");
     public static final Operation PIPELINE_EXPLAIN = mcp(
             "pipeline.explain", Scope.READ, false,
             "Read the shared evidence-backed explanation of one Pipeline's latest observation. A no-match "
@@ -319,6 +323,7 @@ public final class ControlOperations {
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
             PIPELINE_METRICS_HISTORY,
+            PIPELINE_EVENTS,
             PIPELINE_EXPLAIN,
             PIPELINE_POSITION,
             PIPELINE_SET_POSITION,

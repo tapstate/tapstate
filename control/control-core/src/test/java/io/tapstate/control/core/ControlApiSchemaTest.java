@@ -19,7 +19,7 @@ class ControlApiSchemaTest {
             "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
             "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
             "pipeline.status", "pipeline.metrics",
-            "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain",
+            "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.events", "pipeline.explain",
             "data-browser.collections", "data-browser.find", "data-browser.stats");
 
     @Test
@@ -120,7 +120,7 @@ class ControlApiSchemaTest {
     }
 
     @Test
-    void eventContractIsTypedButNotYetExposed() {
+    void eventContractIsTypedAndExposed() {
         Map<?, ?> definitions = (Map<?, ?>) ControlApiSchema.document().get("$defs");
         Map<?, ?> request = (Map<?, ?>) definitions.get("PipelineEventsRequest");
         Map<?, ?> requestProperties = (Map<?, ?>) request.get("properties");
@@ -165,7 +165,7 @@ class ControlApiSchemaTest {
         assertThat(reasons.get("maxItems")).isEqualTo(3);
         assertThat(((Map<?, ?>) reasons.get("items")).get("enum"))
                 .isEqualTo(List.of("QUEUE_FULL", "WRITE_FAILURE", "SHUTDOWN"));
-        assertThat(ControlOperations.registry().isRegistered("pipeline.events")).isFalse();
+        assertThat(ControlOperations.registry().isRegistered("pipeline.events")).isTrue();
     }
 
     /**

@@ -1,0 +1,16 @@
+event.state-changed:
+  message: "Pipeline state changed."
+event.failure:
+  message: "Pipeline execution failed."
+event.execution-restarted:
+  message: "Pipeline execution restarted."
+event.execution-recovered:
+  message: "Pipeline execution recovered."
+event.telemetry-degraded:
+  message: "Pipeline telemetry is degraded."
+event.telemetry-restored:
+  message: "Pipeline telemetry recovered."
+event.cleanup-incomplete:
+  message: "Pipeline cleanup is incomplete."
+event.telemetry-gap:
+  message: "Some pipeline events could not be recorded."

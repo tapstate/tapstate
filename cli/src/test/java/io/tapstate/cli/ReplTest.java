@@ -212,6 +212,7 @@ class ReplTest {
         final Deque<StatusOutcome> statusOutcomes = new ArrayDeque<>();
         MetricsOutcome metricsOutcome = new MetricsOutcome.Unreachable();
         HistoryOutcome historyOutcome = new HistoryOutcome.Unreachable();
+        EventsOutcome eventsOutcome = new EventsOutcome.Unreachable();
         ExplainOutcome explainOutcome;
         /** The readings successive metrics reads answer, in order; the last one sticks, as for status. */
         final Deque<MetricsOutcome> metricsOutcomes = new ArrayDeque<>();
@@ -242,8 +243,10 @@ class ReplTest {
         final List<String> statusCalls = new ArrayList<>();
         final List<String> metricsCalls = new ArrayList<>();
         final List<String> historyCalls = new ArrayList<>();
+        final List<String> eventsCalls = new ArrayList<>();
         final List<String> explainCalls = new ArrayList<>();
         HistoryRequest lastHistoryRequest;
+        EventsRequest lastEventsRequest;
         final List<String> positionCalls = new ArrayList<>();
         final List<String> positionBodies = new ArrayList<>();
         final List<String> snapshotCalls = new ArrayList<>();
@@ -545,6 +548,14 @@ class ReplTest {
             historyCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
             lastHistoryRequest = request;
             return healthy.contains(baseUrl) ? historyOutcome : new HistoryOutcome.Unreachable();
+        }
+
+        @Override
+        public EventsOutcome events(
+                URI baseUrl, String credential, String pipelineId, EventsRequest request) {
+            eventsCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
+            lastEventsRequest = request;
+            return healthy.contains(baseUrl) ? eventsOutcome : new EventsOutcome.Unreachable();
         }
 
         @Override
@@ -5094,6 +5105,46 @@ class ReplTest {
         assertThat(client.statusCalls).isEmpty();
         assertThat(client.metricsCalls).isEmpty();
         assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void eventsPassesTheBoundedQueryAndPrintsFailureGapAndContinuation() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.eventsOutcome = new EventsOutcome.Found("pl1", "2026-09-20T10:00:00Z",
+                "2026-09-20T11:00:00Z", "2026-09-20T10:00:00Z", "2026-09-20T11:00:00Z",
+                "2026-09-05T11:00:00Z", "BEST_EFFORT",
+                List.of(new EventsOutcome.Event("ev-a", "2026-09-20T10:10:00Z", "FAILURE",
+                        "Pipeline failed.", "RUNNING", "FAILED",
+                        new EventsOutcome.Failure("engine.job-failed", Map.of("pipeline", "pl1"),
+                                "Pipeline failed."), null)),
+                List.of(new EventsOutcome.KnownGap("ev-g", "2026-09-20T09:58:00Z",
+                        "2026-09-20T10:19:00Z", List.of("WRITE_FAILURE"))), "opaque-next");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("events pl1 --from 2026-09-20T10:00:00Z --to 2026-09-20T11:00:00Z "
+                + "--limit 1 --cursor opaque-current");
+
+        assertThat(client.lastEventsRequest).isEqualTo(new EventsRequest(
+                "2026-09-20T10:00:00Z", "2026-09-20T11:00:00Z", 1, "opaque-current"));
+        assertThat(client.eventsCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
+        assertThat(h.sink().toString().substring(mark))
+                .contains("best_effort", "FAILURE", "engine.job-failed", "gap ev-g",
+                        "WRITE_FAILURE", "nextCursor opaque-next");
+    }
+
+    @Test
+    void eventsRequireBothTimeBoundsBeforeTheNetworkCall() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("events pl1 --from 2026-09-20T10:00:00Z");
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("control.malformed-request", "events requires both --from and --to");
+        assertThat(client.eventsCalls).isEmpty();
     }
 
     @Test

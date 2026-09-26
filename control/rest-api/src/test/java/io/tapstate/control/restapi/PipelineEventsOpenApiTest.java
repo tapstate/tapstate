@@ -11,16 +11,16 @@ import tools.jackson.databind.ObjectMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Checks the static, unexposed HTTP contract against the shared control schema. */
-class PipelineEventsPlannedOpenApiTest {
+/** Checks the live HTTP contract against the shared control schema. */
+class PipelineEventsOpenApiTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String RESOURCE =
-            "/golden/observability-events/pipeline-events.planned.openapi.json";
+            "/golden/observability-events/pipeline-events.openapi.json";
     private static final String PATH = "/api/pipelines/{id}/events";
 
     @Test
-    void preparedResponseSchemaIsExactlyTheSharedControlDefinition() throws Exception {
+    void responseSchemaIsExactlyTheSharedControlDefinition() throws Exception {
         Map<String, Object> document = contract();
         Map<String, Object> components = object(document.get("components"));
         Map<String, Object> schemas = object(components.get("schemas"));
@@ -33,22 +33,22 @@ class PipelineEventsPlannedOpenApiTest {
     }
 
     @Test
-    void plannedRouteHasTheBoundQueryBearerReadAndCodedResponses() throws Exception {
+    void routeHasTheBoundQueryBearerReadAndCodedResponses() throws Exception {
         Map<String, Object> document = contract();
-        assertThat(document.get("x-tapstate-availability")).isEqualTo("planned-unexposed");
+        assertThat(document).doesNotContainKey("x-tapstate-availability");
         Map<String, Object> paths = object(document.get("paths"));
         assertThat(paths.keySet()).containsExactly(PATH);
         Map<String, Object> path = object(paths.get(PATH));
         assertThat(path.keySet()).containsExactly("get");
         Map<String, Object> operation = object(path.get("get"));
         assertThat(operation.get("operationId")).isEqualTo("pipeline.events");
-        assertThat(operation.get("x-tapstate-availability")).isEqualTo("planned-unexposed");
+        assertThat(operation).doesNotContainKey("x-tapstate-availability");
         assertThat(operation.get("x-tapstate-required-scope")).isEqualTo("READ");
         assertThat(operation.get("security")).isEqualTo(List.of(Map.of("bearerAuth", List.of())));
         Map<String, Object> components = object(document.get("components"));
         Map<String, Object> bearer = object(object(components.get("securitySchemes")).get("bearerAuth"));
         assertThat(bearer).containsEntry("type", "http").containsEntry("scheme", "bearer");
-        assertThat(ControlOperations.registry().isRegistered("pipeline.events")).isFalse();
+        assertThat(ControlOperations.registry().isRegistered("pipeline.events")).isTrue();
 
         Map<String, Object> request = ControlApiSchema.resolve("#/$defs/PipelineEventsRequest");
         Map<String, Object> requestProperties = object(request.get("properties"));
@@ -92,9 +92,9 @@ class PipelineEventsPlannedOpenApiTest {
     }
 
     private static Map<String, Object> contract() throws IOException {
-        try (var input = PipelineEventsPlannedOpenApiTest.class.getResourceAsStream(RESOURCE)) {
+        try (var input = PipelineEventsOpenApiTest.class.getResourceAsStream(RESOURCE)) {
             if (input == null) {
-                throw new IOException("missing prepared OpenAPI contract: " + RESOURCE);
+                throw new IOException("missing events OpenAPI contract: " + RESOURCE);
             }
             String text = new String(input.readAllBytes(), StandardCharsets.UTF_8);
             assertThat(text).doesNotContain("\r").endsWith("\n");

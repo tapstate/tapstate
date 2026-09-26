@@ -172,7 +172,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "cluster", "token", "derived-schema", "explain");
+            "connectors", "cluster", "token", "derived-schema", "explain", "events");
 
     private final CommandLine commandLine;
 
@@ -877,6 +877,9 @@ final class Repl {
         if (words.get(0).equals("metrics")) {
             return metricsOnline(words);
         }
+        if (words.get(0).equals("events")) {
+            return eventsOnline(words);
+        }
         // The other connected verbs take positional operands only; a dash-option (e.g. `-o json`) is not yet
         // supported and must not be silently misread as an id / kind / path.
         for (int i = 1; i < words.size(); i++) {
@@ -893,6 +896,7 @@ final class Repl {
             case "start", "pause", "resume" -> lifecycleOnline(words);
             case "status" -> statusOnline(words);
             case "metrics" -> metricsOnline(words);
+            case "events" -> eventsOnline(words);
             case "explain" -> explainOnline(words);
             case "snapshot" -> snapshotOnline(words);
             case "logs" -> logsOnline(words);
@@ -3616,6 +3620,86 @@ final class Repl {
 
     private static String positionForText(String position) {
         return isSerializedJavaPosition(position) ? OPAQUE_POSITION : position;
+    }
+
+    private int eventsOnline(List<String> words) {
+        if (words.size() < 2 || words.get(1).isBlank()) {
+            return renderMalformedRequest("events requires a pipeline id");
+        }
+        EventsRequest request;
+        try {
+            request = eventsRequest(words.subList(2, words.size()));
+        } catch (IllegalArgumentException invalid) {
+            return renderMalformedRequest(invalid.getMessage());
+        }
+        String id = words.get(1);
+        EventsOutcome outcome = withFailover(() -> controlPlane.events(
+                session.landingNode(), session.credential(), id, request),
+                answer -> answer instanceof EventsOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case EventsOutcome.Found found -> {
+                out.println(found.pipelineId() + "  " + found.completeness().toLowerCase(Locale.ROOT)
+                        + "  " + found.effectiveFrom() + " .. " + found.effectiveTo());
+                for (EventsOutcome.Event event : found.events()) {
+                    out.println(event.occurredAt() + "  " + event.id() + "  " + event.kind()
+                            + "  " + event.message());
+                    if (event.failure() != null) {
+                        out.println("  failure " + event.failure().code());
+                    }
+                    if (event.reason() != null) {
+                        out.println("  reason  " + event.reason());
+                    }
+                }
+                for (EventsOutcome.KnownGap gap : found.knownGaps()) {
+                    out.println("gap " + gap.eventId() + "  " + gap.from() + " .. " + gap.to()
+                            + "  " + String.join(",", gap.reasons()));
+                }
+                out.println("cutoff     " + found.retentionCutoff());
+                out.println("nextCursor " + (found.nextCursor() == null ? "none" : found.nextCursor()));
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case EventsOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case EventsOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    private static EventsRequest eventsRequest(List<String> options) {
+        String from = null;
+        String to = null;
+        Integer limit = null;
+        String cursor = null;
+        for (int i = 0; i < options.size(); i++) {
+            String option = options.get(i);
+            if (!List.of("--from", "--to", "--limit", "--cursor").contains(option)) {
+                throw new IllegalArgumentException("unknown events option " + option);
+            }
+            if (i + 1 >= options.size()) {
+                throw new IllegalArgumentException(option + " requires a value");
+            }
+            String value = options.get(++i);
+            switch (option) {
+                case "--from" -> from = once(from, value, option);
+                case "--to" -> to = once(to, value, option);
+                case "--cursor" -> cursor = once(cursor, value, option);
+                case "--limit" -> {
+                    if (limit != null) {
+                        throw new IllegalArgumentException(option + " may be supplied once");
+                    }
+                    try {
+                        limit = Integer.valueOf(value);
+                    } catch (NumberFormatException invalid) {
+                        throw new IllegalArgumentException("--limit must be an integer", invalid);
+                    }
+                }
+                default -> throw new IllegalStateException("unhandled events option " + option);
+            }
+        }
+        if (from == null || to == null) {
+            throw new IllegalArgumentException("events requires both --from and --to");
+        }
+        return new EventsRequest(from, to, limit, cursor);
     }
 
     private int historyOnline(String id, List<String> options) {

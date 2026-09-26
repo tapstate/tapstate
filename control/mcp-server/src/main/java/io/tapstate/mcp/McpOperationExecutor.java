@@ -74,6 +74,7 @@ final class McpOperationExecutor {
                 case "pipeline.snapshot" -> pipelineRead(args, "snapshot");
                 case "pipeline.logs" -> pipelineLogs(args);
                 case "pipeline.metrics.history" -> pipelineHistory(args);
+                case "pipeline.events" -> pipelineEvents(args);
                 case "pipeline.explain" -> pipelineRead(args, "explain");
                 case "data-browser.collections" -> get(collectionsOf(args));
                 case "data-browser.stats" -> get(collectionOf(args) + "/stats");
@@ -367,6 +368,20 @@ final class McpOperationExecutor {
                 }
                 path.append("&table=").append(segment(value));
             }
+        }
+        optionalText(path, arguments, "cursor");
+        return get(path.toString());
+    }
+
+    private McpResult pipelineEvents(Map<String, Object> arguments) {
+        StringBuilder path = new StringBuilder("/api/pipelines/")
+                .append(segment(required(arguments, "id")))
+                .append("/events?from=")
+                .append(segment(required(arguments, "from")))
+                .append("&to=")
+                .append(segment(required(arguments, "to")));
+        if (arguments.containsKey("limit")) {
+            path.append("&limit=").append(integerArgument(arguments, "limit", 0));
         }
         optionalText(path, arguments, "cursor");
         return get(path.toString());
