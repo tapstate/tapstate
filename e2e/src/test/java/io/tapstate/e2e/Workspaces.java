@@ -65,4 +65,26 @@ final class Workspaces {
                 """
                 .formatted(pipelineId, sourceId, pipelineId, table, pipelineId, targetId);
     }
+
+    /**
+     * The same pipeline with its target written by {@code writers} writers across the cluster, for a case whose
+     * subject is how wide a run is planned and where its writers run.
+     */
+    static String pipelineYaml(String pipelineId, String sourceId, String targetId, String table, int writers) {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: %s
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - { id: %s_step, from: [ %s ], type: filter, expr: "op != 'x'" }
+                serve:
+                  from: %s_step
+                  sync:
+                    - source: %s
+                      execution: { parallelism: %d }
+                """
+                .formatted(pipelineId, sourceId, pipelineId, table, pipelineId, targetId, writers);
+    }
 }

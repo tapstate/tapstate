@@ -97,7 +97,21 @@ final class RealProcessServer implements ServerHandle {
      */
     static RealProcessServer start(String storeUri, String listenAddress,
             IntFunction<List<String>> extraArguments) {
-        RealProcessServer server = launching(storeUri, bootJar(), listenAddress, extraArguments);
+        return start(storeUri, listenAddress, ServerHandle.privateStagingDirectory(), extraArguments);
+    }
+
+    /**
+     * The same, staging the connectors it resolves into {@code stagingDirectory} rather than a directory of this
+     * launch's own.
+     *
+     * <p>For a witness whose subject is a member that cannot stage what it is asked to load. A parameter rather than
+     * something a caller appends, for the reason the listen address is one: the standing setting would be joined
+     * with the caller's by a comma rather than replaced by it.
+     */
+    static RealProcessServer start(String storeUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        RealProcessServer server = launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), listenAddress,
+                List.of(), stagingDirectory, extraArguments);
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
@@ -182,7 +196,8 @@ final class RealProcessServer implements ServerHandle {
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments) {
-        return launching(storeUri, operatorStateDatabase, jar, listenAddress, List.of(), extraArguments);
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, List.of(),
+                ServerHandle.privateStagingDirectory(), extraArguments);
     }
 
     /**
@@ -194,7 +209,7 @@ final class RealProcessServer implements ServerHandle {
      */
     static RealProcessServer startInJvm(String storeUri, List<String> jvmOptions) {
         RealProcessServer server = launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
-                jvmOptions, port -> List.of());
+                jvmOptions, ServerHandle.privateStagingDirectory(), port -> List.of());
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
@@ -205,7 +220,8 @@ final class RealProcessServer implements ServerHandle {
     }
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
-            String listenAddress, List<String> jvmOptions, IntFunction<List<String>> extraArguments) {
+            String listenAddress, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
@@ -213,7 +229,7 @@ final class RealProcessServer implements ServerHandle {
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
         Process process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
-                workingDirectory, output, extraArguments.apply(port));
+                stagingDirectory, workingDirectory, output, extraArguments.apply(port));
         return new RealProcessServer(process, baseUrl, output);
     }
 
@@ -285,7 +301,7 @@ final class RealProcessServer implements ServerHandle {
     }
 
     private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
-            String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
+            String storeUri, String operatorStateDatabase, Path stagingDirectory, Path workingDirectory, Path output,
             List<String> extraArguments) {
         List<String> command = new ArrayList<>();
         command.add(javaBinary());
@@ -305,9 +321,10 @@ final class RealProcessServer implements ServerHandle {
                 "--tapstate.store.mongo.uri=" + storeUri,
                 "--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                 "--tapstate.store.mongo.server-selection-timeout=5s",
-                // A staging directory of this launch's own, for the same reason the other tier gets one:
-                // the cache is content-addressed and reused, so a shared one serves a stale connector.
-                "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + ServerHandle.privateStagingDirectory(),
+                // A staging directory of this launch's own unless a witness names one, for the same reason
+                // the other tier gets one: the cache is content-addressed and reused, so a shared one serves
+                // a stale connector.
+                "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                 "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         // After the standing ones, and additional to them rather than replacing any: a repeated option
         // is joined with the earlier one by comma rather than winning over it, so anything a case needs

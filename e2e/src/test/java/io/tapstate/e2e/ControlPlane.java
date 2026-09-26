@@ -18,6 +18,7 @@ import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -513,6 +514,97 @@ final class ControlPlane {
             }
         }
         return measuring;
+    }
+
+    /** One processor of a run as the cluster places it: its index in the run, on its member, and that member. */
+    record PlacedProcessor(int index, int localIndex, String nodeId) {
+    }
+
+    /**
+     * One vertex of a pipeline's current run as the cluster reports it: the width the run's plan gave it, the engine's
+     * id for the execution it belongs to, and where each of its processors runs. A width the plan does not give the
+     * vertex is null.
+     */
+    record PlacedVertex(String name, Integer requested, Integer effective, Integer computedLocal, String executionId,
+            List<PlacedProcessor> processors) {
+    }
+
+    /**
+     * The vertices of this pipeline's current run as the cluster reports them - empty when no run of it is being
+     * measured. Assembled from the members that have reported so far, like {@link #membersCarryingPartOf}: a case that
+     * counts processors waits for {@link #membersMeasuring} to name every member first.
+     */
+    List<PlacedVertex> placedVertices(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read where " + pipelineId + "'s run is placed");
+        List<PlacedVertex> placed = new ArrayList<>();
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (!(pipeline instanceof Map<?, ?> one) || !pipelineId.equals(one.get("pipelineId"))
+                    || !(one.get("vertices") instanceof List<?> vertices)) {
+                continue;
+            }
+            for (Object vertex : vertices) {
+                if (vertex instanceof Map<?, ?> reported) {
+                    placed.add(placedVertex(reported, response.body()));
+                }
+            }
+        }
+        return placed;
+    }
+
+    private static PlacedVertex placedVertex(Map<?, ?> vertex, String body) {
+        List<PlacedProcessor> processors = new ArrayList<>();
+        if (vertex.get("processors") instanceof List<?> running) {
+            for (Object processor : running) {
+                if (!(processor instanceof Map<?, ?> one) || !(one.get("index") instanceof Number index)
+                        || !(one.get("localIndex") instanceof Number localIndex)
+                        || !(one.get("nodeId") instanceof String nodeId)) {
+                    throw new AssertionError("a processor carried no index, local index or node id: " + body);
+                }
+                processors.add(new PlacedProcessor(index.intValue(), localIndex.intValue(), nodeId));
+            }
+        }
+        return new PlacedVertex(String.valueOf(vertex.get("name")), integerOrNull(vertex.get("requested")),
+                integerOrNull(vertex.get("effective")), integerOrNull(vertex.get("computedLocal")),
+                vertex.get("executionId") instanceof String executionId ? executionId : null,
+                List.copyOf(processors));
+    }
+
+    private static Integer integerOrNull(Object value) {
+        return value instanceof Number number ? number.intValue() : null;
+    }
+
+    /**
+     * The members the cluster says joined after this pipeline's current run was planned, by stable node id - empty
+     * when there are none or no run of it is being measured.
+     */
+    List<String> clusterAwaitingRebalance(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read which members " + pipelineId + "'s run awaits");
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("awaitingRebalance") instanceof List<?> members) {
+                return members.stream().map(String::valueOf).toList();
+            }
+        }
+        return List.of();
+    }
+
+    /**
+     * When the cluster's latest readings of this pipeline's run were taken, by the server's clock - empty when no
+     * run of it is being measured. What lets a case wait for a reading taken after something happened, rather than
+     * for a length of time.
+     */
+    Optional<Instant> measuredAt(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read when " + pipelineId + "'s run was last measured");
+        for (Object pipeline : pipelinesOf(response.body())) {
+            if (pipeline instanceof Map<?, ?> one && pipelineId.equals(one.get("pipelineId"))
+                    && one.get("measuredAt") instanceof String taken) {
+                return Optional.of(Instant.parse(taken));
+            }
+        }
+        return Optional.empty();
     }
 
     private static List<?> pipelinesOf(String body) {
@@ -1255,6 +1347,114 @@ final class ControlPlane {
         return interpretFailureCode(response.statusCode(), response.body(), pipelineId);
     }
 
+    /** A coded failure as the status carries it: the code, and the named arguments it was raised with. */
+    record Failure(String code, Map<String, Object> params) {
+    }
+
+    /**
+     * The failure the status carries, with its named arguments, or empty while it carries none - read on the terms
+     * {@link #failureCode} reads the code on, for a case that also has to say which member or connector it names.
+     */
+    Optional<Failure> failure(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/status"));
+        Optional<String> code = interpretFailureCode(response.statusCode(), response.body(), pipelineId);
+        if (code.isEmpty()) {
+            return Optional.empty();
+        }
+        Map<?, ?> failure = (Map<?, ?>) ((Map<?, ?>) JsonReader.parse(response.body())).get("failure");
+        Map<String, Object> params = new LinkedHashMap<>();
+        if (failure.get("params") instanceof Map<?, ?> named) {
+            named.forEach((name, value) -> params.put(String.valueOf(name), value));
+        }
+        return Optional.of(new Failure(code.get(), Collections.unmodifiableMap(params)));
+    }
+
+    /** A run's plan as the status carries it: the execution it was made for, its members, and each node's width. */
+    record Plan(Long executionGeneration, List<String> members, List<PlannedNode> nodes, Replaced replaces) {
+
+        /** The one node planned at a target of {@code requested}, failing when the plan has not exactly one. */
+        PlannedNode nodeRequested(int requested) {
+            List<PlannedNode> matching = nodes.stream().filter(node -> node.requested() == requested).toList();
+            if (matching.size() != 1) {
+                throw new AssertionError("expected one node planned at a target of " + requested + ", found "
+                        + matching + " in " + nodes);
+            }
+            return matching.get(0);
+        }
+    }
+
+    /** One node of a plan: what was asked of it, the width it was worked out to and why, and how that moved. */
+    record PlannedNode(String node, int requested, String scope, int memberCount, Integer computedLocal,
+            int effective, List<String> reasons, Change change) {
+    }
+
+    /** The run a plan replaced: its execution and the members it was planned over. */
+    record Replaced(Long executionGeneration, List<String> members) {
+    }
+
+    /** How a node's width moved from the run before: what it ran at then, and what moved it. */
+    record Change(int previousEffective, List<String> causes) {
+    }
+
+    /**
+     * The plan the pipeline's current run was submitted under, as its status carries it - empty while nothing about
+     * the pipeline has been published, or no run of it has been planned.
+     */
+    Optional<Plan> executionPlan(String pipelineId) {
+        return statusBody(pipelineId).flatMap(status -> status.get("plan") instanceof Map<?, ?> plan
+                ? Optional.of(plan(plan))
+                : Optional.empty());
+    }
+
+    /**
+     * The members the status says joined after the pipeline's current run was planned, by stable node id - empty when
+     * there are none, which is when the status leaves the field out.
+     */
+    List<String> awaitingRebalance(String pipelineId) {
+        return statusBody(pipelineId)
+                .map(status -> status.get("awaitingRebalance") instanceof List<?> members
+                        ? members.stream().map(String::valueOf).toList()
+                        : List.<String>of())
+                .orElse(List.of());
+    }
+
+    private Optional<Map<?, ?>> statusBody(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/status"));
+        if (interpretState(response.statusCode(), response.body(), pipelineId).isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of((Map<?, ?>) JsonReader.parse(response.body()));
+    }
+
+    private static Plan plan(Map<?, ?> plan) {
+        List<PlannedNode> nodes = new ArrayList<>();
+        if (plan.get("nodes") instanceof List<?> planned) {
+            for (Object node : planned) {
+                Map<?, ?> one = (Map<?, ?>) node;
+                Change change = one.get("change") instanceof Map<?, ?> moved
+                        ? new Change(((Number) moved.get("previousEffective")).intValue(), strings(moved.get("causes")))
+                        : null;
+                nodes.add(new PlannedNode(String.valueOf(one.get("node")), ((Number) one.get("requested")).intValue(),
+                        String.valueOf(one.get("scope")), ((Number) one.get("memberCount")).intValue(),
+                        integerOrNull(one.get("computedLocal")), ((Number) one.get("effective")).intValue(),
+                        strings(one.get("reasons")), change));
+            }
+        }
+        Replaced replaces = plan.get("replaces") instanceof Map<?, ?> replaced
+                ? new Replaced(longOrNull(replaced.get("executionGeneration")), strings(replaced.get("members")))
+                : null;
+        return new Plan(longOrNull(plan.get("executionGeneration")), strings(plan.get("members")),
+                List.copyOf(nodes), replaces);
+    }
+
+    private static Long longOrNull(Object value) {
+        return value instanceof Number number ? number.longValue() : null;
+    }
+
+    private static List<String> strings(Object value) {
+        return value instanceof List<?> list ? list.stream().map(String::valueOf).toList() : List.of();
+    }
+
     /**
      * What a status answer is allowed to say about a failure, read the way the two above are: only the
      * product's own {@code monitor.no-observation} code reads as "nothing published yet", every other refusal
@@ -1582,7 +1782,8 @@ final class ControlPlane {
         }
         Long total = progress.get("rowsTotal") instanceof Number rows ? rows.longValue() : null;
         Integer percent = progress.get("donePct") instanceof Number share ? share.intValue() : null;
-        return Optional.of(new TableSnapshot(done.longValue(), total, percent));
+        boolean landed = Boolean.TRUE.equals(progress.get("landed"));
+        return Optional.of(new TableSnapshot(done.longValue(), total, percent, landed));
     }
 
     static Optional<Long> interpretRecordCount(int status, String body, String pipelineId) {
