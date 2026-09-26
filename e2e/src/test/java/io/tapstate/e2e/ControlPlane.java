@@ -1765,6 +1765,32 @@ final class ControlPlane {
         return read;
     }
 
+    /**
+     * Every table the snapshot read reports for the pipeline, by name - empty while nothing about the pipeline has
+     * been published or no table of its load has been read through. For a case waiting on a table to appear, where
+     * {@link #snapshotTable} would fail the read that comes first.
+     */
+    Map<String, TableSnapshot> snapshotTables(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Map.of();
+        }
+        expect(response, 200, "read the snapshot progress of " + pipelineId);
+        Map<String, TableSnapshot> tables = new LinkedHashMap<>();
+        if (JsonReader.parse(response.body()) instanceof Map<?, ?> map
+                && map.get("snapshot") instanceof Map<?, ?> snapshot) {
+            snapshot.forEach((table, progress) -> {
+                if (progress instanceof Map<?, ?> reading && reading.get("rowsDone") instanceof Number done) {
+                    Long total = reading.get("rowsTotal") instanceof Number rows ? rows.longValue() : null;
+                    Integer percent = reading.get("donePct") instanceof Number share ? share.intValue() : null;
+                    tables.put(String.valueOf(table), new TableSnapshot(done.longValue(), total, percent,
+                            Boolean.TRUE.equals(reading.get("landed"))));
+                }
+            });
+        }
+        return tables;
+    }
+
     Optional<TableSnapshot> snapshotTable(String pipelineId, String table) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
         if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
