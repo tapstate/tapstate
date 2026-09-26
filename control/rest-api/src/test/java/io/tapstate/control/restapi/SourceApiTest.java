@@ -7,6 +7,7 @@ import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
+import io.tapstate.control.core.ConnectionTestReport;
 import io.tapstate.control.core.ConnectionTestService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
@@ -36,6 +37,7 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConnectionTestResult;
+import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.runtime.probe.ConnectionProbe;
 import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
@@ -239,6 +241,99 @@ class SourceApiTest {
 
         assertThat(context.getBean(RecordingConnectionProbe.class).captured().settings())
                 .containsEntry("password", SECRET);
+    }
+
+    @Test
+    void awsRdsMysqlSourceRestoresOmittedSecretForTestAndDiscoveryWithoutReturningIt() throws Exception {
+        String password = "rds-password-sentinel";
+        ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql", "mode", "cdc",
+                        "config", Map.of("host", "db.example", "port", 3306, "database", "orders",
+                                "username", "reader", "password", password)))
+                .retrieve().toEntity(String.class);
+
+        assertThat(created.getBody()).doesNotContain(password);
+        JsonNode saved = JSON.readTree(request("reader").get().uri("/api/sources/rds-source")
+                .retrieve().body(String.class));
+        assertThat(saved.path("connector").asText()).isEqualTo("aws-rds-mysql");
+        assertThat(saved.path("mode").asText()).isEqualTo("cdc");
+        assertThat(saved.path("config").has("password")).isFalse();
+        assertThat(saved.path("configuredSecrets").get(0).asText()).isEqualTo("password");
+        assertThat(request("reader").get().uri("/api/sources").retrieve().body(String.class))
+                .doesNotContain(password);
+        Map<String, Object> safeSettings = JSON.convertValue(saved.path("config"), Map.class);
+
+        ConnectionTestReport passed = request("writer").post().uri("/api/connections:test")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connectorId", "aws-rds-mysql",
+                        "settings", safeSettings))
+                .retrieve().body(ConnectionTestReport.class);
+        assertThat(passed.outcome()).isEqualTo(ConnectionTestReport.Outcome.PASSED);
+        assertThat(context.getBean(RecordingConnectionProbe.class).captured().settings())
+                .containsEntry("port", 3306).containsEntry("password", password);
+
+        SchemaReport schema = request("writer").post().uri("/api/connections:discover-schema")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connectorId", "aws-rds-mysql",
+                        "settings", safeSettings))
+                .retrieve().body(SchemaReport.class);
+        assertThat(schema.connectorId()).isEqualTo("aws-rds-mysql");
+        assertThat(schema.tables()).extracting(SchemaReport.Table::name).containsExactly("orders");
+        assertThat(context.getBean(RecordingSchemaDiscoveryProbe.class).captured().settings())
+                .containsEntry("port", 3306).containsEntry("password", password);
+
+        context.getBean(RecordingConnectionProbe.class).failNext();
+        ResponseEntity<String> failed = request("writer").post().uri("/api/connections:test")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connectorId", "aws-rds-mysql",
+                        "settings", safeSettings))
+                .retrieve().toEntity(String.class);
+        assertThat(failed.getBody()).contains("FAILED", "28000", "Login denied")
+                .doesNotContain(password);
+    }
+
+    @Test
+    void awsRdsMysqlSourceCanPreserveReplaceAndClearItsPassword() {
+        Map<String, Object> safeConfig = Map.of("host", "db.example", "port", 3306,
+                "database", "orders", "username", "reader");
+        ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql",
+                        "config", Map.of("host", "db.example", "port", 3306, "database", "orders",
+                                "username", "reader", "password", "original-secret")))
+                .retrieve().toEntity(String.class);
+
+        ResponseEntity<String> preserved = request("writer").put().uri("/api/sources/rds-source")
+                .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql", "config", safeConfig,
+                        "metadata", Map.of("description", "updated")))
+                .retrieve().toEntity(String.class);
+        assertThat(preserved.getBody()).doesNotContain("original-secret");
+        assertThat(((SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("rds-source").orElseThrow()).config()).containsEntry("password", "original-secret");
+
+        ResponseEntity<String> replaced = request("writer").put().uri("/api/sources/rds-source")
+                .header(HttpHeaders.IF_MATCH, preserved.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql",
+                        "config", Map.of("host", "db.example", "port", 3306, "database", "orders",
+                                "username", "reader", "password", "replacement-secret")))
+                .retrieve().toEntity(String.class);
+        assertThat(replaced.getBody()).doesNotContain("original-secret", "replacement-secret");
+        assertThat(((SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("rds-source").orElseThrow()).config()).containsEntry("password", "replacement-secret");
+
+        ResponseEntity<String> cleared = request("writer").put().uri("/api/sources/rds-source")
+                .header(HttpHeaders.IF_MATCH, replaced.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql",
+                        "config", safeConfig, "clearSecrets", List.of("password")))
+                .retrieve().toEntity(String.class);
+        assertThat(cleared.getBody()).doesNotContain("original-secret", "replacement-secret");
+        assertThat(((SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("rds-source").orElseThrow()).config()).doesNotContainKey("password");
     }
 
     @Test
@@ -798,9 +893,15 @@ class SourceApiTest {
 
     private static final class RecordingConnectionProbe implements ConnectionProbe {
         private ConnectionConfig captured;
+        private boolean failNext;
 
         void clear() {
             captured = null;
+            failNext = false;
+        }
+
+        void failNext() {
+            failNext = true;
         }
 
         ConnectionConfig captured() {
@@ -810,6 +911,13 @@ class SourceApiTest {
         @Override
         public ConnectionTestResult probe(ConnectionConfig config) {
             captured = config;
+            if (failNext) {
+                failNext = false;
+                return new ConnectionTestResult(config.id(), config.connectorId(),
+                        ConnectionTestResult.Outcome.FAILED,
+                        List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                                "Login denied", "bad credentials", "check username/password", "28000")), 1L);
+            }
             return new ConnectionTestResult(
                     config.id(), config.connectorId(), ConnectionTestResult.Outcome.PASSED, List.of(), 1L);
         }
