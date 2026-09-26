@@ -6,6 +6,7 @@ import fnmatch
 import hashlib
 import importlib.util
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -18,8 +19,9 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('shards', HERE / '_ci-shards.py')
 shards = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shards)
-# This is the only pattern list. Duration hints never determine membership.
+# Named witnesses include cases that configure connector jars without calling the gate.
 SELECTOR = 'PublishedExamplesIT,RealMysqlToMongo*IT,Nest*IT,DataBrowser*IT,Watch*IT,AnObjectIdReadsBackTheSameThroughBothFacesIT,SinkValueRoundTripIT,*TargetPreparationIT'
+GATE_CALL = re.compile(r'\bRealConnectorGate\s*\.\s*require\s*\(')
 LEDGER = Path('e2e/target/witness-ledger.txt')
 TIERS = ('IN_PROCESS', 'REAL_PROCESS')
 LEDGERS = Path('e2e/target/witness-ledgers')
@@ -30,8 +32,12 @@ def inventory(root):
     patterns = SELECTOR.split(',')
     result = []
     for test in shards.discover(root):
-        if test['module'] != 'e2e' or test['kind'] != 'it' or not any(
-                fnmatch.fnmatchcase(test['class'].rsplit('.', 1)[-1], p) for p in patterns):
+        if test['module'] != 'e2e' or test['kind'] != 'it':
+            continue
+        name = test['class'].rsplit('.', 1)[-1]
+        named = any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+        source = root / 'e2e/src/test/java' / (test['class'].replace('.', '/') + '.java')
+        if not named and not GATE_CALL.search(source.read_text()):
             continue
         if test['class'].endswith('.PublishedExamplesIT'):
             examples = sorted((root / 'e2e/examples').rglob('*.e2e.yml'))
@@ -127,7 +133,7 @@ def main():
         return
     plan = shards.load_plan(args, args.root)
     shards.require(plan['selection'] == 'inventory' and plan['cohort_hash'] == shards.cohort(inventory(args.root)),
-                   'connector pattern cohort differs from plan')
+                   'connector witness cohort differs from plan')
     shards.require(len(plan['shards']) == 10, 'connector lane requires ten shards')
     if args.command == 'run':
         (args.root / LEDGER).unlink(missing_ok=True)

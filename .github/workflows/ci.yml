@@ -428,6 +428,7 @@ jobs:
         run: bash .github/scripts/one-verify-smoke.sh
       - name: CI shard and aggregate cases
         run: |
+          python3 .github/scripts/connector-witness-coverage-test.py
           bash .github/scripts/connector-witnesses-smoke.sh
           bash .github/scripts/connector-cache-smoke.sh
           bash .github/scripts/connector-workflow-smoke.sh
