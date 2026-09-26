@@ -176,11 +176,12 @@ class CaptureToSinkDataFlowTest {
             actuator.stop(PIPELINE, true);
         }
 
-        // The sink saw exactly the even-id changes the filter kept, after the transform, in read order, each
-        // carrying the injected stream name and the source position the projection lifted from the ring item.
-        // Their arrival proves the whole path AND that the capture and the reader derived the same ring.
+        // The sink saw exactly the even-id changes the filter kept, after the transform, each carrying the
+        // injected stream name and the source position the projection lifted from the ring item - in no order
+        // between them: the sink runs several writers, and the two are changes of different keys. Their arrival
+        // proves the whole path AND that the capture and the reader derived the same ring.
         assertThat(CapturingSinkWriter.collected())
-                .containsExactly(TABLE + "|src-0|0", TABLE + "|src-2|2");
+                .containsExactlyInAnyOrder(TABLE + "|src-0|0", TABLE + "|src-2|2");
 
         // Stop tore the capture down: the fake source's subscription was closed (the cdc daemon is gone, no
         // leak), the pipeline's Jet job is terminal, and the coordinator dropped the handle.
