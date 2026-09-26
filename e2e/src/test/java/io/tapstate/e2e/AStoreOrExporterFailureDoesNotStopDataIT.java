@@ -126,6 +126,34 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
                     () -> "stale=" + stale + ", current=" + control.statusObservedAt(PIPELINE));
             assertThat(customer(targetMongo, target)).isEqualTo("during-outage");
             assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+
+            int writesBeforeDelay = logOccurrences(server.output(), "Could not write latest observation");
+            configureObservationDelay(admin, true);
+            Instant delayed;
+            try {
+                long blockedAt = System.nanoTime();
+                Await.until("bounded failure during a blocked store command", Duration.ofSeconds(15),
+                        () -> logOccurrences(server.output(), "Could not write latest observation")
+                                > writesBeforeDelay,
+                        () -> "statusObservedAt=" + control.statusObservedAt(PIPELINE));
+                assertThat(Duration.ofNanos(System.nanoTime() - blockedAt))
+                        .isGreaterThanOrEqualTo(Duration.ofSeconds(3));
+                delayed = control.statusObservedAt(PIPELINE);
+                update(mysql, "during-slow-observation");
+                Await.until("target CDC while observation write is blocked", WAIT,
+                        () -> "during-slow-observation".equals(customer(targetMongo, target)),
+                        () -> "target=" + customer(targetMongo, target)
+                                + ", actual=" + control.state(PIPELINE));
+                assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+                assertThat(control.statusObservedAt(PIPELINE)).isEqualTo(delayed);
+            } finally {
+                configureObservationDelay(admin, false);
+            }
+            Instant staleWhileSlow = delayed;
+            Await.until("latest observation refresh after blocked command drains", WAIT,
+                    () -> control.statusObservedAt(PIPELINE).isAfter(staleWhileSlow),
+                    () -> "stale=" + staleWhileSlow + ", current=" + control.statusObservedAt(PIPELINE));
+
             Instant from = Instant.now().minusSeconds(60);
             assertThat(control.events(PIPELINE, from, Instant.now().plusSeconds(60)).get("completeness"))
                     .isEqualTo("BEST_EFFORT");
@@ -241,6 +269,20 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
         configureFault(admin, enabled, "pipeline_observation", "update");
     }
 
+    private static void configureObservationDelay(MongoClient admin, boolean enabled) {
+        Document command = new Document("configureFailPoint", "failCommand")
+                .append("mode", enabled ? "alwaysOn" : "off");
+        if (enabled) {
+            command.append("data", new Document("failCommands", List.of("update"))
+                    .append("appName", STORE_APP)
+                    .append("namespace", DATABASE + ".pipeline_observation")
+                    .append("blockConnection", true)
+                    .append("blockTimeMS", 20_000)
+                    .append("errorCode", 2));
+        }
+        admin.getDatabase("admin").runCommand(command);
+    }
+
     private static void configureEventFault(MongoClient admin, boolean enabled) {
         configureFault(admin, enabled, "pipeline_events", "insert");
     }
@@ -267,6 +309,14 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
             return Files.readString(output).contains(token);
         } catch (java.io.IOException unavailable) {
             return false;
+        }
+    }
+
+    private static int logOccurrences(Path output, String token) {
+        try {
+            return Files.readString(output).split(java.util.regex.Pattern.quote(token), -1).length - 1;
+        } catch (java.io.IOException unavailable) {
+            return 0;
         }
     }
 
