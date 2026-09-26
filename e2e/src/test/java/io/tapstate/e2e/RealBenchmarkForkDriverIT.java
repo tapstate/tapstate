@@ -64,11 +64,16 @@ class RealBenchmarkForkDriverIT {
             assertThat(evidence.mongoCommands().totalCommands()).isPositive();
             assertThat(evidence.observedTargetCoverage()).hasSize(expectedPhysical);
             assertThat(evidence.observedTargetCoverage().values()).containsOnly(1L);
+            evidence.phases().forEach(phase -> assertThat(phase.reportedRecordsOut())
+                    .as("replayed sink work remains visible as a cost beside logical delivery")
+                    .isGreaterThanOrEqualTo(phase.acknowledgedOutputs()));
             System.out.printf("benchmark-real-fork id=%s jar=%s throughput=%s"
-                            + " acked=%s samples=%s mongoCommands=%s observedKeys=%s checksum=%s%n",
+                            + " acked=%s reportedOut=%s samples=%s mongoCommands=%s observedKeys=%s checksum=%s%n",
                     evidence.forkId(), evidence.applicationJar(), result.measurement().recordsOutPerSecond(),
                     evidence.phases().stream().mapToLong(
                             RealBenchmarkForkDriver.MeasuredPhase::acknowledgedOutputs).sum(),
+                    evidence.phases().stream().mapToLong(
+                            RealBenchmarkForkDriver.MeasuredPhase::reportedRecordsOut).sum(),
                     evidence.resources().sampleCount(), evidence.mongoCommands().totalCommands(),
                     evidence.observedTargetCoverage().size(), evidence.checksum());
         });

@@ -25,7 +25,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static final Duration PRE_WINDOW_QUIET = Duration.ofSeconds(3);
 
     record MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos,
-                         long completedAckAtNanos, int observedDeliveries) {
+                         long completedAckAtNanos, int observedDeliveries, long reportedRecordsOut) {
         double recordsOutPerSecond() {
             long duration = completedAckAtNanos - firstIssuedAtNanos;
             if (duration <= 0 || acknowledgedOutputs <= 0) {
@@ -223,30 +223,37 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     + ", expected " + phase.expectedLogicalOutputChanges());
         }
         fork.completePhase(phase);
-        awaitRecordsOut(workload, fork.control(), initialAcknowledged,
+        long reportedRecordsOut = awaitRecordsOut(workload, fork.control(), initialAcknowledged,
                 phase.expectedLogicalOutputChanges());
         long firstIssued = issued.batches().getFirst().issuedAtNanos();
         return new PhaseWindow(new MeasuredPhase(phase.id(), phase.expectedLogicalOutputChanges(),
-                firstIssued, completedAckAt, deliveries.size()),
+                firstIssued, completedAckAt, deliveries.size(), reportedRecordsOut),
                 deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList(),
                 resources, commands);
     }
 
-    private static void awaitRecordsOut(BenchmarkWorkloadDefinitions.Workload workload,
+    /** Records idempotent replay work as a cost while logical delivery remains the target-change oracle. */
+    private static long awaitRecordsOut(BenchmarkWorkloadDefinitions.Workload workload,
             ControlPlane control, long before, long expected) throws InterruptedException {
         long deadline = System.nanoTime() + ACK_WAIT.toNanos();
+        long previous = before;
+        long unchangedSince = System.nanoTime();
         while (true) {
             long after = recordsOut(workload, control);
             long delta = after - before;
-            if (delta == expected) {
-                return;
+            long now = System.nanoTime();
+            if (after < previous) {
+                throw new AssertionError("records.out moved backward during the measured phase");
             }
-            if (delta > expected) {
-                throw new AssertionError("target-ACK counter advanced by " + delta + " instead of " + expected
-                        + " (baseline=" + before + ", current=" + after + ")");
+            if (after != previous) {
+                previous = after;
+                unchangedSince = now;
+            } else if (delta >= expected && now - unchangedSince >= PRE_WINDOW_QUIET.toNanos()) {
+                return delta;
             }
-            if (System.nanoTime() >= deadline) {
-                throw new AssertionError("target-ACK counter advanced by only " + delta + " of " + expected);
+            if (now >= deadline) {
+                throw new AssertionError("records.out advanced by " + delta + " of at least " + expected
+                        + " and did not settle (baseline=" + before + ", current=" + after + ")");
             }
             TimeUnit.NANOSECONDS.sleep(COUNTER_POLL.toNanos());
         }
