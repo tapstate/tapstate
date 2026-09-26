@@ -160,6 +160,7 @@ class LifecycleWorkDispatcherTest {
             LifecycleWorkDispatcher.Health settled = dispatcher.health();
             assertThat(settled.activeSlots()).isZero();
             assertThat(settled.pendingPipelines()).isZero();
+            assertThat(settled.queueDepth()).isZero();
             assertThat(settled.queueHighWater()).isEqualTo(1);
             assertThat(settled.coalesced()).isEqualTo(1);
             assertThat(settled.cancelled()).isEqualTo(1);

@@ -77,6 +77,8 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
     private final Instant startedAt = Instant.now();
     private final AtomicBoolean observed = new AtomicBoolean();
     private final AtomicInteger activeSlots = new AtomicInteger();
+    /** Accepted submissions waiting for their worker entry, including the immediate hand-off. */
+    private final AtomicInteger queued = new AtomicInteger();
     private final AtomicLong queueHighWater = new AtomicLong();
     private final AtomicLong coalesced = new AtomicLong();
     private final AtomicLong cancelled = new AtomicLong();
@@ -159,11 +161,14 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
             offered.run();
             return Submission.ACCEPTED;
         }
+        offered.queued.set(true);
+        int acceptedDepth = queued.incrementAndGet();
         try {
             workers.execute(offered);
-            queueHighWater.accumulateAndGet(workers.getQueue().size(), Math::max);
+            queueHighWater.accumulateAndGet(acceptedDepth, Math::max);
             return Submission.ACCEPTED;
         } catch (java.util.concurrent.RejectedExecutionException saturated) {
+            offered.leaveQueue();
             if (workByPipeline.remove(pipelineId, offered)) {
                 capacity.release();
             }
@@ -181,7 +186,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
         workDurations.forEach((verb, histogram) -> histogram.snapshot().ifPresent(value -> measured.put(verb, value)));
         int pending = (int) workByPipeline.values().stream().filter(work -> work.outcome == null).count();
         return new Health(observed.get(), activeSlots.get(), pending,
-                workers == null ? 0 : workers.getQueue().size(), queueHighWater.get(),
+                queued.get(), queueHighWater.get(),
                 coalesced.get(), cancelled.get(), capacityRefusals.get(), capacityWait.snapshot(),
                 Map.copyOf(measured));
     }
@@ -253,6 +258,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
         private final Supplier<ConvergeResult> reconcile;
         private final PipelineLogContext logContext;
         private final long capacityWaitSinceNanos;
+        private final AtomicBoolean queued = new AtomicBoolean();
         private volatile Thread runner;
         private final AtomicBoolean wasCancelled = new AtomicBoolean();
         private volatile Outcome outcome;
@@ -275,6 +281,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
             }
             cancelled.incrementAndGet();
             if (workers != null && workers.remove(this)) {
+                leaveQueue();
                 outcome = Outcome.cancelled();
                 return;
             }
@@ -286,6 +293,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
 
         @Override
         public void run() {
+            leaveQueue();
             runner = Thread.currentThread();
             activeSlots.incrementAndGet();
             PipelineLogContext previousLogContext = PipelineLogContext.capture();
@@ -308,6 +316,12 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
                 previousLogContext.restore();
                 runner = null;
                 activeSlots.decrementAndGet();
+            }
+        }
+
+        private void leaveQueue() {
+            if (queued.compareAndSet(true, false)) {
+                LifecycleWorkDispatcher.this.queued.decrementAndGet();
             }
         }
     }
