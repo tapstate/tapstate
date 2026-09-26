@@ -73,6 +73,11 @@ class MongoHistoryRollupStoreTest {
         assertThat(MongoHistoryRollupStore.toBucket(stored)).isEqualTo(legacy);
         assertThat(((Document) stored.get("_id")))
                 .isNotEqualTo(MongoHistoryRollupStore.toDocument(bucket(Scope.incarnation("legacy"))).get("_id"));
+
+        stored.put("pipelineIncarnationId", null);
+        assertThatThrownBy(() -> MongoHistoryRollupStore.toBucket(stored))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
 
     @Test

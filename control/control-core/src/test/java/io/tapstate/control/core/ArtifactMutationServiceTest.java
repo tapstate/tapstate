@@ -33,6 +33,7 @@ import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.spi.store.PipelineEventStore;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.PipelineLayoutStore;
@@ -502,6 +503,42 @@ class ArtifactMutationServiceTest {
         assertThat(removed).containsExactly("inc-old");
         assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
     }
+
+    @Test
+    void delayedRollupCleanupUsesOnlyTheRemovedIncarnation() {
+        List<Runnable> pending = new ArrayList<>();
+        List<String> removed = new ArrayList<>();
+        HistoryRollupStore rollups = new HistoryRollupStore() {
+            @Override public void upsert(HistoryRollupStore.Bucket bucket) { }
+            @Override public Optional<HistoryRollupStore.Bucket> read(HistoryRollupStore.Key key) {
+                return Optional.empty();
+            }
+            @Override public List<HistoryRollupStore.Bucket> readRange(String id,
+                    HistoryRollupStore.Scope scope, HistoryRollupStore.Resolution resolution,
+                    Instant from, Instant to, int limit) { return List.of(); }
+            @Override public void deleteIncarnation(String id, String incarnation) {
+                removed.add(incarnation);
+            }
+            @Override public void deleteLegacy(String id) { removed.add("legacy"); }
+            @Override public java.time.Duration retention() { return java.time.Duration.ofDays(15); }
+        };
+        ArtifactMutationService delayed = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add,
+                pending::add, null, null, rollups);
+        PipelineResource first = pipeline("flow");
+        store.save(first);
+        store.assignIncarnation("flow", "inc-old");
+
+        delayed.delete(PRINCIPAL, "flow", hash(first));
+        store.save(pipeline("flow"));
+        store.assignIncarnation("flow", "inc-new");
+        pending.forEach(Runnable::run);
+
+        assertThat(removed).containsExactly("inc-old");
+        assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
+    }
+
 
 
     @Test

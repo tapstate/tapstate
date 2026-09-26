@@ -195,6 +195,9 @@ public final class MongoHistoryRollupStore implements HistoryRollupStore {
         try {
             String storedScopeKey = requiredString(document, SCOPE_KEY);
             Object rawIncarnation = document.get(INCARNATION_ID);
+            if (rawIncarnation == null && document.containsKey(INCARNATION_ID)) {
+                throw corrupt(pipelineId, INCARNATION_ID);
+            }
             Scope scope = rawIncarnation == null ? Scope.legacy()
                     : Scope.incarnation(requiredString(document, INCARNATION_ID));
             if (!scopeKey(scope).equals(storedScopeKey)) {

@@ -13,6 +13,7 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.DerivedSchemaStore;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.spi.store.PipelineEventStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.RateHistoryStore;
@@ -78,6 +79,7 @@ public final class ArtifactMutationService {
     private final ObservationStore observations;
     private final PipelineLayoutStore layouts;
     private final RateHistoryStore rateHistory;
+    private final HistoryRollupStore rollups;
     private final PipelineEventStore events;
     private final Executor telemetryCleanup;
     private final LogSink logSink;
@@ -268,12 +270,32 @@ public final class ArtifactMutationService {
             Executor telemetryCleanup,
             LogSink logSink,
             PipelineEventStore events) {
+        this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                auditGate, follows, telemetryCleanup, logSink, events, null);
+    }
+
+    public ArtifactMutationService(
+            ArtifactStore store,
+            DesiredStore desired,
+            StateStore state,
+            ObservationStore observations,
+            PipelineLayoutStore layouts,
+            SrsMetaStore srsMeta,
+            DerivedSchemaStore derivedSchemas,
+            RateHistoryStore rateHistory,
+            AuditGate auditGate,
+            DataBrowserFollows follows,
+            Executor telemetryCleanup,
+            LogSink logSink,
+            PipelineEventStore events,
+            HistoryRollupStore rollups) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.layouts = Objects.requireNonNull(layouts, "layouts");
         this.rateHistory = Objects.requireNonNull(rateHistory, "rateHistory");
+        this.rollups = rollups;
         this.events = events;
         this.telemetryCleanup = Objects.requireNonNull(telemetryCleanup, "telemetryCleanup");
         this.logSink = logSink;
@@ -439,7 +461,33 @@ public final class ArtifactMutationService {
         if (events != null && visibility.incarnationId() != null) {
             steps.add(new ReclaimStep("event-history", () -> submitEventCleanup(id, visibility)));
         }
+        if (rollups != null) {
+            steps.add(new ReclaimStep("history-rollup", () -> submitRollupCleanup(id, visibility)));
+        }
         return List.copyOf(steps);
+    }
+
+    private void submitRollupCleanup(String id, Visibility visibility) {
+        try {
+            telemetryCleanup.execute(() -> {
+                if (visibility.incarnationId() != null) {
+                    try {
+                        rollups.deleteIncarnation(id, visibility.incarnationId());
+                    } catch (RuntimeException failed) {
+                        LOG.log(Level.WARNING, "Could not clear scoped history rollups for " + id, failed);
+                    }
+                }
+                if (visibility.includeLegacy()) {
+                    try {
+                        rollups.deleteLegacy(id);
+                    } catch (RuntimeException failed) {
+                        LOG.log(Level.WARNING, "Could not clear legacy history rollups for " + id, failed);
+                    }
+                }
+            });
+        } catch (RuntimeException rejected) {
+            LOG.log(Level.WARNING, "Could not schedule history rollup cleanup for " + id, rejected);
+        }
     }
 
     private void submitEventCleanup(String id, Visibility visibility) {
