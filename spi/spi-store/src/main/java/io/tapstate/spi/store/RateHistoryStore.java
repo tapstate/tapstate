@@ -71,8 +71,25 @@ public interface RateHistoryStore {
         }
     }
 
+    /** Null incarnation reads only legacy data; a named one may also include legacy data until TTL. */
+    record Visibility(String incarnationId, boolean includeLegacy) {
+        public Visibility {
+            if (incarnationId == null && !includeLegacy) {
+                throw new IllegalArgumentException("legacy-only history visibility includes legacy data");
+            }
+            if (incarnationId != null && incarnationId.isBlank()) {
+                throw new IllegalArgumentException("history incarnation must not be blank");
+            }
+        }
+    }
+
     /** Adds one sample. Never overwrites: a second sample at the same instant is a second document. */
     void append(RateSample sample);
+
+    /** Appends one new-run sample with its internal owner; legacy samples retain no owner. */
+    default void appendScoped(RateSample sample, ObservationStore.Scope scope) {
+        throw new UnsupportedOperationException("scoped rate-history writes are unavailable");
+    }
 
     /**
      * Reads at most {@code limit} samples of one pipeline in {@code [from, to)}, oldest first and with
@@ -82,20 +99,48 @@ public interface RateHistoryStore {
      */
     Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit);
 
+    /** Reads this incarnation's samples, optionally retaining upgrade-era unscoped samples. */
+    default Page readPageVisible(String pipelineId, Visibility visibility,
+            Instant from, Instant to, Key after, int limit) {
+        throw new UnsupportedOperationException("scoped rate-history reads are unavailable");
+    }
+
     /** Reads one exact opaque key when it still exists, for continuity across an external page. */
     Optional<Entry> read(String pipelineId, Key key);
+
+    default Optional<Entry> readVisible(String pipelineId, Visibility visibility, Key key) {
+        throw new UnsupportedOperationException("scoped rate-history key reads are unavailable");
+    }
 
     /** The last sample strictly before {@code at}, used only as the left boundary of a rate interval. */
     Optional<Entry> predecessor(String pipelineId, Instant at);
 
+    default Optional<Entry> predecessorVisible(String pipelineId, Visibility visibility, Instant at) {
+        throw new UnsupportedOperationException("scoped rate-history predecessor reads are unavailable");
+    }
+
     /** The first sample at or after {@code at}, used only as the right boundary of an aggregate interval. */
     Optional<Entry> successor(String pipelineId, Instant at);
+
+    default Optional<Entry> successorVisible(String pipelineId, Visibility visibility, Instant at) {
+        throw new UnsupportedOperationException("scoped rate-history successor reads are unavailable");
+    }
 
     /**
      * Removes every sample of {@code pipelineId}, so a pipeline that no longer exists leaves no history.
      * Removing nothing is a no-op, not an error, for the reason the observation store's delete is one.
      */
     void deleteAll(String pipelineId);
+
+    /** Deletes only the old incarnation captured when the artifact was removed. */
+    default void deleteIncarnation(String pipelineId, String incarnationId) {
+        throw new UnsupportedOperationException("scoped rate-history cleanup is unavailable");
+    }
+
+    /** Deletes only documents from before internal run identity was assigned. */
+    default void deleteLegacy(String pipelineId) {
+        throw new UnsupportedOperationException("legacy rate-history cleanup is unavailable");
+    }
 
     /** How long a sample is kept before the store lets it go. */
     Duration retention();

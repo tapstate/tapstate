@@ -6,6 +6,8 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RateHistoryStore.Entry;
 import io.tapstate.spi.store.RateHistoryStore.Page;
+import io.tapstate.spi.store.RateHistoryStore.Visibility;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -22,6 +24,56 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** Real-store witness for the stable, bounded keyset contract. */
 @RequiresDocker
 class MongoRateHistoryStorePagingIT {
+
+    @Test
+    void newHistoryScopesSurviveRecreateAndOldCleanupCannotDeleteTheNewRun() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("history_scope_it");
+            database.drop();
+            MongoRateHistoryStore history = new MongoRateHistoryStore(database,
+                    SystemCollections.PIPELINE_RATE_HISTORY.on(database), Duration.ofDays(15));
+            history.append(sample("orders", T0, 0));
+            history.appendScoped(sample("orders", T0.plusSeconds(60), 1),
+                    new ObservationStore.Scope("inc-a", 41));
+            history.appendScoped(sample("orders", T0.plusSeconds(120), 2),
+                    new ObservationStore.Scope("inc-a", 42));
+            history.appendScoped(sample("orders", T0.plusSeconds(180), 3),
+                    new ObservationStore.Scope("inc-b", 43));
+
+            Page firstIncarnation = history.readPageVisible("orders", new Visibility("inc-a", true),
+                    T0, T0.plusSeconds(240), null, 10);
+            assertThat(firstIncarnation.entries())
+                    .extracting(entry -> entry.sample().counters().get("records.out"))
+                    .containsExactly(0L, 1L, 2L);
+            assertThat(history.readVisible("orders", new Visibility("inc-b", false),
+                    firstIncarnation.entries().get(1).key())).isEmpty();
+            assertThat(history.predecessorVisible("orders", new Visibility("inc-b", false),
+                    T0.plusSeconds(240))).get()
+                    .extracting(entry -> entry.sample().counters().get("records.out")).isEqualTo(3L);
+            assertThat(history.successorVisible("orders", new Visibility("inc-a", false),
+                    T0.plusSeconds(90))).get()
+                    .extracting(entry -> entry.sample().counters().get("records.out")).isEqualTo(2L);
+            assertThat(history.readPageVisible("orders", new Visibility(null, true),
+                    T0, T0.plusSeconds(240), null, 10).entries())
+                    .extracting(entry -> entry.sample().counters().get("records.out"))
+                    .containsExactly(0L);
+            assertThat(history.readPageVisible("orders", new Visibility("inc-b", false),
+                    T0, T0.plusSeconds(240), null, 10).entries())
+                    .extracting(entry -> entry.sample().counters().get("records.out"))
+                    .containsExactly(3L);
+
+            history.deleteIncarnation("orders", "inc-a");
+            assertThat(history.readPageVisible("orders", new Visibility("inc-a", true),
+                    T0, T0.plusSeconds(240), null, 10).entries())
+                    .extracting(entry -> entry.sample().counters().get("records.out"))
+                    .containsExactly(0L);
+            history.deleteLegacy("orders");
+            assertThat(history.readPageVisible("orders", new Visibility("inc-b", false),
+                    T0, T0.plusSeconds(240), null, 10).entries())
+                    .extracting(entry -> entry.sample().counters().get("records.out"))
+                    .containsExactly(3L);
+        }
+    }
 
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 

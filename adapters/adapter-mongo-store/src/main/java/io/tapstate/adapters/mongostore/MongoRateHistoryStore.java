@@ -8,6 +8,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.RateHistoryStore;
+import io.tapstate.spi.store.ObservationStore;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.bson.types.ObjectId;
@@ -56,6 +57,8 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
     static final String COUNTERS = "counters";
     static final String LAG = "lag";
     static final String COUNTING_SINCE = "countingSince";
+    static final String PIPELINE_INCARNATION_ID = "pipelineIncarnationId";
+    static final String EXECUTION_GENERATION = "executionGeneration";
 
     private final MongoCollection<Document> collection;
     private final Duration retention;
@@ -85,7 +88,29 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
     }
 
     @Override
+    public void appendScoped(RateSample sample, ObservationStore.Scope scope) {
+        Objects.requireNonNull(sample, "sample");
+        Objects.requireNonNull(scope, "scope");
+        Document document = toDocument(sample)
+                .append(PIPELINE_INCARNATION_ID, scope.pipelineIncarnationId())
+                .append(EXECUTION_GENERATION, scope.executionGeneration());
+        StoreIo.run(() -> collection.withTimeout(APPEND_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .insertOne(document));
+    }
+
+    @Override
     public Page readPage(String pipelineId, Instant from, Instant to, Key after, int limit) {
+        return readPageFiltered(pipelineId, from, to, after, limit, null);
+    }
+
+    @Override
+    public Page readPageVisible(String pipelineId, Visibility visibility,
+            Instant from, Instant to, Key after, int limit) {
+        return readPageFiltered(pipelineId, from, to, after, limit, visibilityFilter(visibility));
+    }
+
+    private Page readPageFiltered(String pipelineId, Instant from, Instant to, Key after, int limit,
+            Bson scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(from, "from");
         Objects.requireNonNull(to, "to");
@@ -99,6 +124,9 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
         filters.add(Filters.eq(PIPELINE_ID, pipelineId));
         filters.add(Filters.gte(OBSERVED_AT, Date.from(from)));
         filters.add(Filters.lt(OBSERVED_AT, Date.from(to)));
+        if (scope != null) {
+            filters.add(scope);
+        }
         if (after != null) {
             Date afterAt = Date.from(after.observedAt());
             ObjectId afterId = internalId(after);
@@ -122,11 +150,20 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
 
     @Override
     public Optional<Entry> predecessor(String pipelineId, Instant at) {
+        return predecessorFiltered(pipelineId, at, null);
+    }
+
+    @Override
+    public Optional<Entry> predecessorVisible(String pipelineId, Visibility visibility, Instant at) {
+        return predecessorFiltered(pipelineId, at, visibilityFilter(visibility));
+    }
+
+    private Optional<Entry> predecessorFiltered(String pipelineId, Instant at, Bson scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(at, "at");
-        Document found = StoreIo.call(() -> collection.find(Filters.and(
-                        Filters.eq(PIPELINE_ID, pipelineId),
-                        Filters.lt(OBSERVED_AT, Date.from(at))))
+        List<Bson> filters = scopedFilters(pipelineId, scope);
+        filters.add(Filters.lt(OBSERVED_AT, Date.from(at)));
+        Document found = StoreIo.call(() -> collection.find(Filters.and(filters))
                 .sort(Sorts.orderBy(Sorts.descending(OBSERVED_AT), Sorts.descending(INTERNAL_ID)))
                 .limit(1)
                 .first());
@@ -135,12 +172,21 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
 
     @Override
     public Optional<Entry> read(String pipelineId, Key key) {
+        return readFiltered(pipelineId, key, null);
+    }
+
+    @Override
+    public Optional<Entry> readVisible(String pipelineId, Visibility visibility, Key key) {
+        return readFiltered(pipelineId, key, visibilityFilter(visibility));
+    }
+
+    private Optional<Entry> readFiltered(String pipelineId, Key key, Bson scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(key, "key");
-        Document found = StoreIo.call(() -> collection.find(Filters.and(
-                        Filters.eq(PIPELINE_ID, pipelineId),
-                        Filters.eq(OBSERVED_AT, Date.from(key.observedAt())),
-                        Filters.eq(INTERNAL_ID, internalId(key))))
+        List<Bson> filters = scopedFilters(pipelineId, scope);
+        filters.add(Filters.eq(OBSERVED_AT, Date.from(key.observedAt())));
+        filters.add(Filters.eq(INTERNAL_ID, internalId(key)));
+        Document found = StoreIo.call(() -> collection.find(Filters.and(filters))
                 .limit(1)
                 .first());
         return Optional.ofNullable(found).map(MongoRateHistoryStore::toEntry);
@@ -148,11 +194,20 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
 
     @Override
     public Optional<Entry> successor(String pipelineId, Instant at) {
+        return successorFiltered(pipelineId, at, null);
+    }
+
+    @Override
+    public Optional<Entry> successorVisible(String pipelineId, Visibility visibility, Instant at) {
+        return successorFiltered(pipelineId, at, visibilityFilter(visibility));
+    }
+
+    private Optional<Entry> successorFiltered(String pipelineId, Instant at, Bson scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(at, "at");
-        Document found = StoreIo.call(() -> collection.find(Filters.and(
-                        Filters.eq(PIPELINE_ID, pipelineId),
-                        Filters.gte(OBSERVED_AT, Date.from(at))))
+        List<Bson> filters = scopedFilters(pipelineId, scope);
+        filters.add(Filters.gte(OBSERVED_AT, Date.from(at)));
+        Document found = StoreIo.call(() -> collection.find(Filters.and(filters))
                 .sort(Sorts.orderBy(Sorts.ascending(OBSERVED_AT), Sorts.ascending(INTERNAL_ID)))
                 .limit(1)
                 .first());
@@ -163,6 +218,45 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
     public void deleteAll(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         StoreIo.run(() -> collection.deleteMany(Filters.eq(PIPELINE_ID, pipelineId)));
+    }
+
+    @Override
+    public void deleteIncarnation(String pipelineId, String incarnationId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(incarnationId, "incarnationId");
+        StoreIo.run(() -> collection.deleteMany(Filters.and(
+                Filters.eq(PIPELINE_ID, pipelineId),
+                Filters.eq(PIPELINE_INCARNATION_ID, incarnationId))));
+    }
+
+    @Override
+    public void deleteLegacy(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        StoreIo.run(() -> collection.deleteMany(Filters.and(
+                Filters.eq(PIPELINE_ID, pipelineId), legacyScope())));
+    }
+
+    private static Bson legacyScope() {
+        return Filters.and(Filters.exists(PIPELINE_INCARNATION_ID, false),
+                Filters.exists(EXECUTION_GENERATION, false));
+    }
+
+    private static Bson visibilityFilter(Visibility visibility) {
+        Objects.requireNonNull(visibility, "visibility");
+        if (visibility.incarnationId() == null) {
+            return legacyScope();
+        }
+        Bson scoped = Filters.eq(PIPELINE_INCARNATION_ID, visibility.incarnationId());
+        return visibility.includeLegacy() ? Filters.or(scoped, legacyScope()) : scoped;
+    }
+
+    private static List<Bson> scopedFilters(String pipelineId, Bson scope) {
+        List<Bson> filters = new ArrayList<>();
+        filters.add(Filters.eq(PIPELINE_ID, pipelineId));
+        if (scope != null) {
+            filters.add(scope);
+        }
+        return filters;
     }
 
     @Override
