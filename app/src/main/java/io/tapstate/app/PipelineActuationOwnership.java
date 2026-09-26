@@ -92,11 +92,13 @@ final class PipelineActuationOwnership {
          * stretch is the asker's to decide, so it is kept raw here.
          */
         private long lostAMemberAtNanos = NEVER;
-        /** The gate publication present at the first FAILED observation, before a no-loss verdict. */
-        private long failureObservedAtVisibilityRevision = NEVER;
+        /** The first FAILED observation without visible member loss. */
+        private long failureObservedAtNanos = NEVER;
+        /** The gate publication present when the member-loss detection window first elapsed. */
+        private long visibilityRevisionAtDetectionWindow = NEVER;
     }
 
-    /** No member has been seen missing under this run. Not a time, so no arithmetic is done on it. */
+    /** No observation has been recorded. */
     private static final long NEVER = Long.MIN_VALUE;
 
     private PipelineActuationOwnership() {
@@ -225,7 +227,8 @@ final class PipelineActuationOwnership {
             return Execution.refused();
         }
         state.claim = advanced.get();
-        state.failureObservedAtVisibilityRevision = NEVER;
+        state.failureObservedAtNanos = NEVER;
+        state.visibilityRevisionAtDetectionWindow = NEVER;
         // What this run is planned over. Null rather than empty when nothing is committed -- which the
         // eligibility gate above makes unreachable -- because an empty set would read as "planned over
         // nobody", and nobody can never go missing.
@@ -271,7 +274,7 @@ final class PipelineActuationOwnership {
      * can only be the one that went.
      *
      * <p>The claim carries the run's planned members and the first holder that recorded its failure.
-     * If a fresh membership view confirms no member was lost after the submitting holder saw FAILED,
+     * If a membership view published after the failure-detection window confirms no member was lost,
      * a later handover cannot make that earlier death recoverable. If a member was lost when failure
      * was recorded, that fact survives a takeover even if the member has returned. An inherited run
      * with no recorded failure is admitted: its driver may have gone away before it could record why
@@ -306,8 +309,8 @@ final class PipelineActuationOwnership {
         return nanoTime.getAsLong() - (state.lostAMemberAtNanos + settlingNanos) < 0;
     }
 
-    /** Records the first FAILED observation once the gate can classify its membership. */
-    synchronized void recordFailure(String pipelineId, long settlingNanos) {
+    /** Records FAILED once member loss is visible or a post-detection view confirms none. */
+    synchronized void recordFailure(String pipelineId, long settlingNanos, long detectionWindowNanos) {
         if (!fenced || closing) {
             return;
         }
@@ -333,12 +336,20 @@ final class PipelineActuationOwnership {
         memberLoss |= !state.claim.executionNodeIds().isEmpty()
                 && !visible.nodeIds().containsAll(state.claim.executionNodeIds());
         if (!memberLoss) {
-            if (state.failureObservedAtVisibilityRevision == NEVER) {
-                state.failureObservedAtVisibilityRevision = visible.revision();
+            if (state.failureObservedAtNanos == NEVER) {
+                state.failureObservedAtNanos = now;
+                return;
             }
-            // The view that preceded FAILED may still include a member that has already died.
-            // Only a later publication can make an independent-failure verdict durable.
-            if (visible.revision() <= state.failureObservedAtVisibilityRevision) {
+            // A new publication can still carry the old member set until heartbeat failure detection.
+            // Wait for that window, then require another publication so the verdict uses a later view.
+            if (now - state.failureObservedAtNanos < detectionWindowNanos) {
+                return;
+            }
+            if (state.visibilityRevisionAtDetectionWindow == NEVER) {
+                state.visibilityRevisionAtDetectionWindow = visible.revision();
+                return;
+            }
+            if (visible.revision() <= state.visibilityRevisionAtDetectionWindow) {
                 return;
             }
         }
@@ -480,6 +491,8 @@ final class PipelineActuationOwnership {
             return Permit.denied();
         }
         state.claim = attempt.get().claim();
+        state.failureObservedAtNanos = NEVER;
+        state.visibilityRevisionAtDetectionWindow = NEVER;
         return new Permit(true, state.claim);
     }
 }
