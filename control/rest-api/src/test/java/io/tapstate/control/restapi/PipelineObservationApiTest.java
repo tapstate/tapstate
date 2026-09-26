@@ -28,6 +28,8 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -129,6 +131,18 @@ class PipelineObservationApiTest {
                     Map.of("pipeline", "pl3", "cause", "the sink rejected the batch")));
 
     private static final Instant COUNTING_SINCE = Instant.parse("2026-07-12T11:00:00Z");
+
+    /**
+     * The plan pl2's run was submitted on, on three members with nothing fencing it: a source held to one
+     * processor for the cluster, and a sink worked out to three per member.
+     */
+    private static final ExecutionPlan PL_POS_PLAN = new ExecutionPlan("pl2", null, null, null,
+            List.of("m1", "m2", "m3"),
+            List.of(new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
+                            List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src")),
+                    new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 3, 3, 9, List.of("rounded-up"),
+                            512, 50L, List.of("route.orders_sink", "orders_sink"))),
+            Instant.parse("2026-07-12T11:30:00Z"));
 
     /** One pipeline publishing its measured facts beside the flat map: a counter with attributes, a gauge, a distribution. */
     private static final Observation PL_FACTS = new Observation("pl4", PipelineState.RUNNING,
@@ -232,6 +246,38 @@ class PipelineObservationApiTest {
 
         // Absent, not present-and-null: a client reading this must not have to tell those apart.
         assertThat(body).doesNotContainKey("failure");
+    }
+
+    @Test
+    void statusCarriesThePlanItsRunWasSubmittedOnAndOmitsWhatTheRunDoesNotHave() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl2/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        Map<String, Object> plan = (Map<String, Object>) body.get("plan");
+        assertThat(plan.get("members")).isEqualTo(List.of("m1", "m2", "m3"));
+        assertThat(plan.get("plannedAt")).isEqualTo("2026-07-12T11:30:00Z");
+        // Nothing fences a run on a single member, so it has no generations to name: absent, not sent as zero.
+        assertThat(plan).doesNotContainKeys("claimGeneration", "executionGeneration", "topologyRevision");
+        List<?> nodes = (List<?>) plan.get("nodes");
+        assertThat(nodes).hasSize(2);
+        assertThat((Map<String, Object>) nodes.get(0)).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "node", "orders_src", "requested", 1, "requestedOrigin", "node-default", "scope", "total-one",
+                "memberCount", 3, "effective", 1, "reasons", List.of("requested-one", "source-reads-not-split"),
+                "batch", Map.of("maxRecords", 1024, "maxWaitMillis", 0)));
+        assertThat((Map<String, Object>) nodes.get(1)).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "node", "orders_sink", "requested", 8, "requestedOrigin", "explicit", "scope", "native",
+                "memberCount", 3, "computedLocal", 3, "effective", 9, "reasons", List.of("rounded-up"),
+                "batch", Map.of("maxRecords", 512, "maxWaitMillis", 50)));
+    }
+
+    @Test
+    void statusOfAPipelineWhoseRunHasNoPlanRecordedOmitsThePlan() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        assertThat(body).containsEntry("state", "RUNNING").doesNotContainKey("plan");
     }
 
     @Test
@@ -599,7 +645,9 @@ class PipelineObservationApiTest {
 
         @Bean
         PipelineObservationQueryService pipelineObservationQueryService(ObservationStore observations) {
-            return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations);
+            ExecutionPlans plans = pipelineIds -> pipelineIds.contains("pl2") ? Map.of("pl2", PL_POS_PLAN) : Map.of();
+            return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations,
+                    plans);
         }
 
         @Bean

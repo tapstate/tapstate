@@ -593,8 +593,10 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
-            ArtifactQueryService artifactQueryService, StorePort storePort) {
-        return new PipelineObservationQueryService(artifactQueryService, storePort.observations());
+            ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member) {
+        HazelcastInstance engine = member.getIfAvailable();
+        return new PipelineObservationQueryService(artifactQueryService, storePort.observations(),
+                engine == null ? ExecutionPlans.NONE : new HazelcastExecutionPlans(engine));
     }
 
     @Bean

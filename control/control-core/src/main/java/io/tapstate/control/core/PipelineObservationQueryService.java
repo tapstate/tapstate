@@ -1,10 +1,12 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.spi.store.ObservationStore;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -31,14 +33,36 @@ public final class PipelineObservationQueryService {
 
     private final ArtifactQueryService artifacts;
     private final ObservationStore observations;
+    private final ExecutionPlans plans;
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations) {
-        this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
-        this.observations = Objects.requireNonNull(observations, "observations");
+        this(artifacts, observations, ExecutionPlans.NONE);
     }
 
-    /** The pipeline's lifecycle state, with the coded reason its run died when there is one. */
+    /** As above, answering a status with the plan its pipeline's current run was submitted on, from {@code plans}. */
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans) {
+        this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
+        this.observations = Objects.requireNonNull(observations, "observations");
+        this.plans = Objects.requireNonNull(plans, "plans");
+    }
+
+    /**
+     * The pipeline's lifecycle state, with the coded reason its run died when there is one, and the plan its
+     * current run was submitted on where one is recorded.
+     */
     public PipelineStatus status(String pipelineId) {
+        PipelineStatus status = lifecycleStatus(pipelineId);
+        return new PipelineStatus(status.pipelineId(), status.state(), status.failure(), status.observedAt(),
+                plans.current(List.of(pipelineId)).get(pipelineId));
+    }
+
+    /**
+     * The pipeline's status as {@link #status} answers it, without the plan: what a reader following the state
+     * as it changes asks for on every poll. The plan changes only when a new run is submitted, so reading it on
+     * every poll would be a read thrown away each time.
+     */
+    public PipelineStatus lifecycleStatus(String pipelineId) {
         Observation observation = require(pipelineId);
         return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(),
                 observation.observedAt());
