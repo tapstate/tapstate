@@ -1,10 +1,17 @@
 package io.tapstate.e2e;
 
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.classic.spi.ThrowableProxyUtil;
+import ch.qos.logback.core.read.ListAppender;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.common.JsonWriter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -37,9 +44,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * The MCP stdio process drafting a Source through the remote control contract.
  *
  * <p>The declarative end-to-end vocabulary describes pipeline state and target rows. It has no word
- * for a JSON-RPC stdio process, tool discovery, or the HTTP request a tool sends, so this case drives
- * the shipped MCP entry point as a separate process. A fake HTTP peer keeps the case deterministic
- * while preserving the boundary under test: the MCP process can reach it only over the public wire.
+ * for a JSON-RPC stdio process, tool discovery, or the HTTP request a tool sends, so these cases drive
+ * the shipped MCP entry point as a separate process. A fake HTTP peer exercises the readiness timeout;
+ * the Source and registry cases use the real Mongo-backed Server across the public wire.
  */
 class McpOnlineControlIT {
 
@@ -79,6 +86,87 @@ class McpOnlineControlIT {
         } finally {
             release.countDown();
             server.stop(0);
+        }
+    }
+
+    @Test
+    void sourceDraftOverStdioCannotReadAnExistingSourceSecretOrWriteAnArtifact() throws Exception {
+        String storedSecret = "stored-only-mcp-secret";
+        String callerSecret = "caller-only-mcp-secret";
+        String database = "e2e_mcp_source_draft";
+        String storeUri = SharedMongo.replicaSetUrl(database);
+        Path stderr = temporaryDirectory.resolve("source-draft.stderr");
+
+        try (ServerHandle server = InProcessServer.start(storeUri);
+                MongoClient mongo = MongoClients.create(storeUri)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
+            control.apply(Map.of("source/orders.tap.yml", """
+                    version: tapstate/v1
+                    kind: source
+                    id: orders
+                    connector: mysql
+                    config: { host: localhost, port: 3306, database: orders, username: app, password: %s }
+                    mode: snapshot
+                    """.formatted(storedSecret)));
+            String beforeHash = control.contentHash("orders");
+            String readToken = control.mintToken("read");
+            long beforeAudit = mongo.getDatabase(database).getCollection("audit").countDocuments();
+
+            Process process = startMcp(server.baseUrl(), readToken, stderr);
+            try (Writer input = new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8);
+                    BufferedReader output = process.inputReader(StandardCharsets.UTF_8)) {
+                send(input, """
+                        {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                          "protocolVersion":"2025-06-18","capabilities":{},
+                          "clientInfo":{"name":"tapstate-e2e","version":"1"}}}
+                        """);
+                receive(output);
+                send(input, """
+                        {"jsonrpc":"2.0","method":"notifications/initialized"}
+                        """);
+
+                ch.qos.logback.classic.Logger root =
+                        (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+                ListAppender<ILoggingEvent> serverLogs = new ListAppender<>();
+                serverLogs.setContext(root.getLoggerContext());
+                serverLogs.start();
+                root.addAppender(serverLogs);
+                try {
+                    send(input, JsonWriter.write(Map.of(
+                            "jsonrpc", "2.0", "id", 2, "method", "tools/call",
+                            "params", Map.of("name", "source_draft", "arguments", Map.of(
+                                    "id", "orders", "connector", "mysql", "mode", "snapshot",
+                                    "config", Map.of("host", "localhost", "port", 3306,
+                                            "database", "orders", "username", "app",
+                                            "password", callerSecret))))));
+                    Map<?, ?> result = (Map<?, ?>) receive(output).get("result");
+                    assertThat(result.get("isError")).isEqualTo(false);
+                    String yaml = String.valueOf(((Map<?, ?>) result.get("structuredContent")).get("yaml"));
+                    assertThat(yaml).contains("id: orders", "connector: mysql", "host: localhost")
+                            .doesNotContain(storedSecret, callerSecret);
+                    assertThat(String.valueOf(result)).doesNotContain(storedSecret, callerSecret);
+                } finally {
+                    root.detachAppender(serverLogs);
+                    serverLogs.stop();
+                }
+                String logged = String.join("\n", serverLogs.list.stream()
+                        .map(event -> event.getFormattedMessage()
+                                + (event.getThrowableProxy() == null ? ""
+                                : ThrowableProxyUtil.asString(event.getThrowableProxy())))
+                        .toList());
+                assertThat(logged).doesNotContain(storedSecret, callerSecret);
+            } finally {
+                process.getOutputStream().close();
+                if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                }
+            }
+
+            assertThat(Files.readString(stderr)).doesNotContain(storedSecret, callerSecret);
+            assertThat(control.contentHash("orders")).isEqualTo(beforeHash);
+            assertThat(mongo.getDatabase(database).getCollection("audit").countDocuments())
+                    .isEqualTo(beforeAudit);
         }
     }
 
