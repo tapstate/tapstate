@@ -1746,10 +1746,7 @@ final class StoreBackedDagSource implements DagSource {
         // A unique current value says nothing about what the capture stream puts in an earlier image.
         // Guard only an accepted alternate identity: the discovered primary identity is the capture
         // contract already used throughout the pipeline, while an alternate has no such guarantee.
-        return alternateKey
-                ? () -> ViewSinkWriters.requireAlternateKeyInBeforeImage(
-                        writer.get(), viewId, viewKey)
-                : writer;
+        return alternateKey ? ViewSinkWriters.requiringAlternateKeyInBeforeImage(writer, viewId, viewKey) : writer;
     }
 
     /**
