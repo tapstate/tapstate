@@ -1058,6 +1058,79 @@ class CaptureRunUnitTest {
     }
 
     @Test
+    void aQuietLaterTableCannotReleaseThePhysicalPrefixBeforeAnEarlierTableSettles() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = "physical-prefix-inverse-ack";
+        meta.create(chain, null);
+        long epoch = meta.openEpoch(chain);
+        assertThat(meta.establishPhysicalAnchor(chain,
+                new ChainPosition(new SourceOrder(epoch, -1L), "t0"))).isTrue();
+        meta.selectConsumerTables(chain, "reader", List.of("orders", "customers"), epoch, "reader-run");
+
+        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, chain, epoch, new CaptureHealth())) {
+            prefix.anchor(Optional.of(new SourcePosition("t0")));
+            prefix.admitted(Map.of("orders", 0L), "t1");
+            prefix.admitted(Map.of("customers", 0L), "t2");
+
+            ConsumerOffset selected = meta.read(chain).orElseThrow().consumerOffset("reader").orElseThrow();
+            meta.upsertConsumerOffset(chain, new ConsumerOffset(
+                    selected.pipelineId(), selected.perTableSeq(), selected.sinkAcked(),
+                    selected.snapshotCompletedTables(), selected.cdcStartPosition(), selected.snapshotEpoch(),
+                    selected.selectedTables(), selected.selectedTablesEpoch(), selected.cursorWriterToken(),
+                    Map.of("customers", new ChainPosition(new SourceOrder(epoch, 0L), "t2"))));
+            prefix.tick();
+            assertThat(meta.read(chain).orElseThrow().sourceReadOffset())
+                    .as("the later table cannot skip pending orders work")
+                    .isEqualTo("t0");
+
+            meta.upsertConsumerOffset(chain, new ConsumerOffset(
+                    selected.pipelineId(), selected.perTableSeq(), selected.sinkAcked(),
+                    selected.snapshotCompletedTables(), selected.cdcStartPosition(), selected.snapshotEpoch(),
+                    selected.selectedTables(), selected.selectedTablesEpoch(), selected.cursorWriterToken(),
+                    Map.of("orders", new ChainPosition(new SourceOrder(epoch, 0L), "t1"),
+                            "customers", new ChainPosition(new SourceOrder(epoch, 0L), "t2"))));
+            prefix.tick();
+            assertThat(meta.read(chain).orElseThrow().sourceReadOffset())
+                    .as("an idle source releases both batches only after the earlier one lands")
+                    .isEqualTo("t2");
+        }
+    }
+
+    @Test
+    void aFullPhysicalBarrierWaitsForDurableSinkProgressInsteadOfDroppingABatch() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chain = "physical-prefix-backpressure";
+        meta.create(chain, null);
+        long epoch = meta.openEpoch(chain);
+        assertThat(meta.establishPhysicalAnchor(chain,
+                new ChainPosition(new SourceOrder(epoch, -1L), "t0"))).isTrue();
+        meta.selectConsumerTables(chain, "reader", List.of("orders"), epoch, "reader-run");
+        var caller = Executors.newSingleThreadExecutor();
+        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, chain, epoch, new CaptureHealth())) {
+            prefix.anchor(Optional.of(new SourcePosition("t0")));
+            for (long seq = 0; seq < PhysicalSourcePrefix.MAX_PENDING_BATCHES; seq++) {
+                prefix.admitted(Map.of("orders", seq), "t" + (seq + 1L));
+            }
+            var waiting = caller.submit(prefix::awaitRoom);
+            assertThatThrownBy(() -> waiting.get(100, TimeUnit.MILLISECONDS))
+                    .as("the full queue retains its recovery barriers while the sink is behind")
+                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
+
+            ConsumerOffset selected = meta.read(chain).orElseThrow().consumerOffset("reader").orElseThrow();
+            meta.upsertConsumerOffset(chain, new ConsumerOffset(
+                    selected.pipelineId(), selected.perTableSeq(), selected.sinkAcked(),
+                    selected.snapshotCompletedTables(), selected.cdcStartPosition(), selected.snapshotEpoch(),
+                    selected.selectedTables(), selected.selectedTablesEpoch(), selected.cursorWriterToken(),
+                    Map.of("orders", new ChainPosition(new SourceOrder(epoch, 0L), "t1"))));
+            prefix.tick();
+            waiting.get(5, TimeUnit.SECONDS);
+            assertThat(meta.read(chain).orElseThrow().sourceReadOffset()).isEqualTo("t1");
+        } finally {
+            caller.shutdownNow();
+        }
+    }
+
+    @Test
     void theReadCursorPublisherResolvesTheStoreMemberSideAndAdvancesTheConsumerCursor() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-pub", null);
@@ -1410,6 +1483,17 @@ class CaptureRunUnitTest {
         }
 
         @Override
+        public void startRingAfter(String miningChainId, String pipelineId, String table, long epoch, long seq) {
+            SrsMeta current = require(miningChainId);
+            ConsumerOffset consumer = current.consumerOffset(pipelineId).orElse(null);
+            if (current.epoch() == epoch && consumer != null
+                    && Objects.equals(consumer.selectedTablesEpoch(), epoch)
+                    && consumer.selectedTables().contains(table)) {
+                startRingAfter(miningChainId, pipelineId, table, seq);
+            }
+        }
+
+        @Override
         public Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
             return Map.copyOf(ringDone.getOrDefault(miningChainId + "/" + pipelineId, Map.of()));
         }
@@ -1507,13 +1591,13 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public Optional<SrsMeta> read(String miningChainId) {
+        public synchronized Optional<SrsMeta> read(String miningChainId) {
             wholeRecordReads++;
             return Optional.ofNullable(records.get(miningChainId));
         }
 
         @Override
-        public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+        public synchronized List<ConsumerOffset> consumerOffsets(String miningChainId) {
             cursorReads++;
             Optional<SrsMeta> record = read(miningChainId);
             // This double answers the narrow read out of the same map, so the line above counted a whole
@@ -1539,7 +1623,7 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+        public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), position, m.consumerOffsets(),
@@ -1569,7 +1653,7 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
+        public synchronized void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
             SrsMeta m = require(miningChainId);
             List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
             next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));

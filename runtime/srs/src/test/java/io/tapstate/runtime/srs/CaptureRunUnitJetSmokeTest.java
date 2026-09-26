@@ -263,6 +263,8 @@ class CaptureRunUnitJetSmokeTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             cdcStarted = true;
+            listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
+                    ? resume.position() : new SourcePosition("src-start")));
             for (Envelope e : changes) {
                 listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
             }
@@ -337,6 +339,64 @@ class CaptureRunUnitJetSmokeTest {
 
         final List<String> created = new ArrayList<>();
         private final Map<String, SrsMeta> records = new LinkedHashMap<>();
+        private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
+        private final java.util.Set<String> trustedPhysicalPrefixes = new java.util.HashSet<>();
+        private final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
+
+        @Override
+        public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+            return Optional.ofNullable(physicalSelections.get(miningChainId));
+        }
+
+        @Override
+        public synchronized boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
+            if (require(miningChainId).epoch() != selection.epoch()) {
+                return false;
+            }
+            PhysicalSelection previous = physicalSelections.get(miningChainId);
+            if (previous != null && !previous.equals(selection)) {
+                return false;
+            }
+            physicalSelections.put(miningChainId, selection);
+            return true;
+        }
+
+        @Override
+        public synchronized boolean physicalPrefixTrusted(String miningChainId) {
+            return trustedPhysicalPrefixes.contains(miningChainId);
+        }
+
+        @Override
+        public synchronized boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+            SrsMeta current = require(miningChainId);
+            if (current.epoch() != position.order().epoch()) {
+                return false;
+            }
+            if (current.sourceRead() != null) {
+                return trustedPhysicalPrefixes.contains(miningChainId);
+            }
+            advanceSourceReadOffset(miningChainId, position);
+            trustedPhysicalPrefixes.add(miningChainId);
+            return true;
+        }
+
+        @Override
+        public synchronized Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
+            return Map.copyOf(ringDone.getOrDefault(miningChainId + "/" + pipelineId, Map.of()));
+        }
+
+        @Override
+        public synchronized void startRingAfter(
+                String miningChainId, String pipelineId, String table, long epoch, long seq) {
+            SrsMeta current = require(miningChainId);
+            ConsumerOffset consumer = current.consumerOffset(pipelineId).orElse(null);
+            if (current.epoch() == epoch && consumer != null
+                    && Objects.equals(consumer.selectedTablesEpoch(), epoch)
+                    && consumer.selectedTables().contains(table)) {
+                ringDone.computeIfAbsent(miningChainId + "/" + pipelineId, ignored -> new LinkedHashMap<>())
+                        .putIfAbsent(table, seq);
+            }
+        }
 
         @Override
         public synchronized Optional<SrsMeta> read(String miningChainId) {
