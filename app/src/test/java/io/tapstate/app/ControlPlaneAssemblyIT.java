@@ -4,10 +4,16 @@ import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.PipelineEvent;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.PipelineEventStore;
+import io.tapstate.runtime.scheduler.ObservationPublisher;
+import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -32,10 +38,15 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.jar.Attributes;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
@@ -53,6 +64,99 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @RequiresDocker
 class ControlPlaneAssemblyIT {
+
+    @Test
+    void eventLossAndRecoveryAreReadableThroughAuthenticatedHttpOverRealMongo() throws Exception {
+        int port = start();
+        RestClient client = RestClient.create("http://127.0.0.1:" + port);
+        client.post().uri("/auth/bootstrap").contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("username", "admin", "password", "s3cret"))
+                .retrieve().toBodilessEntity();
+        Map<?, ?> login = client.post().uri("/auth/login").contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("username", "admin", "password", "s3cret"))
+                .retrieve().body(Map.class);
+        String token = (String) login.get("token");
+        StorePort store = context.getBean(StorePort.class);
+        store.artifacts().saveAll(List.of(new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: event_flow
+                source: source
+                serve:
+                  from: /.*/
+                  sync:
+                    - id: sink
+                      source: target
+                      write_mode: upsert
+                      ddl: apply
+                """)));
+        String incarnation = store.artifacts().pipelineIncarnationId("event_flow").orElseThrow();
+        PipelineEventStore durable = store.events();
+        AtomicBoolean reject = new AtomicBoolean(true);
+        PipelineEventStore flaky = new PipelineEventStore() {
+            @Override public void append(PipelineEvent event) {
+                if (reject.get() && event.kind() == PipelineEvent.Kind.STATE_CHANGED) {
+                    throw new IllegalStateException("injected event write outage");
+                }
+                durable.append(event);
+            }
+            @Override public Page readPage(String id, String inc, Instant from, Instant to,
+                    Key after, int limit) { return durable.readPage(id, inc, from, to, after, limit); }
+            @Override public void deleteIncarnation(String id, String inc) {
+                durable.deleteIncarnation(id, inc);
+            }
+            @Override public Duration retention() { return durable.retention(); }
+        };
+        Instant from = Instant.now().minusSeconds(60).truncatedTo(ChronoUnit.MILLIS);
+        Instant to = from.plusSeconds(120);
+        try (TelemetryDispatcher telemetry = new TelemetryDispatcher(
+                new ObservationPublisher(store.state(), store.observations()), null,
+                MetricsExport.none(), null, flaky, 1, 4)) {
+            telemetry.offerEvent(new PipelineEvent("dropped", "event_flow", incarnation, 1,
+                    PipelineEvent.Kind.STATE_CHANGED, Instant.now(), PipelineState.NEW,
+                    PipelineState.RUNNING, null, null, null));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (telemetry.health().get(TelemetryDispatcher.Sink.EVENT).dropped() == 0
+                    && System.nanoTime() < deadline) {
+                TimeUnit.MILLISECONDS.sleep(10);
+            }
+            assertThat(telemetry.health().get(TelemetryDispatcher.Sink.EVENT).dropped()).isEqualTo(1);
+            reject.set(false);
+            while (durable.readPage("event_flow", incarnation, from, to, null, 10).events().size() < 2
+                    && System.nanoTime() < deadline) {
+                TimeUnit.MILLISECONDS.sleep(20);
+            }
+            Instant recoveredAt = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+            telemetry.offerEvent(new PipelineEvent("failed", "event_flow", incarnation, 1,
+                    PipelineEvent.Kind.FAILURE, recoveredAt, PipelineState.RUNNING,
+                    PipelineState.FAILED, new ObservationFailure("engine.job-failed",
+                    Map.of("pipeline", "event_flow", "cause", "sink refused the batch")), null, null));
+            telemetry.offerEvent(new PipelineEvent("recovered", "event_flow", incarnation, 2,
+                    PipelineEvent.Kind.EXECUTION_RECOVERED, recoveredAt.plusMillis(1),
+                    PipelineState.FAILED, PipelineState.RUNNING, null, null, null));
+            while (durable.readPage("event_flow", incarnation, from, to, null, 10).events().size() < 4
+                    && System.nanoTime() < deadline) {
+                TimeUnit.MILLISECONDS.sleep(20);
+            }
+
+            Map<?, ?> page = client.get().uri(builder -> builder.path("/api/pipelines/event_flow/events")
+                            .queryParam("from", from).queryParam("to", to).build())
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                    .retrieve().body(Map.class);
+            assertThat(page.get("completeness")).isEqualTo("BEST_EFFORT");
+            assertThat(page.keySet().stream().map(String::valueOf).toList())
+                    .doesNotContain("pipelineIncarnationId", "executionGeneration");
+            List<?> items = (List<?>) page.get("events");
+            assertThat(items).hasSize(4);
+            assertThat(items.stream().map(item -> String.valueOf(((Map<?, ?>) item).get("kind"))).toList())
+                    .contains("TELEMETRY_GAP", "TELEMETRY_RESTORED", "FAILURE", "EXECUTION_RECOVERED");
+            assertThat(items).allSatisfy(item -> assertThat(((Map<?, ?>) item).keySet().stream()
+                    .map(String::valueOf).toList())
+                    .doesNotContain("pipelineIncarnationId", "executionGeneration"));
+            assertThat((List<?>) page.get("knownGaps")).hasSize(1);
+        }
+    }
+
 
     private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 

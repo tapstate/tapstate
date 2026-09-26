@@ -22,6 +22,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
@@ -117,6 +118,55 @@ class PipelineEventsQueryServiceTest {
                 .query(new PipelineEventsQuery("orders", FROM, NOW, 1, first.nextCursor())),
                 MonitorError.CURSOR_EXPIRED, null);
     }
+
+    @Test
+    void aRecreatedIdDuringTheStoreReadCannotReturnTheOldIncarnationsPage() {
+        AtomicReference<String> current = new AtomicReference<>("inc-a");
+        Resource pipeline = new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: orders
+                source: source
+                serve:
+                  from: /.*/
+                  sync:
+                    - id: sink
+                      source: target
+                      write_mode: upsert
+                      ddl: apply
+                """);
+        ArtifactStore artifacts = new ArtifactStore() {
+            @Override public void saveAll(List<Resource> values) { throw new UnsupportedOperationException(); }
+            @Override public Optional<Resource> get(String id) { return Optional.of(pipeline); }
+            @Override public List<Resource> list() { return List.of(pipeline); }
+            @Override public Optional<HistoryOwner> pipelineHistoryOwner(String id) {
+                return Optional.of(new HistoryOwner(new RateHistoryStore.Visibility(current.get(), false)));
+            }
+        };
+        PipelineEventStore store = new PipelineEventStore() {
+            @Override public void append(PipelineEvent event) { }
+            @Override public Page readPage(String id, String incarnation, Instant from, Instant to,
+                    Key after, int limit) {
+                current.set("inc-b");
+                return new Page(List.of(event("old", "inc-a", FROM.plusSeconds(1),
+                        PipelineEvent.Kind.STATE_CHANGED)), false);
+            }
+            @Override public void deleteIncarnation(String id, String incarnation) { }
+            @Override public Duration retention() { return Duration.ofDays(15); }
+        };
+        PipelineEventsQueryService service = new PipelineEventsQueryService(
+                new ArtifactQueryService(artifacts), store,
+                new EventsCursorCodec(SECRET, Clock.fixed(NOW, ZoneOffset.UTC)),
+                Clock.fixed(NOW, ZoneOffset.UTC), (key, args) -> key);
+
+        TapstateException refusal = catchThrowableOfType(
+                () -> service.query(new PipelineEventsQuery("orders", FROM, NOW)),
+                TapstateException.class);
+        assertThat(refusal).as("a page from the deleted incarnation is refused").isNotNull();
+        assertThat(refusal.code()).isEqualTo(MonitorError.INVALID_CURSOR);
+        assertThat(refusal.args()).containsEntry("reason", "QUERY_MISMATCH");
+    }
+
 
     @Test
     void clippedOrUnincarnatedWindowIsEmptyButNeverCompleteAndInvalidInputsAreCoded() {

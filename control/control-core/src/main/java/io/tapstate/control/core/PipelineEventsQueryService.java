@@ -54,6 +54,10 @@ public final class PipelineEventsQueryService {
         }
         Page page = store.readPage(request.pipelineId(), incarnation, effectiveFrom, effectiveTo,
                 continuation == null ? null : continuation.after(), request.limit());
+        if (!incarnation.equals(requireIncarnation(request.pipelineId()))) {
+            throw new TapstateException(MonitorError.INVALID_CURSOR,
+                    Map.of("operation", "pipeline.events", "reason", "QUERY_MISMATCH"), null);
+        }
         String next = page.hasMore()
                 ? cursors.issue(binding, effectiveFrom, effectiveTo, cutoff, page.lastKey().orElseThrow())
                 : null;
