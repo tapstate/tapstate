@@ -1,6 +1,8 @@
 package io.tapstate.spi.store;
 
 import io.tapstate.core.lifecycle.Observation;
+import java.time.Instant;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -15,6 +17,9 @@ import java.util.Optional;
  * The plain save/read methods retain the pre-identity compatibility path.
  */
 public interface ObservationStore {
+
+    /** Upper bound on one cold-path orphan scan, independent of a caller's batch setting. */
+    int MAX_LATEST_SCAN_BATCH = 256;
 
     /** Internal owner of a published observation; neither field is part of the public observation. */
     record Scope(String pipelineIncarnationId, long executionGeneration) {
@@ -31,6 +36,18 @@ public interface ObservationStore {
         public Stored {
             Objects.requireNonNull(observation, "observation");
             Objects.requireNonNull(scope, "scope");
+        }
+    }
+
+    /** The exact owner and time read during a bounded latest-document scan. */
+    record LatestSnapshot(String pipelineId, Optional<Scope> scope, Optional<Instant> observedAt) {
+        public LatestSnapshot {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(scope, "scope");
+            Objects.requireNonNull(observedAt, "observedAt");
+            if (pipelineId.isBlank()) {
+                throw new IllegalArgumentException("an observation snapshot needs a pipeline id");
+            }
         }
     }
 
@@ -69,5 +86,23 @@ public interface ObservationStore {
     /** Removes only an observation written before an internal execution owner existed. */
     default void deleteLegacy(String pipelineId) {
         throw new UnsupportedOperationException("legacy observation cleanup is unavailable");
+    }
+
+    /**
+     * Scans at most {@code limit} latest documents after an exclusive pipeline-id cursor, in id order.
+     * Only the internal owner and observed time are read; an empty cursor begins at the first id.
+     * Implementations without a bounded keyset scan must fail closed.
+     */
+    default List<LatestSnapshot> scanLatestAfter(Optional<String> afterPipelineId, int limit) {
+        throw new UnsupportedOperationException("bounded observation scans are unavailable");
+    }
+
+    /**
+     * Removes the scanned document only if its id, complete owner envelope and observed time still match.
+     * In particular, a legacy snapshot only matches a document with both owner fields absent. A missing
+     * observed time matches only a document where that field remains absent. Returns false on any race.
+     */
+    default boolean deleteIfUnchanged(LatestSnapshot snapshot) {
+        throw new UnsupportedOperationException("conditional observation cleanup is unavailable");
     }
 }

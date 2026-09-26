@@ -168,6 +168,83 @@ public final class MongoObservationStore implements ObservationStore {
                         .append("executionGeneration", new Document("$exists", false))));
     }
 
+    @Override
+    public List<LatestSnapshot> scanLatestAfter(Optional<String> afterPipelineId, int limit) {
+        Objects.requireNonNull(afterPipelineId, "afterPipelineId");
+        if (limit <= 0 || limit > MAX_LATEST_SCAN_BATCH) {
+            throw new IllegalArgumentException("observation scan batch must be between 1 and "
+                    + MAX_LATEST_SCAN_BATCH);
+        }
+        if (afterPipelineId.filter(String::isBlank).isPresent()) {
+            throw new IllegalArgumentException("observation scan cursor must not be blank");
+        }
+        Document filter = afterPipelineId
+                .map(id -> new Document("_id", new Document("$gt", id)))
+                .orElseGet(Document::new);
+        Document projection = new Document("_id", 1)
+                .append("pipelineIncarnationId", 1)
+                .append("executionGeneration", 1)
+                .append("observedAt", 1);
+        List<Document> documents = StoreIo.call(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .find(filter).projection(projection).sort(new Document("_id", 1))
+                .limit(limit).into(new ArrayList<>(limit)));
+        List<LatestSnapshot> snapshots = new ArrayList<>(documents.size());
+        for (Document document : documents) {
+            snapshots.add(toLatestSnapshot(document));
+        }
+        return List.copyOf(snapshots);
+    }
+
+    @Override
+    public boolean deleteIfUnchanged(LatestSnapshot snapshot) {
+        Objects.requireNonNull(snapshot, "snapshot");
+        Document filter = new Document("_id", snapshot.pipelineId());
+        if (snapshot.scope().isPresent()) {
+            Scope scope = snapshot.scope().orElseThrow();
+            filter.append("pipelineIncarnationId", scope.pipelineIncarnationId())
+                    .append("executionGeneration", scope.executionGeneration());
+        } else {
+            filter.append("pipelineIncarnationId", new Document("$exists", false))
+                    .append("executionGeneration", new Document("$exists", false));
+        }
+        filter.append("observedAt", snapshot.observedAt()
+                .<Object>map(Date::from).orElseGet(() -> new Document("$exists", false)));
+        return StoreIo.call(snapshot.pipelineId(), () -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .deleteOne(filter).getDeletedCount() != 0);
+    }
+
+    private static LatestSnapshot toLatestSnapshot(Document document) {
+        Object rawId = document.get("_id");
+        if (!(rawId instanceof String id) || id.isBlank()) {
+            throw corrupt(String.valueOf(rawId), "observation id");
+        }
+        boolean hasIncarnation = document.containsKey("pipelineIncarnationId");
+        boolean hasGeneration = document.containsKey("executionGeneration");
+        Optional<Scope> scope;
+        if (!hasIncarnation && !hasGeneration) {
+            scope = Optional.empty();
+        } else {
+            Object rawIncarnation = document.get("pipelineIncarnationId");
+            Object rawGeneration = document.get("executionGeneration");
+            if (!hasIncarnation || !hasGeneration || !(rawIncarnation instanceof String incarnation)
+                    || incarnation.isBlank()
+                    || !(rawGeneration instanceof Integer || rawGeneration instanceof Long)
+                    || ((Number) rawGeneration).longValue() <= 0) {
+                throw corrupt(id, "observation scope");
+            }
+            scope = Optional.of(new Scope(incarnation, ((Number) rawGeneration).longValue()));
+        }
+        Optional<Instant> observedAt;
+        if (!document.containsKey("observedAt")) {
+            observedAt = Optional.empty();
+        } else if (document.get("observedAt") instanceof Date date) {
+            observedAt = Optional.of(date.toInstant());
+        } else {
+            throw corrupt(id, "observedAt");
+        }
+        return new LatestSnapshot(id, scope, observedAt);
+    }
+
     /**
      * Maps an observation to its stored document: pipeline id as {@code _id}, state / metrics / snapshot /
      * positions / facts as fields.
