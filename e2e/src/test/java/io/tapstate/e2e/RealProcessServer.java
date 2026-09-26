@@ -182,13 +182,37 @@ final class RealProcessServer implements ServerHandle {
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments) {
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, List.of(), extraArguments);
+    }
+
+    /**
+     * Launches this build in a JVM given {@code jvmOptions}, and returns once its health probe answers.
+     *
+     * <p>For a witness whose subject is how the deliverable behaves inside a runtime of a particular shape -- a
+     * heap too small to hold a load whole, say. The options go before {@code -jar}, where the JVM reads them;
+     * handed to the product instead they would be settings nobody reads.
+     */
+    static RealProcessServer startInJvm(String storeUri, List<String> jvmOptions) {
+        RealProcessServer server = launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
+                jvmOptions, port -> List.of());
+        try {
+            awaitHealthy(server.process, server.baseUrl, server.output);
+        } catch (RuntimeException | AssertionError e) {
+            server.process.destroyForcibly();
+            throw e;
+        }
+        return server;
+    }
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, IntFunction<List<String>> extraArguments) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
         URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
-        Process process = launch(jar, port, listenAddress, storeUri, operatorStateDatabase,
+        Process process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
                 workingDirectory, output, extraArguments.apply(port));
         return new RealProcessServer(process, baseUrl, output);
     }
@@ -260,10 +284,13 @@ final class RealProcessServer implements ServerHandle {
         }
     }
 
-    private static Process launch(Path jar, int port, String listenAddress, String storeUri,
-            String operatorStateDatabase, Path workingDirectory, Path output, List<String> extraArguments) {
-        List<String> command = new ArrayList<>(List.of(
-                javaBinary(),
+    private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
+            String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
+            List<String> extraArguments) {
+        List<String> command = new ArrayList<>();
+        command.add(javaBinary());
+        command.addAll(jvmOptions);
+        command.addAll(List.of(
                 "-jar",
                 jar.toString(),
                 // The role the deliverable is documented to take; parsed by the product before Spring starts.
