@@ -106,6 +106,28 @@ public record PipelineEvent(
         }
     }
 
+    /** Stable identity for a low-frequency event caused by one applied checkpoint transition. */
+    public static String stateId(String pipelineId, String pipelineIncarnationId,
+            long executionGeneration, Kind kind, long checkpointEpoch) {
+        nonBlank(pipelineId, "pipelineId");
+        nonBlank(pipelineIncarnationId, "pipelineIncarnationId");
+        Objects.requireNonNull(kind, "kind");
+        if (executionGeneration <= 0 || checkpointEpoch < 0 || kind == Kind.TELEMETRY_GAP) {
+            throw new IllegalArgumentException("a state event needs a valid generation, epoch and kind");
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            add(digest, pipelineId);
+            add(digest, pipelineIncarnationId);
+            add(digest, Long.toString(executionGeneration));
+            add(digest, kind.name());
+            add(digest, Long.toString(checkpointEpoch));
+            return "state-" + java.util.HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException unavailable) {
+            throw new IllegalStateException("the runtime has no SHA-256 digest", unavailable);
+        }
+    }
+
     private static void add(MessageDigest digest, String value) {
         byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
         digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(bytes.length).array());

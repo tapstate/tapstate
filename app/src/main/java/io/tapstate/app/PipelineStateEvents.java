@@ -1,0 +1,61 @@
+package io.tapstate.app;
+
+import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.PipelineEvent;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.runtime.scheduler.ConvergeResult;
+import io.tapstate.spi.store.ObservationStore;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+
+/** Projects only newly applied checkpoint transitions into stable, scoped event candidates. */
+final class PipelineStateEvents {
+
+    private PipelineStateEvents() {
+    }
+
+    static List<PipelineEvent> of(String pipelineId, ObservationStore.Scope scope,
+            ConvergeResult result, ObservationFailure failure) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        if (scope == null || result == null || result.transitionFrom().isEmpty()
+                || result.checkpoint().isEmpty()) {
+            return List.of();
+        }
+        CheckpointDoc checkpoint = result.checkpoint().orElseThrow();
+        PipelineState from = result.transitionFrom().orElseThrow();
+        PipelineState to = StateJson.parse(checkpoint.stateJson());
+        if (from == to) {
+            return List.of();
+        }
+        List<PipelineEvent> events = new ArrayList<>();
+        events.add(event(pipelineId, scope, checkpoint, PipelineEvent.Kind.STATE_CHANGED,
+                from, to, null));
+        if (to == PipelineState.FAILED && failure != null) {
+            events.add(event(pipelineId, scope, checkpoint, PipelineEvent.Kind.FAILURE,
+                    from, to, failure));
+        }
+        if (to == PipelineState.RUNNING && from == PipelineState.FAILED) {
+            events.add(event(pipelineId, scope, checkpoint, PipelineEvent.Kind.EXECUTION_RECOVERED,
+                    from, to, null));
+        }
+        if (to == PipelineState.RUNNING && from != PipelineState.PAUSED
+                && scope.executionGeneration() > 1) {
+            events.add(event(pipelineId, scope, checkpoint, PipelineEvent.Kind.EXECUTION_RESTARTED,
+                    from, to, null));
+        }
+        return List.copyOf(events);
+    }
+
+    private static PipelineEvent event(String pipelineId, ObservationStore.Scope scope,
+            CheckpointDoc checkpoint, PipelineEvent.Kind kind, PipelineState from,
+            PipelineState to, ObservationFailure failure) {
+        return new PipelineEvent(PipelineEvent.stateId(pipelineId, scope.pipelineIncarnationId(),
+                scope.executionGeneration(), kind, checkpoint.epoch()),
+                pipelineId, scope.pipelineIncarnationId(), scope.executionGeneration(), kind,
+                checkpoint.touchTime(), from, to, failure, null, null);
+    }
+}
