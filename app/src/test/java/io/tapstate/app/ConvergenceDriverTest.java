@@ -29,6 +29,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.tapstate.core.lifecycle.PipelineState.FAILED;
 import static io.tapstate.core.lifecycle.PipelineState.NEW;
@@ -129,6 +130,80 @@ class ConvergenceDriverTest {
             Thread.sleep(10);
         }
         throw new AssertionError("pipeline " + pipelineId + " did not reach " + expected);
+    }
+
+    @Test
+    void stopAndDeleteInterruptAnInFlightStartBeforeItCanSubmit() throws Exception {
+        for (boolean delete : new boolean[] {false, true}) {
+            String id = delete ? "deleted" : "stopped";
+            InMemoryDesiredStore intents = new InMemoryDesiredStore();
+            InMemoryStateStore checkpoints = new InMemoryStateStore();
+            InMemoryObservationStore latest = new InMemoryObservationStore();
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            AtomicBoolean interrupted = new AtomicBoolean();
+            AtomicBoolean submitted = new AtomicBoolean();
+            AtomicInteger stops = new AtomicInteger();
+            LifecycleActuator actuator = new LifecycleActuator() {
+                @Override public PreparedStart prepareStart(String pipelineId) {
+                    entered.countDown();
+                    try {
+                        if (!release.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("blocked start was not released");
+                        }
+                    } catch (InterruptedException cancelled) {
+                        interrupted.set(true);
+                        Thread.currentThread().interrupt();
+                        throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
+                    }
+                    return new PreparedStart() {
+                        @Override public void submit() { submitted.set(true); }
+                        @Override public void close() { }
+                    };
+                }
+                @Override public void start(String pipelineId) { throw new AssertionError("unprepared start"); }
+                @Override public void pause(String pipelineId) { }
+                @Override public void resume(String pipelineId) { }
+                @Override public void stop(String pipelineId, boolean purgeState) { stops.incrementAndGet(); }
+                @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+                @Override public boolean isCarryingAJob(String pipelineId) { return submitted.get(); }
+            };
+            intents.save(new DesiredState(id, RUNNING, "rev-1"));
+            PipelineConverger loop = new PipelineConverger(intents, checkpoints, actuator,
+                    Clock.fixed(T0, ZoneOffset.UTC));
+            LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+            try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(1, 1)) {
+                ConvergenceDriver isolated = new ConvergenceDriver(loop, intents,
+                        new ObservationPublisher(checkpoints, latest), null, MetricsExport.none(),
+                        () -> true, PipelineActuationOwnership.single(), work, null, null, pending);
+                isolated.reconcile();
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                if (delete) {
+                    intents.delete(id);
+                } else {
+                    intents.save(new DesiredState(id, STOPPED, "rev-2"));
+                }
+
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (System.nanoTime() - deadline < 0) {
+                    isolated.reconcile();
+                    if (delete ? work.activeCount() == 0
+                            : checkpoints.read(id).map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
+                                    .filter(STOPPED::equals).isPresent()
+                                    && work.activeCount() == 0) {
+                        break;
+                    }
+                    Thread.sleep(10);
+                }
+                assertThat(work.activeCount()).isZero();
+                assertThat(submitted).isFalse();
+                assertThat(interrupted).isTrue();
+                assertThat(pending.pending(id)).isEmpty();
+                assertThat(stops).hasValue(delete ? 0 : 1);
+            } finally {
+                release.countDown();
+            }
+        }
     }
 
     @Test
