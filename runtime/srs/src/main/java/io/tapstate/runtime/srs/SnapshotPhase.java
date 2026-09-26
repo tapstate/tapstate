@@ -11,10 +11,13 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.function.Consumer;
 
 /**
@@ -22,6 +25,10 @@ import java.util.function.Consumer;
  * downstream stage — every event is a snapshot read (op {@code r}) and none is buffered in the change
  * ring: the snapshot is absorbed by the idempotent sink, not replicated into the volatile SRS ring, and
  * no source replica is materialized.
+ *
+ * <p>It comes in two halves, {@link #open} and {@link Load#read}, because the two are waited for by
+ * different things: the first settles where the tail will join and has to be done before the job taking
+ * the rows is assembled, while the second passes the rows on no faster than that job takes them.
  */
 public final class SnapshotPhase {
 
@@ -83,13 +90,38 @@ public final class SnapshotPhase {
             long ringEpoch,
             SrsMetaStore meta,
             Consumer<Envelope> sink) {
+        Objects.requireNonNull(sink, "sink");
+        try (Load load = open(port, config, miningChainId, pipelineId, tables, ringEpoch, meta)) {
+            long rows = load.read(sink, table -> { });
+            return new Outcome(rows, load.tailSeam());
+        }
+    }
+
+    /**
+     * The half of {@link #run} that has to happen before the job taking the rows exists: works out which
+     * tables this run still owes and, where one is owed, opens the read of the first of them and records
+     * the seam its batch sampled as this pipeline's cdc-start position. No row is taken here; {@link
+     * Load#read} takes them, a table at a time, on a thread that can afford to wait for room to put them.
+     *
+     * <p>Split along this line because of who waits for each half. The seam and its record are read while
+     * the job is assembled, and a source that cannot be opened is best refused by the start that asked for
+     * it. The rows are the load itself: they arrive no faster than the slowest step downstream takes them,
+     * which is hours for a large load behind a slow step, and only a job that is already running takes any.
+     */
+    public static Load open(
+            CapturePort port,
+            CaptureConfig config,
+            String miningChainId,
+            String pipelineId,
+            List<String> tables,
+            long ringEpoch,
+            SrsMetaStore meta) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(tables, "tables");
         Objects.requireNonNull(meta, "meta");
-        Objects.requireNonNull(sink, "sink");
         if (tables.isEmpty()) {
             throw new IllegalArgumentException("a snapshot over a chain must name the tables it reads");
         }
@@ -99,34 +131,37 @@ public final class SnapshotPhase {
         Optional<ConsumerOffset> resumed = resumedSnapshot(record, pipelineId, owed);
         long epoch = resumed.map(ConsumerOffset::snapshotEpoch).orElse(ringEpoch);
         SourceOrder order = SourceOrder.snapshotRow(epoch);
+        if (owed.isEmpty()) {
+            return new Load(port, config, miningChainId, tables, owed, order, null, null, false);
+        }
         // A resume reuses the pair it read back. Both halves come from the same record and the same
         // question, so one of them moving on its own is the state that has no meaning: rows pinned to a
         // generation whose seam is somewhere else.
         String resumedStart = resumed.map(ConsumerOffset::cdcStartPosition).orElse(null);
-        String tailSeam = null;
-        long count = 0;
-        for (String table : owed) {
-            try (CaptureBatch batch = port.snapshot(readOf(config, table))) {
-                // The seam comes from the batch, which sampled it at the source before reading its first
-                // row. A source that reports none leaves the tail nothing to join to, and the run stops
-                // here rather than proceeding: a snapshot whose tail then begins wherever it likes drops
-                // every change made while the snapshot ran, with nothing thrown and nothing logged.
-                SourcePosition seam = batch.seam().orElseThrow(() -> new TapstateException(
-                        CaptureError.SNAPSHOT_REPORTS_NO_SEAM, Map.of("chain", miningChainId), null));
-                if (tailSeam == null) {
-                    tailSeam = resumedStart != null ? resumedStart : seam.token();
-                    // A resume writes back the pair it read, unchanged; a new load writes the pair it
-                    // sampled. Both are scoped to this pipeline, so neither can move another pipeline's
-                    // tail or generation.
-                    meta.setCdcStart(miningChainId, pipelineId, tailSeam, epoch);
-                }
-                while (batch.hasNext()) {
-                    sink.accept(batch.next().withOrder(order));
-                    count++;
-                }
-            }
+        CaptureBatch first = port.snapshot(readOf(config, owed.getFirst()));
+        String tailSeam;
+        try {
+            SourcePosition seam = seamOf(first, miningChainId);
+            tailSeam = resumedStart != null ? resumedStart : seam.token();
+            // A resume writes back the pair it read, unchanged; a new load writes the pair it sampled. Both
+            // are scoped to this pipeline, so neither can move another pipeline's tail or generation.
+            meta.setCdcStart(miningChainId, pipelineId, tailSeam, epoch);
+        } catch (RuntimeException | Error failure) {
+            first.close();
+            throw failure;
         }
-        return new Outcome(count, tailSeam);
+        return new Load(port, config, miningChainId, tables, owed, order, tailSeam, first, false);
+    }
+
+    /**
+     * The seam a batch sampled at the source before reading its first row. A source that reports none
+     * leaves the tail nothing to join to, and the run stops here rather than proceeding: a snapshot whose
+     * tail then begins wherever it likes drops every change made while the snapshot ran, with nothing
+     * thrown and nothing logged.
+     */
+    private static SourcePosition seamOf(CaptureBatch batch, String miningChainId) {
+        return batch.seam().orElseThrow(() -> new TapstateException(
+                CaptureError.SNAPSHOT_REPORTS_NO_SEAM, Map.of("chain", miningChainId), null));
     }
 
     /**
@@ -226,22 +261,192 @@ public final class SnapshotPhase {
      */
     public static long drain(
             CapturePort port, CaptureConfig config, long snapshotEpoch, Consumer<Envelope> sink) {
+        Objects.requireNonNull(sink, "sink");
+        try (Load load = openChainless(port, config, snapshotEpoch)) {
+            return load.read(sink, table -> { });
+        }
+    }
+
+    /**
+     * The half of {@link #drain} that opens its read: the batch over every selected stream, not yet read
+     * from. {@link Load#read} takes the rows, and says every selected table is loaded once the batch is
+     * through -- one read covers them all, so no table is through before the last row of the batch is.
+     */
+    public static Load openChainless(CapturePort port, CaptureConfig config, long snapshotEpoch) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
-        Objects.requireNonNull(sink, "sink");
         if (snapshotEpoch < 1) {
             throw new IllegalArgumentException(
                     "a chainless snapshot generation must be positive, got " + snapshotEpoch);
         }
-
         SourceOrder order = SourceOrder.snapshotRow(snapshotEpoch);
-        long count = 0;
-        try (CaptureBatch batch = port.snapshot(config)) {
-            while (batch.hasNext()) {
-                sink.accept(batch.next().withOrder(order));
-                count++;
+        CaptureBatch batch = port.snapshot(config);
+        return new Load(port, config, null, config.streams(), config.streams(), order, null, batch, true);
+    }
+
+    /**
+     * One run's load, opened and not yet read: which tables it owes, the batch of the first of them already
+     * open, and the order every row is stamped with.
+     *
+     * <p>Reading and abandoning are both done through it, from different threads. Closing it while a read
+     * is under way closes the batch that read is taking rows from, and whatever that batch does next, the
+     * read ends with a {@link CancellationException} and reports no further table as loaded: a table whose
+     * read was cut short is not a table whose rows were all handed over, and saying otherwise is what would
+     * let a load that lost its tail be recorded as written.
+     */
+    public static final class Load implements AutoCloseable {
+
+        private final CapturePort port;
+        private final CaptureConfig config;
+        private final String miningChainId;
+        private final List<String> tables;
+        private final List<String> owed;
+        private final SourceOrder order;
+        private final String tailSeam;
+        private final boolean oneBatch;
+        private CaptureBatch open;
+        private boolean closed;
+
+        private Load(CapturePort port, CaptureConfig config, String miningChainId, List<String> tables,
+                List<String> owed, SourceOrder order, String tailSeam, CaptureBatch open, boolean oneBatch) {
+            this.port = port;
+            this.config = config;
+            this.miningChainId = miningChainId;
+            this.tables = List.copyOf(tables);
+            this.owed = List.copyOf(owed);
+            this.order = order;
+            this.tailSeam = tailSeam;
+            this.open = open;
+            this.oneBatch = oneBatch;
+        }
+
+        /** The seam the tail following this load joins at; null where the load reads nothing. */
+        public String tailSeam() {
+            return tailSeam;
+        }
+
+        /** Whether this load has any row to read at all -- whether any selected table is still owed. */
+        public boolean readsAnything() {
+            return !owed.isEmpty();
+        }
+
+        /**
+         * Reads every row this load owes into {@code sink}, a table at a time, and tells {@code loaded} about
+         * each table once its last row is in -- then about every selected table it owed nothing for, which
+         * has nothing left to hand over. Returns how many rows it passed on.
+         *
+         * <p>A failure stops the read where it happened: the tables after it are not read, and neither they
+         * nor the one that failed are reported. Every batch is closed, whether or not it was read through.
+         */
+        public long read(Consumer<Envelope> sink, Consumer<String> loaded) {
+            Objects.requireNonNull(sink, "sink");
+            Objects.requireNonNull(loaded, "loaded");
+            long count = 0;
+            Set<String> reported = new LinkedHashSet<>();
+            if (oneBatch) {
+                count += readOpenBatch(sink);
+            } else {
+                for (int i = 0; i < owed.size(); i++) {
+                    String table = owed.get(i);
+                    if (i > 0) {
+                        openBatchOf(table);
+                    }
+                    count += readOpenBatch(sink);
+                    report(table, loaded, reported);
+                }
+            }
+            for (String table : tables) {
+                if (!reported.contains(table)) {
+                    report(table, loaded, reported);
+                }
+            }
+            return count;
+        }
+
+        /** Abandons the load: closes the batch being read, if any, and keeps any later one from opening. */
+        @Override
+        public void close() {
+            CaptureBatch batch;
+            synchronized (this) {
+                closed = true;
+                batch = open;
+                open = null;
+            }
+            if (batch != null) {
+                batch.close();
             }
         }
-        return count;
+
+        private long readOpenBatch(Consumer<Envelope> sink) {
+            CaptureBatch batch;
+            synchronized (this) {
+                batch = open;
+            }
+            requireOpen();
+            long count = 0;
+            try {
+                while (batch.hasNext()) {
+                    sink.accept(batch.next().withOrder(order));
+                    count++;
+                }
+            } finally {
+                synchronized (this) {
+                    if (open == batch) {
+                        open = null;
+                    }
+                }
+                batch.close();
+            }
+            return count;
+        }
+
+        /**
+         * Opens the read of a table after the first. Its seam is required as the first one was -- a source
+         * that reports none for one table reports none it can be trusted for -- but it is not recorded: one
+         * seam covers the whole round, and the first read took it.
+         *
+         * <p>A load abandoned already opens nothing more. Asked first, because opening a read is a connection
+         * to the source; the check after it is the one that decides, and this only spares a load that is
+         * over the cost of a read it would close again at once.
+         */
+        private void openBatchOf(String table) {
+            requireOpen();
+            CaptureBatch batch = port.snapshot(readOf(config, table));
+            try {
+                seamOf(batch, miningChainId);
+            } catch (RuntimeException | Error failure) {
+                batch.close();
+                throw failure;
+            }
+            synchronized (this) {
+                if (!closed) {
+                    open = batch;
+                    return;
+                }
+            }
+            batch.close();
+            throw abandoned();
+        }
+
+        /**
+         * Tells {@code loaded} that {@code table} is through -- unless the load was abandoned. A batch closed
+         * under the read may simply have stopped handing rows over, and then what came out of it is a prefix
+         * of the table rather than the table.
+         */
+        private void report(String table, Consumer<String> loaded, Set<String> reported) {
+            requireOpen();
+            loaded.accept(table);
+            reported.add(table);
+        }
+
+        private synchronized void requireOpen() {
+            if (closed) {
+                throw abandoned();
+            }
+        }
+
+        private static CancellationException abandoned() {
+            return new CancellationException("the load was abandoned before it was read through");
+        }
     }
 }

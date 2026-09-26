@@ -15,6 +15,7 @@ import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.core.common.TapstateException;
 import java.util.ArrayDeque;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.LongConsumer;
@@ -36,6 +37,13 @@ import java.util.function.LongConsumer;
  * captures reaches the sink through here, for as long as the pipeline runs. Draining once delivers whatever
  * happened to be buffered when the job started and strands the rest in a member-local queue nothing reads
  * again -- with the job still running, nothing thrown, and the tail reporting healthy.
+ *
+ * <p><strong>A declared load arrives while this runs, and until all of it has, the ring waits.</strong> The
+ * capture reads an initial load into the buffer a few thousand rows at a time, as fast as this source takes
+ * them, so for most of a large load the buffer is empty and more is still coming. An empty buffer therefore
+ * says nothing about whether the load is over; the declaration does. Until the load has been handed over in
+ * full this source neither reads the ring nor promises the load's bound, and a source that finds part of the
+ * load already taken by an instance before it -- a job restarted mid-load -- never promises it at all.
  *
  * <p>Non-cooperative, exactly as Jet's own SourceBuilder-built source is: it runs on its own thread and backs
  * off between empty fills, so an idle input never spins a shared cooperative thread. It is not fault-tolerant -
@@ -78,6 +86,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private boolean announcedAny;
     // Whether this source still owes the bound covering the snapshot rows it was seeded with.
     private boolean snapshotBoundDue;
+    // Whether a load declared for this ring is still arriving. While it is, the ring is not read and the
+    // load's bound is not promised: a change read ahead of a snapshot row of the same key would be overwritten
+    // by the older value, and a bound promised before the last row is a table recorded as written short.
+    private boolean awaitingSnapshot;
+    // Whether this instance saw the declared load from its first row. One that starts after an earlier
+    // instance has already taken some of it -- a job restarted mid-load -- cannot vouch for the rows that
+    // instance took and never emitted, so it promises nothing about the load and leaves the table owed.
+    private boolean vouchesForSnapshot = true;
 
     private SrsSourceProcessor(String pipelineId, String ringName, String src, long epoch,
             SourceBoundStamp stamp, RingTail ringTail) {
@@ -107,6 +123,13 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // with the shared ring switched off never stops appending to it.
         Object bound = context.hazelcastInstance().getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY);
         buffered = bound instanceof SnapshotBuffer resolved ? resolved : null;
+        if (buffered != null) {
+            // Asked before the first drain, so what it says about the load having been started on is about
+            // earlier instances and never about this one.
+            SnapshotBuffer.SnapshotState load = buffered.snapshotState(pipelineId, ringName);
+            awaitingSnapshot = !load.handedOver();
+            vouchesForSnapshot = !load.begun();
+        }
         drainBuffered();
         if (ringTail != null) {
             // Both of these are local lookups. Where the reader starts is not -- it is a guarded operation on
@@ -139,11 +162,17 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // row of one snapshot carries the same reserved position, so downstream never sees a higher position
         // of this table settle, and a sink with no bound to close them on never records the table as
         // written -- which is a table read again from the start on every resume until the load ends.
-        if (snapshotBoundDue) {
+        //
+        // "Every row" is only known once a declared load has been handed over in full: rows that have left
+        // are not the load while more of it is still arriving, and a bound promised on them is a table
+        // recorded as written with its tail missing.
+        if (snapshotBoundDue && !awaitingSnapshot) {
             snapshotBoundDue = false;
-            stampAt(SourceOrder.snapshotRow(epoch));
-            if (!announce()) {
-                return false;
+            if (vouchesForSnapshot) {
+                stampAt(SourceOrder.snapshotRow(epoch));
+                if (!announce()) {
+                    return false;
+                }
             }
         }
         // Reading and projecting what arrived is this stage's unit of work; a pass that finds nothing is
@@ -155,7 +184,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // The ring's sequence pairs with the generation this reader runs under to give each change its
         // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
         // again, so a change of the new ring would otherwise read as older than one of the ring before it.
-        if (ringTail != null && openReader()) {
+        // Not before a declared load is through: the ring may already hold changes to rows the load has
+        // yet to hand over, and each of them has to follow its row, not precede it.
+        if (ringTail != null && !awaitingSnapshot && openReader()) {
             try {
                 reader.fill((item, seq) -> {
                     SourceOrder order = orderOf(seq);
@@ -257,7 +288,13 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         if (buffered == null) {
             return;
         }
-        for (Envelope row : buffered.drain(pipelineId, ringName)) {
+        List<Envelope> rows = buffered.drain(pipelineId, ringName);
+        // Asked after the drain: once the load has ended with none of it left waiting, everything it handed
+        // over has been taken -- in this drain or an earlier one -- and is ahead of anything read from here on.
+        if (awaitingSnapshot) {
+            awaitingSnapshot = !buffered.snapshotState(pipelineId, ringName).handedOver();
+        }
+        for (Envelope row : rows) {
             pending.add(row);
             ChainPosition at = row.position();
             if (at == null || at.order() == null || at.order().seq() == SourceOrder.SNAPSHOT_SEQ) {
@@ -298,7 +335,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * nothing at all, and the levels behind it keep whatever they last promised.
      */
     private void stampWhatHasLeft() {
-        if (read == null) {
+        // A load's bound goes first. The sink records a table's load as written only on reaching the load's
+        // own position; a higher one promised ahead of it makes that position a bound that is no advance and
+        // is never sent, and the table then reads as owed for good. A change handed over behind the last row
+        // of a load -- a tail with no ring does exactly that -- waits the one pass it takes to promise it.
+        if (read == null || snapshotBoundDue) {
             return;
         }
         stampAt(read);

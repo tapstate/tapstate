@@ -4,6 +4,7 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.internal.util.executor.HazelcastManagedThread;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.control.core.ArtifactQueryService;
@@ -11,9 +12,11 @@ import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelineStatus;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.engine.MemberOutOfMemory;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import org.junit.jupiter.api.AfterEach;
@@ -26,6 +29,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 
+import static io.tapstate.core.lifecycle.PipelineState.FAILED;
 import static io.tapstate.core.lifecycle.PipelineState.PAUSED;
 import static io.tapstate.core.lifecycle.PipelineState.RUNNING;
 import static io.tapstate.core.lifecycle.PipelineState.STOPPED;
@@ -139,6 +143,50 @@ class SingleNodeLifecycleE2ETest {
         assertActualState(RUNNING, 3); // 1 = RUNNING, 2 = STOPPED, 3 = RUNNING again
     }
 
+    /**
+     * A pipeline paused when its engine is lost for want of memory is failed with that cause, as a running
+     * one is. Its job was held on the member and went with it, so nothing is left for a resume to continue;
+     * it used to go on reading PAUSED while the server reported itself unhealthy, and turned FAILED only once
+     * somebody resumed it.
+     *
+     * <p>The paused reading comes first, so that a pipeline which never got as far as paused cannot pass for
+     * one failed out of it. The tick after is read too: the intent still says PAUSED, and a loop that went
+     * back to holding the job would be refused and fail the pipeline again on every tick.
+     */
+    @Test
+    @DisplayName("a pipeline paused when its engine is lost for want of memory reads FAILED with that cause, and stays there")
+    void aPipelinePausedWhenItsEngineIsLostForWantOfMemoryReadsFailed() {
+        MemberOutOfMemory.watch(member);
+        desire(RUNNING);
+        Job job = member.getJet().getJob(PIPE);
+        awaitStatus(job, JobStatus.RUNNING);
+        desire(PAUSED);
+        awaitStatus(job, JobStatus.SUSPENDED);
+        driver.reconcile(); // a tick while the engine is up and holds the job: nothing to do
+        assertActualState(PAUSED, 2);
+        assertReadFaceReports(PIPE, PAUSED);
+
+        runOutOfMemoryOnAMemberThread();
+        assertThat(MemberOutOfMemory.of(member))
+                .as("the member's own out-of-memory handling took it down, and the held job with it")
+                .isPresent();
+        driver.reconcile();
+
+        assertThat(readFaces.status(PIPE))
+                .returns(FAILED, PipelineStatus::state)
+                .extracting(PipelineStatus::failure)
+                .as("and the status says what took the engine down")
+                .returns("engine.out-of-memory", ObservationFailure::code);
+        assertActualState(FAILED, 3);
+
+        driver.reconcile();
+
+        assertActualState(FAILED, 3);
+        assertThat(readFaces.status(PIPE).failure())
+                .as("the next tick keeps the cause rather than failing the pipeline again over another")
+                .returns("engine.out-of-memory", ObservationFailure::code);
+    }
+
     /** Saves the pipeline's desired target and runs one reconcile pass, the tick the scheduled driver makes. */
     private void desire(PipelineState target) {
         storePort.desired().save(new DesiredState(PIPE, target, REV));
@@ -167,6 +215,26 @@ class SingleNodeLifecycleE2ETest {
             }
         }
         throw new AssertionError("job did not reach " + expected + " within budget; last status was " + last);
+    }
+
+    /**
+     * Lets an out-of-memory error escape one of the member's own threads, which is how the member hears of it,
+     * and returns once the member's out-of-memory handling is done with it. The error is the one the collector
+     * raises when it gives up, which the handling acts on however full the heap is.
+     */
+    private static void runOutOfMemoryOnAMemberThread() {
+        Thread memberThread = new HazelcastManagedThread(() -> {
+            throw new OutOfMemoryError("GC overhead limit exceeded");
+        }, "test-member-out-of-memory");
+        memberThread.start();
+        try {
+            assertThat(memberThread.join(Duration.ofSeconds(60)))
+                    .as("the member thread hands its out-of-memory error over and ends")
+                    .isTrue();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while the out-of-memory handling ran", interrupted);
+        }
     }
 
     /**

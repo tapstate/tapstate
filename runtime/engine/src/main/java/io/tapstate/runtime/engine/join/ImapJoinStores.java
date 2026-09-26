@@ -1,12 +1,16 @@
 package io.tapstate.runtime.engine.join;
 
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.ReadOnly;
 import com.hazelcast.map.EntryProcessor;
 import com.hazelcast.map.IMap;
 
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -15,8 +19,8 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * A join's state on the cluster: three distributed maps, each reading through to the cold layer behind
- * it, reached the way the driver reaches any store.
+ * A join's state on the cluster: distributed maps, each reading through to the cold layer behind it,
+ * reached the way the driver reaches any store.
  *
  * <p><b>The batch read is the reason the fact mirror is asked through {@link #factsUnder} at all.</b>
  * {@code getAll} is what carries a page of keys to the members holding them in one exchange and, where
@@ -131,6 +135,34 @@ public final class ImapJoinStores implements JoinStores {
     }
 
     /**
+     * Asked where the pages live rather than answered from pages fetched here. A page holds up to a
+     * page size of fact keys and the rows asking about it are often one, so fetching the pages of a
+     * batch would hold a full page for each of its rows at once; what crosses back instead is the keys
+     * found, which the batch already holds. It is one call for the whole batch, as
+     * {@link #factsUnder} is.
+     *
+     * <p>Each set of keys asked is copied once however many pages it is asked of, so a question about
+     * every page of a long bucket carries its keys once rather than once a page.
+     */
+    @Override
+    public Map<ReverseBucket.At, Set<String>> indexNames(String source,
+            Map<ReverseBucket.At, Set<String>> asked) {
+        if (asked.isEmpty()) {
+            return Map.of();
+        }
+        Map<ReverseBucket.At, Set<String>> wanted = new HashMap<>();
+        Map<Set<String>, Set<String>> copies = new IdentityHashMap<>();
+        asked.forEach((at, factKeys) -> wanted.put(at, copies.computeIfAbsent(factKeys, HashSet::new)));
+        Map<ReverseBucket.At, Set<String>> named = new LinkedHashMap<>();
+        index(source).executeOnKeys(wanted.keySet(), new Names(wanted)).forEach((at, found) -> {
+            if (!found.isEmpty()) {
+                named.put(at, found);
+            }
+        });
+        return named;
+    }
+
+    /**
      * Appends to the last page, moving on a page at a time while the one tried is full. Two writers
      * deciding at once that a page is full both move on and both append to the next one, because the
      * append is what decides rather than the reading that preceded it.
@@ -170,6 +202,21 @@ public final class ImapJoinStores implements JoinStores {
             }
         }
         trim(pages, dimensionKey, last);
+    }
+
+    @Override
+    public long batchesTakenIn(String writer) {
+        Long batch = writers().get(writer);
+        return batch == null ? 0 : batch;
+    }
+
+    /**
+     * A plain set, as the fact mirror's is: only the writer the entry is named after ever writes it, so
+     * there is no second writer for an update to be lost to.
+     */
+    @Override
+    public void putBatchesTakenIn(String writer, long batch) {
+        writers().set(writer, batch);
     }
 
     /**
@@ -229,6 +276,10 @@ public final class ImapJoinStores implements JoinStores {
         return member.getMap(JoinMaps.reverseIndex(pipelineId, stepId, source));
     }
 
+    private IMap<String, Long> writers() {
+        return member.getMap(JoinMaps.writers(pipelineId, stepId));
+    }
+
     /** Appends one fact key to a page, or says the page is full. Runs where the entry lives. */
     static final class Append
             implements EntryProcessor<ReverseBucket.At, ReverseBucket, Boolean>, Serializable {
@@ -257,6 +308,44 @@ public final class ImapJoinStores implements JoinStores {
             grown.add(factKey);
             entry.setValue(new ReverseBucket(grown, bucket.furtherPages()));
             return true;
+        }
+    }
+
+    /**
+     * Which of the fact keys asked of a page that page names. Changes nothing, so it runs with no
+     * backup and no write; a page that is not in memory is read from the layer beneath first, as a
+     * get would.
+     */
+    static final class Names
+            implements EntryProcessor<ReverseBucket.At, ReverseBucket, Set<String>>, ReadOnly,
+            Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final Map<ReverseBucket.At, Set<String>> asked;
+
+        Names(Map<ReverseBucket.At, Set<String>> asked) {
+            this.asked = asked;
+        }
+
+        @Override
+        public Set<String> process(Map.Entry<ReverseBucket.At, ReverseBucket> entry) {
+            ReverseBucket page = entry.getValue();
+            Set<String> wanted = asked.getOrDefault(entry.getKey(), Set.of());
+            Set<String> found = new HashSet<>();
+            if (page != null) {
+                for (String factKey : page.factKeys()) {
+                    if (wanted.contains(factKey)) {
+                        found.add(factKey);
+                    }
+                }
+            }
+            return found;
+        }
+
+        @Override
+        public EntryProcessor<ReverseBucket.At, ReverseBucket, Set<String>> getBackupProcessor() {
+            return null;
         }
     }
 

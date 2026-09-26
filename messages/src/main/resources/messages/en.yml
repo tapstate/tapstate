@@ -639,6 +639,9 @@ engine.membership-changed-before-start:
 engine.job-failed:
   message: "Pipeline {pipeline} stopped because its job failed: {cause}."
   solution: "Check the pipeline's logs for the failure, fix what it reports, then start the pipeline again."
+engine.out-of-memory:
+  message: "Pipeline {pipeline} stopped because the engine ran out of memory and shut down."
+  solution: "The server reports itself unhealthy until it is restarted. Restart it with a larger Java heap (for example -XX:MaxRAMPercentage or -Xmx), or run fewer pipelines at once, then start the pipeline again."
 engine.no-such-job:
   message: "Pipeline {pipeline} has no running job to act on."
   solution: "Start the pipeline before pausing or resuming it, and check the id for typos."

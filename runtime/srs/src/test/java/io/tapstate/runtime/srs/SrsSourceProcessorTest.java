@@ -497,6 +497,144 @@ class SrsSourceProcessorTest {
         }
     }
 
+    // ---- a declared load, read while the job runs ---------------------------------------------------
+
+    /**
+     * A declared load arrives a part at a time while the source runs, so an empty buffer is not the end of
+     * it. The ring waits until the load has been handed over in full: here it holds changes from the start,
+     * and a source that read them the first time its buffer ran dry would put them ahead of the row that is
+     * still to come.
+     */
+    @Test
+    void aDeclaredLoadHoldsTheRingUntilItHasAllBeenHandedOver() throws InterruptedException {
+        String ring = "srs.chain.declared";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100));
+        buffer.append(PIPELINE, ring, snapshotRow(101));
+        fill(ring, 2);
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        IList<String> out = hz.getList("out-declared");
+        Job job = hz.getJet().newJob(projectedDag(ring, "orders", "out-declared", 1024, SrsReadCursorPublisherFactory.NONE));
+        try {
+            awaitSize(out, 2);
+            Thread.sleep(300);
+            assertThat(List.copyOf(out))
+                    .as("the ring's changes wait while the load is still arriving")
+                    .containsExactly("orders|null|100|null", "orders|null|101|null");
+
+            buffer.append(PIPELINE, ring, snapshotRow(102));
+            buffer.endSnapshot(PIPELINE, ring);
+            awaitSize(out, 5);
+
+            assertThat(List.copyOf(out)).containsExactly(
+                    "orders|null|100|null", "orders|null|101|null", "orders|null|102|null",
+                    "orders|w0|0|1:0", "orders|w1|1|1:1");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            out.destroy();
+        }
+    }
+
+    /**
+     * The load's bound says every row of it has left, so it waits for the last row rather than for the
+     * buffer to run dry: promised on the rows that have left while more is arriving, it would record the
+     * table as written with its tail still to come.
+     */
+    @Test
+    void promisesADeclaredLoadOnlyOnceItHasAllBeenHandedOver() throws InterruptedException {
+        SEEN.clear();
+        String ring = "srs.chain.declaredbound";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, ring, snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-declaredbound", 1024));
+        try {
+            awaitSize(hz.getList("out-declaredbound"), 2);
+            Thread.sleep(300);
+            assertThat(SEEN).as("no bound while the load is still arriving").doesNotContain("b:7:0");
+
+            buffer.endSnapshot(PIPELINE, ring);
+
+            awaitSeen("b:7:0");
+            assertThat(SEEN).containsSubsequence("i:100", "i:101", "b:7:0");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-declaredbound").destroy();
+        }
+    }
+
+    /**
+     * A source that starts on a load another instance of it has already taken rows from -- a job restarted
+     * part way through the load -- cannot vouch for the rows that instance took and never sent on. It
+     * carries on with the rest and promises nothing about the load, so the table stays owed and is read
+     * again rather than recorded as written without them.
+     */
+    @Test
+    void aSourceStartingOnALoadAlreadyBegunPromisesNothingOfIt() throws InterruptedException {
+        SEEN.clear();
+        String ring = "srs.chain.begun";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        assertThat(buffer.drain(PIPELINE, ring)).as("taken by an instance before this one").hasSize(1);
+        buffer.append(PIPELINE, ring, snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.endSnapshot(PIPELINE, ring);
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-begun", 1024));
+        try {
+            awaitSize(hz.getList("out-begun"), 1);
+            Thread.sleep(500);
+
+            assertThat(SEEN).contains("i:101").doesNotContain("b:7:0");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-begun").destroy();
+        }
+    }
+
+    /**
+     * The sink records a load as written only on reaching the load's own position, so that bound goes out
+     * before the bound of any change that follows it: promised first, the change's higher bound makes the
+     * load's no advance at all, and it is never sent. Here a change is handed over with the load's rows,
+     * which puts a change's position in hand while the load's bound is still owed.
+     */
+    @Test
+    void theLoadsBoundGoesOutAheadOfTheBoundOfAChangeHandedOverWithIt() throws InterruptedException {
+        SEEN.clear();
+        String ring = "srs.chain.loadfirst";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, ring, snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, ring, Envelope.insert(5L, "orders", Map.of("id", 5), null)
+                .withPosition(new ChainPosition(new SourceOrder(1L, 5L), "t5")));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-loadfirst", 1024));
+        try {
+            awaitSize(hz.getList("out-loadfirst"), 3);
+            Thread.sleep(300);
+            assertThat(SEEN.stream().filter(entry -> entry.startsWith("b:")).toList())
+                    .as("nothing promised while the load's own bound is still owed")
+                    .isEmpty();
+
+            buffer.endSnapshot(PIPELINE, ring);
+
+            awaitSeen("b:7:6");
+            assertThat(SEEN.stream().filter(entry -> entry.startsWith("b:")).toList())
+                    .containsExactly("b:7:0", "b:7:6");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-loadfirst").destroy();
+        }
+    }
+
     private static void runRecordingBounds(String ringName, String src, String sinkName, int size, int queueSize,
             String bound) throws InterruptedException {
         Job job = hz.getJet().newJob(recordingDag(ringName, src, sinkName, queueSize));
