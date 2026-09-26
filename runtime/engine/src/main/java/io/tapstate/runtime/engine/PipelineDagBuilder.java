@@ -579,9 +579,8 @@ public final class PipelineDagBuilder {
     }
 
     /**
-     * For each chain, every writer the graph routes that chain's changes to: every processor of each sink the
-     * chain reaches - one, at index zero, for a sink running as one processor for the cluster, and as many as
-     * the sink runs across the cluster otherwise, by the index the engine gives each.
+     * For each chain, every writer the graph routes that chain's changes to: {@linkplain #writersOf every writer}
+     * of each sink the chain reaches.
      *
      * <p>Taken from the graph rather than from what a running writer has seen, for the reason the levels
      * above take their edges from it: at runtime a writer that has not reported yet and a writer that never
