@@ -373,6 +373,29 @@ class PipelineDagBuilderTest {
         assertThat(narrow.byNode()).containsEntry("serve.sync_1", List.of("serve.sync_1"));
     }
 
+    /**
+     * A stateless step runs at its node's width in a vertex of its own, and the drawing says so under the step's
+     * id - so a reader matching a running vertex to the width its node was planned at finds an ordinary step as
+     * it finds a join, and never has to guess from the vertex's name.
+     */
+    @Test
+    void the_drawing_tells_that_a_steps_own_vertex_runs_at_its_width() {
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of(SourceRef.bare("orders_src")),
+                List.of(filter("shape_orders", "row.id % 2 == 0", FromRef.literal("orders_src"))),
+                view("order_state", FromRef.literal("shape_orders")),
+                null, null, null);
+        NodeVertices drawn = new NodeVertices();
+
+        PipelineDagBuilder.build(pipeline, bindings(Map.of(
+                FromRef.literal("orders_src"), List.of("orders_src"),
+                FromRef.literal("shape_orders"), List.of("shape_orders"))),
+                null, null, ExecutionShape.totalOne(), drawn);
+
+        assertThat(drawn.byNode()).containsEntry("shape_orders", List.of("shape_orders"));
+    }
+
     private static PipelineResource joinPipeline(io.tapstate.core.model.ExecutionSpec execution) {
         return new PipelineResource(
                 "p", null,
