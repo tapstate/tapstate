@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.logging.PipelineAttribution;
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.spi.store.ObservationStore;
 import org.slf4j.MDC;
 
@@ -11,6 +12,20 @@ record PipelineLogContext(String pipelineId, String incarnationId, String genera
         return new PipelineLogContext(MDC.get(PipelineAttribution.MDC_KEY),
                 MDC.get(PipelineAttribution.INCARNATION_MDC_KEY),
                 MDC.get(PipelineAttribution.EXECUTION_MDC_KEY));
+    }
+
+    /** Returns the current complete log owner only when it names this exact pipeline. */
+    static LogSink.Scope scopeFor(String pipelineId) {
+        PipelineLogContext context = capture();
+        if (pipelineId == null || !pipelineId.equals(context.pipelineId())
+                || context.incarnationId() == null || context.generation() == null) {
+            return null;
+        }
+        try {
+            return new LogSink.Scope(context.incarnationId(), Long.parseLong(context.generation()));
+        } catch (IllegalArgumentException malformedContext) {
+            return null;
+        }
     }
 
     static void bindScope(ObservationStore.Scope scope) {

@@ -6,7 +6,11 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.tapdata.entity.logger.TapLogger;
 import io.tapstate.core.logging.PipelineAttribution;
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.model.PipelineNode;
+import io.tapstate.spi.sink.DdlPolicy;
+import io.tapstate.spi.sink.SinkConfig;
+import io.tapstate.spi.sink.WriteMode;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -121,6 +125,106 @@ class AConnectorsOwnWordsReachTheHostLogTest {
         assertThat(onItsOwnThread.get())
                 .as("the slot is handed back, so the thread is not left claiming a pipeline it is not in")
                 .isNull();
+    }
+
+    @Test
+    void anUnscopedHandleCannotBorrowAnotherExecutionsDiagnosticContext() {
+        MDC.put(PipelineAttribution.INCARNATION_MDC_KEY, "new-resource");
+        MDC.put(PipelineAttribution.EXECUTION_MDC_KEY, "9");
+        try {
+            List<ILoggingEvent> written = captured("io.tapstate.connector.demo",
+                    () -> new ConnectorLog("demo", PIPELINE).warn("late old-handle warning"));
+
+            assertThat(written).singleElement().satisfies(event -> assertThat(event.getMDCPropertyMap())
+                    .containsEntry(PipelineAttribution.MDC_KEY, PIPELINE)
+                    .doesNotContainKeys(PipelineAttribution.INCARNATION_MDC_KEY,
+                            PipelineAttribution.EXECUTION_MDC_KEY));
+            assertThat(MDC.get(PipelineAttribution.INCARNATION_MDC_KEY)).isEqualTo("new-resource");
+            assertThat(MDC.get(PipelineAttribution.EXECUTION_MDC_KEY)).isEqualTo("9");
+        } finally {
+            MDC.remove(PipelineAttribution.INCARNATION_MDC_KEY);
+            MDC.remove(PipelineAttribution.EXECUTION_MDC_KEY);
+        }
+    }
+
+    @Test
+    void delayedHandleKeepsItsCapturedOwnerAcrossThreadsAndRestoresTheCaller() throws Exception {
+        LogSink.Scope oldRun = new LogSink.Scope("old-resource", 7);
+        ConnectorLog log = new ConnectorLog("demo", PIPELINE, oldRun);
+        MDC.put(PipelineAttribution.INCARNATION_MDC_KEY, "new-resource");
+        MDC.put(PipelineAttribution.EXECUTION_MDC_KEY, "9");
+        try {
+            List<ILoggingEvent> written = captured("io.tapstate.connector.demo", () -> {
+                Thread delayed = new Thread(() -> log.error("old handle finished late"), "old-connector-callback");
+                delayed.start();
+                joinQuietly(delayed);
+            });
+
+            assertThat(written).singleElement().satisfies(event -> assertThat(event.getMDCPropertyMap())
+                    .containsEntry(PipelineAttribution.MDC_KEY, PIPELINE)
+                    .containsEntry(PipelineAttribution.INCARNATION_MDC_KEY, "old-resource")
+                    .containsEntry(PipelineAttribution.EXECUTION_MDC_KEY, "7"));
+            assertThat(MDC.get(PipelineAttribution.INCARNATION_MDC_KEY)).isEqualTo("new-resource");
+            assertThat(MDC.get(PipelineAttribution.EXECUTION_MDC_KEY)).isEqualTo("9");
+        } finally {
+            MDC.remove(PipelineAttribution.INCARNATION_MDC_KEY);
+            MDC.remove(PipelineAttribution.EXECUTION_MDC_KEY);
+        }
+    }
+
+    @Test
+    void aDriveUsesItsCapturedOwnerForHostFacadeAndSharedPdkLogs(@TempDir Path dir) throws Throwable {
+        LogSink.Scope oldRun = new LogSink.Scope("old-resource", 7);
+        MDC.put(PipelineAttribution.INCARNATION_MDC_KEY, "new-resource");
+        MDC.put(PipelineAttribution.EXECUTION_MDC_KEY, "9");
+        try {
+            List<ILoggingEvent> written = captured("io.tapstate.connector.shared", () -> {
+                try (PdkConnector connector = PdkConnector.open("demo", ref(dir), Map.of(),
+                        new PipelineNode(PIPELINE, "src_orders"), null, oldRun)) {
+                    connector.underLoader(() -> {
+                        TapLogger.warn("Synthetic", "old drive warning");
+                        return null;
+                    });
+                } catch (Throwable failure) {
+                    throw new AssertionError(failure);
+                }
+            });
+
+            assertThat(written).singleElement().satisfies(event -> assertThat(event.getMDCPropertyMap())
+                    .containsEntry(PipelineAttribution.MDC_KEY, PIPELINE)
+                    .containsEntry(PipelineAttribution.INCARNATION_MDC_KEY, "old-resource")
+                    .containsEntry(PipelineAttribution.EXECUTION_MDC_KEY, "7"));
+            assertThat(MDC.get(PipelineAttribution.INCARNATION_MDC_KEY)).isEqualTo("new-resource");
+            assertThat(MDC.get(PipelineAttribution.EXECUTION_MDC_KEY)).isEqualTo("9");
+        } finally {
+            MDC.remove(PipelineAttribution.INCARNATION_MDC_KEY);
+            MDC.remove(PipelineAttribution.EXECUTION_MDC_KEY);
+        }
+    }
+
+    @Test
+    void sinkPortPassesTheFrozenOwnerToTheMemberSideConnector(@TempDir Path dir) throws Throwable {
+        ConnectorRef ref = new ConnectorRef(List.of(Synthetic.countingSink(dir)),
+                "synthetic.CountingSink", "2.0.8", null);
+        PdkSinkPort port = new PdkSinkPort(connectorId -> ref);
+        SinkConfig config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.APPLY,
+                null, new PipelineNode(PIPELINE, "sink"));
+        LogSink.Scope oldRun = new LogSink.Scope("old-resource", 7);
+        MDC.put(PipelineAttribution.INCARNATION_MDC_KEY, "new-resource");
+        MDC.put(PipelineAttribution.EXECUTION_MDC_KEY, "9");
+        try (PdkSinkWriter writer = (PdkSinkWriter) port.open(config, Map.of(), oldRun)) {
+            writer.connector().underLoader(() -> {
+                assertThat(MDC.get(PipelineAttribution.MDC_KEY)).isEqualTo(PIPELINE);
+                assertThat(MDC.get(PipelineAttribution.INCARNATION_MDC_KEY)).isEqualTo("old-resource");
+                assertThat(MDC.get(PipelineAttribution.EXECUTION_MDC_KEY)).isEqualTo("7");
+                return null;
+            });
+            assertThat(MDC.get(PipelineAttribution.INCARNATION_MDC_KEY)).isEqualTo("new-resource");
+            assertThat(MDC.get(PipelineAttribution.EXECUTION_MDC_KEY)).isEqualTo("9");
+        } finally {
+            MDC.remove(PipelineAttribution.INCARNATION_MDC_KEY);
+            MDC.remove(PipelineAttribution.EXECUTION_MDC_KEY);
+        }
     }
 
     @Test

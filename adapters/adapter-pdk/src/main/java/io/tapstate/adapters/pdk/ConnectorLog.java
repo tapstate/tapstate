@@ -2,6 +2,7 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.logger.Log;
 import io.tapdata.entity.logger.TapLogger;
+import io.tapstate.core.logging.LogSink;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,11 +25,11 @@ import org.slf4j.LoggerFactory;
  * turning the level up would reach the host log and still show the author nothing where they are
  * looking -- which is the whole of what lowering rather than dropping was for.
  *
- * <p>Each line is filed against the pipeline this connector was opened for, whatever thread writes it --
- * a connector may write from a thread of its own, long after the call that created it returned. A drive
- * that belongs to no single pipeline (a schema discovery, a connection test) names none, and its lines
- * stay in the host log without being filed against any pipeline: a source is discovered on behalf of
- * whoever asked, and any number of pipelines may read the same one.
+ * <p>Each line carries the owner captured when this connector was opened, whatever thread writes it --
+ * a connector may write from a thread of its own, long after the call that created it returned. A handle
+ * opened before execution ownership is known has no execution scope; it must not borrow one from a later
+ * caller's thread. A drive that belongs to no single pipeline (a schema discovery, a connection test)
+ * names none, and its lines stay in the host log without being filed against any pipeline.
  */
 final class ConnectorLog implements Log {
 
@@ -40,14 +41,20 @@ final class ConnectorLog implements Log {
 
     private final Logger host;
     private final String pipelineId;
+    private final LogSink.Scope scope;
 
     /**
      * A log for one connector handle. {@code pipelineId} is the pipeline whose drive opened it, or null
      * for a drive that names no pipeline.
      */
     ConnectorLog(String connectorId, String pipelineId) {
+        this(connectorId, pipelineId, null);
+    }
+
+    ConnectorLog(String connectorId, String pipelineId, LogSink.Scope scope) {
         this.host = LoggerFactory.getLogger(LOGGER_PREFIX + connectorId);
         this.pipelineId = pipelineId;
+        this.scope = scope;
     }
 
     /**
@@ -108,11 +115,7 @@ final class ConnectorLog implements Log {
 
     /** Writes with this connector's pipeline named, putting back whatever the thread carried before. */
     private void attributed(Runnable write) {
-        if (pipelineId == null) {
-            write.run();
-            return;
-        }
-        String previous = ConnectorAttribution.claim(pipelineId);
+        ConnectorAttribution.Previous previous = ConnectorAttribution.claim(pipelineId, scope);
         try {
             write.run();
         } finally {

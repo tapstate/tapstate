@@ -1,6 +1,7 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkPort;
 import io.tapstate.spi.sink.SinkWriter;
@@ -38,9 +39,14 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets) {
+        return open(config, targets, null);
+    }
+
+    /** Opens one member-side writer with the log owner captured when its DAG was built. */
+    public SinkWriter open(SinkConfig config, Map<String, TargetTable> targets, LogSink.Scope logScope) {
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                config.node(), stateStore);
+                config.node(), stateStore, logScope);
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());

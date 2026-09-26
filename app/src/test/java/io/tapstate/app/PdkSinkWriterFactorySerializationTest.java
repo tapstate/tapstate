@@ -3,6 +3,8 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.model.PipelineNode;
+import io.tapstate.core.logging.PipelineAttribution;
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
@@ -14,6 +16,7 @@ import java.io.ObjectOutputStream;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.slf4j.MDC;
 
 /**
  * The sink factory is shipped onto the Jet DAG, so it and everything it carries must serialize. This guards
@@ -62,6 +65,37 @@ class PdkSinkWriterFactorySerializationTest {
         PdkSinkWriterFactory restored = (PdkSinkWriterFactory) roundTrip(factory);
         assertThat(restored.onFullLoad()).isEqualTo(io.tapstate.spi.sink.OnFullLoad.CLEAR);
         assertThat(restored.fullLoad()).isFalse();
+    }
+
+    @Test
+    void capturedLogOwnerSurvivesTheTripAfterTheCoordinatorContextHasGone() throws Exception {
+        PdkSinkWriterFactory factory;
+        MDC.put(PipelineAttribution.MDC_KEY, "p1");
+        MDC.put(PipelineAttribution.INCARNATION_MDC_KEY, "old-resource");
+        MDC.put(PipelineAttribution.EXECUTION_MDC_KEY, "7");
+        try {
+            factory = new PdkSinkWriterFactory("mysql", Map.of(), WriteMode.UPSERT,
+                    DdlPolicy.FAIL, Map.of(), new PipelineNode("p1", "sink"));
+        } finally {
+            MDC.clear();
+        }
+
+        PdkSinkWriterFactory restored = (PdkSinkWriterFactory) roundTrip(factory);
+        assertThat(restored.logScope()).isEqualTo(new LogSink.Scope("old-resource", 7));
+    }
+
+    @Test
+    void aDifferentPipelinesAmbientOwnerIsNeverCarriedToTheSinkMember() {
+        MDC.put(PipelineAttribution.MDC_KEY, "p2");
+        MDC.put(PipelineAttribution.INCARNATION_MDC_KEY, "resource-elsewhere");
+        MDC.put(PipelineAttribution.EXECUTION_MDC_KEY, "9");
+        try {
+            PdkSinkWriterFactory factory = new PdkSinkWriterFactory("mysql", Map.of(), WriteMode.UPSERT,
+                    DdlPolicy.FAIL, Map.of(), new PipelineNode("p1", "sink"));
+            assertThat(factory.logScope()).isNull();
+        } finally {
+            MDC.clear();
+        }
     }
 
     private static Object roundTrip(Object value) throws Exception {

@@ -5,6 +5,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkSinkPort;
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.OnFullLoad;
@@ -61,6 +62,8 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
     private final boolean fullLoad;
     private final Map<String, TargetTable> targets;
     private final PipelineNode node;
+    private final String logIncarnationId;
+    private final long logExecutionGeneration;
 
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl, TargetTable target,
@@ -86,6 +89,11 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
         this.ddl = ddl;
         this.targets = targets == null ? Map.of() : Map.copyOf(targets);
         this.node = node;
+        // The coordinator has just bound this run while constructing the DAG. Member-side execution
+        // must use these frozen coordinates, never its own thread's diagnostic context.
+        LogSink.Scope logScope = node == null ? null : PipelineLogContext.scopeFor(node.pipelineId());
+        this.logIncarnationId = logScope == null ? null : logScope.pipelineIncarnationId();
+        this.logExecutionGeneration = logScope == null ? 0 : logScope.executionGeneration();
     }
 
     /** The write-side models this factory will hand the sink, keyed by the stream each answers for. */
@@ -98,6 +106,10 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
         return node;
     }
 
+    LogSink.Scope logScope() {
+        return logIncarnationId == null ? null : new LogSink.Scope(logIncarnationId, logExecutionGeneration);
+    }
+
     OnFullLoad onFullLoad() { return onFullLoad; }
 
     boolean fullLoad() { return fullLoad; }
@@ -106,7 +118,8 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
     public SinkWriter getEx() {
         HazelcastInstance member = localMember();
         return new PdkSinkPort(provisioner(member), stateStore(member))
-                .open(new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad), targets);
+                .open(new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad),
+                        targets, logScope());
     }
 
     /**

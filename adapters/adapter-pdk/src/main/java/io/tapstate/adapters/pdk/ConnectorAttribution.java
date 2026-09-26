@@ -1,39 +1,55 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.logging.PipelineAttribution;
+import io.tapstate.core.logging.LogSink;
 
 import org.slf4j.MDC;
 
 /**
- * Says which pipeline the work about to run belongs to, for as long as it runs.
+ * Says which pipeline execution the work about to run belongs to, for as long as it runs.
  *
  * <p>A connector's output is filed against a pipeline by the thread that writes it, and a thread says so
  * by carrying the attribution while it works. The threads this runs on are shared and long-lived -- a
- * pooled executor, the tail's own thread, whatever member ran the vertex -- so whatever was in the slot
- * is handed back afterwards rather than cleared: a drive that cleared it would silently unattribute
- * everything the caller logged after it returned.
+ * pooled executor, the tail's own thread, whatever member ran the vertex -- so all three slots are
+ * replaced with this handle's captured owner and handed back afterwards. Retaining an inherited scope
+ * would file an old handle's late line under the execution currently using the thread.
  */
 final class ConnectorAttribution {
 
     private ConnectorAttribution() {
     }
 
-    /**
-     * Claims the slot for {@code pipelineId}, answering what was in it. Pass that answer back to
-     * {@link #restore(String)} when the work is done; call neither for a drive naming no pipeline.
-     */
-    static String claim(String pipelineId) {
-        String previous = MDC.get(PipelineAttribution.MDC_KEY);
-        MDC.put(PipelineAttribution.MDC_KEY, pipelineId);
+    /** Binds exactly the owner captured by this handle, clearing inherited identity when it has none. */
+    static Previous claim(String pipelineId, LogSink.Scope scope) {
+        if (pipelineId == null && scope != null) {
+            throw new IllegalArgumentException("a log scope requires a pipeline");
+        }
+        Previous previous = new Previous(MDC.get(PipelineAttribution.MDC_KEY),
+                MDC.get(PipelineAttribution.INCARNATION_MDC_KEY),
+                MDC.get(PipelineAttribution.EXECUTION_MDC_KEY));
+        putOrRemove(PipelineAttribution.MDC_KEY, pipelineId);
+        putOrRemove(PipelineAttribution.INCARNATION_MDC_KEY,
+                scope == null ? null : scope.pipelineIncarnationId());
+        putOrRemove(PipelineAttribution.EXECUTION_MDC_KEY,
+                scope == null ? null : Long.toString(scope.executionGeneration()));
         return previous;
     }
 
-    /** Puts back what {@link #claim(String)} found, leaving the slot empty when it found nothing. */
-    static void restore(String previous) {
-        if (previous == null) {
-            MDC.remove(PipelineAttribution.MDC_KEY);
+    /** Returns every diagnostic slot to the caller's previous owner. */
+    static void restore(Previous previous) {
+        putOrRemove(PipelineAttribution.MDC_KEY, previous.pipelineId());
+        putOrRemove(PipelineAttribution.INCARNATION_MDC_KEY, previous.incarnationId());
+        putOrRemove(PipelineAttribution.EXECUTION_MDC_KEY, previous.generation());
+    }
+
+    private static void putOrRemove(String key, String value) {
+        if (value == null) {
+            MDC.remove(key);
         } else {
-            MDC.put(PipelineAttribution.MDC_KEY, previous);
+            MDC.put(key, value);
         }
+    }
+
+    record Previous(String pipelineId, String incarnationId, String generation) {
     }
 }

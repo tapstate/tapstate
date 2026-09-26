@@ -333,6 +333,8 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     private PdkConnector open(CaptureConfig config, PipelineNode node) {
+        // Capture can open before the durable execution generation exists, and one physical change
+        // stream can serve several pipelines. A caller's MDC cannot prove ownership for this handle.
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
                 node, stateStore);
     }
