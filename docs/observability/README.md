@@ -37,6 +37,12 @@ that count falls back to the last discovery's estimate. Before confirmation, `ro
 that estimate and can lag a growing table. The current run's own snapshot read count is available as
 `snapshot.rows.read.<table>` on the metrics face.
 
+A table appears on the snapshot read once its load has been read through, and `landed` says whether the target
+has durably confirmed every row of that load. A table read through and not landed is still being written. A sink
+whose writers share one target table's rows writes that table's changes only once its load has landed, so its
+changes wait for it until then; each table crosses on its own, so one table can take changes while another is
+still landing.
+
 `pipeline.explain` requires a current observation. A newly started pipeline may return
 `monitor.no-observation` until its first observation is published. History is independent of the
 latest observation and can still return retained samples for a stopped pipeline.

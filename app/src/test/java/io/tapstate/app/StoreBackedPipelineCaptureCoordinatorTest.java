@@ -1074,15 +1074,19 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
             if (member == 0) {
                 assertThat(coordinator.snapshotProgress("p").byTable())
-                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
+                        .as("read through and not yet confirmed by the target: landing")
+                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, false)));
                 store.meta().markSnapshotComplete(chain.get().value(), "p", "orders");
                 assertThat(coordinator.loadDelivered("p")).isTrue();
+                assertThat(coordinator.snapshotProgress("p").byTable())
+                        .as("the target's durable mark is what lands it")
+                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, true)));
             } else {
                 verify(source, times(1)).snapshot(any());
                 assertThat(coordinator.loadDelivered("p")).isTrue();
                 assertThat(coordinator.snapshotProgress("p").byTable())
-                        .as("a replacement that skips the confirmed load still reports its five rows")
-                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
+                        .as("a replacement that skips the confirmed load still reports its five rows, landed")
+                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, true)));
             }
         }
     }
@@ -1138,7 +1142,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
             assertThat(secondCustomerRead.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(replacement.runSnapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
             assertThat(replacement.snapshotProgress("p").byTable())
-                    .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
+                    .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, true)));
             verify(source, times(1)).snapshot(org.mockito.ArgumentMatchers.argThat(
                     config -> config.streams().equals(List.of("orders"))));
         } finally {
@@ -1250,10 +1254,38 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.startCapture("p");
 
         assertThat(coordinator.snapshotProgress("p").byTable())
-                .containsOnly(entry("orders", new TableSnapshot(8L, 8L, 100)));
+                .containsOnly(entry("orders", new TableSnapshot(8L, 8L, 100, true)));
 
         coordinator.stopCapture("p", true);
         assertThat(store.keyedState().count(SnapshotLoadCounts.namespaceOf("p"))).isZero();
+    }
+
+    @Test
+    void aConfirmedLoadNothingCountedStillReadsAsLanded() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        // Discovered by a connector that cannot count, and confirmed before this run began by a server that kept
+        // no count of its own: the run reads the table through at nought rows and saves no count for it, so there
+        // is no number to report it as complete with.
+        InMemoryStorePort store = discoveredAs(artifacts, "orders", null);
+        SrsCoordinator srs = new SrsCoordinator(store.meta());
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srs.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srs.attachConsumer(chainId, spec.pipelineId());
+            store.meta().markSnapshotComplete(chainId.value(), spec.pipelineId(), "orders");
+            return new CaptureRun(Optional.of(chainId), false, 0L, Map.of("orders", 0L),
+                    Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, srs, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+
+        assertThat(coordinator.snapshotProgress("p").byTable())
+                .as("its reading stands as read, and the target's mark lands it all the same")
+                .containsOnly(entry("orders", new TableSnapshot(0L, null, null, true)));
     }
 
     @Test

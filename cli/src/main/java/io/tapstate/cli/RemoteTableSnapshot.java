@@ -9,6 +9,13 @@ package io.tapstate.cli;
  * @param rowsDone  rows loaded so far
  * @param rowsTotal the table's total row estimate, or null when unavailable
  * @param donePct   the completion percentage, or null when the total is unavailable
+ * @param landed    whether the target has durably confirmed the table's whole load, or null from a server that
+ *                  does not say
  */
-record RemoteTableSnapshot(long rowsDone, Long rowsTotal, Integer donePct) {
+record RemoteTableSnapshot(long rowsDone, Long rowsTotal, Integer donePct, Boolean landed) {
+
+    /** A table's progress from a server that does not say whether its load landed. */
+    RemoteTableSnapshot(long rowsDone, Long rowsTotal, Integer donePct) {
+        this(rowsDone, rowsTotal, donePct, null);
+    }
 }

@@ -1953,6 +1953,25 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void snapshotReadsWhetherEachTableLandedAndLeavesItUnsaidWhereTheServerDoesNotSay() throws Exception {
+        HttpServer server = apiServer("/api/pipelines/pl1/snapshot", 200,
+                "{\"pipelineId\":\"pl1\",\"snapshot\":{"
+                        + "\"orders\":{\"rowsDone\":10,\"rowsTotal\":10,\"donePct\":100,\"landed\":true},"
+                        + "\"items\":{\"rowsDone\":4,\"rowsTotal\":9,\"donePct\":44,\"landed\":false},"
+                        + "\"events\":{\"rowsDone\":5,\"rowsTotal\":null,\"donePct\":null}}}",
+                new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().snapshot(baseOf(server), "tok", "pl1"))
+                    .isEqualTo(new SnapshotOutcome.Found("pl1", Map.of(
+                            "orders", new RemoteTableSnapshot(10, 10L, 100, true),
+                            "items", new RemoteTableSnapshot(4, 9L, 44, false),
+                            "events", new RemoteTableSnapshot(5, null, null, null))));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void snapshotGetsThePerTableProgressIncludingAnUnavailableTotal() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/snapshot", 200,

@@ -3869,9 +3869,9 @@ final class Repl {
 
     /**
      * {@code snapshot <pipeline-id>} — reads the pipeline's per-table initial-load progress and prints one
-     * {@code <table>  <rowsDone>/<rowsTotal> (<pct>%)} line per table in name order (a table with no total
-     * shows {@code <rowsDone>/?} — honest partial data), or a benign {@code no snapshot} line when there is
-     * none. A coded refusal renders its code and message.
+     * {@code <table>  <rowsDone>/<rowsTotal> (<pct>%)  landed|landing} line per table in name order (a table with
+     * no total shows {@code <rowsDone>/?} — honest partial data), or a benign {@code no snapshot} line when there
+     * is none. A coded refusal renders its code and message.
      */
     private int snapshotOnline(List<String> words) {
         String id = readTargetId(words);
@@ -4235,13 +4235,18 @@ final class Repl {
 
     /**
      * One table's snapshot progress: {@code rowsDone/rowsTotal (donePct%)} when the total is known, or
-     * {@code rowsDone/?} when it is unavailable — honest partial data, never faked as a percentage.
+     * {@code rowsDone/?} when it is unavailable — honest partial data, never faked as a percentage. Then
+     * {@code landed} once the target has durably confirmed the whole load, or {@code landing} while it has not;
+     * neither from a server that does not say.
      */
     private static String renderProgress(RemoteTableSnapshot progress) {
-        if (progress.rowsTotal() != null && progress.donePct() != null) {
-            return progress.rowsDone() + "/" + progress.rowsTotal() + " (" + progress.donePct() + "%)";
+        String counted = progress.rowsTotal() != null && progress.donePct() != null
+                ? progress.rowsDone() + "/" + progress.rowsTotal() + " (" + progress.donePct() + "%)"
+                : progress.rowsDone() + "/?";
+        if (progress.landed() == null) {
+            return counted;
         }
-        return progress.rowsDone() + "/?";
+        return counted + (progress.landed() ? "  landed" : "  landing");
     }
 
     /**

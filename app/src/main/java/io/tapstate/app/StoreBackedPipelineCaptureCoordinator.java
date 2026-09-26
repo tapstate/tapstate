@@ -751,7 +751,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // A table this run skipped may not have been published by its hand-off yet, because another
         // table is still being read. Its sink's durable completion mark already answers for it. The
         // measured count was saved before that sink could confirm the load; discovery's estimate is the
-        // fallback for an older completed record without one.
+        // fallback for an older completed record without one. The mark is also what says the load landed,
+        // so a table read through reads as landed from the mark on, and never before it.
         SnapshotReading current = load.reading();
         List<SnapshotOnChain> covered = snapshotTablesByPipeline.getOrDefault(pipelineId, List.of());
         if (covered.isEmpty()) {
@@ -776,14 +777,21 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 TableSnapshot reading = completed.get(key);
                 OptionalLong saved = SnapshotLoadCounts.read(storePort.keyedState(), pipelineId,
                         source.chainId().orElseThrow(), table);
-                Long rows = saved.isPresent() ? saved.getAsLong()
-                        : reading != null && reading.rowsDone() > 0L ? reading.rowsDone()
+                // Boxed in every arm: one unboxed arm types the whole choice as a primitive, and a load nothing
+                // counted anywhere would then throw here instead of reading as uncounted.
+                Long rows = saved.isPresent() ? Long.valueOf(saved.getAsLong())
+                        : reading != null && reading.rowsDone() > 0L ? Long.valueOf(reading.rowsDone())
                         : reading != null && reading.rowsTotal() != null ? reading.rowsTotal()
                         : load.estimatedRows(source.sourceId(), table);
-                if (rows == null) {
+                if (rows != null) {
+                    completed.put(key, new TableSnapshot(rows, rows, 100, true));
+                } else if (reading != null) {
+                    // Nothing counted the table, but this run read it through: its reading stands, now landed.
+                    completed.put(key, new TableSnapshot(
+                            reading.rowsDone(), reading.rowsTotal(), reading.donePct(), true));
+                } else {
                     continue;
                 }
-                completed.put(key, new TableSnapshot(rows, rows, 100));
                 changed = true;
             }
         }

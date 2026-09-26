@@ -5396,6 +5396,22 @@ class ReplTest {
     }
 
     @Test
+    void snapshotSaysOfEachTableWhetherItsLoadLandedOrIsStillLanding() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
+                "orders", new RemoteTableSnapshot(10, 10L, 100, true),
+                "items", new RemoteTableSnapshot(4, 9L, 44, false),
+                "events", new RemoteTableSnapshot(5, null, null, null)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("snapshot pl1");
+        List<String> lines = h.sink().toString().substring(mark).lines().toList();
+        assertThat(lines).contains("orders  10/10 (100%)  landed", "items  4/9 (44%)  landing");
+        // A server that does not say is not read as either.
+        assertThat(lines).contains("events  5/?");
+    }
+
+    @Test
     void snapshotWithNoTablesPrintsABenignNoSnapshotLine() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());

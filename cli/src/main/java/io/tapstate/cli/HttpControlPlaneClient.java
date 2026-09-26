@@ -1723,8 +1723,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     /**
      * The per-table progress decoded from a 200 body's {@code snapshot} object, or {@code null} unless the body
      * carries a string id and a snapshot object. A table needs a numeric {@code rowsDone}; {@code rowsTotal} and
-     * {@code donePct} are kept null when absent or null (unavailable), never faked. An empty object is a
-     * legitimate empty (outside a snapshot phase).
+     * {@code donePct} are kept null when absent or null (unavailable), never faked, and so is {@code landed}, which
+     * a server that predates it does not send. An empty object is a legitimate empty (outside a snapshot phase).
      */
     private static SnapshotOutcome.Found snapshotFound(String body) {
         if (JsonReader.parse(body) instanceof Map<?, ?> m
@@ -1736,7 +1736,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                         && t.get("rowsDone") instanceof Number rowsDone) {
                     Long rowsTotal = t.get("rowsTotal") instanceof Number n ? n.longValue() : null;
                     Integer donePct = t.get("donePct") instanceof Number n ? n.intValue() : null;
-                    tables.put(table, new RemoteTableSnapshot(rowsDone.longValue(), rowsTotal, donePct));
+                    Boolean landed = t.get("landed") instanceof Boolean said ? said : null;
+                    tables.put(table, new RemoteTableSnapshot(rowsDone.longValue(), rowsTotal, donePct, landed));
                 }
             }
             return new SnapshotOutcome.Found(id, tables);
