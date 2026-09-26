@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.srs.SnapshotCapacityUnavailable;
+import io.tapstate.runtime.srs.PhysicalRingNotReady;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -110,10 +112,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     snapshot -> captureCoordinator.startCapture(
                             pipelineId, snapshot, prepared.cursorWriterToken()),
                     () -> captureCoordinator.startCapture(pipelineId));
-        } catch (RingNotOpenYet notYet) {
-            // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
-            // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
-            // being opened on another member, and how long that may take is bounded where it is decided.
+        } catch (RingNotOpenYet | SnapshotCapacityUnavailable | PhysicalRingNotReady notYet) {
+            // Nothing was submitted: the physical ring or its generation boundary is not ready, or the
+            // bounded snapshot pool has no slot. A later pass retries without a data-plane failure.
             return;
         }
         // Capture opens the SRS generation that source vertices compile into the DAG. Build only now, but

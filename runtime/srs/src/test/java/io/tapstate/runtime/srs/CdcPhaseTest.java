@@ -97,6 +97,26 @@ class CdcPhaseTest {
     }
 
     @Test
+    void aLateOldPhysicalPrefixCannotPublishAfterANewerRingGenerationOpens() {
+        RecordingMeta meta = new RecordingMeta();
+        meta.consumers = List.of(prefixConsumer(Map.of()));
+        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, "shared-chain", 1L,
+                new CaptureHealth())) {
+            prefix.anchor(Optional.of(new SourcePosition("t0")));
+            prefix.admitted(Map.of("orders", 0L), "t1");
+            meta.currentEpoch = 2L;
+            meta.consumers = List.of(prefixConsumer(Map.of(
+                    "orders", new ChainPosition(new SourceOrder(1L, 0L), "t1"))));
+
+            assertThatThrownBy(prefix::tick)
+                    .as("an old owner cannot publish a prefix over the new generation")
+                    .isInstanceOf(java.util.concurrent.CancellationException.class);
+            assertThat(meta.physicalAcks).isEmpty();
+            assertThat(meta.advances).isEmpty();
+        }
+    }
+
+    @Test
     void multiTableAdmissionReportsEachTablesOwnRingSequenceForTrimming() {
         RecordingMeta meta = new RecordingMeta();
         meta.consumers = List.of(prefixConsumer(Map.of()));
@@ -1183,6 +1203,7 @@ class CdcPhaseTest {
         volatile List<ConsumerOffset> consumers = List.of();
         volatile ChainPosition anchorPosition;
         volatile boolean trusted;
+        volatile long currentEpoch = 1L;
 
         @Override
         public boolean physicalPrefixTrusted(String miningChainId) {
@@ -1215,8 +1236,19 @@ class CdcPhaseTest {
         }
 
         @Override
+        public boolean advancePhysicalSourceReadOffset(
+                String miningChainId, long epoch, ChainPosition position) {
+            if (epoch != currentEpoch) {
+                return false;
+            }
+            advanceSourceReadOffset(miningChainId, position);
+            return true;
+        }
+
+        @Override
         public Optional<SrsMeta> read(String miningChainId) {
-            return Optional.of(new SrsMeta(miningChainId, anchorPosition, consumers, List.of(), null, 1L));
+            return Optional.of(new SrsMeta(miningChainId, anchorPosition, consumers, List.of(), null,
+                    currentEpoch));
         }
 
         @Override
@@ -1237,6 +1269,16 @@ class CdcPhaseTest {
         @Override
         public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
             physicalAcks.add(position);
+        }
+
+        @Override
+        public boolean advancePhysicalSinkAcked(
+                String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+            if (epoch != currentEpoch) {
+                return false;
+            }
+            advanceSinkAcked(miningChainId, pipelineId, position);
+            return true;
         }
 
         @Override

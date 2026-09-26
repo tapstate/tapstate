@@ -248,6 +248,57 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void ringStartBoundaryIsWriteOnceWithinAnEpochAndOldOwnersCannotSeedTheNext() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            assertThat(store.establishRingGenerationStartAfter(CHAIN, "orders", first, -1L))
+                    .hasValue(-1L);
+            assertThat(store.establishRingGenerationStartAfter(CHAIN, "orders", first, 8L))
+                    .as("a later attachment cannot move the start past an already admitted change")
+                    .hasValue(-1L);
+            assertThat(store.ringGenerationStartAfter(CHAIN, "orders", first)).hasValue(-1L);
+
+            long second = store.openEpoch(CHAIN);
+            assertThat(store.ringGenerationStartAfter(CHAIN, "orders", second)).isEmpty();
+            assertThat(store.establishRingGenerationStartAfter(CHAIN, "orders", first, 99L))
+                    .as("the old owner cannot set a boundary for the new generation")
+                    .isEmpty();
+            assertThat(store.establishRingGenerationStartAfter(CHAIN, "orders", second, 12L))
+                    .hasValue(12L);
+            assertThat(store.ringGenerationStartAfter(CHAIN, "orders", second)).hasValue(12L);
+        });
+    }
+
+    @Test
+    void aLateOldPhysicalOwnerCannotMoveEitherScalarAfterTheRingChangesGeneration() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "reader", List.of("orders", "customers"), first, "old-job");
+            assertThat(store.establishPhysicalAnchor(CHAIN,
+                    new ChainPosition(new SourceOrder(first, -1L), "t0"))).isTrue();
+            ChainPosition safe = new ChainPosition(new SourceOrder(first, 0L), "t1");
+            assertThat(store.advancePhysicalSinkAcked(CHAIN, "reader", first, safe)).isTrue();
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first, safe)).isTrue();
+
+            long second = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "reader", List.of("orders", "customers"), second, "new-job");
+            ChainPosition late = new ChainPosition(new SourceOrder(first, 1L), "t2");
+            assertThat(store.advancePhysicalSinkAcked(CHAIN, "reader", first, late)).isFalse();
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first, late)).isFalse();
+            SrsMeta unchanged = store.read(CHAIN).orElseThrow();
+            assertThat(unchanged.sourceReadOffset()).isEqualTo("t1");
+            assertThat(unchanged.consumerOffset("reader").orElseThrow().sinkAckedSrcpos()).isEqualTo("t1");
+
+            ChainPosition current = new ChainPosition(new SourceOrder(second, 0L), "t3");
+            assertThat(store.advancePhysicalSinkAcked(CHAIN, "reader", second, current)).isTrue();
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, second, current)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("t3");
+        });
+    }
+
+    @Test
     void createSeedsAnEmptyRecordAndReadReturnsIt() {
         withStore(store -> {
             store.create(CHAIN, "7d");

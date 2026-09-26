@@ -11,6 +11,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Objects;
 import java.util.Set;
 import java.util.LinkedHashSet;
@@ -28,6 +29,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     private final Set<String> trustedPhysicalPrefixes = new LinkedHashSet<>();
     private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
     private final Map<String, Set<String>> physicalRequests = new LinkedHashMap<>();
+    private final Map<String, Map<String, Long>> ringStarts = new LinkedHashMap<>();
     /** Per chain, per pipeline: the ring sequence of the last change each table's sink confirmed. */
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
 
@@ -50,6 +52,25 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
         return Optional.ofNullable(physicalSelections.get(miningChainId));
+    }
+
+    @Override
+    public synchronized OptionalLong ringGenerationStartAfter(String miningChainId, String table, long epoch) {
+        SrsMeta current = records.get(miningChainId);
+        Long start = current == null || current.epoch() != epoch ? null
+                : ringStarts.getOrDefault(miningChainId, Map.of()).get(table);
+        return start == null ? OptionalLong.empty() : OptionalLong.of(start);
+    }
+
+    @Override
+    public synchronized OptionalLong establishRingGenerationStartAfter(
+            String miningChainId, String table, long epoch, long proposedSeq) {
+        if (require(miningChainId).epoch() != epoch) {
+            return OptionalLong.empty();
+        }
+        long start = ringStarts.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
+                .computeIfAbsent(table, ignored -> proposedSeq);
+        return OptionalLong.of(start);
     }
 
     @Override
@@ -134,6 +155,16 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), position, m.consumerOffsets(),
                 m.schemaHistory(), m.retention(), m.epoch()));
+    }
+
+    @Override
+    public synchronized boolean advancePhysicalSourceReadOffset(
+            String miningChainId, long epoch, ChainPosition position) {
+        if (require(miningChainId).epoch() != epoch) {
+            return false;
+        }
+        advanceSourceReadOffset(miningChainId, position);
+        return true;
     }
 
     @Override
@@ -304,6 +335,21 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized boolean advancePhysicalSinkAcked(
+            String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+        SrsMeta current = require(miningChainId);
+        if (current.epoch() != epoch) {
+            return false;
+        }
+        ConsumerOffset consumer = current.consumerOffset(pipelineId).orElse(null);
+        if (consumer != null && Objects.equals(consumer.selectedTablesEpoch(), epoch)
+                && (consumer.sinkAcked() == null || consumer.sinkAcked().order().compareTo(position.order()) < 0)) {
+            advanceSinkAcked(miningChainId, pipelineId, position);
+        }
+        return true;
+    }
+
+    @Override
     public synchronized void setCdcStart(
             String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
         SrsMeta m = require(miningChainId);
@@ -335,6 +381,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     public synchronized long openEpoch(String miningChainId) {
         SrsMeta m = require(miningChainId);
         long opened = m.epoch() + 1;
+        ringStarts.remove(miningChainId);
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
                 m.schemaHistory(), m.retention(), opened));
@@ -399,6 +446,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         trustedPhysicalPrefixes.remove(miningChainId);
         physicalSelections.remove(miningChainId);
         physicalRequests.remove(miningChainId);
+        ringStarts.remove(miningChainId);
         ringDone.remove(miningChainId);
     }
 

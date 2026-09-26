@@ -171,6 +171,7 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             synchronized (this) {
                 failure = error;
             }
+            ACTIVE.remove(this);
             health.fail(error);
         }
     }
@@ -187,10 +188,14 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             if (physical.token() != null) {
                 for (String pipelineId : first.required().keySet()) {
                     if (current.containsKey(pipelineId)) {
-                        meta.advanceSinkAcked(chainId, pipelineId, physical);
+                        if (!meta.advancePhysicalSinkAcked(chainId, pipelineId, epoch, physical)) {
+                            throw new CancellationException("physical sink prefix lost its ring generation");
+                        }
                     }
                 }
-                meta.advanceSourceReadOffset(chainId, physical);
+                if (!meta.advancePhysicalSourceReadOffset(chainId, epoch, physical)) {
+                    throw new CancellationException("physical source prefix lost its ring generation");
+                }
             }
             pending.removeFirst();
         }

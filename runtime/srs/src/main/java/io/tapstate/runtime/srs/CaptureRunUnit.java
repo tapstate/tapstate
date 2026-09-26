@@ -25,6 +25,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -129,6 +132,7 @@ public final class CaptureRunUnit {
         boolean consumerAttached = false;
         long epoch = 0;
         String cursorWriterToken = null;
+        ConsumerOffset previousConsumer = null;
         Optional<Subscription> subscription = Optional.empty();
         List<String> tables = spec.config().streams();
         if (tables == null || tables.isEmpty()) {
@@ -152,6 +156,16 @@ public final class CaptureRunUnit {
             }
 
             if (plan.sharedRing()) {
+                if (startTail) {
+                    for (String table : tables) {
+                        SrsRingbuffer ring = new SrsRingbuffer(
+                                hz.getRingbuffer(SrsRingbuffer.ringName(chainId.value(), table)));
+                        if (meta.establishRingGenerationStartAfter(
+                                chainId.value(), table, epoch, ring.tailSequence()).isEmpty()) {
+                            throw new PhysicalRingNotReady(chainId.value(), table);
+                        }
+                    }
+                }
                 if (!startTail) {
                     SrsMetaStore.PhysicalSelection selection =
                             meta.physicalSelection(chainId.value()).orElse(null);
@@ -168,26 +182,24 @@ public final class CaptureRunUnit {
                         ? tables : spec.selectedChainTables();
                 cursorWriterToken = spec.cursorWriterToken() == null
                         ? java.util.UUID.randomUUID().toString() : spec.cursorWriterToken();
-                ConsumerOffset previous = meta.consumerOffsets(chainId.value()).stream()
+                previousConsumer = meta.consumerOffsets(chainId.value()).stream()
                         .filter(offset -> offset.pipelineId().equals(spec.pipelineId()))
                         .findFirst().orElse(null);
-                if (previous == null || !selected.equals(previous.selectedTables())
-                        || !Objects.equals(previous.selectedTablesEpoch(), epoch)
-                        || !cursorWriterToken.equals(previous.cursorWriterToken())) {
+                if (previousConsumer == null || !selected.equals(previousConsumer.selectedTables())
+                        || !Objects.equals(previousConsumer.selectedTablesEpoch(), epoch)
+                        || !cursorWriterToken.equals(previousConsumer.cursorWriterToken())) {
                     meta.selectConsumerTables(
                             chainId.value(), spec.pipelineId(), selected, epoch, cursorWriterToken);
                 }
             }
 
-            // Where this pipeline starts in each ring, marked now: after it is on the chain, and before its
-            // own load reads a row or any tail this run opens mines a change -- so everything it is owed lands
-            // above the mark. Only where changes come to it through the ring, and only for a read that starts
-            // from the ring as it stands: a load does, since its rows cover what came before, and so does a
-            // cdc-only read from the present. A cdc-only read from the earliest change or from an instant is
-            // placed by that start instead, when its reader opens. A pipeline coming back keeps the place it
-            // had -- see SrsMetaStore#startRingAfter.
+            // A new reader starts after the current ring tail; a returning reader whose earlier ring
+            // generation ended starts after that generation's recorded boundary, so it still receives
+            // changes the new owner re-mined before this job attached. A new load covers older rows with
+            // its own snapshot. An earliest or instant read is placed by that start instead.
             if (plan.sharedRing() && (plan.snapshot() || spec.startFrom() instanceof StartFrom.Latest)) {
-                markWhereThisPipelineArrives(chainId.value(), spec.pipelineId(), epoch, tables);
+                markWhereThisPipelineArrives(chainId.value(), spec.pipelineId(), epoch, tables,
+                        previousConsumer, plan.snapshot());
             }
 
             // Opened before the load, not with the tail: the load's rows are this run's too, and an
@@ -377,7 +389,11 @@ public final class CaptureRunUnit {
         Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
         for (String table : physicalTables) {
             String ringName = SrsRingbuffer.ringName(cid, table);
-            SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ringName)));
+            SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(ringName));
+            if (meta.establishRingGenerationStartAfter(cid, table, epoch, ring.tailSequence()).isEmpty()) {
+                throw new PhysicalRingNotReady(cid, table);
+            }
+            SrsWriteGate gate = new SrsWriteGate(ring);
             CdcChain chain = new CdcChain(
                     gate, meta, cid, epoch, spec.schemaVer(), spec.captureFence());
             LongConsumer trim = trimmer == null ? seq -> { } : seq -> {
@@ -856,16 +872,28 @@ public final class CaptureRunUnit {
         };
     }
 
-    /**
-     * Marks, for each of the pipeline's tables, where it starts in that table's ring: just past what the ring
-     * already holds. Read from the ring itself, which numbers on across rebuilds, so the mark names the same
-     * place for every member that reads it. A refusal while the cluster is still forming surfaces as an
-     * uncoded failure of this start, which the next pass tries again.
-     */
-    private void markWhereThisPipelineArrives(String chainId, String pipelineId, long epoch, List<String> tables) {
+    /** Marks either a new arrival or a returning reader's earliest change in this ring generation. */
+    private void markWhereThisPipelineArrives(
+            String chainId, String pipelineId, long epoch, List<String> tables,
+            ConsumerOffset previous, boolean snapshot) {
         for (String table : tables) {
             SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, table)));
-            meta.startRingAfter(chainId, pipelineId, table, epoch, ring.tailSequence());
+            boolean selectedBefore = previous != null
+                    && (previous.selectedTables() == null || previous.selectedTables().contains(table));
+            boolean completedLoad = !snapshot
+                    || (previous != null && previous.snapshotCompletedTables().contains(table));
+            long after = ring.tailSequence();
+            boolean doneInThisGeneration = previous != null
+                    && Objects.equals(previous.selectedTablesEpoch(), epoch)
+                    && previous.ringDoneThrough().containsKey(table);
+            if (selectedBefore && completedLoad && !doneInThisGeneration) {
+                OptionalLong boundary = meta.ringGenerationStartAfter(chainId, table, epoch);
+                if (boundary.isEmpty()) {
+                    throw new PhysicalRingNotReady(chainId, table);
+                }
+                after = boundary.getAsLong();
+            }
+            meta.startRingAfter(chainId, pipelineId, table, epoch, after);
         }
     }
 

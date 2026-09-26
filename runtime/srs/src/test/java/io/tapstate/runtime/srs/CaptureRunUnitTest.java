@@ -40,6 +40,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
@@ -790,11 +794,14 @@ class CaptureRunUnitTest {
         new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
                 .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-return"), e -> { }, true);
         SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
+        long epoch = meta.read(chain).orElseThrow().epoch();
         long hadReached = ring.append(buffered(1));
-        meta.startRingAfter(chain, "pipe-b", "orders", hadReached);
+        meta.selectConsumerTables(chain, "pipe-b", List.of("orders"), epoch, "previous-job");
+        meta.startRingAfter(chain, "pipe-b", "orders", epoch, hadReached);
+        meta.markSnapshotComplete(chain, "pipe-b", "orders");
         ring.append(buffered(2));
         ring.append(buffered(3));
-        meta.advanceConsumerReadSeq(chain, "pipe-b", "orders", 1L);
+        meta.advanceConsumerReadSeq(chain, "pipe-b", "orders", epoch, "previous-job", 1L);
 
         new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
                 .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-return"), e -> { }, false);
@@ -976,6 +983,42 @@ class CaptureRunUnitTest {
             expanded.close();
         }
         assertThat(active).hasValue(0);
+    }
+
+    @Test
+    void aReturningTableReadsChangesReminedBeforeItsNewJobAttaches() {
+        InMemoryMeta meta = new InMemoryMeta();
+        SrsCoordinator coordinator = new SrsCoordinator(meta);
+        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
+        CaptureConfig customers = new CaptureConfig("mysql", Map.of(), List.of("customers"));
+        String chain = MiningChainId.resolve(orders, "restart-backlog").value();
+        meta.create(chain, null);
+        long oldEpoch = meta.openEpoch(chain);
+        assertThat(meta.establishPhysicalAnchor(chain,
+                new ChainPosition(new SourceOrder(oldEpoch, -1L), "safe-before-downtime"))).isTrue();
+        meta.selectConsumerTables(chain, "customer-reader", List.of("customers"), oldEpoch, "old-job");
+        meta.startRingAfter(chain, "customer-reader", "customers", oldEpoch, -1L);
+
+        Envelope downtimeChange = Envelope.insert(10L, "customers", Map.of("id", 10), Map.of());
+        CaptureRunUnit owner = new CaptureRunUnit(
+                new FakeSource(List.of(), List.of(downtimeChange)), coordinator, meta, hz);
+        CaptureRunSpec ownerSpec = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "restart-backlog", true,
+                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
+        CaptureRunSpec returningSpec = new CaptureRunSpec(customers, ReadMode.CDC_ONLY, "restart-backlog", true,
+                "customers-source", "customer-reader", StartFrom.latest(), null, 0L);
+        try (CaptureRun ignored = owner.start(ownerSpec, event -> { })) {
+            long currentEpoch = meta.read(chain).orElseThrow().epoch();
+            assertThat(currentEpoch).isGreaterThan(oldEpoch);
+            assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "customers")).tailSequence())
+                    .as("the new physical owner already re-mined a customer change")
+                    .isEqualTo(0L);
+
+            new CaptureRunUnit(new FakeSource(List.of(), List.of()), coordinator, meta, hz)
+                    .start(returningSpec, event -> { }, false);
+            assertThat(meta.ringDoneThrough(chain, "customer-reader"))
+                    .as("a returning reader must start at the new generation's beginning, before the backlog")
+                    .containsEntry("customers", -1L);
+        }
     }
 
     @Test
@@ -1451,6 +1494,26 @@ class CaptureRunUnitTest {
         private final java.util.Set<String> trustedPhysicalPrefixes = new java.util.HashSet<>();
         private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
         private final Map<String, java.util.Set<String>> physicalRequests = new LinkedHashMap<>();
+        private final Map<String, Map<String, Long>> ringStarts = new LinkedHashMap<>();
+
+        @Override
+        public OptionalLong ringGenerationStartAfter(String miningChainId, String table, long epoch) {
+            SrsMeta current = records.get(miningChainId);
+            Long start = current == null || current.epoch() != epoch ? null
+                    : ringStarts.getOrDefault(miningChainId, Map.of()).get(table);
+            return start == null ? OptionalLong.empty() : OptionalLong.of(start);
+        }
+
+        @Override
+        public OptionalLong establishRingGenerationStartAfter(
+                String miningChainId, String table, long epoch, long proposedSeq) {
+            if (require(miningChainId).epoch() != epoch) {
+                return OptionalLong.empty();
+            }
+            long start = ringStarts.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
+                    .computeIfAbsent(table, ignored -> proposedSeq);
+            return OptionalLong.of(start);
+        }
 
         @Override
         public Optional<PhysicalSelection> physicalSelection(String miningChainId) {
@@ -1552,6 +1615,16 @@ class CaptureRunUnitTest {
         }
 
         @Override
+        public synchronized boolean advancePhysicalSourceReadOffset(
+                String miningChainId, long epoch, ChainPosition position) {
+            if (require(miningChainId).epoch() != epoch) {
+                return false;
+            }
+            advanceSourceReadOffset(miningChainId, position);
+            return true;
+        }
+
+        @Override
         public boolean physicalPrefixTrusted(String miningChainId) {
             return trustedPhysicalPrefixes.contains(miningChainId);
         }
@@ -1623,6 +1696,9 @@ class CaptureRunUnitTest {
                 throw new IllegalStateException("consumer selection must match the open ring generation");
             }
             ConsumerOffset previous = m.consumerOffset(pipelineId).orElse(null);
+            if (previous != null && !Objects.equals(previous.selectedTablesEpoch(), epoch)) {
+                ringDone.remove(miningChainId + "/" + pipelineId);
+            }
             Map<String, Long> retained = new LinkedHashMap<>();
             if (previous != null && Objects.equals(previous.selectedTablesEpoch(), epoch)
                     && Objects.equals(previous.cursorWriterToken(), cursorWriterToken)
@@ -1683,6 +1759,20 @@ class CaptureRunUnitTest {
         }
 
         @Override
+        public synchronized boolean advancePhysicalSinkAcked(
+                String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+            SrsMeta current = require(miningChainId);
+            if (current.epoch() != epoch) {
+                return false;
+            }
+            ConsumerOffset consumer = current.consumerOffset(pipelineId).orElse(null);
+            if (consumer != null && Objects.equals(consumer.selectedTablesEpoch(), epoch)) {
+                advanceSinkAcked(miningChainId, pipelineId, position);
+            }
+            return true;
+        }
+
+        @Override
         public void setCdcStart(
                 String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             SrsMeta m = require(miningChainId);
@@ -1714,6 +1804,7 @@ class CaptureRunUnitTest {
         public long openEpoch(String miningChainId) {
             SrsMeta m = require(miningChainId);
             long opened = m.epoch() + 1;
+            ringStarts.remove(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), opened));

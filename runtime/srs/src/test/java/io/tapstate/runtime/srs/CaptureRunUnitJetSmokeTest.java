@@ -39,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
@@ -342,6 +343,26 @@ class CaptureRunUnitJetSmokeTest {
         private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
         private final java.util.Set<String> trustedPhysicalPrefixes = new java.util.HashSet<>();
         private final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
+        private final Map<String, Map<String, Long>> ringStarts = new LinkedHashMap<>();
+
+        @Override
+        public synchronized OptionalLong ringGenerationStartAfter(String miningChainId, String table, long epoch) {
+            SrsMeta current = records.get(miningChainId);
+            Long start = current == null || current.epoch() != epoch ? null
+                    : ringStarts.getOrDefault(miningChainId, Map.of()).get(table);
+            return start == null ? OptionalLong.empty() : OptionalLong.of(start);
+        }
+
+        @Override
+        public synchronized OptionalLong establishRingGenerationStartAfter(
+                String miningChainId, String table, long epoch, long proposedSeq) {
+            if (require(miningChainId).epoch() != epoch) {
+                return OptionalLong.empty();
+            }
+            long start = ringStarts.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
+                    .computeIfAbsent(table, ignored -> proposedSeq);
+            return OptionalLong.of(start);
+        }
 
         @Override
         public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
@@ -558,6 +579,7 @@ class CaptureRunUnitJetSmokeTest {
         public synchronized long openEpoch(String miningChainId) {
             SrsMeta m = require(miningChainId);
             long opened = m.epoch() + 1;
+            ringStarts.remove(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), opened));
