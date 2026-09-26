@@ -51,9 +51,13 @@ class ClusterRebuildAdmissionTest {
         assertThat(ownership.permit("orders").granted()).isTrue();
         assertThat(ownership.beginExecution("orders").allowed()).isTrue();
 
-        // Admission is asked for a FAILED run. Before the restart, its driver finds no lost member.
+        // Admission is asked for a FAILED run. A later intact view confirms no member was lost.
         assertThat(admission.admits("orders"))
-                .as("the run failed while its original driver and all planned members were present")
+                .as("recovery waits for a view newer than the failure")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("a fresh intact view records the failure as independent before takeover")
                 .isFalse();
 
         // The driver restarts after that failure. Its stable node id remains in the committed and
@@ -80,11 +84,34 @@ class ClusterRebuildAdmissionTest {
         submitRunUnder(7);
 
         assertThat(admission.admits("orders")).isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("the refreshed intact view confirms the failure was independent")
+                .isFalse();
         membership.canCommit(Set.of("node-a", "node-b"));
 
         assertThat(admission.admits("orders"))
                 .as("the missing member appeared only after the failure was recorded")
                 .isFalse();
+    }
+
+    @Test
+    void aFailureSeenBeforeMembershipRefreshCanRecoverWhenTheMissingMemberBecomesVisible() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+
+        admission.recordFailure("orders");
+        assertThat(admission.admits("orders"))
+                .as("the last visible snapshot still includes every member, so recovery waits")
+                .isFalse();
+        assertThat(admission.admits("orders"))
+                .as("another pass over the same view is not new membership evidence")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders"))
+                .as("the refreshed view reveals the member lost under the failed run")
+                .isTrue();
     }
 
     @Test

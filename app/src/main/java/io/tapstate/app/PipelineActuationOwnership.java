@@ -92,6 +92,8 @@ final class PipelineActuationOwnership {
          * stretch is the asker's to decide, so it is kept raw here.
          */
         private long lostAMemberAtNanos = NEVER;
+        /** The gate publication present at the first FAILED observation, before a no-loss verdict. */
+        private long failureObservedAtVisibilityRevision = NEVER;
     }
 
     /** No member has been seen missing under this run. Not a time, so no arithmetic is done on it. */
@@ -223,6 +225,7 @@ final class PipelineActuationOwnership {
             return Execution.refused();
         }
         state.claim = advanced.get();
+        state.failureObservedAtVisibilityRevision = NEVER;
         // What this run is planned over. Null rather than empty when nothing is committed -- which the
         // eligibility gate above makes unreachable -- because an empty set would read as "planned over
         // nobody", and nobody can never go missing.
@@ -268,10 +271,11 @@ final class PipelineActuationOwnership {
      * can only be the one that went.
      *
      * <p>The claim carries the run's planned members and the first holder that recorded its failure.
-     * If the submitting holder saw FAILED while no member was lost, a later handover cannot make that
-     * earlier death recoverable. If a member was lost when failure was recorded, that fact survives a
-     * takeover even if the member has returned. An inherited run with no recorded failure is admitted:
-     * its driver may have gone away before it could record why the run ended.
+     * If a fresh membership view confirms no member was lost after the submitting holder saw FAILED,
+     * a later handover cannot make that earlier death recoverable. If a member was lost when failure
+     * was recorded, that fact survives a takeover even if the member has returned. An inherited run
+     * with no recorded failure is admitted: its driver may have gone away before it could record why
+     * the run ended.
      */
     boolean aMemberLeftUnderTheRun(String pipelineId, long settlingNanos) {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -302,7 +306,7 @@ final class PipelineActuationOwnership {
         return nanoTime.getAsLong() - (state.lostAMemberAtNanos + settlingNanos) < 0;
     }
 
-    /** Records the first FAILED observation with the execution before another holder can inherit it. */
+    /** Records the first FAILED observation once the gate can classify its membership. */
     synchronized void recordFailure(String pipelineId, long settlingNanos) {
         if (!fenced || closing) {
             return;
@@ -319,14 +323,25 @@ final class PipelineActuationOwnership {
         if (state.claim.failureClaimGeneration() != 0) {
             return;
         }
-        observeMembership(state);
+        ClusterMembershipGate.VisibleSnapshot visible = membership.visibleSnapshot();
+        observeMembership(state, visible.nodeIds());
         long now = nanoTime.getAsLong();
         boolean memberLoss = state.lostAMemberAtNanos != NEVER
                 && now - (state.lostAMemberAtNanos + settlingNanos) < 0;
         // A new holder has no local run snapshot. The execution's durable members are the snapshot
         // it can use if its first sight of FAILED is after a handover.
         memberLoss |= !state.claim.executionNodeIds().isEmpty()
-                && !membership.visibleNodeIds().containsAll(state.claim.executionNodeIds());
+                && !visible.nodeIds().containsAll(state.claim.executionNodeIds());
+        if (!memberLoss) {
+            if (state.failureObservedAtVisibilityRevision == NEVER) {
+                state.failureObservedAtVisibilityRevision = visible.revision();
+            }
+            // The view that preceded FAILED may still include a member that has already died.
+            // Only a later publication can make an independent-failure verdict durable.
+            if (visible.revision() <= state.failureObservedAtVisibilityRevision) {
+                return;
+            }
+        }
         Optional<WorkloadClaim> recorded;
         try {
             recorded = claims.recordExecutionFailure(state.claim, memberLoss);
@@ -376,6 +391,10 @@ final class PipelineActuationOwnership {
      * members are all present again - which is where the caller's stretch takes over.
      */
     private void observeMembership(Held state) {
+        observeMembership(state, membership.visibleNodeIds());
+    }
+
+    private void observeMembership(Held state, Set<String> visibleNodeIds) {
         if (state.runMembers == null) {
             return;
         }
@@ -384,7 +403,7 @@ final class PipelineActuationOwnership {
         // would call every such death the pipeline's own. Only a run somebody else left behind was ever
         // picked up that way, which is why a cluster losing its driver recovered and one losing any
         // other member of the run stayed failed.
-        if (!membership.visibleNodeIds().containsAll(state.runMembers)) {
+        if (!visibleNodeIds.containsAll(state.runMembers)) {
             state.lostAMemberAtNanos = nanoTime.getAsLong();
         }
     }
