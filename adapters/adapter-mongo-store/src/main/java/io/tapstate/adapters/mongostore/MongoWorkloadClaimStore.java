@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /** Mongo server-time implementation of the cluster-scoped workload-claim port. */
 public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
@@ -95,16 +96,40 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     @Override
-    public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+    public Optional<WorkloadClaim> advanceExecution(
+            WorkloadClaim expected, long topologyRevision, Set<String> executionNodeIds) {
         Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(executionNodeIds, "executionNodeIds");
         if (topologyRevision < 0) {
             throw new IllegalArgumentException("topologyRevision must not be negative");
         }
-        Document next = new Document("$set", new Document("executionGeneration",
-                new Document("$add", List.of(
-                        new Document("$ifNull", List.of("$executionGeneration", 0L)), 1L))));
+        Document nextGeneration = new Document("$add", List.of(
+                new Document("$ifNull", List.of("$executionGeneration", 0L)), 1L));
+        Document next = new Document("$set", new Document("executionGeneration", nextGeneration)
+                .append("contextExecutionGeneration", nextGeneration)
+                .append("executionClaimGeneration", "$claimGeneration")
+                .append("executionNodeIds", executionNodeIds.stream().sorted().toList())
+                .append("failureClaimGeneration", 0L)
+                .append("failureAfterMemberLoss", false));
         Document advanced = findOneAndUpdate(liveExpected(expected, topologyRevision), List.of(next), false);
         return Optional.ofNullable(advanced).map(MongoWorkloadClaimStore::read);
+    }
+
+    @Override
+    public Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss) {
+        Objects.requireNonNull(expected, "expected");
+        Document unrecorded = new Document("$eq", List.of(
+                new Document("$ifNull", List.of("$failureClaimGeneration", 0L)), 0L));
+        Document next = new Document("$set", new Document("failureClaimGeneration",
+                new Document("$cond", List.of(unrecorded, "$claimGeneration", "$failureClaimGeneration")))
+                .append("failureAfterMemberLoss", new Document("$cond", List.of(
+                        unrecorded, afterMemberLoss, "$failureAfterMemberLoss"))));
+        Document sameExecution = new Document("$expr", new Document("$eq", List.of(
+                "$contextExecutionGeneration", "$executionGeneration")));
+        Document filter = new Document("$and", List.of(
+                liveExpected(expected, expected.topologyRevision()), sameExecution));
+        Document recorded = findOneAndUpdate(filter, List.of(next), false);
+        return Optional.ofNullable(recorded).map(MongoWorkloadClaimStore::read);
     }
 
     @Override
@@ -227,7 +252,12 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 number(document, "claimGeneration"),
                 number(document, "executionGeneration"),
                 number(document, "topologyRevision"),
-                date(document, "leaseUntil").toInstant());
+                date(document, "leaseUntil").toInstant(),
+                numberOrZero(document, "contextExecutionGeneration"),
+                numberOrZero(document, "executionClaimGeneration"),
+                Set.copyOf(document.getList("executionNodeIds", String.class, List.of())),
+                numberOrZero(document, "failureClaimGeneration"),
+                Boolean.TRUE.equals(document.getBoolean("failureAfterMemberLoss")));
     }
 
     private static WorkloadClaimReading reading(Document document) {
@@ -241,6 +271,11 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
             throw new IllegalStateException("workload claim has no " + field);
         }
         return value.longValue();
+    }
+
+    private static long numberOrZero(Document document, String field) {
+        Number value = document.get(field, Number.class);
+        return value == null ? 0 : value.longValue();
     }
 
     private static Date date(Document document, String field) {

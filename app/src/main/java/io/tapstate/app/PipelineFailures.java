@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.runtime.engine.EngineError;
@@ -53,6 +54,12 @@ final class PipelineFailures {
         }
         return new ObservationFailure(EngineError.JOB_FAILED.code(),
                 Map.of("pipeline", pipelineId, "cause", describe(failure)));
+    }
+
+    /** Recognizes the coded sink failure before Jet can reduce it to a generic wrapper. */
+    static boolean isSinkWriteFailure(String pipelineId, Throwable failure) {
+        return failure != null
+                && ConnectorError.WRITE_FAILED.code().equals(of(pipelineId, failure).code());
     }
 
     /**

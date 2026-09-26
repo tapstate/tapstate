@@ -251,6 +251,9 @@ class PipelineConvergerTest {
         assertThat(StateJson.parse(state.read("p1").orElseThrow().stateJson()))
                 .as("the death is recorded and publishable before anything is decided about replacing it")
                 .isEqualTo(FAILED);
+        assertThat(admission.recorded())
+                .as("the failure context is recorded on the pass that first writes FAILED")
+                .containsExactly("p1");
         actuator.reset();
 
         admission.answer(true);
@@ -721,7 +724,13 @@ class PipelineConvergerTest {
     private static final class RecordingAdmission implements RebuildAdmission {
 
         private final java.util.List<String> asked = new java.util.ArrayList<>();
+        private final java.util.List<String> recorded = new java.util.ArrayList<>();
         private boolean answer;
+
+        @Override
+        public void recordFailure(String pipelineId) {
+            recorded.add(pipelineId);
+        }
 
         @Override
         public boolean admits(String pipelineId) {
@@ -735,6 +744,10 @@ class PipelineConvergerTest {
 
         java.util.List<String> asked() {
             return java.util.List.copyOf(asked);
+        }
+
+        java.util.List<String> recorded() {
+            return java.util.List.copyOf(recorded);
         }
     }
 }

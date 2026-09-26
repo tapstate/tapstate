@@ -22,6 +22,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -87,11 +88,64 @@ class WorkloadClaimStoreIT {
                     new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders"),
                     new WorkloadOwner("node-a", "boot-1"), 7, TTL).claim();
 
-            WorkloadClaim advanced = store.advanceExecution(claim, 7).orElseThrow();
+            WorkloadClaim advanced = store.advanceExecution(claim, 7, Set.of("node-a", "node-b")).orElseThrow();
 
             assertThat(advanced.claimGeneration()).isEqualTo(claim.claimGeneration());
             assertThat(advanced.executionGeneration()).isEqualTo(1);
-            assertThat(store.advanceExecution(claim, 7)).isEmpty();
+            assertThat(advanced.contextExecutionGeneration()).isEqualTo(advanced.executionGeneration());
+            assertThat(advanced.executionClaimGeneration()).isEqualTo(claim.claimGeneration());
+            assertThat(advanced.executionNodeIds()).containsExactlyInAnyOrder("node-a", "node-b");
+            assertThat(store.advanceExecution(claim, 7, Set.of("node-a", "node-b"))).isEmpty();
+        });
+    }
+
+    @Test
+    void executionAndFirstFailureContextSurviveTakeoverAndResetForTheNextRun() {
+        withStore((store, collection) -> {
+            WorkloadClaimKey pipeline =
+                    new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            WorkloadClaim first = store.acquire(
+                    pipeline, new WorkloadOwner("node-a", "boot-1"), 7, TTL).claim();
+            WorkloadClaim run = store.advanceExecution(first, 7, Set.of("node-b", "node-a")).orElseThrow();
+            WorkloadClaim failed = store.recordExecutionFailure(run, false).orElseThrow();
+
+            var stored = collection.find().first();
+            assertThat(stored).isNotNull();
+            assertThat(stored.getLong("executionClaimGeneration")).isEqualTo(1L);
+            assertThat(stored.getLong("contextExecutionGeneration")).isEqualTo(1L);
+            assertThat(stored.getList("executionNodeIds", String.class)).containsExactly("node-a", "node-b");
+            assertThat(stored.getLong("failureClaimGeneration")).isEqualTo(1L);
+            assertThat(stored.getBoolean("failureAfterMemberLoss")).isFalse();
+            assertThat(store.recordExecutionFailure(failed, true).orElseThrow().failureAfterMemberLoss())
+                    .as("the first failure observation fixes the order of failure and member loss")
+                    .isFalse();
+
+            assertThat(store.release(failed)).isTrue();
+            WorkloadClaim inherited = store.acquire(
+                    pipeline, new WorkloadOwner("node-b", "boot-2"), 7, TTL).claim();
+            assertThat(inherited.claimGeneration()).isEqualTo(2);
+            assertThat(inherited.executionGeneration()).isEqualTo(run.executionGeneration());
+            assertThat(inherited.contextExecutionGeneration()).isEqualTo(run.executionGeneration());
+            assertThat(inherited.executionClaimGeneration()).isEqualTo(1);
+            assertThat(inherited.executionNodeIds()).containsExactlyInAnyOrder("node-a", "node-b");
+            assertThat(inherited.failureClaimGeneration()).isEqualTo(1);
+            assertThat(store.recordExecutionFailure(failed, true)).isEmpty();
+
+            WorkloadClaim nextRun = store.advanceExecution(inherited, 7, Set.of("node-b")).orElseThrow();
+            assertThat(nextRun.executionClaimGeneration()).isEqualTo(2);
+            assertThat(nextRun.contextExecutionGeneration()).isEqualTo(nextRun.executionGeneration());
+            assertThat(nextRun.executionNodeIds()).containsExactly("node-b");
+            assertThat(nextRun.failureClaimGeneration()).isZero();
+            assertThat(nextRun.failureAfterMemberLoss()).isFalse();
+
+            // An older member can advance the generation without writing the newer context fields.
+            // The mismatch must be visible, so a new holder does not reuse the prior run's verdict.
+            collection.updateOne(new org.bson.Document("resourceId", "orders"),
+                    new org.bson.Document("$inc", new org.bson.Document("executionGeneration", 1L)));
+            WorkloadClaim olderWriter = store.read(pipeline).orElseThrow().claim();
+            assertThat(olderWriter.contextExecutionGeneration())
+                    .isLessThan(olderWriter.executionGeneration());
+            assertThat(store.recordExecutionFailure(olderWriter, false)).isEmpty();
         });
     }
 

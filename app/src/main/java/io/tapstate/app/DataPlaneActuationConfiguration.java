@@ -147,12 +147,14 @@ class DataPlaneActuationConfiguration {
      */
     @Bean
     RebuildAdmission rebuildAdmission(
-            ClusterProperties clusterProperties, PipelineActuationOwnership pipelineActuationOwnership) {
+            ClusterProperties clusterProperties, HazelcastProperties hazelcastProperties,
+            PipelineActuationOwnership pipelineActuationOwnership) {
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return RebuildAdmission.never();
         }
         return new ClusterRebuildAdmission(
-                pipelineActuationOwnership, clusterProperties.getWorkloadClaimTtl());
+                pipelineActuationOwnership, clusterProperties.getWorkloadClaimTtl(),
+                hazelcastProperties.getMaximumNoHeartbeat());
     }
 
     /**
