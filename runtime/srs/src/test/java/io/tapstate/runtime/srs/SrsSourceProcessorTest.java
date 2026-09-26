@@ -31,7 +31,6 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.runtime.engine.LoadGate;
 import io.tapstate.core.lifecycle.LoadLandings;
-import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.spi.capture.SourcePosition;
@@ -812,20 +811,30 @@ class SrsSourceProcessorTest {
         return recordingDag(ringName, src, sinkName, queueSize, null);
     }
 
-    /** The same graph with the source's changes held at {@code gate}, or not held at all where it is null. */
+    /**
+     * The same graph with the source's changes held at {@code gate}, or not held at all where it is null, and the
+     * source reading in the batch it takes where its author wrote none.
+     */
     private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize, LoadGate gate) {
-        return recordingDag(ringName, src, sinkName, queueSize, gate, BatchSpec.DEFAULT_MAX_RECORDS);
+        return recordingDag(SrsSourceProcessor.metaSupplier(
+                PIPELINE, ringName, src, StartFrom.earliest(), null, 1L, SrsReadCursorPublisherFactory.NONE,
+                RECORDED_STAMP, SourcePlacement.anyMember()), sinkName, queueSize, gate);
     }
 
     /** The same graph with the source reading at most {@code readBatch} changes a pass. */
     private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize, LoadGate gate,
             int readBatch) {
-        DAG dag = new DAG();
-        ProcessorMetaSupplier reading = SrsSourceProcessor.metaSupplier(
+        return recordingDag(SrsSourceProcessor.metaSupplier(
                 PIPELINE, ringName, src, StartFrom.earliest(), null, 1L, SrsReadCursorPublisherFactory.NONE,
-                order -> new Watermark(
-                        order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7),
-                SourcePlacement.anyMember(), readBatch);
+                RECORDED_STAMP, SourcePlacement.anyMember(), readBatch), sinkName, queueSize, gate);
+    }
+
+    /** A bound one past the change it covers, on axis 7; the snapshot's reserved position bounds at zero. */
+    private static final SourceBoundStamp RECORDED_STAMP = order -> new Watermark(
+            order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7);
+
+    private static DAG recordingDag(ProcessorMetaSupplier reading, String sinkName, int queueSize, LoadGate gate) {
+        DAG dag = new DAG();
         Vertex source = dag.newVertex("source", gate == null ? reading : gate.appliedTo(reading));
         Vertex record = dag.newVertex("record", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of(RecordingBounds::new)));
