@@ -99,6 +99,21 @@ public interface HistoryRollupStore {
         }
     }
 
+    /** Additive counter values before the public nine-place rounding. Optional in older cache rows. */
+    record CounterStats(BigDecimal delta, long coveredNanos, BigDecimal maxRate) {
+        public CounterStats {
+            Objects.requireNonNull(delta, "delta");
+            Objects.requireNonNull(maxRate, "maxRate");
+            if (delta.signum() < 0 || maxRate.signum() < 0 || coveredNanos <= 0
+                    || coveredNanos > Duration.ofHours(6).toNanos()
+                    || delta.precision() > 64 || maxRate.precision() > 64
+                    || delta.scale() < -30 || delta.scale() > 30
+                    || maxRate.scale() < -30 || maxRate.scale() > 30) {
+                throw new IllegalArgumentException("rollup counter statistics are bounded");
+            }
+        }
+    }
+
     record Lag(String table, Instant observedAt, long last, long max) {
         public Lag {
             Objects.requireNonNull(table, "table");
@@ -113,7 +128,9 @@ public interface HistoryRollupStore {
 
     /** One reset-aware projection fragment within a bucket. Frequent boundaries use the fallback marker. */
     record Fragment(int segment, StartReason startReason, Instant intervalStart, Instant intervalEnd,
-            Rate recordsOut, Rate bytesOut, List<Lag> lag) {
+            Rate recordsOut, Rate bytesOut, List<Lag> lag,
+            CounterStats recordsOutStats, CounterStats bytesOutStats,
+            RateHistoryStore.Key resumeAfter, Instant resumeAt) {
         public Fragment {
             Objects.requireNonNull(startReason, "startReason");
             Objects.requireNonNull(intervalStart, "intervalStart");
@@ -122,6 +139,20 @@ public interface HistoryRollupStore {
             if (segment < 0 || intervalStart.isAfter(intervalEnd) || lag.size() > MAX_LAGS_PER_FRAGMENT) {
                 throw new IllegalArgumentException("a rollup fragment has bounded ordered content");
             }
+            if ((recordsOutStats != null && recordsOut == null)
+                    || (bytesOutStats != null && bytesOut == null)) {
+                throw new IllegalArgumentException("rollup statistics require a projected rate");
+            }
+            if ((resumeAfter == null) != (resumeAt == null)
+                    || (resumeAfter != null && resumeAfter.internalKey().length() > 256)) {
+                throw new IllegalArgumentException("a rollup resume anchor is complete and bounded");
+            }
+        }
+
+        public Fragment(int segment, StartReason startReason, Instant intervalStart, Instant intervalEnd,
+                Rate recordsOut, Rate bytesOut, List<Lag> lag) {
+            this(segment, startReason, intervalStart, intervalEnd, recordsOut, bytesOut, lag,
+                    null, null, null, null);
         }
     }
 
@@ -146,7 +177,7 @@ public interface HistoryRollupStore {
      */
     record Bucket(Key key, Instant computedAt, Instant inputReadStartedAt, Instant validUntil,
             boolean requiresFinerResolution,
-            List<Fragment> fragments, List<Gap> gaps) {
+            List<Fragment> fragments, List<Gap> gaps, int inWindowSamples) {
         public Bucket {
             Objects.requireNonNull(key, "key");
             Objects.requireNonNull(computedAt, "computedAt");
@@ -166,6 +197,7 @@ public interface HistoryRollupStore {
                 throw new IllegalArgumentException("a rollup is computed after bucket close and before expiry");
             }
             if (fragments.size() > MAX_FRAGMENTS || gaps.size() > MAX_GAPS
+                    || inWindowSamples < -1
                     || (requiresFinerResolution && (!fragments.isEmpty() || !gaps.isEmpty()))) {
                 throw new IllegalArgumentException("a rollup bucket has bounded fragments or a fallback marker");
             }
@@ -187,6 +219,12 @@ public interface HistoryRollupStore {
                     throw new IllegalArgumentException("a rollup gap is within its bucket");
                 }
             }
+        }
+
+        public Bucket(Key key, Instant computedAt, Instant inputReadStartedAt, Instant validUntil,
+                boolean requiresFinerResolution, List<Fragment> fragments, List<Gap> gaps) {
+            this(key, computedAt, inputReadStartedAt, validUntil, requiresFinerResolution,
+                    fragments, gaps, -1);
         }
 
         public boolean usableAt(Instant at) {

@@ -20,6 +20,8 @@ import io.tapstate.spi.store.RateHistoryStore.Visibility;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -27,6 +29,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -40,10 +43,9 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /**
- * Builds disposable five-minute buckets on one low-priority, fixed-batch worker. A successful upsert
- * advances only an in-process cursor; after a restart the worker walks deterministic persisted keys from
- * the first retained sample and skips completed buckets. Expired buckets are refreshed only on bounded
- * hints, leaving the query face to descend to raw history when a hint is lost.
+ * Builds disposable fixed-resolution buckets on one low-priority, fixed-batch worker. Each scope and
+ * resolution has its own contiguous position; after a restart persisted keys recover that position.
+ * Expired buckets are refreshed only on bounded hints, leaving reads to descend when a hint is lost.
  */
 final class HistoryRollupWorker implements AutoCloseable {
 
@@ -54,7 +56,9 @@ final class HistoryRollupWorker implements AutoCloseable {
     private static final Duration EMPTY_POLL_INTERVAL = Duration.ofMinutes(1);
 
     private static final Logger LOG = LoggerFactory.getLogger(HistoryRollupWorker.class);
-    private static final Resolution RESOLUTION = Resolution.PT5M;
+    private static final List<Resolution> LEVELS = List.of(Resolution.values());
+    private static final BigDecimal NANOS_PER_SECOND = BigDecimal.valueOf(1_000_000_000L);
+    private static final int INTERNAL_SCALE = 30;
 
     private enum BuildResult { WRITTEN, NO_INPUT, OWNER_LOST }
 
@@ -68,6 +72,8 @@ final class HistoryRollupWorker implements AutoCloseable {
         }
     }
 
+    private record LevelWork(Work work, Resolution resolution) { }
+
     private final RateHistoryStore raw;
     private final HistoryRollupStore rollups;
     private final Clock clock;
@@ -76,8 +82,8 @@ final class HistoryRollupWorker implements AutoCloseable {
     private final Supplier<List<Work>> current;
     private final Predicate<Work> permitted;
     private final ScheduledExecutorService scheduler;
-    private final Map<Work, Instant> nextBucket = new HashMap<>();
-    private final Map<Work, Instant> emptyRetryAt = new HashMap<>();
+    private final Map<LevelWork, Instant> nextBucket = new HashMap<>();
+    private final Map<LevelWork, Instant> emptyRetryAt = new HashMap<>();
     private final LinkedHashSet<Key> refreshHints = new LinkedHashSet<>();
     private int nextWorkIndex;
 
@@ -113,33 +119,40 @@ final class HistoryRollupWorker implements AutoCloseable {
 
     /** One global batch, with at most one key per scope before moving to the next. */
     synchronized void runOneBatch() {
-        List<Work> live;
+        List<Work> currentWork;
         try {
-            live = List.copyOf(new LinkedHashSet<>(current.get()));
+            currentWork = List.copyOf(new LinkedHashSet<>(current.get()));
         } catch (RuntimeException failure) {
             LOG.warn("Could not enumerate history rollup work; retrying", failure);
             return;
         }
-        if (live.isEmpty()) {
+        if (currentWork.isEmpty()) {
             nextBucket.clear();
             emptyRetryAt.clear();
             refreshHints.clear();
             return;
         }
-        Set<Work> liveSet = new HashSet<>(live);
+        List<LevelWork> live = new ArrayList<>();
+        for (Resolution resolution : LEVELS) {
+            for (Work work : currentWork) {
+                live.add(new LevelWork(work, resolution));
+            }
+        }
+        Set<LevelWork> liveSet = new HashSet<>(live);
         nextBucket.keySet().retainAll(liveSet);
         emptyRetryAt.keySet().retainAll(liveSet);
-        refreshHints.removeIf(key -> !liveSet.contains(new Work(key.pipelineId(), key.scope())));
+        refreshHints.removeIf(key -> !liveSet.contains(new LevelWork(
+                new Work(key.pipelineId(), key.scope()), key.resolution())));
         int idle = 0;
-        Set<Work> failedThisPass = new HashSet<>();
+        Set<LevelWork> failedThisPass = new HashSet<>();
         for (int attempts = 0; attempts < batchSize && idle < live.size();) {
-            Work work = live.get(Math.floorMod(nextWorkIndex++, live.size()));
-            if (failedThisPass.contains(work)) {
+            LevelWork level = live.get(Math.floorMod(nextWorkIndex++, live.size()));
+            if (failedThisPass.contains(level)) {
                 idle++;
                 continue;
             }
             try {
-                if (!permitted.test(work) || !processOne(work)) {
+                if (!permitted.test(level.work()) || !processOne(level)) {
                     idle++;
                 } else {
                     attempts++;
@@ -148,9 +161,9 @@ final class HistoryRollupWorker implements AutoCloseable {
             } catch (RuntimeException failure) {
                 attempts++;
                 idle++;
-                failedThisPass.add(work);
+                failedThisPass.add(level);
                 LOG.warn("Could not build a closed history rollup bucket for pipeline {}; retrying",
-                        work.pipelineId(), failure);
+                        level.work().pipelineId(), failure);
             }
         }
     }
@@ -159,8 +172,8 @@ final class HistoryRollupWorker implements AutoCloseable {
     synchronized boolean requestRefresh(Key key) {
         Objects.requireNonNull(key, "key");
         Instant now = clock.instant();
-        if (key.resolution() != RESOLUTION || key.bucketEnd().isAfter(now)
-                || key.bucketStart().isBefore(ceil(now.minus(raw.retention())))) {
+        if (key.bucketEnd().isAfter(now)
+                || key.bucketStart().isBefore(ceil(now.minus(raw.retention()), key.resolution()))) {
             return false;
         }
         if (refreshHints.contains(key)) {
@@ -172,12 +185,15 @@ final class HistoryRollupWorker implements AutoCloseable {
         return refreshHints.add(key);
     }
 
-    private boolean processOne(Work work) {
+    private boolean processOne(LevelWork level) {
+        Work work = level.work();
+        Resolution resolution = level.resolution();
         Key hinted = refreshHints.stream()
-                .filter(key -> key.pipelineId().equals(work.pipelineId()) && key.scope().equals(work.scope()))
+                .filter(key -> key.pipelineId().equals(work.pipelineId()) && key.scope().equals(work.scope())
+                        && key.resolution() == resolution)
                 .findFirst().orElse(null);
         if (hinted != null) {
-            if (hinted.bucketStart().isBefore(ceil(clock.instant().minus(raw.retention())))) {
+            if (hinted.bucketStart().isBefore(ceil(clock.instant().minus(raw.retention()), resolution))) {
                 refreshHints.remove(hinted);
                 return true;
             }
@@ -186,52 +202,64 @@ final class HistoryRollupWorker implements AutoCloseable {
                 refreshHints.remove(hinted);
             }
             if (result == BuildResult.WRITTEN) {
-                emptyRetryAt.remove(work);
+                emptyRetryAt.remove(level);
             }
             return result != BuildResult.OWNER_LOST;
         }
 
-        Instant retryAt = emptyRetryAt.get(work);
+        Instant retryAt = emptyRetryAt.get(level);
         if (retryAt != null && clock.instant().isBefore(retryAt)) {
             return false;
         }
 
-        Instant from = nextBucket.get(work);
+        Instant from = nextBucket.get(level);
         if (from == null) {
-            Instant cutoff = ceil(clock.instant().minus(raw.retention()));
+            Instant cutoff = ceil(clock.instant().minus(raw.retention()), resolution);
             Page first = raw.readPageVisible(work.pipelineId(), visibility(work.scope()),
                     cutoff, clock.instant(), null, 1);
             if (first.entries().isEmpty()) {
                 return false;
             }
-            from = floor(first.entries().getFirst().key().observedAt());
-            nextBucket.put(work, from);
+            from = floor(first.entries().getFirst().key().observedAt(), resolution);
+            nextBucket.put(level, from);
         }
-        Instant cutoff = ceil(clock.instant().minus(raw.retention()));
+        Instant cutoff = ceil(clock.instant().minus(raw.retention()), resolution);
         if (from.isBefore(cutoff)) {
             from = cutoff;
-            nextBucket.put(work, from);
+            nextBucket.put(level, from);
         }
-        Key key = new Key(work.pipelineId(), work.scope(), RESOLUTION, from);
+        Key key = new Key(work.pipelineId(), work.scope(), resolution, from);
         if (key.bucketEnd().isAfter(clock.instant())) {
             return false;
         }
         if (rollups.read(key).isEmpty()) {
             BuildResult built = upsert(key);
             if (built == BuildResult.NO_INPUT) {
-                emptyRetryAt.put(work, clock.instant().plus(EMPTY_POLL_INTERVAL));
+                emptyRetryAt.put(level, clock.instant().plus(EMPTY_POLL_INTERVAL));
                 return false;
             }
             if (built == BuildResult.OWNER_LOST) {
                 return false;
             }
         }
-        emptyRetryAt.remove(work);
-        nextBucket.put(work, key.bucketEnd());
+        emptyRetryAt.remove(level);
+        nextBucket.put(level, key.bucketEnd());
         return true;
     }
 
     private BuildResult upsert(Key key) {
+        Bucket cascaded = fromChildren(key);
+        if (cascaded != null) {
+            if (!permitted.test(new Work(key.pipelineId(), key.scope()))) {
+                return BuildResult.OWNER_LOST;
+            }
+            rollups.upsert(cascaded);
+            return BuildResult.WRITTEN;
+        }
+        return upsertFromRaw(key);
+    }
+
+    private BuildResult upsertFromRaw(Key key) {
         Instant readStartedAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
         Visibility visibility = visibility(key.scope());
         Entry predecessor = raw.predecessorVisible(key.pipelineId(), visibility, key.bucketStart())
@@ -267,7 +295,7 @@ final class HistoryRollupWorker implements AutoCloseable {
                 return BuildResult.NO_INPUT;
             }
             HistoryAggregator aggregator = new HistoryAggregator(key.bucketStart(), key.bucketEnd(),
-                    key.bucketStart(), RESOLUTION.duration(), sampleInterval, List.copyOf(tables),
+                    key.bucketStart(), key.resolution().duration(), sampleInterval, List.copyOf(tables),
                     predecessor == null ? PipelineMetricsHistory.StartReason.WINDOW_START
                             : PipelineMetricsHistory.StartReason.CONTINUATION,
                     HistoryRollupStore.MAX_FRAGMENTS + 1);
@@ -302,8 +330,121 @@ final class HistoryRollupWorker implements AutoCloseable {
             return BuildResult.OWNER_LOST;
         }
         rollups.upsert(new Bucket(key, computedAt, readStartedAt, validUntil, tooLarge,
-                tooLarge ? List.of() : fragments, tooLarge ? List.of() : gaps));
+                tooLarge ? List.of() : fragments, tooLarge ? List.of() : gaps, entries.size()));
         return BuildResult.WRITTEN;
+    }
+
+    /** A missing, stale or complex child is recomputed from bounded raw input for this coarse bucket. */
+    private Bucket fromChildren(Key key) {
+        Resolution finer = finer(key.resolution());
+        if (finer == null) {
+            return null;
+        }
+        Instant readAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
+        List<Fragment> parts = new ArrayList<>();
+        Instant earliestRead = null;
+        Instant deadline = null;
+        int samples = 0;
+        for (Instant at = key.bucketStart(); at.isBefore(key.bucketEnd());
+                at = at.plus(finer.duration())) {
+            Bucket child = rollups.read(new Key(key.pipelineId(), key.scope(), finer, at)).orElse(null);
+            if (child == null || !child.usableAt(readAt) || child.inWindowSamples() < 0
+                    || !child.gaps().isEmpty() || child.fragments().size() > 1) {
+                return null;
+            }
+            earliestRead = earliestRead == null || child.inputReadStartedAt().isBefore(earliestRead)
+                    ? child.inputReadStartedAt() : earliestRead;
+            deadline = deadline == null || child.validUntil().isBefore(deadline)
+                    ? child.validUntil() : deadline;
+            samples = Math.addExact(samples, child.inWindowSamples());
+            for (Fragment fragment : child.fragments()) {
+                if (fragment.segment() != 0
+                        || fragment.startReason() == HistoryRollupStore.StartReason.GAP
+                        || fragment.startReason() == HistoryRollupStore.StartReason.COUNTER_RESET
+                        || (fragment.recordsOut() != null && fragment.recordsOutStats() == null)
+                        || (fragment.bytesOut() != null && fragment.bytesOutStats() == null)
+                        || fragment.resumeAfter() == null) {
+                    return null;
+                }
+                parts.add(fragment);
+            }
+        }
+        Instant computedAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
+        if (parts.isEmpty() || deadline == null || !computedAt.isBefore(deadline)) {
+            return null;
+        }
+        try {
+            Fragment merged = merge(parts);
+            return new Bucket(key, computedAt, earliestRead, deadline, false,
+                    List.of(merged), List.of(), samples);
+        } catch (IllegalArgumentException | ArithmeticException unrepresentable) {
+            return null;
+        }
+    }
+
+    private static Resolution finer(Resolution resolution) {
+        return switch (resolution) {
+            case PT5M -> null;
+            case PT30M -> Resolution.PT5M;
+            case PT1H -> Resolution.PT30M;
+            case PT3H -> Resolution.PT1H;
+            case PT6H -> Resolution.PT3H;
+        };
+    }
+
+    private static Fragment merge(List<Fragment> parts) {
+        Fragment first = parts.getFirst();
+        Fragment last = parts.getLast();
+        Instant start = first.intervalStart();
+        Instant end = first.intervalEnd();
+        HistoryRollupStore.CounterStats records = null;
+        HistoryRollupStore.CounterStats bytes = null;
+        Map<String, Lag> lag = new LinkedHashMap<>();
+        for (Fragment part : parts) {
+            if (part.intervalStart().isBefore(start)) {
+                start = part.intervalStart();
+            }
+            if (part.intervalEnd().isAfter(end)) {
+                end = part.intervalEnd();
+            }
+            records = combine(records, part.recordsOutStats());
+            bytes = combine(bytes, part.bytesOutStats());
+            for (Lag reading : part.lag()) {
+                lag.merge(reading.table(), reading, (earlier, later) -> new Lag(earlier.table(),
+                        later.observedAt().isAfter(earlier.observedAt())
+                                ? later.observedAt() : earlier.observedAt(),
+                        later.observedAt().isAfter(earlier.observedAt()) ? later.last() : earlier.last(),
+                        Math.max(earlier.max(), later.max())));
+            }
+        }
+        return new Fragment(0, first.startReason(), start, end,
+                projectedRate(records), projectedRate(bytes),
+                lag.values().stream().sorted(java.util.Comparator.comparing(Lag::table)).toList(),
+                records, bytes, last.resumeAfter(), last.resumeAt());
+    }
+
+    private static HistoryRollupStore.CounterStats combine(HistoryRollupStore.CounterStats left,
+            HistoryRollupStore.CounterStats right) {
+        if (right == null) {
+            return left;
+        }
+        if (left == null) {
+            return right;
+        }
+        return new HistoryRollupStore.CounterStats(left.delta().add(right.delta()),
+                Math.addExact(left.coveredNanos(), right.coveredNanos()),
+                left.maxRate().max(right.maxRate()));
+    }
+
+    private static Rate projectedRate(HistoryRollupStore.CounterStats stats) {
+        if (stats == null) {
+            return null;
+        }
+        PipelineMetricsHistory.Rate wire = new PipelineMetricsHistory.Rate(stats.delta(),
+                stats.delta().multiply(NANOS_PER_SECOND)
+                        .divide(BigDecimal.valueOf(stats.coveredNanos()), INTERNAL_SCALE, RoundingMode.HALF_EVEN),
+                stats.maxRate());
+        return rate(wire);
     }
 
     private static Fragment fragment(Emitted emitted) {
@@ -312,7 +453,14 @@ final class HistoryRollupWorker implements AutoCloseable {
                 HistoryRollupStore.StartReason.valueOf(emitted.startReason().name()),
                 point.intervalStart(), point.intervalEnd(), rate(point.recordsOut()), rate(point.bytesOut()),
                 point.lag().stream().map(lag -> new Lag(lag.table(), lag.observedAt(),
-                        lag.last(), lag.max())).toList());
+                        lag.last(), lag.max())).toList(),
+                stats(emitted.recordsOutStats()), stats(emitted.bytesOutStats()),
+                emitted.resumeAfter(), emitted.resumeAt());
+    }
+
+    private static HistoryRollupStore.CounterStats stats(HistoryAggregator.CounterStats stats) {
+        return stats == null ? null : new HistoryRollupStore.CounterStats(
+                stats.delta(), stats.coveredNanos(), stats.maxRate());
     }
 
     private static Rate rate(PipelineMetricsHistory.Rate rate) {
@@ -330,14 +478,14 @@ final class HistoryRollupWorker implements AutoCloseable {
                 .orElseGet(() -> new Visibility(null, true));
     }
 
-    private static Instant floor(Instant at) {
-        long seconds = RESOLUTION.duration().toSeconds();
+    private static Instant floor(Instant at, Resolution resolution) {
+        long seconds = resolution.duration().toSeconds();
         return Instant.ofEpochSecond(Math.floorDiv(at.getEpochSecond(), seconds) * seconds);
     }
 
-    private static Instant ceil(Instant at) {
-        Instant floor = floor(at);
-        return floor.equals(at) ? floor : floor.plus(RESOLUTION.duration());
+    private static Instant ceil(Instant at, Resolution resolution) {
+        Instant floor = floor(at, resolution);
+        return floor.equals(at) ? floor : floor.plus(resolution.duration());
     }
 
     @Override

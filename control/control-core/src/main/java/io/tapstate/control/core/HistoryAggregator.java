@@ -33,13 +33,29 @@ public final class HistoryAggregator {
     private static final BigDecimal NANOS_PER_SECOND = BigDecimal.valueOf(1_000_000_000L);
 
     /** One completed point and the stateless position from which a later page recomputes. */
+    /** Additive internal values retained before the public rate is rounded. */
+    public record CounterStats(BigDecimal delta, long coveredNanos, BigDecimal maxRate) {
+        public CounterStats {
+            Objects.requireNonNull(delta, "delta");
+            Objects.requireNonNull(maxRate, "maxRate");
+            if (coveredNanos <= 0) {
+                throw new IllegalArgumentException("counter coverage is positive");
+            }
+        }
+    }
+
     public record Emitted(Point point, int segment, StartReason startReason, Key resumeAfter,
-            Instant resumeAt) {
+            Instant resumeAt, CounterStats recordsOutStats, CounterStats bytesOutStats) {
         public Emitted {
             Objects.requireNonNull(point, "point");
             Objects.requireNonNull(startReason, "startReason");
             Objects.requireNonNull(resumeAfter, "resumeAfter");
             Objects.requireNonNull(resumeAt, "resumeAt");
+        }
+
+        public Emitted(Point point, int segment, StartReason startReason, Key resumeAfter,
+                Instant resumeAt) {
+            this(point, segment, startReason, resumeAfter, resumeAt, null, null);
         }
     }
 
@@ -292,7 +308,8 @@ public final class HistoryAggregator {
             return;
         }
         if (emitted.size() < outputCeiling) {
-            emitted.add(new Emitted(active.point(), active.segment, active.reason, resumeAfter, resumeAt));
+            emitted.add(new Emitted(active.point(), active.segment, active.reason, resumeAfter, resumeAt,
+                    active.recordsStats(), active.bytesStats()));
         }
         active = null;
     }
@@ -347,6 +364,10 @@ public final class HistoryAggregator {
             BigDecimal average = delta.multiply(NANOS_PER_SECOND)
                     .divide(BigDecimal.valueOf(nanos), INTERNAL_SCALE, RoundingMode.HALF_EVEN);
             return new Rate(delta, average, maxRate);
+        }
+
+        CounterStats stats() {
+            return nanos == 0 ? null : new CounterStats(delta, nanos, maxRate);
         }
     }
 
@@ -419,6 +440,14 @@ public final class HistoryAggregator {
                     .map(entry -> entry.getValue().finish(entry.getKey()))
                     .toList();
             return new Point(start, end, records.rate(), bytes.rate(), readings);
+        }
+
+        CounterStats recordsStats() {
+            return records.stats();
+        }
+
+        CounterStats bytesStats() {
+            return bytes.stats();
         }
 
         private void touch(Instant from, Instant to) {

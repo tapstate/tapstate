@@ -174,7 +174,12 @@ class HistoryRollupWorkerTest {
             worker.runOneBatch();
         }
 
-        assertThat(rollups.rows).containsOnlyKeys(FIRST);
+        assertThat(rollups.rows.keySet()).extracting(Key::resolution)
+                .containsExactlyInAnyOrder(Resolution.values());
+        assertThat(rollups.rows.keySet()).allSatisfy(key -> {
+            assertThat(key.bucketStart()).isBeforeOrEqualTo(TEN.plusSeconds(60));
+            assertThat(key.bucketEnd()).isAfter(TEN.plusSeconds(60));
+        });
     }
 
     @Test
@@ -276,6 +281,94 @@ class HistoryRollupWorkerTest {
 
         assertThat(rollups.attempts).containsExactly(
                 FIRST, new Key("other", Scope.incarnation("inc-b"), Resolution.PT5M, TEN));
+    }
+
+    @Test
+    void everyCoarseLevelInheritsTheEarliestChildDeadlineAndExactCounterCoverage() {
+        Instant start = Instant.parse("2026-09-27T06:00:00Z");
+        for (Resolution resolution : List.of(Resolution.PT30M, Resolution.PT1H,
+                Resolution.PT3H, Resolution.PT6H)) {
+            Key target = new Key(ID, SCOPED, resolution, start);
+            MutableClock clock = new MutableClock(target.bucketEnd().plus(Duration.ofMinutes(1)));
+            InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+            raw.appendScoped(sample(start.plusSeconds(60), 1, 1), owner(1));
+            MemoryRollups rollups = new MemoryRollups();
+            Resolution finer = switch (resolution) {
+                case PT30M -> Resolution.PT5M;
+                case PT1H -> Resolution.PT30M;
+                case PT3H -> Resolution.PT1H;
+                case PT6H -> Resolution.PT3H;
+                default -> throw new AssertionError(resolution);
+            };
+            int childIndex = 0;
+            for (Instant at = start; at.isBefore(target.bucketEnd()); at = at.plus(finer.duration())) {
+                rollups.upsert(child(new Key(ID, SCOPED, finer, at), clock.instant(), childIndex++));
+            }
+            try (HistoryRollupWorker worker = worker(raw, rollups, clock, 16,
+                    List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+                assertThat(worker.requestRefresh(target)).isTrue();
+                worker.runOneBatch();
+            }
+
+            Bucket coarse = rollups.read(target).orElseThrow();
+            assertThat(coarse.inputReadStartedAt()).isEqualTo(clock.instant().minusSeconds(60));
+            assertThat(coarse.validUntil()).isEqualTo(clock.instant().plusSeconds(120));
+            assertThat(coarse.inWindowSamples()).isEqualTo(resolution.duration().toMinutes());
+            assertThat(coarse.fragments()).singleElement().satisfies(fragment -> {
+                assertThat(fragment.recordsOut().delta())
+                        .isEqualByComparingTo(BigDecimal.valueOf(resolution.duration().toSeconds()));
+                assertThat(fragment.recordsOut().averageRate()).isEqualByComparingTo("1");
+                assertThat(fragment.recordsOutStats().coveredNanos())
+                        .isEqualTo(resolution.duration().toNanos());
+                assertThat(fragment.resumeAt()).isEqualTo(target.bucketEnd());
+            });
+        }
+    }
+
+    @Test
+    void expiredChildIsRebuiltFromRawWithoutPublishingAnExpiredCoarseBucket() {
+        Key target = new Key(ID, SCOPED, Resolution.PT30M, TEN);
+        MutableClock clock = new MutableClock(target.bucketEnd().plus(Duration.ofMinutes(1)));
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        raw.appendScoped(sample(TEN.plusSeconds(60), 1, 1), owner(1));
+        MemoryRollups rollups = new MemoryRollups();
+        int childIndex = 0;
+        for (Instant at = TEN; at.isBefore(target.bucketEnd()); at = at.plus(Duration.ofMinutes(5))) {
+            rollups.upsert(child(new Key(ID, SCOPED, Resolution.PT5M, at), clock.instant(), childIndex++));
+        }
+        Key firstChild = new Key(ID, SCOPED, Resolution.PT5M, TEN);
+        Bucket first = rollups.read(firstChild).orElseThrow();
+        rollups.upsert(new Bucket(first.key(), first.computedAt(), first.inputReadStartedAt(),
+                clock.instant(), false, first.fragments(), first.gaps(), first.inWindowSamples()));
+
+        try (HistoryRollupWorker worker = worker(raw, rollups, clock, 16,
+                List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+            assertThat(worker.requestRefresh(target)).isTrue();
+            worker.runOneBatch();
+        }
+
+        Bucket coarse = rollups.read(target).orElseThrow();
+        assertThat(coarse.inputReadStartedAt()).isEqualTo(clock.instant());
+        assertThat(coarse.validUntil()).isEqualTo(clock.instant().plus(Duration.ofMinutes(5)));
+        assertThat(coarse.inWindowSamples()).isEqualTo(1);
+    }
+
+    private static Bucket child(Key key, Instant now, int childIndex) {
+        Instant readAt = now.minusSeconds(60);
+        Instant validUntil = now.plusSeconds(childIndex == 0 ? 120 : 240);
+        long seconds = key.resolution().duration().toSeconds();
+        HistoryRollupStore.CounterStats stats = new HistoryRollupStore.CounterStats(
+                BigDecimal.valueOf(seconds), key.resolution().duration().toNanos(), BigDecimal.ONE);
+        HistoryRollupStore.Fragment fragment = new HistoryRollupStore.Fragment(0,
+                childIndex == 0 ? HistoryRollupStore.StartReason.WINDOW_START
+                        : HistoryRollupStore.StartReason.CONTINUATION,
+                key.bucketStart(), key.bucketEnd(),
+                new HistoryRollupStore.Rate(BigDecimal.valueOf(seconds), BigDecimal.ONE, BigDecimal.ONE),
+                null, List.of(), stats, null,
+                new io.tapstate.spi.store.RateHistoryStore.Key(
+                        key.bucketEnd().minusSeconds(60), "child-" + childIndex), key.bucketEnd());
+        return new Bucket(key, now.minusSeconds(30), readAt, validUntil, false,
+                List.of(fragment), List.of(), (int) key.resolution().duration().toMinutes());
     }
 
     private static HistoryRollupWorker worker(InMemoryRateHistoryStore raw,
