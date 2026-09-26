@@ -105,12 +105,18 @@ class HistoryQueryBenchmarkIT {
                         : Instant.parse(configuredAnchor);
                 Instant missingBucket = Instant.ofEpochSecond(
                         Math.floorDiv(to.minus(Duration.ofMinutes(30)).getEpochSecond(), 1_800) * 1_800);
-                int samples = seed(database, to, missingBucket);
+                Document artifact = database.getCollection(MongoStorePort.ARTIFACTS)
+                        .find(new Document("_id", PIPELINE)).first();
+                assertThat(artifact).as("the applied pipeline artifact").isNotNull();
+                String incarnation = artifact.getString("pipelineIncarnationId");
+                int samples = seed(database, to, missingBucket, incarnation);
                 System.out.printf("history-query-fixture jar=%s os=%s/%s java=%s mongo=7.0"
-                                + " anchor=%s missingBucket=%s seededSamples=%d concurrency=1 hotReads=%d%n",
+                                + " anchor=%s missingBucket=%s seededSamples=%d historyScope=%s"
+                                + " concurrency=1 hotReads=%d%n",
                         jar == null ? "reactor" : jar,
                         System.getProperty("os.name"), System.getProperty("os.arch"),
-                        System.getProperty("java.version"), to, missingBucket, samples, HOT_READS);
+                        System.getProperty("java.version"), to, missingBucket, samples,
+                        incarnation == null ? "legacy" : "incarnation", HOT_READS);
 
                 for (Window window : List.of(
                         new Window("1h", Duration.ofHours(1), "raw", "PT1M"),
@@ -131,7 +137,7 @@ class HistoryQueryBenchmarkIT {
         }
     }
 
-    private static int seed(MongoDatabase database, Instant to, Instant missingBucket) {
+    private static int seed(MongoDatabase database, Instant to, Instant missingBucket, String incarnation) {
         MongoCollection<Document> history = database.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY);
         Instant first = to.truncatedTo(ChronoUnit.MINUTES).minus(Duration.ofDays(15))
                 .plus(Duration.ofMinutes(10));
@@ -142,9 +148,15 @@ class HistoryQueryBenchmarkIT {
                 continue;
             }
             long minutes = Duration.between(first, at).toMinutes();
-            samples.add(MongoRateHistoryStore.toDocument(new RateSample(PIPELINE, at,
+            Document sample = MongoRateHistoryStore.toDocument(new RateSample(PIPELINE, at,
                     Map.of("records.out", minutes * 60, "bytes.out", minutes * 600),
-                    Map.of("orders", minutes % 11), first)));
+                    Map.of("orders", minutes % 11), first));
+            // The fixture keeps the same logical samples on both builds. New runs carry their current
+            // internal owner; a pre-identity reference build reads the same samples as legacy history.
+            if (incarnation != null) {
+                sample.append("pipelineIncarnationId", incarnation).append("executionGeneration", 1L);
+            }
+            samples.add(sample);
         }
         history.insertMany(samples);
         assertThat(history.countDocuments()).isEqualTo(samples.size());
