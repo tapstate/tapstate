@@ -142,6 +142,7 @@ class StoreBackedDagSourceTargetModelTest {
             String output = computed ? "amount" : "total";
             TargetField field = bound.getFirst().fields().stream().filter(f -> f.name().equals(output)).findFirst().orElseThrow();
             assertThat(field.numericType()).isEqualTo(computed ? null : number);
+            assertThat(field.type()).isNull();
         }
     }
 

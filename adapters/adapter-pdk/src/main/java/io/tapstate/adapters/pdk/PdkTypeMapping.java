@@ -16,6 +16,8 @@ import io.tapdata.entity.schema.type.TapYear;
 import io.tapstate.core.common.TapstateType;
 
 import java.math.BigDecimal;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import io.tapstate.core.common.NumericType;
 import io.tapstate.core.common.StringType;
 
@@ -33,6 +35,7 @@ final class PdkTypeMapping {
     /** The widest domain a 64-bit integer covers: signed at the bottom, unsigned at the top. */
     private static final BigDecimal SIGNED_64_MIN = BigDecimal.valueOf(Long.MIN_VALUE);
     private static final BigDecimal UNSIGNED_64_MAX = new BigDecimal("18446744073709551615");
+    private static final Pattern DECLARED_DECIMAL = Pattern.compile("(?i)decimal\\(([1-9][0-9]*),([0-9]+)\\)");
 
     private PdkTypeMapping() {
     }
@@ -90,6 +93,32 @@ final class PdkTypeMapping {
         }
         return new NumericType(number.getBit(), number.getFixed(), number.getUnsigned(), number.getZerofill(),
                 number.getMinValue(), number.getMaxValue(), number.getPrecision(), number.getScale());
+    }
+
+    /** Restores the connector's decimal descriptor from an older model's complete SQL type token. */
+    static NumericType declaredDecimal(String dataType) {
+        if (dataType == null) {
+            return null;
+        }
+        Matcher match = DECLARED_DECIMAL.matcher(dataType);
+        if (!match.matches()) {
+            return null;
+        }
+        try {
+            int precision = Integer.parseInt(match.group(1));
+            int scale = Integer.parseInt(match.group(2));
+            // The source connector's DECIMAL declaration accepts at most 65 digits and 30 fractional
+            // digits. Outside that domain, a token cannot establish the bounds this bridge promises.
+            if (precision > 65 || scale > 30 || scale > precision) {
+                return null;
+            }
+            // The connector's published DECIMAL mapping uses precision for this range, independently
+            // of scale. Preserve that descriptor so an upgraded model and fresh discovery translate alike.
+            BigDecimal max = BigDecimal.TEN.pow(precision).subtract(BigDecimal.ONE);
+            return new NumericType(null, true, null, null, max.negate(), max, precision, scale);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 
     /** Copies all declared string attributes, including the source's character width. */
