@@ -85,7 +85,7 @@ def selected_files(layout: Path, layers: list[Any], platform: str) -> dict[str, 
 
 
 def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
-                    entries: list[dict[str, Any]], lock_bytes: bytes) -> dict[str, str]:
+                    entries: list[dict[str, Any]], lock_bytes: bytes) -> tuple[dict[str, str], str]:
     manifest = object_from_bytes(blob(layout, descriptor.get("digest")), f"{platform} manifest")
     config_descriptor = manifest.get("config")
     if not isinstance(config_descriptor, dict):
@@ -118,6 +118,7 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
         raise ImageError(f"{platform} release metadata has missing or unexpected files")
     if "opt/tapstate/tapstate.jar" not in files:
         raise ImageError(f"{platform} has no Boot JAR")
+    boot_jar_sha256 = hashlib.sha256(files["opt/tapstate/tapstate.jar"]).hexdigest()
     if files.get("opt/tapstate/release/connectors.lock.json") != lock_bytes:
         raise ImageError(f"{platform} embeds a different connector lock")
     expected_checksums = "".join(
@@ -130,10 +131,10 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
         jar = files[path]
         if len(jar) != entry["bytes"] or hashlib.sha256(jar).hexdigest() != entry["sha256"]:
             raise ImageError(f"{platform} {entry['id']} JAR differs from the release lock")
-    return relevant_labels
+    return relevant_labels, boot_jar_sha256
 
 
-def verify(layout: Path, lock_path: Path) -> str:
+def verify(layout: Path, lock_path: Path, boot_jar_path: Path | None = None) -> str:
     try:
         entries = STAGING.read_lock(lock_path)
         lock_bytes = lock_path.read_bytes()
@@ -163,8 +164,17 @@ def verify(layout: Path, lock_path: Path) -> str:
         platforms[platform] = verify_platform(layout, descriptor, platform, entries, lock_bytes)
     if set(platforms) != {"linux/amd64", "linux/arm64"}:
         raise ImageError(f"OCI archive platforms are {sorted(platforms)}, expected amd64 and arm64")
-    if platforms["linux/amd64"] != platforms["linux/arm64"]:
+    if platforms["linux/amd64"][1] != platforms["linux/arm64"][1]:
+        raise ImageError("OCI platforms have different Boot JAR bytes")
+    if platforms["linux/amd64"][0] != platforms["linux/arm64"][0]:
         raise ImageError("OCI platforms have different release or Web provenance labels")
+    if boot_jar_path is not None:
+        try:
+            expected_sha256, _ = STAGING.sha256_and_size(boot_jar_path)
+        except OSError as exc:
+            raise ImageError("cannot read the expected Boot JAR") from exc
+        if platforms["linux/amd64"][1] != expected_sha256:
+            raise ImageError("OCI Boot JAR differs from the verified build input")
     return top_digest
 
 
@@ -172,9 +182,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--oci-layout", required=True, type=Path)
     parser.add_argument("--lock", required=True, type=Path)
+    parser.add_argument("--boot-jar", required=True, type=Path)
     args = parser.parse_args()
     try:
-        digest = verify(args.oci_layout, args.lock)
+        digest = verify(args.oci_layout, args.lock, args.boot_jar)
     except ImageError as exc:
         print(f"Cloud image verification refused: {exc}", file=sys.stderr)
         return 1

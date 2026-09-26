@@ -107,6 +107,7 @@ fi
 mkdir "$TEMP_ROOT/oci-layout"
 tar -xf "$TEMP_ROOT/cloud-image.tar" -C "$TEMP_ROOT/oci-layout"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/deploy/cloud/verify-image.py" \
-    --oci-layout "$TEMP_ROOT/oci-layout" --lock "$TEMP_ROOT/connectors.lock.json"
+    --oci-layout "$TEMP_ROOT/oci-layout" --lock "$TEMP_ROOT/connectors.lock.json" \
+    --boot-jar "$TEMP_ROOT/context/app/target/app-smoke-boot.jar"
 
 echo "PASS: default server target remains connector-free; Cloud target and both OCI platforms carry seven locked synthetic JARs"

@@ -74,7 +74,8 @@ class StageConnectorsTest(unittest.TestCase):
         self.lock.write_text(json.dumps({"schemaVersion": 1, "connectors": self.entries}), encoding="utf-8")
 
     def make_oci(self, *, architectures: tuple[str, ...] = ("amd64", "arm64"),
-                 tamper: str | None = None, license_label: str | None = "NOASSERTION") -> Path:
+                 tamper: str | None = None, license_label: str | None = "NOASSERTION",
+                 boot_jars: dict[str, bytes] | None = None) -> Path:
         MODULE.stage(self.lock, self.jars, self.staged)
         layout = self.root / "oci"
         (layout / "blobs/sha256").mkdir(parents=True)
@@ -91,7 +92,8 @@ class StageConnectorsTest(unittest.TestCase):
         for architecture in architectures:
             layer_stream = io.BytesIO()
             with tarfile.open(fileobj=layer_stream, mode="w") as archive:
-                files = {"opt/tapstate/tapstate.jar": b"synthetic-boot-jar"}
+                boot_jar = (boot_jars or {}).get(architecture, b"synthetic-boot-jar")
+                files = {"opt/tapstate/tapstate.jar": boot_jar}
                 for path in self.staged.rglob("*"):
                     if path.is_file():
                         name = "opt/tapstate/" + str(path.relative_to(self.staged))
@@ -208,6 +210,20 @@ class StageConnectorsTest(unittest.TestCase):
     def test_oci_requires_both_platforms_with_same_locked_jars(self) -> None:
         layout = self.make_oci()
         self.assertTrue(IMAGE.verify(layout, self.lock).startswith("sha256:"))
+
+    def test_oci_rejects_different_boot_jars_across_platforms(self) -> None:
+        layout = self.make_oci(boot_jars={"arm64": b"other-boot-jar"})
+        with self.assertRaisesRegex(IMAGE.ImageError, "different Boot JAR bytes"):
+            IMAGE.verify(layout, self.lock)
+
+    def test_oci_boot_jar_matches_the_verified_build_input(self) -> None:
+        layout = self.make_oci()
+        boot_jar = self.root / "app-boot.jar"
+        boot_jar.write_bytes(b"synthetic-boot-jar")
+        self.assertTrue(IMAGE.verify(layout, self.lock, boot_jar).startswith("sha256:"))
+        boot_jar.write_bytes(b"different-build-input")
+        with self.assertRaisesRegex(IMAGE.ImageError, "differs from the verified build input"):
+            IMAGE.verify(layout, self.lock, boot_jar)
 
     def test_oci_rejects_tampered_jar(self) -> None:
         layout = self.make_oci(tamper="opt/tapstate/connectors/mysql-connector.jar")
