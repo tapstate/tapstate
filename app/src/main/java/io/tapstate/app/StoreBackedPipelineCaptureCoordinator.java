@@ -106,6 +106,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** Looks for captures pipelines here read and nobody tails; started with the first capture joined. */
     private volatile ScheduledExecutorService takeovers;
 
+    /** One member-wide poll of durable expansion requests for captures this member owns. */
+    private volatile ScheduledExecutorService physicalReconfigurations;
+
     /** What each running pipeline's load read, keyed by pipeline; dropped when it stops. */
     private final Map<String, SnapshotReading> snapshotsByPipeline = new ConcurrentHashMap<>();
     private final Map<String, LiveSnapshot> liveSnapshotsByPipeline = new ConcurrentHashMap<>();
@@ -335,9 +338,78 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         List<KeyedLocks.Hold<CaptureId>> captureHolds = lockCaptures(plans.stream()
                 .map(SourcePlan::captureId).distinct().toList(), true);
         try {
-            startPlannedCapture(pipelineId, plans, pending);
+            ensurePhysicalSelections(plans);
+            try {
+                startPlannedCapture(pipelineId, plans, pending);
+            } catch (TapstateException refused) {
+                if (refused.code() != CaptureError.SHARED_SELECTION_RESTART_REQUIRED) {
+                    throw refused;
+                }
+                // The first publication and a remote request can cross after preflight. Register the
+                // demand again against the now-published selection and retry on a later pass.
+                ensurePhysicalSelections(plans);
+                throw new RingNotOpenYet(plans.getFirst().captureId());
+            }
         } finally {
             releaseCaptures(captureHolds);
+        }
+    }
+
+    /** Registers missing tables before any new snapshot or reader can rely on the physical tail. */
+    private void ensurePhysicalSelections(List<SourcePlan> plans) {
+        for (SourcePlan plan : plans) {
+            CaptureRunSpec spec = plan.spec();
+            if (!spec.srsEnabled() || spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
+                continue;
+            }
+            MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
+            SrsMeta record = storePort.meta().read(chain.value()).orElse(null);
+            if (record == null || record.epoch() < 1) {
+                continue;
+            }
+            List<String> wanted = spec.selectedChainTables() == null
+                    ? spec.config().streams() : spec.selectedChainTables();
+            var selection = storePort.meta().physicalSelection(chain.value()).orElse(null);
+            if (selection != null && selection.epoch() == record.epoch()
+                    && selection.tables().containsAll(wanted)) {
+                continue;
+            }
+            if (!storePort.meta().requestPhysicalTables(chain.value(), record.epoch(), wanted)) {
+                throw new RingNotOpenYet(plan.captureId());
+            }
+            if (selection == null) {
+                // A tail not yet published must include every request in its first subscription. Its
+                // conditional publication refuses a union that raced this request.
+                continue;
+            }
+            OwnedCapture owned = ownedCaptures.get(plan.captureId());
+            if (owned != null && selection.epoch() == record.epoch()) {
+                reopenOwnedPhysicalTail(plan.captureId(), owned);
+                var expanded = storePort.meta().physicalSelection(chain.value()).orElse(null);
+                if (expanded != null && expanded.epoch() == record.epoch()
+                        && expanded.tables().containsAll(wanted)) {
+                    continue;
+                }
+            }
+            throw new RingNotOpenYet(plan.captureId());
+        }
+    }
+
+    /** Called under this capture's lock; the old subscription must be closed before the new one opens. */
+    private void reopenOwnedPhysicalTail(CaptureId captureId, OwnedCapture owned) {
+        owned.reconfiguring = Thread.currentThread();
+        try {
+            CaptureRun replacement = captureAttacher.reopenPhysicalTail(owned.spec, owned.run);
+            if (ownedCaptures.get(captureId) != owned) {
+                replacement.close();
+                throw new CancellationException("capture owner changed during physical expansion");
+            }
+            owned.run = replacement;
+        } catch (RuntimeException | Error failure) {
+            owned.run.health().fail(failure);
+            throw failure;
+        } finally {
+            owned.reconfiguring = null;
         }
     }
 
@@ -363,21 +435,17 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 CaptureRunSpec spec = plan.spec();
                 CaptureId captureId = plan.captureId();
                 Map<String, Long> observedSnapshotCounts = new ConcurrentHashMap<>();
+                Consumer<Envelope> receive = snapshotPassthrough(pipelineId, plan.sourceId(), resolution,
+                        spec.cursorWriterToken(), liveSnapshot, observedSnapshotCounts);
                 CaptureRun run;
                 if (!managedOwnership) {
-                    run = captureStarter.start(
-                            spec, snapshotPassthrough(pipelineId, plan.sourceId(), resolution,
-                                    spec.cursorWriterToken(), liveSnapshot,
-                                    observedSnapshotCounts));
+                    run = captureStarter.start(spec, receive);
                     runs.add(PipelineRun.unmanaged(run));
                 } else {
                     OwnedCapture existing = ownedCaptures.get(captureId);
                     if (existing != null) {
                         run = captureAttacher.start(
-                                spec.withCaptureFence(existing.permit.fence()),
-                                snapshotPassthrough(pipelineId, plan.sourceId(), resolution,
-                                        spec.cursorWriterToken(), liveSnapshot,
-                                        observedSnapshotCounts), false);
+                                spec.withCaptureFence(existing.permit.fence()), receive, false);
                         existing.pipelines.add(pipelineId);
                     } else {
                         OpeningClaim opening = permits.get(captureId);
@@ -387,11 +455,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             CaptureRun started = null;
                             try {
                                 opening.check();
-                                started = captureAttacher.start(
-                                        spec.withCaptureFence(opening.permit.fence()),
-                                        snapshotPassthrough(pipelineId, plan.sourceId(), resolution,
-                                                spec.cursorWriterToken(), liveSnapshot,
-                                                observedSnapshotCounts), true);
+                                CaptureRunSpec ownedSpec = spec.withCaptureFence(opening.permit.fence());
+                                started = captureAttacher.start(ownedSpec, receive, true);
                                 opening.check();
                                 pending.check();
                                 run = started;
@@ -402,7 +467,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                                 if (joined != null) {
                                     pipelines.addAll(joined.pipelines);
                                 }
-                                opening.publish(run, pipelines);
+                                opening.publish(run, pipelines, ownedSpec, receive);
                             } catch (RuntimeException | Error failure) {
                                 boolean interrupted = Thread.interrupted();
                                 try {
@@ -429,12 +494,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             // Another member tails this source. The pipeline reads it no differently for
                             // that: its own load where its record says one is owed, then the changes the
                             // other member's tail writes into the shared ring.
-                            Consumer<Envelope> passthrough =
-                                    snapshotPassthrough(pipelineId, plan.sourceId(), resolution,
-                                            spec.cursorWriterToken(), liveSnapshot,
-                                            observedSnapshotCounts);
-                            run = captureAttacher.start(spec, passthrough, false);
-                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec, passthrough))
+                            run = captureAttacher.start(spec, receive, false);
+                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec, receive))
                                     .pipelines.add(pipelineId);
                             lookForCapturesNobodyTails();
                         }
@@ -617,6 +678,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             }
             cancelPendingStarts(captureId);
             OwnedCapture current = published;
+            if (current != null && current.reconfiguring != null) {
+                current.reconfiguring.interrupt();
+            }
             if (current == null && openingThread != null) {
                 openingThread.interrupt();
             }
@@ -631,11 +695,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             }
         }
 
-        private void publish(CaptureRun run, Set<String> pipelines) {
-            OwnedCapture owned = new OwnedCapture(run, permit, pipelines);
+        private void publish(CaptureRun run, Set<String> pipelines,
+                CaptureRunSpec spec, Consumer<Envelope> receive) {
+            OwnedCapture owned = new OwnedCapture(run, permit, pipelines, spec, receive);
             owned.lease = lease;
             published = owned;
             ownedCaptures.put(captureId, owned);
+            watchPhysicalRequests();
             openingPending = null;
         }
 
@@ -646,15 +712,21 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     private static final class OwnedCapture {
-        private final CaptureRun run;
+        private volatile CaptureRun run;
         private final CaptureOwnership.Permit permit;
         private final Set<String> pipelines = new LinkedHashSet<>();
+        private final CaptureRunSpec spec;
+        private final Consumer<Envelope> receive;
         private CaptureClaimLease lease;
+        private volatile Thread reconfiguring;
 
-        private OwnedCapture(CaptureRun run, CaptureOwnership.Permit permit, Collection<String> pipelines) {
+        private OwnedCapture(CaptureRun run, CaptureOwnership.Permit permit, Collection<String> pipelines,
+                CaptureRunSpec spec, Consumer<Envelope> receive) {
             this.run = run;
             this.permit = permit;
             this.pipelines.addAll(pipelines);
+            this.spec = spec;
+            this.receive = receive;
         }
     }
 
@@ -679,6 +751,60 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch());
             this.tailPassthrough = passthrough;
         }
+    }
+
+    /** A remote attachment records its table demand in the chain document; only the owner replaces it. */
+    void reconfigureRequestedCaptures() {
+        for (CaptureId captureId : List.copyOf(ownedCaptures.keySet())) {
+            KeyedLocks.Hold<CaptureId> hold = captureLocks.tryAcquire(captureId);
+            if (hold == null) {
+                continue;
+            }
+            try (hold) {
+                OwnedCapture owned = ownedCaptures.get(captureId);
+                if (owned == null || !owned.spec.srsEnabled()
+                        || owned.spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
+                    continue;
+                }
+                MiningChainId chain = owned.run.chainId().orElse(null);
+                if (chain == null) {
+                    continue;
+                }
+                List<String> requested = storePort.meta().requestedPhysicalTables(chain.value());
+                if (requested.isEmpty()) {
+                    continue;
+                }
+                var selection = storePort.meta().physicalSelection(chain.value()).orElse(null);
+                if (selection == null) {
+                    // A reserved snapshot has not opened its tail yet. Its first subscription reads
+                    // these durable requests, so there is no running subscription to replace.
+                    continue;
+                }
+                if (selection.tables().containsAll(requested)) {
+                    storePort.meta().clearPhysicalRequests(chain.value(), selection.epoch(), requested);
+                    continue;
+                }
+                reopenOwnedPhysicalTail(captureId, owned);
+            }
+        }
+    }
+
+    private synchronized void watchPhysicalRequests() {
+        if (physicalReconfigurations != null || claimRenewInterval.isZero()) {
+            return;
+        }
+        physicalReconfigurations = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "tapstate-capture-selection");
+            thread.setDaemon(true);
+            return thread;
+        });
+        physicalReconfigurations.scheduleWithFixedDelay(() -> {
+            try {
+                reconfigureRequestedCaptures();
+            } catch (RuntimeException failure) {
+                LOG.warn("Could not expand a requested physical capture subscription", failure);
+            }
+        }, 1000, 1000, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -721,7 +847,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             capture.tailSpec.withCaptureFence(permit.fence()), capture.tailPassthrough, true);
                     opening.check();
                     joinedCaptures.remove(captureId, capture);
-                    opening.publish(tail, capture.pipelines);
+                    opening.publish(tail, capture.pipelines,
+                            capture.tailSpec.withCaptureFence(permit.fence()), capture.tailPassthrough);
                     if (opening.lost) {
                         captureClaimLost(captureId, opening.published);
                         throw new CancellationException("capture claim was lost during takeover");
@@ -777,6 +904,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (takeovers != null) {
             takeovers.shutdownNow();
             takeovers = null;
+        }
+        if (physicalReconfigurations != null) {
+            physicalReconfigurations.shutdownNow();
+            physicalReconfigurations = null;
         }
     }
 

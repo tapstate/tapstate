@@ -314,6 +314,8 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             started.set(start);
+            listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
+                    ? resume.position() : new SourcePosition("src-start")));
             running = true;
             daemon = new Thread(() -> {
                 while (running) {

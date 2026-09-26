@@ -170,9 +170,12 @@ class MongoSrsMetaStoreIT {
             long first = store.openEpoch(CHAIN);
             PhysicalSelection orders = new PhysicalSelection(first, List.of("orders"));
             assertThat(store.publishPhysicalSelection(CHAIN, orders)).isTrue();
-            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
+            assertThat(store.physicalPrefixTrusted(CHAIN))
+                    .as("publishing a table list does not prove where its source read begins")
+                    .isFalse();
             assertThat(store.establishPhysicalAnchor(CHAIN,
                     new ChainPosition(new SourceOrder(first, -1L), "first-safe-start"))).isTrue();
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
             assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("first-safe-start");
             assertThat(store.physicalSelection(CHAIN)).contains(orders);
             assertThat(store.publishPhysicalSelection(CHAIN, orders)).isTrue();
@@ -185,6 +188,38 @@ class MongoSrsMetaStoreIT {
             assertThat(store.publishPhysicalSelection(CHAIN, union)).isTrue();
             assertThat(store.physicalSelection(CHAIN)).contains(
                     new PhysicalSelection(second, List.of("customers", "orders")));
+        });
+    }
+
+    @Test
+    void aPendingTableRequestRequiresAnOrderedPhysicalSubscriptionReplacement() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            PhysicalSelection orders = new PhysicalSelection(epoch, List.of("orders"));
+            assertThat(store.publishPhysicalSelection(CHAIN, orders)).isTrue();
+            assertThat(store.requestPhysicalTables(CHAIN, epoch, List.of("customers"))).isTrue();
+            assertThat(store.requestedPhysicalTables(CHAIN)).containsExactly("customers");
+            assertThat(store.publishPhysicalSelection(CHAIN, orders))
+                    .as("the old table set cannot be republished over a pending new request")
+                    .isFalse();
+
+            PhysicalSelection expanded = new PhysicalSelection(epoch, 2L, List.of("orders", "customers"));
+            assertThat(store.replacePhysicalSelection(CHAIN, orders, expanded)).isTrue();
+            assertThat(store.physicalSelection(CHAIN)).contains(expanded);
+            assertThat(store.replacePhysicalSelection(CHAIN, orders,
+                    new PhysicalSelection(epoch, 2L, List.of("orders", "customers", "items"))))
+                    .as("a stale physical owner cannot overwrite the replacement")
+                    .isFalse();
+            store.clearPhysicalRequests(CHAIN, epoch, expanded.tables());
+            assertThat(store.requestedPhysicalTables(CHAIN)).isEmpty();
+
+            long next = store.openEpoch(CHAIN);
+            assertThat(store.requestPhysicalTables(CHAIN, epoch, List.of("items")))
+                    .as("an old attachment cannot request a table in the next ring generation")
+                    .isFalse();
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new PhysicalSelection(next, List.of("orders", "customers")))).isTrue();
         });
     }
 

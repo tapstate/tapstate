@@ -62,6 +62,18 @@ class CaptureIdTest {
         assertThat(CaptureId.of(cdc)).isEqualTo(CaptureId.of(snapshotAndCdc));
     }
 
+    @Test
+    void twoSnapshotOnlyPipelinesDoNotShareAClosableCaptureHandle() {
+        CaptureConfig config = new CaptureConfig("mysql", Map.of("host", "db.internal"), List.of("orders"));
+        CaptureRunSpec first = new CaptureRunSpec(config, ReadMode.SNAPSHOT_ONLY, null, true,
+                "source", "pipeline-a", StartFrom.latest(), null, 0L);
+        CaptureRunSpec second = new CaptureRunSpec(config, ReadMode.SNAPSHOT_ONLY, null, true,
+                "source", "pipeline-b", StartFrom.latest(), null, 0L);
+
+        assertThat(CaptureId.of(first)).as("stopping one bounded read cannot own the other's close handle")
+                .isNotEqualTo(CaptureId.of(second));
+    }
+
     /**
      * Two pipelines reading one source directly are two captures, however alike their reads.
      *

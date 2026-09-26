@@ -11,4 +11,9 @@ import java.util.function.Consumer;
 interface CaptureAttacher {
 
     CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> passthrough, boolean startTail);
+
+    /** Replaces only the physical tail while keeping every attached pipeline's live ring reader. */
+    default CaptureRun reopenPhysicalTail(CaptureRunSpec spec, CaptureRun previous) {
+        throw new UnsupportedOperationException("physical capture expansion is unavailable");
+    }
 }

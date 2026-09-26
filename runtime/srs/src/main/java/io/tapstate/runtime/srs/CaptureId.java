@@ -12,11 +12,11 @@ import java.util.Objects;
  * Stable identity of one normalized source/read contract, shared by every pipeline using it.
  * Pipeline/source node identity is deliberately excluded. A shared-ring tail is owned once per physical
  * mining chain, regardless of each pipeline's selected table subset; snapshot-only and direct reads still
- * include their selected streams because those reads belong to their own contracts.
+ * include their selected streams and node identity because those reads belong to their own pipelines.
  *
- * <p>The one read no two pipelines can share is a direct tail -- one with the shared ring switched off --
- * which streams to the pipeline that opened it and writes nothing anybody else could read. Its identity
- * therefore names that pipeline and source as well, so each such pipeline holds a capture of its own.
+ * <p>A direct tail streams only to the pipeline that opened it, and a snapshot carries that pipeline's
+ * own bounded rows. Their identities therefore name the pipeline and source; only the ring-backed CDC
+ * tail has an output that another pipeline can attach to.
  */
 public record CaptureId(String value) {
 
@@ -37,15 +37,19 @@ public record CaptureId(String value) {
     public static CaptureId of(CaptureRunSpec spec) {
         Objects.requireNonNull(spec, "spec");
         if (spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
-            return of(spec.config(), spec.srsKey(), "snapshot", true);
+            return of(spec.config(), spec.srsKey(), "snapshot:" + nodeIdentity(spec), true);
         }
         if (spec.srsEnabled()) {
             return of(spec.config(), spec.srsKey(), "tail:ring", false);
         }
+        return of(spec.config(), spec.srsKey(), "tail:direct:" + directStart(spec.startFrom())
+                + '|' + nodeIdentity(spec), true);
+    }
+
+    private static String nodeIdentity(CaptureRunSpec spec) {
         String reader = Objects.requireNonNull(spec.pipelineId(), "spec.pipelineId");
         String source = Objects.requireNonNull(spec.sourceId(), "spec.sourceId");
-        return of(spec.config(), spec.srsKey(), "tail:direct:" + directStart(spec.startFrom())
-                + '|' + reader.length() + ':' + reader + '|' + source.length() + ':' + source, true);
+        return reader.length() + ":" + reader + '|' + source.length() + ':' + source;
     }
 
     private static String directStart(StartFrom startFrom) {

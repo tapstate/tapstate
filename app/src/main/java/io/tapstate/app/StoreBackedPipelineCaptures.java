@@ -24,8 +24,9 @@ import java.util.Optional;
  * The capture identities a pipeline reads through, worked out from what is stored.
  *
  * <p>Derived rather than asked of whoever is running the pipeline, and that is the point of it. A
- * capture's identity is a function of the source contract -- connector settings, the streams the pipeline
- * reads, the read axis -- so every member computes the same ids from the same artifacts, and the read face
+ * capture's identity is a function of the source contract and read axis. A ring-backed tail is identified
+ * by its physical mining chain, while direct and bounded reads also name their own node and streams. Every
+ * member computes the same ids from the same artifacts, and the read face
  * answers the same on a member that is running nothing. Asking the running member instead would give an answer
  * only that member could give, over a face whose whole promise is that any node answers.
  *
@@ -83,8 +84,9 @@ final class StoreBackedPipelineCaptures implements PipelineCaptures {
             if (source.isEmpty() || !(source.get() instanceof SourceResource resolved)) {
                 continue;
             }
-            // Narrowed to the tables the pipeline addresses, as its start narrows them: the id covers the
-            // streams a capture reads, so the whole source's tables would name a claim nobody took.
+            // Narrowed to the tables the pipeline addresses, as its start narrows them. Direct and bounded
+            // capture identities include this selection; a ring-backed CDC identity shares the physical
+            // chain while its attachment still keeps this pipeline's selected tables.
             Optional<SourceCaptureResolution> selected;
             try {
                 selected = SourceCaptureResolution.forPipeline(pipeline, resolved, reads.discovery(resolved));

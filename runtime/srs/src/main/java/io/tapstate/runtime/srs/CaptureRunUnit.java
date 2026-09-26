@@ -274,7 +274,7 @@ public final class CaptureRunUnit {
                             Optional.of(chainId), merged, snapshotCount, snapshotCounts,
                             ringSource, Optional.empty(), health);
                 }
-                subscription = Optional.of(startSharedTail(spec, chainId, ringEpoch, ownSeam, tables, health));
+                subscription = Optional.of(startSharedTail(spec, chainId, ringEpoch, ownSeam, tables, health, false));
             } else if (plan.directTail() && startTail) {
                 // srs.enabled:false: the tail streams straight to the consumer with no shared ring. The ring
                 // is the whole of what the flag decides -- the chain is open and its record is kept either
@@ -309,10 +309,45 @@ public final class CaptureRunUnit {
         }
     }
 
+    /** Stops the old physical subscription before opening an expanded one over the same live ring. */
+    public CaptureRun reopenPhysicalTail(CaptureRunSpec spec, CaptureRun previous) {
+        Objects.requireNonNull(spec, "spec");
+        Objects.requireNonNull(previous, "previous");
+        if (!spec.srsEnabled() || spec.readMode() == io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY) {
+            throw new IllegalArgumentException("only a shared CDC tail can expand its physical selection");
+        }
+        MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+        if (!previous.chainId().equals(Optional.of(chainId)) || previous.cdcSubscription().isEmpty()) {
+            throw new IllegalArgumentException("physical tail replacement needs the matching live capture");
+        }
+        SrsMeta record = meta.read(chainId.value()).orElseThrow();
+        SrsMetaStore.PhysicalSelection current = meta.physicalSelection(chainId.value()).orElseThrow();
+        if (current.epoch() != record.epoch() || record.sourceReadOffset() == null) {
+            throw new TapstateException(CaptureError.RESUME_ANCHOR_UNAVAILABLE,
+                    Map.of("chain", chainId.value()), null);
+        }
+        LinkedHashSet<String> needed = new LinkedHashSet<>(current.tables());
+        needed.addAll(meta.requestedPhysicalTables(chainId.value()));
+        if (needed.size() == current.tables().size()) {
+            return previous;
+        }
+        previous.close();
+        Subscription replacement = startSharedTail(spec, chainId, record.epoch(), null,
+                spec.config().streams(), previous.health(), true);
+        return new CaptureRun(previous.chainId(), previous.merged(), previous.snapshotCount(),
+                previous.snapshotCounts(), previous.ringSource(), Optional.of(replacement), previous.health());
+    }
+
     private Subscription startSharedTail(CaptureRunSpec spec, MiningChainId chainId, long epoch,
-            String ownSeam, List<String> tables, CaptureHealth health) {
+            String ownSeam, List<String> tables, CaptureHealth health, boolean replacing) {
         String cid = chainId.value();
         LinkedHashSet<String> union = new LinkedHashSet<>(tables);
+        SrsMetaStore.PhysicalSelection current = meta.physicalSelection(cid).orElse(null);
+        if (current != null && current.epoch() == epoch) {
+            union.addAll(current.tables());
+        }
+        List<String> requested = meta.requestedPhysicalTables(cid);
+        union.addAll(requested);
         for (ConsumerOffset consumer : meta.consumerOffsets(cid)) {
             if (consumer.selectedTables() != null) {
                 union.addAll(consumer.selectedTables());
@@ -340,7 +375,8 @@ public final class CaptureRunUnit {
         refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
         PhysicalSourcePrefix prefix = physicalTables.size() > 1
                 ? new PhysicalSourcePrefix(meta, cid, epoch, health) : null;
-        if (!meta.publishPhysicalSelection(cid, new SrsMetaStore.PhysicalSelection(epoch, physicalTables))) {
+        if (current != null && current.epoch() == epoch
+                && !current.tables().equals(physicalTables) && !replacing) {
             if (prefix != null) {
                 prefix.close();
             }
@@ -349,6 +385,15 @@ public final class CaptureRunUnit {
         }
         CaptureConfig physicalConfig = new CaptureConfig(spec.config().connectorId(),
                 spec.config().settings(), physicalTables, spec.config().node());
+        SrsMeta stored = meta.read(cid).orElseThrow();
+        if (stored.epoch() != epoch || (physicalTables.size() == 1 && stored.sourceRead() == null
+                && epoch > 1 && !meta.physicalPrefixTrusted(cid))) {
+            if (prefix != null) {
+                prefix.close();
+            }
+            throw new TapstateException(CaptureError.SHARED_POSITION_UNVERIFIED,
+                    Map.of("chain", cid), null);
+        }
         Consumer<Optional<SourcePosition>> singleTableAnchor = physicalTables.size() == 1
                 ? start -> {
                     String token = start.map(SourcePosition::token).orElseThrow(() ->
@@ -361,7 +406,35 @@ public final class CaptureRunUnit {
                                 Map.of("chain", cid), null);
                     }
                 } : null;
-        return CdcPhase.run(port, physicalConfig, minerStart, routes, health, prefix, singleTableAnchor);
+        Subscription source = CdcPhase.run(port, physicalConfig, minerStart, routes, health, prefix,
+                singleTableAnchor);
+        try {
+            boolean published;
+            if (current != null && current.epoch() == epoch) {
+                published = current.tables().equals(physicalTables)
+                        || meta.replacePhysicalSelection(cid, current,
+                                new SrsMetaStore.PhysicalSelection(
+                                        epoch, Math.addExact(current.revision(), 1L), physicalTables));
+            } else {
+                published = meta.publishPhysicalSelection(cid,
+                        new SrsMetaStore.PhysicalSelection(epoch, physicalTables));
+            }
+            if (!published) {
+                throw new TapstateException(CaptureError.SHARED_SELECTION_RESTART_REQUIRED,
+                        Map.of("chain", cid), null);
+            }
+            if (!requested.isEmpty()) {
+                meta.clearPhysicalRequests(cid, epoch, physicalTables);
+            }
+            return source;
+        } catch (RuntimeException | Error failure) {
+            try {
+                source.close();
+            } catch (RuntimeException unclosed) {
+                failure.addSuppressed(unclosed);
+            }
+            throw failure;
+        }
     }
 
     private CaptureRun startDeferredSnapshot(CaptureRunSpec spec, Consumer<Envelope> passthrough,
@@ -418,7 +491,7 @@ public final class CaptureRunUnit {
                     snapshotBuffer.completeSnapshot(spec.pipelineId(), ringName, token);
                 }
                 if (plan.sharedRing() && startTail) {
-                    deferred.attach(startSharedTail(spec, chainId, epoch, ownSeam, tables, health));
+                    deferred.attach(startSharedTail(spec, chainId, epoch, ownSeam, tables, health, false));
                 } else if (plan.directTail() && startTail) {
                     deferred.attach(startDirectTail(spec, chainId, epoch, ownSeam, health, passthrough));
                 }

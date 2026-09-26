@@ -176,7 +176,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public Optional<PhysicalSelection> physicalSelection(String miningChainId) {
         Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
-                .projection(Projections.include("physicalCaptureEpoch", "physicalCaptureTables")).first());
+                .projection(Projections.include(
+                        "physicalCaptureEpoch", "physicalCaptureRevision", "physicalCaptureTables")).first());
         if (root == null || (!root.containsKey("physicalCaptureEpoch")
                 && !root.containsKey("physicalCaptureTables"))) {
             return Optional.empty();
@@ -188,38 +189,124 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                     Map.of("id", miningChainId, "field", "physicalCaptureTables"), null);
         }
-        return Optional.of(new PhysicalSelection(epoch.longValue(), tables.stream()
+        Object rawRevision = root.get("physicalCaptureRevision");
+        if (rawRevision != null && !(rawRevision instanceof Number)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", miningChainId, "field", "physicalCaptureRevision"), null);
+        }
+        long revision = rawRevision == null ? 1L : ((Number) rawRevision).longValue();
+        return Optional.of(new PhysicalSelection(epoch.longValue(), revision, tables.stream()
                 .map(String.class::cast).toList()));
     }
 
     @Override
     public boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
         Objects.requireNonNull(selection, "selection");
+        if (selection.revision() != 1L) {
+            throw new IllegalArgumentException("a newly opened ring starts at physical capture revision one");
+        }
         List<String> tables = selection.tables().stream().distinct().sorted().toList();
+        Document sameSelection = new Document("physicalCaptureEpoch", selection.epoch())
+                .append("physicalCaptureTables", tables)
+                .append("$or", List.of(
+                        new Document("physicalCaptureRevision", new Document("$exists", false)),
+                        new Document("physicalCaptureRevision", 1L)));
         Document filter = new Document("_id", miningChainId)
                 .append("epoch", selection.epoch())
+                .append("$expr", new Document("$setIsSubset", List.of(
+                        new Document("$ifNull", List.of("$physicalCaptureRequested", List.of())), tables)))
                 .append("$or", List.of(
                         new Document("physicalCaptureEpoch", new Document("$exists", false)),
                         new Document("physicalCaptureEpoch", new Document("$lt", selection.epoch())),
-                        new Document("physicalCaptureEpoch", selection.epoch())
-                                .append("physicalCaptureTables", tables)));
+                        sameSelection));
         Document fields = new Document("physicalCaptureEpoch", selection.epoch())
+                .append("physicalCaptureRevision", 1L)
                 .append("physicalCaptureTables", tables);
-        if (tables.size() == 1) {
-            Document fresh = new Document(filter).append("sourceReadOffset", new Document("$exists", false));
-            long seeded = StoreIo.call(() -> collection.updateOne(fresh,
-                    new Document("$set", new Document(fields).append("physicalPrefixTrusted", true)))
-                    .getMatchedCount());
-            if (seeded == 1) {
-                return true;
-            }
-        }
         long matched = StoreIo.call(() -> collection.updateOne(filter,
                 new Document("$set", fields)).getMatchedCount());
         if (matched == 0) {
             requireSeeded(miningChainId);
         }
         return matched == 1;
+    }
+
+    @Override
+    public List<String> requestedPhysicalTables(String miningChainId) {
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("physicalCaptureRequested")).first());
+        if (root == null || !root.containsKey("physicalCaptureRequested")) {
+            return List.of();
+        }
+        Object raw = root.get("physicalCaptureRequested");
+        if (!(raw instanceof List<?> tables) || tables.stream().anyMatch(table -> !(table instanceof String))) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", miningChainId, "field", "physicalCaptureRequested"), null);
+        }
+        return tables.stream().map(String.class::cast).distinct().sorted().toList();
+    }
+
+    @Override
+    public boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+        Objects.requireNonNull(tables, "tables");
+        if (epoch < 1 || tables.isEmpty() || tables.stream().anyMatch(table -> table == null || table.isBlank())) {
+            throw new IllegalArgumentException("physical capture expansion requires an open generation and tables");
+        }
+        long matched = StoreIo.call(() -> collection.updateOne(
+                new Document("_id", miningChainId).append("epoch", epoch),
+                new Document("$addToSet", new Document("physicalCaptureRequested",
+                        new Document("$each", tables.stream().distinct().sorted().toList()))))
+                .getMatchedCount());
+        if (matched == 0) {
+            requireSeeded(miningChainId);
+        }
+        return matched == 1;
+    }
+
+    @Override
+    public boolean replacePhysicalSelection(
+            String miningChainId, PhysicalSelection expected, PhysicalSelection replacement) {
+        Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(replacement, "replacement");
+        if (expected.epoch() != replacement.epoch()
+                || replacement.revision() != expected.revision() + 1
+                || !replacement.tables().containsAll(expected.tables())) {
+            throw new IllegalArgumentException("a physical subscription replacement must expand the current selection");
+        }
+        Document filter = new Document("_id", miningChainId)
+                .append("epoch", expected.epoch())
+                .append("physicalCaptureEpoch", expected.epoch())
+                .append("physicalCaptureTables", expected.tables())
+                .append("$expr", new Document("$setIsSubset", List.of(
+                        new Document("$ifNull", List.of("$physicalCaptureRequested", List.of())),
+                        replacement.tables())));
+        if (expected.revision() == 1L) {
+            filter.append("$or", List.of(
+                    new Document("physicalCaptureRevision", new Document("$exists", false)),
+                    new Document("physicalCaptureRevision", 1L)));
+        } else {
+            filter.append("physicalCaptureRevision", expected.revision());
+        }
+        long matched = StoreIo.call(() -> collection.updateOne(filter,
+                new Document("$set", new Document("physicalCaptureRevision", replacement.revision())
+                        .append("physicalCaptureTables", replacement.tables()))).getMatchedCount());
+        if (matched == 0) {
+            requireSeeded(miningChainId);
+        }
+        return matched == 1;
+    }
+
+    @Override
+    public void clearPhysicalRequests(String miningChainId, long epoch, List<String> tables) {
+        if (tables.isEmpty()) {
+            return;
+        }
+        long matched = StoreIo.call(() -> collection.updateOne(
+                new Document("_id", miningChainId).append("epoch", epoch),
+                new Document("$pullAll", new Document("physicalCaptureRequested", tables)))
+                .getMatchedCount());
+        if (matched == 0) {
+            requireSeeded(miningChainId);
+        }
     }
 
     @Override
