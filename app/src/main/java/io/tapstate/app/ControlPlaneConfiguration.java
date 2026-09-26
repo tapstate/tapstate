@@ -587,6 +587,11 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    LifecyclePendingRegistry lifecyclePendingRegistry() {
+        return new LifecyclePendingRegistry();
+    }
+
+    @Bean
     CurrentObservationReader currentObservationReader(StorePort storePort, ClusterProperties cluster,
             ClusterIdentityStore clusterIdentities) {
         String clusterId = cluster.getProfile() == ClusterProperties.Profile.SINGLE
@@ -615,10 +620,11 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineExplainService pipelineExplainService(
-            ArtifactQueryService artifactQueryService, CurrentObservationReader observations, Clock clock) {
+            ArtifactQueryService artifactQueryService, CurrentObservationReader observations, Clock clock,
+            LifecyclePendingRegistry pending) {
         ExplanationCatalog messages = ExplanationCatalog.bundled();
         return new PipelineExplainService(
-                artifactQueryService, observations, clock, messages::render);
+                artifactQueryService, observations, clock, messages::render, pending::pending);
     }
 
     /**

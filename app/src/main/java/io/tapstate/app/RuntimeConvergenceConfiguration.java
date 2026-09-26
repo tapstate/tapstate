@@ -157,10 +157,10 @@ class RuntimeConvergenceConfiguration {
             RateSampler rateSampler, MetricsExport metricsExport,
             ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership,
             LifecycleWorkDispatcher lifecycleWorkDispatcher, ObservationScopeRegistry observationScopes,
-            TelemetryDispatcher telemetryWork) {
+            TelemetryDispatcher telemetryWork, LifecyclePendingRegistry pendingWork) {
         return new ConvergenceDriver(
                 pipelineConverger, storePort.desired(), observationPublisher, rateSampler, metricsExport,
                 membershipGate::businessEligible, pipelineActuationOwnership, lifecycleWorkDispatcher,
-                observationScopes, telemetryWork);
+                observationScopes, telemetryWork, pendingWork);
     }
 }

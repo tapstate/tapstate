@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.control.core.PipelineExplanation.PendingReason;
 import io.tapstate.runtime.scheduler.ConvergeResult;
 import io.tapstate.runtime.scheduler.ConvergeStatus;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
@@ -39,6 +41,7 @@ final class ConvergenceDriver {
     private final LifecycleWorkDispatcher lifecycleWork;
     private final ObservationScopeRegistry observationScopes;
     private final TelemetryDispatcher telemetryWork;
+    private final LifecyclePendingRegistry pendingWork;
 
     // Consecutive failed-reconcile passes per pipeline, so a pipeline that keeps throwing surfaces as a
     // climbing errorCount rather than an empty read face. Reconcile runs on a single scheduler thread with a
@@ -106,6 +109,15 @@ final class ConvergenceDriver {
             RateSampler sampler, MetricsExport export, BooleanSupplier businessEligible,
             PipelineActuationOwnership actuation, LifecycleWorkDispatcher lifecycleWork,
             ObservationScopeRegistry observationScopes, TelemetryDispatcher telemetryWork) {
+        this(converger, desired, publisher, sampler, export, businessEligible, actuation, lifecycleWork,
+                observationScopes, telemetryWork, null);
+    }
+
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            RateSampler sampler, MetricsExport export, BooleanSupplier businessEligible,
+            PipelineActuationOwnership actuation, LifecycleWorkDispatcher lifecycleWork,
+            ObservationScopeRegistry observationScopes, TelemetryDispatcher telemetryWork,
+            LifecyclePendingRegistry pendingWork) {
         this.converger = converger;
         this.desired = desired;
         this.publisher = publisher;
@@ -116,12 +128,16 @@ final class ConvergenceDriver {
         this.lifecycleWork = lifecycleWork;
         this.observationScopes = observationScopes;
         this.telemetryWork = telemetryWork;
+        this.pendingWork = pendingWork;
     }
 
     @Scheduled(fixedDelayString = "${tapstate.converge.interval-ms:1000}")
     void reconcile() {
         if (!businessEligible.getAsBoolean()) {
             lifecycleWork.cancelAll();
+            if (pendingWork != null) {
+                pendingWork.clearAll();
+            }
             return;
         }
         List<String> pipelineIds = desired.pipelineIds();
@@ -150,23 +166,36 @@ final class ConvergenceDriver {
                     // starts one in -- and publishing here would overwrite the driver's observation with
                     // this member's own run statistics, which are absent because the run is not here.
                     lifecycleWork.cancel(pipelineId);
+                    if (pendingWork != null) {
+                        pendingWork.clear(pipelineId);
+                    }
                     continue;
                 }
                 LifecycleWorkDispatcher.Outcome completed = lifecycleWork.take(pipelineId);
+                if (completed != null && pendingWork != null) {
+                    pendingWork.clear(pipelineId);
+                }
                 if (completed == null || completed.superseded()) {
                     DesiredState intent = desired.read(pipelineId).orElse(null);
                     if (intent == null) {
                         lifecycleWork.cancel(pipelineId);
+                        if (pendingWork != null) {
+                            pendingWork.clear(pipelineId);
+                        }
                         continue;
                     }
                     LifecycleWorkDispatcher.Submission submission = lifecycleWork.offer(
                             pipelineId, intent, () -> converger.converge(pipelineId));
+                    notePending(pipelineId, intent, submission);
                     if (submission == LifecycleWorkDispatcher.Submission.CAPACITY) {
                         LOG.debug("Lifecycle work for pipeline {} is waiting for dispatcher capacity", pipelineId);
                     }
                     // Inline fixtures finish now; a real worker normally leaves this empty until a later
                     // tick. In both cases the same result path publishes the reconciled state.
                     completed = lifecycleWork.take(pipelineId);
+                    if (completed != null && pendingWork != null) {
+                        pendingWork.clear(pipelineId);
+                    }
                 }
                 ObservationFailure failure = null;
                 if (completed != null && completed.failure() != null) {
@@ -200,6 +229,9 @@ final class ConvergenceDriver {
                     reconcileFailures.remove(pipelineId);
                 }
             } catch (RuntimeException e) {
+                if (pendingWork != null) {
+                    pendingWork.clear(pipelineId);
+                }
                 // A pass that keeps throwing never reaches publish(), so the read face would stay empty and a
                 // permanently broken pipeline would look identical to a slow one. Count the consecutive
                 // failures and publish them as an error observation so the failure is observable, not just
@@ -239,6 +271,9 @@ final class ConvergenceDriver {
         // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
         lifecycleWork.retain(pipelineIds);
+        if (pendingWork != null) {
+            pendingWork.retain(pipelineIds);
+        }
         // Same for the claims: a pipeline that is gone still has this member named as its driver until the
         // lease runs out, which delays nothing but reads as an owner over something that no longer exists.
         actuation.retain(pipelineIds);
@@ -253,6 +288,21 @@ final class ConvergenceDriver {
             sampler.forgetPipelinesOutside(pipelineIds);
         }
         export.forgetPipelinesOutside(pipelineIds);
+    }
+
+    private void notePending(String pipelineId, DesiredState intent, LifecycleWorkDispatcher.Submission submission) {
+        if (pendingWork == null) {
+            return;
+        }
+        if (intent.targetState() == PipelineState.RUNNING) {
+            pendingWork.put(pipelineId, submission == LifecycleWorkDispatcher.Submission.CAPACITY
+                    ? PendingReason.START_CAPACITY : PendingReason.START_PENDING);
+        } else if (intent.targetState() == PipelineState.STOPPED) {
+            pendingWork.put(pipelineId, submission == LifecycleWorkDispatcher.Submission.CAPACITY
+                    ? PendingReason.STOP_CAPACITY : PendingReason.STOP_PENDING);
+        } else {
+            pendingWork.clear(pipelineId);
+        }
     }
 
     private Optional<io.tapstate.core.lifecycle.Observation> publish(String pipelineId, ObservationFailure failure) {

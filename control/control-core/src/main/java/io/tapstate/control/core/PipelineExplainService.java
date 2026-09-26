@@ -6,6 +6,7 @@ import io.tapstate.control.core.PipelineExplanation.Freshness;
 import io.tapstate.control.core.PipelineExplanation.Kind;
 import io.tapstate.control.core.PipelineExplanation.Next;
 import io.tapstate.control.core.PipelineExplanation.NextAction;
+import io.tapstate.control.core.PipelineExplanation.Pending;
 import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
@@ -42,29 +43,43 @@ public final class PipelineExplainService {
     private final Function<String, Optional<Observation>> observations;
     private final Clock clock;
     private final ExplanationMessages messages;
+    private final Function<String, Optional<Pending>> pending;
 
     public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
             Clock clock, ExplanationMessages messages) {
-        this(artifacts, observations::read, clock, messages);
+        this(artifacts, observations::read, clock, messages, id -> Optional.empty());
+    }
+
+    public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
+            Clock clock, ExplanationMessages messages, Function<String, Optional<Pending>> pending) {
+        this(artifacts, observations::read, clock, messages, pending);
     }
 
     public PipelineExplainService(ArtifactQueryService artifacts, CurrentObservationReader observations,
             Clock clock, ExplanationMessages messages) {
-        this(artifacts, observations::read, clock, messages);
+        this(artifacts, observations::read, clock, messages, id -> Optional.empty());
+    }
+
+    public PipelineExplainService(ArtifactQueryService artifacts, CurrentObservationReader observations,
+            Clock clock, ExplanationMessages messages, Function<String, Optional<Pending>> pending) {
+        this(artifacts, observations::read, clock, messages, pending);
     }
 
     private PipelineExplainService(ArtifactQueryService artifacts,
-            Function<String, Optional<Observation>> observations, Clock clock, ExplanationMessages messages) {
+            Function<String, Optional<Observation>> observations, Clock clock, ExplanationMessages messages,
+            Function<String, Optional<Pending>> pending) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.messages = Objects.requireNonNull(messages, "messages");
+        this.pending = Objects.requireNonNull(pending, "pending");
     }
 
     /** Reads one observation once and applies the fixed first-match checklist without writing it back. */
     public PipelineExplanation explain(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation observation = observations.apply(pipelineId).orElseThrow(() -> unobserved(pipelineId));
+        Pending lifecyclePending = pending.apply(pipelineId).orElse(null);
         Time time = time(observation.observedAt());
         Facts facts = facts(observation);
 
@@ -73,7 +88,7 @@ public final class PipelineExplainService {
                     text("explain.observation-stale", Map.of("age", human(time.ageMillis()))),
                     List.of(evidence(Source.STATUS, "observedAgeMillis", time.ageMillis())),
                     List.of(text("explain.cannot-current-now", Map.of())),
-                    next(NextAction.CHECK_SERVER, "explain.next-check-server", Map.of()));
+                    next(NextAction.CHECK_SERVER, "explain.next-check-server", Map.of()), lifecyclePending);
         }
         if (observation.failure() != null) {
             ObservationFailure found = observation.failure();
@@ -83,7 +98,7 @@ public final class PipelineExplainService {
                     text("explain.coded-failure", Map.of("code", found.code())),
                     List.of(evidence(Source.STATUS, "failure", failure)), List.of(),
                     next(NextAction.OPEN_PIPELINE_LOGS, "explain.next-open-logs",
-                            Map.of("pipeline", pipelineId)));
+                            Map.of("pipeline", pipelineId)), lifecyclePending);
         }
         if (facts.reconcileFailures() != null && facts.reconcileFailures() > 0
                 && converging(observation.state())) {
@@ -93,7 +108,7 @@ public final class PipelineExplainService {
                             evidence(Source.METRICS, RECONCILE_STREAK, facts.reconcileFailures()),
                             evidence(Source.STATUS, "state", observation.state())),
                     List.of(text("explain.cannot-job-alive", Map.of("state", lower(observation.state())))),
-                    next(NextAction.CHECK_SERVER, "explain.next-check-server", Map.of()));
+                    next(NextAction.CHECK_SERVER, "explain.next-check-server", Map.of()), lifecyclePending);
         }
         if (converging(observation.state())
                 && (facts.recordCount() == null || facts.recordCount() == 0)
@@ -105,7 +120,7 @@ public final class PipelineExplainService {
                             evidence(Source.SNAPSHOT, "rowsDone", facts.snapshotRowsDone())),
                     List.of(text("explain.cannot-source-head", Map.of())),
                     next(NextAction.OPEN_PIPELINE_LOGS, "explain.next-open-logs",
-                            Map.of("pipeline", pipelineId)));
+                            Map.of("pipeline", pipelineId)), lifecyclePending);
         }
         if (!facts.stalledChains().isEmpty()) {
             List<Evidence> evidence = facts.stalledChains().entrySet().stream()
@@ -116,7 +131,7 @@ public final class PipelineExplainService {
                     text("explain.frontier-stalled",
                             Map.of("chains", String.join(", ", facts.stalledChains().keySet()))),
                     evidence, List.of(),
-                    next(NextAction.CHECK_TARGET, "explain.next-check-target", Map.of()));
+                    next(NextAction.CHECK_TARGET, "explain.next-check-target", Map.of()), lifecyclePending);
         }
 
         List<Evidence> evidence = List.of(
@@ -136,13 +151,14 @@ public final class PipelineExplainService {
         }
         cannotSay.add(text("explain.cannot-snapshot-phase", Map.of()));
         return answer(observation, time, Kind.NO_MATCH, text("explain.no-match", Map.of()),
-                evidence, cannotSay, null);
+                evidence, cannotSay, null, lifecyclePending);
     }
 
     private PipelineExplanation answer(Observation observation, Time time, Kind kind, String message,
-            List<Evidence> evidence, List<String> cannotSay, Next next) {
+            List<Evidence> evidence, List<String> cannotSay, Next next, Pending lifecyclePending) {
         return new PipelineExplanation(observation.pipelineId(), observation.state(), kind, message,
-                observation.observedAt(), time.ageMillis(), time.freshness(), evidence, cannotSay, next, null);
+                observation.observedAt(), time.ageMillis(), time.freshness(), evidence, cannotSay, next,
+                lifecyclePending);
     }
 
     private Facts facts(Observation observation) {

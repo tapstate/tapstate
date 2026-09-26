@@ -5,6 +5,8 @@ import io.tapstate.control.core.PipelineExplanation.Failure;
 import io.tapstate.control.core.PipelineExplanation.Freshness;
 import io.tapstate.control.core.PipelineExplanation.Kind;
 import io.tapstate.control.core.PipelineExplanation.NextAction;
+import io.tapstate.control.core.PipelineExplanation.Pending;
+import io.tapstate.control.core.PipelineExplanation.PendingReason;
 import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
@@ -30,6 +32,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 class PipelineExplainServiceTest {
+
+    @Test
+    void existingObservationCanCarryCapacityWaitingWithoutChangingItsActualState() {
+        Observation latest = observation(PipelineState.RUNNING, Map.of("recordCount", 7L), 3,
+                NOW.minusSeconds(2));
+        PipelineExplainService explain = new PipelineExplainService(
+                artifacts(ID), observations(latest), Clock.fixed(NOW, ZoneOffset.UTC),
+                (key, args) -> key, id -> Optional.of(new Pending(PendingReason.START_CAPACITY)));
+
+        PipelineExplanation answer = explain.explain(ID);
+
+        assertThat(answer.state()).isEqualTo(PipelineState.RUNNING);
+        assertThat(answer.pending()).isEqualTo(new Pending(PendingReason.START_CAPACITY));
+
+        PipelineExplainService withoutObservation = new PipelineExplainService(
+                artifacts(ID), observations(), Clock.fixed(NOW, ZoneOffset.UTC),
+                (key, args) -> key, id -> Optional.of(new Pending(PendingReason.START_CAPACITY)));
+        TapstateException absent = catchThrowableOfType(
+                () -> withoutObservation.explain(ID), TapstateException.class);
+        assertThat(absent.code()).isEqualTo(MonitorError.NO_OBSERVATION);
+    }
 
     private static final String ID = "orders";
     private static final Instant NOW = Instant.parse("2026-09-21T12:00:00Z");

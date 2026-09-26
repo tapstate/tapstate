@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.control.core.PipelineExplanation.PendingReason;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
@@ -41,6 +42,59 @@ import static org.assertj.core.api.Assertions.entry;
  * rest of the pass.
  */
 class ConvergenceDriverTest {
+
+    @Test
+    void acceptedWorkAndCapacityWaitingHaveDistinctPendingReasonsWithoutFabricatingActualState()
+            throws Exception {
+        CountDownLatch slowEntered = new CountDownLatch(1);
+        CountDownLatch releaseSlow = new CountDownLatch(1);
+        LifecycleActuator blocking = new LifecycleActuator() {
+            @Override public void start(String id) {
+                if (!id.equals("slow")) {
+                    return;
+                }
+                slowEntered.countDown();
+                try {
+                    if (!releaseSlow.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("slow start was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+            }
+            @Override public void pause(String id) { }
+            @Override public void resume(String id) { }
+            @Override public void stop(String id, boolean purgeState) { }
+            @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String id) { return true; }
+        };
+        desired.save(new DesiredState("slow", RUNNING, "rev-1"));
+        desired.save(new DesiredState("queued", RUNNING, "rev-1"));
+        desired.save(new DesiredState("wait", RUNNING, "rev-1"));
+        desired.save(new DesiredState("stop", STOPPED, "rev-1"));
+        PipelineConverger loop = new PipelineConverger(desired, state, blocking,
+                Clock.fixed(T0, ZoneOffset.UTC));
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(1, 1)) {
+            ConvergenceDriver isolated = new ConvergenceDriver(loop, desired,
+                    new ObservationPublisher(state, observations), null, MetricsExport.none(), () -> true,
+                    PipelineActuationOwnership.single(), work, null, null, pending);
+
+            isolated.reconcile();
+
+            assertThat(slowEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(pending.pending("slow").orElseThrow().reason()).isEqualTo(PendingReason.START_PENDING);
+            assertThat(pending.pending("queued").orElseThrow().reason()).isEqualTo(PendingReason.START_PENDING);
+            assertThat(pending.pending("wait").orElseThrow().reason()).isEqualTo(PendingReason.START_CAPACITY);
+            assertThat(pending.pending("stop").orElseThrow().reason()).isEqualTo(PendingReason.STOP_CAPACITY);
+            assertThat(state.read("wait")).isEmpty();
+            assertThat(observations.read("wait")).isEmpty();
+            releaseSlow.countDown();
+        } finally {
+            releaseSlow.countDown();
+        }
+    }
 
     @Test
     void aMissingPausedJobReachesTheStoreBackedStatusWithItsCodedReason() {
