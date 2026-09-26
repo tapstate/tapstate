@@ -78,6 +78,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     static final String PER_TABLE_RING_DONE = "perTableRingDone";
 
     /**
+     * Per table, the last acked position written for it - its generation, its sequence in the table's ring and
+     * its token: what an ack of that table is compared with before it moves the chain's acked position. Dropped
+     * with the rest of the consumer when its record is rewritten, so a position written back is moved on from
+     * wherever it now stands.
+     */
+    static final String SINK_ACKED_BY_TABLE = "sinkAckedByTable";
+
+    /**
      * How much of a chain's schema history the record retains, in bytes of stored entries.
      *
      * <p>The record is one document, and the endpoint refuses a write whose result passes its 16 MiB
@@ -289,44 +297,42 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     @Override
     public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
-        advanceSinkAcked(miningChainId, pipelineId, position, sinkAckedUpdate(pipelineId, position), null);
-    }
-
-    @Override
-    public void advanceSinkAcked(
-            String miningChainId, String pipelineId, String table, ChainPosition position) {
-        Objects.requireNonNull(table, "table");
-        advanceSinkAcked(miningChainId, pipelineId, position, sinkAckedUpdate(pipelineId, table, position),
-                table);
+        updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, position));
     }
 
     /**
-     * Writes {@code update} while {@code position} is later than the acked position the consumer holds, and
-     * otherwise only what of it only ever rises: {@code table}'s place in its ring.
+     * Writes the whole update while {@code position} is later than the last one written for {@code table}, and
+     * otherwise only the part of it that only ever rises: the table's place in its ring.
      *
-     * <p>Every writer of a sink reports on its own and works the acked position out from what it read back, so
+     * <p>Every writer of a sink reports on its own, working the table's position out from what it read back, so
      * a report worked out before a later one can land after it, carrying the older answer; written, it would
-     * move the position back, and a run replacing this one would start from there. So it is compared with what
-     * is held, in the same transaction as the write - and every write to a chain's consumers takes the chain's
-     * revision first, so two of them never both pass the comparison over the same value.
+     * move the position back, and a run replacing this one would start from there. So it is compared with the
+     * table's last one in the same transaction as the write - and every write to a chain's consumers takes the
+     * chain's revision first, so two of them never both pass the comparison over the same value. Only the
+     * table's own: each table's ring numbers its changes on its own, so one table's position says nothing about
+     * how far another's has got.
      */
-    private void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position,
-            Document update, String table) {
+    @Override
+    public void advanceSinkAcked(
+            String miningChainId, String pipelineId, String table, ChainPosition position) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(position, "position");
         migrateLegacyConsumers(miningChainId, true);
         Document key = consumerKey(miningChainId, pipelineId);
         writeConsumer(miningChainId, session -> {
             Document held = consumers.find(session, key)
-                    .projection(Projections.include("sinkAckedEpoch", "sinkAckedSeq", "sinkAckedSrcpos")).first();
-            ChainPosition acked = held == null ? null : sinkAckedFrom(held);
-            Document write = update;
-            if (acked != null && position.order().compareTo(acked.order()) <= 0) {
-                if (table == null || position.order().seq() < 0) {
-                    return;
-                }
+                    .projection(Projections.include(SINK_ACKED_BY_TABLE + "." + table)).first();
+            SourceOrder last = held == null ? null : tableAckedFrom(held, table);
+            Document write;
+            if (last == null || position.order().compareTo(last) > 0) {
+                write = sinkAckedUpdate(pipelineId, table, position);
+            } else if (position.order().seq() >= 0) {
                 write = new Document("$max",
                         new Document(PER_TABLE_RING_DONE + "." + table, position.order().seq()));
+            } else {
+                return;
             }
             write.append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
             consumers.updateOne(session, key, write, new UpdateOptions().upsert(true));
@@ -528,15 +534,32 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * the same write, so the per-table record can never run ahead of the chain position it came with. A
      * {@code $max} rather than a set: two members confirming at once both write, and the record only ever
      * moves forward. A snapshot row sits at a reserved sequence below every change and is no place in any
-     * ring, so it raises nothing.
+     * ring, so it raises nothing. The order is also kept as the table's last acked one, which the next ack of
+     * the table is compared with.
      */
     static Document sinkAckedUpdate(String pipelineId, String table, ChainPosition position) {
         Objects.requireNonNull(table, "table");
         Document update = sinkAckedUpdate(pipelineId, position);
+        Document last = new Document("epoch", position.order().epoch()).append("ringSeq", position.order().seq());
+        if (position.token() != null) {
+            last.append("token", position.token());
+        }
+        update.get("$set", Document.class).append(SINK_ACKED_BY_TABLE + "." + table, last);
         if (position.order().seq() >= 0) {
             update.append("$max", new Document(PER_TABLE_RING_DONE + "." + table, position.order().seq()));
         }
         return update;
+    }
+
+    /** The order of the last acked position written for {@code table}, or null while none has been. */
+    private static SourceOrder tableAckedFrom(Document document, String table) {
+        Document byTable = document.get(SINK_ACKED_BY_TABLE, Document.class);
+        Document last = byTable == null ? null : byTable.get(table, Document.class);
+        if (last == null || !(last.get("epoch") instanceof Number epoch)
+                || !(last.get("ringSeq") instanceof Number seq)) {
+            return null;
+        }
+        return new SourceOrder(epoch.longValue(), seq.longValue());
     }
 
     @Override

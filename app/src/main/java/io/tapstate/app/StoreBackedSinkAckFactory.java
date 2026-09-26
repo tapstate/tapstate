@@ -342,12 +342,12 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             ChainPosition resumable = now.resumableAt();
             if (resumable != null && (before == null || before.resumableAt() == null
                     || resumable.order().compareTo(before.resumableAt().order()) > 0)) {
-                if (isSnapshotOf(resumable)) {
-                    meta.advanceSinkAcked(miningChainId, pipelineId, resumable);
-                } else {
-                    // Recorded against the table's own ring too, at the sequence the change sat at there, so a
-                    // run replacing this one carries on from it instead of from the head of the ring.
-                    meta.advanceSinkAcked(miningChainId, pipelineId, chain, resumable);
+                // Recorded against the table: a change at the sequence it sat at in the table's own ring, so a
+                // run replacing this one carries on from it instead of from the head of the ring. And every
+                // writer reports on its own, so this may land after a later report of the table's - which the
+                // store, comparing the two, leaves standing.
+                meta.advanceSinkAcked(miningChainId, pipelineId, chain, resumable);
+                if (!isSnapshotOf(resumable)) {
                     recordHowFarTheSourceHasBeenRead(meta, miningChainId, resumable, recordedRead);
                 }
             }

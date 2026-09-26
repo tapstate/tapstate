@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -20,13 +21,18 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.lang.reflect.InvocationTargetException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.mockito.AdditionalAnswers;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 
 /**
  * The production sink-ack factory maps a sink's chain (the {@code src} stream name, a table at L1) to its
@@ -410,6 +416,49 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     /**
+     * Each writer works the table's position out from what it read back and reports it on its own, so what one
+     * worked out before another's later answer can reach the store after it. Here the answer that the load has
+     * landed is held on its way while the table's first change lands, and then let through: the position stays
+     * at the change. Written as it came, it would go back to the load, and every writer having already reported
+     * the change, nothing would move it on until another change of the table landed.
+     */
+    @Test
+    void anAnswerOfATableThatArrivesAfterALaterOneLeavesThePositionWhereItIs() {
+        InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+        backing.create("mc-orders", null);
+        backing.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
+        AtomicBoolean holdTheNext = new AtomicBoolean();
+        List<Runnable> held = new ArrayList<>();
+        Answer<Object> holdingTheNext = invocation -> {
+            if (holdTheNext.getAndSet(false)) {
+                held.add(() -> invokeOn(backing, invocation));
+                return null;
+            }
+            return invokeOn(backing, invocation);
+        };
+        SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+        doAnswer(holdingTheNext).when(store).advanceSinkAcked(anyString(), anyString(), any());
+        doAnswer(holdingTheNext).when(store).advanceSinkAcked(anyString(), anyString(), anyString(), any());
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER, OTHER_WRITER)));
+        SinkAck writing = factory.resolve(member).forWriter(WRITER);
+        SinkAck idle = factory.resolve(member).forWriter(OTHER_WRITER);
+
+        writing.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
+        holdTheNext.set(true);
+        idle.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
+        writing.advance("orders", at(0, "w1"));
+        idle.bounded("orders", new SourceOrder(1, 0));
+        assertThat(held).as("the load's answer, on its way").hasSize(1);
+        held.forEach(Runnable::run);
+
+        assertThat(ackedChainPosition(backing, "mc-orders", "pipe-1"))
+                .as("the change stays where the pipeline resumes: the load's answer arrived after it")
+                .isEqualTo(at(0, "w1"));
+    }
+
+    /**
      * A writer handed none of a table's rows holds the table back until a bound says none are coming, and no
      * longer. Until it has said anything it may be holding every change there is; once a bound covers them,
      * it is holding none, and the other writer's progress stands.
@@ -637,6 +686,17 @@ class StoreBackedSinkAckFactoryTest {
 
         assertThat(factory.loadLandings(member).stillLanding(
                 List.of(new AwaitedLoad("serve.s", "orders", List.of(WRITER))))).isEmpty();
+    }
+
+    /** What {@code invocation} asked of the mock, asked of {@code store}, failing as it fails. */
+    private static Object invokeOn(SrsMetaStore store, InvocationOnMock invocation) {
+        try {
+            return invocation.getMethod().invoke(store, invocation.getArguments());
+        } catch (InvocationTargetException failed) {
+            throw failed.getCause() instanceof RuntimeException runtime ? runtime : new IllegalStateException(failed);
+        } catch (IllegalAccessException unreachable) {
+            throw new IllegalStateException(unreachable);
+        }
     }
 
     /** One change's position: the order the engine assigned it, and the token the connector gave. */

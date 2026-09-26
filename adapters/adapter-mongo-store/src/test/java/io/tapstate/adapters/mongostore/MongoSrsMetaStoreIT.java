@@ -328,29 +328,58 @@ class MongoSrsMetaStoreIT {
             assertThat(store.ringDoneThrough(CHAIN, "p1"))
                     .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 9L, "items", 4L));
             assertThat(onlyConsumer(store).sinkAckedSrcpos())
-                    .as("and the chain's acked position, written with them, stays at the latest of them")
-                    .isEqualTo("t9");
+                    .as("and the chain's acked position is the last one written that moved its own table on: "
+                            + "the older reports of orders moved nothing, and the tables' sequences are not ranked "
+                            + "against one another")
+                    .isEqualTo("t4");
         });
     }
 
     @Test
-    void aConfirmationThatLandsAfterALaterOneLeavesTheAckedPositionWhereItIs() {
+    void aTablesReportThatLandsAfterALaterOneLeavesTheAckedPositionWhereItIs() {
         withStore(store -> {
             store.create(CHAIN, null);
 
-            store.advanceSinkAcked(CHAIN, "p1", new ChainPosition(new SourceOrder(1, 5), "t5"));
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 5), "t5"));
             // Each writer of a sink works the acked position out from what it read back and reports on its own,
             // so a report worked out before a later one can land after it, carrying the older answer.
-            store.advanceSinkAcked(CHAIN, "p1", new ChainPosition(new SourceOrder(1, 3), "t3"));
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 3), "t3"));
             store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(SourceOrder.snapshotRow(1), "s"));
             assertThat(onlyConsumer(store).sinkAcked())
-                    .as("never moved back by a confirmation of what it had already passed")
+                    .as("never moved back by a report of what the table had already passed")
                     .isEqualTo(new ChainPosition(new SourceOrder(1, 5), "t5"));
 
             store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(2, 0), "n0"));
             assertThat(onlyConsumer(store).sinkAcked())
                     .as("and moved on by the first one past it, a new generation of the ring included")
                     .isEqualTo(new ChainPosition(new SourceOrder(2, 0), "n0"));
+
+            store.advanceSinkAcked(CHAIN, "p1", "items", new ChainPosition(new SourceOrder(1, 2), "i2"));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("another table's report is not ranked against it: each table's ring numbers its changes "
+                            + "on its own")
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 2), "i2"));
+
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 7), "t7"));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("while a report of orders is still compared with the last one of orders")
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 2), "i2"));
+        });
+    }
+
+    @Test
+    void aRewrittenConsumerRecordLetsATableMoveOnFromWhereItNowStands() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 5), "t5"));
+
+            // A write-back moving the pipeline to an earlier position: the run after it confirms from there.
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("p1", Map.of(), null));
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 3), "t3"));
+
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("compared with nothing the rewritten record no longer holds")
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 3), "t3"));
         });
     }
 

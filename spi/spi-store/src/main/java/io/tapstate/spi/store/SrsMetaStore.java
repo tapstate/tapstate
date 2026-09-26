@@ -114,9 +114,8 @@ public interface SrsMetaStore {
      * never clobbers the {@code perTableSeq} read cursor the pipeline's reader writes to the same consumer
      * record: the sink-ack and the read cursor are independent writers of one consumer, of different
      * lifetime. It creates the consumer entry when the pipeline has none yet, so a sink may ack before the
-     * reader first publishes a cursor. Only ever raised, never lowered: a position no later than the one held is
-     * left where it is, since every writer of a sink reports on its own and a report worked out before a later
-     * one can land after it. A mutate on an unseeded chain is a caller ordering error.
+     * reader first publishes a cursor. The caller only ever advances, never lowers; this store persists the
+     * position the caller resolved. A mutate on an unseeded chain is a caller ordering error.
      *
      * <p>Both halves of the position are persisted. The token is what a read resumes from; the order is
      * what the next comparison runs on, and a stored token without it can no longer be ranked against the
@@ -136,8 +135,15 @@ public interface SrsMetaStore {
      * has been confirmed; it cannot say where in any one ring that was, and positioning a table's ring by
      * another table's sequence would skip changes nobody confirmed. Only ever raised, never lowered.
      *
-     * <p>The default records the chain position alone, which leaves a replacing run starting at the head of
-     * each ring as runs always have: more replayed than needed, nothing missed.
+     * <p>A position no later than the last one recorded for {@code table} leaves the chain position where it
+     * is, and still raises the table's place in its ring: every writer of a sink reports on its own, so a
+     * report worked out before a later one can land after it, and written it would move the position back.
+     * Only the table's own last position is compared: each table's ring numbers its changes on its own, so
+     * one table's position says nothing about another's, and the last position recorded that moved its own
+     * table on stands. A snapshot row sits beneath every change of its generation and raises no ring place.
+     *
+     * <p>The default records the chain position alone, compared with nothing, which leaves a replacing run
+     * starting at the head of each ring as runs always have: more replayed than needed, nothing missed.
      */
     default void advanceSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {

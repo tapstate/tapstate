@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
@@ -26,6 +27,8 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     private final Map<String, SrsMeta> records = new LinkedHashMap<>();
     /** Per chain, per pipeline: the ring sequence of the last change each table's sink confirmed. */
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
+    /** Per chain, per pipeline: the order of the last acked position recorded for each table. */
+    private final Map<String, Map<String, Map<String, SourceOrder>>> tableAcked = new LinkedHashMap<>();
     /**
      * Per chain, per pipeline: the current run's writer accounting, without the load generation - that is
      * read off the consumer when the run is answered, as the real store reads both off one document.
@@ -130,11 +133,6 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 next.add(c);
             }
         }
-        if (existing != null && existing.sinkAcked() != null
-                && position.order().compareTo(existing.sinkAcked().order()) <= 0) {
-            // Only ever raised, as the contract says: a confirmation landing after a later one moves nothing.
-            return;
-        }
         Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
         next.add(new ConsumerOffset(
                 pipelineId,
@@ -236,6 +234,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         // Idempotent for the same reason the detach below is: an absent chain already satisfies it.
         records.remove(miningChainId);
         ringDone.remove(miningChainId);
+        tableAcked.remove(miningChainId);
         writerRuns.remove(miningChainId);
     }
 
@@ -325,7 +324,15 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized void advanceSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {
-        advanceSinkAcked(miningChainId, pipelineId, position);
+        require(miningChainId);
+        Map<String, SourceOrder> last = tableAcked.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
+                .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>());
+        // Compared with the table's own last one only, as the real store does: a report landing after a later
+        // one of the table moves nothing, and another table's position is not ranked against it.
+        if (!last.containsKey(table) || position.order().compareTo(last.get(table)) > 0) {
+            advanceSinkAcked(miningChainId, pipelineId, position);
+            last.put(table, position.order());
+        }
         if (position.order().seq() >= 0) {
             ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
                     .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
@@ -350,6 +357,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         Map<String, Map<String, Long>> byPipeline = ringDone.get(miningChainId);
         if (byPipeline != null) {
             byPipeline.remove(pipelineId);
+        }
+        Map<String, Map<String, SourceOrder>> ackedByPipeline = tableAcked.get(miningChainId);
+        if (ackedByPipeline != null) {
+            ackedByPipeline.remove(pipelineId);
         }
         Map<String, WriterRun> runs = writerRuns.get(miningChainId);
         if (runs != null) {
