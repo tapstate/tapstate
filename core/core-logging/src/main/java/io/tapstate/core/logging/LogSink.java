@@ -29,10 +29,7 @@ public interface LogSink {
         throw new UnsupportedOperationException("scoped log append is unavailable");
     }
 
-    /**
-     * Returns the most recent buffered lines for a pipeline, oldest to newest, as an immutable
-     * snapshot. Empty when the pipeline has logged nothing (or is unknown to this node).
-     */
+    /** Returns legacy unscoped lines, oldest to newest; only callers with a legacy artifact use this view. */
     List<LogLine> tail(String pipelineId);
 
     /** Reads only lines from one current execution. */

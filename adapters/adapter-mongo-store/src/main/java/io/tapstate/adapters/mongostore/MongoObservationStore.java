@@ -148,6 +148,26 @@ public final class MongoObservationStore implements ObservationStore {
         StoreIo.run(() -> collection.deleteOne(new Document("_id", pipelineId)));
     }
 
+    @Override
+    public void deleteIncarnation(String pipelineId, String incarnationId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(incarnationId, "incarnationId");
+        if (incarnationId.isBlank()) {
+            throw new IllegalArgumentException("observation incarnation must not be blank");
+        }
+        StoreIo.run(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .deleteOne(new Document("_id", pipelineId).append("pipelineIncarnationId", incarnationId)));
+    }
+
+    @Override
+    public void deleteLegacy(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        StoreIo.run(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .deleteOne(new Document("_id", pipelineId)
+                        .append("pipelineIncarnationId", new Document("$exists", false))
+                        .append("executionGeneration", new Document("$exists", false))));
+    }
+
     /**
      * Maps an observation to its stored document: pipeline id as {@code _id}, state / metrics / snapshot /
      * positions / facts as fields.

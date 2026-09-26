@@ -77,7 +77,7 @@ public final class ArtifactMutationService {
     private final ObservationStore observations;
     private final PipelineLayoutStore layouts;
     private final RateHistoryStore rateHistory;
-    private final Executor historyCleanup;
+    private final Executor telemetryCleanup;
     private final LogSink logSink;
     private final SrsMetaStore srsMeta;
     private final DerivedSchemaStore derivedSchemas;
@@ -230,9 +230,9 @@ public final class ArtifactMutationService {
             RateHistoryStore rateHistory,
             AuditGate auditGate,
             DataBrowserFollows follows,
-            Executor historyCleanup) {
+            Executor telemetryCleanup) {
         this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
-                auditGate, follows, historyCleanup, null);
+                auditGate, follows, telemetryCleanup, null);
     }
 
     public ArtifactMutationService(
@@ -246,7 +246,7 @@ public final class ArtifactMutationService {
             RateHistoryStore rateHistory,
             AuditGate auditGate,
             DataBrowserFollows follows,
-            Executor historyCleanup,
+            Executor telemetryCleanup,
             LogSink logSink) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
@@ -254,7 +254,7 @@ public final class ArtifactMutationService {
         this.observations = Objects.requireNonNull(observations, "observations");
         this.layouts = Objects.requireNonNull(layouts, "layouts");
         this.rateHistory = Objects.requireNonNull(rateHistory, "rateHistory");
-        this.historyCleanup = Objects.requireNonNull(historyCleanup, "historyCleanup");
+        this.telemetryCleanup = Objects.requireNonNull(telemetryCleanup, "telemetryCleanup");
         this.logSink = logSink;
         this.srsMeta = Objects.requireNonNull(srsMeta, "srsMeta");
         this.derivedSchemas = Objects.requireNonNull(derivedSchemas, "derivedSchemas");
@@ -269,8 +269,9 @@ public final class ArtifactMutationService {
      * {@code principal} is the identity the removal is attributed to.
      *
      * <p>A refusal happens before anything is written. A failure in required pipeline bookkeeping
-     * reclamation is reported after the artifact is gone. Rate-history cleanup is scheduled separately:
-     * its failure is logged and age-based expiry remains its final bound.
+     * reclamation is reported after the artifact is gone. Telemetry cleanup is scheduled separately:
+     * its failure is logged, while identity-fenced reads and bounded retention keep residue from
+     * appearing as the new resource's state.
      *
      * <p>The two are told apart by their code, not only by their text. A refusal means nothing happened
      * and the caller may retry; {@code artifact.reclaim-incomplete} means the artifact is gone and
@@ -351,7 +352,7 @@ public final class ArtifactMutationService {
     }
 
     /**
-     * Reclaims a removed pipeline's required bookkeeping and submits its best-effort history cleanup.
+     * Reclaims a removed pipeline's required bookkeeping and submits best-effort telemetry cleanup.
      * Every step is attempted even after one fails; required-step failures are reported together.
      *
      * <p>The shared chains are detached first because theirs is the only residue that harms a
@@ -402,7 +403,7 @@ public final class ArtifactMutationService {
                 new ReclaimStep("mining-chain-consumer", () -> detachFromEveryChain(id)),
                 new ReclaimStep("desired", () -> desired.delete(id)),
                 new ReclaimStep("state", () -> state.delete(id)),
-                new ReclaimStep("observation", () -> observations.delete(id)),
+                new ReclaimStep("observation", () -> submitObservationCleanup(id, visibility)),
                 new ReclaimStep("layout", () -> layouts.delete(id)),
                 // Left behind, this record would be read as the derivation history of whatever is applied
                 // under the id next, and would refuse to start it over a difference against a schema
@@ -417,12 +418,35 @@ public final class ArtifactMutationService {
         return List.copyOf(steps);
     }
 
+    private void submitObservationCleanup(String id, Visibility visibility) {
+        try {
+            telemetryCleanup.execute(() -> {
+                if (visibility.incarnationId() != null) {
+                    try {
+                        observations.deleteIncarnation(id, visibility.incarnationId());
+                    } catch (RuntimeException failed) {
+                        LOG.log(Level.WARNING, "Could not clear scoped observation for " + id, failed);
+                    }
+                }
+                if (visibility.includeLegacy()) {
+                    try {
+                        observations.deleteLegacy(id);
+                    } catch (RuntimeException failed) {
+                        LOG.log(Level.WARNING, "Could not clear legacy observation for " + id, failed);
+                    }
+                }
+            });
+        } catch (RuntimeException rejected) {
+            LOG.log(Level.WARNING, "Could not schedule observation cleanup for " + id, rejected);
+        }
+    }
+
     private void submitLogCleanup(String id, Visibility visibility) {
         if (logSink == null) {
             return;
         }
         try {
-            historyCleanup.execute(() -> {
+            telemetryCleanup.execute(() -> {
                 try {
                     if (visibility.incarnationId() != null) {
                         logSink.clearIncarnation(id, visibility.incarnationId());
@@ -441,7 +465,7 @@ public final class ArtifactMutationService {
 
     private void submitHistoryCleanup(String id, Visibility visibility) {
         try {
-            historyCleanup.execute(() -> {
+            telemetryCleanup.execute(() -> {
                 if (visibility.incarnationId() != null) {
                     try {
                         rateHistory.deleteIncarnation(id, visibility.incarnationId());

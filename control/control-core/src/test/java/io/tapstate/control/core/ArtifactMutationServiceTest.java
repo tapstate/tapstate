@@ -396,13 +396,59 @@ class ArtifactMutationServiceTest {
         delayed.delete(PRINCIPAL, "flow", hash(first));
         store.save(pipeline("flow"));
         store.assignIncarnation("flow", "inc-new");
-        assertThat(pending).hasSize(1);
-        pending.getFirst().run();
+        assertThat(pending).hasSize(2);
+        pending.forEach(Runnable::run);
 
         assertThat(rateHistory.deletedIncarnations).containsExactly("inc-old");
         assertThat(rateHistory.deleted).doesNotContain("inc-new");
         assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
     }
+
+    @Test
+    void observationCleanupWaitsOutsideArtifactRemovalAndCannotDeleteARecreatedId() {
+        List<Runnable> pending = new ArrayList<>();
+        ArtifactMutationService delayed = new ArtifactMutationService(
+                store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory,
+                new AuditGate(auditStore, FIXED_CLOCK), followsStopped::add, pending::add);
+        PipelineResource first = pipeline("flow");
+        store.save(first);
+        store.assignIncarnation("flow", "inc-old");
+        observations.saveScoped(new Observation("flow", PipelineState.STOPPED,
+                Map.of("recordCount", 1L), Map.of()), new ObservationStore.Scope("inc-old", 1));
+
+        delayed.delete(PRINCIPAL, "flow", hash(first));
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(observations.read("flow")).as("telemetry cleanup is delayed").isPresent();
+
+        store.save(pipeline("flow"));
+        store.assignIncarnation("flow", "inc-new");
+        observations.saveScoped(new Observation("flow", PipelineState.NEW,
+                Map.of("recordCount", 2L), Map.of()), new ObservationStore.Scope("inc-new", 2));
+        pending.forEach(Runnable::run);
+
+        assertThat(observations.readStored("flow").orElseThrow())
+                .satisfies(stored -> {
+                    assertThat(stored.scope()).contains(new ObservationStore.Scope("inc-new", 2));
+                    assertThat(stored.observation().metrics()).containsEntry("recordCount", 2L);
+                });
+    }
+
+    @Test
+    void observationCleanupFailureDoesNotReverseCompletedArtifactRemoval() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        store.assignIncarnation("flow", "inc-old");
+        observations.saveScoped(new Observation("flow", PipelineState.STOPPED,
+                Map.of(), Map.of()), new ObservationStore.Scope("inc-old", 1));
+        observations.failDeleteWith(new IllegalStateException("observation store unavailable"));
+
+        service.delete(PRINCIPAL, "flow", hash(flow));
+
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(observations.readStored("flow").orElseThrow().scope())
+                .contains(new ObservationStore.Scope("inc-old", 1));
+    }
+
 
     @Test
     void delayedLogCleanupUsesTheRemovedIncarnationAfterSameIdRecreation() {
@@ -763,9 +809,10 @@ class ArtifactMutationServiceTest {
     }
 
     @Test
-    void everyReclaimFailureIsReportedAndNotJustTheFirst() {
+    void requiredReclaimFailuresAreReportedButObservationFailureIsBestEffort() {
         PipelineResource flow = pipeline("flow");
         store.save(flow);
+        observations.put("flow");
         RuntimeException first = new IllegalArgumentException("desired store is down");
         RuntimeException second = new IllegalArgumentException("state store is down");
         RuntimeException third = new IllegalArgumentException("observation store is down");
@@ -773,16 +820,15 @@ class ArtifactMutationServiceTest {
         state.failDeleteWith(second);
         observations.failDeleteWith(third);
 
-        // All three lifecycle steps are armed, not two: a step left out of the collecting wrapper
-        // would abort the reclaim at itself, and the steps after it would go unattempted while the
-        // artifact is already gone. The suppressed order also pins the sequence the reclaim runs in,
-        // and the residue list names each of them — a report saying only "the reclaim failed" leaves
-        // whoever has to clear it guessing which documents are still there.
+        // The required lifecycle stores still report both failures; telemetry cleanup runs and logs
+        // its own failure without turning a completed artifact deletion into a rejected request.
         assertThatThrownBy(() -> service.delete(PRINCIPAL, "flow", hash(flow)))
                 .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.args())
-                        .containsEntry("residue", List.of("desired", "state", "observation")))
+                        .containsEntry("residue", List.of("desired", "state")))
                 .hasCause(first)
-                .satisfies(thrown -> assertThat(thrown.getSuppressed()).containsExactly(second, third));
+                .satisfies(thrown -> assertThat(thrown.getSuppressed()).containsExactly(second));
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(observations.read("flow")).isPresent();
     }
 
     private static SourceResource source(String id) {
@@ -1068,6 +1114,7 @@ class ArtifactMutationServiceTest {
     private final class InMemoryObservationStore implements ObservationStore {
 
         private final Map<String, Observation> docs = new LinkedHashMap<>();
+        private final Map<String, Scope> scopes = new LinkedHashMap<>();
         private RuntimeException deleteFailure;
 
         void put(String pipelineId) {
@@ -1082,6 +1129,14 @@ class ArtifactMutationServiceTest {
         @Override
         public void save(Observation observation) {
             docs.put(observation.pipelineId(), observation);
+            scopes.remove(observation.pipelineId());
+        }
+
+        @Override
+        public boolean saveScoped(Observation observation, Scope scope) {
+            docs.put(observation.pipelineId(), observation);
+            scopes.put(observation.pipelineId(), scope);
+            return true;
         }
 
         @Override
@@ -1090,11 +1145,33 @@ class ArtifactMutationServiceTest {
         }
 
         @Override
+        public Optional<Stored> readStored(String pipelineId) {
+            return read(pipelineId).map(observation ->
+                    new Stored(observation, Optional.ofNullable(scopes.get(pipelineId))));
+        }
+
+        @Override
         public void delete(String pipelineId) {
             // Fail before mutating, so an armed failure leaves the document behind — the residue
             // the reporting is about.
             step("observation", deleteFailure);
             docs.remove(pipelineId);
+            scopes.remove(pipelineId);
+        }
+
+        @Override
+        public void deleteIncarnation(String pipelineId, String incarnationId) {
+            Scope scope = scopes.get(pipelineId);
+            if (scope != null && scope.pipelineIncarnationId().equals(incarnationId)) {
+                delete(pipelineId);
+            }
+        }
+
+        @Override
+        public void deleteLegacy(String pipelineId) {
+            if (!scopes.containsKey(pipelineId)) {
+                delete(pipelineId);
+            }
         }
     }
 
