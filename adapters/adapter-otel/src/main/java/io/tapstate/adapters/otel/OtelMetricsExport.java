@@ -108,6 +108,11 @@ public final class OtelMetricsExport implements MetricsExport {
         producer.forgetPipelinesOutside(pipelineIds);
     }
 
+    @Override
+    public void forgetPipeline(String pipelineId) {
+        producer.forgetPipeline(pipelineId);
+    }
+
     /** Pushes what is held to every push reader now, for a caller that cannot wait for the cadence; true when every push completed. */
     public boolean flush(Duration within) {
         return provider.forceFlush().join(within.toMillis(), TimeUnit.MILLISECONDS).isSuccess();

@@ -148,6 +148,19 @@ final class FactsMetricProducer implements MetricProducer {
         }
     }
 
+    /** Clears a reused id without disturbing other pipelines still exported by this process. */
+    void forgetPipeline(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        latest.remove(pipelineId);
+        synchronized (folder) {
+            folder.forgetPipeline(pipelineId);
+        }
+        synchronized (this) {
+            named.values().forEach(sets -> sets.removeIf(attributes ->
+                    pipelineId.equals(attributes.get(MetricAttributes.PIPELINE_ID))));
+        }
+    }
+
     /** The pipelines currently held, for a reader of this producer that wants to say what it exports. */
     Set<String> pipelines() {
         return Set.copyOf(latest.keySet());

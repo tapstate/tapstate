@@ -34,6 +34,7 @@ class TheBudgetsHoldAtTheExportTest {
     private static final AttributeKey<String> OVERFLOW = AttributeKey.stringKey(MetricAttributes.OVERFLOW);
     private static final AttributeKey<String> DIRECTION = AttributeKey.stringKey(MetricAttributes.DIRECTION);
     private static final AttributeKey<String> TABLE = AttributeKey.stringKey(MetricAttributes.TABLE_ID);
+    private static final AttributeKey<String> PIPELINE = AttributeKey.stringKey(MetricAttributes.PIPELINE_ID);
 
     private final FactsMetricProducer producer = new FactsMetricProducer(START);
 
@@ -151,6 +152,26 @@ class TheBudgetsHoldAtTheExportTest {
         assertThat(namedTables(recordsPoints(producer.produce(Resource.empty()))))
                 .hasSize(CardinalityBudget.RECORDS.distinctValues())
                 .allSatisfy(table -> assertThat(table).startsWith("u"));
+    }
+
+    @Test
+    void aRecreatedIdReleasesOnlyItsPreviousCurrentSeriesAndNamedTables() {
+        int tables = CardinalityBudget.RECORDS.distinctValues() + 20;
+        producer.offer("orders", PipelineState.RUNNING, AT, List.of(rowsOver("orders", tables, "old")));
+        producer.offer("other", PipelineState.RUNNING, AT, List.of(Facts.records("other", 1, 1)));
+        producer.produce(Resource.empty());
+
+        producer.forgetPipeline("orders");
+
+        assertThat(producer.pipelines()).containsExactly("other");
+        producer.offer("orders", PipelineState.RUNNING, AT, List.of(rowsOver("orders", tables, "new")));
+        List<String> recreated = recordsPoints(producer.produce(Resource.empty())).stream()
+                .filter(point -> "orders".equals(point.getAttributes().get(PIPELINE)))
+                .map(point -> point.getAttributes().get(TABLE)).filter(java.util.Objects::nonNull)
+                .distinct().toList();
+        assertThat(recreated).hasSize(CardinalityBudget.RECORDS.distinctValues())
+                .allSatisfy(table -> assertThat(table).startsWith("new"));
+        assertThat(producer.pipelines()).containsExactlyInAnyOrder("orders", "other");
     }
 
     /** One records fact over {@code tables} tables of {@code pipelineId}, in and out, each table named by the prefix. */

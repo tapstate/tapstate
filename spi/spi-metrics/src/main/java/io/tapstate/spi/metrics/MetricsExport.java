@@ -34,6 +34,10 @@ public interface MetricsExport extends AutoCloseable {
     /** Drops what is held for every pipeline outside {@code pipelineIds}, which is the set that still exists. */
     void forgetPipelinesOutside(Collection<String> pipelineIds);
 
+    /** Releases one current pipeline's local series when its resource or execution identity changes. */
+    default void forgetPipeline(String pipelineId) {
+    }
+
     /** Stops the backend, if one was started; the default releases nothing because it holds nothing. */
     @Override
     default void close() {
