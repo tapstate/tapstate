@@ -24,7 +24,7 @@ class CaptureIdTest {
     }
 
     @Test
-    void streamOrderIsNormalizedButADifferentReadSetIsADifferentCapture() {
+    void tableSubsetsOfOnePhysicalChainShareOneCaptureClaim() {
         CaptureConfig one = new CaptureConfig("mysql", Map.of("host", "db.internal"),
                 List.of("orders", "customers"));
         CaptureConfig reordered = new CaptureConfig("mysql", Map.of("host", "db.internal"),
@@ -33,16 +33,16 @@ class CaptureIdTest {
                 List.of("orders"));
 
         assertThat(CaptureId.of(one, null)).isEqualTo(CaptureId.of(reordered, null));
-        assertThat(CaptureId.of(one, null)).isNotEqualTo(CaptureId.of(narrower, null));
+        assertThat(CaptureId.of(one, null)).isEqualTo(CaptureId.of(narrower, null));
     }
 
     @Test
-    void anExplicitMiningKeyStillKeepsDistinctReadContractsApart() {
+    void anExplicitMiningKeyAlsoSharesOnePhysicalCaptureAcrossTableSubsets() {
         CaptureConfig orders = new CaptureConfig("mysql", Map.of("host", "db.internal"), List.of("orders"));
         CaptureConfig customers = new CaptureConfig("mysql", Map.of("host", "db.internal"), List.of("customers"));
 
         assertThat(CaptureId.of(orders, "shared-db"))
-                .isNotEqualTo(CaptureId.of(customers, "shared-db"));
+                .isEqualTo(CaptureId.of(customers, "shared-db"));
     }
 
     @Test

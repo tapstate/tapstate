@@ -3,6 +3,7 @@ package io.tapstate.runtime.srs;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.core.event.ChainPosition;
@@ -20,9 +21,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
+import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -123,7 +126,7 @@ public final class CdcPhase {
         TableRoute route = new TableRoute(chain, consumers, seq -> { });
         AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
         return port.cdc(config, start, health.recording(
-                (events, position) -> writeBatch(events, position, table -> route, lastWritten)));
+                (events, position) -> writeBatch(events, position, table -> route, lastWritten, null)));
     }
 
     /** Starts one connector subscription and routes each event to the ring for its source table. */
@@ -145,17 +148,78 @@ public final class CdcPhase {
             CaptureStart start,
             Map<String, TableRoute> routes,
             CaptureHealth health) {
+        return run(port, config, start, routes, health, null);
+    }
+
+    /** The shared-chain path releases only capture-owned physical batch barriers. */
+    static Subscription run(
+            CapturePort port,
+            CaptureConfig config,
+            CaptureStart start,
+            Map<String, TableRoute> routes,
+            CaptureHealth health,
+            PhysicalSourcePrefix prefix) {
+        return run(port, config, start, routes, health, prefix, null);
+    }
+
+    static Subscription run(
+            CapturePort port,
+            CaptureConfig config,
+            CaptureStart start,
+            Map<String, TableRoute> routes,
+            CaptureHealth health,
+            PhysicalSourcePrefix prefix,
+            Consumer<Optional<SourcePosition>> singleTableAnchor) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(start, "start");
         Objects.requireNonNull(routes, "routes");
         Objects.requireNonNull(health, "health");
         Map<String, TableRoute> routeSnapshot = Map.copyOf(routes);
+        String chainId = routeSnapshot.isEmpty() ? "unknown"
+                : routeSnapshot.values().iterator().next().chain().miningChainId();
+        AtomicBoolean startReported = new AtomicBoolean(prefix == null && singleTableAnchor == null);
         // The last position actually persisted, for the life of this subscription. It is what lets a run
         // that resolves the same frontier as the one before it write nothing: see writeBatch.
         AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
-        return port.cdc(config, start, health.recording(
-                (events, position) -> writeBatch(events, position, routeSnapshot::get, lastWritten)));
+        try {
+            CaptureListener listener = new CaptureListener() {
+                @Override
+                public void onStart(Optional<SourcePosition> position) {
+                    if (prefix != null) {
+                        prefix.anchor(position);
+                    } else if (singleTableAnchor != null) {
+                        singleTableAnchor.accept(position);
+                    }
+                    startReported.set(true);
+                }
+
+                @Override
+                public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                    if (!startReported.get()) {
+                        throw new TapstateException(CaptureError.RESUME_ANCHOR_UNAVAILABLE,
+                                Map.of("chain", chainId), null);
+                    }
+                    writeBatch(events, position, routeSnapshot::get, lastWritten, prefix);
+                }
+            };
+            Subscription source = port.cdc(config, start, health.recording(listener));
+            if (prefix == null) {
+                return source;
+            }
+            return () -> {
+                try {
+                    source.close();
+                } finally {
+                    prefix.close();
+                }
+            };
+        } catch (RuntimeException | Error failure) {
+            if (prefix != null) {
+                prefix.close();
+            }
+            throw failure;
+        }
     }
 
     /**
@@ -218,11 +282,15 @@ public final class CdcPhase {
             List<Envelope> events,
             Optional<SourcePosition> position,
             Function<String, TableRoute> routes,
-            AtomicReference<ChainPosition> lastWritten) {
+            AtomicReference<ChainPosition> lastWritten,
+            PhysicalSourcePrefix prefix) {
         if (events.isEmpty()) {
             // The source handed over only events that carry no change -- a heartbeat and its like. There is
             // nothing to write, and nothing has been read past, so the offset does not move either.
             return;
+        }
+        if (prefix != null) {
+            prefix.awaitRoom();
         }
         int last = events.size() - 1;
         Map<String, List<SrsItem>> byTable = new LinkedHashMap<>();
@@ -244,8 +312,10 @@ public final class CdcPhase {
         String closingTable = events.get(last).src();
         long closingSeq = -1;
         Collection<ConsumerOffset> closingOffsets = List.of();
+        Map<String, Long> lastRingSeqByTable = new LinkedHashMap<>();
         for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
             Admitted admitted = admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue());
+            lastRingSeqByTable.put(entry.getKey(), admitted.lastSeq());
             if (entry.getKey().equals(closingTable)) {
                 closingSeq = admitted.lastSeq();
                 // The cursors the admission read, rather than a second reading of them. They are the same
@@ -253,6 +323,10 @@ public final class CdcPhase {
                 // advance shorter, never further, so the bound it enforces still holds.
                 closingOffsets = admitted.offsets();
             }
+        }
+        if (prefix != null) {
+            prefix.admitted(lastRingSeqByTable, position.map(SourcePosition::token).orElse(null));
+            return;
         }
         // The run is in the rings; advance the durable read offset to the position that closes it, clamped
         // so it never passes the slowest consumer's sink-acked position -- a change only ever in the

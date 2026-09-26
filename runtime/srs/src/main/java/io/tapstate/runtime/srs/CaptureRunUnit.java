@@ -7,6 +7,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.SourcePosition;
@@ -19,6 +20,7 @@ import io.tapstate.spi.store.SrsMetaStore;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -169,6 +171,15 @@ public final class CaptureRunUnit {
             }
 
             if (plan.sharedRing()) {
+                if (!startTail) {
+                    SrsMetaStore.PhysicalSelection selection =
+                            meta.physicalSelection(chainId.value()).orElse(null);
+                    if (selection != null && selection.epoch() == epoch
+                            && !selection.tables().containsAll(tables)) {
+                        throw new TapstateException(CaptureError.SHARED_SELECTION_RESTART_REQUIRED,
+                                Map.of("chain", chainId.value()), null);
+                    }
+                }
                 // A chain can carry other pipelines and several sources of this pipeline. Publish the
                 // complete selection before a miner writes, so headroom is guarded by exactly the tables
                 // this pipeline reads. A prior generation's cursor cannot grant headroom in this one.
@@ -301,15 +312,22 @@ public final class CaptureRunUnit {
     private Subscription startSharedTail(CaptureRunSpec spec, MiningChainId chainId, long epoch,
             String ownSeam, List<String> tables, CaptureHealth health) {
         String cid = chainId.value();
+        LinkedHashSet<String> union = new LinkedHashSet<>(tables);
+        for (ConsumerOffset consumer : meta.consumerOffsets(cid)) {
+            if (consumer.selectedTables() != null) {
+                union.addAll(consumer.selectedTables());
+            }
+        }
+        List<String> physicalTables = union.stream().sorted().toList();
         // The cursors alone, not the whole record: this is read on every run of changes, and the
         // record also carries a schema history that grows per DDL and is never read here.
         Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
         SrsLogStore log = hz.getUserContext().get(SRS_LOG_USER_CONTEXT_KEY) instanceof SrsLogStore
                 bound ? bound : null;
         // One scalar ACK cannot identify which table's ring to cut on a multi-table chain.
-        boolean cuttable = log != null && tables.size() == 1;
+        boolean cuttable = log != null && physicalTables.size() == 1;
         Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
-        for (String table : tables) {
+        for (String table : physicalTables) {
             String ringName = SrsRingbuffer.ringName(cid, table);
             SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ringName)));
             CdcChain chain = new CdcChain(
@@ -320,7 +338,30 @@ public final class CaptureRunUnit {
         CaptureStart minerStart = tailStart(
                 meta, cid, spec.pipelineId(), ownSeam, CaptureStart.present());
         refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
-        return CdcPhase.run(port, spec.config(), minerStart, routes, health);
+        PhysicalSourcePrefix prefix = physicalTables.size() > 1
+                ? new PhysicalSourcePrefix(meta, cid, epoch, health) : null;
+        if (!meta.publishPhysicalSelection(cid, new SrsMetaStore.PhysicalSelection(epoch, physicalTables))) {
+            if (prefix != null) {
+                prefix.close();
+            }
+            throw new TapstateException(CaptureError.SHARED_SELECTION_RESTART_REQUIRED,
+                    Map.of("chain", cid), null);
+        }
+        CaptureConfig physicalConfig = new CaptureConfig(spec.config().connectorId(),
+                spec.config().settings(), physicalTables, spec.config().node());
+        Consumer<Optional<SourcePosition>> singleTableAnchor = physicalTables.size() == 1
+                ? start -> {
+                    String token = start.map(SourcePosition::token).orElseThrow(() ->
+                            new TapstateException(CaptureError.RESUME_ANCHOR_UNAVAILABLE,
+                                    Map.of("chain", cid), null));
+                    if (meta.read(cid).orElseThrow().sourceRead() == null
+                            && !meta.establishPhysicalAnchor(cid,
+                                    new ChainPosition(new SourceOrder(epoch, -1L), token))) {
+                        throw new TapstateException(CaptureError.RESUME_ANCHOR_UNAVAILABLE,
+                                Map.of("chain", cid), null);
+                    }
+                } : null;
+        return CdcPhase.run(port, physicalConfig, minerStart, routes, health, prefix, singleTableAnchor);
     }
 
     private CaptureRun startDeferredSnapshot(CaptureRunSpec spec, Consumer<Envelope> passthrough,
@@ -486,11 +527,34 @@ public final class CaptureRunUnit {
         Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
         AtomicLong forwarded = new AtomicLong();
         AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
+        AtomicBoolean anchored = new AtomicBoolean();
         return port.cdc(spec.config(), tailStart(
                         meta, cid, spec.pipelineId(), ownSeam, sourceStart(spec.startFrom())),
-                health.recording((events, position) -> forwardDirect(
-                        events, position, cid, epoch, forwarded,
-                        consumers, lastWritten, passthrough)));
+                health.recording(new CaptureListener() {
+                    @Override
+                    public void onStart(Optional<SourcePosition> position) {
+                        String token = position.map(SourcePosition::token).orElseThrow(() ->
+                                new TapstateException(CaptureError.RESUME_ANCHOR_UNAVAILABLE,
+                                        Map.of("chain", cid), null));
+                        if (meta.read(cid).orElseThrow().sourceRead() == null
+                                && !meta.establishPhysicalAnchor(cid,
+                                        new ChainPosition(new SourceOrder(epoch, -1L), token))) {
+                            throw new TapstateException(CaptureError.RESUME_ANCHOR_UNAVAILABLE,
+                                    Map.of("chain", cid), null);
+                        }
+                        anchored.set(true);
+                    }
+
+                    @Override
+                    public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                        if (!anchored.get()) {
+                            throw new TapstateException(CaptureError.RESUME_ANCHOR_UNAVAILABLE,
+                                    Map.of("chain", cid), null);
+                        }
+                        forwardDirect(events, position, cid, epoch, forwarded,
+                                consumers, lastWritten, passthrough);
+                    }
+                }));
     }
 
     /**

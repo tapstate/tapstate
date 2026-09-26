@@ -156,6 +156,34 @@ class CaptureOwnershipTest {
     }
 
     @Test
+    void twoTableSubsetsOfOneMiningChainTakeOnlyOnePhysicalCaptureClaim() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("orders-reader", "orders-source.orders"));
+        artifacts.save(pipelineServing("customers-reader", "orders-source.customers"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        AtomicInteger physicalTails = new AtomicInteger();
+        CaptureAttacher attacher = (spec, passthrough, startTail) -> {
+            if (startTail) {
+                physicalTails.incrementAndGet();
+                opensTheRing(store);
+            }
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = managed(
+                store, attacher, eligibleGate(), new MemoryClaims(),
+                new WorkloadOwner("node-a", "boot-a"));
+
+        coordinator.startCapture("orders-reader");
+        coordinator.startCapture("customers-reader");
+        assertThat(physicalTails).hasValue(1);
+        assertThat(new StoreBackedPipelineCaptures(store).captureIds("orders-reader"))
+                .isEqualTo(new StoreBackedPipelineCaptures(store).captureIds("customers-reader"));
+        coordinator.stopCapture("orders-reader", false);
+        coordinator.stopCapture("customers-reader", false);
+    }
+
+    @Test
     void aClaimIsRenewedWhileItsOwningSnapshotIsStillBlocked() throws Exception {
         InMemoryStorePort store = new InMemoryStorePort(
                 artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p"));

@@ -25,6 +25,29 @@ import java.util.Optional;
  */
 public interface SrsMetaStore {
 
+    /** The selected streams of the one physical CDC reader in this ring generation. */
+    record PhysicalSelection(long epoch, List<String> tables) {
+        public PhysicalSelection {
+            if (epoch < 1 || tables == null || tables.isEmpty()) {
+                throw new IllegalArgumentException("physical capture selection needs a generation and tables");
+            }
+            if (tables.stream().anyMatch(table -> table == null || table.isBlank())) {
+                throw new IllegalArgumentException("physical capture tables must be named");
+            }
+            tables = tables.stream().distinct().sorted().toList();
+        }
+    }
+
+    /** The table union the current physical owner actually subscribed to, if it has opened a tail. */
+    default Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+        return Optional.empty();
+    }
+
+    /** Publishes that union only while this chain still has the generation the owner opened. */
+    default boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
+        throw new UnsupportedOperationException("physical capture selection is unavailable");
+    }
+
     /** Returns the meta record for a mining chain, or empty if the chain has not been seeded. */
     Optional<SrsMeta> read(String miningChainId);
 
@@ -70,6 +93,23 @@ public interface SrsMetaStore {
      * against anything.
      */
     void advanceSourceReadOffset(String miningChainId, ChainPosition position);
+
+    /**
+     * Whether this chain's stored read position was established by a physical source boundary or an
+     * explicit position repair. An older multi-table scalar has no such proof and must not be resumed.
+     */
+    default boolean physicalPrefixTrusted(String miningChainId) {
+        return false;
+    }
+
+    /**
+     * Atomically persists the connector's position immediately before its first delivered change and
+     * marks the chain's physical prefix trusted. Returns false if an existing untrusted offset or a newer
+     * generation prevents this anchor. A trusted chain may retain its earlier safe offset unchanged.
+     */
+    default boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+        throw new UnsupportedOperationException("physical source anchors are unavailable");
+    }
 
     /**
      * Puts the chain's source read offset at exactly {@code token}, forward or back, and drops the order

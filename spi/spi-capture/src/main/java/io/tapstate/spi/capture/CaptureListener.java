@@ -13,6 +13,14 @@ import java.util.Optional;
 public interface CaptureListener {
 
     /**
+     * The connector's safe start offset before it delivers the first CDC batch. A reader that needs to
+     * resume after losing its volatile buffer persists this anchor before accepting any change. A source
+     * unable to name an offset reports empty; the reader may then refuse a resumable subscription.
+     */
+    default void onStart(Optional<SourcePosition> position) {
+    }
+
+    /**
      * Called once per run of changes the source hands over, with the position it reported for that run.
      *
      * <p><strong>The run is the source's own, and it is delivered whole.</strong> A source reads a batch

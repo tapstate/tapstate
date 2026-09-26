@@ -174,6 +174,55 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("physicalCaptureEpoch", "physicalCaptureTables")).first());
+        if (root == null || (!root.containsKey("physicalCaptureEpoch")
+                && !root.containsKey("physicalCaptureTables"))) {
+            return Optional.empty();
+        }
+        Object rawEpoch = root.get("physicalCaptureEpoch");
+        Object rawTables = root.get("physicalCaptureTables");
+        if (!(rawEpoch instanceof Number epoch) || !(rawTables instanceof List<?> tables)
+                || tables.isEmpty() || tables.stream().anyMatch(table -> !(table instanceof String))) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", miningChainId, "field", "physicalCaptureTables"), null);
+        }
+        return Optional.of(new PhysicalSelection(epoch.longValue(), tables.stream()
+                .map(String.class::cast).toList()));
+    }
+
+    @Override
+    public boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
+        Objects.requireNonNull(selection, "selection");
+        List<String> tables = selection.tables().stream().distinct().sorted().toList();
+        Document filter = new Document("_id", miningChainId)
+                .append("epoch", selection.epoch())
+                .append("$or", List.of(
+                        new Document("physicalCaptureEpoch", new Document("$exists", false)),
+                        new Document("physicalCaptureEpoch", new Document("$lt", selection.epoch())),
+                        new Document("physicalCaptureEpoch", selection.epoch())
+                                .append("physicalCaptureTables", tables)));
+        Document fields = new Document("physicalCaptureEpoch", selection.epoch())
+                .append("physicalCaptureTables", tables);
+        if (tables.size() == 1) {
+            Document fresh = new Document(filter).append("sourceReadOffset", new Document("$exists", false));
+            long seeded = StoreIo.call(() -> collection.updateOne(fresh,
+                    new Document("$set", new Document(fields).append("physicalPrefixTrusted", true)))
+                    .getMatchedCount());
+            if (seeded == 1) {
+                return true;
+            }
+        }
+        long matched = StoreIo.call(() -> collection.updateOne(filter,
+                new Document("$set", fields)).getMatchedCount());
+        if (matched == 0) {
+            requireSeeded(miningChainId);
+        }
+        return matched == 1;
+    }
+
+    @Override
     public void create(String miningChainId, String retention) {
         // Insert-only: insertOne fails on a duplicate _id, so an existing chain's accumulated offset /
         // cursor / schema truth is never discarded by a re-seed.
@@ -207,6 +256,38 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public boolean physicalPrefixTrusted(String miningChainId) {
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("physicalPrefixTrusted")).first());
+        return root != null && Boolean.TRUE.equals(root.get("physicalPrefixTrusted"));
+    }
+
+    @Override
+    public boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        Objects.requireNonNull(position.token(), "physical source anchor token");
+        Document fields = sourceReadFields(position, Instant.now(clock))
+                .append("physicalPrefixTrusted", true);
+        long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
+                new Document("_id", miningChainId)
+                        .append("epoch", position.order().epoch())
+                        .append("sourceReadOffset", new Document("$exists", false)),
+                new Document("$set", fields)).getMatchedCount());
+        if (matched == 1) {
+            return true;
+        }
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("epoch", "physicalPrefixTrusted"))
+                .first());
+        if (root == null) {
+            throw unseededChain(miningChainId);
+        }
+        return readEpoch(root, "epoch") == position.order().epoch()
+                && Boolean.TRUE.equals(root.get("physicalPrefixTrusted"));
+    }
+
+    @Override
     public void rewindSourceReadOffset(String miningChainId, String token) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(token, "token");
@@ -217,7 +298,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
                         new Document("_id", miningChainId),
                         new Document("$set", new Document("sourceReadOffset", token)
-                                .append("sourceReadAt", Instant.now(clock).toEpochMilli()))
+                                .append("sourceReadAt", Instant.now(clock).toEpochMilli())
+                                .append("physicalPrefixTrusted", true))
                                 .append("$unset", new Document("sourceReadEpoch", "")
                                         .append("sourceReadSeq", "")))
                 .getMatchedCount());

@@ -941,6 +941,47 @@ class CaptureRunUnitTest {
     }
 
     @Test
+    void physicalTailSubscribesToTheUnionOfPreviouslyAttachedConsumers() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
+        String chain = MiningChainId.resolve(orders, "shared-union").value();
+        meta.create(chain, null);
+        long earlier = meta.openEpoch(chain);
+        meta.selectConsumerTables(chain, "customer-reader", List.of("customers"), earlier, "old-reader");
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunSpec spec = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "shared-union", true,
+                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
+
+        try (CaptureRun ignored = runUnit(source, meta).start(spec, event -> { })) {
+            assertThat(source.cdcStreams).containsExactly("customers", "orders");
+            assertThat(meta.physicalSelection(chain)).contains(new SrsMetaStore.PhysicalSelection(
+                    meta.read(chain).orElseThrow().epoch(), List.of("customers", "orders")));
+        }
+    }
+
+    @Test
+    void aLateNewTableCannotAttachToAnOldPhysicalSubscription() {
+        InMemoryMeta meta = new InMemoryMeta();
+        SrsCoordinator coordinator = new SrsCoordinator(meta);
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = new CaptureRunUnit(source, coordinator, meta, hz);
+        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
+        CaptureConfig customers = new CaptureConfig("mysql", Map.of(), List.of("customers"));
+        CaptureRunSpec first = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "shared-expand", true,
+                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
+        CaptureRunSpec late = new CaptureRunSpec(customers, ReadMode.CDC_ONLY, "shared-expand", true,
+                "customers-source", "customers-reader", StartFrom.latest(), null, 0L);
+
+        try (CaptureRun ignored = unit.start(first, event -> { })) {
+            assertThatThrownBy(() -> unit.start(late, event -> { }, false))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            coded -> assertThat(coded.code())
+                                    .isEqualTo(CaptureError.SHARED_SELECTION_RESTART_REQUIRED));
+            assertThat(source.cdcStarts).isEqualTo(1);
+        }
+    }
+
+    @Test
     void theReadCursorPublisherResolvesTheStoreMemberSideAndAdvancesTheConsumerCursor() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-pub", null);
@@ -1182,6 +1223,7 @@ class CaptureRunUnitTest {
         private Throwable cdcError;
         boolean cdcStarted;
         int cdcStarts;
+        List<String> cdcStreams;
         /** Where the run asked this source to begin -- the whole of what a resume is observable as. */
         CaptureStart cdcStart;
         boolean cdcClosed;
@@ -1218,10 +1260,13 @@ class CaptureRunUnitTest {
             cdcStarted = true;
             cdcStarts++;
             cdcStart = start;
+            cdcStreams = config.streams();
             if (cdcError != null) {
                 listener.onError(cdcError);
                 return () -> cdcClosed = true;
             }
+            listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
+                    ? resume.position() : new SourcePosition("src-start")));
             for (Envelope e : changes) {
                 listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
             }
@@ -1322,6 +1367,27 @@ class CaptureRunUnitTest {
         int wholeRecordReads;
         int cursorReads;
         private final Map<String, SrsMeta> records = new LinkedHashMap<>();
+        private final java.util.Set<String> trustedPhysicalPrefixes = new java.util.HashSet<>();
+        private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
+
+        @Override
+        public Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+            return Optional.ofNullable(physicalSelections.get(miningChainId));
+        }
+
+        @Override
+        public boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
+            if (require(miningChainId).epoch() != selection.epoch()) {
+                return false;
+            }
+            PhysicalSelection previous = physicalSelections.get(miningChainId);
+            if (previous != null && previous.epoch() == selection.epoch()
+                    && !java.util.Set.copyOf(previous.tables()).equals(java.util.Set.copyOf(selection.tables()))) {
+                return false;
+            }
+            physicalSelections.put(miningChainId, selection);
+            return true;
+        }
 
         @Override
         public Optional<SrsMeta> read(String miningChainId) {
@@ -1361,6 +1427,28 @@ class CaptureRunUnitTest {
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), position, m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), m.epoch()));
+        }
+
+        @Override
+        public boolean physicalPrefixTrusted(String miningChainId) {
+            return trustedPhysicalPrefixes.contains(miningChainId);
+        }
+
+        @Override
+        public boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+            SrsMeta current = require(miningChainId);
+            if (current.epoch() != position.order().epoch()) {
+                return false;
+            }
+            if (trustedPhysicalPrefixes.contains(miningChainId)) {
+                return true;
+            }
+            if (current.sourceRead() != null) {
+                return false;
+            }
+            advanceSourceReadOffset(miningChainId, position);
+            trustedPhysicalPrefixes.add(miningChainId);
+            return true;
         }
 
         @Override
