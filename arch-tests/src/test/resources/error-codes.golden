@@ -3,6 +3,8 @@
 # Sorted, one <domain>.<symbol> per line. The ErrorCodeGatesTest diffs the scanned codes
 # against this file. Adding a code = append it here in the same change set; renaming or
 # removing one = a breaking change to an external contract (review + major version).
+actuation.connector-differs-across-members
+actuation.connector-unavailable-on-member
 actuation.from-regex-empty
 actuation.from-regex-invalid
 actuation.join-input-not-a-table

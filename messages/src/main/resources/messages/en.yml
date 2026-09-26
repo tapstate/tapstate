@@ -47,6 +47,12 @@ actuation.no-safe-parallelism:
 actuation.parallelism-needs-a-key:
   message: "Pipeline {pipeline} cannot start: node {node} asks for {requested} processors but can only run as one ({reason})."
   solution: "Set execution.parallelism to 1 on {node}, or leave it out; the node then runs as one processor and keeps every change in order."
+actuation.connector-unavailable-on-member:
+  message: "Pipeline {pipeline} was not started: member {member} cannot load connector {connector} ({reason})."
+  solution: "Every member loads the connectors a pipeline writes through from the shared connector registry into its own plugins directory. Check that member's access to the store and that its plugins directory is writable, then start the pipeline again."
+actuation.connector-differs-across-members:
+  message: "Pipeline {pipeline} was not started: the members load different artifacts for connector {connector} ({artifacts})."
+  solution: "Check that every member reads the same store; a registration replaced while the pipeline was starting is picked up by starting it again."
 actuation.schema-sync-while-running:
   message: "Pipeline `{pipeline}` is {state} and has been asked to be {desired}, so the recorded model of what it produces cannot be re-copied from its sources right now."
   solution: "Stop the pipeline and wait until it is at rest, then retry the schema refresh. Pausing is not enough: a paused run retains its assembled model, and resuming an unchanged pipeline may reuse it."

@@ -35,6 +35,12 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
         this.bootstrapMinMembers = properties.getBootstrapMinMembers();
     }
 
+    /** A member by the stable id it joined under, or by its engine identity where it names none. */
+    static String stableIdOf(Member member) {
+        String nodeId = member.getAttribute(NODE_ID_ATTRIBUTE);
+        return nodeId != null ? nodeId : member.getUuid().toString();
+    }
+
     @Override
     public boolean apply(Collection<Member> members) {
         return eligible(rememberVisible(nodeIds(members)));

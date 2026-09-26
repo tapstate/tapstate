@@ -72,6 +72,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -181,7 +182,31 @@ final class StoreBackedDagSource implements DagSource {
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
-                fence -> captured.plannedDagFor(pipelineId, fence));
+                fence -> captured.plannedDagFor(pipelineId, fence), captured.sinkConnectors(pipelineId));
+    }
+
+    /**
+     * The connectors the pipeline's sinks open: each serve.sync element's target source's, and that of the managed
+     * store a view materializes into. A view whose store is not configured contributes none here; building its
+     * sink refuses it with the code that names the missing store.
+     */
+    @Override
+    public Set<String> sinkConnectors(String pipelineId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        Set<String> connectors = new TreeSet<>();
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
+            for (SyncElement element : serve.sync()) {
+                connectors.add(StoredArtifacts.requireSource(artifacts(), element.source()).connector());
+            }
+        }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            artifacts().get(ViewTargetResolver.resolve(view).sourceId())
+                    .filter(SourceResource.class::isInstance)
+                    .map(SourceResource.class::cast)
+                    .ifPresent(store -> connectors.add(store.connector()));
+        }
+        return connectors;
     }
 
     @Override

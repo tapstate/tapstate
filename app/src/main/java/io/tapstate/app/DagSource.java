@@ -37,7 +37,17 @@ interface DagSource {
         NestCapacity capacity = capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(
-                capacity, locations, Optional.empty(), fence -> plannedDagFor(pipelineId, fence));
+                capacity, locations, Optional.empty(), fence -> plannedDagFor(pipelineId, fence),
+                sinkConnectors(pipelineId));
+    }
+
+    /**
+     * The connectors the pipeline's sinks open, by id. A sink opens its connector on whichever member runs it, so
+     * these are what every member a run takes part on has to be able to load. A source with no store-backed sinks
+     * opens none.
+     */
+    default Set<String> sinkConnectors(String pipelineId) {
+        return Set.of();
     }
 
     /**
@@ -160,13 +170,21 @@ interface DagSource {
             NestCapacity capacity,
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot,
-            Function<ExecutionFence, PlannedDag> dagBuilder) {
+            Function<ExecutionFence, PlannedDag> dagBuilder,
+            Set<String> sinkConnectors) {
 
         public StartPreparation {
             Objects.requireNonNull(capacity, "capacity");
             stateLocations = Set.copyOf(Objects.requireNonNull(stateLocations, "stateLocations"));
             Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
             Objects.requireNonNull(dagBuilder, "dagBuilder");
+            sinkConnectors = Set.copyOf(Objects.requireNonNull(sinkConnectors, "sinkConnectors"));
+        }
+
+        /** A preparation whose sinks open no connector. */
+        StartPreparation(NestCapacity capacity, Set<OperatorStateLocation> stateLocations,
+                Optional<ArtifactStore> artifactSnapshot, Function<ExecutionFence, PlannedDag> dagBuilder) {
+            this(capacity, stateLocations, artifactSnapshot, dagBuilder, Set.of());
         }
 
         /**

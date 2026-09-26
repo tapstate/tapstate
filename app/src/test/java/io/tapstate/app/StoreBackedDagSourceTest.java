@@ -949,6 +949,38 @@ class StoreBackedDagSourceTest {
                 });
     }
 
+    /**
+     * The connectors a pipeline's sinks open are what every member a run takes part on must be able to load: each
+     * sync element's target source's, and the managed store's a view materializes into. The source it reads from
+     * is not among them - its connector is opened by the capture, on one member only - and a start carries the
+     * same set it was worked out from, taken from the artifacts the start froze.
+     */
+    @Test
+    void the_connectors_a_start_needs_on_every_member_are_its_sync_targets_and_its_views_store() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(new SourceResource("orders_dest", null, "postgres", Map.of("host", "d"),
+                null, null, null, null));
+        store.artifacts().save(new SourceResource("orders_copy", null, "oracle", Map.of("host", "e"),
+                null, null, null, null));
+        store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "mongodb",
+                Map.of("uri", "m"), null, null, null, null));
+        store.artifacts().save(new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null),
+                serve(FromRef.literal("order_state"), sync("sync_1", "orders_dest"), sync("sync_2", "orders_copy")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+
+        assertThat(source.sinkConnectors("p")).containsExactly("mongodb", "oracle", "postgres");
+        assertThat(source.prepareStart("p", "tapstate").sinkConnectors())
+                .containsExactlyInAnyOrder("mongodb", "oracle", "postgres");
+    }
+
     // ---- fixtures ----------------------------------------------------------------------
 
     private static SourceResource cdcSource(String id, String table) {

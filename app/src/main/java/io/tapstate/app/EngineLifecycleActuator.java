@@ -57,6 +57,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final PipelineActuationOwnership actuation;
     private final ExecutionPlanRecorder plans;
     private final Clock clock;
+    private final ConnectorReadiness connectors;
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown) {
@@ -73,6 +74,16 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown, PipelineActuationOwnership actuation, ExecutionPlanRecorder plans,
             Clock clock) {
+        this(engine, dagSource, captureCoordinator, stateTeardown, actuation, plans, clock, ConnectorReadiness.NONE);
+    }
+
+    /**
+     * As above, first asking {@code connectors} whether every member the run would take part on can load the
+     * connectors its sinks open.
+     */
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            NestStateTeardown stateTeardown, PipelineActuationOwnership actuation, ExecutionPlanRecorder plans,
+            Clock clock, ConnectorReadiness connectors) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
@@ -80,6 +91,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         this.actuation = Objects.requireNonNull(actuation, "actuation");
         this.plans = Objects.requireNonNull(plans, "plans");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.connectors = Objects.requireNonNull(connectors, "connectors");
     }
 
     @Override
@@ -92,6 +104,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         engine.refuseIfLost(pipelineId);
         DagSource.StartPreparation prepared = dagSource.prepareStart(
                 pipelineId, stateTeardown.defaultDatabase());
+        // Every member the run would take part on loads the connectors its sinks open, asked before the run is
+        // fenced or anything is opened: a member that finds out only as its sink opens fails a run that is
+        // already reading, and its reason stays on that member.
+        connectors.requireEveryMemberCanLoad(pipelineId, prepared.sinkConnectors());
         // The run's own generation, taken before the first side effect for the same reason: a run this
         // member cannot fence is one nothing could later stop from writing, so it must not be half built.
         // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any

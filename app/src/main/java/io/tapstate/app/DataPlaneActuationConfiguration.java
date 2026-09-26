@@ -55,6 +55,13 @@ class DataPlaneActuationConfiguration {
     private static final Duration STORE_PROBE_TIMEOUT = Duration.ofSeconds(10);
 
     /**
+     * How long a start waits for every member to say whether it can load the pipeline's sink connectors. A member
+     * seeing an artifact for the first time downloads and stages it, so this allows for that; a member that has
+     * not answered by then refuses the start rather than holding the pass that is starting it.
+     */
+    private static final Duration CONNECTOR_READINESS_TIMEOUT = Duration.ofSeconds(60);
+
+    /**
      * The topology builder, with every source vertex it builds held to this member. A start runs its capture
      * here before it builds, so this member's hand-off is the one the sources have to drain; left to the
      * engine, a source lands on another member as often as not on a cluster and reads nothing, healthily.
@@ -76,10 +83,7 @@ class DataPlaneActuationConfiguration {
     private static List<String> dataMembers(HazelcastInstance member) {
         return member.getCluster().getMembers().stream()
                 .filter(m -> !m.isLiteMember())
-                .map(m -> {
-                    String nodeId = m.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE);
-                    return nodeId != null ? nodeId : m.getUuid().toString();
-                })
+                .map(ClusterMembershipGate::stableIdOf)
                 .sorted()
                 .toList();
     }
@@ -248,8 +252,10 @@ class DataPlaneActuationConfiguration {
     @Bean
     LifecycleActuator lifecycleActuator(Engine engine, DagSource dagSource,
             PipelineCaptureCoordinator pipelineCaptureCoordinator, NestStateTeardown nestStateTeardown,
-            PipelineActuationOwnership pipelineActuationOwnership, HazelcastExecutionPlans executionPlans) {
+            PipelineActuationOwnership pipelineActuationOwnership, HazelcastExecutionPlans executionPlans,
+            HazelcastInstance hazelcastMember) {
         return new EngineLifecycleActuator(engine, dagSource, pipelineCaptureCoordinator, nestStateTeardown,
-                pipelineActuationOwnership, executionPlans, Clock.systemUTC());
+                pipelineActuationOwnership, executionPlans, Clock.systemUTC(),
+                new HazelcastConnectorReadiness(hazelcastMember, CONNECTOR_READINESS_TIMEOUT));
     }
 }
