@@ -7,21 +7,24 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SrsDurableFrontier;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * The production sink-ack factory carried onto the DAG: it advances one consumer pipeline's durable
- * sink-acked source position as the sink confirms writes, so the source-read durable frontier has a real
- * input. It holds only serializable coordinates — a {@code table -> mining chain id} map for every source
+ * The production sink-ack factory carried onto the DAG: it records each table's durable sink confirmation.
+ * On a known single-table chain it also advances the legacy chain prefix; a shared chain leaves that prefix
+ * for its capture owner to release in physical source order. It holds only serializable coordinates — a
+ * {@code table -> mining chain id} map for every source
  * the pipeline reads, plus the consumer pipeline id — and resolves the durable store on the member that
  * runs the sink, mirroring how the source's read-cursor publisher binds its store member-side. The store
  * itself is not serializable and never crosses the wire.
  *
  * <p>The sink knows a chain only by the {@code src} stream name its events carry — a table at L1 — so this
  * maps that stream to the mining chain that keys its durable record and advances
- * {@code (miningChainId, pipelineId, srcpos)}. A member with no store bound resolves to a no-op ack, so a
+ * {@code (miningChainId, pipelineId, table, position)}. A member with no store bound resolves to a no-op ack, so a
  * sink still runs before the assembly layer makes the member SRS-capable. A stream the map does not carry
  * is a builder-side wiring defect (the sink saw a chain the pipeline never sourced) and crashes bare.
  *
@@ -68,20 +71,37 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     : isSnapshotOf(position) ? cdcStart(meta, miningChainId, pipelineId) : null;
             ChainPosition acked = new ChainPosition(position.order(), token);
             if (isSnapshotOf(position)) {
-                meta.advanceSinkAcked(miningChainId, pipelineId, acked);
+                if (singleTableChain(miningChainId, chain, meta.consumerOffsets(miningChainId))) {
+                    meta.advanceSinkAcked(miningChainId, pipelineId, acked);
+                }
                 meta.markSnapshotComplete(miningChainId, pipelineId, chain);
             } else {
                 // A change is also recorded against its own table's ring, at the sequence it sat at there,
                 // so a run replacing this one carries on from it instead of from the head of the ring.
-                meta.advanceSinkAcked(miningChainId, pipelineId, chain, acked);
-                recordHowFarTheSourceHasBeenRead(meta, miningChainId, acked, recorded);
+                meta.advanceTableSinkAcked(miningChainId, pipelineId, chain, acked);
+                List<ConsumerOffset> consumers = meta.consumerOffsets(miningChainId);
+                if (singleTableChain(miningChainId, chain, consumers)) {
+                    meta.advanceSinkAcked(miningChainId, pipelineId, acked);
+                    List<ConsumerOffset> confirmed = consumers.stream()
+                            .map(consumer -> consumer.pipelineId().equals(pipelineId)
+                                    ? consumer.withSinkAcked(acked) : consumer)
+                            .toList();
+                    recordHowFarTheSourceHasBeenRead(meta, miningChainId, acked, confirmed, recorded);
+                }
             }
         };
     }
 
+    private boolean singleTableChain(String miningChainId, String table, List<ConsumerOffset> consumers) {
+        long mapped = chainIdByTable.entrySet().stream()
+                .filter(entry -> entry.getValue().equals(miningChainId)).count();
+        return mapped == 1 && consumers.stream().allMatch(consumer ->
+                consumer.selectedTables() == null || consumer.selectedTables().equals(List.of(table)));
+    }
+
     /**
-     * Works out again, now that this acknowledgement has landed, how far the chain may say its source has
-     * been read.
+     * Works out again on the single-table path, now that this acknowledgement has landed, how far the chain
+     * may say its source has been read. Shared chains use the capture owner's ordered batch barriers.
      *
      * <p>That value is the lowest of what the source read and what every consumer has durably landed, and
      * it used to be resolved only while a run of changes was being forwarded — against the acknowledgements
@@ -114,8 +134,9 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             SrsMetaStore meta,
             String miningChainId,
             ChainPosition acked,
+            List<ConsumerOffset> consumers,
             Map<String, ChainPosition> recorded) {
-        SrsDurableFrontier.safeAdvance(acked, meta.consumerOffsets(miningChainId)).ifPresent(safe -> {
+        SrsDurableFrontier.safeAdvance(acked, consumers).ifPresent(safe -> {
             if (!safe.equals(recorded.get(miningChainId))) {
                 meta.advanceSourceReadOffset(miningChainId, safe);
                 recorded.put(miningChainId, safe);

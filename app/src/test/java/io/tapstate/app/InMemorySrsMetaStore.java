@@ -83,6 +83,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         return existing == null ? List.of() : existing.snapshotCompletedTables();
     }
 
+    private static Map<String, ChainPosition> tableAcksOf(ConsumerOffset existing) {
+        return existing == null ? Map.of() : existing.sinkAckedByTable();
+    }
+
     @Override
     public synchronized void advanceConsumerReadSeq(
             String miningChainId, String pipelineId, String table, long lastReadSeq) {
@@ -108,7 +112,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 existing == null ? 0L : existing.snapshotEpoch(),
                 existing == null ? null : existing.selectedTables(),
                 existing == null ? null : existing.selectedTablesEpoch(),
-                existing == null ? null : existing.cursorWriterToken()));
+                existing == null ? null : existing.cursorWriterToken(), tableAcksOf(existing)));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
                 m.schemaHistory(), m.retention(), m.epoch()));
@@ -136,11 +140,22 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         }
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(offset -> offset.pipelineId().equals(pipelineId));
+        Map<String, ChainPosition> retainedAcks = new LinkedHashMap<>();
+        if (previous != null && Objects.equals(previous.selectedTablesEpoch(), epoch)) {
+            for (String table : tables) {
+                ChainPosition ack = previous.sinkAckedByTable().get(table);
+                if (ack != null) {
+                    retainedAcks.put(table, ack);
+                }
+            }
+        } else {
+            forgetRingSeqs(miningChainId, pipelineId);
+        }
         next.add(new ConsumerOffset(pipelineId, retained,
                 previous == null ? null : previous.sinkAcked(), completedOf(previous),
                 previous == null ? null : previous.cdcStartPosition(),
                 previous == null ? 0L : previous.snapshotEpoch(),
-                tables, epoch, cursorWriterToken));
+                tables, epoch, cursorWriterToken, retainedAcks));
         records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), next,
                 m.schemaHistory(), m.retention(), m.epoch()));
     }
@@ -179,7 +194,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 existing == null ? 0L : existing.snapshotEpoch(),
                 existing == null ? null : existing.selectedTables(),
                 existing == null ? null : existing.selectedTablesEpoch(),
-                existing == null ? null : existing.cursorWriterToken()));
+                existing == null ? null : existing.cursorWriterToken(), tableAcksOf(existing)));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
                 m.schemaHistory(), m.retention(), m.epoch()));
@@ -207,7 +222,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 snapshotEpoch,
                 existing == null ? null : existing.selectedTables(),
                 existing == null ? null : existing.selectedTablesEpoch(),
-                existing == null ? null : existing.cursorWriterToken()));
+                existing == null ? null : existing.cursorWriterToken(), tableAcksOf(existing)));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
                 m.schemaHistory(), m.retention(), m.epoch()));
@@ -258,7 +273,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 mine == null ? 0L : mine.snapshotEpoch(),
                 mine == null ? null : mine.selectedTables(),
                 mine == null ? null : mine.selectedTablesEpoch(),
-                mine == null ? null : mine.cursorWriterToken()));
+                mine == null ? null : mine.cursorWriterToken(), tableAcksOf(mine)));
         records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
                 m.schemaHistory(), m.retention(), m.epoch()));
     }
@@ -288,6 +303,45 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         if (position.order().seq() >= 0) {
             ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
                     .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
+                    .merge(table, position.order().seq(), Math::max);
+        }
+    }
+
+    @Override
+    public synchronized void advanceTableSinkAcked(
+            String miningChainId, String pipelineId, String table, ChainPosition position) {
+        SrsMeta meta = require(miningChainId);
+        ConsumerOffset current = meta.consumerOffset(pipelineId).orElse(null);
+        if (current != null && current.selectedTablesEpoch() != null
+                && current.selectedTablesEpoch() != position.order().epoch()) {
+            return;
+        }
+        if (current != null && current.selectedTables() != null
+                && !current.selectedTables().contains(table)) {
+            return;
+        }
+        ChainPosition prior = current == null ? null : current.sinkAckedByTable().get(table);
+        if (prior != null && prior.order().compareTo(position.order()) >= 0) {
+            return;
+        }
+        Map<String, ChainPosition> tableAcks = new LinkedHashMap<>(tableAcksOf(current));
+        tableAcks.put(table, position);
+        List<ConsumerOffset> next = new ArrayList<>(meta.consumerOffsets());
+        next.removeIf(offset -> offset.pipelineId().equals(pipelineId));
+        next.add(new ConsumerOffset(pipelineId,
+                current == null ? Map.of() : current.perTableSeq(),
+                current == null ? null : current.sinkAcked(),
+                completedOf(current),
+                current == null ? null : current.cdcStartPosition(),
+                current == null ? 0L : current.snapshotEpoch(),
+                current == null ? null : current.selectedTables(),
+                current == null ? null : current.selectedTablesEpoch(),
+                current == null ? null : current.cursorWriterToken(), tableAcks));
+        records.put(miningChainId, new SrsMeta(meta.miningChainId(), meta.sourceRead(), next,
+                meta.schemaHistory(), meta.retention(), meta.epoch()));
+        if (position.order().seq() >= 0) {
+            ringDone.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
+                    .computeIfAbsent(pipelineId, ignored -> new LinkedHashMap<>())
                     .merge(table, position.order().seq(), Math::max);
         }
     }

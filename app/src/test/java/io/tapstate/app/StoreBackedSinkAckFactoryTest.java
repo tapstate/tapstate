@@ -19,6 +19,7 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -148,6 +149,32 @@ class StoreBackedSinkAckFactoryTest {
         // apart and neither ring is positioned by the other's.
         assertThat(store.ringDoneThrough("mc-shop", "pipe-1"))
                 .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 7L, "items", 3L));
+    }
+
+    @Test
+    void aQuietTableAckCannotAdvanceTheSharedSourcePastAnotherTablesPendingChange() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-shop", null);
+        store.advanceSourceReadOffset("mc-shop", at(-1, "t0"));
+        store.upsertConsumerOffset("mc-shop", new ConsumerOffset("pipe-1", Map.of(), null,
+                List.of(), null, 0L, List.of("orders", "customers"), 1L, "reader-1"));
+        SinkAck ack = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-shop", "customers", "mc-shop"), "pipe-1")
+                .resolve(memberWith(store));
+
+        // Orders at physical token t1 is still in flight. The later customers change at t2 has no
+        // target row and may settle independently, but a restart must still be able to re-mine orders.
+        ack.advance("customers", at(0, "t2"));
+
+        assertThat(store.ringDoneThrough("mc-shop", "pipe-1"))
+                .containsExactlyInAnyOrderEntriesOf(Map.of("customers", 0L));
+        ConsumerOffset consumer = store.read("mc-shop").orElseThrow()
+                .consumerOffset("pipe-1").orElseThrow();
+        assertThat(consumer.sinkAckedByTable()).containsEntry("customers", at(0, "t2"));
+        assertThat(consumer.sinkAcked()).isNull();
+        assertThat(store.read("mc-shop").orElseThrow().sourceReadOffset())
+                .as("a physical source read offset cannot cross an unacknowledged table")
+                .isEqualTo("t0");
     }
 
     @Test

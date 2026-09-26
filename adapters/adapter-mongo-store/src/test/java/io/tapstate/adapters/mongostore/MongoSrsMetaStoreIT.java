@@ -91,6 +91,44 @@ class MongoSrsMetaStoreIT {
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
+    void tableAcksPersistIndependentlyAndOldRingGenerationsCannotConfirmTheNewOne() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders", "customers"), first, "reader-one");
+
+            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(first, 0), "t2"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(first, 4), "t1"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(first, 0), "stale"));
+
+            ConsumerOffset persisted = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(persisted.sinkAcked()).isNull();
+            assertThat(persisted.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                    "orders", new ChainPosition(new SourceOrder(first, 4), "t1"),
+                    "customers", new ChainPosition(new SourceOrder(first, 0), "t2")));
+            assertThat(store.ringDoneThrough(CHAIN, "pipe"))
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 4L, "customers", 0L));
+
+            long second = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders", "customers"), second, "reader-two");
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(first, 99), "old-run"));
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow()
+                    .sinkAckedByTable()).isEmpty();
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).isEmpty();
+
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(second, 0), "replayed"));
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow()
+                    .sinkAckedByTable()).containsOnlyKeys("orders");
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 0L);
+        });
+    }
+
+    @Test
     void createSeedsAnEmptyRecordAndReadReturnsIt() {
         withStore(store -> {
             store.create(CHAIN, "7d");

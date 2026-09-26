@@ -167,6 +167,17 @@ public interface SrsMetaStore {
     }
 
     /**
+     * Records only this table's durable acknowledgement in its own ring generation, without moving the
+     * chain-level acknowledgement. A capture owner releases the latter only after every table and consumer
+     * affected by an ordered physical source batch has confirmed it. The table update also raises its
+     * {@code ringDoneThrough} cursor in the same atomic write. Older or equal table positions are ignored.
+     */
+    default void advanceTableSinkAcked(
+            String miningChainId, String pipelineId, String table, ChainPosition position) {
+        throw new UnsupportedOperationException("per-table sink acknowledgements are unavailable");
+    }
+
+    /**
      * Per table, the ring sequence up to which this pipeline has nothing left to receive from that table's
      * change ring: the last change its sink confirmed there, or where the ring stood when the pipeline
      * arrived on it, whichever {@link #advanceSinkAcked(String, String, String, ChainPosition)} and
