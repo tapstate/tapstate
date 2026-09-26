@@ -59,6 +59,9 @@ final class TelemetryCleanupHealth implements TelemetryCleanupReporter {
 
     List<MetricFact> facts() {
         Health health = health();
+        if (health.failures() == 0) {
+            return List.of();
+        }
         Instant observedAt = clock.instant();
         return List.of(
                 MetricFact.single("tapstate.process.telemetry.cleanup.failure", MetricType.COUNTER,

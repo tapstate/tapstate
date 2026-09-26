@@ -36,6 +36,8 @@ class TelemetryCleanupHealthTest {
             }
         };
         TelemetryCleanupHealth health = new TelemetryCleanupHealth(CLOCK, export, offered::add);
+        assertThat(process.get()).isNotNull();
+        assertThat(process.get().get()).isEmpty();
 
         health.failed(new TelemetryCleanupReporter.Failure("flow", "inc-old", OptionalLong.of(4),
                 "event-history", true));
