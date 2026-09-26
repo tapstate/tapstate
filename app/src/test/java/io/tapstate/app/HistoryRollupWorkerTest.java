@@ -95,6 +95,23 @@ class HistoryRollupWorkerTest {
     }
 
     @Test
+    void oneFailedBucketIsAttemptedOnlyOncePerColdPass() {
+        MutableClock clock = new MutableClock(TEN.plus(Duration.ofMinutes(6)));
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        raw.appendScoped(sample(TEN.plusSeconds(60), 1, 1), owner(1));
+        MemoryRollups rollups = new MemoryRollups();
+        rollups.alwaysFail = true;
+
+        try (HistoryRollupWorker worker = worker(raw, rollups, clock, 16,
+                List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+            worker.runOneBatch();
+        }
+
+        assertThat(rollups.attempts).containsExactly(FIRST);
+    }
+
+
+    @Test
     void ownerDenialDoesNotReadRawOrWriteAndLateRefreshIsBoundedAndExplicit() {
         MutableClock clock = new MutableClock(TEN.plus(Duration.ofMinutes(6)));
         InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
@@ -302,10 +319,11 @@ class HistoryRollupWorkerTest {
         private final Map<Key, Bucket> rows = new HashMap<>();
         private final List<Key> attempts = new ArrayList<>();
         private boolean failNextUpsert;
+        private boolean alwaysFail;
 
         @Override public void upsert(Bucket bucket) {
             attempts.add(bucket.key());
-            if (failNextUpsert) {
+            if (failNextUpsert || alwaysFail) {
                 failNextUpsert = false;
                 throw new IllegalStateException("injected rollup write failure");
             }

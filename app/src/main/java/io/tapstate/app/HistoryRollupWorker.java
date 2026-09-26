@@ -131,8 +131,13 @@ final class HistoryRollupWorker implements AutoCloseable {
         emptyRetryAt.keySet().retainAll(liveSet);
         refreshHints.removeIf(key -> !liveSet.contains(new Work(key.pipelineId(), key.scope())));
         int idle = 0;
+        Set<Work> failedThisPass = new HashSet<>();
         for (int attempts = 0; attempts < batchSize && idle < live.size();) {
             Work work = live.get(Math.floorMod(nextWorkIndex++, live.size()));
+            if (failedThisPass.contains(work)) {
+                idle++;
+                continue;
+            }
             try {
                 if (!permitted.test(work) || !processOne(work)) {
                     idle++;
@@ -142,7 +147,8 @@ final class HistoryRollupWorker implements AutoCloseable {
                 }
             } catch (RuntimeException failure) {
                 attempts++;
-                idle = 0;
+                idle++;
+                failedThisPass.add(work);
                 LOG.warn("Could not build a closed history rollup bucket for pipeline {}; retrying",
                         work.pipelineId(), failure);
             }
