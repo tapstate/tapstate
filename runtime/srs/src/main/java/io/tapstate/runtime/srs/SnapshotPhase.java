@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.function.Consumer;
 
 /**
@@ -82,6 +83,20 @@ public final class SnapshotPhase {
             long ringEpoch,
             SrsMetaStore meta,
             Consumer<Envelope> sink) {
+        return run(port, config, miningChainId, pipelineId, tables, ringEpoch, meta, null, sink);
+    }
+
+    /** The prepared-run form refuses a seam write after a newer reader takes the cursor token. */
+    public static Outcome run(
+            CapturePort port,
+            CaptureConfig config,
+            String miningChainId,
+            String pipelineId,
+            List<String> tables,
+            long ringEpoch,
+            SrsMetaStore meta,
+            String cursorWriterToken,
+            Consumer<Envelope> sink) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(miningChainId, "miningChainId");
@@ -122,7 +137,12 @@ public final class SnapshotPhase {
                             CaptureError.SNAPSHOT_REPORTS_NO_SEAM, Map.of("chain", miningChainId), null));
                     if (progress.tailSeam == null) {
                         progress.tailSeam = resumedStart != null ? resumedStart : found.token();
-                        meta.setCdcStart(miningChainId, pipelineId, progress.tailSeam, epoch);
+                        if (cursorWriterToken == null) {
+                            meta.setCdcStart(miningChainId, pipelineId, progress.tailSeam, epoch);
+                        } else if (!meta.setCdcStartIfCurrent(miningChainId, pipelineId,
+                                cursorWriterToken, ringEpoch, progress.tailSeam, epoch)) {
+                            throw new CancellationException("snapshot cursor token was replaced before its seam");
+                        }
                     }
                 }
 

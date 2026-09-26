@@ -24,6 +24,7 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceRef;
@@ -76,6 +77,8 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import org.junit.jupiter.api.AfterEach;
@@ -98,6 +101,183 @@ import org.junit.jupiter.api.Test;
  */
 class LifecycleVerbsOnRealChainE2ETest {
 
+    @Test
+    void slowSnapshotLeavesAnotherCdcPipelinesConvergenceAndObservationCadenceLive() throws Exception {
+        store = seedPipelineAndSchema();
+        addFastCdcPipeline();
+        makeMemberCapable(store);
+        CountDownLatch slowRead = new CountDownLatch(1);
+        CountDownLatch releaseSlow = new CountDownLatch(1);
+        CapturePort source = new CapturePort() {
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("streaming start must not materialize a batch");
+            }
+            @Override public void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
+                listener.seam(Optional.of(new SourcePosition("seam-0")));
+                listener.row(read(1));
+                slowRead.countDown();
+                try {
+                    if (!releaseSlow.await(10, TimeUnit.SECONDS)) {
+                        throw new AssertionError("slow snapshot was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+                listener.row(read(2));
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                if (config.streams().contains("fast_orders")) {
+                    listener.onBatch(List.of(Envelope.insert(100L, "fast_orders",
+                                    Map.of("id", 100L, "amount", "fast"), Map.of())),
+                            Optional.of(new SourcePosition("fast-100")));
+                }
+                return () -> { };
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        wireConvergeChain(source, true);
+        try {
+            store.desired().save(new DesiredState(PIPELINE, RUNNING, REV));
+            store.desired().save(new DesiredState("fast-pipe", RUNNING, REV));
+            driver.reconcile();
+            assertThat(slowRead.await(10, TimeUnit.SECONDS)).isTrue();
+            awaitKeys("100");
+            Observation first = store.observations().read("fast-pipe").orElseThrow();
+            assertThat(first.state()).isEqualTo(RUNNING);
+            assertThat(releaseSlow.getCount()).isEqualTo(1);
+
+            Thread.sleep(10);
+            driver.reconcile();
+            Observation next = store.observations().read("fast-pipe").orElseThrow();
+            assertThat(next.observedAt()).isAfter(first.observedAt());
+            assertThat(releaseSlow.getCount()).isEqualTo(1);
+        } finally {
+            releaseSlow.countDown();
+        }
+    }
+
+    @Test
+    void streamingSnapshotAdvancesRowsDoneBeforeCompletionAndKeepsCdcBehindIt() throws Exception {
+        store = seedPipelineAndSchema();
+        makeMemberCapable(store);
+        CountDownLatch firstRead = new CountDownLatch(1);
+        CountDownLatch releaseRead = new CountDownLatch(1);
+        CapturePort source = new CapturePort() {
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("streaming start must not materialize a batch");
+            }
+            @Override public void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
+                listener.seam(Optional.of(new SourcePosition("seam-0")));
+                listener.row(read(1));
+                firstRead.countDown();
+                try {
+                    if (!releaseRead.await(10, TimeUnit.SECONDS)) {
+                        throw new AssertionError("snapshot read was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+                listener.row(read(2));
+                listener.row(read(3));
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                listener.onBatch(List.of(insert(4)), Optional.of(new SourcePosition("src-4")));
+                return () -> { };
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        wireConvergeChain(source, true);
+        try {
+            desire(RUNNING);
+            assertThat(firstRead.await(10, TimeUnit.SECONDS)).isTrue();
+            awaitKeys("1");
+            awaitCondition(() -> captureCoordinator.snapshotProgress(PIPELINE)
+                            .byTable().get(TABLE).rowsDone() == 1L,
+                    () -> "live snapshot rowsDone did not reach one: "
+                            + captureCoordinator.snapshotProgress(PIPELINE));
+            driver.reconcile();
+            Observation inFlight = store.observations().read(PIPELINE).orElseThrow();
+            assertThat(inFlight.snapshot().get(TABLE).rowsDone()).isEqualTo(1L);
+            assertThat(inFlight.observedAt()).isNotNull();
+            Thread.sleep(100);
+            assertThat(RecordingSink.keys()).contains("1").doesNotContain("2", "3", "4");
+
+            releaseRead.countDown();
+            awaitKeys("1", "2", "3", "4");
+            awaitCondition(() -> captureCoordinator.snapshotProgress(PIPELINE)
+                            .byTable().get(TABLE).rowsDone() == 3L,
+                    () -> "live snapshot rowsDone did not reach three: "
+                            + captureCoordinator.snapshotProgress(PIPELINE));
+        } finally {
+            releaseRead.countDown();
+        }
+    }
+
+    @Test
+    void stoppingAMidReadSnapshotCancelsItsWorkerAndReleasesItsSession() throws Exception {
+        store = seedPipelineAndSchema();
+        makeMemberCapable(store);
+        CountDownLatch reading = new CountDownLatch(1);
+        CountDownLatch exited = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CapturePort source = new CapturePort() {
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("streaming start must not materialize a batch");
+            }
+            @Override public void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
+                try {
+                    listener.seam(Optional.of(new SourcePosition("seam-0")));
+                    listener.row(read(1));
+                    reading.countDown();
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    exited.countDown();
+                }
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                throw new AssertionError("cancelled snapshot must not start CDC");
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        wireConvergeChain(source, true);
+        SnapshotBuffer buffer = (SnapshotBuffer) member.getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY);
+        SourceResource artifact = (SourceResource) store.artifacts().get(SOURCE_ID).orElseThrow();
+        String ringName = SourceCaptureResolution.of(artifact).ringName(TABLE);
+        try {
+            desire(RUNNING);
+            assertThat(reading.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(buffer.hasSnapshot(PIPELINE, ringName)).isTrue();
+
+            desire(STOPPED);
+
+            assertThat(exited.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(buffer.hasSnapshot(PIPELINE, ringName)).isFalse();
+            assertThat(captureCoordinator.snapshotProgress(PIPELINE)).isEqualTo(SnapshotReading.NONE);
+            assertActualState(STOPPED, 2L);
+        } finally {
+            release.countDown();
+        }
+    }
+
     private static final String PIPELINE = "orders-pipe";
     private static final String SOURCE_ID = "orders_src";
     private static final String DEST_ID = "orders_dest";
@@ -109,6 +289,8 @@ class LifecycleVerbsOnRealChainE2ETest {
     private InMemoryStorePort store;
     private ConvergenceDriver driver;
     private PipelineObservationQueryService readFaces;
+    private PipelineCaptureCoordinator captureCoordinator;
+    private io.tapstate.runtime.srs.SnapshotWorkers snapshotWorkers;
 
     @BeforeEach
     void startMember() {
@@ -135,6 +317,9 @@ class LifecycleVerbsOnRealChainE2ETest {
 
     @AfterEach
     void stopMember() {
+        if (snapshotWorkers != null) {
+            snapshotWorkers.close();
+        }
         if (member != null) {
             member.shutdown();
         }
@@ -241,15 +426,25 @@ class LifecycleVerbsOnRealChainE2ETest {
 
     // ---- wiring ------------------------------------------------------------------------
 
-    private void wireConvergeChain(FakeSource source) {
+    private void wireConvergeChain(CapturePort source) {
+        wireConvergeChain(source, false);
+    }
+
+    private void wireConvergeChain(CapturePort source, boolean streamingSnapshot) {
         SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
-        CaptureRunUnit captureRunUnit = new CaptureRunUnit(source, srsCoordinator, store.meta(), member);
+        SnapshotBuffer buffer = (SnapshotBuffer) member.getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY);
+        snapshotWorkers = streamingSnapshot ? new io.tapstate.runtime.srs.SnapshotWorkers(1, 1) : null;
+        CaptureRunUnit captureRunUnit = streamingSnapshot
+                ? new CaptureRunUnit(source, srsCoordinator, store.meta(), member, buffer, snapshotWorkers)
+                : new CaptureRunUnit(source, srsCoordinator, store.meta(), member);
         PipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
-                store, captureRunUnit::start, srsCoordinator,
-                (SnapshotBuffer) member.getUserContext().get(SnapshotBuffer.USER_CONTEXT_KEY));
+                store, captureRunUnit::start, srsCoordinator, buffer);
+        captureCoordinator = coordinator;
         StoreBackedDagSource.SinkWriterBinder recordingSink =
                 (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) () -> new RecordingSink(target);
-        DagSource dagSource = new StoreBackedDagSource(store, recordingSink);
+        DagSource dagSource = streamingSnapshot
+                ? new StoreBackedDagSource(store, recordingSink, buffer)
+                : new StoreBackedDagSource(store, recordingSink);
         Engine engine = new Engine(member);
         EngineLifecycleActuator actuator = TestEngineLifecycleActuators.create(
                 engine, dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
@@ -286,6 +481,20 @@ class LifecycleVerbsOnRealChainE2ETest {
                         List.of("id"),
                         List.of())))));
         return seeded;
+    }
+
+    private void addFastCdcPipeline() {
+        store.artifacts().save(new SourceResource("fast_src", null, "fake", Map.of("host", "fast"),
+                SourceMode.CDC, List.of(TableRef.literal("fast_orders")), null, null));
+        store.artifacts().save(new PipelineResource("fast-pipe", null,
+                List.of(SourceRef.spec("fast_src", true)), List.of(), null,
+                new ServeBlock.Inline(null, FromRef.literal("fast_src"),
+                        List.of(new SyncElement("fast_sync", DEST_ID, null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+        store.schemas().save(new DiscoveredSourceModel("fast_src", "fake", 0L, new SourceModel(List.of(
+                new SourceTable("fast_orders",
+                        List.of(new SourceField("id", "INT"), new SourceField("amount", "STRING")),
+                        List.of("id"), List.of())))));
     }
 
     private void makeMemberCapable(InMemoryStorePort seeded) {

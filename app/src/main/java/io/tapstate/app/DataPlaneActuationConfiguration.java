@@ -64,10 +64,11 @@ class DataPlaneActuationConfiguration {
      */
     @Bean
     DagSource dagSource(StorePort storePort, NestSettings nestSettings, ConnectionTester connectionTester,
-            HazelcastInstance hazelcastMember) {
+            HazelcastInstance hazelcastMember, SnapshotBuffer snapshotBuffer) {
         return new StoreBackedDagSource(storePort, nestSettings,
                 StoreReachability.probing(connectionTester, STORE_PROBE_TIMEOUT),
-                SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()));
+                SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()),
+                snapshotBuffer);
     }
 
     @Bean
@@ -91,10 +92,19 @@ class DataPlaneActuationConfiguration {
         return new SnapshotBuffer();
     }
 
+    @Bean(destroyMethod = "close")
+    io.tapstate.runtime.srs.SnapshotWorkers snapshotWorkers() {
+        return new io.tapstate.runtime.srs.SnapshotWorkers(
+                io.tapstate.runtime.srs.SnapshotWorkers.DEFAULT_CONCURRENCY,
+                io.tapstate.runtime.srs.SnapshotWorkers.DEFAULT_QUEUE_CAPACITY);
+    }
+
     @Bean
     CaptureRunUnit captureRunUnit(CapturePort capturePort, SrsCoordinator srsCoordinator,
-            SrsMetaStore srsMetaStore, HazelcastInstance hazelcastMember) {
-        return new CaptureRunUnit(capturePort, srsCoordinator, srsMetaStore, hazelcastMember);
+            SrsMetaStore srsMetaStore, HazelcastInstance hazelcastMember,
+            SnapshotBuffer snapshotBuffer, io.tapstate.runtime.srs.SnapshotWorkers snapshotWorkers) {
+        return new CaptureRunUnit(capturePort, srsCoordinator, srsMetaStore, hazelcastMember,
+                snapshotBuffer, snapshotWorkers);
     }
 
     @Bean

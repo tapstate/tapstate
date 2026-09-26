@@ -40,6 +40,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
@@ -55,6 +58,82 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
  * connector (a fixed snapshot batch and a fixed change stream) standing in for a real PDK source.
  */
 class CaptureRunUnitTest {
+
+    @Test
+    void reservedSnapshotReturnsBeforeReadingAndStartsOnlyAfterActivation() throws Exception {
+        CountDownLatch firstRow = new CountDownLatch(1);
+        CountDownLatch releaseRead = new CountDownLatch(1);
+        CapturePort source = new CapturePort() {
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("whole snapshot batch must not be used");
+            }
+            @Override public void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
+                listener.seam(Optional.empty());
+                listener.row(row(1));
+                firstRow.countDown();
+                try {
+                    if (!releaseRead.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("snapshot read was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+                listener.row(row(2));
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                throw new AssertionError("snapshot-only capture has no CDC tail");
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        InMemoryMeta meta = new InMemoryMeta();
+        String ringName = SrsRingbuffer.ringName(
+                MiningChainId.resolve(config(), "deferred-snapshot-test").value(), "orders");
+        List<Envelope> observed = new java.util.concurrent.CopyOnWriteArrayList<>();
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1);
+                var caller = Executors.newSingleThreadExecutor()) {
+            CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz,
+                    buffer, workers);
+            CaptureRunSpec request = spec(ReadMode.SNAPSHOT_ONLY, false, "deferred-snapshot-test")
+                    .withChainSelection(List.of("orders"), "run-a");
+            CaptureRun run = caller.submit(() -> unit.start(request, observed::add)).get(5, TimeUnit.SECONDS);
+            try {
+                assertThat(firstRow.getCount()).isEqualTo(1);
+                assertThat(buffer.hasSnapshot("pipe-1", ringName, "run-a")).isTrue();
+                assertThat(buffer.drainSnapshot("pipe-1", ringName,
+                        request.cursorWriterToken(), 1).state())
+                        .isEqualTo(SnapshotBuffer.SessionState.ACTIVE);
+                run.activateSnapshot();
+                assertThat(firstRow.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(observed).hasSize(1);
+                List<Envelope> buffered = new ArrayList<>(
+                        buffer.drainSnapshot("pipe-1", ringName, "run-a", 1).rows());
+                releaseRead.countDown();
+                SnapshotBuffer.SessionState terminal = SnapshotBuffer.SessionState.ACTIVE;
+                long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (terminal != SnapshotBuffer.SessionState.DONE && System.nanoTime() < until) {
+                    SnapshotBuffer.SessionDrain next = buffer.drainSnapshot("pipe-1", ringName, "run-a", 1);
+                    buffered.addAll(next.rows());
+                    terminal = next.state();
+                    if (terminal == SnapshotBuffer.SessionState.ACTIVE) {
+                        Thread.sleep(5);
+                    }
+                }
+                assertThat(terminal).isEqualTo(SnapshotBuffer.SessionState.DONE);
+                assertThat(buffered).extracting(event -> event.after().get("id")).containsExactly(1, 2);
+                assertThat(observed).hasSize(2);
+            } finally {
+                releaseRead.countDown();
+                run.close();
+            }
+        }
+    }
 
     private static HazelcastInstance hz;
 

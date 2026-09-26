@@ -24,6 +24,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Objects;
+import java.util.concurrent.CancellationException;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -36,6 +38,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * records the cdc-start position, and a capturing downstream sink.
  */
 class SnapshotPhaseTest {
+
+    @Test
+    void aReplacedCursorTokenRefusesTheOldSeamBeforeAnySnapshotRowLeaves() {
+        FakePort port = new FakePort(new FakeBatch(List.of(row(1)), "old-seam"));
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>());
+        meta.expectedToken = "run-b";
+        List<Envelope> delivered = new ArrayList<>();
+
+        assertThatThrownBy(() -> SnapshotPhase.run(port, config(), "chain", PIPE,
+                List.of("orders"), 1L, meta, "run-a", delivered::add))
+                .isInstanceOf(CancellationException.class);
+        assertThat(meta.cdcStart).isNull();
+        assertThat(delivered).isEmpty();
+    }
 
     @Test
     void chainlessSnapshotUsesTheStreamingPortWithoutMaterializingABatch() {
@@ -638,6 +654,7 @@ class SnapshotPhaseTest {
         String pipelineId;
         String cdcStart;
         long pinnedEpoch;
+        String expectedToken;
 
         RecordingMeta(List<String> trace) {
             this(trace, new SrsMeta("chain", null, List.of(), List.of(), null));
@@ -655,6 +672,17 @@ class SnapshotPhaseTest {
             this.cdcStart = cdcStartPosition;
             this.pinnedEpoch = snapshotEpoch;
             trace.add("cdc-start");
+        }
+
+        @Override
+        public boolean setCdcStartIfCurrent(String miningChainId, String pipelineId,
+                String cursorWriterToken, long selectedTablesEpoch,
+                String cdcStartPosition, long snapshotEpoch) {
+            if (!Objects.equals(expectedToken, cursorWriterToken)) {
+                return false;
+            }
+            setCdcStart(miningChainId, pipelineId, cdcStartPosition, snapshotEpoch);
+            return true;
         }
 
         @Override

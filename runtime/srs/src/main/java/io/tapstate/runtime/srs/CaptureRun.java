@@ -16,19 +16,18 @@ import java.util.Map;
  *       a snapshot-only or srs-disabled run opens no shared chain.</li>
  *   <li>{@code merged} — whether provisioning force-merged onto an already-open chain (a config coinciding
  *       with a running capture) rather than opening a fresh one; false when no chain was provisioned.</li>
- *   <li>{@code snapshotCount} — how many snapshot rows were drained straight to the pass-through sink; zero
- *       when the read mode runs no snapshot.</li>
- *   <li>{@code snapshotCounts} — the same count split by source stream; empty when the read mode runs no
- *       snapshot. This carries the table dimension needed by a multi-table source.</li>
+ *   <li>{@code snapshotCount} / {@code snapshotCounts} — rows read by the time this handle was created;
+ *       an asynchronously activated snapshot begins at zero and reports live counts through its health
+ *       and the coordinator's pass-through callback.</li>
  *   <li>{@code ringSource} — the self-built Jet source over the change ring, present only on the shared-ring
  *       path; the downstream reads the cdc tail from it.</li>
- *   <li>{@code cdcSubscription} — the handle that stops the cdc stream, present whenever a tail runs (the
- *       shared-ring writer or the srs-disabled direct stream); closing it stops the capture.</li>
+ *   <li>{@code cdcSubscription} — the close handle for a running tail or reserved snapshot worker;
+ *       a snapshot-only run may carry the latter until its bounded read ends.</li>
  * </ul>
  *
  * <p>The handle is itself {@link AutoCloseable}: closing it tears the running capture down by closing the
- * cdc subscription it carries. A run that opened no tail (a snapshot-only or srs-disabled run) carries no
- * subscription, so closing it is a safe no-op. The subscription contract stops the capture with no checked
+ * cdc subscription or snapshot reservation it carries. A run that opened neither has no subscription, so
+ * closing it is a safe no-op. The subscription contract stops the capture with no checked
  * exception and is idempotent, so this close needs neither a throws clause nor its own guard.
  */
 public record CaptureRun(
@@ -66,6 +65,15 @@ public record CaptureRun(
      */
     public Optional<Throwable> failure() {
         return health.failure();
+    }
+
+    /** Starts a reserved data-plane snapshot after the downstream job is ready to drain it. */
+    public void activateSnapshot() {
+        cdcSubscription.ifPresent(subscription -> {
+            if (subscription instanceof SnapshotActivation activation) {
+                activation.activateSnapshot();
+            }
+        });
     }
 
     /** Stops the capture by closing its cdc subscription, or does nothing when the run opened no tail. */

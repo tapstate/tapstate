@@ -115,6 +115,29 @@ public final class SnapshotBuffer {
         }
     }
 
+    /** Whether this exact run owns the member-local session for the ring. */
+    public boolean hasSnapshot(String pipelineId, String ringName, String token) {
+        Session session = sessions.get(new BufferKey(pipelineId, ringName));
+        return session != null && session.token.equals(token);
+    }
+
+    /** Whether any snapshot session is present, including one belonging to a newer run. */
+    public boolean hasSnapshot(String pipelineId, String ringName) {
+        return sessions.containsKey(new BufferKey(pipelineId, ringName));
+    }
+
+    /** Releases one exact session without touching another source of the same pipeline. */
+    public void releaseSnapshot(String pipelineId, String ringName, String token) {
+        BufferKey key = new BufferKey(pipelineId, ringName);
+        sessions.computeIfPresent(key, (ignored, session) -> {
+            if (!session.token.equals(token)) {
+                return session;
+            }
+            session.release();
+            return null;
+        });
+    }
+
     /** Waits for bounded row and logical-byte capacity, then appends under the exact run token. */
     public void appendSnapshot(String pipelineId, String ringName, String token, Envelope row) {
         Objects.requireNonNull(row, "row");

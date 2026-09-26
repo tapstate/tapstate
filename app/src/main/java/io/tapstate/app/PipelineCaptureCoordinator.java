@@ -10,7 +10,8 @@ import java.util.Optional;
  * Runs a pipeline's source-side capture alongside its Jet job. When a pipeline starts, its cdc capture must
  * run so the per-table change rings its topology reads are actually filled; when it stops, that capture must
  * be torn down so no capture daemon leaks. The actuator drives both this and the engine, composing the two
- * so a start fills the ring before the job reads it and a stop stops the job before the capture behind it.
+ * so a start provisions the ring before job submission and activates a reserved snapshot reader afterward;
+ * a stop stops the job before the capture behind it.
  */
 interface PipelineCaptureCoordinator {
 
@@ -38,6 +39,10 @@ interface PipelineCaptureCoordinator {
     default void startCapture(
             String pipelineId, ArtifactStore artifactSnapshot, String cursorWriterToken) {
         startCapture(pipelineId, artifactSnapshot);
+    }
+
+    /** Activates reserved snapshot readers only after the consuming Jet job has been submitted. */
+    default void activateSnapshot(String pipelineId) {
     }
 
     /** Whether this member still holds capture handles for the pipeline after its Jet job has ended. */
@@ -71,10 +76,8 @@ interface PipelineCaptureCoordinator {
      * Whether every table this pipeline reads has had its initial load confirmed at this pipeline's target.
      *
      * <p>Delivered, not read -- and the two come apart for the whole of the window this question exists for.
-     * A bounded read drains in one blocking pass before the job that carries its rows is even submitted, so
-     * by the time anyone can hold a pipeline part way through its load, every table's read has long since
-     * returned while almost none of what it read has reached the target. A reading taken from the read side
-     * answers yes throughout, which is the same as not asking at all.
+     * A streaming read may still be running while the job carries its first rows, and none of those rows is
+     * durable until a target confirms it. A reading taken from the source side alone answers too early.
      *
      * <p>It has to be asked because the rows a read produced live nowhere durable until the target confirms
      * them: they reach the source vertex through a member-local hand-off that is consumed once. A job that
@@ -96,11 +99,7 @@ interface PipelineCaptureCoordinator {
      *
      * <p>The start rides along because the rows are a total and a total without what it accumulates from
      * cannot be read: a pipeline restarted onto a fresh load and one whose count went backwards are the
-     * same observation otherwise.
-     *
-     * <p>What this reports is the finished load, not a live position in one: a table's bounded snapshot read
-     * drains in one blocking pass, so its row count exists only once that pass returns. Until then the table
-     * is simply absent, which the read face publishes as unavailable rather than as a table at zero rows.
+     * same observation otherwise. Counts advance from source callbacks while a load is running.
      */
     default SnapshotReading snapshotProgress(String pipelineId) {
         return SnapshotReading.NONE;
@@ -116,10 +115,8 @@ interface PipelineCaptureCoordinator {
      * them, and that gap is the only thing distinguishing a pipeline that is keeping up from one whose
      * reading is fine and whose writing has stopped.
      *
-     * <p><strong>A bounded load lands in one step.</strong> Its read drains in one blocking pass before the
-     * pipeline has a job or a registered run at all, so its rows appear here the moment that pass returns
-     * and not while it runs -- the same window {@link #snapshotProgress} is blind through, for the same
-     * reason. What follows the load is counted as it arrives.
+     * <p>A bounded load and its tail are counted by the same run health account. Its rows become visible as
+     * the source hands them over, including while the snapshot is still running.
      */
     default CaptureReading capturedRows(String pipelineId) {
         return CaptureReading.NONE;

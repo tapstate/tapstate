@@ -214,6 +214,19 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized boolean setCdcStartIfCurrent(String miningChainId, String pipelineId,
+            String cursorWriterToken, long selectedTablesEpoch,
+            String cdcStartPosition, long snapshotEpoch) {
+        ConsumerOffset current = require(miningChainId).consumerOffset(pipelineId).orElse(null);
+        if (current == null || !Objects.equals(current.cursorWriterToken(), cursorWriterToken)
+                || !Objects.equals(current.selectedTablesEpoch(), selectedTablesEpoch)) {
+            return false;
+        }
+        setCdcStart(miningChainId, pipelineId, cdcStartPosition, snapshotEpoch);
+        return true;
+    }
+
+    @Override
     public synchronized long openEpoch(String miningChainId) {
         SrsMeta m = require(miningChainId);
         long opened = m.epoch() + 1;

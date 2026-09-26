@@ -41,6 +41,7 @@ import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.srs.SrsReadCursorPublisherFactory;
 import io.tapstate.runtime.srs.SrsSourceProcessor;
+import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.OnFullLoad;
@@ -103,6 +104,7 @@ final class StoreBackedDagSource implements DagSource {
     private final StepSchemaRecord stepSchemaRecord;
     private final SourcePlacement sourcePlacement;
     private final String cursorWriterToken;
+    private final SnapshotBuffer snapshotBuffer;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -130,6 +132,13 @@ final class StoreBackedDagSource implements DagSource {
         this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement);
     }
 
+    StoreBackedDagSource(
+            StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability,
+            SourcePlacement sourcePlacement, SnapshotBuffer snapshotBuffer) {
+        this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement,
+                storePort.artifacts(), null, Objects.requireNonNull(snapshotBuffer, "snapshotBuffer"));
+    }
+
     /**
      * The binder the product is assembled with, named rather than written inline at each construction.
      *
@@ -153,7 +162,7 @@ final class StoreBackedDagSource implements DagSource {
         String cursorToken = java.util.UUID.randomUUID().toString();
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
-                snapshot, cursorToken);
+                snapshot, cursorToken, snapshotBuffer);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
@@ -194,6 +203,13 @@ final class StoreBackedDagSource implements DagSource {
         this(storePort, sinkWriterBinder, NestSettings.defaults());
     }
 
+    StoreBackedDagSource(StorePort storePort, SinkWriterBinder sinkWriterBinder,
+            SnapshotBuffer snapshotBuffer) {
+        this(storePort, sinkWriterBinder, NestSettings.defaults(), StoreReachability.assumingReachable(),
+                SourcePlacement.anyMember(), storePort.artifacts(), null,
+                Objects.requireNonNull(snapshotBuffer, "snapshotBuffer"));
+    }
+
     StoreBackedDagSource(StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings) {
         // No prober: the store is taken at its word. Every construction that means to check one passes it.
         this(storePort, sinkWriterBinder, nestSettings, StoreReachability.assumingReachable());
@@ -218,13 +234,13 @@ final class StoreBackedDagSource implements DagSource {
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore) {
         this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
-                artifactStore, null);
+                artifactStore, null, null);
     }
 
     private StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement,
-            ArtifactStore artifactStore, String cursorWriterToken) {
+            ArtifactStore artifactStore, String cursorWriterToken, SnapshotBuffer snapshotBuffer) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
@@ -236,6 +252,7 @@ final class StoreBackedDagSource implements DagSource {
         this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
         this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
         this.cursorWriterToken = cursorWriterToken;
+        this.snapshotBuffer = snapshotBuffer;
     }
 
     @Override
@@ -2292,10 +2309,15 @@ final class StoreBackedDagSource implements DagSource {
         // here rather than reached for from the source.
         String chain = vertex.table();
         byte axis = axes.axisOf(chain);
+        String ringName = vertex.resolution().ringName(vertex.table());
+        String snapshotToken = snapshotBuffer != null && cursorWriterToken != null
+                && snapshotBuffer.hasSnapshot(vertex.pipelineId(), ringName, cursorWriterToken)
+                ? cursorWriterToken : null;
         if (snapshotOnly) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(
-                    vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), snapshotEpoch,
-                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
+                    vertex.pipelineId(), ringName, vertex.table(), snapshotEpoch,
+                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
+                    snapshotToken);
         }
         // Where in the ring this run starts. Not the head as such: a ring outlives the runs that read it, so
         // after one run dies the head can sit far below what this pipeline already landed, and starting there
@@ -2319,9 +2341,10 @@ final class StoreBackedDagSource implements DagSource {
                 : CaptureRunUnit.readCursorPublisher(
                         chainId, vertex.pipelineId(), vertex.table(), generation, boundCursorToken);
         return SrsSourceProcessor.metaSupplier(
-                vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), freshStart,
+                vertex.pipelineId(), ringName, vertex.table(), freshStart,
                 doneThrough, generation, cursorPublisher,
-                order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
+                order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
+                snapshotToken);
     }
 
     /**

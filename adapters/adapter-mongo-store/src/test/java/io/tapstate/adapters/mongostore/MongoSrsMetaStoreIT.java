@@ -417,6 +417,25 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void anOldSnapshotWorkerCannotReplaceTheNewReadersSeam() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "p1", List.of("orders"), epoch, "run-a");
+            assertThat(store.setCdcStartIfCurrent(
+                    CHAIN, "p1", "run-a", epoch, "seam-a", epoch)).isTrue();
+            store.selectConsumerTables(CHAIN, "p1", List.of("orders"), epoch, "run-b");
+            assertThat(store.setCdcStartIfCurrent(
+                    CHAIN, "p1", "run-b", epoch, "seam-b", epoch)).isTrue();
+
+            assertThat(store.setCdcStartIfCurrent(
+                    CHAIN, "p1", "run-a", epoch, "late-old-seam", epoch)).isFalse();
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("p1").orElseThrow()
+                    .cdcStartPosition()).isEqualTo("seam-b");
+        });
+    }
+
+    @Test
     void openEpochAllocatesTheNextGenerationAgainstTheRealStore() {
         withStore(store -> {
             store.create(CHAIN, null);

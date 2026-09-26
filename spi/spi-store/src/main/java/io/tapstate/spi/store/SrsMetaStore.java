@@ -207,6 +207,17 @@ public interface SrsMetaStore {
     void setCdcStart(String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch);
 
     /**
+     * Records a snapshot seam only while this pipeline's selected-table reader still owns the current
+     * cursor token and ring generation. A stale asynchronous reader returns false without changing either
+     * half of the seam. The legacy unscoped method remains for callers without a prepared run token.
+     */
+    default boolean setCdcStartIfCurrent(String miningChainId, String pipelineId,
+            String cursorWriterToken, long selectedTablesEpoch,
+            String cdcStartPosition, long snapshotEpoch) {
+        throw new UnsupportedOperationException("scoped snapshot seam writes are unavailable");
+    }
+
+    /**
      * Opens the chain's next ring generation and returns it — the monotonic counter every order on this
      * chain compares first. Generations begin at one, so a chain whose stored generation is still zero has
      * never had a ring opened.

@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
 /**
@@ -480,6 +481,31 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         updateConsumer(miningChainId, pipelineId,
                 new Document("$set", new Document("cdcStartPosition", cdcStartPosition)
                         .append("snapshotEpoch", snapshotEpoch)));
+    }
+
+    @Override
+    public boolean setCdcStartIfCurrent(String miningChainId, String pipelineId,
+            String cursorWriterToken, long selectedTablesEpoch,
+            String cdcStartPosition, long snapshotEpoch) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(cdcStartPosition, "cdcStartPosition");
+        if (cursorWriterToken == null || cursorWriterToken.isBlank()
+                || selectedTablesEpoch < 1 || snapshotEpoch < 1) {
+            throw new IllegalArgumentException("scoped snapshot seam needs a token and positive generations");
+        }
+        migrateLegacyConsumers(miningChainId, true);
+        AtomicBoolean accepted = new AtomicBoolean();
+        writeConsumer(miningChainId, session -> {
+            Document filter = new Document(consumerKey(miningChainId, pipelineId))
+                    .append("cursorWriterToken", cursorWriterToken)
+                    .append("selectedTablesEpoch", selectedTablesEpoch);
+            UpdateResult result = consumers.updateOne(session, filter,
+                    new Document("$set", new Document("cdcStartPosition", cdcStartPosition)
+                            .append("snapshotEpoch", snapshotEpoch)));
+            // A transaction callback may be retried; only the last attempt is the answer.
+            accepted.set(result.getMatchedCount() == 1);
+        });
+        return accepted.get();
     }
 
     @Override

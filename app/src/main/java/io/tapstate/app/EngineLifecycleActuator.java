@@ -4,6 +4,7 @@ import io.tapstate.control.core.PipelineIncarnationService;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.runtime.srs.SnapshotCapacityUnavailable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,10 +19,9 @@ import java.util.Optional;
  *
  * <p>Each verb composes the two sides in the order the data flow requires:
  * <ul>
- *   <li>{@code start} validates the pipeline before side effects, finishes any drop an earlier stop left
- *       outstanding, fills the change ring (capture), then submits the job that reads it (engine), so the
- *       topology never starts against an unmet prerequisite, an unfilled ring, nor state that was half let go
- *       of.</li>
+ *   <li>{@code start} validates before side effects, finishes an earlier drop, provisions capture and
+ *       reserves its snapshot data-plane work, submits the job, then activates the reader. The source holds
+ *       CDC behind the snapshot completion marker.</li>
  *   <li>{@code stop} cancels the job first (engine) then stops the capture behind it (coordinator), so the
  *       capture daemon is torn down only once nothing reads its ring; the operator state the run kept is
  *       let go of last, once the job it belonged to is actually over -- and only where the stop asked for
@@ -133,10 +133,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     snapshot -> captureCoordinator.startCapture(
                             pipelineId, snapshot, prepared.cursorWriterToken()),
                     () -> captureCoordinator.startCapture(pipelineId));
-        } catch (RingNotOpenYet notYet) {
-            // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
-            // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
-            // being opened on another member, and how long that may take is bounded where it is decided.
+        } catch (RingNotOpenYet | SnapshotCapacityUnavailable notYet) {
+            // Nothing was submitted: either another member has not opened the ring yet or the bounded
+            // snapshot pool has no slot. A later pass retries without recording a data-plane failure.
             if (observationScope != null) {
                 observationScopes.discard(pipelineId, observationScope);
             }
@@ -165,7 +164,24 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
-        engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+        try {
+            engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+            captureCoordinator.activateSnapshot(pipelineId);
+        } catch (RuntimeException | Error failure) {
+            // A submitted job or reserved snapshot may already exist. Give both back before another
+            // convergence pass retries, so a failed activation cannot leave a producer with no consumer.
+            try {
+                engine.cancel(pipelineId);
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            try {
+                captureCoordinator.stopCapture(pipelineId, false);
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            throw failure;
+        }
     }
 
     private void closeCaptureAfterCancellation(String pipelineId) {
