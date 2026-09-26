@@ -200,7 +200,7 @@ class EngineLifecycleActuatorTest {
     }
 
     @Test
-    void anUnconfirmedStandaloneGenerationRefusesBeforeCaptureOrJobSubmission() {
+    void anUnconfirmedStandaloneGenerationClosesAdmittedCaptureWithoutJobSubmission() {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
         RecordingDagSource dagSource = new RecordingDagSource(events);
@@ -222,7 +222,9 @@ class EngineLifecycleActuatorTest {
         assertThatThrownBy(() -> actuator.start(PIPE))
                 .isInstanceOfSatisfying(TapstateException.class, failure ->
                         assertThat(failure.code()).isEqualTo(ActuationError.EXECUTION_GENERATION_UNAVAILABLE));
-        assertThat(events).isEmpty();
+        assertThat(events).containsExactly("startCapture:" + PIPE,
+                "stopCapture:" + PIPE + "[keep][jobLive]");
+        assertThat(coordinator.activeCapture).isFalse();
         assertThat(member.getJet().getJob(PIPE)).isNull();
     }
 
@@ -322,6 +324,30 @@ class EngineLifecycleActuatorTest {
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
         coordinator.snapshotCapacityUnavailable = true;
         assertDeferredStartKeepsActualNew(coordinator);
+    }
+
+    @Test
+    void capacityRetriesDoNotAdvanceExecutionGenerationBeforeSubmission() {
+        InMemoryWorkloadClaimStore generations = new InMemoryWorkloadClaimStore();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
+        coordinator.snapshotCapacityUnavailable = true;
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
+                new Engine(member), new RecordingDagSource(new CopyOnWriteArrayList<>()), coordinator,
+                teardown(), PipelineActuationOwnership.single("single", generations));
+        InMemoryDesiredStore desired = new InMemoryDesiredStore();
+        InMemoryStateStore state = new InMemoryStateStore();
+        PipelineConverger loop = new PipelineConverger(desired, state, actuator, Clock.systemUTC());
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+
+        loop.converge(PIPE);
+        loop.converge(PIPE);
+        assertThat(generations.executionGeneration(standaloneKey()))
+                .as("a capacity retry has not created a data-plane execution").isZero();
+
+        coordinator.snapshotCapacityUnavailable = false;
+        loop.converge(PIPE);
+        assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(1);
+        assertThat(actuator.isCarryingAJob(PIPE)).isTrue();
     }
 
     private void assertDeferredStartKeepsActualNew(RecordingCaptureCoordinator coordinator) {

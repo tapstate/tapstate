@@ -99,26 +99,11 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 pipelineId, stateTeardown.defaultDatabase());
         String incarnation = incarnations == null ? null : incarnations.ensureCurrent(pipelineId)
                 .orElseThrow(() -> new IllegalStateException("validated pipeline lost its artifact before start"));
-        PipelineActuationOwnership.Execution execution = actuation.beginExecution(pipelineId);
-        if (!execution.allowed()) {
-            LOG.warn("Not starting pipeline {} on this member: its run could not be fenced to a new "
-                    + "execution generation", pipelineId);
-            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
-        }
-        ObservationStore.Scope observationScope = observationScopes == null ? null
-                : observationScopes.begin(pipelineId, incarnation, execution.fence().executionGeneration());
-        try {
-            return startPrepared(pipelineId, prepared, execution, observationScope);
-        } catch (RuntimeException | Error failed) {
-            if (observationScope != null) {
-                observationScopes.discard(pipelineId, observationScope);
-            }
-            throw failed;
-        }
+        return startPrepared(pipelineId, prepared, incarnation);
     }
 
     private PreparedStart startPrepared(String pipelineId, DagSource.StartPreparation prepared,
-            PipelineActuationOwnership.Execution execution, ObservationStore.Scope observationScope) {
+            String incarnation) {
         if (captureCoordinator.hasActiveCapture(pipelineId)) {
             // A prior job can die while its source capture remains open. Close that run before opening
             // another so its reader cursor is not reused by a new job that resumes from an earlier sink ACK.
@@ -146,6 +131,37 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             closeCaptureAfterCancellation(pipelineId);
             throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
+        // Capacity and physical-ring admission are settled before advancing the durable execution
+        // generation. A refused attempt is still a pending start, not a new data-plane execution.
+        PipelineActuationOwnership.Execution execution;
+        try {
+            execution = actuation.beginExecution(pipelineId);
+        } catch (RuntimeException | Error failure) {
+            try {
+                captureCoordinator.stopCapture(pipelineId, false);
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            throw failure;
+        }
+        if (!execution.allowed()) {
+            captureCoordinator.stopCapture(pipelineId, false);
+            LOG.warn("Not starting pipeline {} on this member: its run could not be fenced to a new "
+                    + "execution generation", pipelineId);
+            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
+        }
+        ObservationStore.Scope observationScope;
+        try {
+            observationScope = observationScopes == null ? null
+                    : observationScopes.begin(pipelineId, incarnation, execution.fence().executionGeneration());
+        } catch (RuntimeException | Error failure) {
+            try {
+                captureCoordinator.stopCapture(pipelineId, false);
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            throw failure;
+        }
         // Capture opens the SRS generation that source vertices compile into the DAG. Build from the
         // same frozen artifacts after provisioning, but submit only when the checkpoint CAS succeeds.
         DagSource.StartPlan plan;
@@ -157,10 +173,16 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             } catch (RuntimeException cleanup) {
                 failure.addSuppressed(cleanup);
             }
+            if (observationScope != null) {
+                observationScopes.discard(pipelineId, observationScope);
+            }
             throw failure;
         }
         if (Thread.currentThread().isInterrupted()) {
             closeCaptureAfterCancellation(pipelineId);
+            if (observationScope != null) {
+                observationScopes.discard(pipelineId, observationScope);
+            }
             throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
         return new PreparedStart() {
