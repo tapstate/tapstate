@@ -112,6 +112,14 @@ public final class HistoryAggregator {
             throw new IllegalStateException("rate-history entries are not in stable ascending order");
         }
         if (previous == null) {
+            if (current.gapFrom() != null) {
+                segmentReason = StartReason.GAP;
+                Instant gapStart = max(resumeFrom, current.gapFrom());
+                Instant gapEnd = min(to, current.sample().observedAt());
+                if (gapStart.isBefore(gapEnd)) {
+                    gaps.add(new EmittedGap(segment, new Gap(gapStart, gapEnd, GapReason.SAMPLE_GAP)));
+                }
+            }
             addLag(current);
         } else {
             processPair(previous, current, true);
@@ -157,7 +165,7 @@ public final class HistoryAggregator {
             segment++;
             segmentReason = boundary;
             if (boundary == StartReason.GAP) {
-                Instant gapStart = max(resumeFrom, a.observedAt());
+                Instant gapStart = max(resumeFrom, gapStart(left, right));
                 Instant gapEnd = min(to, b.observedAt());
                 if (gapStart.isBefore(gapEnd)) {
                     gaps.add(new EmittedGap(segment, new Gap(gapStart, gapEnd, GapReason.SAMPLE_GAP)));
@@ -186,6 +194,9 @@ public final class HistoryAggregator {
     private StartReason boundary(Entry previous, Entry current, Duration elapsed) {
         RateSample left = previous.sample();
         RateSample right = current.sample();
+        if (current.gapFrom() != null) {
+            return StartReason.GAP;
+        }
         if (!elapsed.isZero() && elapsed.compareTo(gapThreshold) >= 0) {
             return StartReason.GAP;
         }
@@ -199,6 +210,13 @@ public final class HistoryAggregator {
             return StartReason.CONTINUATION;
         }
         return null;
+    }
+
+    private static Instant gapStart(Entry previous, Entry current) {
+        if (current.gapFrom() != null && !previous.scope().equals(current.scope())) {
+            return current.gapFrom();
+        }
+        return previous.sample().observedAt();
     }
 
     private static boolean decreased(RateSample left, RateSample right, String name) {

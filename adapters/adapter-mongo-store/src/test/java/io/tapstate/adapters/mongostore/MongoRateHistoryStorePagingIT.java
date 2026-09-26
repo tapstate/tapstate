@@ -9,6 +9,7 @@ import io.tapstate.spi.store.RateHistoryStore.Page;
 import io.tapstate.spi.store.RateHistoryStore.Visibility;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -16,6 +17,7 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 
@@ -24,6 +26,39 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** Real-store witness for the stable, bounded keyset contract. */
 @RequiresDocker
 class MongoRateHistoryStorePagingIT {
+
+    @Test
+    void recoveryMarkerSurvivesScopedPagingAndUsesTheSampleTtlDocument() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("history_gap_it");
+            database.drop();
+            MongoRateHistoryStore history = new MongoRateHistoryStore(database,
+                    SystemCollections.PIPELINE_RATE_HISTORY.on(database), Duration.ofDays(15));
+            ObservationStore.Scope owner = new ObservationStore.Scope("inc-a", 41);
+            Instant failedAt = T0.plusSeconds(60);
+            history.appendScoped(sample("orders", T0, 100), owner);
+            history.appendScoped(sample("orders", T0.plusSeconds(61), 161), owner, failedAt);
+
+            Page first = history.readPageVisible("orders", new Visibility("inc-a", false),
+                    T0, T0.plusSeconds(120), null, 1);
+            Page second = history.readPageVisible("orders", new Visibility("inc-a", false),
+                    T0, T0.plusSeconds(120), first.lastKey().orElseThrow(), 1);
+            assertThat(first.entries()).singleElement().extracting(Entry::gapFrom).isNull();
+            assertThat(second.entries()).singleElement().extracting(Entry::gapFrom).isEqualTo(failedAt);
+            assertThat(history.readVisible("orders", new Visibility("inc-a", false),
+                    second.entries().getFirst().key())).get()
+                    .extracting(Entry::gapFrom).isEqualTo(failedAt);
+            assertThat(history.readPageVisible("orders", new Visibility("inc-b", false),
+                    T0, T0.plusSeconds(120), null, 10).entries()).isEmpty();
+
+            Document stored = SystemCollections.PIPELINE_RATE_HISTORY.on(database)
+                    .find(new Document("observedAt", Date.from(T0.plusSeconds(61)))).first();
+            assertThat(SystemCollections.PIPELINE_RATE_HISTORY.on(database).countDocuments()).isEqualTo(2);
+            assertThat(stored).isNotNull();
+            assertThat(stored.get("gapFrom")).isEqualTo(Date.from(failedAt));
+            assertThat(stored.get("observedAt")).isEqualTo(Date.from(T0.plusSeconds(61)));
+        }
+    }
 
     @Test
     void newHistoryScopesSurviveRecreateAndOldCleanupCannotDeleteTheNewRun() {

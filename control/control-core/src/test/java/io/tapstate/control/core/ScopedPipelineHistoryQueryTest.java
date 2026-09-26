@@ -5,6 +5,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.RateHistoryStore;
 import org.junit.jupiter.api.Test;
 
@@ -52,6 +53,27 @@ class ScopedPipelineHistoryQueryTest {
         assertThat(stale.args()).containsEntry("reason", "QUERY_MISMATCH");
     }
 
+    @Test
+    void recoveryGapStartsInsideTheNewExecutionRatherThanAtTheOldExecutionSample() {
+        Artifacts artifacts = new Artifacts();
+        History history = new History();
+        history.addScoped(START, 100, "inc-old", 41, null);
+        history.addScoped(START.plusSeconds(61), 161, "inc-old", 42, START.plusSeconds(60));
+        PipelineHistoryQueryService service = service(artifacts, history);
+
+        for (HistoryResolution resolution : List.of(HistoryResolution.RAW, HistoryResolution.PT5M)) {
+            PipelineMetricsHistory result = service.query(new PipelineHistoryQuery("orders", START, NOW,
+                    resolution, 10, List.of(), null));
+            assertThat(result.gaps()).singleElement().satisfies(gap -> {
+                assertThat(gap.intervalStart()).isEqualTo(START.plusSeconds(60));
+                assertThat(gap.intervalEnd()).isEqualTo(START.plusSeconds(61));
+            });
+            assertThat(result.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                    .containsExactly(PipelineMetricsHistory.StartReason.WINDOW_START,
+                            PipelineMetricsHistory.StartReason.GAP);
+        }
+    }
+
     private static PipelineHistoryQueryService service(Artifacts artifacts, History history) {
         Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
         return new PipelineHistoryQueryService(new ArtifactQueryService(artifacts), history,
@@ -97,6 +119,13 @@ class ScopedPipelineHistoryQueryTest {
             RateSample sample = new RateSample("orders", at, Map.of("records.out", value),
                     Map.of(), START);
             samples.add(new Scoped(new Entry(new Key(at, "key-" + value), sample), incarnation));
+        }
+
+        void addScoped(Instant at, long value, String incarnation, long generation, Instant gapFrom) {
+            RateSample sample = new RateSample("orders", at, Map.of("records.out", value),
+                    Map.of(), START);
+            samples.add(new Scoped(new Entry(new Key(at, "key-" + value), sample,
+                    Optional.of(new ObservationStore.Scope(incarnation, generation)), gapFrom), incarnation));
         }
 
         @Override public void append(RateSample sample) { throw new UnsupportedOperationException(); }

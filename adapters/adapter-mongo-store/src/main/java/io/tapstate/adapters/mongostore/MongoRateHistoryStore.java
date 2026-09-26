@@ -59,6 +59,7 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
     static final String COUNTING_SINCE = "countingSince";
     static final String PIPELINE_INCARNATION_ID = "pipelineIncarnationId";
     static final String EXECUTION_GENERATION = "executionGeneration";
+    static final String GAP_FROM = "gapFrom";
 
     private final MongoCollection<Document> collection;
     private final Duration retention;
@@ -82,16 +83,26 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
 
     @Override
     public void append(RateSample sample) {
+        append(sample, null);
+    }
+
+    @Override
+    public void append(RateSample sample, Instant gapFrom) {
         Objects.requireNonNull(sample, "sample");
         StoreIo.run(() -> collection.withTimeout(APPEND_DEADLINE_SECONDS, TimeUnit.SECONDS)
-                .insertOne(toDocument(sample)));
+                .insertOne(withGap(toDocument(sample), sample, gapFrom)));
     }
 
     @Override
     public void appendScoped(RateSample sample, ObservationStore.Scope scope) {
+        appendScoped(sample, scope, null);
+    }
+
+    @Override
+    public void appendScoped(RateSample sample, ObservationStore.Scope scope, Instant gapFrom) {
         Objects.requireNonNull(sample, "sample");
         Objects.requireNonNull(scope, "scope");
-        Document document = toDocument(sample)
+        Document document = withGap(toDocument(sample), sample, gapFrom)
                 .append(PIPELINE_INCARNATION_ID, scope.pipelineIncarnationId())
                 .append(EXECUTION_GENERATION, scope.executionGeneration());
         StoreIo.run(() -> collection.withTimeout(APPEND_DEADLINE_SECONDS, TimeUnit.SECONDS)
@@ -283,6 +294,16 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
         return document;
     }
 
+    private static Document withGap(Document document, RateSample sample, Instant gapFrom) {
+        if (gapFrom != null) {
+            if (gapFrom.isAfter(sample.observedAt())) {
+                throw new IllegalArgumentException("a rate-history gap cannot start after its recovery sample");
+            }
+            document.append(GAP_FROM, Date.from(gapFrom));
+        }
+        return document;
+    }
+
     /** Reconstructs a sample; a missing or wrong-typed cell is corruption, surfaced coded rather than as a cast. */
     static RateSample toSample(Document document) {
         Object rawId = document.get(PIPELINE_ID);
@@ -323,7 +344,15 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
         } else {
             throw corrupt(sample.pipelineId(), EXECUTION_GENERATION);
         }
-        return new Entry(new Key(sample.observedAt(), id.toHexString()), sample, scope);
+        Object rawGapFrom = document.get(GAP_FROM);
+        if (rawGapFrom != null && !(rawGapFrom instanceof Date)) {
+            throw corrupt(sample.pipelineId(), GAP_FROM);
+        }
+        Instant gapFrom = rawGapFrom == null ? null : ((Date) rawGapFrom).toInstant();
+        if (gapFrom != null && gapFrom.isAfter(sample.observedAt())) {
+            throw corrupt(sample.pipelineId(), GAP_FROM);
+        }
+        return new Entry(new Key(sample.observedAt(), id.toHexString()), sample, scope, gapFrom);
     }
 
     private static ObjectId internalId(Key key) {

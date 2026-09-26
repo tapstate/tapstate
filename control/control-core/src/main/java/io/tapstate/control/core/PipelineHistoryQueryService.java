@@ -363,7 +363,7 @@ public final class PipelineHistoryQueryService {
                 segment++;
                 reason = boundary;
                 if (boundary == StartReason.GAP) {
-                    Instant gapStart = max(from, previous.sample().observedAt());
+                    Instant gapStart = max(from, gapStart(previous, current));
                     Instant gapEnd = min(to, current.sample().observedAt());
                     if (gapStart.isBefore(gapEnd)) {
                         gaps.add(new EmittedGap(segment, new Gap(gapStart, gapEnd, GapReason.SAMPLE_GAP)));
@@ -372,6 +372,14 @@ public final class PipelineHistoryQueryService {
                 point = new Point(current.sample().observedAt(), current.sample().observedAt(),
                         null, null, lag(current.sample(), tables));
             } else if (previous == null) {
+                if (current.gapFrom() != null) {
+                    reason = StartReason.GAP;
+                    Instant gapStart = max(from, current.gapFrom());
+                    Instant gapEnd = min(to, current.sample().observedAt());
+                    if (gapStart.isBefore(gapEnd)) {
+                        gaps.add(new EmittedGap(segment, new Gap(gapStart, gapEnd, GapReason.SAMPLE_GAP)));
+                    }
+                }
                 point = new Point(current.sample().observedAt(), current.sample().observedAt(),
                         null, null, lag(current.sample(), tables));
             } else {
@@ -392,6 +400,9 @@ public final class PipelineHistoryQueryService {
         RateSample left = previous.sample();
         RateSample right = current.sample();
         Duration elapsed = Duration.between(left.observedAt(), right.observedAt());
+        if (current.gapFrom() != null) {
+            return StartReason.GAP;
+        }
         if (!elapsed.isNegative() && !elapsed.isZero()
                 && elapsed.compareTo(sampleInterval.multipliedBy(2)) >= 0) {
             return StartReason.GAP;
@@ -406,6 +417,13 @@ public final class PipelineHistoryQueryService {
             return StartReason.CONTINUATION;
         }
         return null;
+    }
+
+    private static Instant gapStart(Entry previous, Entry current) {
+        if (current.gapFrom() != null && !previous.scope().equals(current.scope())) {
+            return current.gapFrom();
+        }
+        return previous.sample().observedAt();
     }
 
     private static boolean decreased(RateSample left, RateSample right, String counter) {

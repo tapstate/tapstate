@@ -42,8 +42,8 @@ public interface RateHistoryStore {
         }
     }
 
-    /** One stored sample, its opaque ordering key and an optional internal execution owner. */
-    record Entry(Key key, RateSample sample, Optional<ObservationStore.Scope> scope) {
+    /** One stored sample, its opaque ordering key and optional internal owner and append-loss boundary. */
+    record Entry(Key key, RateSample sample, Optional<ObservationStore.Scope> scope, Instant gapFrom) {
         public Entry {
             Objects.requireNonNull(key, "key");
             Objects.requireNonNull(sample, "sample");
@@ -51,11 +51,19 @@ public interface RateHistoryStore {
             if (!key.observedAt().equals(sample.observedAt())) {
                 throw new IllegalArgumentException("a rate-history key and sample name different instants");
             }
+            if (gapFrom != null && gapFrom.isAfter(sample.observedAt())) {
+                throw new IllegalArgumentException("a rate-history gap cannot start after its recovery sample");
+            }
+        }
+
+        /** A sample with no known append loss. */
+        public Entry(Key key, RateSample sample, Optional<ObservationStore.Scope> scope) {
+            this(key, sample, scope, null);
         }
 
         /** A legacy sample with no execution owner. */
         public Entry(Key key, RateSample sample) {
-            this(key, sample, Optional.empty());
+            this(key, sample, Optional.empty(), null);
         }
     }
 
@@ -92,9 +100,25 @@ public interface RateHistoryStore {
     /** Adds one sample. Never overwrites: a second sample at the same instant is a second document. */
     void append(RateSample sample);
 
+    /** Appends a recovery sample with the first failed append time in its internal envelope. */
+    default void append(RateSample sample, Instant gapFrom) {
+        if (gapFrom != null) {
+            throw new UnsupportedOperationException("append-loss boundaries are unavailable");
+        }
+        append(sample);
+    }
+
     /** Appends one new-run sample with its internal owner; legacy samples retain no owner. */
     default void appendScoped(RateSample sample, ObservationStore.Scope scope) {
         throw new UnsupportedOperationException("scoped rate-history writes are unavailable");
+    }
+
+    /** Appends a scoped recovery sample without changing the published sample model. */
+    default void appendScoped(RateSample sample, ObservationStore.Scope scope, Instant gapFrom) {
+        if (gapFrom != null) {
+            throw new UnsupportedOperationException("append-loss boundaries are unavailable");
+        }
+        appendScoped(sample, scope);
     }
 
     /**

@@ -34,15 +34,32 @@ class RateSamplerTest {
     private static final class RecordingHistory implements RateHistoryStore {
         private final List<RateSample> appended = new ArrayList<>();
         private final List<ObservationStore.Scope> scopes = new ArrayList<>();
+        private final List<Instant> gapStarts = new ArrayList<>();
+        private int failuresRemaining;
 
         @Override
         public void append(RateSample sample) {
+            append(sample, null);
+        }
+
+        @Override
+        public void append(RateSample sample, Instant gapFrom) {
+            if (failuresRemaining > 0) {
+                failuresRemaining--;
+                throw new IllegalStateException("injected append failure");
+            }
             appended.add(sample);
+            gapStarts.add(gapFrom);
         }
 
         @Override
         public void appendScoped(RateSample sample, ObservationStore.Scope scope) {
-            appended.add(sample);
+            appendScoped(sample, scope, null);
+        }
+
+        @Override
+        public void appendScoped(RateSample sample, ObservationStore.Scope scope, Instant gapFrom) {
+            append(sample, gapFrom);
             scopes.add(scope);
         }
 
@@ -191,5 +208,53 @@ class RateSamplerTest {
         assertThat(history.scopes).containsExactly(first, recreated, restarted);
         assertThat(history.appended).extracting(sample -> sample.counters().get("records.out"))
                 .containsExactly(1L, 3L, 4L);
+    }
+
+    @Test
+    void repeatedFailuresKeepOnlyTheFirstLostTimeUntilRecovery() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        history.failuresRemaining = 2;
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> sampler.appendIfDue(moving(T0, 1)))
+                .hasMessage("injected append failure");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> sampler.appendIfDue(moving(T0.plusSeconds(1), 2)))
+                .hasMessage("injected append failure");
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(2), 3))).isTrue();
+        assertThat(history.gapStarts).containsExactly(T0);
+        assertThat(history.appended).hasSize(1);
+    }
+
+    @Test
+    void scopedRecoveryWritesTheGapInTheSameExecution() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope run = new ObservationStore.Scope("inc-a", 41);
+        sampler.appendIfDue(moving(T0, 1), run);
+        history.failuresRemaining = 1;
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                sampler.appendIfDue(moving(T0.plusSeconds(60), 2), run))
+                .hasMessage("injected append failure");
+
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(61), 3), run)).isTrue();
+        assertThat(history.scopes).containsExactly(run, run);
+        assertThat(history.gapStarts).containsExactly(null, T0.plusSeconds(60));
+    }
+
+    @Test
+    void anOldExecutionFailureDoesNotMarkTheNextExecution() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope old = new ObservationStore.Scope("inc-a", 41);
+        ObservationStore.Scope next = new ObservationStore.Scope("inc-a", 42);
+        sampler.appendIfDue(moving(T0, 1), old);
+        history.failuresRemaining = 1;
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                sampler.appendIfDue(moving(T0.plusSeconds(60), 2), old))
+                .hasMessage("injected append failure");
+
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(61), 3), next)).isTrue();
+        assertThat(history.scopes).containsExactly(old, next);
+        assertThat(history.gapStarts).containsExactly(null, null);
     }
 }

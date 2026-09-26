@@ -22,20 +22,39 @@ final class InMemoryRateHistoryStore implements RateHistoryStore {
 
     private final List<Stored> samples = new ArrayList<>();
     private long nextKey;
+    private boolean failNextAppend;
+
+    void failNextAppend() {
+        failNextAppend = true;
+    }
 
     @Override
     public void append(RateSample sample) {
-        appendWithScope(sample, null);
+        appendWithScope(sample, null, null);
+    }
+
+    @Override
+    public void append(RateSample sample, Instant gapFrom) {
+        appendWithScope(sample, null, gapFrom);
     }
 
     @Override
     public void appendScoped(RateSample sample, ObservationStore.Scope scope) {
-        appendWithScope(sample, scope);
+        appendWithScope(sample, scope, null);
     }
 
-    private void appendWithScope(RateSample sample, ObservationStore.Scope scope) {
+    @Override
+    public void appendScoped(RateSample sample, ObservationStore.Scope scope, Instant gapFrom) {
+        appendWithScope(sample, scope, gapFrom);
+    }
+
+    private void appendWithScope(RateSample sample, ObservationStore.Scope scope, Instant gapFrom) {
+        if (failNextAppend) {
+            failNextAppend = false;
+            throw new IllegalStateException("injected history append failure");
+        }
         samples.add(new Stored(new Entry(new Key(sample.observedAt(), "%020d".formatted(nextKey++)), sample,
-                Optional.ofNullable(scope)), scope));
+                Optional.ofNullable(scope), gapFrom), scope));
     }
 
     @Override

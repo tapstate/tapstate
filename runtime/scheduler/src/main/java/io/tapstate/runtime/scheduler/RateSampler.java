@@ -44,9 +44,9 @@ public final class RateSampler {
 
     private final RateHistoryStore history;
     private final Duration interval;
-    private record LastSample(ObservationStore.Scope scope, Instant at) { }
+    private record Cadence(ObservationStore.Scope scope, Instant lastWrittenAt, Instant firstFailedAt) { }
 
-    private final Map<String, LastSample> lastSampledAt = new ConcurrentHashMap<>();
+    private final Map<String, Cadence> cadence = new ConcurrentHashMap<>();
 
     public RateSampler(RateHistoryStore history, Duration interval) {
         this.history = Objects.requireNonNull(history, "history");
@@ -79,23 +79,41 @@ public final class RateSampler {
         if (sample == null) {
             return false;
         }
-        LastSample last = lastSampledAt.get(observation.pipelineId());
-        if (last != null && Objects.equals(last.scope(), scope)
-                && observation.observedAt().isBefore(last.at().plus(interval))) {
+        Cadence prior = cadence.get(observation.pipelineId());
+        if (prior != null && !Objects.equals(prior.scope(), scope)) {
+            prior = null;
+        }
+        if (prior != null && prior.lastWrittenAt() != null
+                && observation.observedAt().isBefore(prior.lastWrittenAt().plus(interval))) {
             return false;
         }
-        if (scope == null) {
-            history.append(sample);
-        } else {
-            history.appendScoped(sample, scope);
+        Instant gapFrom = prior != null && prior.firstFailedAt() != null
+                && prior.firstFailedAt().isBefore(sample.observedAt()) ? prior.firstFailedAt() : null;
+        try {
+            if (scope == null) {
+                history.append(sample, gapFrom);
+            } else {
+                history.appendScoped(sample, scope, gapFrom);
+            }
+        } catch (RuntimeException failed) {
+            Instant firstFailedAt = prior == null || prior.firstFailedAt() == null
+                    ? sample.observedAt() : min(prior.firstFailedAt(), sample.observedAt());
+            cadence.put(observation.pipelineId(), new Cadence(scope,
+                    prior == null ? null : prior.lastWrittenAt(), firstFailedAt));
+            throw failed;
         }
-        lastSampledAt.put(observation.pipelineId(), new LastSample(scope, observation.observedAt()));
+        Instant unresolved = prior == null || gapFrom != null ? null : prior.firstFailedAt();
+        cadence.put(observation.pipelineId(), new Cadence(scope, sample.observedAt(), unresolved));
         return true;
     }
 
     /** Drops the cadence bookkeeping of every pipeline outside {@code live}, which is the set that still exists. */
     public void forgetPipelinesOutside(Collection<String> live) {
-        lastSampledAt.keySet().retainAll(live);
+        cadence.keySet().retainAll(live);
+    }
+
+    private static Instant min(Instant left, Instant right) {
+        return left.isBefore(right) ? left : right;
     }
 
     /** The sample {@code observation} yields, or {@code null} when it carries nothing to draw a line from. */
