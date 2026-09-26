@@ -56,8 +56,8 @@ class ConvergenceDriverTest {
                 if (pipelineId.equals("slow")) {
                     slowStopEntered.countDown();
                     try {
-                        if (!releaseSlowStop.await(30, TimeUnit.SECONDS)) {
-                            throw new AssertionError("slow teardown exceeded its thirty-second budget");
+                        if (!releaseSlowStop.await(35, TimeUnit.SECONDS)) {
+                            throw new AssertionError("slow teardown was not released");
                         }
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
@@ -87,6 +87,7 @@ class ConvergenceDriverTest {
                 Thread.sleep(10);
             }
             assertThat(slowStopEntered.getCount()).isZero();
+            long slowStopStarted = System.nanoTime();
             assertThat(pending.pending("slow").orElseThrow().reason()).isEqualTo(PendingReason.STOP_PENDING);
 
             desired.save(new DesiredState("fast", io.tapstate.core.lifecycle.PipelineState.PAUSED, "rev-2"));
@@ -94,6 +95,21 @@ class ConvergenceDriverTest {
             desired.save(new DesiredState("fast", RUNNING, "rev-3"));
             awaitStateAndObservation(isolated, "fast", RUNNING);
             assertThat(releaseSlowStop.getCount()).isEqualTo(1L);
+            if (Boolean.getBoolean("tapstate.e2e.long-stop-witness")) {
+                Instant beforeLongWait = observations.read("fast").orElseThrow().observedAt();
+                long fullBudget = slowStopStarted + TimeUnit.SECONDS.toNanos(30);
+                while (System.nanoTime() - fullBudget < 0) {
+                    isolated.reconcile();
+                    Thread.sleep(250);
+                }
+                Instant afterLongWait = observations.read("fast").orElseThrow().observedAt();
+                assertThat(afterLongWait).isAfter(beforeLongWait);
+                assertThat(releaseSlowStop.getCount()).isEqualTo(1L);
+                assertThat(state.read("fast").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+                System.out.printf("long-stop-isolation heldMs=%.3f fastObservedBefore=%s fastObservedAfter=%s%n",
+                        (System.nanoTime() - slowStopStarted) / 1_000_000.0,
+                        beforeLongWait, afterLongWait);
+            }
         } finally {
             releaseSlowStop.countDown();
         }
