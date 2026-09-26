@@ -274,9 +274,16 @@ final class HistoryRollupWorker implements AutoCloseable {
             Instant now = clock.instant();
             for (Resolution resolution : LEVELS) {
                 Instant frontier = frontiers.get(resolution);
-                levels.put(resolution, new LevelHealth(computed.get(resolution.ordinal()),
-                        retried.get(resolution.ordinal()), failed.get(resolution.ordinal()),
-                        rawFallback.get(resolution.ordinal()),
+                long built = computed.get(resolution.ordinal());
+                long repeated = retried.get(resolution.ordinal());
+                long unsuccessful = failed.get(resolution.ordinal());
+                long fromRaw = rawFallback.get(resolution.ordinal());
+                if (built == 0 && repeated == 0 && unsuccessful == 0 && fromRaw == 0
+                        && frontier == null) {
+                    continue;
+                }
+                levels.put(resolution, new LevelHealth(built, repeated, unsuccessful,
+                        fromRaw,
                         frontier == null ? OptionalLong.empty()
                                 : OptionalLong.of(Math.max(0L,
                                         Duration.between(frontier, now).toMillis()))));

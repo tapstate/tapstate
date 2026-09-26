@@ -101,6 +101,7 @@ import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ConnectorRegistry;
+import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.spi.store.SchemaDiscoverer;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SessionStore;
@@ -120,6 +121,7 @@ import org.springframework.lang.Nullable;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Clock;
+import java.util.function.Consumer;
 
 /**
  * Wires the control plane into the assembly root: the authentication ports over the store, the control-core
@@ -651,10 +653,14 @@ class ControlPlaneConfiguration {
             StorePort storePort,
             MetricsHistoryProperties history,
             Clock clock,
-            HistoryCursorCodec cursors) {
+            HistoryCursorCodec cursors,
+            ObjectProvider<HistoryRollupWorker> rollupWorker) {
+        HistoryRollupWorker worker = rollupWorker.getIfAvailable();
+        Consumer<HistoryRollupStore.Key> refresh =
+                worker == null ? ignored -> { } : worker::requestRefresh;
         return new PipelineHistoryQueryService(
                 artifactQueryService, storePort.rateHistory(), storePort.historyRollups(),
-                history.getSampleInterval(), clock, cursors);
+                refresh, history.getSampleInterval(), clock, cursors);
     }
 
     @Bean

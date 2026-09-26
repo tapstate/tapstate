@@ -49,6 +49,18 @@ class HistoryRollupWorkerTest {
     private static final Key FIRST = new Key(ID, SCOPED, Resolution.PT5M, TEN);
 
     @Test
+    void aPipelineWithNoRetainedSamplesDoesNotPublishZeroRollupSeries() {
+        MutableClock clock = new MutableClock(TEN.plus(Duration.ofMinutes(6)));
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        MemoryRollups rollups = new MemoryRollups();
+        try (HistoryRollupWorker worker = worker(raw, rollups, clock, 1,
+                List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+            worker.runOneBatch();
+            assertThat(HistoryRollupFacts.snapshot(worker.health(), START, clock.instant())).isEmpty();
+        }
+    }
+
+    @Test
     void processHealthReportsFiveClosedResolutionsAndRecoveryWithoutIdentityLabels() {
         MutableClock clock = new MutableClock(TEN.plus(Duration.ofMinutes(6)));
         InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
@@ -69,7 +81,7 @@ class HistoryRollupWorkerTest {
             worker.runOneBatch();
             HistoryRollupWorker.Health recovered = worker.health();
             assertThat(recovered.degraded()).isFalse();
-            assertThat(recovered.levels()).hasSize(5);
+            assertThat(recovered.levels()).containsOnlyKeys(Resolution.PT5M);
             assertThat(recovered.levels().get(Resolution.PT5M).computed()).isEqualTo(1);
             assertThat(recovered.levels().get(Resolution.PT5M).retried()).isEqualTo(1);
             assertThat(recovered.levels().get(Resolution.PT5M).closedThroughAgeMillis())
@@ -91,7 +103,7 @@ class HistoryRollupWorkerTest {
             assertThat(facts.stream().flatMap(fact -> fact.points().stream())
                     .map(point -> point.attributes().get(MetricAttributes.ROLLUP_RESOLUTION))
                     .filter(java.util.Objects::nonNull).distinct())
-                    .containsExactlyInAnyOrderElementsOf(MetricAttributes.ROLLUP_RESOLUTIONS);
+                    .containsExactly("5m");
         }
     }
 
