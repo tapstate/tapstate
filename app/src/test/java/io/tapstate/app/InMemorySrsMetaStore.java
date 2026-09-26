@@ -130,6 +130,11 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 next.add(c);
             }
         }
+        if (existing != null && existing.sinkAcked() != null
+                && position.order().compareTo(existing.sinkAcked().order()) <= 0) {
+            // Only ever raised, as the contract says: a confirmation landing after a later one moves nothing.
+            return;
+        }
         Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
         next.add(new ConsumerOffset(
                 pipelineId,

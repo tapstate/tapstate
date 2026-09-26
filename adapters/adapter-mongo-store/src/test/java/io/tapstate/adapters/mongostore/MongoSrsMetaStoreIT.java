@@ -328,8 +328,29 @@ class MongoSrsMetaStoreIT {
             assertThat(store.ringDoneThrough(CHAIN, "p1"))
                     .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 9L, "items", 4L));
             assertThat(onlyConsumer(store).sinkAckedSrcpos())
-                    .as("the chain's acked position is written in the same update, as it always was")
-                    .isEqualTo("s");
+                    .as("and the chain's acked position, written with them, stays at the latest of them")
+                    .isEqualTo("t9");
+        });
+    }
+
+    @Test
+    void aConfirmationThatLandsAfterALaterOneLeavesTheAckedPositionWhereItIs() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+
+            store.advanceSinkAcked(CHAIN, "p1", new ChainPosition(new SourceOrder(1, 5), "t5"));
+            // Each writer of a sink works the acked position out from what it read back and reports on its own,
+            // so a report worked out before a later one can land after it, carrying the older answer.
+            store.advanceSinkAcked(CHAIN, "p1", new ChainPosition(new SourceOrder(1, 3), "t3"));
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(SourceOrder.snapshotRow(1), "s"));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("never moved back by a confirmation of what it had already passed")
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 5), "t5"));
+
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(2, 0), "n0"));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("and moved on by the first one past it, a new generation of the ring included")
+                    .isEqualTo(new ChainPosition(new SourceOrder(2, 0), "n0"));
         });
     }
 
