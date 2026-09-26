@@ -326,6 +326,37 @@ class HistoryRollupWorkerTest {
     }
 
     @Test
+    void cascadedThirtyMinuteBucketMatchesRawForIrregularIntervalsAndLagFrames() {
+        Key target = new Key(ID, SCOPED, Resolution.PT30M, TEN);
+        MutableClock clock = new MutableClock(target.bucketEnd().plus(Duration.ofMinutes(1)));
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        for (int minute = 0; minute <= 30; minute++) {
+            Instant at = TEN.plusSeconds(minute * 60L + minute % 3 * 5L);
+            raw.appendScoped(sample(at, minute * 3L, minute % 7), owner(1));
+        }
+        MemoryRollups rollups = new MemoryRollups();
+        try (HistoryRollupWorker worker = worker(raw, rollups, clock, 16,
+                List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+            for (int pass = 0; pass < 8; pass++) {
+                worker.runOneBatch();
+            }
+            Bucket direct = rollups.read(target).orElseThrow();
+            assertThat(rollups.readRange(ID, SCOPED, Resolution.PT5M,
+                    TEN, target.bucketEnd(), 6)).hasSize(6);
+            rollups.rows.remove(target);
+
+            assertThat(worker.requestRefresh(target)).isTrue();
+            worker.runOneBatch();
+
+            Bucket cascaded = rollups.read(target).orElseThrow();
+            assertThat(cascaded.inputReadStartedAt()).isEqualTo(direct.inputReadStartedAt());
+            assertThat(cascaded.validUntil()).isEqualTo(direct.validUntil());
+            assertThat(cascaded.inWindowSamples()).isEqualTo(direct.inWindowSamples());
+            assertThat(cascaded.fragments()).isEqualTo(direct.fragments());
+        }
+    }
+
+    @Test
     void expiredChildIsRebuiltFromRawWithoutPublishingAnExpiredCoarseBucket() {
         Key target = new Key(ID, SCOPED, Resolution.PT30M, TEN);
         MutableClock clock = new MutableClock(target.bucketEnd().plus(Duration.ofMinutes(1)));
