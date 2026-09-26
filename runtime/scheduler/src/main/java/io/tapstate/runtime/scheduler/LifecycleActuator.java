@@ -41,6 +41,11 @@ public interface LifecycleActuator {
         };
     }
 
+    /** Whether a held job has an undelivered load and must be replaced before it can resume. */
+    default boolean needsRebuildOnResume(String pipelineId) {
+        return false;
+    }
+
     /** Begins a fresh run of the pipeline: submits its topology as the pipeline's one job. */
     void start(String pipelineId);
 

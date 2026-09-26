@@ -75,7 +75,11 @@ public final class PipelineConverger {
         Long stampedAt = intent.get().rebuiltAtStateEpoch();
         boolean rebuildOwed = reassemble && stampedAt != null
                 && actualDoc.map(CheckpointDoc::epoch).orElse(-1L).equals(stampedAt);
-        boolean rebuild = reassemble && (stampedAt == null || rebuildOwed);
+        boolean resumeNeedsRebuild = target == PipelineState.RUNNING && actual == PipelineState.PAUSED
+                && actuator.needsRebuildOnResume(pipelineId);
+        boolean rebuild = resumeNeedsRebuild || (reassemble && (rebuildOwed
+                || (stampedAt == null && actual == PipelineState.PAUSED)
+                || (actual == PipelineState.STOPPED && actuator.isCarryingAJob(pipelineId))));
 
         if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING) {
             // A pipeline believed running whose job has died converges to the observable FAILED state,
@@ -99,7 +103,7 @@ public final class PipelineConverger {
             // is where the previous process's progress was recorded, so this resumes the work without
             // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
             // rather than "this process did not start it", so the next tick actuates nothing.
-            if (!actuator.isCarryingAJob(pipelineId)) {
+            if (!actuator.isCarryingAJob(pipelineId) && !rebuild) {
                 try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(pipelineId)) {
                     prepared.submit();
                 } catch (StartDeferred waiting) {
@@ -196,10 +200,10 @@ public final class PipelineConverger {
             state.create(pipelineId, StateJson.of(PipelineState.NEW), clock.instant());
             current = requireCheckpoint(pipelineId);
         }
-        // A rebuild is the one thing this comparison cannot see. It asks for the run behind the state
-        // to be replaced, and the state already matching is exactly the condition it is asked for in,
-        // so reading it as converged is how both halves of a stop and a start written together went
-        // missing at once with nothing anywhere reporting it.
+        if (target == PipelineState.RUNNING && rebuild) {
+            return rebuildToRunning(pipelineId, current, purgeState);
+        }
+        // A requested rebuild was handled above; an ordinary state match needs no further actuation.
         if (current.stateJson().equals(targetJson) && !evenIfAlreadyThere) {
             return ConvergeResult.converged(current);
         }
@@ -226,7 +230,7 @@ public final class PipelineConverger {
                         if (prepared != null) {
                             prepared.submit();
                         } else {
-                            actuate(pipelineId, from, target, purgeState, rebuild);
+                            actuate(pipelineId, from, target, purgeState);
                         }
                     } catch (TapstateException refused) {
                         // A coded refusal after a transition is an observable pipeline failure. Internal
@@ -255,34 +259,58 @@ public final class PipelineConverger {
     }
 
     /**
+     * Records the old job as stopped before replacing it. A new start that waits for capture capacity
+     * leaves STOPPED in the checkpoint, so neither a reader nor a later pass mistakes it for RUNNING.
+     * Both halves still consume the same desired instruction in one pass when admission succeeds.
+     */
+    private ConvergeResult rebuildToRunning(String pipelineId, CheckpointDoc current, boolean purgeState) {
+        boolean stoppedHere = false;
+        for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS
+                && StateJson.parse(current.stateJson()) != PipelineState.STOPPED; attempt++) {
+            CasOutcome outcome = state.compareAndSwap(
+                    pipelineId, current.epoch(), StateJson.of(PipelineState.STOPPED), clock.instant());
+            if (outcome instanceof CasOutcome.Applied applied) {
+                current = applied.next();
+                try {
+                    actuator.stop(pipelineId, purgeState);
+                } catch (TapstateException refused) {
+                    return failedWith(pipelineId, refused);
+                }
+                stoppedHere = true;
+                break;
+            }
+            current = requireCheckpoint(pipelineId);
+        }
+        if (StateJson.parse(current.stateJson()) != PipelineState.STOPPED) {
+            return ConvergeResult.superseded();
+        }
+        if (!stoppedHere && actuator.isCarryingAJob(pipelineId)) {
+            try {
+                actuator.stop(pipelineId, purgeState);
+            } catch (TapstateException refused) {
+                return failedWith(pipelineId, refused);
+            }
+        }
+        return driveTo(pipelineId, PipelineState.RUNNING, false, current, false, false, false);
+    }
+
+    /**
      * Drives the job side to match a state transition the store just recorded. Start and resume both
      * land in RUNNING, so the origin state decides between them: RUNNING reached from PAUSED continues
      * the held job (resume), reached from anywhere else begins a fresh run (start). A pipeline seeded at
      * NEW is never a transition target here, so it drives nothing.
      *
-     * <p>An intent that asks to be re-assembled overrides the first of those: the held job is torn down
-     * and a fresh one submitted, keeping everything the pipeline has. That is what makes an edit made
-     * while paused take effect, and it happens here rather than as two intents because this side samples
-     * the latest intent instead of consuming every one written.
+     * <p>Rebuilding a job follows the separate STOPPED-to-RUNNING path above, preserving the same intent
+     * while a replacement waits for admission.
      *
      * <p>{@code purgeState} reaches only the stop, and only ever carries what a user's own stop asked
      * for. A pipeline that completed or failed arrives at the same verb, and arrives with it false: an
      * ending nobody asked for is not permission to throw away where it had got to.
      */
-    private void actuate(
-            String pipelineId, PipelineState from, PipelineState target, boolean purgeState,
-            boolean rebuild) {
+    private void actuate(String pipelineId, PipelineState from, PipelineState target, boolean purgeState) {
         switch (target) {
             case RUNNING -> {
-                if (rebuild) {
-                    // Both halves here, in one pass, because they cannot be two intents: this side reads
-                    // the latest intent rather than consuming a queue of them, so a stop written and
-                    // immediately overwritten by a start is never observed and neither half happens.
-                    // Nothing is cleared -- carrying on from the recorded position is the whole point of
-                    // re-assembling rather than re-reading the source.
-                    actuator.stop(pipelineId, purgeState);
-                    actuator.start(pipelineId);
-                } else if (from == PipelineState.PAUSED) {
+                if (from == PipelineState.PAUSED) {
                     actuator.resume(pipelineId);
                 } else {
                     actuator.start(pipelineId);

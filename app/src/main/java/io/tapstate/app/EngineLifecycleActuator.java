@@ -260,6 +260,11 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override
+    public boolean needsRebuildOnResume(String pipelineId) {
+        return !captureCoordinator.loadDelivered(pipelineId);
+    }
+
+    @Override
     public void stop(String pipelineId, boolean purgeState) {
         engine.cancel(pipelineId);
         if (purgeState) {

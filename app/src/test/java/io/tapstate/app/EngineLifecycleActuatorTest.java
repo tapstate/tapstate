@@ -475,6 +475,62 @@ class EngineLifecycleActuatorTest {
         assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(2);
     }
 
+    @Test
+    void anUndeliveredPausedLoadWaitingForCapacityDoesNotRecordRunning() {
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
+                new Engine(member), new RecordingDagSource(new CopyOnWriteArrayList<>()),
+                coordinator, teardown());
+        InMemoryDesiredStore desired = new InMemoryDesiredStore();
+        InMemoryStateStore state = new InMemoryStateStore();
+        PipelineConverger loop = new PipelineConverger(desired, state, actuator, Clock.systemUTC());
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+        loop.converge(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        desired.save(new DesiredState(PIPE, PipelineState.PAUSED, "rev-1"));
+        loop.converge(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.SUSPENDED);
+
+        coordinator.loadDelivered = false;
+        coordinator.snapshotCapacityUnavailable = true;
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+        loop.converge(PIPE);
+
+        assertThat(StateJson.parse(state.read(PIPE).orElseThrow().stateJson()))
+                .as("rebuilding resume must not report a running job when admission deferred")
+                .isEqualTo(PipelineState.STOPPED);
+        assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
+    }
+
+    @Test
+    void aRestartWaitingForCapacityStopsOnceAndRetriesTheSameIntent() {
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
+        LifecycleActuator actuator = TestEngineLifecycleActuators.create(
+                new Engine(member), new RecordingDagSource(new CopyOnWriteArrayList<>()),
+                coordinator, teardown());
+        InMemoryDesiredStore desired = new InMemoryDesiredStore();
+        InMemoryStateStore state = new InMemoryStateStore();
+        PipelineConverger loop = new PipelineConverger(desired, state, actuator, Clock.systemUTC());
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+        loop.converge(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        long previousEpoch = state.read(PIPE).orElseThrow().epoch();
+
+        coordinator.snapshotCapacityUnavailable = true;
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-2", false,
+                null, true, previousEpoch));
+        loop.converge(PIPE);
+        assertThat(StateJson.parse(state.read(PIPE).orElseThrow().stateJson()))
+                .isEqualTo(PipelineState.STOPPED);
+        assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
+
+        coordinator.snapshotCapacityUnavailable = false;
+        loop.converge(PIPE);
+        assertThat(StateJson.parse(state.read(PIPE).orElseThrow().stateJson()))
+                .isEqualTo(PipelineState.RUNNING);
+        assertThat(actuator.isCarryingAJob(PIPE)).isTrue();
+    }
+
     /**
      * The same hold over a pipeline that reads its source once and opens no tail. It rebuilds too, and for
      * the same reason: what a resume cannot carry on from is the load, and a load is no less unfinished for

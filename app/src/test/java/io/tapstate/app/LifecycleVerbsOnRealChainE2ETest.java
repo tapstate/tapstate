@@ -127,6 +127,7 @@ class LifecycleVerbsOnRealChainE2ETest {
                 listener.row(read(2));
             }
             @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                listener.onStart(safeStart(start));
                 if (config.streams().contains("fast_orders")) {
                     listener.onBatch(List.of(Envelope.insert(100L, "fast_orders",
                                     Map.of("id", 100L, "amount", "fast"), Map.of())),
@@ -188,6 +189,7 @@ class LifecycleVerbsOnRealChainE2ETest {
                 listener.row(read(3));
             }
             @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                listener.onStart(safeStart(start));
                 listener.onBatch(List.of(insert(4)), Optional.of(new SourcePosition("src-4")));
                 return () -> { };
             }
@@ -602,6 +604,7 @@ class LifecycleVerbsOnRealChainE2ETest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            listener.onStart(safeStart(start));
             for (Envelope change : changes) {
                 listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }
@@ -617,6 +620,11 @@ class LifecycleVerbsOnRealChainE2ETest {
         public DiscoveredSchema discoverSchema(CaptureConfig config) {
             throw new UnsupportedOperationException();
         }
+    }
+
+    private static Optional<SourcePosition> safeStart(CaptureStart start) {
+        return Optional.of(start instanceof CaptureStart.Resume resume
+                ? resume.position() : new SourcePosition("src-start"));
     }
 
     /** A bounded snapshot batch over a fixed list of rows. */
