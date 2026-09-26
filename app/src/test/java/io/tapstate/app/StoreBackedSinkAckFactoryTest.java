@@ -15,6 +15,7 @@ import static org.mockito.Mockito.when;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.runtime.engine.AwaitedLoad;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
@@ -538,6 +539,104 @@ class StoreBackedSinkAckFactoryTest {
         assertThatThrownBy(() -> unbound.advance("orders", at(7, "w7")))
                 .isInstanceOf(IllegalStateException.class);
         assertThat(ackedPosition(store, "mc-orders", "pipe-1")).isNull();
+    }
+
+    /**
+     * A load a change waits for has landed once every writer of the sink it is awaited at has passed it - the
+     * writers of another sink the table reaches do not count, and neither does the table being recorded as
+     * loaded, which waits for them too. A writer given none of the load's rows passes it by a bound.
+     */
+    @Test
+    void aLoadHasLandedOnceEveryWriterOfTheSinkItIsAwaitedAtHasPassedIt() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of("serve.s#0", "serve.s#1", "serve.t#0")));
+        AwaitedLoad load = new AwaitedLoad("serve.s", "orders", List.of("serve.s#0", "serve.s#1"));
+
+        assertThat(factory.loadLandings(member).stillLanding(List.of(load))).containsExactly(load);
+
+        factory.resolve(member).forWriter("serve.s#0").advance("orders",
+                new ChainPosition(SourceOrder.snapshotRow(1), null));
+
+        assertThat(factory.loadLandings(member).stillLanding(List.of(load))).containsExactly(load);
+
+        factory.resolve(member).forWriter("serve.s#1").bounded("orders", SourceOrder.snapshotRow(1));
+
+        assertThat(factory.loadLandings(member).stillLanding(List.of(load))).isEmpty();
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1"))
+                .as("while serve.t still holds the table back from being recorded as loaded")
+                .isEmpty();
+    }
+
+    /** A load recorded as landed has landed, in a later run whose writers have said nothing yet. */
+    @Test
+    void aLoadRecordedAsLandedHasLandedWhicheverRunLandedIt() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
+        store.markSnapshotComplete("mc-orders", "pipe-1", "orders");
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER)), "run-2");
+
+        assertThat(factory.loadLandings(member).stillLanding(
+                List.of(new AwaitedLoad("serve.s", "orders", List.of(WRITER))))).isEmpty();
+    }
+
+    /** A table whose load the pipeline does not read at all has none in flight for a change to overtake. */
+    @Test
+    void aTableThePipelineReadsNoLoadOfHasNoneInFlight() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER)));
+
+        assertThat(factory.loadLandings(member).stillLanding(
+                List.of(new AwaitedLoad("serve.s", "orders", List.of(WRITER))))).isEmpty();
+    }
+
+    /**
+     * Progress of a run that is not this one says nothing about this run's writers: a run started after it
+     * has replaced it, and a run not started yet has no writers to speak of.
+     */
+    @Test
+    void noRunButThisOneSaysALoadHasLanded() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
+        HazelcastInstance member = memberWith(store);
+        Map<String, String> chains = Map.of("orders", "mc-orders");
+        AwaitedLoad load = new AwaitedLoad("serve.s", "orders", List.of(WRITER));
+        StoreBackedSinkAckFactory notStarted = new StoreBackedSinkAckFactory(chains, "pipe-1", "run-1");
+
+        assertThat(notStarted.loadLandings(member).stillLanding(List.of(load))).containsExactly(load);
+
+        // Another sink's writer still holds the table back from being recorded as loaded, which would answer
+        // for every run.
+        StoreBackedSinkAckFactory current = startedRun(member, chains, "pipe-1",
+                Map.of("orders", List.of(WRITER, OTHER_WRITER)), "run-2");
+        current.resolve(member).forWriter(WRITER).bounded("orders", SourceOrder.snapshotRow(1));
+
+        assertThat(current.loadLandings(member).stillLanding(List.of(load))).isEmpty();
+        assertThat(notStarted.loadLandings(member).stillLanding(List.of(load)))
+                .as("run-1's writers never said anything, whatever run-2's did")
+                .containsExactly(load);
+    }
+
+    /** A member with no store bound has no record a load could be seen landing in, and holds nothing back. */
+    @Test
+    void aMemberWithNoStoreBoundHoldsNothingBack() {
+        HazelcastInstance member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>());
+        StoreBackedSinkAckFactory factory =
+                new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1", "run-1");
+
+        assertThat(factory.loadLandings(member).stillLanding(
+                List.of(new AwaitedLoad("serve.s", "orders", List.of(WRITER))))).isEmpty();
     }
 
     /** One change's position: the order the engine assigned it, and the token the connector gave. */

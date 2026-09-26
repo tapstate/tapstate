@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.runtime.engine.LoadLandings;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 
@@ -53,6 +54,15 @@ final class FencedSinkAckFactory implements SinkAckFactory {
     public void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
         ExecutionAuthorization.of(coordinator).require(fence);
         delegate.beginRun(coordinator, writersByChain);
+    }
+
+    /**
+     * Where the loads stand, read as the wrapped factory reads it. Reading moves nothing, and what it reads
+     * already answers only for the run the factory was made for.
+     */
+    @Override
+    public LoadLandings loadLandings(HazelcastInstance member) {
+        return delegate.loadLandings(member);
     }
 
     /**

@@ -38,4 +38,16 @@ public interface SinkAckFactory extends Serializable {
      */
     default void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
     }
+
+    /**
+     * Resolves, on {@code member}, how the loads a source's changes wait for stand, read from the same durable
+     * record the acks resolved here write: a load has landed once every writer named with it has recorded
+     * progress past it.
+     *
+     * <p>A factory whose acks record no writer's progress has nothing a load could be seen landing in, and
+     * answers that every load has: a change held for a record nothing writes would be held for good.
+     */
+    default LoadLandings loadLandings(HazelcastInstance member) {
+        return awaited -> List.of();
+    }
 }

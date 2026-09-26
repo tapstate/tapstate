@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine;
 
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -21,17 +22,45 @@ final class PipelineChains {
     private final Map<String, List<String>> byVertex = new LinkedHashMap<>();
     // Per vertex: over how many distinct paths each chain reaching it gets there.
     private final Map<String, Map<String, Integer>> pathsByVertex = new LinkedHashMap<>();
+    // Per vertex: the chains whose own rows reach it, rather than rows a nest or a join assembled from them.
+    private final Map<String, Set<String>> unassembledByVertex = new LinkedHashMap<>();
 
     /** Records that the vertex keyed {@code vertexKey} reads {@code chain} and nothing else. */
     void source(String vertexKey, String chain) {
         byVertex.put(vertexKey, List.of(chain));
         pathsByVertex.put(vertexKey, Map.of(chain, 1));
+        unassembledByVertex.put(vertexKey, Set.of(chain));
     }
 
     /** Records that the vertex keyed {@code vertexKey} carries whatever the vertices behind it carry. */
     void derived(String vertexKey, List<String> upstreamKeys) {
         byVertex.put(vertexKey, union(upstreamKeys));
         pathsByVertex.put(vertexKey, paths(upstreamKeys));
+        unassembledByVertex.put(vertexKey, unassembled(upstreamKeys));
+    }
+
+    /**
+     * Records that the vertex keyed {@code vertexKey} carries the chains behind it in rows of its own: a nest's
+     * documents and a join's widened rows move with those chains' bounds, but none of them is a row one of
+     * the chains' sources read.
+     */
+    void assembled(String vertexKey, List<String> upstreamKeys) {
+        byVertex.put(vertexKey, union(upstreamKeys));
+        pathsByVertex.put(vertexKey, paths(upstreamKeys));
+        unassembledByVertex.put(vertexKey, Set.of());
+    }
+
+    /**
+     * The chains whose own rows reach a vertex fed by all of {@code upstreamKeys}: rows their source read,
+     * passed along or reshaped one at a time, a snapshot row still a snapshot row of its table.
+     */
+    Set<String> unassembled(List<String> upstreamKeys) {
+        Set<String> merged = new LinkedHashSet<>();
+        for (String key : upstreamKeys) {
+            of(key);
+            merged.addAll(unassembledByVertex.get(key));
+        }
+        return Collections.unmodifiableSet(merged);
     }
 
     /**

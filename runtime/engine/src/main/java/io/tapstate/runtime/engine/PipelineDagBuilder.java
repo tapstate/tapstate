@@ -359,7 +359,7 @@ public final class PipelineDagBuilder {
                                     alias -> chains.perProducer(
                                             aliasUpstream(inline.from(), alias, bindings)))));
                     if (chains != null) {
-                        chains.derived(step.id(), nestUpstream(inline.from(), bindings));
+                        chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
                     assembled = true;
                     continue;
@@ -380,7 +380,7 @@ public final class PipelineDagBuilder {
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             bindings.join().stores(), bindings.join().displaced()));
                     if (chains != null) {
-                        chains.derived(step.id(), nestUpstream(inline.from(), bindings));
+                        chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }
                     assembled = true;
                     continue;
@@ -422,7 +422,73 @@ public final class PipelineDagBuilder {
             connect(dag, verticesOf(sink.upstream(), byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
         }
 
+        // Only once every sink is known: what a source's changes wait for depends on every sink its rows reach.
+        // Held against the durable record the acks write, so a graph whose sinks record nothing holds nothing.
+        if (sinkAck != null && chains != null) {
+            Map<String, List<AwaitedLoad>> gates = loadGates(sinks, chains, shape);
+            for (String sourceId : pipeline.sourceIds()) {
+                for (String sourceKey : bindings.sourceKeys().apply(sourceId)) {
+                    List<AwaitedLoad> awaited = gates.get(frontier.chainOf(sourceKey));
+                    if (awaited != null) {
+                        LoadGate gate = new LoadGate(sinkAck, awaited);
+                        byKey.get(sourceKey).updateMetaSupplier(gate::appliedTo);
+                    }
+                }
+            }
+        }
+
         return dag;
+    }
+
+    /**
+     * For each chain whose changes have to wait before they leave its source, the loads they wait for.
+     *
+     * <p>A sink running several writers hands a keyed target table's load rows to whichever writer has room and
+     * every change to the writer its key belongs to, so a change reaching its writer could overtake a load row
+     * of the same key still being written by another, and the older value would land last. What a change of
+     * one table could overtake there is a load row of any table written into the same target table, since a
+     * row of either can carry the same key - so its changes wait for every one of those loads, landed at every
+     * writer of that sink.
+     *
+     * <p>Only rows a table's source read are handed out that way. A nest's documents and a join's widened rows
+     * are rows of their own, never load rows, and go to the writer their key belongs to like any change; a
+     * table reaching a sink only through one of them waits for nothing there. Neither does a table with no key,
+     * all of whose rows go to one writer in the order they were read, nor anything reaching a sink that runs
+     * one processor for the cluster.
+     */
+    private static Map<String, List<AwaitedLoad>> loadGates(List<SinkNode> sinks, PipelineChains chains,
+            ExecutionShape shape) {
+        Map<String, Set<AwaitedLoad>> byChain = new LinkedHashMap<>();
+        for (SinkNode sink : sinks) {
+            if (!shape.isNative(sink.name())) {
+                continue;
+            }
+            Map<String, SinkTarget> targets = shape.sinkTargetsOf(sink.name());
+            List<String> writers = writersOf(sink, shape);
+            // The tables whose own rows reach this sink, by the keyed target table each is written into.
+            Map<String, List<String>> loadsByTarget = new LinkedHashMap<>();
+            for (String chain : chains.unassembled(sink.upstream())) {
+                SinkTarget target = targets.get(chain);
+                if (target == null) {
+                    throw new IllegalStateException("sink '" + sink.name() + "' receives rows of '" + chain
+                            + "' but no target table was worked out for them");
+                }
+                if (target.keyed()) {
+                    loadsByTarget.computeIfAbsent(target.table(), table -> new ArrayList<>()).add(chain);
+                }
+            }
+            for (List<String> loads : loadsByTarget.values()) {
+                for (String chain : loads) {
+                    Set<AwaitedLoad> awaited = byChain.computeIfAbsent(chain, ignored -> new LinkedHashSet<>());
+                    for (String load : loads) {
+                        awaited.add(new AwaitedLoad(sink.name(), load, writers));
+                    }
+                }
+            }
+        }
+        Map<String, List<AwaitedLoad>> gates = new LinkedHashMap<>();
+        byChain.forEach((chain, awaited) -> gates.put(chain, List.copyOf(awaited)));
+        return gates;
     }
 
     /** One sink a graph draws: its vertex, the producers it reads, and the writers it opens. */
@@ -525,16 +591,25 @@ public final class PipelineDagBuilder {
             ExecutionShape shape) {
         Map<String, List<String>> byChain = new LinkedHashMap<>();
         for (SinkNode sink : sinks) {
-            int width = shape.isNative(sink.name()) ? shape.effectiveOf(sink.name()) : 1;
-            List<String> writers = new ArrayList<>(width);
-            for (int index = 0; index < width; index++) {
-                writers.add(SinkProcessor.writerId(sink.name(), index));
-            }
+            List<String> writers = writersOf(sink, shape);
             for (String chain : chains.union(sink.upstream())) {
                 byChain.computeIfAbsent(chain, ignored -> new ArrayList<>()).addAll(writers);
             }
         }
         return byChain;
+    }
+
+    /**
+     * Every writer {@code sink} runs: one, at index zero, for a sink running as one processor for the cluster,
+     * and as many as it runs across the cluster otherwise, by the index the engine gives each.
+     */
+    private static List<String> writersOf(SinkNode sink, ExecutionShape shape) {
+        int width = shape.isNative(sink.name()) ? shape.effectiveOf(sink.name()) : 1;
+        List<String> writers = new ArrayList<>(width);
+        for (int index = 0; index < width; index++) {
+            writers.add(SinkProcessor.writerId(sink.name(), index));
+        }
+        return writers;
     }
 
     /**

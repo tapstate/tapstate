@@ -3,15 +3,19 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.runtime.engine.AwaitedLoad;
+import io.tapstate.runtime.engine.LoadLandings;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SrsDurableFrontier;
 import io.tapstate.runtime.srs.SrsWriterFrontier;
 import io.tapstate.runtime.srs.SrsWriterFrontier.Landed;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.WriterProgress;
 import io.tapstate.spi.store.WriterRun;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -97,6 +101,60 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             return (chain, position) -> { };
         }
         return new Unbound(meta, chainIdByTable, pipelineId, runId);
+    }
+
+    /**
+     * Where the loads a source's changes wait for stand, as this pipeline's record on each table's mining chain
+     * says: a load has landed once every writer named with it has recorded progress, in this run, past the
+     * reserved position every row of the load sits at.
+     *
+     * <p>A load the pipeline recorded as landed has landed, whichever run landed it, and a table the pipeline
+     * reads no load of on its chain has none in flight. A run that is not this one - not started yet, or
+     * already replaced by a later one - says nothing about this run's writers, so nothing of it counts: a
+     * source of a replaced run keeps holding until it is stopped. A member with no store bound has no record to
+     * read, and holds nothing back, as its acks record nothing.
+     */
+    @Override
+    public LoadLandings loadLandings(HazelcastInstance member) {
+        SrsMetaStore meta = storeOn(member);
+        if (meta == null) {
+            return awaited -> List.of();
+        }
+        return awaited -> {
+            // One read of each chain's consumers and run per look, however many of its tables are awaited -
+            // and the consumers on their own, for the reason the ack path asks for them that way.
+            Map<String, List<ConsumerOffset>> consumers = new HashMap<>();
+            Map<String, Optional<WriterRun>> runs = new HashMap<>();
+            List<AwaitedLoad> landing = new ArrayList<>();
+            for (AwaitedLoad load : awaited) {
+                String miningChainId = miningChainOf(chainIdByTable, load.table());
+                List<ConsumerOffset> offsets = consumers.computeIfAbsent(miningChainId, meta::consumerOffsets);
+                Optional<WriterRun> run =
+                        runs.computeIfAbsent(miningChainId, chain -> meta.writerRun(chain, pipelineId));
+                if (!landed(load, offsets, run)) {
+                    landing.add(load);
+                }
+            }
+            return landing;
+        };
+    }
+
+    private boolean landed(AwaitedLoad load, List<ConsumerOffset> consumers, Optional<WriterRun> run) {
+        boolean recorded = consumers.stream().anyMatch(consumer -> consumer.pipelineId().equals(pipelineId)
+                && consumer.snapshotCompletedTables().contains(load.table()));
+        if (recorded) {
+            return true;
+        }
+        if (run.isEmpty() || !run.get().runId().equals(runId)) {
+            return false;
+        }
+        Long snapshotEpoch = run.get().snapshotEpoch();
+        if (snapshotEpoch == null) {
+            return true;
+        }
+        return SrsWriterFrontier.landed(run.get(), load.table(), load.writers())
+                .map(landed -> SrsWriterFrontier.passedLoad(landed, snapshotEpoch))
+                .orElse(false);
     }
 
     private static SrsMetaStore storeOn(HazelcastInstance member) {

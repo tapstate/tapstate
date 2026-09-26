@@ -28,11 +28,19 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.runtime.engine.AwaitedLoad;
+import io.tapstate.runtime.engine.LoadGate;
+import io.tapstate.runtime.engine.LoadLandings;
+import io.tapstate.runtime.engine.SinkAck;
+import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.spi.capture.SourcePosition;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
 import org.junit.jupiter.api.AfterAll;
@@ -635,6 +643,108 @@ class SrsSourceProcessorTest {
         }
     }
 
+    /**
+     * Where a sink spreads loads over several writers, a change could reach its writer while a load row of the
+     * same key is still being written by another, and the older value would land last. So the ring's changes
+     * wait until the loads they could overtake have landed - and so does every bound past the load's own, which
+     * would say they had been read and passed on. The load and its bound go out as before, since the load
+     * cannot land without them.
+     */
+    @Test
+    void holdsTheRingsChangesAndEveryBoundPastItsLoadUntilTheLoadsHaveLanded() throws InterruptedException {
+        SEEN.clear();
+        LANDED.set(false);
+        LOOKS.set(0);
+        String ring = "srs.chain.gated";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, ring, snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.endSnapshot(PIPELINE, ring);
+        fill(ring, 2);
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-gated", 1024, gateOn("orders")));
+        try {
+            awaitSeen("b:7:0");
+            // Looked twice: once the load was through the gate was asked, and said no, and time went on.
+            awaitLooks(2);
+            assertThat(SEEN).as("the load and its bound leave, and nothing after them while it lands")
+                    .containsExactly("i:100", "i:101", "b:7:0");
+
+            LANDED.set(true);
+
+            awaitSeen("b:7:2");
+            assertThat(SEEN).containsSubsequence("b:7:0", "i:0", "i:1", "b:7:2");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-gated").destroy();
+        }
+    }
+
+    /**
+     * The same wait for a change that reaches the source through its hand-off rather than a ring, handed over
+     * right behind the load's last row: it is held there, not emitted with the load it follows.
+     */
+    @Test
+    void holdsAChangeHandedOverBehindItsLoadUntilTheLoadsHaveLanded() throws InterruptedException {
+        SEEN.clear();
+        LANDED.set(false);
+        LOOKS.set(0);
+        String ring = "srs.chain.gatedhandoff";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, ring, snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.endSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, Envelope.insert(5L, "orders", Map.of("id", 5), null)
+                .withPosition(new ChainPosition(new SourceOrder(1L, 5L), "t5")));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-gatedhandoff", 1024, gateOn("orders")));
+        try {
+            awaitSeen("b:7:0");
+            awaitLooks(2);
+            assertThat(SEEN).as("the load and its bound leave, and the change behind them waits")
+                    .containsExactly("i:100", "i:101", "b:7:0");
+
+            LANDED.set(true);
+
+            awaitSeen("b:7:6");
+            assertThat(SEEN).containsSubsequence("b:7:0", "i:5", "b:7:6");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-gatedhandoff").destroy();
+        }
+    }
+
+    /**
+     * A source that started on a load an earlier instance had begun taking promises nothing of that load, so
+     * the load never lands in this run - and changes waiting for it would wait for as long as the run lasts,
+     * with the job running and nothing said. The run ends instead.
+     */
+    @Test
+    void aSourceThatCannotVouchForItsOwnLoadEndsTheRunRatherThanHoldItsChangesForGood() {
+        LANDED.set(false);
+        String ring = "srs.chain.gatedbegun";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        assertThat(buffer.drain(PIPELINE, ring)).as("taken by an instance before this one").hasSize(1);
+        buffer.append(PIPELINE, ring, snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.endSnapshot(PIPELINE, ring);
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-gatedbegun", 1024, gateOn("orders")));
+        try {
+            assertThatThrownBy(() -> job.getFuture().get(20, TimeUnit.SECONDS))
+                    .hasStackTraceContaining("an earlier instance had begun");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-gatedbegun").destroy();
+        }
+    }
+
     private static void runRecordingBounds(String ringName, String src, String sinkName, int size, int queueSize,
             String bound) throws InterruptedException {
         Job job = hz.getJet().newJob(recordingDag(ringName, src, sinkName, queueSize));
@@ -670,18 +780,64 @@ class SrsSourceProcessorTest {
      * value that means "no bound" and so is one no source can send.
      */
     private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize) {
+        return recordingDag(ringName, src, sinkName, queueSize, null);
+    }
+
+    /** The same graph with the source's changes held at {@code gate}, or not held at all where it is null. */
+    private static DAG recordingDag(String ringName, String src, String sinkName, int queueSize, LoadGate gate) {
         DAG dag = new DAG();
-        Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
+        ProcessorMetaSupplier reading = SrsSourceProcessor.metaSupplier(
                 PIPELINE, ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
                 order -> new Watermark(
                         order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7),
-                SourcePlacement.anyMember()));
+                SourcePlacement.anyMember());
+        Vertex source = dag.newVertex("source", gate == null ? reading : gate.appliedTo(reading));
         Vertex record = dag.newVertex("record", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of(RecordingBounds::new)));
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(sinkName)).localParallelism(1);
         dag.edge(between(source, record).setConfig(new EdgeConfig().setQueueSize(queueSize)))
                 .edge(between(record, sink));
         return dag;
+    }
+
+    /** Whether the loads a gated source waits for have landed, as the test says; and how often it asked. */
+    private static final AtomicBoolean LANDED = new AtomicBoolean();
+    private static final AtomicInteger LOOKS = new AtomicInteger();
+
+    /** A gate awaiting {@code table}'s load at one writer, landed when {@link #LANDED} says so. */
+    private static LoadGate gateOn(String table) {
+        return new LoadGate(new SwitchedLandings(),
+                List.of(new AwaitedLoad("serve.s", table, List.of("serve.s#0"))));
+    }
+
+    private static void awaitLooks(int looks) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        while (LOOKS.get() < looks) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("timed out waiting for the source to look at its gate " + looks
+                        + " times, it looked " + LOOKS.get());
+            }
+            Thread.sleep(50);
+        }
+    }
+
+    /** Acks that record nothing, over a record whose loads land when the test says so. */
+    private static final class SwitchedLandings implements SinkAckFactory {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public SinkAck resolve(HazelcastInstance member) {
+            return (chain, position) -> { };
+        }
+
+        @Override
+        public LoadLandings loadLandings(HazelcastInstance member) {
+            return awaited -> {
+                LOOKS.incrementAndGet();
+                return LANDED.get() ? List.of() : awaited;
+            };
+        }
     }
 
     /** What one vertex was handed, in arrival order: {@code i:<id>} for a change, {@code b:<axis>:<bound>}. */

@@ -1,5 +1,9 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.runtime.engine.AwaitedLoad;
+import io.tapstate.runtime.engine.HoldsChangesForLoads;
+import io.tapstate.runtime.engine.LoadGate;
+import io.tapstate.runtime.engine.LoadLandings;
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -45,13 +49,19 @@ import java.util.function.LongConsumer;
  * full this source neither reads the ring nor promises the load's bound, and a source that finds part of the
  * load already taken by an instance before it -- a job restarted mid-load -- never promises it at all.
  *
+ * <p><strong>Where a sink spreads loads over several writers, changes also wait for the loads to land.</strong>
+ * Such a sink hands a load row to whichever writer has room and a change to the writer its key belongs to, so
+ * a change leaving here could overtake a load row of the same key still being written elsewhere. Given a
+ * {@link LoadGate}, this source holds its changes -- and every bound past its own load -- until each load the
+ * gate awaits has landed at those writers, as the pipeline's durable record shows it.
+ *
  * <p>Non-cooperative, exactly as Jet's own SourceBuilder-built source is: it runs on its own thread and backs
  * off between empty fills, so an idle input never spins a shared cooperative thread. It is not fault-tolerant -
  * it keeps no snapshot and a ring read position never enters Jet state; on an L1 restart the ring is re-mined
  * and replayed from the durable source offset. A configured ring and read-cursor sink are resolved on the
  * member the processor runs on, so nothing but serializable coordinates crosses the wire.
  */
-public final class SrsSourceProcessor extends AbstractProcessor implements Staged {
+public final class SrsSourceProcessor extends AbstractProcessor implements Staged, HoldsChangesForLoads {
 
     @Override
     public Stage stage() {
@@ -60,6 +70,13 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     /** The most changes one fill drains before yielding - a bounded batch that lets Jet pace the source. */
     private static final int FILL_BATCH = 256;
+
+    /**
+     * How often a source holding its changes looks at whether the loads they wait for have landed. Each look is
+     * a read of the durable record, and a load lands once, so a change waits at most this much longer than it
+     * has to rather than the record being read on every pass.
+     */
+    private static final long LOOK_INTERVAL_NANOS = 500_000_000L;
 
     private final String pipelineId;
     private final String ringName;
@@ -94,6 +111,16 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     // instance has already taken some of it -- a job restarted mid-load -- cannot vouch for the rows that
     // instance took and never emitted, so it promises nothing about the load and leaves the table owed.
     private boolean vouchesForSnapshot = true;
+    // What this source's changes wait for, when a sink it reaches spreads loads over several writers; null for
+    // a source whose changes leave as soon as they are read.
+    private LoadGate gate;
+    private LoadLandings landings;
+    // Whether changes are still being held for the gate. It opens once and stays open: a load that has landed
+    // does not stop having landed.
+    private boolean holding;
+    // The first change handed over while the gate is shut, and everything handed over behind it, in order.
+    private final ArrayDeque<Envelope> held = new ArrayDeque<>();
+    private long nextLookNanos;
 
     private SrsSourceProcessor(String pipelineId, String ringName, String src, long epoch,
             SourceBoundStamp stamp, RingTail ringTail) {
@@ -107,6 +134,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     // Times each read of the ring that produced something, which is this stage's unit of work.
     private StageTimer timer = StageTimer.none(Stage.SOURCE);
+
+    @Override
+    public void holdChangesUntil(LoadGate gate) {
+        this.gate = Objects.requireNonNull(gate, "gate");
+    }
 
     @Override
     protected void init(Context context) {
@@ -129,6 +161,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             SnapshotBuffer.SnapshotState load = buffered.snapshotState(pipelineId, ringName);
             awaitingSnapshot = !load.handedOver();
             vouchesForSnapshot = !load.begun();
+        }
+        if (gate != null) {
+            landings = gate.landingsOn(context.hazelcastInstance());
+            holding = true;
+            nextLookNanos = System.nanoTime();
         }
         drainBuffered();
         if (ringTail != null) {
@@ -175,6 +212,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                 }
             }
         }
+        lookAtTheGate();
         // Reading and projecting what arrived is this stage's unit of work; a pass that finds nothing is
         // not a unit and is not timed, or the distribution would be swamped by the idle polls between rows.
         long started = timer.begin();
@@ -185,8 +223,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
         // again, so a change of the new ring would otherwise read as older than one of the ring before it.
         // Not before a declared load is through: the ring may already hold changes to rows the load has
-        // yet to hand over, and each of them has to follow its row, not precede it.
-        if (ringTail != null && !awaitingSnapshot && openReader()) {
+        // yet to hand over, and each of them has to follow its row, not precede it. Nor while changes are held
+        // for the loads they could overtake: the ring keeps them, in order, until the gate opens.
+        if (ringTail != null && !awaitingSnapshot && !holding && openReader()) {
             try {
                 reader.fill((item, seq) -> {
                     SourceOrder order = orderOf(seq);
@@ -285,7 +324,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * they have all left.
      */
     private void drainBuffered() {
-        if (buffered == null) {
+        // Nothing more is taken while a change is held: whatever was handed over behind it can only be more
+        // changes, and they wait where they are rather than twice over here.
+        if (buffered == null || !held.isEmpty()) {
             return;
         }
         List<Envelope> rows = buffered.drain(pipelineId, ringName);
@@ -295,15 +336,66 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             awaitingSnapshot = !buffered.snapshotState(pipelineId, ringName).handedOver();
         }
         for (Envelope row : rows) {
-            pending.add(row);
-            ChainPosition at = row.position();
-            if (at == null || at.order() == null || at.order().seq() == SourceOrder.SNAPSHOT_SEQ) {
-                // Rows to emit means a bound to promise once they have left. A source that took none owes
-                // nothing: there is no snapshot of this table in this run for a sink to be waiting on.
-                snapshotBoundDue = true;
+            if (holding && (!held.isEmpty() || !isLoadRow(row))) {
+                held.add(row);
             } else {
-                read = at.order();
+                take(row);
             }
+        }
+    }
+
+    /** Queues {@code row} to be emitted, and counts it as the kind of row it is. */
+    private void take(Envelope row) {
+        pending.add(row);
+        if (isLoadRow(row)) {
+            // Rows to emit means a bound to promise once they have left. A source that took none owes
+            // nothing: there is no snapshot of this table in this run for a sink to be waiting on.
+            snapshotBoundDue = true;
+        } else {
+            read = row.position().order();
+        }
+    }
+
+    /** Whether {@code row} is a row of a load: every one sits at the reserved position, or carries none. */
+    private static boolean isLoadRow(Envelope row) {
+        ChainPosition at = row.position();
+        return at == null || at.order() == null || at.order().seq() == SourceOrder.SNAPSHOT_SEQ;
+    }
+
+    /**
+     * Asks, now and then, whether the loads this source's changes wait for have landed, and once they have,
+     * lets the changes go: those held here first, in the order they were handed over, then the ring.
+     *
+     * <p>Only once this table's own load is through, and only where there is something that could be held:
+     * a change can only follow the load, and a source with no ring and nothing held has nothing to release.
+     *
+     * <p>A source that could not vouch for its own load -- it started on one an earlier instance had begun
+     * taking -- never promises that load's bound, so the load never lands in this run and the gate would stay
+     * shut for as long as the run lasts, with nothing reported. Every start and every resume over a load not
+     * yet delivered hands the load over afresh, so this is a state nothing enters; were anything to, the run
+     * ends here rather than stand still.
+     */
+    private void lookAtTheGate() {
+        if (!holding || awaitingSnapshot || (ringTail == null && held.isEmpty())) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (now - nextLookNanos < 0) {
+            return;
+        }
+        nextLookNanos = now + LOOK_INTERVAL_NANOS;
+        List<AwaitedLoad> landing = landings.stillLanding(gate.awaited());
+        if (!landing.isEmpty()) {
+            if (!vouchesForSnapshot && landing.stream().anyMatch(load -> load.table().equals(src))) {
+                throw new IllegalStateException("source of '" + src + "' in pipeline '" + pipelineId
+                        + "' started on a load an earlier instance had begun, so that load never lands in this"
+                        + " run, and the changes waiting for it would be held for good");
+            }
+            return;
+        }
+        holding = false;
+        while (!held.isEmpty()) {
+            take(held.poll());
         }
     }
 
