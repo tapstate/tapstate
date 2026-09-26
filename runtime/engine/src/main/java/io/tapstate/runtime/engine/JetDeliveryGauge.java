@@ -2,8 +2,10 @@ package io.tapstate.runtime.engine;
 
 import io.tapstate.core.lifecycle.HistogramValue;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Publishes a sink's delivery readings as run statistics of the job it belongs to, one per table and
@@ -66,17 +68,22 @@ final class JetDeliveryGauge implements DeliveryGauge {
 
     @Override
     public void waiting(Map<String, Long> queuedByStream, Map<String, Long> inFlightByTable) {
-        Map<String, Long> now = new HashMap<>();
-        queuedByStream.forEach((stream, rows) -> now.put(SinkWaitingMetricNames.queuedNameOf(stream), rows));
-        inFlightByTable.forEach((table, rows) -> now.put(SinkWaitingMetricNames.inFlightNameOf(table), rows));
-        // A stream or table with nothing waiting any more reads zero, not the last number it had: the statistics
-        // keep whatever was set under a name until something else is.
-        waitingByName.forEach((name, statistic) -> {
-            if (!now.containsKey(name)) {
-                statistic.set(0);
-            }
-        });
-        now.forEach((name, rows) -> waitingByName.computeIfAbsent(name, JobStatistic::new).set(rows));
+        waitingReadings(queuedByStream, inFlightByTable, waitingByName.keySet())
+                .forEach((name, rows) -> waitingByName.computeIfAbsent(name, JobStatistic::new).set(rows));
+    }
+
+    /**
+     * What a waiting report sets: each stream's and table's count under its name, and zero under every name set
+     * before whose stream or table has nothing waiting now. The statistics keep whatever was set under a name
+     * until something else is, so a count not set back to zero would read as still waiting.
+     */
+    static Map<String, Long> waitingReadings(Map<String, Long> queuedByStream, Map<String, Long> inFlightByTable,
+            Set<String> setBefore) {
+        Map<String, Long> readings = new LinkedHashMap<>();
+        setBefore.forEach(name -> readings.put(name, 0L));
+        queuedByStream.forEach((stream, rows) -> readings.put(SinkWaitingMetricNames.queuedNameOf(stream), rows));
+        inFlightByTable.forEach((table, rows) -> readings.put(SinkWaitingMetricNames.inFlightNameOf(table), rows));
+        return readings;
     }
 
     @Override
