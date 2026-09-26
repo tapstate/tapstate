@@ -637,7 +637,8 @@ class ControlPlaneConfiguration {
             Clock clock,
             HistoryCursorCodec cursors) {
         return new PipelineHistoryQueryService(
-                artifactQueryService, storePort.rateHistory(), history.getSampleInterval(), clock, cursors);
+                artifactQueryService, storePort.rateHistory(), storePort.historyRollups(),
+                history.getSampleInterval(), clock, cursors);
     }
 
     @Bean

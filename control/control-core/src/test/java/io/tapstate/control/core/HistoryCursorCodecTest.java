@@ -42,6 +42,26 @@ class HistoryCursorCodecTest {
         assertThat(state.retentionCutoff()).isEqualTo(T0.minus(Duration.ofDays(15)));
         assertThat(state.resumeAt()).isEqualTo(T0.minusSeconds(15));
         assertThat(state.expiresAt()).isEqualTo(T0.plus(Duration.ofMinutes(10)));
+        assertThat(state.cachePosition()).isNull();
+    }
+
+    @Test
+    void cachedPositionRoundTripsWithTheRawFallbackAnchor() {
+        HistoryCursorCodec codec = codecAt(T0);
+        HistoryCursorCodec.CachePosition position = new HistoryCursorCodec.CachePosition(
+                Instant.parse("2026-09-21T09:55:00Z"), 2, T0.minusSeconds(10));
+        String token = codec.issue(BINDING, T0.minusSeconds(3600), T0,
+                T0.minus(Duration.ofDays(15)), KEY, T0.minusSeconds(15), position);
+
+        HistoryCursorCodec.State state = codec.read(token, BINDING);
+
+        assertThat(state.cachePosition()).isEqualTo(position);
+        assertThat(state.afterKey()).isEqualTo(KEY);
+        assertThat(state.resumeAt()).isEqualTo(T0.minusSeconds(15));
+        TapstateException expired = catchThrowableOfType(() ->
+                codecAt(T0.plus(Duration.ofMinutes(10))).read(token, BINDING),
+                TapstateException.class);
+        assertThat(expired.code()).isEqualTo(MonitorError.CURSOR_EXPIRED);
     }
 
     @Test

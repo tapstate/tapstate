@@ -67,9 +67,21 @@ public final class HistoryCursorCodec {
         }
     }
 
+    /** The last emitted fragment of a cached page; the raw anchor remains its fallback position. */
+    public record CachePosition(Instant bucketStart, int fragmentIndex, Instant computedAt) {
+        public CachePosition {
+            Objects.requireNonNull(bucketStart, "bucketStart");
+            Objects.requireNonNull(computedAt, "computedAt");
+            if (fragmentIndex < 0) {
+                throw new IllegalArgumentException("a cached fragment index is non-negative");
+            }
+        }
+    }
+
     /** Frozen bounds and the exact key/boundary at which projection resumes. */
     public record State(QueryBinding binding, Instant effectiveFrom, Instant effectiveTo,
-            Instant retentionCutoff, Key afterKey, Instant resumeAt, Instant issuedAt, Instant expiresAt) {
+            Instant retentionCutoff, Key afterKey, Instant resumeAt, Instant issuedAt, Instant expiresAt,
+            CachePosition cachePosition) {
         public State {
             Objects.requireNonNull(binding, "binding");
             Objects.requireNonNull(effectiveFrom, "effectiveFrom");
@@ -85,9 +97,14 @@ public final class HistoryCursorCodec {
     /** Issues a cursor without retaining any server-side state. */
     public String issue(QueryBinding binding, Instant effectiveFrom, Instant effectiveTo,
             Instant retentionCutoff, Key afterKey, Instant resumeAt) {
+        return issue(binding, effectiveFrom, effectiveTo, retentionCutoff, afterKey, resumeAt, null);
+    }
+
+    public String issue(QueryBinding binding, Instant effectiveFrom, Instant effectiveTo,
+            Instant retentionCutoff, Key afterKey, Instant resumeAt, CachePosition cachePosition) {
         Instant issuedAt = clock.instant();
         State state = new State(binding, effectiveFrom, effectiveTo, retentionCutoff, afterKey, resumeAt,
-                issuedAt, issuedAt.plus(ttl));
+                issuedAt, issuedAt.plus(ttl), cachePosition);
         byte[] claims = claims(state).getBytes(StandardCharsets.UTF_8);
         return ENCODER.encodeToString(claims) + "." + ENCODER.encodeToString(sign(claims));
     }
@@ -137,7 +154,7 @@ public final class HistoryCursorCodec {
     private String claims(State state) {
         QueryBinding binding = state.binding();
         StringBuilder out = new StringBuilder();
-        line(out, "v", "2");
+        line(out, "v", state.cachePosition() == null ? "2" : "3");
         line(out, "op", "pipeline.metrics.history");
         line(out, "pipeline", text(binding.pipelineId()));
         line(out, "from", instant(binding.from()));
@@ -157,6 +174,11 @@ public final class HistoryCursorCodec {
         line(out, "afterAt", instant(state.afterKey().observedAt()));
         line(out, "afterKey", text(state.afterKey().internalKey()));
         line(out, "resumeAt", instant(state.resumeAt()));
+        if (state.cachePosition() != null) {
+            line(out, "cacheBucket", instant(state.cachePosition().bucketStart()));
+            line(out, "cacheFragment", Integer.toString(state.cachePosition().fragmentIndex()));
+            line(out, "cacheComputed", instant(state.cachePosition().computedAt()));
+        }
         line(out, "issuedAt", instant(state.issuedAt()));
         line(out, "expiresAt", instant(state.expiresAt()));
         return out.toString();
@@ -177,7 +199,7 @@ public final class HistoryCursorCodec {
                     .add(line.substring(split + 1));
         }
         String version = one(values, "v");
-        if (!("1".equals(version) || "2".equals(version))
+        if (!("1".equals(version) || "2".equals(version) || "3".equals(version))
                 || !"pipeline.metrics.history".equals(one(values, "op"))) {
             throw new IllegalArgumentException("unsupported cursor claims");
         }
@@ -188,7 +210,7 @@ public final class HistoryCursorCodec {
         }
         List<String> tables = encodedTables.stream().map(HistoryCursorCodec::plain).toList();
         Visibility visibility;
-        if ("2".equals(version)) {
+        if ("2".equals(version) || "3".equals(version)) {
             String includeLegacy = one(values, "includeLegacy");
             if (!("true".equals(includeLegacy) || "false".equals(includeLegacy))) {
                 throw new IllegalArgumentException("invalid history visibility flag");
@@ -207,6 +229,11 @@ public final class HistoryCursorCodec {
                 Integer.parseInt(one(values, "limit")),
                 tables, visibility);
         Key key = new Key(parsedInstant(one(values, "afterAt")), plain(one(values, "afterKey")));
+        CachePosition cachePosition = "3".equals(version)
+                ? new CachePosition(parsedInstant(one(values, "cacheBucket")),
+                        Integer.parseInt(one(values, "cacheFragment")),
+                        parsedInstant(one(values, "cacheComputed")))
+                : null;
         State state = new State(binding,
                 parsedInstant(one(values, "effectiveFrom")),
                 parsedInstant(one(values, "effectiveTo")),
@@ -214,10 +241,11 @@ public final class HistoryCursorCodec {
                 key,
                 parsedInstant(one(values, "resumeAt")),
                 parsedInstant(one(values, "issuedAt")),
-                parsedInstant(one(values, "expiresAt")));
+                parsedInstant(one(values, "expiresAt")), cachePosition);
         List<String> expectedNames = List.of("v", "op", "pipeline", "from", "to", "resolution", "limit",
                 "tables", "table", "incarnation", "includeLegacy", "effectiveFrom", "effectiveTo",
-                "retentionCutoff", "afterAt", "afterKey", "resumeAt", "issuedAt", "expiresAt");
+                "retentionCutoff", "afterAt", "afterKey", "resumeAt", "cacheBucket",
+                "cacheFragment", "cacheComputed", "issuedAt", "expiresAt");
         if (values.keySet().stream().anyMatch(name -> !expectedNames.contains(name))) {
             throw new IllegalArgumentException("unknown cursor claim");
         }

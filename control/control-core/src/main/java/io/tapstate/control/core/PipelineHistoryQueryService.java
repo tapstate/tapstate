@@ -22,6 +22,11 @@ import io.tapstate.spi.store.RateHistoryStore.Entry;
 import io.tapstate.spi.store.RateHistoryStore.Key;
 import io.tapstate.spi.store.RateHistoryStore.Page;
 import io.tapstate.spi.store.RateHistoryStore.Visibility;
+import io.tapstate.spi.store.HistoryRollupStore;
+import io.tapstate.spi.store.HistoryRollupStore.Bucket;
+import io.tapstate.spi.store.HistoryRollupStore.Fragment;
+import io.tapstate.spi.store.HistoryRollupStore.Resolution;
+import io.tapstate.spi.store.HistoryRollupStore.Scope;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -29,6 +34,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -44,12 +50,17 @@ public final class PipelineHistoryQueryService {
     public static final int DEFAULT_RAW_SCAN_BUDGET = 25_000;
     public static final int MAX_SERIES = 22;
     public static final Duration MAX_RANGE = Duration.ofDays(15);
+    private static final int ROLLUP_READ_BATCH = 64;
+    private static final int MAX_ROLLUP_READS = 128;
+    private static final int MAX_RAW_FALLBACK_BUCKETS = 64;
+    private static final int MAX_CACHED_ITEMS = 16_384;
 
     private static final String PIPELINE_KIND = "pipeline";
     private static final BigDecimal NANOS_PER_SECOND = BigDecimal.valueOf(1_000_000_000L);
 
     private final ArtifactQueryService artifacts;
     private final RateHistoryStore history;
+    private final HistoryRollupStore rollups;
     private final Duration sampleInterval;
     private final Clock clock;
     private final HistoryCursorCodec cursors;
@@ -58,15 +69,28 @@ public final class PipelineHistoryQueryService {
 
     public PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
             Duration sampleInterval, Clock clock, HistoryCursorCodec cursors) {
-        this(artifacts, history, sampleInterval, clock, cursors,
+        this(artifacts, history, null, sampleInterval, clock, cursors,
+                DEFAULT_RAW_BATCH_SIZE, DEFAULT_RAW_SCAN_BUDGET);
+    }
+
+    public PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
+            HistoryRollupStore rollups, Duration sampleInterval, Clock clock, HistoryCursorCodec cursors) {
+        this(artifacts, history, rollups, sampleInterval, clock, cursors,
                 DEFAULT_RAW_BATCH_SIZE, DEFAULT_RAW_SCAN_BUDGET);
     }
 
     PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
             Duration sampleInterval, Clock clock, HistoryCursorCodec cursors,
             int rawBatchSize, int rawScanBudget) {
+        this(artifacts, history, null, sampleInterval, clock, cursors, rawBatchSize, rawScanBudget);
+    }
+
+    PipelineHistoryQueryService(ArtifactQueryService artifacts, RateHistoryStore history,
+            HistoryRollupStore rollups, Duration sampleInterval, Clock clock, HistoryCursorCodec cursors,
+            int rawBatchSize, int rawScanBudget) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.history = Objects.requireNonNull(history, "history");
+        this.rollups = rollups;
         this.sampleInterval = Objects.requireNonNull(sampleInterval, "sampleInterval");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.cursors = Objects.requireNonNull(cursors, "cursors");
@@ -112,15 +136,336 @@ public final class PipelineHistoryQueryService {
         }
 
         Cost cost = new Cost();
-        Entry predecessor = boundaryBefore(normalized, frozen, cost);
-        QueryRun run = effective.raw()
-                ? raw(normalized, frozen, effective, predecessor, cost)
-                : aggregate(normalized, frozen, effective, predecessor, cost);
+        QueryRun cached = effective.raw() ? null : cachedAggregate(normalized, frozen, effective, cost);
+        QueryRun run;
+        if (cached != null) {
+            run = cached;
+        } else {
+            Entry predecessor = boundaryBefore(normalized, frozen, cost);
+            run = effective.raw()
+                    ? raw(normalized, frozen, effective, predecessor, cost)
+                    : aggregate(normalized, frozen, effective, predecessor, cost);
+        }
         if (!visibility.equals(requirePipeline(normalized.binding().pipelineId()))) {
             throw new TapstateException(MonitorError.INVALID_CURSOR,
                     Map.of("operation", "pipeline.metrics.history", "reason", "QUERY_MISMATCH"), null);
         }
         return run;
+    }
+
+    private QueryRun cachedAggregate(Normalized normalized, Frozen frozen,
+            EffectiveHistoryResolution effective, Cost cost) {
+        if (rollups == null || (frozen.afterKey() != null && frozen.cachePosition() == null)) {
+            return null;
+        }
+        QueryBinding binding = normalized.binding();
+        Visibility visibility = binding.visibility();
+        if (visibility.incarnationId() != null && visibility.includeLegacy()) {
+            return null;
+        }
+        Resolution resolution = Resolution.valueOf(effective.name());
+        Scope scope = visibility.incarnationId() == null
+                ? Scope.legacy() : Scope.incarnation(visibility.incarnationId());
+        Duration width = resolution.duration();
+        Instant first = floor(frozen.from(), width);
+        Instant end = ceil(frozen.to(), width);
+        Map<Instant, Bucket> cached = new HashMap<>();
+        int cachedItems = 0;
+        Instant batchFrom = first;
+        while (batchFrom.isBefore(end)) {
+            Instant batchTo = min(end, batchFrom.plus(width.multipliedBy(ROLLUP_READ_BATCH)));
+            if (++cost.storeReads > MAX_ROLLUP_READS) {
+                return null;
+            }
+            List<Bucket> page;
+            try {
+                page = rollups.readRange(binding.pipelineId(), scope, resolution,
+                        batchFrom, batchTo, ROLLUP_READ_BATCH);
+            } catch (RuntimeException unavailable) {
+                return null;
+            }
+            for (Bucket bucket : page) {
+                cachedItems += 1 + bucket.fragments().size() + bucket.gaps().size();
+                if (cachedItems > MAX_CACHED_ITEMS) {
+                    return null;
+                }
+                if (!bucket.key().pipelineId().equals(binding.pipelineId())
+                        || !bucket.key().scope().equals(scope)
+                        || bucket.key().resolution() != resolution
+                        || bucket.key().bucketStart().isBefore(batchFrom)
+                        || !bucket.key().bucketStart().isBefore(batchTo)
+                        || cached.putIfAbsent(bucket.key().bucketStart(), bucket) != null) {
+                    return null;
+                }
+            }
+            batchFrom = batchTo;
+        }
+        if (cached.isEmpty()) {
+            return null;
+        }
+
+        List<BucketSlice> slices = new ArrayList<>();
+        int fallbackBuckets = 0;
+        Instant checkedAt = clock.instant();
+        for (Instant at = first; at.isBefore(end); at = at.plus(width)) {
+            Instant sliceFrom = max(at, frozen.from());
+            Instant sliceTo = min(at.plus(width), frozen.to());
+            Bucket bucket = cached.get(at);
+            boolean full = at.equals(sliceFrom) && at.plus(width).equals(sliceTo);
+            if (!full || bucket == null || !bucket.usableAt(checkedAt)
+                    || bucket.inWindowSamples() < 0
+                    || bucket.inWindowSamples() > 0 && bucket.fragments().isEmpty()) {
+                bucket = null;
+                fallbackBuckets++;
+            }
+            slices.add(new BucketSlice(at, sliceFrom, sliceTo, bucket));
+        }
+        if (fallbackBuckets > MAX_RAW_FALLBACK_BUCKETS) {
+            return null;
+        }
+        HistoryCursorCodec.CachePosition resume = frozen.cachePosition();
+        if (resume != null) {
+            Bucket anchor = cached.get(resume.bucketStart());
+            if (anchor == null || !anchor.usableAt(checkedAt)
+                    || !anchor.computedAt().equals(resume.computedAt())
+                    || resume.fragmentIndex() >= anchor.fragments().size()
+                    || !Objects.equals(anchor.fragments().get(resume.fragmentIndex()).resumeAfter(),
+                            frozen.afterKey())
+                    || !Objects.equals(anchor.fragments().get(resume.fragmentIndex()).resumeAt(),
+                            frozen.resumeAt())) {
+                return null;
+            }
+        }
+
+        boolean retainedSample = slices.stream().anyMatch(slice ->
+                slice.bucket() != null && slice.bucket().inWindowSamples() > 0);
+        List<Emitted> output = new ArrayList<>();
+        List<Gap> observedGaps = new ArrayList<>();
+        List<HistoryCursorCodec.CachePosition> positions = new ArrayList<>();
+        boolean passedAnchor = resume == null;
+        int globalSegment = 0;
+        int precedingLocalSegment = -1;
+        Instant precedingBucket = null;
+        boolean hasPriorPoint = resume != null;
+        if (resume != null) {
+            precedingBucket = resume.bucketStart();
+            precedingLocalSegment = cached.get(resume.bucketStart()).fragments()
+                    .get(resume.fragmentIndex()).segment();
+        }
+        for (BucketSlice slice : slices) {
+            if (resume != null && slice.bucketStart().isBefore(resume.bucketStart())) {
+                continue;
+            }
+            SliceProjection projection = slice.bucket() == null
+                    ? rawSlice(normalized, frozen, effective, slice, cost)
+                    : cachedSlice(slice.bucket(), normalized.tables());
+            retainedSample |= projection.inWindowSamples() > 0;
+            for (HistoryRollupStore.Gap gap : projection.gaps()) {
+                Instant start = max(frozen.resumeAt(), gap.intervalStart());
+                if (start.isBefore(gap.intervalEnd())) {
+                    observedGaps.add(new Gap(start, gap.intervalEnd(),
+                            GapReason.valueOf(gap.reason().name())));
+                }
+            }
+            if (output.size() > binding.limit()) {
+                if (retainedSample) {
+                    break;
+                }
+                continue;
+            }
+            for (SourcePoint source : projection.points()) {
+                if (!passedAnchor) {
+                    if (source.position() != null && source.position().equals(resume)) {
+                        passedAnchor = true;
+                    }
+                    continue;
+                }
+                boolean boundary = false;
+                if (hasPriorPoint) {
+                    boolean sameBucket = slice.bucketStart().equals(precedingBucket);
+                    boundary = sameBucket
+                            ? source.localSegment() != precedingLocalSegment
+                            : source.localSegment() > 0 || source.startReason() == StartReason.GAP
+                                    || source.startReason() == StartReason.COUNTER_RESET;
+                    if (boundary) {
+                        globalSegment++;
+                    }
+                } else {
+                    globalSegment = source.localSegment();
+                }
+                StartReason reason = hasPriorPoint && !boundary
+                        ? StartReason.CONTINUATION
+                        : !hasPriorPoint && source.localSegment() == 0
+                                && source.startReason() == StartReason.CONTINUATION
+                                ? StartReason.WINDOW_START : source.startReason();
+                Key anchor = source.resumeAfter() == null
+                        ? new Key(source.point().intervalEnd(), "cache-unanchored")
+                        : source.resumeAfter();
+                output.add(new Emitted(source.point(), globalSegment, reason,
+                        anchor, source.resumeAt() == null ? source.point().intervalEnd() : source.resumeAt()));
+                positions.add(source.position());
+                hasPriorPoint = true;
+                precedingBucket = slice.bucketStart();
+                precedingLocalSegment = source.localSegment();
+                if (output.size() > binding.limit()) {
+                    break;
+                }
+            }
+            if (output.size() > binding.limit() && retainedSample) {
+                break;
+            }
+        }
+        if (!passedAnchor) {
+            return null;
+        }
+        if (cached.values().stream().anyMatch(bucket -> bucket.usableAt(checkedAt)
+                && !clock.instant().isBefore(bucket.validUntil()))) {
+            return null;
+        }
+        if (!retainedSample && resume == null) {
+            return measured(response(normalized, frozen, effective,
+                    Status.NO_RETAINED_SAMPLES, List.of(), List.of(), List.of(), null), cost);
+        }
+        boolean hasMore = output.size() > binding.limit();
+        List<Emitted> emitted = hasMore ? output.subList(0, binding.limit()) : output;
+        String next = null;
+        if (hasMore && !emitted.isEmpty()) {
+            Emitted last = emitted.getLast();
+            HistoryCursorCodec.CachePosition position = positions.get(binding.limit() - 1);
+            if (position != null) {
+                Fragment fragment = cached.get(position.bucketStart()).fragments().get(position.fragmentIndex());
+                if (fragment.resumeAfter() == null || fragment.resumeAt() == null) {
+                    return null;
+                }
+                next = cursors.issue(binding, frozen.from(), frozen.to(), frozen.cutoff(),
+                        last.resumeAfter(), last.resumeAt(), position);
+            } else {
+                next = cursors.issue(binding, frozen.from(), frozen.to(), frozen.cutoff(),
+                        last.resumeAfter(), last.resumeAt());
+            }
+        }
+        List<Segment> segments = segments(emitted);
+        List<Gap> related = cachedGapsForPage(segments, observedGaps);
+        return measured(response(normalized, frozen, effective, Status.OK,
+                segments, related, unavailable(segments, normalized.tables()), next), cost);
+    }
+
+    private static List<Gap> cachedGapsForPage(List<Segment> segments, List<Gap> observed) {
+        if (observed.isEmpty()) {
+            return List.of();
+        }
+        List<Gap> ordered = observed.stream()
+                .sorted(java.util.Comparator.comparing(Gap::intervalStart)
+                        .thenComparing(Gap::intervalEnd))
+                .toList();
+        List<Gap> merged = new ArrayList<>();
+        for (Gap gap : ordered) {
+            if (!merged.isEmpty()) {
+                Gap last = merged.getLast();
+                if (last.reason() == gap.reason()
+                        && !last.intervalEnd().isBefore(gap.intervalStart())) {
+                    merged.set(merged.size() - 1, new Gap(last.intervalStart(),
+                            max(last.intervalEnd(), gap.intervalEnd()), last.reason()));
+                    continue;
+                }
+            }
+            merged.add(gap);
+        }
+        return merged.stream().filter(gap -> segments.stream()
+                .anyMatch(segment -> segment.startReason() == StartReason.GAP
+                        && !segment.intervalStart().isBefore(gap.intervalEnd())))
+                .toList();
+    }
+
+    private SliceProjection cachedSlice(Bucket bucket, List<String> tables) {
+        List<SourcePoint> points = new ArrayList<>();
+        for (int index = 0; index < bucket.fragments().size(); index++) {
+            Fragment fragment = bucket.fragments().get(index);
+            List<Lag> selectedLag = fragment.lag().stream()
+                    .filter(lag -> tables.contains(lag.table()))
+                    .map(lag -> new Lag(lag.table(), lag.observedAt(), lag.last(), lag.max()))
+                    .toList();
+            Point point = new Point(fragment.intervalStart(), fragment.intervalEnd(),
+                    cachedRate(fragment.recordsOut()), cachedRate(fragment.bytesOut()), selectedLag);
+            HistoryCursorCodec.CachePosition position = new HistoryCursorCodec.CachePosition(
+                    bucket.key().bucketStart(), index, bucket.computedAt());
+            points.add(new SourcePoint(point, fragment.segment(),
+                    StartReason.valueOf(fragment.startReason().name()),
+                    fragment.resumeAfter(), fragment.resumeAt(), position));
+        }
+        return new SliceProjection(bucket.inWindowSamples(), points, bucket.gaps());
+    }
+
+    private static Rate cachedRate(HistoryRollupStore.Rate value) {
+        return value == null ? null : new Rate(value.delta(), value.averageRate(), value.maxRate());
+    }
+
+    private SliceProjection rawSlice(Normalized normalized, Frozen frozen,
+            EffectiveHistoryResolution effective, BucketSlice slice, Cost cost) {
+        QueryBinding binding = normalized.binding();
+        cost.storeReads++;
+        Optional<Entry> boundary = history.predecessorVisible(binding.pipelineId(), binding.visibility(),
+                slice.from());
+        boundary.ifPresent(ignored -> cost.rawDocumentsScanned++);
+        Entry predecessor = retained(boundary, frozen).orElse(null);
+        requireScanBudget(cost);
+        HistoryAggregator aggregator = new HistoryAggregator(slice.from(), slice.to(), slice.from(),
+                effective.duration(), sampleInterval, normalized.tables(),
+                slice.from().equals(frozen.from()) ? StartReason.WINDOW_START : StartReason.CONTINUATION,
+                binding.limit() + 1);
+        aggregator.begin(predecessor);
+        Key after = null;
+        int count = 0;
+        boolean storeHasMore;
+        do {
+            Page page = history.readPageVisible(binding.pipelineId(), binding.visibility(),
+                    slice.from(), slice.to(), after, rawBatchSize);
+            cost.page(page, predecessor == null ? 0 : 1);
+            requireScanBudget(cost);
+            for (Entry entry : page.entries()) {
+                aggregator.add(entry);
+                count++;
+                after = entry.key();
+                if (aggregator.full()) {
+                    break;
+                }
+            }
+            storeHasMore = page.hasMore();
+            if (page.entries().isEmpty() || aggregator.full()) {
+                break;
+            }
+        } while (storeHasMore);
+        Entry successor = null;
+        if (count > 0 && !aggregator.full() && !storeHasMore) {
+            cost.storeReads++;
+            successor = history.successorVisible(binding.pipelineId(), binding.visibility(),
+                    slice.to()).orElse(null);
+            if (successor != null) {
+                cost.rawDocumentsScanned++;
+                requireScanBudget(cost);
+            }
+        }
+        HistoryAggregator.Projection projection = aggregator.finish(successor);
+        List<SourcePoint> points = projection.points().stream()
+                .map(emitted -> new SourcePoint(emitted.point(), emitted.segment(),
+                        emitted.startReason(), emitted.resumeAfter(), emitted.resumeAt(), null))
+                .toList();
+        List<HistoryRollupStore.Gap> gaps = projection.gaps().stream()
+                .map(gap -> new HistoryRollupStore.Gap(gap.segment(), gap.gap().intervalStart(),
+                        gap.gap().intervalEnd(),
+                        HistoryRollupStore.GapReason.valueOf(gap.gap().reason().name())))
+                .toList();
+        return new SliceProjection(count, points, gaps);
+    }
+
+    private static Instant floor(Instant at, Duration width) {
+        long seconds = width.toSeconds();
+        return Instant.ofEpochSecond(Math.floorDiv(at.getEpochSecond(), seconds) * seconds);
+    }
+
+    private static Instant ceil(Instant at, Duration width) {
+        Instant floor = floor(at, width);
+        return floor.equals(at) ? floor : floor.plus(width);
     }
 
     private QueryRun raw(Normalized normalized, Frozen frozen, EffectiveHistoryResolution effective,
@@ -294,7 +639,7 @@ public final class PipelineHistoryQueryService {
         if (normalized.cursor() != null) {
             State state = cursors.read(normalized.cursor(), normalized.binding());
             return new Frozen(state.effectiveFrom(), state.effectiveTo(), state.retentionCutoff(),
-                    state.afterKey(), state.resumeAt());
+                    state.afterKey(), state.resumeAt(), state.cachePosition());
         }
         Instant now = clock.instant();
         Instant cutoff = now.minus(history.retention());
@@ -303,7 +648,7 @@ public final class PipelineHistoryQueryService {
         if (effectiveFrom.isAfter(effectiveTo)) {
             effectiveFrom = effectiveTo;
         }
-        return new Frozen(effectiveFrom, effectiveTo, cutoff, null, effectiveFrom);
+        return new Frozen(effectiveFrom, effectiveTo, cutoff, null, effectiveFrom, null);
     }
 
     private Visibility requirePipeline(String pipelineId) {
@@ -545,7 +890,19 @@ public final class PipelineHistoryQueryService {
     private record Normalized(QueryBinding binding, List<String> tables, String cursor) {
     }
 
-    private record Frozen(Instant from, Instant to, Instant cutoff, Key afterKey, Instant resumeAt) {
+    private record Frozen(Instant from, Instant to, Instant cutoff, Key afterKey, Instant resumeAt,
+            HistoryCursorCodec.CachePosition cachePosition) {
+    }
+
+    private record BucketSlice(Instant bucketStart, Instant from, Instant to, Bucket bucket) {
+    }
+
+    private record SourcePoint(Point point, int localSegment, StartReason startReason,
+            Key resumeAfter, Instant resumeAt, HistoryCursorCodec.CachePosition position) {
+    }
+
+    private record SliceProjection(int inWindowSamples, List<SourcePoint> points,
+            List<HistoryRollupStore.Gap> gaps) {
     }
 
     private record Projection(List<Emitted> points, List<EmittedGap> gaps) {
