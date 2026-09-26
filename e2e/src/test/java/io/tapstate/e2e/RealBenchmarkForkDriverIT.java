@@ -52,7 +52,7 @@ class RealBenchmarkForkDriverIT {
         int expectedPhysical = switch (workloadId) {
             case "copy" -> 12_001;
             case "stateless" -> 12_002;
-            case "stateful" -> 36_003;
+            case "stateful" -> 36_002;
             default -> throw new AssertionError("unrecognized benchmark workload " + workloadId);
         };
         assertThat(result.measurement().deliveryNanos()).hasSize(expectedMeasured);

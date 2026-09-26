@@ -35,9 +35,9 @@ import java.util.function.Function;
  * The resulting latency includes source execution, connector transit, target write and cursor delivery.
  * It does not isolate time spent in any one of those components.
  *
- * <p>One key names one physical target document. Repeated writes to that document are matched against
- * the key's expectations in registration order. The caller must know every insert/update owed by the
- * workload; an unregistered target write is a failure, including an extra write of a known key.
+ * <p>One key names one physical target document. Required writes are matched in registration order; an
+ * unmeasured terminal may allow one named refinement whose presence depends on source arrival order.
+ * Unregistered or duplicate target writes remain failures.
  */
 final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
 
@@ -74,6 +74,9 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private record Pending(String phaseId, ExpectedChange change, long issuedAtNanos, boolean measured) {
     }
 
+    private record OptionalChange(String phaseId, ExpectedChange change) {
+    }
+
     private final Object lock = new Object();
     private final String targetId;
     private final String targetCollection;
@@ -83,6 +86,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private final MongoChangeStreamCursor<ChangeStreamDocument<Document>> cursor;
     private final Thread reader;
     private final Map<String, ArrayDeque<Pending>> pendingByKey = new HashMap<>();
+    private final Map<String, ArrayDeque<OptionalChange>> optionalByKey = new HashMap<>();
     private final List<Delivery> deliveries = new ArrayList<>();
     private final Map<ObservedKey, Long> observedCoverage = new HashMap<>();
 
@@ -152,6 +156,24 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             throw new IllegalArgumentException("an unmeasured phase must name target changes");
         }
         register(phaseId, 0, expected, false);
+    }
+
+    /** Allows one unmeasured write after a required terminal insert, without requiring it. */
+    void allowOptionalUnmeasured(String phaseId, List<ExpectedChange> allowed) {
+        Objects.requireNonNull(allowed, "optional terminal target changes");
+        synchronized (lock) {
+            requireOpenAndReady();
+            if (!Objects.equals(activePhase, phaseId)) {
+                throw new IllegalStateException("optional changes must join the registered terminal phase");
+            }
+            for (ExpectedChange change : allowed) {
+                if (!pendingByKey.containsKey(change.key())) {
+                    throw new IllegalArgumentException("optional change has no required target key");
+                }
+                optionalByKey.computeIfAbsent(change.key(), ignored -> new ArrayDeque<>())
+                        .addLast(new OptionalChange(phaseId, change));
+            }
+        }
     }
 
     private void register(String phaseId, long issuedAtNanos, List<ExpectedChange> expected, boolean measured) {
@@ -237,6 +259,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             activePhase = null;
             phaseExpected = 0;
             phaseObserved = 0;
+            optionalByKey.clear();
             pendingBarrierId = null;
             barrierSeen = false;
             checkpointing = false;
@@ -259,7 +282,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         return result;
     }
 
-    /** The physically observed key/kind multiset, with stable target identity and phase. */
+    /** Required target coverage; an allowed terminal refinement does not change fork correctness. */
     Map<ObservedKey, Long> observedCoverage() {
         synchronized (lock) {
             if (failure != null) {
@@ -349,7 +372,10 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 return;
             }
             if (pending.isEmpty()) {
-                fail("extra or duplicate target change for key " + key, null);
+                Kind actual = operation == OperationType.INSERT ? Kind.INSERT : Kind.UPDATE;
+                if (!acceptOptional(key, actual)) {
+                    fail("extra or duplicate target change for key " + key, null);
+                }
                 return;
             }
             Pending expected = pending.removeFirst();
@@ -376,6 +402,18 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             phaseObserved = Math.addExact(phaseObserved, 1);
             lock.notifyAll();
         }
+    }
+
+    private boolean acceptOptional(String key, Kind actual) {
+        ArrayDeque<OptionalChange> allowed = optionalByKey.get(key);
+        if (allowed == null || allowed.isEmpty()) {
+            return false;
+        }
+        OptionalChange candidate = allowed.removeFirst();
+        if (!candidate.phaseId().equals(activePhase) || candidate.change().kind() != actual) {
+            fail("optional terminal change mismatch for key " + key, null);
+        }
+        return true;
     }
 
     private void fail(String message, Throwable cause) {

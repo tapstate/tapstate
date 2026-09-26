@@ -27,12 +27,13 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** A small real join/nest pipeline witnesses the frozen terminal rows' physical Mongo write shape. */
+/** A small real join/nest pipeline witnesses terminal target content, source ACKs and allowed write order. */
 class BenchmarkTerminalTargetChangesIT {
 
     private static final String BOOT_JAR_PROPERTY = "tapstate.e2e.benchmark-smoke.jar";
@@ -196,6 +197,15 @@ class BenchmarkTerminalTargetChangesIT {
                         () -> join.find(Filters.eq("order_id", 1L)).first() != null
                                 && hasItem(nest.find(Filters.eq("id", 1L)).first(), 1L),
                         () -> "join=" + join.countDocuments() + " nest=" + nest.countDocuments());
+                Await.until("initial target ACKs for every stateful source", Duration.ofSeconds(45),
+                        () -> workload.sourceChains().stream()
+                                .allMatch(chain -> control.targetAckForIfPresent(chain).isPresent()),
+                        () -> workload.sourceChains().stream().map(chain -> chain.id() + "="
+                                + control.targetAckForIfPresent(chain).isPresent()).toList().toString());
+                Map<String, String> ackBeforeTerminal = new LinkedHashMap<>();
+                for (BenchmarkWorkloadDefinitions.SourceChain chain : workload.sourceChains()) {
+                    ackBeforeTerminal.put(chain.id(), control.targetAckFor(chain));
+                }
 
                 try (MongoChangeStreamCursor<ChangeStreamDocument<Document>> joinChanges =
                                 viewsMongo.getDatabase("views").watch()
@@ -224,15 +234,21 @@ class BenchmarkTerminalTargetChangesIT {
                     List<OperationType> nestOps = untilBarrier(nestChanges, nestDatabase, "bench_nest_orders",
                             "id", 900_013L, nestBarrier);
 
+                    Await.until("terminal ACKs advanced for every stateful source", Duration.ofSeconds(45),
+                            () -> workload.sourceChains().stream()
+                                    .allMatch(chain -> control.targetAckForIfPresent(chain)
+                                            .filter(after -> !Objects.equals(after, ackBeforeTerminal.get(chain.id())))
+                                            .isPresent()),
+                            () -> workload.sourceChains().stream().map(chain -> chain.id() + "="
+                                    + control.targetAckForIfPresent(chain)
+                                            .filter(after -> !Objects.equals(after, ackBeforeTerminal.get(chain.id())))
+                                            .isPresent()).toList().toString());
+                    System.out.printf("benchmark-terminal-shape join=%s nest=%s%n", joinOps, nestOps);
+
                     assertThat(joinOps).as("join terminal physical writes").containsExactly(OperationType.INSERT);
                     assertThat(nestOps).as("nest terminal physical writes")
-                            .containsExactly(OperationType.INSERT, OperationType.UPDATE);
-                    System.out.printf("benchmark-terminal-shape join=%s nest=%s%n", joinOps, nestOps);
-                    Await.until("terminal ACKs for every stateful source", Duration.ofSeconds(45),
-                            () -> workload.sourceChains().stream()
-                                    .allMatch(chain -> control.targetAckForIfPresent(chain).isPresent()),
-                            () -> workload.sourceChains().stream().map(chain -> chain.id() + "="
-                                    + control.targetAckForIfPresent(chain).isPresent()).toList().toString());
+                            .isIn(List.of(OperationType.INSERT),
+                                    List.of(OperationType.INSERT, OperationType.UPDATE));
                 }
             }
         }

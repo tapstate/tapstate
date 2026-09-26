@@ -24,6 +24,64 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** The observer uses Mongo's real replica-set change stream, without a product process. */
 class BenchmarkMongoDeliveryObserverIT {
 
+    @Test
+    void optionalTerminalRefinementAllowsEitherArrivalOrderWithTheSameRequiredCoverage() {
+        for (boolean childAfterRoot : List.of(false, true)) {
+            String suffix = childAfterRoot ? "late" : "early";
+            String external = SharedMongo.replicaSetUrl("benchmark_delivery_optional_" + suffix);
+            String views = SharedMongo.replicaSetUrl("views");
+            String table = "benchmark_delivery_optional_" + suffix;
+            MongoCollection<Document> target = freshCollection(external, table);
+            try (BenchmarkMongoDeliveryObserver observer = BenchmarkMongoDeliveryObserver.open(
+                    target(BenchmarkWorkloadDefinitions.TargetLocation.EXTERNAL_MONGO, table),
+                    external, views, row -> String.valueOf(row.get("id")))) {
+                observer.expectUnmeasured("terminal", List.of(
+                        new BenchmarkMongoDeliveryObserver.ExpectedChange(
+                                "2", BenchmarkMongoDeliveryObserver.Kind.INSERT)));
+                observer.allowOptionalUnmeasured("terminal", List.of(
+                        new BenchmarkMongoDeliveryObserver.ExpectedChange(
+                                "2", BenchmarkMongoDeliveryObserver.Kind.UPDATE)));
+                target.insertOne(new Document("id", 2L).append("item", childAfterRoot ? null : "child"));
+                if (childAfterRoot) {
+                    target.updateOne(Filters.eq("id", 2L), Updates.set("item", "child"));
+                }
+
+                assertThat(observer.checkpoint("terminal", BOUND)).isEmpty();
+                assertThat(observer.observedCoverage()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                        new BenchmarkMongoDeliveryObserver.ObservedKey(
+                                "terminal", "observer_test/" + table, "2",
+                                BenchmarkMongoDeliveryObserver.Kind.INSERT), 1L));
+                assertThat(target.find(Filters.eq("id", 2L)).first().getString("item"))
+                        .isEqualTo("child");
+            }
+        }
+    }
+
+    @Test
+    void aSecondOptionalTerminalUpdateIsStillAnUnexpectedPhysicalWrite() {
+        String external = SharedMongo.replicaSetUrl("benchmark_delivery_optional_duplicate");
+        String views = SharedMongo.replicaSetUrl("views");
+        String table = "benchmark_delivery_optional_duplicate_test";
+        MongoCollection<Document> target = freshCollection(external, table);
+        try (BenchmarkMongoDeliveryObserver observer = BenchmarkMongoDeliveryObserver.open(
+                target(BenchmarkWorkloadDefinitions.TargetLocation.EXTERNAL_MONGO, table),
+                external, views, row -> String.valueOf(row.get("id")))) {
+            observer.expectUnmeasured("terminal", List.of(
+                    new BenchmarkMongoDeliveryObserver.ExpectedChange(
+                            "2", BenchmarkMongoDeliveryObserver.Kind.INSERT)));
+            observer.allowOptionalUnmeasured("terminal", List.of(
+                    new BenchmarkMongoDeliveryObserver.ExpectedChange(
+                            "2", BenchmarkMongoDeliveryObserver.Kind.UPDATE)));
+            target.insertOne(new Document("id", 2L));
+            target.updateOne(Filters.eq("id", 2L), Updates.set("item", "first"));
+            target.updateOne(Filters.eq("id", 2L), Updates.set("item", "second"));
+
+            assertThatThrownBy(() -> observer.checkpoint("terminal", BOUND))
+                    .isInstanceOf(AssertionError.class)
+                    .hasMessageContaining("extra or duplicate target change for key 2");
+        }
+    }
+
     private static final Duration BOUND = Duration.ofSeconds(15);
     private static final List<MongoClient> CLIENTS = new ArrayList<>();
 
