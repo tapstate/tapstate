@@ -106,6 +106,55 @@ class HistoryRollupWorkerMongoIT {
         }
     }
 
+    @Test
+    void freshPersistedFiveMinuteChildrenCanRebuildTheCoarseBucketWithoutRawFallback() {
+        Instant bucketStart = Instant.parse("2026-09-27T10:00:00Z");
+        HistoryRollupStore.Scope scope = HistoryRollupStore.Scope.incarnation("inc-cascade");
+        HistoryRollupStore.Key coarse = new HistoryRollupStore.Key("orders", scope,
+                HistoryRollupStore.Resolution.PT30M, bucketStart);
+        Clock clock = Clock.fixed(bucketStart.plus(Duration.ofMinutes(31)), ZoneOffset.UTC);
+        try (MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
+                MONGO.getReplicaSetUrl("history_rollup_cascade_it"), null, Duration.ofSeconds(5)))) {
+            connection.verify();
+            MongoStorePort store = new MongoStorePort(connection, "operator_rollup_cascade_it");
+            ObservationStore.Scope owner = new ObservationStore.Scope("inc-cascade", 1);
+            for (int minute = 0; minute <= 30; minute++) {
+                store.rateHistory().appendScoped(sample(bucketStart.plusSeconds(minute * 60L),
+                        minute * 10L), owner);
+            }
+            try (HistoryRollupWorker worker = worker(store, clock,
+                    List.of(new HistoryRollupWorker.Work("orders", scope)), 16)) {
+                for (int pass = 0; pass < 6; pass++) {
+                    worker.runOneBatch();
+                }
+                for (int slot = 0; slot < 6; slot++) {
+                    HistoryRollupStore.Key child = new HistoryRollupStore.Key("orders", scope,
+                            HistoryRollupStore.Resolution.PT5M,
+                            bucketStart.plus(Duration.ofMinutes(slot * 5L)));
+                    assertThat(store.historyRollups().read(child)).isPresent();
+                }
+                long rawFallbackBefore = worker.health().levels().get(
+                        HistoryRollupStore.Resolution.PT30M).rawFallback();
+                long builtBefore = worker.health().levels().get(
+                        HistoryRollupStore.Resolution.PT30M).computed();
+
+                assertThat(worker.requestRefresh(coarse)).isTrue();
+                worker.runOneBatch();
+
+                HistoryRollupStore.Bucket rebuilt = store.historyRollups().read(coarse).orElseThrow();
+                assertThat(rebuilt.fragments()).singleElement().satisfies(fragment -> {
+                    assertThat(fragment.recordsOut().delta()).isEqualByComparingTo("300");
+                    assertThat(fragment.recordsOutStats()).isNotNull();
+                    assertThat(fragment.resumeAfter()).isNotNull();
+                });
+                assertThat(worker.health().levels().get(HistoryRollupStore.Resolution.PT30M).rawFallback())
+                        .isEqualTo(rawFallbackBefore);
+                assertThat(worker.health().levels().get(HistoryRollupStore.Resolution.PT30M).computed())
+                        .isEqualTo(builtBefore + 1);
+            }
+        }
+    }
+
     private static HistoryRollupWorker worker(MongoStorePort store, Clock clock,
             List<HistoryRollupWorker.Work> work) {
         return worker(store, clock, work, 1);
