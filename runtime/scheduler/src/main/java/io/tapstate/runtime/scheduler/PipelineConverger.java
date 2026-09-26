@@ -90,7 +90,8 @@ public final class PipelineConverger {
                 ConvergeResult driven =
                         driveTo(pipelineId, PipelineState.FAILED, false, actualDoc.orElse(null), false);
                 return driven.checkpoint()
-                        .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get()))
+                        .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get(),
+                                driven.transitionFrom()))
                         .orElse(driven);
             }
             // Nothing failed and nothing is carrying it: this process has come up to a checkpoint an
@@ -130,7 +131,8 @@ public final class PipelineConverger {
                 ConvergeResult driven = driveTo(
                         pipelineId, PipelineState.FAILED, false, actualDoc.orElse(null), false);
                 Throwable cause = failure.get();
-                return driven.checkpoint().map(checkpoint -> ConvergeResult.failed(checkpoint, cause))
+                return driven.checkpoint().map(checkpoint -> ConvergeResult.failed(checkpoint, cause,
+                        driven.transitionFrom()))
                         .orElse(driven);
             }
         }
@@ -237,7 +239,7 @@ public final class PipelineConverger {
                         // admission waits are handled above, before the transition.
                         return failedWith(pipelineId, refused);
                     }
-                    return ConvergeResult.converged(applied.next());
+                    return ConvergeResult.converged(applied.next(), from);
                 }
                 // Fenced: another writer moved the epoch on. Re-read and rebase before retrying.
                 current = requireCheckpoint(pipelineId);
@@ -339,7 +341,8 @@ public final class PipelineConverger {
         ConvergeResult driven =
                 driveTo(pipelineId, PipelineState.FAILED, false, requireCheckpoint(pipelineId), false);
         return driven.checkpoint()
-                .map(checkpoint -> ConvergeResult.failed(checkpoint, cause))
+                .map(checkpoint -> ConvergeResult.failed(checkpoint, cause,
+                        driven.transitionFrom()))
                 .orElse(driven);
     }
 

@@ -66,6 +66,7 @@ class PipelineConvergerTest {
         ConvergeResult result = converger.converge("p1");
 
         assertThat(result.status()).isEqualTo(CONVERGED);
+        assertThat(result.transitionFrom()).contains(NEW);
         CheckpointDoc actual = state.read("p1").orElseThrow();
         assertThat(actual.stateJson()).isEqualTo(StateJson.of(RUNNING));
         assertThat(actual.epoch()).isEqualTo(1); // 0 = NEW seed, 1 = first transition
@@ -81,6 +82,7 @@ class PipelineConvergerTest {
         ConvergeResult again = converger.converge("p1");
 
         assertThat(again.status()).isEqualTo(CONVERGED);
+        assertThat(again.transitionFrom()).isEmpty();
         assertThat(state.read("p1").orElseThrow().epoch()).isEqualTo(epochAfterFirst);
     }
 
@@ -114,6 +116,7 @@ class PipelineConvergerTest {
         ConvergeResult result = converger.converge("p1");
 
         assertThat(result.status()).isEqualTo(CONVERGED);
+        assertThat(result.transitionFrom()).contains(PAUSED);
         CheckpointDoc actual = state.read("p1").orElseThrow();
         assertThat(actual.stateJson()).isEqualTo(StateJson.of(RUNNING));
         assertThat(actual.epoch()).isEqualTo(2); // 0 seed -> 1 competitor(PAUSED) -> 2 converger(RUNNING)
@@ -374,6 +377,7 @@ class PipelineConvergerTest {
         ConvergeResult lost = converger.converge("p1");
 
         assertThat(lost.status()).isEqualTo(ConvergeStatus.FAILED);
+        assertThat(lost.transitionFrom()).contains(PAUSED);
         assertThat(lost.failure()).hasValueSatisfying(cause -> {
             assertThat(cause).isInstanceOf(TapstateException.class);
             assertThat(((TapstateException) cause).code().code()).isEqualTo("lifecycle.paused-job-missing");
@@ -446,6 +450,7 @@ class PipelineConvergerTest {
         ConvergeResult result = converger.converge("p1");
 
         assertThat(result.status()).isEqualTo(ConvergeStatus.FAILED);
+        assertThat(result.transitionFrom()).contains(RUNNING);
         // The cause has to travel, not just the status: what the publisher renders as the observation's
         // coded failure is this object, so a pass that reported FAILED with nothing attached would leave
         // the read face saying the pipeline is broken and not saying why -- which is the whole defect.
