@@ -25,7 +25,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static final Duration PRE_WINDOW_QUIET = Duration.ofSeconds(3);
 
     record MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos,
-                         long completedAckAtNanos, int observedDeliveries, long reportedRecordsOut) {
+                         long sourceCompletedAtNanos, long completedAckAtNanos,
+                         long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut) {
         double recordsOutPerSecond() {
             long duration = completedAckAtNanos - firstIssuedAtNanos;
             if (duration <= 0 || acknowledgedOutputs <= 0) {
@@ -225,8 +226,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         long reportedRecordsOut = awaitRecordsOut(workload, fork.control(), initialAcknowledged,
                 phase.expectedLogicalOutputChanges());
         long firstIssued = issued.batches().getFirst().issuedAtNanos();
+        long expectedSourceChanges = phase.expectedLogicalCoverage().values().stream()
+                .mapToLong(Long::longValue).sum();
         return new PhaseWindow(new MeasuredPhase(phase.id(), phase.expectedLogicalOutputChanges(),
-                firstIssued, completedAckAt, deliveries.size(), reportedRecordsOut),
+                firstIssued, issued.sourceCompletedAtNanos(), completedAckAt, expectedSourceChanges,
+                deliveries.size(), reportedRecordsOut),
                 deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList(),
                 resources, commands);
     }

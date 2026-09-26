@@ -529,15 +529,16 @@ final class BenchmarkWorkloadDefinitions {
     private static Phase pacedPhase(String id, Stage stage, long logicalOutputChanges,
                                    List<String> sql, int statementsPerBatch,
                                    Map<String, Long> coverage, TargetExpectation target) {
+        // Keep source issuance ahead of the data plane; actual SQL completion remains measured per batch.
         return new Phase(id, stage, true, logicalOutputChanges, sql, statementsPerBatch,
-                Duration.ofMillis(250), coverage, List.of(target));
+                Duration.ofMillis(1), coverage, List.of(target));
     }
 
     private static Phase pacedPhase(String id, Stage stage, long logicalOutputChanges,
                                    List<String> sql, int statementsPerBatch,
                                    Map<String, Long> coverage, List<TargetExpectation> targets) {
         return new Phase(id, stage, true, logicalOutputChanges, sql, statementsPerBatch,
-                Duration.ofMillis(250), coverage, targets);
+                Duration.ofMillis(1), coverage, targets);
     }
 
     private static Map<String, Long> coverage(SourceChain chain, String phase, long events) {
