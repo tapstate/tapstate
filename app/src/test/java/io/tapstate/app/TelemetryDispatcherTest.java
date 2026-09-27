@@ -32,6 +32,46 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TelemetryDispatcherTest {
 
     @Test
+    void scopedExportUsesTheCurrentOwnerAndADeletedOwnerIsImmediatelyAbsent() throws Exception {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        AtomicReference<java.util.function.Function<String, Optional<MetricsExport.ScopeToken>>> current =
+                new AtomicReference<>();
+        AtomicReference<MetricsExport.ScopeToken> offered = new AtomicReference<>();
+        MetricsExport export = new MetricsExport() {
+            @Override public void offer(String id, PipelineState state, Instant at, List<MetricFact> facts) { }
+            @Override public void offerFoldedScoped(String id, ScopeToken scope, PipelineState state,
+                    Instant at, List<MetricFact> facts) { offered.set(scope); }
+            @Override public void bindCurrentScopes(
+                    java.util.function.Function<String, Optional<ScopeToken>> resolver) {
+                current.set(resolver);
+            }
+            @Override public void forgetPipelinesOutside(java.util.Collection<String> ids) { }
+        };
+        ObservationStore store = new ObservationStore() {
+            @Override public void save(Observation observation) { }
+            @Override public boolean saveScoped(Observation observation, Scope scope) { return true; }
+            @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+            @Override public void delete(String id) { }
+        };
+        try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
+                new ObservationPublisher(new InMemoryStateStore(), store), null, export, scopes, 1, 2)) {
+            ObservationStore.Scope old = scopes.begin("orders", "inc-old", 41);
+            MetricsExport.ScopeToken oldToken = new MetricsExport.ScopeToken("inc-old", 41);
+            assertThat(current.get().apply("orders")).contains(oldToken);
+            dispatcher.offer(frame(1), old);
+            await(() -> oldToken.equals(offered.get()));
+
+            scopes.forgetIncarnation("orders", "inc-old");
+            assertThat(current.get().apply("orders")).isEmpty();
+            ObservationStore.Scope next = scopes.begin("orders", "inc-new", 42);
+            dispatcher.offer(frame(2), next);
+            MetricsExport.ScopeToken nextToken = new MetricsExport.ScopeToken("inc-new", 42);
+            await(() -> nextToken.equals(offered.get()));
+            assertThat(current.get().apply("orders")).contains(nextToken);
+        }
+    }
+
+    @Test
     void rejectedHistoryQueueFrameMarksTheNextRetainedSampleAsAGap() throws Exception {
         Instant at = Instant.parse("2026-09-27T10:00:00Z");
         CountDownLatch entered = new CountDownLatch(1);
