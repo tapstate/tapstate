@@ -26,14 +26,22 @@ final class ConnectorCallFacts {
         List<MetricPoint> counts = new ArrayList<>();
         List<MetricPoint> durations = new ArrayList<>();
         for (PdkExternalCallStats.Call call : PdkExternalCallStats.Call.values()) {
+            Map<PdkExternalCallStats.Outcome, PdkExternalCallStats.Reading> byOutcome =
+                    readings.getOrDefault(call, Map.of());
             for (PdkExternalCallStats.Outcome outcome : PdkExternalCallStats.Outcome.values()) {
                 Map<String, String> attributes = Map.of(
                         MetricAttributes.CONNECTOR_CALL, call.label(),
                         MetricAttributes.CONNECTOR_OUTCOME, outcome.label());
-                PdkExternalCallStats.Reading reading = readings.get(call).get(outcome);
+                PdkExternalCallStats.Reading reading = byOutcome.get(outcome);
+                if (reading == null || reading.count() == 0) {
+                    continue;
+                }
                 counts.add(MetricPoint.accumulated(attributes, startedAt, observedAt, reading.count()));
                 durations.add(MetricPoint.distribution(attributes, startedAt, observedAt, reading.duration()));
             }
+        }
+        if (counts.isEmpty()) {
+            return List.of();
         }
         return List.of(
                 new MetricFact("tapstate.process.connector.external.call.count", MetricType.COUNTER,
