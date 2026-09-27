@@ -5,6 +5,7 @@ import com.hazelcast.map.MapLoaderLifecycleSupport;
 import com.hazelcast.map.MapStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.runtime.engine.StateStoreCostProbe;
+import io.tapstate.runtime.engine.StateStoreCostStats;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -71,10 +72,16 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         String resolved = database == null ? stores.defaultDatabase() : database;
         this.store = stores.inDatabase(resolved).state();
         this.stats = NestStateStats.of(member);
+        if (costs == null) {
+            this.costs = StateStoreCostStats.of(member);
+        }
     }
 
     @Override
     public void destroy() {
+        if (costs instanceof StateStoreCostStats measured) {
+            measured.forget(namespace);
+        }
     }
 
     /**

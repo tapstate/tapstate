@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine;
 
+import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.runtime.engine.StateStoreCostProbe.Codec;
 import io.tapstate.runtime.engine.StateStoreCostProbe.Operation;
 import java.util.EnumMap;
@@ -10,7 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * Benchmark costs measured at the operator state's cold-layer boundary. A namespace is a map name
+ * Member-local costs measured at the operator state's cold-layer boundary. A namespace is a map name
  * supplied by the compiled graph, never a value read from a row. Each namespace has a fixed number of
  * counters regardless of how many keys it contains; teardown forgets the counters with the state.
  *
@@ -21,7 +22,16 @@ import java.util.concurrent.atomic.LongAdder;
  */
 public final class StateStoreCostStats implements StateStoreCostProbe {
 
+    private static final String USER_CONTEXT_KEY = StateStoreCostStats.class.getName();
+
     private final Map<String, Counters> byNamespace = new ConcurrentHashMap<>();
+
+    /** The member-local counter bank shared by this member's partition threads. */
+    public static StateStoreCostStats of(HazelcastInstance member) {
+        Objects.requireNonNull(member, "member");
+        return (StateStoreCostStats) member.getUserContext()
+                .computeIfAbsent(USER_CONTEXT_KEY, ignored -> new StateStoreCostStats());
+    }
 
     @Override
     public void completed(String namespace, Operation operation, long nanos, long payloadBytes) {

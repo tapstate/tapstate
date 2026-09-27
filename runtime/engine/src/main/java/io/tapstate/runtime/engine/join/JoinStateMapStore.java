@@ -5,6 +5,7 @@ import com.hazelcast.map.MapLoaderLifecycleSupport;
 import com.hazelcast.map.MapStore;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.runtime.engine.StateStoreCostProbe;
+import io.tapstate.runtime.engine.StateStoreCostStats;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -83,10 +84,16 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     public void init(HazelcastInstance member, Properties properties, String mapName) {
         this.store = JoinStateMapStoreFactory.boundTo(member);
         this.stats = JoinStateStats.of(member);
+        if (costs == null) {
+            this.costs = StateStoreCostStats.of(member);
+        }
     }
 
     @Override
     public void destroy() {
+        if (costs instanceof StateStoreCostStats measured) {
+            measured.forget(namespace);
+        }
     }
 
     /**

@@ -4,6 +4,8 @@ import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.runtime.engine.StateStoreCostProbe;
+import io.tapstate.runtime.engine.StateStoreCostStats;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -140,6 +142,41 @@ class JoinStateIsSharedAcrossMembersTest {
         assertThat(elsewhere.fact("f1"))
                 .as("a different step is a different namespace and must not see it")
                 .isNull();
+    }
+
+    @Test
+    void aRemoteFactWriteIsMeasuredOnThePartitionMemberThatUsesTheColdStore() {
+        String remoteMember = two.getCluster().getLocalMember().getUuid().toString();
+        String factKey = null;
+        for (int index = 0; index < 10_000; index++) {
+            String candidate = "remote-fact-" + index;
+            if (one.getPartitionService().getPartition(candidate).getOwner().getUuid().toString()
+                    .equals(remoteMember)) {
+                factKey = candidate;
+                break;
+            }
+        }
+        assertThat(factKey).as("a fact key partitioned to the other member").isNotNull();
+        String namespace = JoinMaps.factMirror(PIPELINE, STEP);
+        new ImapJoinStores(one, PIPELINE, STEP, 4).putFact(factKey, row("id", 17L));
+
+        assertThat(StateStoreCostStats.of(one).reading(namespace)).isEmpty();
+        StateStoreCostStats.Reading remote = StateStoreCostStats.of(two).reading(namespace).orElseThrow();
+        assertThat(remote.operations().get(StateStoreCostProbe.Operation.SAVE).completed()).isEqualTo(1);
+        assertThat(remote.operations().get(StateStoreCostProbe.Operation.SAVE).failed()).isZero();
+        assertThat(remote.operations().get(StateStoreCostProbe.Operation.SAVE).payloadBytes()).isPositive();
+        assertThat(remote.codecs().get(StateStoreCostProbe.Codec.ENCODE).completed()).isEqualTo(1);
+        assertThat(remote.codecs().get(StateStoreCostProbe.Codec.ENCODE).bytes())
+                .isEqualTo(remote.operations().get(StateStoreCostProbe.Operation.SAVE).payloadBytes());
+
+        one.getMap(namespace).evict(factKey);
+        assertThat(new ImapJoinStores(one, PIPELINE, STEP, 4).fact(factKey))
+                .containsEntry("id", 17L);
+        StateStoreCostStats.Reading loaded = StateStoreCostStats.of(two).reading(namespace).orElseThrow();
+        assertThat(loaded.operations().get(StateStoreCostProbe.Operation.LOAD).completed()).isEqualTo(1);
+        assertThat(loaded.codecs().get(StateStoreCostProbe.Codec.DECODE).completed()).isEqualTo(1);
+        assertThat(loaded.operations().get(StateStoreCostProbe.Operation.LOAD).payloadBytes())
+                .isEqualTo(remote.operations().get(StateStoreCostProbe.Operation.SAVE).payloadBytes());
     }
 
     @Test
