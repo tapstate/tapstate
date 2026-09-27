@@ -92,6 +92,10 @@ class RealAtlasToAtlasPipelineIT {
                             () -> "target count=" + targetRows.countDocuments()
                                     + ", first=" + value(targetRows, "first")
                                     + ", third=" + value(targetRows, "third"));
+                    Await.until("Atlas target to durably acknowledge the CDC writes", TIMEOUT,
+                            () -> control.durablePosition(PIPELINE_ID, COLLECTION).isPresent(),
+                            () -> "target ACK is absent after the target rows arrived");
+                    String ackedBeforeRestart = control.durablePosition(PIPELINE_ID, COLLECTION).orElseThrow();
 
                     control.stop(PIPELINE_ID, false);
                     Await.until("Atlas Pipeline to stop", TIMEOUT,
@@ -103,6 +107,10 @@ class RealAtlasToAtlasPipelineIT {
                             () -> targetRows.countDocuments() == 3 && value(targetRows, "fourth") == 44L,
                             () -> "target count=" + targetRows.countDocuments()
                                     + ", fourth=" + value(targetRows, "fourth"));
+                    Await.until("Atlas target ACK to advance after restart", TIMEOUT,
+                            () -> control.durablePosition(PIPELINE_ID, COLLECTION)
+                                    .filter(position -> !position.equals(ackedBeforeRestart)).isPresent(),
+                            () -> "target ACK did not advance after the resumed CDC write");
                     assertThat(targetRows.find(Filters.eq("_id", "second")).first()).isNull();
                     assertThat(value(targetRows, "first")).isEqualTo(111L);
                     assertThat(value(targetRows, "third")).isEqualTo(33L);
