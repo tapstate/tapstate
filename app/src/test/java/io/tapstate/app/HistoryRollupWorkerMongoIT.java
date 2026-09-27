@@ -5,6 +5,10 @@ import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.HistoryRollupStore;
+import io.tapstate.spi.store.HistoryRollupStore.Bucket;
+import io.tapstate.spi.store.HistoryRollupStore.Key;
+import io.tapstate.spi.store.HistoryRollupStore.Resolution;
+import io.tapstate.spi.store.HistoryRollupStore.Scope;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
@@ -19,6 +23,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -151,6 +156,88 @@ class HistoryRollupWorkerMongoIT {
                         .isEqualTo(rawFallbackBefore);
                 assertThat(worker.health().levels().get(HistoryRollupStore.Resolution.PT30M).computed())
                         .isEqualTo(builtBefore + 1);
+            }
+        }
+    }
+
+    @Test
+    void newOwnerResumesPersistedProgressAcrossAllFiveLevelsWithoutAnOldOwnerWrite() {
+        Instant start = Instant.parse("2026-09-27T00:00:00Z");
+        Clock clock = Clock.fixed(start.plus(Duration.ofHours(6)).plus(Duration.ofMinutes(1)), ZoneOffset.UTC);
+        HistoryRollupStore.Scope scope = HistoryRollupStore.Scope.incarnation("inc-takeover");
+        List<HistoryRollupWorker.Work> work = List.of(new HistoryRollupWorker.Work("orders", scope));
+        AtomicBoolean owner = new AtomicBoolean(true);
+        try (MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
+                MONGO.getReplicaSetUrl("history_rollup_owner_takeover_it"), null, Duration.ofSeconds(5)))) {
+            connection.verify();
+            MongoStorePort store = new MongoStorePort(connection, "operator_rollup_owner_takeover_it");
+            ObservationStore.Scope execution = new ObservationStore.Scope("inc-takeover", 17);
+            for (int minute = 0; minute <= 360; minute++) {
+                store.rateHistory().appendScoped(sample(start.plus(Duration.ofMinutes(minute)), minute * 10L),
+                        execution);
+            }
+            HistoryRollupStore.Key first = new HistoryRollupStore.Key("orders", scope,
+                    HistoryRollupStore.Resolution.PT5M, start);
+            HistoryRollupStore.Key second = new HistoryRollupStore.Key("orders", scope,
+                    HistoryRollupStore.Resolution.PT5M, start.plus(Duration.ofMinutes(5)));
+
+            try (HistoryRollupWorker old = worker(store, clock, work, 1)) {
+                old.runOneBatch();
+            }
+            HistoryRollupStore.Bucket firstByOldOwner = store.historyRollups().read(first).orElseThrow();
+            assertThat(store.historyRollups().read(second)).isEmpty();
+
+            owner.set(false);
+            try (HistoryRollupWorker denied = new HistoryRollupWorker(store.rateHistory(),
+                    store.historyRollups(), clock, Duration.ofMinutes(1), 64,
+                    Duration.ofSeconds(5), () -> work, ignored -> owner.get(), false)) {
+                denied.runOneBatch();
+            }
+            assertThat(store.historyRollups().read(second)).isEmpty();
+
+            owner.set(true);
+            HistoryRollupStore durable = store.historyRollups();
+            AtomicBoolean failFirstCoarseWrite = new AtomicBoolean(true);
+            HistoryRollupStore onceUnavailable = new HistoryRollupStore() {
+                @Override
+                public void upsert(Bucket bucket) {
+                    if (bucket.key().resolution() == Resolution.PT30M
+                            && bucket.key().bucketStart().equals(start)
+                            && failFirstCoarseWrite.compareAndSet(true, false)) {
+                        throw new IllegalStateException("one coarse write is unavailable");
+                    }
+                    durable.upsert(bucket);
+                }
+
+                @Override public java.util.Optional<Bucket> read(Key key) { return durable.read(key); }
+                @Override public List<Bucket> readRange(String id, Scope owner, Resolution resolution,
+                        Instant from, Instant to, int limit) {
+                    return durable.readRange(id, owner, resolution, from, to, limit);
+                }
+                @Override public void deleteIncarnation(String id, String incarnation) {
+                    durable.deleteIncarnation(id, incarnation);
+                }
+                @Override public void deleteLegacy(String id) { durable.deleteLegacy(id); }
+                @Override public Duration retention() { return durable.retention(); }
+            };
+            try (HistoryRollupWorker successor = new HistoryRollupWorker(store.rateHistory(),
+                    onceUnavailable, clock, Duration.ofMinutes(1), 64,
+                    Duration.ofSeconds(5), () -> work, ignored -> owner.get(), false)) {
+                for (int pass = 0; pass < 12; pass++) {
+                    successor.runOneBatch();
+                }
+                assertThat(failFirstCoarseWrite).isFalse();
+                assertThat(successor.health().levels().get(Resolution.PT30M).failed()).isEqualTo(1);
+                assertThat(successor.health().levels().get(Resolution.PT30M).retried()).isPositive();
+                assertThat(successor.health().degraded()).isFalse();
+            }
+            assertThat(store.historyRollups().read(first)).contains(firstByOldOwner);
+            for (HistoryRollupStore.Resolution resolution : HistoryRollupStore.Resolution.values()) {
+                int expected = (int) (Duration.ofHours(6).toMinutes() / resolution.duration().toMinutes());
+                assertThat(store.historyRollups().readRange("orders", scope, resolution,
+                        start, start.plus(Duration.ofHours(6)), HistoryRollupStore.MAX_PAGE_SIZE))
+                        .as("the successor closes every %s bucket without losing the old owner's first", resolution)
+                        .hasSize(expected);
             }
         }
     }
