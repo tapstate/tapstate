@@ -236,7 +236,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             lookForCapturesNobodyTails();
                         }
                     }
-                    runs.add(PipelineRun.managed(captureId, run));
+                    runs.add(PipelineRun.managed(
+                            captureId, run, spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY));
                 }
                 if (run.loadOverWhenHandedBack()) {
                     // Handed back with its load already over -- read on this thread, or none owed. What the
@@ -376,14 +377,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         permits.clear();
     }
 
-    private record PipelineRun(CaptureId captureId, CaptureRun run, boolean managed) {
+    private record PipelineRun(CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail) {
 
         static PipelineRun unmanaged(CaptureRun run) {
-            return new PipelineRun(null, run, false);
+            return new PipelineRun(null, run, false, false);
         }
 
-        static PipelineRun managed(CaptureId captureId, CaptureRun run) {
-            return new PipelineRun(captureId, run, true);
+        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail) {
+            return new PipelineRun(captureId, run, true, sharedTail);
         }
     }
 
@@ -1179,16 +1180,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (runs == null) {
             return Optional.empty();
         }
-        // The pipeline's cdc capture has failed if any of its source runs' tails died; surface the first, so a
-        // dead tail becomes a failure the converge loop drives to the observable FAILED state rather than an
-        // engine job that stays running over a ring gone quiet.
+        // Surface a failure of this pipeline's own run or a tail it shares with another pipeline. A
+        // snapshot-only capture has no shared tail; its owner's load failure belongs to that owner alone.
         return runs.stream()
                 .map(run -> {
                     Optional<Throwable> ownFailure = run.run.failure();
                     if (ownFailure.isPresent()) {
                         return ownFailure;
                     }
-                    OwnedCapture shared = run.managed ? ownedCaptures.get(run.captureId) : null;
+                    OwnedCapture shared = run.sharedTail ? ownedCaptures.get(run.captureId) : null;
                     return shared == null ? Optional.<Throwable>empty() : shared.run.failure();
                 })
                 .filter(Optional::isPresent)
