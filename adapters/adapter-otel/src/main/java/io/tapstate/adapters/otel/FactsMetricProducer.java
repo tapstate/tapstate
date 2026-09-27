@@ -259,10 +259,13 @@ final class FactsMetricProducer implements MetricProducer {
         }
         if (overflowSeries > 0) {
             Instant now = Instant.now();
-            out.add(metric(resource, OVERFLOW_INSTRUMENTS, MetricType.GAUGE, "{instrument}",
-                    List.of(MetricPoint.reading(Map.of(), now, overflowInstruments))));
-            out.add(metric(resource, OVERFLOW_SERIES, MetricType.GAUGE, "{series}",
-                    List.of(MetricPoint.reading(Map.of(), now, overflowSeries))));
+            MetricFact instruments = MetricFact.single(OVERFLOW_INSTRUMENTS, MetricType.GAUGE,
+                    "{instrument}", MetricPoint.reading(Map.of(), now, overflowInstruments));
+            MetricFact series = MetricFact.single(OVERFLOW_SERIES, MetricType.GAUGE,
+                    "{series}", MetricPoint.reading(Map.of(), now, overflowSeries));
+            out.add(metric(resource, instruments.name(), instruments.type(),
+                    instruments.unit(), instruments.points()));
+            out.add(metric(resource, series.name(), series.type(), series.unit(), series.points()));
         }
         if (!snapshot.isEmpty()) {
             out.add(stateGauge(resource, snapshot));
