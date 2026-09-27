@@ -36,6 +36,28 @@ latest observation and can still return retained samples for a stopped pipeline.
 The current read faces are separate requests, not one transactional snapshot. If you need a diagnostic
 conclusion, read `pipeline.explain`; do not join the other responses and copy its rules.
 
+## Read performance and telemetry health facts
+
+The current metrics response carries a flat numeric `metrics` map and typed `facts` with units, attributes,
+and each point's measurement time. A missing measurement means it was quiet or unavailable. Do not fill it
+with zero. When a per-table, code, chain, or namespace series exceeds its budget, an
+`otel.metric.overflow=true` point keeps the folded value; the dimension name is no longer available for
+that point. The exporter also applies a process-wide 10,000-series ceiling.
+
+| Reading | First check when it worsens |
+|---|---|
+| `tapstate.pipeline.queue.depth`, `.capacity`, `.high_water` | Compare depth with capacity, then inspect the stage durations and sink pending batches. High-water is the highest collected Jet sample, so a shorter peak between scrapes may not appear. |
+| `tapstate.pipeline.sink.batch.pending`, `.limit`, `.write.duration`, and `tapstate.pipeline.sink.backpressure.duration` | A full pending limit with increasing write time points toward target delivery. Compare target-acknowledged `records.out` with issued batches; an issued batch is not an acknowledgement. |
+| `tapstate.pipeline.nest.cold_layer.over_threshold` and `nestStateColdLayerOverThreshold.<namespace>` | A measured value of 1 means at least 100 state accesses in the decision window and at least half served from the cold layer. Compare access/backfill deltas, in-memory entries, stored entries, and backfill time before changing state memory. A quiet window has no threshold fact; it is not a measured 0. |
+| `tapstate.process.nest.stored_count.queued`, `.active`, `.failed`, `.rejected`, `.duration.sum` | Inspect Mongo namespace size and the `_id` range index when counts queue or fail. Stored counts are sampled by two bounded background workers: refresh starts after 15 seconds, a result expires after 30 seconds, and pending or expired results are absent. The typed `nest.stored` point keeps its actual count time; the flat value can be up to 30 seconds old. |
+| `tapstate.process.lifecycle.pipelines.pending`, `.queue.high_water`, `.capacity.refused`, `.work.duration` | Check whether start or stop work is occupying the four default lifecycle slots. `START_CAPACITY` and `STOP_CAPACITY` in explain describe a wait, not a failed data job. |
+| `tapstate.process.telemetry.degraded`, `.queue.depth`, `.dropped`, `.write.failure`, `.last_success.age` | Filter by the fixed observation/history/event/export sink. A failing observation store leaves the last successful document and its old `observedAt` in the API. Check local logs and the affected sink before interpreting an unchanged graph as an idle pipeline. |
+
+Process facts are emitted only when Prometheus or OTLP export is configured; they have no pipeline or row
+labels. Connector call duration includes its synchronous callback. Connector-internal retries and pool
+occupancy have no general measurement yet. JVM GC collection time is not an exact stop-the-world pause;
+process RSS is not currently emitted. Do not substitute committed heap for RSS when comparing workloads.
+
 ## What history measures
 
 History contains samples, not stored rates. By default the server samples no more often than once per
@@ -109,6 +131,13 @@ Raw responses are also derived intervals, not stored counter documents. The serv
 before `from` so it can calculate the first in-window rate. That first point can therefore have an
 `intervalStart` before `from`; plot it at its in-window `intervalEnd`. Without a valid predecessor, the
 rate field is absent and any real lag reading remains available.
+
+For larger resolutions, the server may use disposable 5m, 30m, 1h, 3h, and 6h rollup buckets. Raw samples
+remain the source of truth. A complete valid bucket avoids a raw read; missing, expired, partial, or
+fallback-marked buckets descend to a finer level or raw for only the affected interval. A late raw sample
+may differ from a cached result for up to five minutes from the cache's first input read. After that,
+the query must descend or refresh; it cannot serve the expired bucket as if it were current. Rollups add
+about 26% as many retained documents as one-minute raw history over a fully populated 15-day window.
 
 ## Segments and gaps
 
