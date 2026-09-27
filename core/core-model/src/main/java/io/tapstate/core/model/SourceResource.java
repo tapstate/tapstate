@@ -15,7 +15,7 @@ import java.util.Objects;
 @Doc("kind: source — an independent collection/mining resource owning connection config and, "
         + "for CDC, the Shared Record Store.")
 public record SourceResource(
-        @Doc(value = "Unique resource id across the workspace; must not contain a dot.",
+        @Doc(value = "Unique resource id across the project; must not contain a dot.",
                 required = true)
         String id,
         @Doc("Optional labels and free-text description.")

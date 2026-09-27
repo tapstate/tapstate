@@ -404,9 +404,9 @@ public final class ControlApiSchema {
         properties.put("kind", Map.of(
                 "type", "string",
                 "enum", List.of("view"),
-                "description", "What this collection is, for the collections this workspace declares. "
+                "description", "What this collection is, for the collections this project declares. "
                         + "Absent for a collection no declaration covers — the listing shows "
-                        + "everything the database holds, and a database holds more than a workspace "
+                        + "everything the database holds, and a database holds more than a project "
                         + "authored, so an absent kind means this one was not made here rather than "
                         + "that it is of some unknown class. Other kinds join this list as they "
                         + "arrive."));
@@ -420,7 +420,7 @@ public final class ControlApiSchema {
                         + "collection's first page and look at a row."));
         properties.put("description", string(
                 "What whoever declared this collection wrote about it. Absent for a collection no view "
-                        + "declares, which is most of them — a database holds far more than a workspace "
+                        + "declares, which is most of them — a database holds far more than a project "
                         + "authored."));
         return object(List.of("name"), properties, false);
     }

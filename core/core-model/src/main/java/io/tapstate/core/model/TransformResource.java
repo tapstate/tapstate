@@ -11,7 +11,7 @@ import java.util.Objects;
  */
 @Doc("A reusable transform definition holding pure logic that pipeline steps can reference; it cannot declare its own input wiring.")
 public record TransformResource(
-        @Doc(value = "Unique resource id across the workspace; must not contain a dot.", required = true)
+        @Doc(value = "Unique resource id across the project; must not contain a dot.", required = true)
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,

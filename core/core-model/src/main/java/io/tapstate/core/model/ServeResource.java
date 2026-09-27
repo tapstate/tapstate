@@ -12,7 +12,7 @@ import java.util.Objects;
  */
 @Doc("Reusable publish-surface definition holding sync, query and push declarations without source wiring.")
 public record ServeResource(
-        @Doc(value = "Unique resource id across the workspace; must not contain a dot.", required = true)
+        @Doc(value = "Unique resource id across the project; must not contain a dot.", required = true)
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,

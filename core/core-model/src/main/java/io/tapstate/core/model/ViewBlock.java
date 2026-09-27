@@ -13,7 +13,7 @@ public sealed interface ViewBlock {
 
     @Doc("An inline view that defines its private MDM sink directly inside the pipeline.")
     record Inline(
-                  @Doc(value = "Unique resource id across the workspace; must not contain a dot.", required = true)
+                  @Doc(value = "Unique resource id across the project; must not contain a dot.", required = true)
                   String id,
                   @Doc(value = "The upstream source this view consumes records from.", required = true)
                   FromRef from,
@@ -30,7 +30,7 @@ public sealed interface ViewBlock {
 
     @Doc("A reference to a separately defined view body, reused inside this pipeline.")
     record Use(
-               @Doc("Unique resource id across the workspace; must not contain a dot. Defaults to the referenced view name.")
+               @Doc("Unique resource id across the project; must not contain a dot. Defaults to the referenced view name.")
                String id,
                @Doc(value = "Name of the externally defined view to reuse.", required = true)
                String use,
