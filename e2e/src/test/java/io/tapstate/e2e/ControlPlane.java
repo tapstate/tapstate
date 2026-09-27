@@ -211,6 +211,30 @@ final class ControlPlane {
     }
 
     /**
+     * Applies resource documents as one batch made from {@code project}: the server labels each of them as
+     * that project's and refuses an id another project owns. Returns the warnings the apply carried.
+     */
+    List<Warning> applyAsProject(String project, Map<String, String> contentBySource) {
+        HttpResponse<String> response = send(authed("/api/artifacts:apply", projectBody(project, contentBySource)));
+        expect(response, 200, "apply " + contentBySource.keySet() + " as project " + project);
+        return warningsOf(response.body());
+    }
+
+    /** The same batch, expected to be refused; returns the refusal. */
+    Refusal applyAsProjectExpectingRefusal(String project, Map<String, String> contentBySource) {
+        HttpResponse<String> response = send(authed("/api/artifacts:apply", projectBody(project, contentBySource)));
+        return interpretRefusal(response.statusCode(), response.body(),
+                "applying " + contentBySource.keySet() + " as project " + project);
+    }
+
+    private static String projectBody(String project, Map<String, String> contentBySource) {
+        List<Map<String, String>> drafts = contentBySource.entrySet().stream()
+                .map(entry -> Map.of("source", entry.getKey(), "content", entry.getValue()))
+                .toList();
+        return JsonWriter.write(Map.of("drafts", drafts, "project", project));
+    }
+
+    /**
      * One document submitted for apply, optionally carrying the version it was written against. A null
      * {@code expectedContentHash} submits no precondition, which is the unconditional apply every caller
      * above sends.

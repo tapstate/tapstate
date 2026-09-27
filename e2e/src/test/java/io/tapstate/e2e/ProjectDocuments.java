@@ -1,9 +1,12 @@
-package io.tapstate.app;
+package io.tapstate.e2e;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /** Documents the project cases apply: a read source, a pipeline over it, and a write target. */
-final class ProjectFixtures {
+final class ProjectDocuments {
 
-    private ProjectFixtures() {
+    private ProjectDocuments() {
     }
 
     static String source(String id) {
@@ -53,5 +56,20 @@ final class ProjectFixtures {
                 connector: mongodb
                 config: { uri: "mongodb://10.30.0.11:27017/ods" }
                 """.formatted(id);
+    }
+
+    /** Documents keyed by the file name each would have, in the order given. */
+    static Map<String, String> batch(String... idsAndDocuments) {
+        Map<String, String> batch = new LinkedHashMap<>();
+        for (int i = 0; i < idsAndDocuments.length; i += 2) {
+            batch.put(idsAndDocuments[i] + ".tap.yml", idsAndDocuments[i + 1]);
+        }
+        return batch;
+    }
+
+    /** The project label a stored artifact carries, read from its canonical form; null when it has none. */
+    static String projectOf(ControlPlane control, String id) {
+        String canonical = control.artifact(id).orElseThrow().canonicalForm();
+        return io.tapstate.core.dsl.ProjectLabel.of(new io.tapstate.core.dsl.DslParser().parse(canonical));
     }
 }
