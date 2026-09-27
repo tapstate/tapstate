@@ -143,6 +143,7 @@ fallback-marked buckets descend to a finer level or raw for only the affected in
 may differ from a cached result for up to five minutes from the cache's first input read. After that,
 the query must descend or refresh; it cannot serve the expired bucket as if it were current. Rollups add
 about 26% as many retained documents as one-minute raw history over a fully populated 15-day window.
+This is a document-count ratio; bucket fragments and indexes can make the byte and disk cost higher.
 For a same-build diagnostic comparison, set `tapstate.metrics.history.rollup-read-enabled=false` at
 startup. The same request resolution then aggregates raw samples without reading the rollup cache; the
 default is `true`. This switch does not remove cached documents or stop the background worker, and a raw

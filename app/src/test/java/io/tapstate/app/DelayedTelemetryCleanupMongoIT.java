@@ -6,9 +6,22 @@ import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.control.core.ArtifactMutationService;
+import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.AuditGate;
+import io.tapstate.control.core.CurrentObservationReader;
 import io.tapstate.control.core.DataBrowserFollows;
+import io.tapstate.control.core.EventsCursorCodec;
+import io.tapstate.control.core.HistoryCursorCodec;
+import io.tapstate.control.core.HistoryResolution;
+import io.tapstate.control.core.PipelineEventsQuery;
+import io.tapstate.control.core.PipelineEventsQueryService;
+import io.tapstate.control.core.PipelineHistoryQuery;
+import io.tapstate.control.core.PipelineHistoryQueryService;
+import io.tapstate.control.core.PipelineLogQueryService;
+import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.TelemetryCleanupReporter;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineEvent;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -32,13 +45,16 @@ import org.testcontainers.utility.DockerImageName;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** A delayed lifecycle cleanup cannot erase the telemetry of a new artifact under the same id. */
 @RequiresDocker
@@ -68,6 +84,21 @@ class DelayedTelemetryCleanupMongoIT {
                 uri, null, Duration.ofSeconds(5)))) {
             connection.verify();
             MongoStorePort store = new MongoStorePort(connection, "operator_delayed_cleanup_it");
+            String clusterId = "cleanup-read-it";
+            Clock queryClock = Clock.fixed(at.plusSeconds(30), ZoneOffset.UTC);
+            ArtifactQueryService artifacts = new ArtifactQueryService(store.artifacts());
+            PipelineObservationQueryService observationRead = new PipelineObservationQueryService(
+                    artifacts, new CurrentObservationReader(store.artifacts(), store.workloadClaims(),
+                            store.observations(), clusterId));
+            PipelineHistoryQueryService historyRead = new PipelineHistoryQueryService(
+                    artifacts, store.rateHistory(), Duration.ofMinutes(1), queryClock,
+                    new HistoryCursorCodec("cleanup-history".getBytes(StandardCharsets.UTF_8), queryClock));
+            PipelineEventsQueryService eventRead = new PipelineEventsQueryService(
+                    artifacts, store.events(),
+                    new EventsCursorCodec("cleanup-events".getBytes(StandardCharsets.UTF_8), queryClock),
+                    queryClock, (key, args) -> key);
+            PipelineLogQueryService logRead = new PipelineLogQueryService(
+                    logs, store.artifacts(), store.workloadClaims(), clusterId);
             ArtifactMutationService mutations = new ArtifactMutationService(
                     store.artifacts(), store.desired(), store.state(), store.observations(),
                     store.layouts(), store.meta(), store.derivedSchemas(), store.rateHistory(),
@@ -79,11 +110,23 @@ class DelayedTelemetryCleanupMongoIT {
             PipelineResource resource = pipeline(id);
             store.artifacts().save(resource);
             String oldIncarnation = store.artifacts().pipelineIncarnationId(id).orElseThrow();
-            ObservationStore.Scope oldOwner = new ObservationStore.Scope(oldIncarnation, 1);
+            ObservationStore.Scope oldOwner = new ObservationStore.Scope(oldIncarnation,
+                    store.workloadClaims().advanceStandalone(clusterId, id).orElseThrow());
             publishScoped(store, logs, id, oldOwner, at, bucketStart, 1);
+            assertPublicCurrent(observationRead, historyRead, eventRead, logRead, id, at, 1);
 
             mutations.delete("operator", id, CanonicalHash.of(resource));
             assertThat(store.artifacts().get(id)).isEmpty();
+            assertThatThrownBy(() -> observationRead.metrics(id))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(LifecycleError.UNKNOWN_PIPELINE));
+            assertThatThrownBy(() -> historyRead.query(historyQuery(id, at)))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(LifecycleError.UNKNOWN_PIPELINE));
+            assertThatThrownBy(() -> eventRead.query(eventsQuery(id, at)))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(LifecycleError.UNKNOWN_PIPELINE));
+            assertThat(logRead.logs(id).lines()).isEmpty();
             assertThat(removedCurrent).containsExactly(id + ":" + oldIncarnation);
             assertThat(store.observations().readStored(id).orElseThrow().scope()).contains(oldOwner);
             assertThat(store.rateHistory().readPageVisible(id,
@@ -98,8 +141,10 @@ class DelayedTelemetryCleanupMongoIT {
             store.artifacts().save(resource);
             String newIncarnation = store.artifacts().pipelineIncarnationId(id).orElseThrow();
             assertThat(newIncarnation).isNotEqualTo(oldIncarnation);
-            ObservationStore.Scope newOwner = new ObservationStore.Scope(newIncarnation, 2);
+            ObservationStore.Scope newOwner = new ObservationStore.Scope(newIncarnation,
+                    store.workloadClaims().advanceStandalone(clusterId, id).orElseThrow());
             publishScoped(store, logs, id, newOwner, at.plusSeconds(1), bucketStart, 2);
+            assertPublicCurrent(observationRead, historyRead, eventRead, logRead, id, at, 2);
 
             String legacyId = "legacy_flow";
             PipelineResource legacyResource = pipeline(legacyId);
@@ -135,6 +180,7 @@ class DelayedTelemetryCleanupMongoIT {
             assertThat(failures).isEmpty();
 
             assertScopedSurvives(store, logs, id, oldIncarnation, newOwner, at, bucketStart);
+            assertPublicCurrent(observationRead, historyRead, eventRead, logRead, id, at, 2);
             assertScopedSurvives(store, logs, legacyId, null, recreatedLegacyOwner, at, bucketStart);
             assertThat(store.rateHistory().readPageVisible(legacyId,
                     new RateHistoryStore.Visibility(null, true),
@@ -177,7 +223,7 @@ class DelayedTelemetryCleanupMongoIT {
         assertThat(store.rateHistory().readPageVisible(id,
                 new RateHistoryStore.Visibility(current.pipelineIncarnationId(), false),
                 at.minusSeconds(1), at.plusSeconds(30), null, 10).entries())
-                .extracting(entry -> entry.sample().counters().get("recordsOut"))
+                .extracting(entry -> entry.sample().counters().get("records.out"))
                 .containsExactly(2L);
         assertThat(store.events().readPage(id, current.pipelineIncarnationId(),
                 at.minusSeconds(1), at.plusSeconds(30), null, 10).events()).hasSize(1);
@@ -198,6 +244,30 @@ class DelayedTelemetryCleanupMongoIT {
         }
     }
 
+    private static void assertPublicCurrent(PipelineObservationQueryService observations,
+            PipelineHistoryQueryService history, PipelineEventsQueryService events,
+            PipelineLogQueryService logs, String id, Instant at, long count) {
+        assertThat(observations.metrics(id).metrics()).containsEntry("recordCount", count);
+        assertThat(history.query(historyQuery(id, at)).segments())
+                .flatExtracting(segment -> segment.points())
+                .flatExtracting(point -> point.lag())
+                .extracting(lag -> lag.last())
+                .containsExactly(count);
+        assertThat(events.query(eventsQuery(id, at)).events())
+                .extracting(event -> event.id()).containsExactly(id + "-event-" + count);
+        assertThat(logs.logs(id).lines()).extracting(LogLine::message)
+                .containsExactly("run-" + count);
+    }
+
+    private static PipelineHistoryQuery historyQuery(String id, Instant at) {
+        return new PipelineHistoryQuery(id, at.minusSeconds(1), at.plusSeconds(30),
+                HistoryResolution.RAW, PipelineHistoryQuery.DEFAULT_LIMIT, List.of("orders"), null);
+    }
+
+    private static PipelineEventsQuery eventsQuery(String id, Instant at) {
+        return new PipelineEventsQuery(id, at.minusSeconds(1), at.plusSeconds(30));
+    }
+
     private static PipelineResource pipeline(String id) {
         return new PipelineResource(id, null, List.of(), null, null, null, null, null);
     }
@@ -208,7 +278,8 @@ class DelayedTelemetryCleanupMongoIT {
     }
 
     private static RateSample sample(String id, Instant at, long count) {
-        return new RateSample(id, at, Map.of("recordsOut", count), Map.of(), at.minusSeconds(60));
+        return new RateSample(id, at, Map.of("records.out", count), Map.of("orders", count),
+                at.minusSeconds(60));
     }
 
     private static HistoryRollupStore.Key key(String id, HistoryRollupStore.Scope scope,

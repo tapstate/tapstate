@@ -5,22 +5,27 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.migration.MigrationRunner;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.spi.store.HistoryRollupStore.Bucket;
 import io.tapstate.spi.store.HistoryRollupStore.Key;
 import io.tapstate.spi.store.HistoryRollupStore.Resolution;
 import io.tapstate.spi.store.HistoryRollupStore.Scope;
+import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
+import org.bson.types.ObjectId;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -79,6 +84,115 @@ class MongoHistoryRollupStoreIT {
             assertThat(indexes).extracting(index -> index.getString("name"))
                     .contains("pipelineId_scopeKey_resolution_bucketStart_idx");
         }
+    }
+
+    @Test
+    void fifteenDayScheduleKeepsFiveRollupLevelsWithinTwentySixPercentOfRawDocuments() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("rollup_fifteen_day_capacity_it");
+            MongoCollection<Document> raw = SystemCollections.PIPELINE_RATE_HISTORY.on(database);
+            MongoCollection<Document> collection = SystemCollections.PIPELINE_HISTORY_ROLLUPS.on(database);
+            Duration retention = Duration.ofDays(15);
+            new MongoRateHistoryStore(database, raw, retention);
+            HistoryRollupStore store = new MongoHistoryRollupStore(database, collection, retention);
+
+            // Start fourteen days ago so the TTL monitor cannot remove the first fixture documents.
+            long sixHours = Duration.ofHours(6).toSeconds();
+            Instant first = Instant.ofEpochSecond(Math.floorDiv(
+                    Instant.now().minus(Duration.ofDays(14)).getEpochSecond(), sixHours) * sixHours);
+            Instant end = first.plus(retention);
+            List<Document> batch = new ArrayList<>(1_000);
+            long rawStarted = System.nanoTime();
+            long minute = 0;
+            for (Instant at = first; at.isBefore(end); at = at.plus(Duration.ofMinutes(1)), minute++) {
+                RateSample sample = new RateSample("capacity", at,
+                        Map.of("records.out", minute * 60, "bytes.out", minute * 600),
+                        Map.of("orders", minute % 11), first);
+                batch.add(MongoRateHistoryStore.toDocument(sample).append("_id", new ObjectId()));
+                if (batch.size() == 1_000) {
+                    raw.insertMany(batch);
+                    batch.clear();
+                }
+            }
+            if (!batch.isEmpty()) {
+                raw.insertMany(batch);
+                batch.clear();
+            }
+            long rawInsertNanos = System.nanoTime() - rawStarted;
+
+            Map<Resolution, Integer> expected = Map.of(
+                    Resolution.PT5M, 4_320,
+                    Resolution.PT30M, 720,
+                    Resolution.PT1H, 360,
+                    Resolution.PT3H, 120,
+                    Resolution.PT6H, 60);
+            Instant computedAt = end;
+            long rollupStarted = System.nanoTime();
+            for (Resolution resolution : Resolution.values()) {
+                for (Instant at = first; at.isBefore(end); at = at.plus(resolution.duration())) {
+                    Bucket bucket = representativeBucket(resolution, at, computedAt);
+                    batch.add(MongoHistoryRollupStore.toDocument(bucket));
+                    if (batch.size() == 1_000) {
+                        collection.insertMany(batch);
+                        batch.clear();
+                    }
+                }
+                if (!batch.isEmpty()) {
+                    collection.insertMany(batch);
+                    batch.clear();
+                }
+                assertThat(collection.countDocuments(new Document("resolution", resolution.name())))
+                        .as("one physical document for each closed %s bucket", resolution)
+                        .isEqualTo(expected.get(resolution).longValue());
+            }
+            long rollupInsertNanos = System.nanoTime() - rollupStarted;
+
+            long rawDocuments = raw.countDocuments();
+            long rollupDocuments = collection.countDocuments();
+            assertThat(rawDocuments).isEqualTo(21_600);
+            assertThat(rollupDocuments).isEqualTo(5_580)
+                    .isLessThanOrEqualTo(rawDocuments * 26 / 100);
+            for (Resolution resolution : Resolution.values()) {
+                store.upsert(representativeBucket(resolution, first, computedAt));
+            }
+            assertThat(collection.countDocuments()).as("refresh replaces each bucket in place")
+                    .isEqualTo(rollupDocuments);
+
+            Document rawStats = database.runCommand(new Document("collStats", raw.getNamespace().getCollectionName()));
+            Document rollupStats = database.runCommand(
+                    new Document("collStats", collection.getNamespace().getCollectionName()));
+            System.out.printf("history-rollup-capacity fixture=one-fragment rawDocs=%d"
+                            + " rollupDocs=%d ratioPercent=%.3f"
+                            + " rawLogicalBytes=%d rollupLogicalBytes=%d"
+                            + " rawBulkSeedMs=%.3f rollupBulkSeedMs=%.3f%n",
+                    rawDocuments, rollupDocuments, rollupDocuments * 100d / rawDocuments,
+                    number(rawStats, "size"), number(rollupStats, "size"),
+                    rawInsertNanos / 1_000_000d, rollupInsertNanos / 1_000_000d);
+        }
+    }
+
+    private static Bucket representativeBucket(Resolution resolution, Instant at, Instant computedAt) {
+        Instant end = at.plus(resolution.duration());
+        long minutes = resolution.duration().toMinutes();
+        HistoryRollupStore.Rate records = new HistoryRollupStore.Rate(
+                BigDecimal.valueOf(minutes * 60), BigDecimal.ONE, BigDecimal.ONE);
+        HistoryRollupStore.Rate bytes = new HistoryRollupStore.Rate(
+                BigDecimal.valueOf(minutes * 600), BigDecimal.TEN, BigDecimal.TEN);
+        HistoryRollupStore.Fragment fragment = new HistoryRollupStore.Fragment(0,
+                HistoryRollupStore.StartReason.CONTINUATION, at, end, records, bytes,
+                List.of(new HistoryRollupStore.Lag("orders", end.minusSeconds(60), 7, 10)),
+                new HistoryRollupStore.CounterStats(records.delta(), resolution.duration().toNanos(),
+                        records.maxRate()),
+                new HistoryRollupStore.CounterStats(bytes.delta(), resolution.duration().toNanos(),
+                        bytes.maxRate()),
+                new RateHistoryStore.Key(end.minusSeconds(60), new ObjectId().toHexString()), end);
+        return new Bucket(new Key("capacity", Scope.incarnation("capacity-owner"), resolution, at),
+                computedAt, computedAt, computedAt.plus(HistoryRollupStore.MAX_CACHE_AGE),
+                false, List.of(fragment), List.of(), Math.toIntExact(minutes));
+    }
+
+    private static long number(Document source, String name) {
+        return source.get(name, Number.class).longValue();
     }
 
     @Test
