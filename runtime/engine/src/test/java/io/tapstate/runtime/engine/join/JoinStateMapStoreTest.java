@@ -1,6 +1,8 @@
 package io.tapstate.runtime.engine.join;
 
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.runtime.engine.StateStoreCostStats;
+import io.tapstate.runtime.engine.StateStoreCostProbe;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -10,6 +12,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -112,6 +117,76 @@ class JoinStateMapStoreTest {
         assertThat(stats.trips("ns")).isEqualTo(1);
     }
 
+    @Test
+    void coldLayerCallsAndCodecBytesAreCountedFromTheBytesActuallyCrossing() {
+        RecordingStore store = new RecordingStore();
+        JoinStateStats stats = new JoinStateStats();
+        StateStoreCostStats costs = new StateStoreCostStats();
+        JoinStateMapStore bridge = bridge("ns", store, stats, costs);
+
+        bridge.store("O1", "payload");
+        int encodedBytes = store.entries.get("ns kO1").length;
+        assertThat(bridge.load("O1")).isEqualTo("payload");
+        assertThat(bridge.loadAll(List.of("O1", "missing"))).containsEntry("O1", "payload");
+        bridge.delete("O1");
+
+        StateStoreCostStats.Reading measured = costs.reading("ns").orElseThrow();
+        assertThat(measured.operations().get(StateStoreCostProbe.Operation.SAVE).completed()).isEqualTo(1);
+        assertThat(measured.operations().get(StateStoreCostProbe.Operation.SAVE).payloadBytes())
+                .isEqualTo(encodedBytes);
+        assertThat(measured.operations().get(StateStoreCostProbe.Operation.LOAD).payloadBytes())
+                .isEqualTo(encodedBytes);
+        assertThat(measured.operations().get(StateStoreCostProbe.Operation.LOAD_ALL).completed())
+                .as("a two-key batch is one state-store call").isEqualTo(1);
+        assertThat(measured.operations().get(StateStoreCostProbe.Operation.LOAD_ALL).payloadBytes())
+                .as("the absent key contributes no invented bytes").isEqualTo(encodedBytes);
+        assertThat(measured.operations().get(StateStoreCostProbe.Operation.DELETE).completed()).isEqualTo(1);
+        assertThat(measured.codecs().get(StateStoreCostProbe.Codec.ENCODE).completed()).isEqualTo(1);
+        assertThat(measured.codecs().get(StateStoreCostProbe.Codec.ENCODE).bytes()).isEqualTo(encodedBytes);
+        assertThat(measured.codecs().get(StateStoreCostProbe.Codec.DECODE).completed()).isEqualTo(2);
+        assertThat(measured.codecs().get(StateStoreCostProbe.Codec.DECODE).bytes())
+                .isEqualTo(2L * encodedBytes);
+        assertThat(measured.operations().values()).allSatisfy(operation ->
+                assertThat(operation.durationNanos()).isPositive());
+    }
+
+    @Test
+    void aBlockedFailingSaveKeepsItsElapsedTimeButNotSuccessfulPayloadBytes() throws Exception {
+        RecordingStore store = new RecordingStore();
+        store.saveEntered = new CountDownLatch(1);
+        store.saveRelease = new CountDownLatch(1);
+        store.failSave = true;
+        JoinStateStats stats = new JoinStateStats();
+        StateStoreCostStats costs = new StateStoreCostStats();
+        JoinStateMapStore bridge = bridge("ns", store, stats, costs);
+        AtomicReference<RuntimeException> failure = new AtomicReference<>();
+        Thread writer = Thread.ofVirtual().start(() -> {
+            try {
+                bridge.store("O1", "payload");
+            } catch (RuntimeException cause) {
+                failure.set(cause);
+            }
+        });
+
+        assertThat(store.saveEntered.await(5, TimeUnit.SECONDS)).isTrue();
+        StateStoreCostStats.Reading blocked = costs.reading("ns").orElseThrow();
+        assertThat(blocked.operations()).doesNotContainKey(StateStoreCostProbe.Operation.SAVE);
+        assertThat(blocked.codecs().get(StateStoreCostProbe.Codec.ENCODE).completed()).isOne();
+        Thread.sleep(30);
+        store.saveRelease.countDown();
+        writer.join(5_000);
+
+        assertThat(writer.isAlive()).isFalse();
+        assertThat(failure.get()).isInstanceOf(IllegalStateException.class)
+                .hasMessage("store unavailable");
+        StateStoreCostStats.OperationReading saved = costs.reading("ns")
+                .orElseThrow().operations().get(StateStoreCostProbe.Operation.SAVE);
+        assertThat(saved.completed()).isZero();
+        assertThat(saved.failed()).isOne();
+        assertThat(saved.payloadBytes()).isZero();
+        assertThat(saved.durationNanos()).isGreaterThanOrEqualTo(30_000_000L);
+    }
+
     /**
      * A mirror key and an index page key share one namespace's worth of names in the layer beneath, and
      * a mirror key is a rendering that can hold anything - including something shaped like a page name.
@@ -142,12 +217,20 @@ class JoinStateMapStoreTest {
         return new JoinStateMapStore(namespace, store, stats);
     }
 
+    private static JoinStateMapStore bridge(String namespace, KeyedStateStore store,
+            JoinStateStats stats, StateStoreCostStats costs) {
+        return new JoinStateMapStore(namespace, store, stats, costs);
+    }
+
     /** A cold layer that says what it was asked, and how. */
     private static final class RecordingStore implements KeyedStateStore {
 
         private final Map<String, byte[]> entries = new HashMap<>();
         private final List<String> singles = new ArrayList<>();
         private final List<Collection<String>> batches = new ArrayList<>();
+        private CountDownLatch saveEntered;
+        private CountDownLatch saveRelease;
+        private boolean failSave;
 
         void put(String namespace, String key, Object state) {
             entries.put(namespace + " " + key, JoinStateMapStoreTest.bytes(state));
@@ -174,6 +257,20 @@ class JoinStateMapStoreTest {
 
         @Override
         public void save(String namespace, String key, byte[] state) {
+            if (saveEntered != null) {
+                saveEntered.countDown();
+                try {
+                    if (!saveRelease.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("save was never released");
+                    }
+                } catch (InterruptedException cause) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("save interrupted", cause);
+                }
+            }
+            if (failSave) {
+                throw new IllegalStateException("store unavailable");
+            }
             entries.put(namespace + " " + key, state);
         }
 

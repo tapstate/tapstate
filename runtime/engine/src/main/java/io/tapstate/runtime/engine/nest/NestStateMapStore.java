@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.MapLoaderLifecycleSupport;
 import com.hazelcast.map.MapStore;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.runtime.engine.StateStoreCostProbe;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -47,6 +48,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     private KeyedStateStore store;
 
     private NestStateStats stats;
+    private StateStoreCostProbe costs;
 
     NestStateMapStore(String namespace) {
         this(namespace, null);
@@ -55,6 +57,12 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     NestStateMapStore(String namespace, String database) {
         this.namespace = Objects.requireNonNull(namespace, "namespace");
         this.database = database;
+    }
+
+    NestStateMapStore(String namespace, KeyedStateStore store, StateStoreCostProbe costs) {
+        this(namespace, null);
+        this.store = Objects.requireNonNull(store, "store");
+        this.costs = Objects.requireNonNull(costs, "costs");
     }
 
     @Override
@@ -77,12 +85,23 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     @Override
     public Object load(Object key) {
         long began = System.nanoTime();
-        Object state = store.load(namespace, NestStateKeys.nameOf(key))
-                .map(NestStateMapStore::fromBytes).orElse(null);
-        if (stats != null) {
-            stats.backfill(namespace, System.nanoTime() - began);
+        try {
+            var loaded = store.load(namespace, NestStateKeys.nameOf(key));
+            Object state = loaded.map(this::fromBytes).orElse(null);
+            if (costs != null) {
+                costs.completed(namespace, StateStoreCostProbe.Operation.LOAD,
+                        System.nanoTime() - began, loaded.map(bytes -> (long) bytes.length).orElse(0L));
+            }
+            if (stats != null) {
+                stats.backfill(namespace, System.nanoTime() - began);
+            }
+            return state;
+        } catch (RuntimeException cause) {
+            if (costs != null) {
+                costs.failed(namespace, StateStoreCostProbe.Operation.LOAD, System.nanoTime() - began);
+            }
+            throw cause;
         }
-        return state;
     }
 
     /**
@@ -108,13 +127,31 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             byName.put(NestStateKeys.nameOf(key), key);
         }
         long began = System.nanoTime();
-        Map<String, byte[]> found = store.loadAll(namespace, byName.keySet());
-        if (stats != null) {
-            stats.backfill(namespace, System.nanoTime() - began);
+        try {
+            Map<String, byte[]> found = store.loadAll(namespace, byName.keySet());
+            Map<Object, Object> loaded = new LinkedHashMap<>();
+            long payloadBytes = 0;
+            for (Map.Entry<String, byte[]> state : found.entrySet()) {
+                byte[] bytes = state.getValue();
+                loaded.put(byName.get(state.getKey()), fromBytes(bytes));
+                if (costs != null) {
+                    payloadBytes += bytes.length;
+                }
+            }
+            if (costs != null) {
+                costs.completed(namespace, StateStoreCostProbe.Operation.LOAD_ALL,
+                        System.nanoTime() - began, payloadBytes);
+            }
+            if (stats != null) {
+                stats.backfill(namespace, System.nanoTime() - began);
+            }
+            return loaded;
+        } catch (RuntimeException cause) {
+            if (costs != null) {
+                costs.failed(namespace, StateStoreCostProbe.Operation.LOAD_ALL, System.nanoTime() - began);
+            }
+            throw cause;
         }
-        Map<Object, Object> loaded = new LinkedHashMap<>();
-        found.forEach((name, state) -> loaded.put(byName.get(name), fromBytes(state)));
-        return loaded;
     }
 
     /** Nothing, always - and an empty answer rather than a null one. See the class note. */
@@ -125,7 +162,20 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void store(Object key, Object value) {
-        store.save(namespace, NestStateKeys.nameOf(key), toBytes(value));
+        if (costs == null) {
+            store.save(namespace, NestStateKeys.nameOf(key), toBytes(value));
+            return;
+        }
+        long began = System.nanoTime();
+        try {
+            byte[] bytes = toBytes(value);
+            store.save(namespace, NestStateKeys.nameOf(key), bytes);
+            costs.completed(namespace, StateStoreCostProbe.Operation.SAVE,
+                    System.nanoTime() - began, bytes.length);
+        } catch (RuntimeException cause) {
+            costs.failed(namespace, StateStoreCostProbe.Operation.SAVE, System.nanoTime() - began);
+            throw cause;
+        }
     }
 
     @Override
@@ -135,7 +185,19 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void delete(Object key) {
-        store.delete(namespace, NestStateKeys.nameOf(key));
+        if (costs == null) {
+            store.delete(namespace, NestStateKeys.nameOf(key));
+            return;
+        }
+        long began = System.nanoTime();
+        try {
+            store.delete(namespace, NestStateKeys.nameOf(key));
+            costs.completed(namespace, StateStoreCostProbe.Operation.DELETE,
+                    System.nanoTime() - began, 0);
+        } catch (RuntimeException cause) {
+            costs.failed(namespace, StateStoreCostProbe.Operation.DELETE, System.nanoTime() - began);
+            throw cause;
+        }
     }
 
     @Override
@@ -149,7 +211,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
      * be kept in step with the first. A state that cannot be written is a defect in the state class,
      * not something a user did, so it crashes bare.
      */
-    private static byte[] toBytes(Object value) {
+    private byte[] toBytes(Object value) {
         if (!(value instanceof Serializable)) {
             throw new IllegalArgumentException("nest state of type " + value.getClass().getName()
                     + " cannot be written to the state layer");
@@ -160,12 +222,20 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         } catch (IOException cause) {
             throw new IllegalStateException("could not write nest state", cause);
         }
-        return bytes.toByteArray();
+        byte[] encoded = bytes.toByteArray();
+        if (costs != null) {
+            costs.serialized(namespace, StateStoreCostProbe.Codec.ENCODE, encoded.length);
+        }
+        return encoded;
     }
 
-    private static Object fromBytes(byte[] bytes) {
+    private Object fromBytes(byte[] bytes) {
         try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
-            return in.readObject();
+            Object state = in.readObject();
+            if (costs != null) {
+                costs.serialized(namespace, StateStoreCostProbe.Codec.DECODE, bytes.length);
+            }
+            return state;
         } catch (IOException | ClassNotFoundException cause) {
             throw new IllegalStateException("could not read back nest state", cause);
         }

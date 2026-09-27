@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.MapLoaderLifecycleSupport;
 import com.hazelcast.map.MapStore;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.runtime.engine.StateStoreCostProbe;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -54,6 +55,7 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     private KeyedStateStore store;
 
     private JoinStateStats stats;
+    private StateStoreCostProbe costs;
 
     JoinStateMapStore(String namespace) {
         this.namespace = Objects.requireNonNull(namespace, "namespace");
@@ -66,9 +68,15 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
      * question cost the expensive one. The wiring itself is witnessed where a member exists anyway.
      */
     JoinStateMapStore(String namespace, KeyedStateStore store, JoinStateStats stats) {
+        this(namespace, store, stats, null);
+    }
+
+    JoinStateMapStore(String namespace, KeyedStateStore store, JoinStateStats stats,
+            StateStoreCostProbe costs) {
         this.namespace = Objects.requireNonNull(namespace, "namespace");
         this.store = Objects.requireNonNull(store, "store");
         this.stats = Objects.requireNonNull(stats, "stats");
+        this.costs = costs;
     }
 
     @Override
@@ -89,10 +97,21 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     @Override
     public Object load(Object key) {
         long began = System.nanoTime();
-        Object state = store.load(namespace, JoinStateKeys.nameOf(key))
-                .map(JoinStateMapStore::fromBytes).orElse(null);
-        count(1, began);
-        return state;
+        try {
+            var loaded = store.load(namespace, JoinStateKeys.nameOf(key));
+            Object state = loaded.map(this::fromBytes).orElse(null);
+            if (costs != null) {
+                costs.completed(namespace, StateStoreCostProbe.Operation.LOAD,
+                        System.nanoTime() - began, loaded.map(bytes -> (long) bytes.length).orElse(0L));
+            }
+            count(1, began);
+            return state;
+        } catch (RuntimeException cause) {
+            if (costs != null) {
+                costs.failed(namespace, StateStoreCostProbe.Operation.LOAD, System.nanoTime() - began);
+            }
+            throw cause;
+        }
     }
 
     /**
@@ -110,11 +129,29 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             byName.put(JoinStateKeys.nameOf(key), key);
         }
         long began = System.nanoTime();
-        Map<String, byte[]> states = store.loadAll(namespace, byName.keySet());
-        count(byName.size(), began);
-        Map<Object, Object> loaded = new LinkedHashMap<>();
-        states.forEach((name, bytes) -> loaded.put(byName.get(name), fromBytes(bytes)));
-        return loaded;
+        try {
+            Map<String, byte[]> states = store.loadAll(namespace, byName.keySet());
+            Map<Object, Object> loaded = new LinkedHashMap<>();
+            long payloadBytes = 0;
+            for (Map.Entry<String, byte[]> state : states.entrySet()) {
+                byte[] bytes = state.getValue();
+                loaded.put(byName.get(state.getKey()), fromBytes(bytes));
+                if (costs != null) {
+                    payloadBytes += bytes.length;
+                }
+            }
+            if (costs != null) {
+                costs.completed(namespace, StateStoreCostProbe.Operation.LOAD_ALL,
+                        System.nanoTime() - began, payloadBytes);
+            }
+            count(byName.size(), began);
+            return loaded;
+        } catch (RuntimeException cause) {
+            if (costs != null) {
+                costs.failed(namespace, StateStoreCostProbe.Operation.LOAD_ALL, System.nanoTime() - began);
+            }
+            throw cause;
+        }
     }
 
     /** Nothing, always - and an empty answer rather than a null one. See the class note. */
@@ -125,7 +162,20 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void store(Object key, Object value) {
-        store.save(namespace, JoinStateKeys.nameOf(key), toBytes(value));
+        if (costs == null) {
+            store.save(namespace, JoinStateKeys.nameOf(key), toBytes(value));
+            return;
+        }
+        long began = System.nanoTime();
+        try {
+            byte[] bytes = toBytes(value);
+            store.save(namespace, JoinStateKeys.nameOf(key), bytes);
+            costs.completed(namespace, StateStoreCostProbe.Operation.SAVE,
+                    System.nanoTime() - began, bytes.length);
+        } catch (RuntimeException cause) {
+            costs.failed(namespace, StateStoreCostProbe.Operation.SAVE, System.nanoTime() - began);
+            throw cause;
+        }
     }
 
     @Override
@@ -135,7 +185,19 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void delete(Object key) {
-        store.delete(namespace, JoinStateKeys.nameOf(key));
+        if (costs == null) {
+            store.delete(namespace, JoinStateKeys.nameOf(key));
+            return;
+        }
+        long began = System.nanoTime();
+        try {
+            store.delete(namespace, JoinStateKeys.nameOf(key));
+            costs.completed(namespace, StateStoreCostProbe.Operation.DELETE,
+                    System.nanoTime() - began, 0);
+        } catch (RuntimeException cause) {
+            costs.failed(namespace, StateStoreCostProbe.Operation.DELETE, System.nanoTime() - began);
+            throw cause;
+        }
     }
 
     @Override
@@ -160,7 +222,7 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
      * be kept in step with the first. A state that cannot be written is a defect in the state class,
      * not something a user did, so it crashes bare.
      */
-    private static byte[] toBytes(Object value) {
+    private byte[] toBytes(Object value) {
         if (!(value instanceof Serializable)) {
             throw new IllegalArgumentException("join state of type " + value.getClass().getName()
                     + " cannot be written to the state layer");
@@ -171,12 +233,20 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         } catch (IOException cause) {
             throw new IllegalStateException("could not write join state", cause);
         }
-        return bytes.toByteArray();
+        byte[] encoded = bytes.toByteArray();
+        if (costs != null) {
+            costs.serialized(namespace, StateStoreCostProbe.Codec.ENCODE, encoded.length);
+        }
+        return encoded;
     }
 
-    private static Object fromBytes(byte[] bytes) {
+    private Object fromBytes(byte[] bytes) {
         try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
-            return in.readObject();
+            Object state = in.readObject();
+            if (costs != null) {
+                costs.serialized(namespace, StateStoreCostProbe.Codec.DECODE, bytes.length);
+            }
+            return state;
         } catch (IOException | ClassNotFoundException cause) {
             throw new IllegalStateException("could not read back join state", cause);
         }
