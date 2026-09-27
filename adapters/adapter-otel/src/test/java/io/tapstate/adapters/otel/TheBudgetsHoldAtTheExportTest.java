@@ -56,7 +56,8 @@ class TheBudgetsHoldAtTheExportTest {
         }
         producer.offer("wide", PipelineState.RUNNING, AT, List.of(new MetricFact(RECORDS, MetricType.COUNTER, "{record}", points)));
 
-        Collection<LongPointData> exported = recordsPoints(producer.produce(Resource.empty()));
+        Collection<MetricData> produced = producer.produce(Resource.empty());
+        Collection<LongPointData> exported = recordsPoints(produced);
         List<LongPointData> overflow = exported.stream().filter(point -> "true".equals(point.getAttributes().get(OVERFLOW))).toList();
         System.out.printf(Locale.ROOT, "records series offered=%d exported=%d (named=%d, overflow=%d)%n",
                 points.size(), exported.size(), exported.size() - overflow.size(), overflow.size());
@@ -66,6 +67,8 @@ class TheBudgetsHoldAtTheExportTest {
         // The fold drops the table and keeps the direction: one overflow series per direction, each
         // holding the 250 tables that did not get a name, added up.
         assertThat(overflow).hasSize(2);
+        assertThat(overflowHealth(produced, FactsMetricProducer.OVERFLOW_INSTRUMENTS)).isEqualTo(1);
+        assertThat(overflowHealth(produced, FactsMetricProducer.OVERFLOW_SERIES)).isEqualTo(2);
         assertThat(overflow).allSatisfy(point -> {
             assertThat(point.getAttributes().get(TABLE)).isNull();
             assertThat(point.getAttributes().get(DIRECTION)).isNotNull();
@@ -99,7 +102,8 @@ class TheBudgetsHoldAtTheExportTest {
                     List.of(Facts.records(String.format(Locale.ROOT, "p%05d", i), 1, 1)));
         }
 
-        Collection<LongPointData> exported = recordsPoints(producer.produce(Resource.empty()));
+        Collection<MetricData> produced = producer.produce(Resource.empty());
+        Collection<LongPointData> exported = recordsPoints(produced);
         List<LongPointData> overflow = exported.stream().filter(point -> "true".equals(point.getAttributes().get(OVERFLOW))).toList();
         System.out.printf(Locale.ROOT, "records series offered=%d exported=%d (named=%d, overflow=%d, overflow value=%d)%n",
                 pipelines * 2, exported.size(), exported.size() - overflow.size(), overflow.size(),
@@ -107,6 +111,8 @@ class TheBudgetsHoldAtTheExportTest {
 
         assertThat(exported).hasSize(CardinalityBudget.EXPORT_SERIES_LIMIT);
         assertThat(overflow).hasSize(1);
+        assertThat(overflowHealth(produced, FactsMetricProducer.OVERFLOW_INSTRUMENTS)).isEqualTo(1);
+        assertThat(overflowHealth(produced, FactsMetricProducer.OVERFLOW_SERIES)).isEqualTo(1);
         // The standard overflow series: only the marker, and the sum of everything that did not get a name.
         assertThat(overflow.get(0).getAttributes().asMap()).hasSize(1);
         assertThat(overflow.get(0).getValue()).isEqualTo(pipelines * 2L - (CardinalityBudget.EXPORT_SERIES_LIMIT - 1));
@@ -130,7 +136,9 @@ class TheBudgetsHoldAtTheExportTest {
         // Under the limit to begin with: 4999 pipelines, two series each, nothing folded anywhere.
         int seenEarly = (CardinalityBudget.EXPORT_SERIES_LIMIT - 2) / 2;
         offerPipelines("a", seenEarly);
-        List<Attributes> early = recordsPoints(producer.produce(Resource.empty())).stream()
+        Collection<MetricData> earlyProduced = producer.produce(Resource.empty());
+        assertThat(earlyProduced).noneMatch(metric -> metric.getName().startsWith("tapstate.process.metrics.overflow."));
+        List<Attributes> early = recordsPoints(earlyProduced).stream()
                 .map(LongPointData::getAttributes).toList();
         assertThat(early).hasSize(seenEarly * 2);
 
@@ -162,6 +170,8 @@ class TheBudgetsHoldAtTheExportTest {
         assertThat(namedTables(recordsPoints(producer.produce(Resource.empty()))))
                 .hasSize(CardinalityBudget.RECORDS.distinctValues());
         producer.forgetPipelinesOutside(List.of());
+        assertThat(producer.produce(Resource.empty()))
+                .noneMatch(metric -> metric.getName().startsWith("tapstate.process.metrics.overflow."));
 
         producer.offer("orders", PipelineState.RUNNING, AT, List.of(rowsOver("orders", tables, "u")));
 
@@ -207,6 +217,14 @@ class TheBudgetsHoldAtTheExportTest {
     private static List<String> namedTables(Collection<LongPointData> exported) {
         return exported.stream().map(point -> point.getAttributes().get(TABLE))
                 .filter(table -> table != null).distinct().toList();
+    }
+
+    private static long overflowHealth(Collection<MetricData> produced, String name) {
+        MetricData metric = produced.stream().filter(candidate -> candidate.getName().equals(name))
+                .findFirst().orElseThrow();
+        LongPointData point = metric.getLongGaugeData().getPoints().iterator().next();
+        assertThat(point.getAttributes().asMap()).isEmpty();
+        return point.getValue();
     }
 
     @Test

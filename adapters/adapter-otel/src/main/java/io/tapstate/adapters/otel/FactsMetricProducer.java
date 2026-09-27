@@ -75,6 +75,9 @@ final class FactsMetricProducer implements MetricProducer {
     /** The attribute the state gauge names the state under; the value is the state's lower-case name. */
     static final String STATE_ATTRIBUTE = "state";
 
+    static final String OVERFLOW_INSTRUMENTS = "tapstate.process.metrics.overflow.instruments";
+    static final String OVERFLOW_SERIES = "tapstate.process.metrics.overflow.series";
+
     private static final Attributes OVERFLOW_ONLY = Attributes.of(
             AttributeKey.stringKey(MetricAttributes.OVERFLOW), "true");
 
@@ -236,8 +239,31 @@ final class FactsMetricProducer implements MetricProducer {
             }
         }
         List<MetricData> out = new ArrayList<>();
-        byInstrument.forEach((name, series) ->
-                out.add(metric(resource, name, series.type, series.unit, backstop(name, series.type, series.points))));
+        long overflowInstruments = 0;
+        long overflowSeries = 0;
+        for (Map.Entry<String, Series> entry : byInstrument.entrySet()) {
+            String name = entry.getKey();
+            Series series = entry.getValue();
+            List<MetricPoint> exported = backstop(name, series.type, series.points);
+            long overflowed = 0;
+            for (MetricPoint point : exported) {
+                if ("true".equals(point.attributes().get(MetricAttributes.OVERFLOW))) {
+                    overflowed++;
+                }
+            }
+            if (overflowed > 0) {
+                overflowInstruments++;
+                overflowSeries += overflowed;
+            }
+            out.add(metric(resource, name, series.type, series.unit, exported));
+        }
+        if (overflowSeries > 0) {
+            Instant now = Instant.now();
+            out.add(metric(resource, OVERFLOW_INSTRUMENTS, MetricType.GAUGE, "{instrument}",
+                    List.of(MetricPoint.reading(Map.of(), now, overflowInstruments))));
+            out.add(metric(resource, OVERFLOW_SERIES, MetricType.GAUGE, "{series}",
+                    List.of(MetricPoint.reading(Map.of(), now, overflowSeries))));
+        }
         if (!snapshot.isEmpty()) {
             out.add(stateGauge(resource, snapshot));
         }
