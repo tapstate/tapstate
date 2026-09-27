@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.adapters.pdk.fixture.StopAwaitingReadSource;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
@@ -11,6 +12,7 @@ import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
+import io.tapstate.spi.capture.SnapshotSession;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -25,6 +27,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -248,6 +251,81 @@ class PdkCapturePortTest {
         }
         assertThat(got).hasSize(1);
         assertThat(got.get(0).op()).isEqualTo(Op.READ);
+    }
+
+    @Test
+    void snapshotSessionKeepsOneInitializedConnectorAcrossTableReads(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.singleInitSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.SingleInit", null));
+        PdkConnector connector;
+
+        try (SnapshotSession session = port.snapshotSession(config("t1"))) {
+            PdkCaptureBatch first = (PdkCaptureBatch) session.read("t1");
+            assertThat(takeAll(first)).hasSize(1);
+            connector = first.connector();
+            assertThat(connector.isAlive()).as("closing one table leaves the session connector usable").isTrue();
+
+            PdkCaptureBatch second = (PdkCaptureBatch) session.read("t1");
+            assertThat(takeAll(second)).hasSize(1);
+            assertThat(second.connector()).isSameAs(connector);
+        }
+        assertThat(connector.isAlive()).as("closing the session stops its connector").isFalse();
+    }
+
+    @Test
+    void closingSessionWakesFullReadAheadBeforeStoppingConnector() throws Exception {
+        String connectorId = "stop-awaiting-read-" + System.nanoTime();
+        Path classes = Path.of(StopAwaitingReadSource.class.getProtectionDomain()
+                .getCodeSource().getLocation().toURI());
+        PdkCapturePort port = new PdkCapturePort(provisioner(
+                classes, StopAwaitingReadSource.class.getName(), null));
+        CountDownLatch fifthBatch = new CountDownLatch(1);
+        CountDownLatch readExited = new CountDownLatch(1);
+        AtomicBoolean stopSawExit = new AtomicBoolean();
+        System.getProperties().put(StopAwaitingReadSource.FIFTH_BATCH, fifthBatch);
+        System.getProperties().put(StopAwaitingReadSource.READ_EXITED, readExited);
+        System.getProperties().put(StopAwaitingReadSource.STOP_SAW_EXIT, stopSawExit);
+        try (SnapshotSession session = port.snapshotSession(
+                new CaptureConfig(connectorId, Map.of(), List.of("t1")))) {
+            session.read("t1");
+            assertThat(fifthBatch.await(5, TimeUnit.SECONDS)).as("the four queued batches filled read-ahead")
+                    .isTrue();
+            Thread reader = readerWaitingForQueue("tapstate-snapshot-" + connectorId);
+            assertThat(reader).as("the fifth batch is blocked on the full queue").isNotNull();
+            AtomicReference<Throwable> uncaught = new AtomicReference<>();
+            reader.setUncaughtExceptionHandler((thread, failure) -> uncaught.set(failure));
+
+            session.close();
+
+            assertThat(readExited.getCount()).as("the batch reader exited").isZero();
+            assertThat(stopSawExit).as("connector stop observed the read exit").isTrue();
+            assertThat(reader.isAlive()).as("the reader was joined before the session closed").isFalse();
+            assertThat(uncaught.get()).as("reader cancellation did not escape its thread").isNull();
+        } finally {
+            System.getProperties().remove(StopAwaitingReadSource.FIFTH_BATCH);
+            System.getProperties().remove(StopAwaitingReadSource.READ_EXITED);
+            System.getProperties().remove(StopAwaitingReadSource.STOP_SAW_EXIT);
+        }
+    }
+
+    private static Thread readerWaitingForQueue(String threadName) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            for (Map.Entry<Thread, StackTraceElement[]> entry : Thread.getAllStackTraces().entrySet()) {
+                if (!entry.getKey().getName().equals(threadName)
+                        || entry.getKey().getState() != Thread.State.TIMED_WAITING) {
+                    continue;
+                }
+                for (StackTraceElement frame : entry.getValue()) {
+                    if (frame.getClassName().equals(PdkCaptureBatch.class.getName())
+                            && frame.getMethodName().equals("put")) {
+                        return entry.getKey();
+                    }
+                }
+            }
+            Thread.sleep(10);
+        }
+        return null;
     }
 
     // A failure after the seam is sampled reaches whoever is taking the rows, as the rows would have: the read
