@@ -142,8 +142,46 @@ class NestAssemblesParentAndChildrenIT {
                     throw new AssertionError(diagnose(control, mongo, targetUri, documents));
                 }
                 assertAssembled(documents);
+                assertCurrentStateCostFact(control);
             }
         }
+    }
+
+    /** The same running job reports a real cold-store write without exposing its member or state key. */
+    private void assertCurrentStateCostFact(ControlPlane control) {
+        long deadline = System.nanoTime() + TIMEOUT.toNanos();
+        List<Map<String, Object>> latest = List.of();
+        while (System.nanoTime() - deadline < 0) {
+            latest = control.metricFacts(pipelineId);
+            for (Map<String, Object> fact : latest) {
+                if (!"tapstate.pipeline.state.store.operation.count".equals(fact.get("name"))) {
+                    continue;
+                }
+                assertThat(fact).containsEntry("type", "counter").containsEntry("unit", "{operation}");
+                if (!(fact.get("points") instanceof List<?> points)) {
+                    throw new AssertionError("state-store cost fact carried no points: " + fact);
+                }
+                for (Object entry : points) {
+                    if (!(entry instanceof Map<?, ?> point)
+                            || !(point.get("attributes") instanceof Map<?, ?> attributes)) {
+                        throw new AssertionError("state-store cost point is malformed: " + entry);
+                    }
+                    if ("save".equals(attributes.get("state.operation"))
+                            && "success".equals(attributes.get("state.outcome"))
+                            && point.get("value") instanceof Number count && count.longValue() > 0) {
+                        assertThat(attributes.get("tapstate.pipeline.id")).isEqualTo(pipelineId);
+                        assertThat(attributes.containsKey("tapstate.state.namespace")).isTrue();
+                        assertThat(attributes.containsKey("member") || attributes.containsKey("job")
+                                || attributes.containsKey("state.key")).isFalse();
+                        assertThat(String.valueOf(attributes.get("tapstate.state.namespace")))
+                                .startsWith("nest.");
+                        return;
+                    }
+                }
+            }
+            sleep();
+        }
+        throw new AssertionError("the running nest published no successful cold-store save fact: " + latest);
     }
 
     /**
