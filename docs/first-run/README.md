@@ -16,11 +16,11 @@ The whole path, on a clean machine:
 
 ```
 curl -sSL https://install.tapstate.dev | sh    # installs the CLI, nothing else
-tapstate new                                   # which outcome? -> writes a workspace, offline
-tapstate up                                    # which server? -> brings that workspace to RUNNING
+tapstate new                                   # which outcome? -> writes a project, offline
+tapstate up                                    # which server? -> brings that project to RUNNING
 ```
 
-No resource YAML has to be read or written to get there. The workspace that `new` writes
+No resource YAML has to be read or written to get there. The project that `new` writes
 is an ordinary one — readable, editable, and exactly what the lower-level commands
 (`validate`, `ls`, `desc`, `apply`, `start`) operate on. The guided commands hide the
 *sequence*, never the model.
@@ -33,7 +33,7 @@ one a command enters; they are never presented as interchangeable.
 | Entry | What it does | What it must not do |
 |---|---|---|
 | `curl -sSL https://install.tapstate.dev \| sh` (also `/cli`) | Install the CLI binary for this platform | Start a server or a demo as a side effect |
-| `https://install.tapstate.dev/demo` | Bootstrap a disposable full demo: server, sample databases, connectors, CLI, a demo workspace, and one running pipeline | Be described as "installing Tapstate" |
+| `https://install.tapstate.dev/demo` | Bootstrap a disposable full demo: server, sample databases, connectors, CLI, a demo project, and one running pipeline | Be described as "installing Tapstate" |
 | Server-backed guided use (`tapstate new` → `tapstate up`) | The path this page describes | Introduce a second configuration model or a second lifecycle |
 | Manual operation (explicit YAML + `apply` / `discover` / `start`) | Full control; the reference path | Be the public first-run path |
 
@@ -43,11 +43,11 @@ server's own lifecycle is managed outside this CLI.
 
 ## `tapstate new`
 
-**`new` never reaches a server.** It asks what the workspace is for, writes files, and stops;
+**`new` never reaches a server.** It asks what the project is for, writes files, and stops;
 which server those files are brought up against is `up`'s question, asked the first time you run
 it. Nothing here probes, starts, signs in or binds.
 
-Bare `new` at a terminal runs the guided flow. To scaffold one resource in an existing workspace,
+Bare `new` at a terminal runs the guided flow. To scaffold one resource in an existing project,
 use `add <kind>`:
 
 ```sh
@@ -62,8 +62,8 @@ change to a released command and is called out in the release note.
 
 ### Step 1 — which outcome
 
-The wizard states what it is building — *a workspace: a directory of `.tap.yml` files you
-can read and edit* — and then asks what that workspace is for. The catalog is short and
+The wizard states what it is building — *a project: a directory of `.tap.yml` files you
+can read and edit* — and then asks what that project is for. The catalog is short and
 curated, worded by outcome, not by mechanism:
 
 | id | Shown as | What it writes | Uses |
@@ -83,7 +83,7 @@ Rules the catalog follows, so that the next recipe added behaves like these:
   greyed out; it is added when it ships. `blank` is the deliberate exception — its skeletons
   carry placeholders that connect to nothing, so it is the one entry that is not `runnable`,
   and it sits last because it means "none of the above", not "start here".
-- **Every recipe starts from an empty directory.** Recipes that add to an existing workspace
+- **Every recipe starts from an empty directory.** Recipes that add to an existing project
   are a different class; if one is ever added it declares that, and the picker does not offer
   it in an empty directory.
 - **One id space.** Later recipes — including ones aimed at a specific role — are added to
@@ -166,12 +166,27 @@ can rely on it:
 - Secrets are prompted masked. They are **not** written into the `.tap.yml`: the file holds
   a reference (`password: ${ORDERS_DB_PASSWORD}`), the value goes into a `.env` file next
   to it, and a generated `.gitignore` excludes `.env`. `up` and the lower-level commands read
-  `.env` from the workspace root into the environment they interpolate from.
+  `.env` from the project root into the environment they interpolate from.
 
 ### What `new` writes
 
-A workspace directory laid out by kind — `source/<id>.tap.yml`, `pipeline/<id>.tap.yml`,
-and so on — plus `.env` and `.gitignore` when a secret was entered. Existing files are never
+A project directory laid out by kind — `source/<id>.tap.yml`, `pipeline/<id>.tap.yml`,
+and so on — plus `.env` and `.gitignore` when a secret was entered, and a `project.tap.yml`
+at the root that names the project:
+
+```yaml
+version: tapstate/v1
+kind: project
+id: orders
+```
+
+The id is the directory's name unless you change it; `sample` names its project `order_demo`.
+The file carries the id and optional `metadata` and nothing else — where the project runs is
+decided when it is brought up, not written here. A directory that already has one keeps it.
+Any command run in a subdirectory of the project acts on the whole project: the CLI looks
+upwards for the nearest `project.tap.yml` (after `-w` and `TAPSTATE_WORKDIR`, and before the
+conventional `tap-work`). A directory without the file still works, named after itself, and
+`up` says so. Existing files are never
 overwritten; `--force` is the only way to replace one, and the summary marks the files it
 replaced.
 
@@ -186,7 +201,7 @@ never guesses.
 
 The last thing printed, in this order:
 
-1. **Where the workspace is, and what is in it** — every file, one line each, with what that
+1. **Where the project is, and what is in it** — every file, one line each, with what that
    file is for: `<kind> <id>: ` followed by the same one-line summary `ls` prints for it (so
    the two never disagree), and ` — assumed <what>; edit if the table is keyed otherwise` on a file
    the recipe had to assume something for. Under `--force` a line ends `(replaced)` or, for a
@@ -204,7 +219,7 @@ the prose.
 
 ### What a skeleton must satisfy
 
-**A skeleton validates as written.** `tapstate validate` on a freshly written `blank` workspace
+**A skeleton validates as written.** `tapstate validate` on a freshly written `blank` project
 passes: the placeholders are values of the right shape (`your_database`, `your_table`), not gaps,
 and the pipeline's `view.from` names the table its source declares, so the reference closure
 resolves. The password is the one field written as a `${...}` reference rather than a placeholder
@@ -219,38 +234,38 @@ difference `runnable: false` records: valid to parse, not ready to run.
 
 ## `tapstate up`
 
-Brings the bound workspace to a running state. It runs the ordinary sequence — apply the
-sources, discover schema where a source needs it, apply the rest of the workspace, start the
+Brings the bound project to a running state. It runs the ordinary sequence — apply the
+sources, discover schema where a source needs it, apply the rest of the project, start the
 pipeline — through the same services the individual commands use. There is no second
 lifecycle.
 
-- **Idempotent, by convergence.** Running it again on a workspace that is already up
+- **Idempotent, by convergence.** Running it again on a project that is already up
   changes nothing and says so. If something blocks convergence (a resource changed on the
-  server in a way the workspace does not describe), it stops with a named error saying
+  server in a way the project does not describe), it stops with a named error saying
   what, rather than guessing.
-- **Preflight before mutation**: server reachable and version-compatible, workspace
+- **Preflight before mutation**: server reachable and version-compatible, project
   readable, the connector each source needs registered on that server, each source
   reachable. Anything missing is reported with the stage, a stable error code, and the next
   action — before anything is applied.
-- **The stages are exactly** `preflight`, `apply sources`, `discover`, `apply workspace`, `start`,
+- **The stages are exactly** `preflight`, `apply sources`, `discover`, `apply project`, `start`,
   in that order; a run stops at the first one that fails.
-- **`.env` is read first.** Before anything is submitted, a `${NAME}` reference in a workspace file
-  is resolved from `<workspace>/.env` (the file `new` wrote the secrets to), and only then from the
+- **`.env` is read first.** Before anything is submitted, a `${NAME}` reference in a project file
+  is resolved from `<project>/.env` (the file `new` wrote the secrets to), and only then from the
   process environment. Nothing else reads that file.
 - **A failure names its stage.** "`up: discover failed on orders_src: <code> — <message>`" followed
   by the catalog's next action, never the internal command that happened to be running.
-- Flags: `--server <url>` has one meaning per state — on an unbound workspace it names the server
+- Flags: `--server <url>` has one meaning per state — on an unbound project it names the server
   to sign in to and bind to, and on a bound one it overrides the target for this run and leaves the
   binding alone (there is nothing to override before a binding exists); `-u <name>` and
   `--start-local` belong to the server question below; `--yes` never prompts.
 - **This verb owns every contact with a server.** Probing one, starting the local development
-  stack, signing in and binding the workspace all happen here and nowhere else: `new` and the
-  scaffolding verbs write files and learn nothing. A workspace can therefore be authored with
+  stack, signing in and binding the project all happen here and nowhere else: `new` and the
+  scaffolding verbs write files and learn nothing. A project can therefore be authored with
   no server in existence, which is what makes offline authoring a real path rather than a claim.
 
 ### The server question
 
-Asked once per workspace, on the first `up` in a directory that is not bound to a server yet,
+Asked once per project, on the first `up` in a directory that is not bound to a server yet,
 and not at all when `--server` names one for the run. Two answers:
 
 | Answer | Meaning |
@@ -258,7 +273,7 @@ and not at all when `--server` names one for the run. Two answers:
 | **(a)** `http://127.0.0.1:8080` — the default, taken on an empty reply | Use the server on this machine. If nothing is listening there, start a local development stack in Docker on that port, wait for it to be healthy, then register and bind it. |
 | **(b)** a URL you type | Use a server you already run. You are asked to sign in. |
 
-Either answer is saved as a registered server and bound to the workspace directory, so the
+Either answer is saved as a registered server and bound to the project directory, so the
 question is not asked again in that directory and `up` knows where to go.
 
 The local development stack, when the default has to start one:
@@ -288,7 +303,7 @@ terminal to ask at, `up` stops with a named error rather than starting anything,
 `--start-local` was passed explicitly. Scripts either pass that flag, pass `--server <url>`, or
 work in a directory that is already bound.
 
-What `up` says afterwards follows the same shape as `new`: the workspace, the pipeline and
+What `up` says afterwards follows the same shape as `new`: the project, the pipeline and
 source names with their state, the commands that do the same thing one step at a time, and
 the AI line.
 

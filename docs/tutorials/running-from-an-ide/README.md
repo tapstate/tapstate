@@ -219,7 +219,7 @@ java -jar cli/target/cli-0.2.1.jar --version        # -> tapstate 0.2.1
 TAPSTATE_PASSWORD=admin java -jar cli/target/cli-0.2.1.jar -w ./work -c 127.0.0.1:8080 -u admin
 ```
 
-With no subcommand it opens a REPL - one session holding a workspace and a connection. With a
+With no subcommand it opens a REPL - one session holding a project and a connection. With a
 subcommand it runs that verb and exits, which is the form for scripts. The verbs are identical in both.
 
 A terminal hands it a real TTY, so **Tab completion works with nothing to configure** - and completion
@@ -248,8 +248,8 @@ the CLI behaves differently between the two.
 ### Use a saved context when you work on the same checkout repeatedly
 
 The launch above uses a temporary target and login. That is useful for a one-off debugging session,
-but it does not save the server or a session. To keep this workspace associated with the server, start
-the REPL with only its workspace and create a context from `:ctx`:
+but it does not save the server or a session. To keep this project associated with the server, start
+the REPL with only its project and create a context from `:ctx`:
 
 ```console
 $ java -jar cli/target/cli-0.2.1.jar -w ./work
@@ -266,7 +266,7 @@ Password:                       # masked; TAPSTATE_PASSWORD also works for scrip
 signed in as admin; session saved
 ```
 
-The context stores the server URL and workspace binding in `~/.tapstate/config.yaml`. The login stores
+The context stores the server URL and project binding in `~/.tapstate/config.yaml`. The login stores
 an owner-only, revocable session file under `~/.tapstate/auth/`; it never stores the password or the
 short-lived access token. Start the same command again and the first online verb resumes that session:
 
@@ -282,7 +282,7 @@ server session and remove the local cache. `Verify TLS` should stay enabled for 
 for a deliberately local HTTP endpoint such as the example above. The temporary `-c/-u` launch remains
 available, but it changes only that process and does not update the saved context.
 
-### There are three rules for giving a workspace, and `--help` describes one
+### There are three rules for giving a project, and `--help` describes one
 
 The arguments above carry no subcommand, so that is the session form and `-w` is accepted. Add a
 subcommand to the same line and the rule changes:
@@ -314,7 +314,7 @@ The prompt names who and where: `tapstate(admin@127.0.0.1:8080)>`. Two things wo
 
 - [Assembling one document out of many tables](../nest-document-assembly/) - build a live document out
   of nine tables. It needs the MySQL source and the connector jars mentioned above.
-- `tapstate validate ./work` - check a workspace without a server at all.
+- `tapstate validate ./work` - check a project without a server at all.
 
 ## Troubleshooting
 

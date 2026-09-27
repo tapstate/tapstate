@@ -125,7 +125,7 @@ should be removed. A failed clear stops the pipeline before it writes rows.
 
 `quickstart.sh` runs everything on this page for you: it makes itself a
 `tapstate-demo` directory, fetches the stack, installs the CLI in place, generates
-the demo workspace, brings the stack up, and runs the pipeline — then prints the
+the demo project, brings the stack up, and runs the pipeline — then prints the
 target row count and the commands to drive CDC and tear down:
 
 ```sh
@@ -171,7 +171,7 @@ export COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml
 ```
 
 Everything below runs from here — this is where the compose file lives, so
-`docker compose …` finds it, and the jars and workspace you create sit alongside it.
+`docker compose …` finds it, and the jars and project you create sit alongside it.
 
 `docker-compose.yml` on its own names the published server image and never builds,
 because that is the file a user downloads into an empty directory where there is no
@@ -308,16 +308,27 @@ is not reachable.
 
 ## 5. Author the resources
 
-A workspace is a folder partitioned by resource kind. Create three resources — one read
-source per engine, and the single pipeline that assembles them:
+A project is a folder partitioned by resource kind, named by a `project.tap.yml` at its root.
+Create the folders and the project file, then three resources — one read source per engine,
+and the single pipeline that assembles them:
 
 ```sh
 mkdir -p work/source work/pipeline
+cat > work/project.tap.yml <<'YAML'
+version: tapstate/v1
+kind: project
+id: order_demo
+YAML
 ```
 
-The commands below name this workspace explicitly — the verbs take it as an argument
+Everything applied from this folder is labelled on the server as belonging to project
+`order_demo`, and the web console groups it under that name.
+
+The commands below name this project explicitly — the verbs take it as an argument
 (`tapstate validate work`) and the REPL takes it as a flag (`tapstate -w work`).
-Unnamed, the CLI falls back to its default workspace, `tap-work`, and finds nothing.
+Unnamed, the CLI looks upwards from the current directory for a `project.tap.yml`, so run
+from inside `work/` it finds this project; from anywhere else it falls back to `tap-work`
+and finds nothing.
 (`TAPSTATE_WORKDIR=work` in the environment does the same job for both.)
 
 The connector configs address the databases by their **compose service names**
@@ -440,7 +451,7 @@ Validate offline before going online (no server needed):
 
 ## 6. Save a context, sign in, and run
 
-Create a named context once, bind it to this workspace, and sign in from the same
+Create a named context once, bind it to this project, and sign in from the same
 session. The password prompt is masked. The CLI does not accept a password option: use the prompt or
 `TAPSTATE_PASSWORD` for non-interactive use.
 
@@ -468,9 +479,9 @@ tapstate(admin@127.0.0.1:8080)> apply
 tapstate(admin@127.0.0.1:8080)> start order_pipeline
 ```
 
-The context stores the server target and workspace binding. The CLI stores a revocable
+The context stores the server target and project binding. The CLI stores a revocable
 opaque session separately, never the password or access token. After a process restart,
-the workspace binding selects `local` and the first online command resumes that session:
+the project binding selects `local` and the first online command resumes that session:
 
 ```console
 $ ./tapstate-cli/bin/tapstate -w work
@@ -486,7 +497,7 @@ save a session.
 
 The context definition is kept in `~/.tapstate/config.yaml`; its session cache is separate under
 `~/.tapstate/auth/` and is owner-only. Enter `:ctx` again to choose or edit a context, bind or
-unbind the current workspace, or delete a context. Deleting a context can leave its server-side
+unbind the current project, or delete a context. Deleting a context can leave its server-side
 session active, so run `auth logout` when you also want to revoke that session. Keep `Verify TLS` enabled for HTTPS endpoints; turn
 it off only for a deliberately local HTTP endpoint such as the loopback example above. If the
 configuration path or file is group/world-readable, the CLI refuses to read or overwrite it until
@@ -510,13 +521,13 @@ while a machine token is selected.
 - **`register`** uploads a connector jar to the server (content-addressed and
   idempotent; re-registering the same jar is a no-op). An exact published connector id,
   such as `oracle` or `sqlserver`, is downloaded from `connectors-preview` first. Local
-  paths resolve against the workspace root — `work/` here — which is why the jars beside
+  paths resolve against the project root — `work/` here — which is why the jars beside
   it are reached as `../mysql-connector.jar`. An absolute path works too, as does naming
   a directory: `register ..` uploads every `*.jar` under it as one batch. An existing
   local file or directory always wins over a release id with the same name.
-- **`apply`** with no argument applies the whole workspace as one batch. The batch is
+- **`apply`** with no argument applies the whole project as one batch. The batch is
   the reference closure — a pipeline and the sources it names must be applied
-  together, so apply the workspace, not one file at a time.
+  together, so apply the project, not one file at a time.
 - **Each capture source is applied on its own first**, which is the one exception to
   that. A discovery has to be asked for before the pipeline is applied, and a discovery
   needs the source to already exist on the server — so a single batch carrying both
@@ -584,7 +595,7 @@ An agent should use this sequence:
    `connection_discover_schema`. Source config may contain `${NAME}` or
    `${var:NAME:default}` references; the sidecar expands them only inside `config`
    immediately before the HTTP request.
-4. Author the complete `tapstate/v1` workspace and send every resource as a YAML
+4. Author the complete `tapstate/v1` project and send every resource as a YAML
    draft to `artifact_validate`. Fix all diagnostics before `artifact_apply`.
 5. Call `pipeline_start`, then use `pipeline_status`, `pipeline_metrics`,
    `pipeline_snapshot`, and `pipeline_logs` until the expected state and data are

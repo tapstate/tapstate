@@ -42,13 +42,13 @@ tapstate new
 tapstate up
 ```
 
-`tapstate new` asks what the workspace is for, from a short catalog of outcomes: try it
+`tapstate new` asks what the project is for, from a short catalog of outcomes: try it
 with sample data, mirror one table as it changes, assemble several tables into one
-object. It writes that workspace to disk as ordinary `.tap.yml` files you can read and
+object. It writes that project to disk as ordinary `.tap.yml` files you can read and
 edit, and it reaches nothing while doing so — you can author offline, with no server in
 existence. `tapstate up` asks which server to bring it up against the first time — the
 default starts a local development stack in Docker on this machine — then checks the
-server and the sources, applies the workspace, and starts the pipeline.
+server and the sources, applies the project, and starts the pipeline.
 
 To see the whole thing running before you touch a database of your own, there is a
 disposable demo: it starts MySQL, PostgreSQL, Tapstate, and MongoDB, then maintains a

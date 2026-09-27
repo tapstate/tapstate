@@ -15,13 +15,13 @@ Every page here says which of the two it is, in a header at the top of the file 
 headed for publication, or a pointer to the published page that replaced it. The shapes,
 and what a contributor does with them, are in
 [CONTRIBUTING.md](../CONTRIBUTING.md#documentation). Anything under this directory that is
-not a page - sample data, workspace files, scripts - carries no header: it belongs with the
+not a page - sample data, project files, scripts - carries no header: it belongs with the
 code and is read by running it.
 
 
 | Start here | |
 |---|---|
-| [First run](first-run/) | The guided path: install the CLI, answer a few questions, and bring a workspace to running - the contract every step is held to. |
+| [First run](first-run/) | The guided path: install the CLI, answer a few questions, and bring a project to running - the contract every step is held to. |
 | [Quickstart](quickstart-online.md) | The full demo (`install.tapstate.dev/demo`): sample databases, the server, and a live object assembled from two engines - and the same flow by hand, verb by verb, as the reference for what the guided path does. |
 | [Running on your own databases](running-on-your-own-databases.md) | Run the server as a process on your machine, against a MySQL and a MongoDB you already have. |
 | [Tutorials](tutorials/) | Worked scenarios, each with its own sample data, run end to end. |

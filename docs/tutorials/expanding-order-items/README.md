@@ -18,11 +18,11 @@ expanding them. It does not assume MySQL JSON text is decoded into a list by a
 connector. The map evaluates both current and previous images, so source CDC
 changes the list presented to unwind.
 
-## Create the workspace and data
+## Create the project and data
 
 Use a new source database and an empty target database for this exercise. Load
 [seed.sql](seed.sql) into the source database with your MySQL client. From this
-tutorial directory, create a fresh workspace:
+tutorial directory, create a fresh project:
 
 ```sh
 mkdir work
@@ -33,7 +33,7 @@ Edit `work/src_mysql.tap.yml` with your source host, port, database, username an
 password. Edit `work/tgt_mongo.tap.yml` with the target MongoDB URI. The checked-in
 values are local examples, not a database or account created for you. Addresses
 must be reachable from the server, and the URI should name the empty target
-database. Keep connection settings in your local workspace.
+database. Keep connection settings in your local project.
 
 The [pipeline](pipeline.tap.yml) maps revision 0 to three elements (`a`, `b`, `c`)
 and revision 1 to one (`d`). `unwind` lifts each element's `sku` to a top-level
@@ -58,7 +58,7 @@ status unwind_snapshot
 ```
 
 Apply the connection resources first, then discover the source before applying the
-whole workspace. Its map expression reads `revision`, so applying the entire workspace
+whole project. Its map expression reads `revision`, so applying the entire project
 before discovery is refused with `dsl.row-expression-needs-discovery`. After discovery,
 use bare `apply` to submit the pipeline together with both connection definitions;
 applying the pipeline file alone cannot resolve those references in its batch.

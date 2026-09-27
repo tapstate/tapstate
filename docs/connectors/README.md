@@ -10,7 +10,7 @@ A connector becomes known to Tapstate along one of two paths, and they answer to
 
 **The bundled catalog** is a set of generated rows shipped inside the binary: one row per connector,
 holding its configuration fields, the modes it supports and whether it can be written to. Everything
-that validates a workspace offline reads it - `tapstate validate`, and the validation status
+that validates a project offline reads it - `tapstate validate`, and the validation status
 `tapstate desc` and `tapstate explain` report - as do the `new` wizard and `-c` tab completion. It is
 regenerated from an upstream repository on a schedule, and adding to it means running that
 regeneration.
