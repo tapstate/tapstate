@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
@@ -268,6 +269,18 @@ class APipelineRecordsItsOwnSrsSwitchTest {
                 byId.put(artifact.id(), writer.write(artifact));
             }
             saveCount += artifacts.size();
+        }
+
+        @Override
+        public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+            for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
+                String canonical = byId.get(expected.getKey());
+                if (canonical == null || !CanonicalHash.of(parser.parse(canonical)).equals(expected.getValue())) {
+                    return Optional.of(expected.getKey());
+                }
+            }
+            saveAll(artifacts);
+            return Optional.empty();
         }
 
         @Override
