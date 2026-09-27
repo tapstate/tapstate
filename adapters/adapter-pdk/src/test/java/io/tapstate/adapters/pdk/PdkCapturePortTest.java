@@ -11,6 +11,7 @@ import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
+import io.tapstate.spi.capture.SnapshotSession;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -248,6 +249,25 @@ class PdkCapturePortTest {
         }
         assertThat(got).hasSize(1);
         assertThat(got.get(0).op()).isEqualTo(Op.READ);
+    }
+
+    @Test
+    void snapshotSessionKeepsOneInitializedConnectorAcrossTableReads(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.singleInitSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.SingleInit", null));
+        PdkConnector connector;
+
+        try (SnapshotSession session = port.snapshotSession(config("t1"))) {
+            PdkCaptureBatch first = (PdkCaptureBatch) session.read("t1");
+            assertThat(takeAll(first)).hasSize(1);
+            connector = first.connector();
+            assertThat(connector.isAlive()).as("closing one table leaves the session connector usable").isTrue();
+
+            PdkCaptureBatch second = (PdkCaptureBatch) session.read("t1");
+            assertThat(takeAll(second)).hasSize(1);
+            assertThat(second.connector()).isSameAs(connector);
+        }
+        assertThat(connector.isAlive()).as("closing the session stops its connector").isFalse();
     }
 
     // A failure after the seam is sampled reaches whoever is taking the rows, as the rows would have: the read

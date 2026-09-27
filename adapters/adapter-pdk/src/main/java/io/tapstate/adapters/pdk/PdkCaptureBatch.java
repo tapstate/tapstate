@@ -15,12 +15,13 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
 /**
- * A snapshot batch read from the connector while it is being taken, holding the connector open until
- * closed. Every event is a snapshot read (op {@code r}). Closing stops the connector and closes its loader;
- * it is idempotent and may be called before the batch is drained.
+ * A snapshot batch read from the connector while it is being taken. Every event is a snapshot read
+ * (op {@code r}). A standalone batch stops and closes its connector; a session batch leaves that
+ * connector to its enclosing session. Closing either batch is idempotent and may precede draining.
  *
  * <p><b>The connector reads on a thread of its own, at most a few of its batches ahead of whoever takes the
  * rows.</b> A connector hands its rows over a batch at a time from inside its own read loop, and that loop
@@ -66,25 +67,33 @@ final class PdkCaptureBatch implements CaptureBatch {
     }
 
     private final PdkConnector connector;
+    private final boolean ownsConnector;
     private final BlockingQueue<Object> ahead = new ArrayBlockingQueue<>(READ_AHEAD);
     private final CompletableFuture<Optional<SourcePosition>> seam = new CompletableFuture<>();
     private final Thread reader;
     private Iterator<Envelope> current = Collections.emptyIterator();
     private boolean over;
-    private volatile boolean closed;
+    private final AtomicBoolean closed = new AtomicBoolean();
 
-    private PdkCaptureBatch(PdkConnector connector, Read read, String threadName) {
+    private PdkCaptureBatch(PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
         this.connector = connector;
+        this.ownsConnector = ownsConnector;
         this.reader = new Thread(() -> readAll(read), threadName);
         this.reader.setDaemon(true);
     }
 
     /**
-     * Starts {@code read} on a thread of its own and returns once it has sampled the seam. A read that fails
-     * before it gets that far is thrown here, having stopped and closed the connector.
+     * Starts {@code read} on a thread of its own and returns once it has sampled the seam. A standalone
+     * read that fails before then is thrown here after its connector has been stopped and closed.
      */
     static PdkCaptureBatch start(PdkConnector connector, Read read, String threadName) {
-        PdkCaptureBatch batch = new PdkCaptureBatch(connector, read, threadName);
+        return start(connector, read, threadName, true);
+    }
+
+    /** A batch whose enclosing snapshot session keeps the connector for the next table. */
+    static PdkCaptureBatch start(
+            PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
+        PdkCaptureBatch batch = new PdkCaptureBatch(connector, read, threadName, ownsConnector);
         batch.reader.start();
         try {
             batch.seam.get();
@@ -165,21 +174,24 @@ final class PdkCaptureBatch implements CaptureBatch {
 
     @Override
     public void close() {
-        if (closed) {
+        if (!closed.compareAndSet(false, true)) {
             return;
         }
-        closed = true;
-        // The order the change tail closes in: wake the reading thread, stop the connector under it, give
-        // it a moment to let go, then release the connector's loader.
+        // A session-owned batch releases only its worker. The session stops and closes the connector
+        // after the table read, or on abandonment before this worker is joined.
         reader.interrupt();
-        connector.stopQuietly();
+        if (ownsConnector) {
+            connector.stopQuietly();
+        }
         try {
             reader.join(JOIN_MILLIS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         }
         ahead.clear();
-        connector.close();
+        if (ownsConnector) {
+            connector.close();
+        }
     }
 
     private void readAll(Read read) {
@@ -191,7 +203,7 @@ final class PdkCaptureBatch implements CaptureBatch {
         } catch (CancellationException abandoned) {
             seam.completeExceptionally(abandoned);
         } catch (Throwable failure) {
-            if (!seam.completeExceptionally(failure) && !closed) {
+            if (!seam.completeExceptionally(failure) && !closed.get()) {
                 put(new Failure(failure));
             }
         }
@@ -201,7 +213,7 @@ final class PdkCaptureBatch implements CaptureBatch {
     private void put(Object element) {
         try {
             while (!ahead.offer(element, POLL_MILLIS, TimeUnit.MILLISECONDS)) {
-                if (closed) {
+                if (closed.get()) {
                     throw new CancellationException("the snapshot read was closed before it was taken");
                 }
             }
@@ -219,7 +231,7 @@ final class PdkCaptureBatch implements CaptureBatch {
     private Object take() {
         try {
             while (true) {
-                if (closed) {
+                if (closed.get()) {
                     throw new CancellationException("the snapshot read was closed before it was read through");
                 }
                 Object next = ahead.poll(POLL_MILLIS, TimeUnit.MILLISECONDS);

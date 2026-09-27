@@ -12,6 +12,7 @@ import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.capture.TableSchema;
@@ -59,7 +60,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * stream failure reaches the caller and the backpressure that bounds the stream belong to the runtime that
  * owns stream execution, not to this port.
  */
-public final class PdkCapturePort implements CapturePort {
+public final class PdkCapturePort implements CapturePort, SnapshotSession.Provider {
 
     private static final Logger LOG = LoggerFactory.getLogger(PdkCapturePort.class);
 
@@ -118,6 +119,82 @@ public final class PdkCapturePort implements CapturePort {
                 connector,
                 reading -> read(connector, () -> batchRead(connector, config, batch, reading)),
                 "tapstate-snapshot-" + connector.connectorId());
+    }
+
+    /** One initialized connector serves every table of a chained snapshot round. */
+    @Override
+    public SnapshotSession snapshotSession(CaptureConfig config) {
+        PdkConnector connector = open(config);
+        try {
+            BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
+            return new SharedSnapshotSession(connector, config, batch);
+        } catch (RuntimeException | Error failure) {
+            connector.close();
+            throw failure;
+        }
+    }
+
+    private final class SharedSnapshotSession implements SnapshotSession {
+
+        private final PdkConnector connector;
+        private final CaptureConfig config;
+        private final BatchReadFunction batch;
+        private volatile PreparedSnapshot prepared;
+        private PdkCaptureBatch active;
+        private volatile boolean closed;
+
+        private SharedSnapshotSession(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) {
+            this.connector = connector;
+            this.config = config;
+            this.batch = batch;
+        }
+
+        @Override
+        public CaptureBatch read(String table) {
+            if (closed) {
+                throw new java.util.concurrent.CancellationException("the snapshot session was closed");
+            }
+            PdkCaptureBatch opened = PdkCaptureBatch.start(connector,
+                    reading -> PdkCapturePort.read(connector, () -> {
+                        PreparedSnapshot snapshot = prepared;
+                        if (snapshot == null) {
+                            snapshot = prepareSnapshot(connector, config);
+                            prepared = snapshot;
+                        }
+                        reading.seamSampled(snapshot.seam());
+                        readTable(connector, snapshot, table, batch, reading);
+                        return null;
+                    }),
+                    "tapstate-snapshot-" + connector.connectorId(), false);
+            synchronized (this) {
+                if (!closed) {
+                    active = opened;
+                    return opened;
+                }
+            }
+            opened.close();
+            throw new java.util.concurrent.CancellationException("the snapshot session was closed");
+        }
+
+        @Override
+        public void close() {
+            PdkCaptureBatch reading;
+            synchronized (this) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                reading = active;
+            }
+            connector.stopQuietly();
+            try {
+                if (reading != null) {
+                    reading.close();
+                }
+            } finally {
+                connector.close();
+            }
+        }
     }
 
     /**
@@ -301,6 +378,17 @@ public final class PdkCapturePort implements CapturePort {
      */
     private Void batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch,
             PdkCaptureBatch reading) throws Throwable {
+        PreparedSnapshot snapshot = prepareSnapshot(connector, config);
+        reading.seamSampled(snapshot.seam());
+        List<String> streams = config.streams().isEmpty()
+                ? new ArrayList<>(snapshot.discovered().keySet()) : config.streams();
+        for (String stream : streams) {
+            readTable(connector, snapshot, stream, batch, reading);
+        }
+        return null;
+    }
+
+    private PreparedSnapshot prepareSnapshot(PdkConnector connector, CaptureConfig config) throws Throwable {
         connector.connector().init(connector.context());
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
@@ -309,26 +397,29 @@ public final class PdkCapturePort implements CapturePort {
         connector.context().setTableMap(tableMap(discovered));
         // Position discovery may inspect the selected tables too. Populate their context first, while
         // still sampling before any snapshot row is read so the snapshot-to-stream transition has no gap.
-        reading.seamSampled(position(connector, startOffset(connector, null)));
-        List<String> streams = config.streams().isEmpty()
-                ? new ArrayList<>(discovered.keySet()) : config.streams();
-        Map<String, Map<String, String>> declared = declaredTypes(discovered);
-        for (String stream : streams) {
-            TapTable table = discovered.get(stream);
-            if (table == null) {
-                throw new IllegalStateException(
-                        "stream " + stream + " was requested but the connector did not discover it");
-            }
-            batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
-                if (events.isEmpty()) {
-                    return;
-                }
-                // A copy: the list is the connector's, and is decoded only once somebody takes it.
-                List<TapEvent> handed = new ArrayList<>(events);
-                reading.rowsRead(() -> decodeSnapshotRows(connector, handed, declared));
-            });
+        return new PreparedSnapshot(discovered, declaredTypes(discovered),
+                position(connector, startOffset(connector, null)));
+    }
+
+    private void readTable(PdkConnector connector, PreparedSnapshot snapshot, String stream,
+            BatchReadFunction batch, PdkCaptureBatch reading) throws Throwable {
+        TapTable table = snapshot.discovered().get(stream);
+        if (table == null) {
+            throw new IllegalStateException(
+                    "stream " + stream + " was requested but the connector did not discover it");
         }
-        return null;
+        batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
+            if (events.isEmpty()) {
+                return;
+            }
+            // A copy: the list is the connector's, and is decoded only once somebody takes it.
+            List<TapEvent> handed = new ArrayList<>(events);
+            reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
+        });
+    }
+
+    private record PreparedSnapshot(Map<String, TapTable> discovered,
+            Map<String, Map<String, String>> declared, Optional<SourcePosition> seam) {
     }
 
     /**
