@@ -8,6 +8,9 @@ import io.tapstate.adapters.mongostore.migration.MigrationRunner;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.SrsLogRecord;
 import org.bson.Document;
@@ -62,7 +65,15 @@ class ManagedAtlasMetadataIT {
                     connection.verify();
                     assertMigrationCurrent(connection);
                     MongoStorePort port = new MongoStorePort(connection, operatorDatabase, Duration.ofHours(1));
-                    port.artifacts().save(new DslParser().parse(SOURCE));
+                    DslParser parser = new DslParser();
+                    var first = parser.parse(SOURCE);
+                    var second = parser.parse(SOURCE.replace("metadata_probe", "metadata_probe_second"));
+                    var rolledBack = parser.parse(SOURCE.replace("metadata_probe", "metadata_probe_rolled_back"));
+                    port.artifacts().saveAll(List.of(first, second));
+                    assertThat(port.artifacts().writeAll(List.of(
+                            ArtifactWrite.createOnly(rolledBack), ArtifactWrite.createOnly(first))))
+                            .isEqualTo(ArtifactBatchWrite.refused("metadata_probe", ArtifactMutation.ALREADY_EXISTS));
+                    assertThat(port.artifacts().get("metadata_probe_rolled_back")).isEmpty();
                     port.state().create("metadata_probe_pipeline", "{\"phase\":\"snapshot\"}", Instant.now());
                     port.keyedState().save("nest.metadata_probe_pipeline", "key",
                             "cold-state".getBytes(StandardCharsets.UTF_8));
@@ -80,6 +91,8 @@ class ManagedAtlasMetadataIT {
                     assertMigrationCurrent(reopened);
                     MongoStorePort port = new MongoStorePort(reopened, operatorDatabase, Duration.ofMinutes(30));
                     assertThat(port.artifacts().get("metadata_probe")).isPresent();
+                    assertThat(port.artifacts().get("metadata_probe_second")).isPresent();
+                    assertThat(port.artifacts().get("metadata_probe_rolled_back")).isEmpty();
                     assertThat(port.state().read("metadata_probe_pipeline")).isPresent();
                     assertThat(port.keyedState().load("nest.metadata_probe_pipeline", "key"))
                             .hasValueSatisfying(bytes -> assertThat(bytes)
@@ -95,7 +108,7 @@ class ManagedAtlasMetadataIT {
                     assertThat(expirySeconds(reopened.database())).isEqualTo(1_800L);
 
                     MongoDatabase metadata = reopened.database();
-                    assertThat(metadata.getCollection(MongoStorePort.ARTIFACTS).countDocuments()).isEqualTo(1);
+                    assertThat(metadata.getCollection(MongoStorePort.ARTIFACTS).countDocuments()).isEqualTo(2);
                     assertThat(metadata.getCollection(MongoStorePort.SRS_LOG).countDocuments()).isEqualTo(1);
                     assertThat(metadata.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY).countDocuments())
                             .isEqualTo(1);
