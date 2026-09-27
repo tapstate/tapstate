@@ -44,6 +44,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The PDK implementation of the read-side capture port: it provisions a connector, refuses it with a
@@ -139,7 +140,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         private final PdkConnector connector;
         private final CaptureConfig config;
         private final BatchReadFunction batch;
-        private volatile PreparedSnapshot prepared;
+        private final AtomicReference<PreparedSnapshot> prepared = new AtomicReference<>();
         private PdkCaptureBatch active;
         private volatile boolean closed;
 
@@ -156,10 +157,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             }
             PdkCaptureBatch opened = PdkCaptureBatch.start(connector,
                     reading -> PdkCapturePort.read(connector, () -> {
-                        PreparedSnapshot snapshot = prepared;
+                        PreparedSnapshot snapshot = prepared.get();
                         if (snapshot == null) {
                             snapshot = prepareSnapshot(connector, config);
-                            prepared = snapshot;
+                            prepared.set(snapshot);
                         }
                         reading.seamSampled(snapshot.seam());
                         readTable(connector, snapshot, table, batch, reading);
