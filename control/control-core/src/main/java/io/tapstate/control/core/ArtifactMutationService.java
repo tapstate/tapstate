@@ -398,6 +398,12 @@ public final class ArtifactMutationService {
                         .filter(scope -> scope.pipelineIncarnationId().equals(visibility.incarnationId()))
                         .map(scope -> OptionalLong.of(scope.executionGeneration()))
                         .orElseGet(OptionalLong::empty);
+                try {
+                    cleanupReporter.removed(id, visibility.incarnationId());
+                } catch (RuntimeException releaseFailed) {
+                    cleanupFailed(new CleanupIntent(id, visibility, cleanupGeneration),
+                            "local-current", false, releaseFailed);
+                }
                 reclaim(id, visibility, cleanupGeneration);
             }
             if (target instanceof SourceResource) {

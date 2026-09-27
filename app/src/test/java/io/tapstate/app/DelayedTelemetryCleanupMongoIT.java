@@ -55,7 +55,14 @@ class DelayedTelemetryCleanupMongoIT {
         Instant bucketStart = Instant.ofEpochSecond(Math.floorDiv(at.getEpochSecond(), 300) * 300 - 300);
         List<Runnable> pending = new ArrayList<>();
         List<TelemetryCleanupReporter.Failure> failures = new ArrayList<>();
+        List<String> removedCurrent = new ArrayList<>();
         RingBufferLogSink logs = new RingBufferLogSink(8, 8);
+        TelemetryCleanupReporter reporter = new TelemetryCleanupReporter() {
+            @Override public void failed(Failure failure) { failures.add(failure); }
+            @Override public void removed(String pipelineId, String incarnationId) {
+                removedCurrent.add(pipelineId + ":" + incarnationId);
+            }
+        };
 
         try (MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
                 uri, null, Duration.ofSeconds(5)))) {
@@ -66,7 +73,7 @@ class DelayedTelemetryCleanupMongoIT {
                     store.layouts(), store.meta(), store.derivedSchemas(), store.rateHistory(),
                     new AuditGate(record -> { }, Clock.systemUTC()), DataBrowserFollows.NONE,
                     pending::add, logs, store.events(), store.historyRollups(),
-                    ignored -> Optional.empty(), failures::add);
+                    ignored -> Optional.empty(), reporter);
 
             String id = "recreated_flow";
             PipelineResource resource = pipeline(id);
@@ -77,6 +84,7 @@ class DelayedTelemetryCleanupMongoIT {
 
             mutations.delete("operator", id, CanonicalHash.of(resource));
             assertThat(store.artifacts().get(id)).isEmpty();
+            assertThat(removedCurrent).containsExactly(id + ":" + oldIncarnation);
             assertThat(store.observations().readStored(id).orElseThrow().scope()).contains(oldOwner);
             assertThat(store.rateHistory().readPageVisible(id,
                     new RateHistoryStore.Visibility(oldIncarnation, false),
@@ -106,6 +114,8 @@ class DelayedTelemetryCleanupMongoIT {
             publishLegacy(store, logs, legacyId, at, bucketStart);
             mutations.delete("operator", legacyId, CanonicalHash.of(legacyResource));
             assertThat(store.artifacts().get(legacyId)).isEmpty();
+            assertThat(removedCurrent).containsExactly(id + ":" + oldIncarnation,
+                    legacyId + ":null");
             assertThat(store.observations().readStored(legacyId).orElseThrow().scope()).isEmpty();
             assertThat(store.rateHistory().readPageVisible(legacyId,
                     new RateHistoryStore.Visibility(null, true),

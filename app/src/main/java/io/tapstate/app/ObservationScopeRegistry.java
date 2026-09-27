@@ -54,6 +54,28 @@ final class ObservationScopeRegistry {
         return entry == null ? Optional.empty() : Optional.ofNullable(entry.current);
     }
 
+    /** Invalidates a deleted resource without clearing a newer incarnation already under the same id. */
+    void forgetIncarnation(String pipelineId, String incarnationId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Entry entry = entries.get(pipelineId);
+        if (entry == null) {
+            return;
+        }
+        synchronized (entry) {
+            ObservationStore.Scope current = entry.current;
+            if (current == null || !Objects.equals(current.pipelineIncarnationId(), incarnationId)) {
+                return;
+            }
+            // Keep the entry object: a concurrent begin may already hold it after computeIfAbsent.
+            entry.current = null;
+            entry.last = null;
+            entry.pendingFrom = null;
+            entry.pending = null;
+            entry.active = null;
+            entry.folder = CardinalityBudget.folder();
+        }
+    }
+
     /** Whether this execution is carrying a bounded cumulative baseline from its predecessor. */
     boolean continuing(String pipelineId, ObservationStore.Scope scope) {
         Entry entry = entries.get(pipelineId);

@@ -58,6 +58,11 @@ labels. Connector call duration includes its synchronous callback. Connector-int
 occupancy have no general measurement yet. JVM GC collection time is not an exact stop-the-world pause;
 process RSS is not currently emitted. Do not substitute committed heap for RSS when comparing workloads.
 
+Deleting a pipeline removes its old current points from the local exporter, including when the same id
+is recreated before another sweep. Exported point labels contain the pipeline id but no incarnation or
+execution selector. A remote Prometheus or OTLP backend may retain older points until its own retention
+expires; do not use that remote history to decide which incarnation a current store-backed read belongs to.
+
 ## What history measures
 
 History contains samples, not stored rates. By default the server samples no more often than once per

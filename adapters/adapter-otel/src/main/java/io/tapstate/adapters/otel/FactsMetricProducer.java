@@ -20,6 +20,7 @@ import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.metrics.MetricsExport.ScopeToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,9 +33,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -76,7 +79,7 @@ final class FactsMetricProducer implements MetricProducer {
             AttributeKey.stringKey(MetricAttributes.OVERFLOW), "true");
 
     /** What one pipeline last offered. */
-    private record Offered(PipelineState state, Instant observedAt, List<MetricFact> facts) {
+    private record Offered(PipelineState state, Instant observedAt, List<MetricFact> facts, ScopeToken scope) {
     }
 
     /** One instrument's points across every pipeline, gathered for one collection. */
@@ -95,6 +98,7 @@ final class FactsMetricProducer implements MetricProducer {
     private final CardinalityBudget.Folder folder = CardinalityBudget.folder();
     private final Map<String, Offered> latest = new ConcurrentHashMap<>();
     private final Map<String, Supplier<List<MetricFact>>> processFacts = new ConcurrentHashMap<>();
+    private volatile Function<String, Optional<ScopeToken>> currentScopes;
 
     /** Per instrument, the attribute sets that hold a series of their own past the export limit, in first-seen order. */
     private final Map<String, Set<Map<String, String>>> named = new HashMap<>();
@@ -114,13 +118,42 @@ final class FactsMetricProducer implements MetricProducer {
                 folded.add(folder.fold(fact));
             }
         }
-        latest.put(pipelineId, new Offered(state, observedAt, List.copyOf(folded)));
+        latest.put(pipelineId, new Offered(state, observedAt, List.copyOf(folded), null));
     }
 
     /** The observation publisher has already spent the per-pipeline fold on this immutable frame. */
     void offerFolded(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
         latest.put(Objects.requireNonNull(pipelineId, "pipelineId"),
-                new Offered(state, observedAt, List.copyOf(Objects.requireNonNull(facts, "facts"))));
+                new Offered(state, observedAt, List.copyOf(Objects.requireNonNull(facts, "facts")), null));
+    }
+
+    void bindCurrentScopes(Function<String, Optional<ScopeToken>> current) {
+        currentScopes = Objects.requireNonNull(current, "current");
+    }
+
+    void offerFoldedScoped(String pipelineId, ScopeToken scope,
+            PipelineState state, Instant observedAt, List<MetricFact> facts) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(scope, "scope");
+        Offered offered = new Offered(state, observedAt, List.copyOf(Objects.requireNonNull(facts, "facts")), scope);
+        latest.compute(pipelineId, (id, previous) -> {
+            Function<String, Optional<ScopeToken>> current = currentScopes;
+            if (current != null && !current.apply(id).filter(scope::equals).isPresent()) {
+                return previous;
+            }
+            return previous != null && previous.scope() != null
+                    && (previous.scope().executionGeneration() > scope.executionGeneration()
+                        || (previous.scope().executionGeneration() == scope.executionGeneration()
+                            && !previous.scope().incarnationId().equals(scope.incarnationId())))
+                    ? previous : offered;
+        });
+    }
+
+    void forgetIncarnation(String pipelineId, String incarnationId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        latest.computeIfPresent(pipelineId, (id, previous) -> previous.scope() == null
+                ? incarnationId == null ? null : previous
+                : Objects.equals(previous.scope().incarnationId(), incarnationId) ? null : previous);
     }
 
     /** Process facts are read on collection, independently of observation and store worker success. */
@@ -178,7 +211,13 @@ final class FactsMetricProducer implements MetricProducer {
 
     @Override
     public Collection<MetricData> produce(Resource resource) {
-        Map<String, Offered> snapshot = Map.copyOf(latest);
+        Map<String, Offered> current = new HashMap<>();
+        latest.forEach((pipelineId, offered) -> {
+            if (visible(pipelineId, offered)) {
+                current.put(pipelineId, offered);
+            }
+        });
+        Map<String, Offered> snapshot = Map.copyOf(current);
         Map<String, Series> byInstrument = new TreeMap<>();
         for (Offered offered : snapshot.values()) {
             for (MetricFact fact : offered.facts()) {
@@ -203,6 +242,12 @@ final class FactsMetricProducer implements MetricProducer {
             out.add(stateGauge(resource, snapshot));
         }
         return out;
+    }
+
+    private boolean visible(String pipelineId, Offered offered) {
+        Function<String, Optional<ScopeToken>> current = currentScopes;
+        return current == null || offered.scope() == null
+                || current.apply(pipelineId).filter(offered.scope()::equals).isPresent();
     }
 
     /**

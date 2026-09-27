@@ -12,5 +12,9 @@ public interface TelemetryCleanupReporter {
 
     void failed(Failure failure);
 
+    /** Immediately invalidates local current telemetry for the deleted owner before async cleanup. */
+    default void removed(String pipelineId, String incarnationId) {
+    }
+
     TelemetryCleanupReporter NONE = failure -> { };
 }

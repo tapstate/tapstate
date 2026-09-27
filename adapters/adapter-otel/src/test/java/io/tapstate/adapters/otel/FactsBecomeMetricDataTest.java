@@ -14,12 +14,15 @@ import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.metrics.MetricsExport;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.tapstate.adapters.otel.Facts.AT;
 import static io.tapstate.adapters.otel.Facts.DELIVERY;
@@ -36,6 +39,40 @@ import static org.assertj.core.api.Assertions.assertThat;
 class FactsBecomeMetricDataTest {
 
     private final FactsMetricProducer producer = new FactsMetricProducer(START.minusSeconds(5));
+
+    @Test
+    void aDeletedIncarnationCannotBeScrapedOrRestoreOldCurrentPointsAfterRecreation() {
+        MetricsExport.ScopeToken old = new MetricsExport.ScopeToken("inc-old", 41);
+        MetricsExport.ScopeToken current = new MetricsExport.ScopeToken("inc-new", 42);
+        AtomicReference<MetricsExport.ScopeToken> owner = new AtomicReference<>(old);
+        producer.bindCurrentScopes(id -> Optional.ofNullable(owner.get()));
+        producer.offerFoldedScoped("orders", old, PipelineState.RUNNING, AT,
+                List.of(Facts.records("orders", 3, 5)));
+        assertThat(only(producer.produce(Resource.empty()), RECORDS).getLongSumData().getPoints())
+                .extracting(LongPointData::getValue).containsExactlyInAnyOrder(3L, 5L);
+
+        owner.set(null);
+        assertThat(producer.produce(Resource.empty())).noneMatch(metric ->
+                metric.getName().equals(RECORDS) || metric.getName().equals(FactsMetricProducer.STATE_METRIC));
+        producer.forgetIncarnation("orders", "inc-old");
+        assertThat(producer.pipelines()).isEmpty();
+
+        owner.set(current);
+        producer.offerFoldedScoped("orders", current, PipelineState.RUNNING, AT.plusSeconds(1),
+                List.of(Facts.records("orders", 7, 11)));
+        producer.forgetIncarnation("orders", "inc-old");
+        producer.offerFoldedScoped("orders", old, PipelineState.RUNNING, AT.plusSeconds(2),
+                List.of(Facts.records("orders", 13, 17)));
+        assertThat(only(producer.produce(Resource.empty()), RECORDS).getLongSumData().getPoints())
+                .extracting(LongPointData::getValue).containsExactlyInAnyOrder(7L, 11L);
+        assertThat(only(producer.produce(Resource.empty()), RECORDS).getLongSumData().getPoints())
+                .allSatisfy(point -> {
+                    assertThat(point.getAttributes().get(AttributeKey.stringKey("pipelineIncarnationId")))
+                            .isNull();
+                    assertThat(point.getAttributes().get(AttributeKey.longKey("executionGeneration")))
+                            .isNull();
+                });
+    }
 
     @Test
     void processHealthIsPulledWithoutAnyPipelineObservationOrStoreWrite() {

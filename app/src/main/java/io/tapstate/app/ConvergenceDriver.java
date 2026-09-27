@@ -132,6 +132,11 @@ final class ConvergenceDriver {
         this.observationScopes = observationScopes;
         this.telemetryWork = telemetryWork;
         this.pendingWork = pendingWork;
+        if (observationScopes != null && telemetryWork == null) {
+            this.export.bindCurrentScopes(id -> observationScopes.current(id)
+                    .map(owner -> new MetricsExport.ScopeToken(
+                            owner.pipelineIncarnationId(), owner.executionGeneration())));
+        }
     }
 
     @Scheduled(fixedDelayString = "${tapstate.converge.interval-ms:1000}")
@@ -375,7 +380,16 @@ final class ConvergenceDriver {
     /** Offers the same measured facts to export on the inline compatibility path. */
     private void export(io.tapstate.core.lifecycle.Observation published) {
         try {
-            export.offerFolded(published.pipelineId(), published.state(), published.observedAt(), published.facts());
+            var scope = observationScopes == null ? Optional.<io.tapstate.spi.store.ObservationStore.Scope>empty()
+                    : observationScopes.current(published.pipelineId());
+            if (scope.isPresent()) {
+                var owner = scope.orElseThrow();
+                export.offerFoldedScoped(published.pipelineId(), new MetricsExport.ScopeToken(
+                        owner.pipelineIncarnationId(), owner.executionGeneration()), published.state(),
+                        published.observedAt(), published.facts());
+            } else {
+                export.offerFolded(published.pipelineId(), published.state(), published.observedAt(), published.facts());
+            }
         } catch (RuntimeException unexported) {
             LOG.warn("Could not offer the facts of pipeline {} for export", published.pipelineId(), unexported);
         }

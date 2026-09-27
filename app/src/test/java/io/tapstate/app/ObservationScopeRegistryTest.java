@@ -21,6 +21,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ObservationScopeRegistryTest {
 
     @Test
+    void removingAnOldIncarnationInvalidatesItsScopeButCannotEraseARecreatedOne() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        ObservationStore.Scope old = scopes.begin(PIPELINE, "inc-old", 41);
+
+        scopes.forgetIncarnation(PIPELINE, "inc-old");
+        assertThat(scopes.current(PIPELINE)).isEmpty();
+
+        ObservationStore.Scope current = scopes.begin(PIPELINE, "inc-new", 42);
+        scopes.forgetIncarnation(PIPELINE, "inc-old");
+        assertThat(scopes.current(PIPELINE)).contains(current);
+        assertThat(current).isNotEqualTo(old);
+    }
+
+    @Test
     void aRebuildKeepsNamedSeriesWithinTheDeclaredTableBudgetAndPreservesTheirTotal() {
         ObservationScopeRegistry scopes = new ObservationScopeRegistry();
         ObservationStore.Scope old = scopes.begin(PIPELINE, "inc-a", 1);

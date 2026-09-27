@@ -384,12 +384,20 @@ class ControlPlaneConfiguration {
 
     @Bean
     TelemetryCleanupHealth telemetryCleanupHealth(Clock clock,
-            ObjectProvider<MetricsExport> export, ObjectProvider<TelemetryDispatcher> telemetry) {
-        return new TelemetryCleanupHealth(clock, export.getIfAvailable(MetricsExport::none), event -> {
+            ObjectProvider<MetricsExport> export, ObjectProvider<TelemetryDispatcher> telemetry,
+            ObjectProvider<ObservationScopeRegistry> scopes) {
+        MetricsExport metrics = export.getIfAvailable(MetricsExport::none);
+        return new TelemetryCleanupHealth(clock, metrics, event -> {
             TelemetryDispatcher dispatcher = telemetry.getIfAvailable();
             if (dispatcher != null) {
                 dispatcher.offerEvent(event);
             }
+        }, (pipelineId, incarnationId) -> {
+            ObservationScopeRegistry local = scopes.getIfAvailable();
+            if (local != null) {
+                local.forgetIncarnation(pipelineId, incarnationId);
+            }
+            metrics.forgetIncarnation(pipelineId, incarnationId);
         });
     }
 

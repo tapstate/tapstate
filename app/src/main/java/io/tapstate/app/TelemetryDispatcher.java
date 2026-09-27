@@ -292,6 +292,10 @@ final class TelemetryDispatcher implements AutoCloseable {
         this.sampler = sampler;
         this.export = Objects.requireNonNull(export, "export");
         this.scopes = scopes;
+        if (scopes != null) {
+            export.bindCurrentScopes(id -> scopes.current(id).map(owner -> new MetricsExport.ScopeToken(
+                    owner.pipelineIncarnationId(), owner.executionGeneration())));
+        }
         this.events = events;
         if (latestConcurrency < 1 || queueCapacity < 1) {
             throw new IllegalArgumentException("telemetry worker and queue budgets must be positive");
@@ -589,8 +593,14 @@ final class TelemetryDispatcher implements AutoCloseable {
                         export.forgetPipeline(observation.pipelineId());
                     }
                 }
-                export.offerFolded(observation.pipelineId(), observation.state(),
-                        observation.observedAt(), observation.facts());
+                if (scope == null) {
+                    export.offerFolded(observation.pipelineId(), observation.state(),
+                            observation.observedAt(), observation.facts());
+                } else {
+                    export.offerFoldedScoped(observation.pipelineId(), new MetricsExport.ScopeToken(
+                            scope.pipelineIncarnationId(), scope.executionGeneration()), observation.state(),
+                            observation.observedAt(), observation.facts());
+                }
                 if (scope != null && scopes != null) {
                     offeredScopes.put(observation.pipelineId(), scope);
                 }

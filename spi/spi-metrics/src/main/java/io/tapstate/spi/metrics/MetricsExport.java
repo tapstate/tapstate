@@ -6,6 +6,9 @@ import io.tapstate.core.lifecycle.PipelineState;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -19,6 +22,16 @@ import java.util.function.Supplier;
  * exporter's problem to report, not the convergence loop's to stop over.
  */
 public interface MetricsExport extends AutoCloseable {
+
+    /** Internal current-resource owner; it never becomes an exported point attribute. */
+    record ScopeToken(String incarnationId, long executionGeneration) {
+        public ScopeToken {
+            Objects.requireNonNull(incarnationId, "incarnationId");
+            if (incarnationId.isBlank() || executionGeneration <= 0) {
+                throw new IllegalArgumentException("an export scope needs an incarnation and generation");
+            }
+        }
+    }
 
     /**
      * The facts of one pipeline as of one observation, replacing whatever this export held for it. The
@@ -34,6 +47,20 @@ public interface MetricsExport extends AutoCloseable {
      */
     default void offerFolded(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
         offer(pipelineId, state, observedAt, facts);
+    }
+
+    /** Offers a folded frame with its internal owner so a reused id cannot expose old current points. */
+    default void offerFoldedScoped(String pipelineId, ScopeToken scope, PipelineState state,
+            Instant observedAt, List<MetricFact> facts) {
+        offerFolded(pipelineId, state, observedAt, facts);
+    }
+
+    /** Binds a local, nonblocking owner lookup used to filter current points during collection. */
+    default void bindCurrentScopes(Function<String, Optional<ScopeToken>> current) {
+    }
+
+    /** Forgets only the deleted resource's current points; a new incarnation under the id survives. */
+    default void forgetIncarnation(String pipelineId, String incarnationId) {
     }
 
     /** Registers a cheap, store-independent process reading sampled by the exporter's own pull cadence. */

@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /** Local evidence of cleanup residue, independent of the store whose cleanup may have failed. */
@@ -24,15 +25,27 @@ final class TelemetryCleanupHealth implements TelemetryCleanupReporter {
 
     private final Clock clock;
     private final Consumer<PipelineEvent> eventOffer;
+    private final BiConsumer<String, String> localCurrentRelease;
     private final Instant startedAt;
     private final AtomicLong failures = new AtomicLong();
     private final AtomicLong rejections = new AtomicLong();
 
     TelemetryCleanupHealth(Clock clock, MetricsExport export, Consumer<PipelineEvent> eventOffer) {
+        this(clock, export, eventOffer, (id, incarnation) -> { });
+    }
+
+    TelemetryCleanupHealth(Clock clock, MetricsExport export, Consumer<PipelineEvent> eventOffer,
+            BiConsumer<String, String> localCurrentRelease) {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.eventOffer = Objects.requireNonNull(eventOffer, "eventOffer");
+        this.localCurrentRelease = Objects.requireNonNull(localCurrentRelease, "localCurrentRelease");
         this.startedAt = clock.instant();
         Objects.requireNonNull(export, "export").observeProcess("telemetry-cleanup", this::facts);
+    }
+
+    @Override
+    public void removed(String pipelineId, String incarnationId) {
+        localCurrentRelease.accept(pipelineId, incarnationId);
     }
 
     @Override

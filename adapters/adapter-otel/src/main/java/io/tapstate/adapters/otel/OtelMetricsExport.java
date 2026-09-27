@@ -21,7 +21,9 @@ import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -104,6 +106,22 @@ public final class OtelMetricsExport implements MetricsExport {
     @Override
     public void offerFolded(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
         producer.offerFolded(pipelineId, state, observedAt, facts);
+    }
+
+    @Override
+    public void offerFoldedScoped(String pipelineId, ScopeToken scope, PipelineState state,
+            Instant observedAt, List<MetricFact> facts) {
+        producer.offerFoldedScoped(pipelineId, scope, state, observedAt, facts);
+    }
+
+    @Override
+    public void bindCurrentScopes(Function<String, Optional<ScopeToken>> current) {
+        producer.bindCurrentScopes(current);
+    }
+
+    @Override
+    public void forgetIncarnation(String pipelineId, String incarnationId) {
+        producer.forgetIncarnation(pipelineId, incarnationId);
     }
 
     @Override
