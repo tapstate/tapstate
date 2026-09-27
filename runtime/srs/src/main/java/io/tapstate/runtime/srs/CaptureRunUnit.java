@@ -220,9 +220,7 @@ public final class CaptureRunUnit {
                 consumerAttached = true;
                 // A selected table protects its ring before the reader's first progress report. Raising
                 // the floor to -1 also leaves an already advanced cursor where a returning run left it.
-                for (String table : tables) {
-                    meta.advanceConsumerReadSeq(chainId.value(), spec.pipelineId(), table, -1L);
-                }
+                registerConsumerTables(chainId.value(), spec.pipelineId(), tables);
             } else if (plan.directTail() && startTail) {
                 // Stated rather than relied on: a direct tail is `tail && !sharedRing`, so reaching here
                 // means the branch above already resolved the chain. That is a fact about a record's
@@ -305,6 +303,12 @@ public final class CaptureRunUnit {
                 failure.addSuppressed(cleanupFailure);
             }
             throw failure;
+        }
+    }
+
+    private void registerConsumerTables(String chainId, String pipelineId, List<String> tables) {
+        for (String table : tables) {
+            meta.advanceConsumerReadSeq(chainId, pipelineId, table, -1L);
         }
     }
 
