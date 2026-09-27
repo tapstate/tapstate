@@ -83,6 +83,9 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.lag",
                         "tapstate.pipeline.record.delivery.duration",
                         "tapstate.pipeline.process.duration",
+                        "tapstate.pipeline.queue.depth",
+                        "tapstate.pipeline.queue.capacity",
+                        "tapstate.pipeline.queue.high_water",
                         "tapstate.pipeline.sink.batch.issued",
                         "tapstate.pipeline.sink.batch.records",
                         "tapstate.pipeline.sink.batch.records.max",
@@ -505,6 +508,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                 .map(CardinalityBudget::instrument))
                 .containsExactlyInAnyOrder(
                         "tapstate.pipeline.lag",
+                        "tapstate.pipeline.queue.high_water",
                         "tapstate.pipeline.frontier.gap",
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.pending.high_water",
