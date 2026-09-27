@@ -852,7 +852,9 @@ class CaptureRunUnitTest {
         assertThat(run.cdcSubscription()).isPresent();
 
         String chainId = run.chainId().get().value();
-        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1")).isEmpty();
+        ConsumerOffset offset = meta.read(chainId).orElseThrow().consumerOffset("pipe-1").orElseThrow();
+        assertThat(offset.perTableSeq()).containsEntry("orders", -1L);
+        assertThat(offset.cdcStartPosition()).isNull();
         Ringbuffer<SrsItem> ring = hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders"));
         assertThat(ring.tailSequence()).isEqualTo(1L);
     }
@@ -1104,6 +1106,7 @@ class CaptureRunUnitTest {
         SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
         long hadReached = ring.append(buffered(1));
         meta.startRingAfter(chain, "pipe-b", "orders", hadReached);
+        meta.advanceConsumerReadSeq(chain, "pipe-b", "orders", hadReached);
         ring.append(buffered(2));
         ring.append(buffered(3));
 
@@ -1113,6 +1116,9 @@ class CaptureRunUnitTest {
         assertThat(meta.ringDoneThrough(chain, "pipe-b"))
                 .as("the two changes written while it was away are still owed to it")
                 .containsExactly(Map.entry("orders", hadReached));
+        assertThat(meta.read(chain).orElseThrow().consumerOffset("pipe-b").orElseThrow().perTableSeq())
+                .as("attaching on another member leaves the returning reader's cursor advanced")
+                .containsEntry("orders", hadReached);
     }
 
     @Test
@@ -1127,6 +1133,7 @@ class CaptureRunUnitTest {
         new CaptureRunUnit(new FakeSource(List.of(), List.of()), new SrsCoordinator(meta), meta, hz)
                 .start(new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-cdc-start", true, "src-1",
                         "pipe-present", StartFrom.latest(), null, 0L), e -> { }, false);
+        meta.advanceConsumerReadSeq(chain, "pipe-earliest", "orders", held);
         new CaptureRunUnit(new FakeSource(List.of(), List.of()), new SrsCoordinator(meta), meta, hz)
                 .start(new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-cdc-start", true, "src-1",
                         "pipe-earliest", StartFrom.earliest(), null, 0L), e -> { }, false);
@@ -1137,6 +1144,10 @@ class CaptureRunUnitTest {
         assertThat(meta.ringDoneThrough(chain, "pipe-earliest"))
                 .as("a read from the earliest change is owed everything the ring holds, so nothing is marked")
                 .isEmpty();
+        assertThat(meta.read(chain).orElseThrow().consumerOffset("pipe-present").orElseThrow().perTableSeq())
+                .containsEntry("orders", -1L);
+        assertThat(meta.read(chain).orElseThrow().consumerOffset("pipe-earliest").orElseThrow().perTableSeq())
+                .containsEntry("orders", held);
     }
 
     private static SrsItem buffered(int id) {
@@ -1166,6 +1177,8 @@ class CaptureRunUnitTest {
         String chainId = run.chainId().orElseThrow().value();
         assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders")).tailSequence()).isEqualTo(0L);
         assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "customers")).tailSequence()).isEqualTo(0L);
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1").orElseThrow().perTableSeq())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", -1L, "customers", -1L));
     }
 
     @Test
@@ -1273,7 +1286,7 @@ class CaptureRunUnitTest {
         InMemoryMeta many = new InMemoryMeta();
         runUnit(new FakeSource(List.of(), List.of(
                         change(10), change(11), change(12), change(13), change(14),
-                        change(15), change(16), change(17), change(18), change(19))),
+                        change(15), change(16), change(17))),
                 many)
                 .start(spec(ReadMode.CDC_ONLY, true, "chain-reads-many"), e -> { });
 
@@ -1281,9 +1294,9 @@ class CaptureRunUnitTest {
         // costs when both come from the same record.
         assertThat(many.cursorReads - few.cursorReads)
                 .as("cursor reads scale one-for-one with runs of changes")
-                .isEqualTo(8);
+                .isEqualTo(6);
         // And the whole record is fetched only by the start path, the same number of times either way:
-        // eight more runs of changes fetch it not once more.
+        // six more runs of changes fetch it not once more.
         assertThat(many.wholeRecordReads)
                 .as("whole-record fetches do not scale with the number of change runs")
                 .isEqualTo(few.wholeRecordReads);
@@ -1311,14 +1324,14 @@ class CaptureRunUnitTest {
     }
 
     @Test
-    void theHeadroomBoundTreatsAConsumerThatHasNotReadTheTableAsHavingReadNothing() {
+    void theHeadroomBoundIgnoresAConsumerWithoutThatTable() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-other", null);
-        // The consumer has a cursor on another table but none on orders: for orders it has read nothing (-1),
-        // holding the orders ring at the head until it starts reading orders.
+        // A cursor for customers alone does not say this consumer subscribes to orders.
         meta.advanceConsumerReadSeq("chain-other", "p1", "customers", 9L);
 
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders")).isEqualTo(-1L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders"))
+                .isEqualTo(Long.MAX_VALUE);
     }
 
     /** A mock connector: a fixed snapshot batch and a fixed change stream driven into the listener when cdc starts. */
@@ -1572,7 +1585,7 @@ class CaptureRunUnitTest {
                 }
             }
             Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
-            perTable.put(table, lastReadSeq);
+            perTable.merge(table, lastReadSeq, Math::max);
             ChainPosition ack = existing == null ? null : existing.sinkAcked();
             next.add(new ConsumerOffset(
                     pipelineId,

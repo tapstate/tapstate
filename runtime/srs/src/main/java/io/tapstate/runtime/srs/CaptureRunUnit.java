@@ -218,6 +218,11 @@ public final class CaptureRunUnit {
             if (plan.sharedRing()) {
                 coordinator.attachConsumer(chainId, spec.pipelineId());
                 consumerAttached = true;
+                // A selected table protects its ring before the reader's first progress report. Raising
+                // the floor to -1 also leaves an already advanced cursor where a returning run left it.
+                for (String table : tables) {
+                    meta.advanceConsumerReadSeq(chainId.value(), spec.pipelineId(), table, -1L);
+                }
             } else if (plan.directTail() && startTail) {
                 // Stated rather than relied on: a direct tail is `tail && !sharedRing`, so reaching here
                 // means the branch above already resolved the chain. That is a fact about a record's

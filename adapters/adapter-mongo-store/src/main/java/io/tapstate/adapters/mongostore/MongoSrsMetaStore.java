@@ -325,15 +325,15 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     /**
-     * The path-scoped update advancing one consumer document's read cursor for one table. It sets only
-     * {@code perTableSeq.<table>}, so the sink-acked position in that document is left untouched. The L1
-     * stream name is a bare identifier, so the dotted path addresses exactly one field. A deep
-     * {@code $set} creates the cursor map when a reader advances before the sink has written anything.
+     * The path-scoped update advancing one consumer document's read cursor for one table. It raises only
+     * {@code perTableSeq.<table>}, so registration at -1 and a slower publisher cannot lower an advanced
+     * cursor or touch the sink-acked position. The L1 stream name is a bare identifier, so the dotted path
+     * addresses exactly one field. A deep {@code $max} creates the cursor map when none exists yet.
      */
     static Document consumerReadSeqUpdate(String pipelineId, String table, long lastReadSeq) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(table, "table");
-        return new Document("$set", new Document("perTableSeq." + table, lastReadSeq));
+        return new Document("$max", new Document("perTableSeq." + table, lastReadSeq));
     }
 
     /**

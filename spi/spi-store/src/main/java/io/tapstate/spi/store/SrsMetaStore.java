@@ -99,9 +99,10 @@ public interface SrsMetaStore {
     void upsertConsumerOffset(String miningChainId, ConsumerOffset offset);
 
     /**
-     * Advances one consumer pipeline's read cursor into one table's change ring — a scoped set of that
-     * consumer's {@code perTableSeq} entry for the table alone. It touches only the read cursor, so a
-     * reader advancing here never clobbers the {@code sinkAckedSrcpos} the pipeline's sink writes to the
+     * Advances one consumer pipeline's read cursor into one table's change ring — a scoped raise of that
+     * consumer's {@code perTableSeq} entry for the table alone. A call with {@code -1} registers a table
+     * before its reader publishes progress without lowering a cursor that already exists. It touches only
+     * the read cursor, so a reader advancing here never clobbers the {@code sinkAckedSrcpos} the sink writes to the
      * same consumer record: the read cursor and the sink-ack are independent writers of one consumer, of
      * different lifetime. It creates the consumer entry when the pipeline has none yet, so a reader may
      * advance before the sink first acks. A mutate on an unseeded chain is a caller ordering error.

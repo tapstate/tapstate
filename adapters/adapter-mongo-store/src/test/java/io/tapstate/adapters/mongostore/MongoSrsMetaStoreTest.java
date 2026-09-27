@@ -190,12 +190,12 @@ class MongoSrsMetaStoreTest {
 
     @Test
     void consumerReadSeqUpdateTargetsOnlyThatTablesCursorPathNotTheWholeConsumer() {
-        // The reader's per-table cursor advance is a path-scoped $set: it touches only
+        // The reader's per-table cursor advance is a path-scoped $max: it touches only
         // perTableSeq.<table> in that pipeline's document, so a reader advancing its cursor never clobbers
         // the sink-acked position the sink writes there -- the two are independent writers.
         Document update = MongoSrsMetaStore.consumerReadSeqUpdate("p1", "orders", 42L);
 
-        assertThat(update.get("$set", Document.class))
+        assertThat(update.get("$max", Document.class))
                 .containsExactly(Map.entry("perTableSeq.orders", 42L));
     }
 
