@@ -129,6 +129,9 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         long began = System.nanoTime();
         try {
             Map<String, byte[]> found = store.loadAll(namespace, byName.keySet());
+            if (stats != null) {
+                stats.backfill(namespace, System.nanoTime() - began);
+            }
             Map<Object, Object> loaded = new LinkedHashMap<>();
             long payloadBytes = 0;
             for (Map.Entry<String, byte[]> state : found.entrySet()) {
@@ -141,9 +144,6 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             if (costs != null) {
                 costs.completed(namespace, StateStoreCostProbe.Operation.LOAD_ALL,
                         System.nanoTime() - began, payloadBytes);
-            }
-            if (stats != null) {
-                stats.backfill(namespace, System.nanoTime() - began);
             }
             return loaded;
         } catch (RuntimeException cause) {

@@ -131,6 +131,7 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         long began = System.nanoTime();
         try {
             Map<String, byte[]> states = store.loadAll(namespace, byName.keySet());
+            count(byName.size(), began);
             Map<Object, Object> loaded = new LinkedHashMap<>();
             long payloadBytes = 0;
             for (Map.Entry<String, byte[]> state : states.entrySet()) {
@@ -144,7 +145,6 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
                 costs.completed(namespace, StateStoreCostProbe.Operation.LOAD_ALL,
                         System.nanoTime() - began, payloadBytes);
             }
-            count(byName.size(), began);
             return loaded;
         } catch (RuntimeException cause) {
             if (costs != null) {
