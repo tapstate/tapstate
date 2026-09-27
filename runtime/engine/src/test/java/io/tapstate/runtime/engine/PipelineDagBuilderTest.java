@@ -325,7 +325,8 @@ class PipelineDagBuilderTest {
                 new FrontierBinding(Map.of("orders_src", "orders", "customers_src", "customers")));
 
         assertThat(vertexNames(dag))
-                .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "j:project", "serve.sync_1");
+                .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "j:project", "serve.sync_1",
+                        StateStoreCostMetricNames.VERTEX);
         assertThat(edges(dag)).contains(
                 edge("orders_src", "j", 0, 0),
                 edge("customers_src", "j", 0, 1),

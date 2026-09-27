@@ -37,6 +37,8 @@ public final class NestStateMapStoreFactory implements MapStoreFactory<Object, O
      * be spelled two ways - and the store would then find nothing, on a member configured correctly.
      */
     public static final String USER_CONTEXT_KEY = "tapstate.nest.state-store";
+    /** The map-name family this factory serves, shared with member-local cost registration. */
+    public static final String NAMESPACE_PREFIX = NestMaps.NAMESPACE_PREFIX;
 
     /** Required: the substrate builds this by name, so it has to be buildable with nothing. */
     public NestStateMapStoreFactory() {

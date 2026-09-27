@@ -285,6 +285,7 @@ public final class PipelineDagBuilder {
         Map<Vertex, Integer> outboundOrdinal = new HashMap<>();
         Map<Vertex, Integer> inboundOrdinal = new HashMap<>();
         PipelineChains chains = frontier == null ? null : new PipelineChains();
+        Set<String> costNamespaces = new LinkedHashSet<>(joinStateNamespaces(pipeline));
 
         for (String sourceId : pipeline.sourceIds()) {
             List<String> sourceKeys = bindings.sourceKeys().apply(sourceId);
@@ -319,6 +320,7 @@ public final class PipelineDagBuilder {
                     }
                     NestTopology topology =
                             NestTopology.compile(pipeline.id(), step.id(), nest, bindings.nest().tables());
+                    costNamespaces.addAll(topology.stateNamespaces());
                     // Before a vertex is drawn, not after: the paths a tree keeps its state under are
                     // named by the tree, so a job built first and refused afterwards would already have
                     // decided which entries it was about to read - and every one of them would be the
@@ -410,6 +412,10 @@ public final class PipelineDagBuilder {
             }
         }
 
+        if (!costNamespaces.isEmpty()) {
+            dag.newVertex(StateStoreCostMetricNames.VERTEX,
+                    StateStoreCostBridge.metaSupplier(costNamespaces)).localParallelism(1);
+        }
         return dag;
     }
 

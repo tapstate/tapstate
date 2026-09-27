@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.Util;
 import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.config.ProcessingGuarantee;
 import com.hazelcast.jet.core.DAG;
@@ -18,6 +19,8 @@ import io.tapstate.core.lifecycle.QueueReading;
 import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
+import io.tapstate.core.lifecycle.StateStoreCostReading;
+import io.tapstate.runtime.engine.StateStoreCostMetricNames.Kind;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
 import io.tapstate.runtime.engine.nest.NestMemoryBudget;
@@ -29,6 +32,7 @@ import io.tapstate.spi.store.OperatorStateStores;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -43,6 +47,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * The data-plane execution engine: the lifecycle actuator that maps a pipeline's lifecycle to Jet
@@ -945,6 +950,140 @@ public final class Engine {
                     sampled.map(StoredCountSampler.Sample::observedAt)));
         });
         return readings;
+    }
+
+    /**
+     * Returns costs only when every current member reported every component from one execution of the
+     * live job. A partial sum after member loss is absent, never a deceptively smaller pipeline total.
+     */
+    public Map<String, StateStoreCostReading> stateStoreCostReadings(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null || job.getSubmissionTime() <= 0) {
+            return Map.of();
+        }
+        Set<String> members = memberIds();
+        if (members.isEmpty()) {
+            return Map.of();
+        }
+        String jobTag = Util.idToString(job.getId());
+        JobMetrics collected = job.getMetrics();
+        if (job.getStatus().isTerminal() || !members.equals(memberIds())) {
+            return Map.of();
+        }
+        Map<String, CostMeasurements> byNamespace = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            StateStoreCostMetricNames.Reading reading = StateStoreCostMetricNames.readingOf(metric);
+            if (reading == null) {
+                continue;
+            }
+            for (Measurement measurement : collected.get(metric)) {
+                if (!StateStoreCostMetricNames.VERTEX.equals(measurement.tag(MetricTags.VERTEX))) {
+                    continue;
+                }
+                CostMeasurements costs = byNamespace.computeIfAbsent(
+                        reading.namespace(), ignored -> new CostMeasurements());
+                String source = measurement.tag(MetricTags.MEMBER);
+                String execution = measurement.tag(MetricTags.EXECUTION);
+                if (!jobTag.equals(measurement.tag(MetricTags.JOB)) || source == null
+                        || !members.contains(source) || execution == null || measurement.value() < 0) {
+                    costs.invalid = true;
+                } else {
+                    costs.add(reading.kind(), source, execution, measurement.value());
+                }
+            }
+        }
+        if (job.getStatus().isTerminal() || !members.equals(memberIds())) {
+            return Map.of();
+        }
+        Instant since = Instant.ofEpochMilli(job.getSubmissionTime());
+        Map<String, StateStoreCostReading> readings = new HashMap<>();
+        byNamespace.forEach((namespace, costs) -> costs.complete(members, since)
+                .ifPresent(complete -> readings.put(namespace, complete)));
+        return Map.copyOf(readings);
+    }
+
+    private Set<String> memberIds() {
+        return member.getCluster().getMembers().stream()
+                .map(current -> current.getUuid().toString()).collect(Collectors.toUnmodifiableSet());
+    }
+
+    static final class CostMeasurements {
+        private final Map<Kind, Map<String, Long>> values = new EnumMap<>(Kind.class);
+        private String execution;
+        private boolean invalid;
+
+        void add(Kind kind, String member, String observedExecution, long value) {
+            if (execution == null) {
+                execution = observedExecution;
+            } else if (!execution.equals(observedExecution)) {
+                invalid = true;
+            }
+            if (values.computeIfAbsent(kind, ignored -> new HashMap<>()).putIfAbsent(member, value) != null) {
+                invalid = true;
+            }
+        }
+
+        Optional<StateStoreCostReading> complete(Set<String> members, Instant since) {
+            if (invalid || execution == null || !allMembers(Kind.READY, members)
+                    || values.get(Kind.READY).values().stream().anyMatch(ready -> ready != 1)
+                    || !allMembers(Kind.CLUSTER_SIZE, members)
+                    || values.get(Kind.CLUSTER_SIZE).values().stream()
+                            .anyMatch(size -> size != members.size())) {
+                return Optional.empty();
+            }
+            for (Kind kind : Kind.values()) {
+                if (!allMembers(kind, members)) {
+                    return Optional.empty();
+                }
+            }
+            try {
+                Map<Kind, Long> totals = new EnumMap<>(Kind.class);
+                for (Kind kind : Kind.values()) {
+                    long total = 0;
+                    for (long value : values.get(kind).values()) {
+                        total = Math.addExact(total, value);
+                    }
+                    totals.put(kind, total);
+                }
+                Map<String, StateStoreCostReading.OperationCost> operations = new HashMap<>();
+                operation(operations, "load", totals, Kind.LOAD_COMPLETED, Kind.LOAD_FAILED,
+                        Kind.LOAD_DURATION_NANOS, Kind.LOAD_PAYLOAD_BYTES);
+                operation(operations, "load_all", totals, Kind.LOAD_ALL_COMPLETED, Kind.LOAD_ALL_FAILED,
+                        Kind.LOAD_ALL_DURATION_NANOS, Kind.LOAD_ALL_PAYLOAD_BYTES);
+                operation(operations, "save", totals, Kind.SAVE_COMPLETED, Kind.SAVE_FAILED,
+                        Kind.SAVE_DURATION_NANOS, Kind.SAVE_PAYLOAD_BYTES);
+                operation(operations, "delete", totals, Kind.DELETE_COMPLETED, Kind.DELETE_FAILED,
+                        Kind.DELETE_DURATION_NANOS, Kind.DELETE_PAYLOAD_BYTES);
+                Map<String, StateStoreCostReading.CodecCost> codecs = new HashMap<>();
+                codec(codecs, "encode", totals, Kind.ENCODE_COMPLETED, Kind.ENCODE_BYTES);
+                codec(codecs, "decode", totals, Kind.DECODE_COMPLETED, Kind.DECODE_BYTES);
+                return operations.isEmpty() && codecs.isEmpty() ? Optional.empty()
+                        : Optional.of(new StateStoreCostReading(since, operations, codecs));
+            } catch (ArithmeticException overflow) {
+                return Optional.empty();
+            }
+        }
+
+        private boolean allMembers(Kind kind, Set<String> members) {
+            return values.containsKey(kind) && values.get(kind).keySet().equals(members);
+        }
+
+        private static void operation(Map<String, StateStoreCostReading.OperationCost> output,
+                String name, Map<Kind, Long> totals, Kind completed, Kind failed, Kind duration, Kind bytes) {
+            long successCount = totals.get(completed);
+            long failureCount = totals.get(failed);
+            if (successCount != 0 || failureCount != 0) {
+                output.put(name, new StateStoreCostReading.OperationCost(successCount, failureCount,
+                        totals.get(duration), totals.get(bytes)));
+            }
+        }
+
+        private static void codec(Map<String, StateStoreCostReading.CodecCost> output,
+                String name, Map<Kind, Long> totals, Kind count, Kind bytes) {
+            if (totals.get(count) != 0) {
+                output.put(name, new StateStoreCostReading.CodecCost(totals.get(count), totals.get(bytes)));
+            }
+        }
     }
 
     /**
