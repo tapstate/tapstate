@@ -71,10 +71,10 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     record Snapshot(OptionalLong cpuNanos, OptionalLong heapUsedBytes, OptionalLong rssBytes,
-                    OptionalLong gcPauseMillis) {
+                    OptionalLong gcCollectionMillis) {
         boolean complete() {
             return cpuNanos.isPresent() && heapUsedBytes.isPresent()
-                    && rssBytes.isPresent() && gcPauseMillis.isPresent();
+                    && rssBytes.isPresent() && gcCollectionMillis.isPresent();
         }
     }
 
@@ -87,7 +87,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
         if (cpu.isEmpty()) {
             cpu = jmxCpu();
         }
-        return new Snapshot(cpu, heapUsed(), rss(), gcPause());
+        return new Snapshot(cpu, heapUsed(), rss(), gcCollectionTime());
     }
 
     private OptionalLong jmxCpu() {
@@ -119,7 +119,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
         }
     }
 
-    private OptionalLong gcPause() {
+    private OptionalLong gcCollectionTime() {
         if (connection == null) {
             return OptionalLong.empty();
         }
@@ -131,11 +131,11 @@ final class BenchmarkProcessProbe implements AutoCloseable {
             }
             long total = 0;
             for (GarbageCollectorMXBean collector : collectors) {
-                long pause = collector.getCollectionTime();
-                if (pause < 0) {
+                long elapsed = collector.getCollectionTime();
+                if (elapsed < 0) {
                     return OptionalLong.empty();
                 }
-                total = Math.addExact(total, pause);
+                total = Math.addExact(total, elapsed);
             }
             return OptionalLong.of(total);
         } catch (IOException | RuntimeException e) {

@@ -346,7 +346,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         int samples = 0;
         for (BenchmarkResourceSampler.Summary window : windows) {
             cpu = Math.addExact(cpu, window.cpuNanos());
-            gc = Math.addExact(gc, window.gcPauseMillis());
+            gc = Math.addExact(gc, window.gcCollectionMillis());
             heap = Math.max(heap, window.peakHeapBytes());
             rss = Math.max(rss, window.peakRssBytes());
             samples = Math.addExact(samples, window.sampleCount());

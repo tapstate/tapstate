@@ -326,7 +326,7 @@ class PipelineBenchmarkLiveRunIT {
                 "throughputRecordsPerSecond", performance.recordsOutPerSecond(),
                 "deliveryP99Nanos", p99, "deliveryNanos", Arrays.stream(durations).boxed().toList(),
                 "resources", object("cpuNanos", resources.cpuNanos(),
-                        "gcPauseMillis", resources.gcPauseMillis(),
+                        "gcCollectionMillis", resources.gcCollectionMillis(),
                         "peakHeapBytes", resources.peakHeapBytes(),
                         "peakRssBytes", resources.peakRssBytes(),
                         "sampleCount", resources.sampleCount()),

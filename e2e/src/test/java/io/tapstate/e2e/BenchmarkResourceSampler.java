@@ -109,14 +109,14 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         BenchmarkProcessProbe.Snapshot first = readings.getFirst();
         BenchmarkProcessProbe.Snapshot last = readings.getLast();
         long cpu = last.cpuNanos().orElseThrow() - first.cpuNanos().orElseThrow();
-        long gc = last.gcPauseMillis().orElseThrow() - first.gcPauseMillis().orElseThrow();
+        long gc = last.gcCollectionMillis().orElseThrow() - first.gcCollectionMillis().orElseThrow();
         if (cpu < 0 || gc < 0 || peakHeap <= 0 || peakRss <= 0) {
             throw new AssertionError("resource counter moved backward or memory was unavailable");
         }
         return new Summary(cpu, gc, peakHeap, peakRss, readings.size());
     }
 
-    record Summary(long cpuNanos, long gcPauseMillis, long peakHeapBytes, long peakRssBytes, int sampleCount) {
+    record Summary(long cpuNanos, long gcCollectionMillis, long peakHeapBytes, long peakRssBytes, int sampleCount) {
     }
 
     @Override

@@ -21,7 +21,7 @@ class BenchmarkResourceSamplerTest {
                 reading(170, 23, 1_200, 2_200)));
 
         assertThat(summary.cpuNanos()).isEqualTo(70);
-        assertThat(summary.gcPauseMillis()).isEqualTo(3);
+        assertThat(summary.gcCollectionMillis()).isEqualTo(3);
         assertThat(summary.peakHeapBytes()).isEqualTo(1_500);
         assertThat(summary.peakRssBytes()).isEqualTo(2_500);
         assertThat(summary.sampleCount()).isEqualTo(3);

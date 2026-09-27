@@ -39,7 +39,7 @@ class BenchmarkProcessProbeTest {
                 assertThat(sample.cpuNanos().orElseThrow()).isPositive();
                 assertThat(sample.heapUsedBytes().orElseThrow()).isGreaterThan(16L * 1_024 * 1_024);
                 assertThat(sample.rssBytes().orElseThrow()).isGreaterThan(sample.heapUsedBytes().orElseThrow());
-                assertThat(sample.gcPauseMillis().orElseThrow()).isNotNegative();
+                assertThat(sample.gcCollectionMillis().orElseThrow()).isNotNegative();
             }
 
             child.getOutputStream().close();
@@ -50,7 +50,7 @@ class BenchmarkProcessProbeTest {
                 assertThat(unavailable.cpuNanos()).isEmpty();
                 assertThat(unavailable.heapUsedBytes()).isEmpty();
                 assertThat(unavailable.rssBytes()).isEmpty();
-                assertThat(unavailable.gcPauseMillis()).isEmpty();
+                assertThat(unavailable.gcCollectionMillis()).isEmpty();
             }
         } finally {
             child.destroyForcibly();
