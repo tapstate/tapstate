@@ -589,7 +589,7 @@ final class TelemetryDispatcher implements AutoCloseable {
                         export.forgetPipeline(observation.pipelineId());
                     }
                 }
-                export.offer(observation.pipelineId(), observation.state(),
+                export.offerFolded(observation.pipelineId(), observation.state(),
                         observation.observedAt(), observation.facts());
                 if (scope != null && scopes != null) {
                     offeredScopes.put(observation.pipelineId(), scope);

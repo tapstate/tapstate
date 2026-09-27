@@ -27,6 +27,15 @@ public interface MetricsExport extends AutoCloseable {
      */
     void offer(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts);
 
+    /**
+     * Offers facts already folded by the observation publisher. An exporter may apply its process-wide
+     * series ceiling, but must preserve this per-pipeline reduction. Other implementations can treat it
+     * as an ordinary offer.
+     */
+    default void offerFolded(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
+        offer(pipelineId, state, observedAt, facts);
+    }
+
     /** Registers a cheap, store-independent process reading sampled by the exporter's own pull cadence. */
     default void observeProcess(Supplier<List<MetricFact>> facts) {
     }

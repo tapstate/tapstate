@@ -102,6 +102,11 @@ public final class OtelMetricsExport implements MetricsExport {
     }
 
     @Override
+    public void offerFolded(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
+        producer.offerFolded(pipelineId, state, observedAt, facts);
+    }
+
+    @Override
     public void observeProcess(Supplier<List<MetricFact>> facts) {
         producer.observeProcess(facts);
     }

@@ -375,7 +375,7 @@ final class ConvergenceDriver {
     /** Offers the same measured facts to export on the inline compatibility path. */
     private void export(io.tapstate.core.lifecycle.Observation published) {
         try {
-            export.offer(published.pipelineId(), published.state(), published.observedAt(), published.facts());
+            export.offerFolded(published.pipelineId(), published.state(), published.observedAt(), published.facts());
         } catch (RuntimeException unexported) {
             LOG.warn("Could not offer the facts of pipeline {} for export", published.pipelineId(), unexported);
         }

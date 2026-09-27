@@ -117,6 +117,12 @@ final class FactsMetricProducer implements MetricProducer {
         latest.put(pipelineId, new Offered(state, observedAt, List.copyOf(folded)));
     }
 
+    /** The observation publisher has already spent the per-pipeline fold on this immutable frame. */
+    void offerFolded(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
+        latest.put(Objects.requireNonNull(pipelineId, "pipelineId"),
+                new Offered(state, observedAt, List.copyOf(Objects.requireNonNull(facts, "facts"))));
+    }
+
     /** Process facts are read on collection, independently of observation and store worker success. */
     void observeProcess(Supplier<List<MetricFact>> facts) {
         observeProcess("default", facts);

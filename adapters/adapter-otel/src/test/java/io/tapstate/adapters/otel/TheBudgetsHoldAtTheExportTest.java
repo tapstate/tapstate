@@ -74,6 +74,22 @@ class TheBudgetsHoldAtTheExportTest {
     }
 
     @Test
+    void anAlreadyFoldedObservationDoesNotSpendTheExportersPerPipelineNamingBudgetAgain() {
+        MetricFact published = CardinalityBudget.folder().fold(rowsOver("orders", 1_200, "old"));
+        producer.offerFolded("orders", PipelineState.RUNNING, AT, List.of(published));
+        assertThat(namedTables(recordsPoints(producer.produce(Resource.empty()))))
+                .hasSize(CardinalityBudget.RECORDS.distinctValues())
+                .allSatisfy(table -> assertThat(table).startsWith("old"));
+
+        // The raw-input compatibility path has its own folder. A second fold of the published frame
+        // would have filled it with old names and forced these new names into overflow.
+        producer.offer("orders", PipelineState.RUNNING, AT, List.of(rowsOver("orders", 1_200, "new")));
+        assertThat(namedTables(recordsPoints(producer.produce(Resource.empty()))))
+                .hasSize(CardinalityBudget.RECORDS.distinctValues())
+                .allSatisfy(table -> assertThat(table).startsWith("new"));
+    }
+
+    @Test
     void pastTheExportLimitAcrossPipelinesTheRestFoldIntoOneOverflowSeriesAndStayFolded() {
         // 5001 pipelines, two series each: 10002 series against the export limit of 10000. The per
         // pipeline fold cannot see this: each pipeline is well within its own budget.
