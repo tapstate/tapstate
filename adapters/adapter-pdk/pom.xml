@@ -66,6 +66,13 @@
       <version>${revision}</version>
     </dependency>
 
+    <!-- Fixed call-duration buckets belong to the shared metric contract, not the PDK bridge. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-lifecycle</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
     <!-- The read/write port contracts this bridge implements (spi ring, over the event envelope).
          adapter -> spi is the port-adapter direction: the bridge is the PDK implementation of these
          ports, so runtime/control depend on the ports, never on this module. -->

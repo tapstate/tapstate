@@ -136,7 +136,9 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.process.rollup.query.raw_fallback",
                         "tapstate.process.rollup.query.full_raw_fallback",
                         "tapstate.process.rollup.query.bucket.down_drilled",
-                        "tapstate.process.lifecycle.work.duration");
+                        "tapstate.process.lifecycle.work.duration",
+                        "tapstate.process.connector.external.call.count",
+                        "tapstate.process.connector.external.call.duration");
         for (CardinalityBudget budget : List.of(CardinalityBudget.RECORDS, CardinalityBudget.BYTES,
                 CardinalityBudget.LAG, CardinalityBudget.RECORD_DELIVERY_DURATION,
                 CardinalityBudget.SNAPSHOT_ROWS, CardinalityBudget.SNAPSHOT_ROWS_TOTAL)) {
@@ -174,6 +176,11 @@ class WhatHappensPastTheCardinalityBudgetTest {
         }
         assertThat(CardinalityBudget.LIFECYCLE_WORK_DURATION.openDimension()).isEmpty();
         assertThat(CardinalityBudget.LIFECYCLE_WORK_DURATION.distinctValues()).isEqualTo(4);
+        for (CardinalityBudget budget : List.of(CardinalityBudget.CONNECTOR_EXTERNAL_CALL_COUNT,
+                CardinalityBudget.CONNECTOR_EXTERNAL_CALL_DURATION)) {
+            assertThat(budget.openDimension()).as(budget.name()).isEmpty();
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(4);
+        }
         for (CardinalityBudget budget : List.of(CardinalityBudget.ROLLUP_QUERY_RAW_FALLBACK,
                 CardinalityBudget.ROLLUP_QUERY_FULL_RAW_FALLBACK,
                 CardinalityBudget.ROLLUP_QUERY_BUCKET_DOWN_DRILLED)) {

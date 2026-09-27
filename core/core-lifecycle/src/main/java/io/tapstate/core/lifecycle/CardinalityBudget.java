@@ -134,7 +134,10 @@ public enum CardinalityBudget {
     ROLLUP_QUERY_FULL_RAW_FALLBACK("tapstate.process.rollup.query.full_raw_fallback", null, 5, Fold.ADDED),
     ROLLUP_QUERY_BUCKET_DOWN_DRILLED("tapstate.process.rollup.query.bucket.down_drilled", null, 5, Fold.ADDED),
     /** Only the four fixed lifecycle verbs can create duration series. */
-    LIFECYCLE_WORK_DURATION("tapstate.process.lifecycle.work.duration", null, 4, Fold.ADDED);
+    LIFECYCLE_WORK_DURATION("tapstate.process.lifecycle.work.duration", null, 4, Fold.ADDED),
+    /** Two completed PDK calls by success/failure; never by connector, pipeline, or row. */
+    CONNECTOR_EXTERNAL_CALL_COUNT("tapstate.process.connector.external.call.count", null, 4, Fold.ADDED),
+    CONNECTOR_EXTERNAL_CALL_DURATION("tapstate.process.connector.external.call.duration", null, 4, Fold.ADDED);
 
     /**
      * What several series of one instrument make when they fold into one.

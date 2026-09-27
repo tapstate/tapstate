@@ -72,6 +72,7 @@ public final class PdkCapturePort implements CapturePort {
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
     private final Duration preflightTimeout;
+    private final PdkExternalCallStats externalCalls;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
@@ -84,9 +85,15 @@ public final class PdkCapturePort implements CapturePort {
 
     public PdkCapturePort(
             ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout) {
+        this(provisioner, stateStore, preflightTimeout, PdkExternalCallStats.disabled());
+    }
+
+    public PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
+            Duration preflightTimeout, PdkExternalCallStats externalCalls) {
         this.provisioner = provisioner;
         this.stateStore = stateStore;
         this.preflightTimeout = requirePositive(preflightTimeout);
+        this.externalCalls = Objects.requireNonNull(externalCalls, "externalCalls");
     }
 
     private static Duration requirePositive(Duration timeout) {
@@ -135,23 +142,26 @@ public final class PdkCapturePort implements CapturePort {
                         throw new IllegalStateException(
                                 "stream " + stream + " was requested but the connector did not discover it");
                     }
-                    batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
-                        for (TapEvent event : events) {
-                            Envelope row;
-                            try {
-                                row = TapEventCodec.decodeSnapshotRow(
-                                        event, connector.codecs(), declaredTypes(declared, event));
-                            } catch (RuntimeException projection) {
-                                throw new TapstateException(ConnectorError.PROJECTION_FAILED,
-                                        Map.of("connector", connector.connectorId(), "detail", detail(projection)),
-                                        projection);
+                    measuredBatchRead(() -> {
+                        batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
+                            for (TapEvent event : events) {
+                                Envelope row;
+                                try {
+                                    row = TapEventCodec.decodeSnapshotRow(
+                                            event, connector.codecs(), declaredTypes(declared, event));
+                                } catch (RuntimeException projection) {
+                                    throw new TapstateException(ConnectorError.PROJECTION_FAILED,
+                                            Map.of("connector", connector.connectorId(), "detail", detail(projection)),
+                                            projection);
+                                }
+                                try {
+                                    listener.row(row);
+                                } catch (RuntimeException | Error downstream) {
+                                    throw new SnapshotListenerFailure(downstream);
+                                }
                             }
-                            try {
-                                listener.row(row);
-                            } catch (RuntimeException | Error downstream) {
-                                throw new SnapshotListenerFailure(downstream);
-                            }
-                        }
+                        });
+                        return null;
                     });
                 }
                 return null;
@@ -358,7 +368,10 @@ public final class PdkCapturePort implements CapturePort {
                 throw new IllegalStateException(
                         "stream " + stream + " was requested but the connector did not discover it");
             }
-            batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> raw.addAll(events));
+            measuredBatchRead(() -> {
+                batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> raw.addAll(events));
+                return null;
+            });
         }
         return new Read(raw, setup.tables(), setup.seam());
     }
@@ -688,6 +701,17 @@ public final class PdkCapturePort implements CapturePort {
         } catch (Throwable t) {
             throw new TapstateException(ConnectorError.CAPTURE_FAILED,
                     Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
+        }
+    }
+
+    private void measuredBatchRead(PdkConnector.Action<Void> action) throws Throwable {
+        long began = externalCalls.begin();
+        boolean success = false;
+        try {
+            action.run();
+            success = true;
+        } finally {
+            externalCalls.completed(PdkExternalCallStats.Call.SNAPSHOT_READ, began, success);
         }
     }
 

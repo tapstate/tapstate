@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -50,6 +51,7 @@ final class PdkSinkWriter implements SinkWriter {
     private final DdlPolicy ddl;
     private final Map<String, TargetTable> targets;
     private final PdkTargetPreparation preparation;
+    private final PdkExternalCallStats externalCalls;
     private final Map<String, TapTable> tableModels = new LinkedHashMap<>();
     private boolean closed;
 
@@ -72,19 +74,30 @@ final class PdkSinkWriter implements SinkWriter {
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
             Map<String, TargetTable> targets, KeyedStateStore stateStore) {
+        this(connector, write, config, targets, stateStore, PdkExternalCallStats.disabled());
+    }
+
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore, PdkExternalCallStats externalCalls) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
                 new PdkTargetPreparation(connector.context(), connector.functions(), config.onFullLoad(),
-                        config.fullLoad(), config.node(), stateStore));
+                        config.fullLoad(), config.node(), stateStore), externalCalls);
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
             Map<String, TargetTable> targets, PdkTargetPreparation preparation) {
+        this(connector, write, mode, ddl, targets, preparation, PdkExternalCallStats.disabled());
+    }
+
+    private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
+            Map<String, TargetTable> targets, PdkTargetPreparation preparation, PdkExternalCallStats externalCalls) {
         this.connector = connector;
         this.write = write;
         this.mode = mode;
         this.ddl = ddl;
         this.targets = targets == null ? Map.of() : Map.copyOf(targets);
         this.preparation = preparation;
+        this.externalCalls = Objects.requireNonNull(externalCalls, "externalCalls");
     }
 
     /** Prepare selected tables even when their source snapshot contains no rows. */
@@ -149,8 +162,11 @@ final class PdkSinkWriter implements SinkWriter {
                             : TargetTapTable.bare(rows.get(0).getTableId());
                     preparation.prepare(target, table);
                     // A connector may report the batch in several flushes, one callback each; accumulate.
-                    write.writeRecord(connector.context(), rows, table,
-                            result -> accepted[0] += accepted(result));
+                    measuredWrite(() -> {
+                        write.writeRecord(connector.context(), rows, table,
+                                result -> accepted[0] += accepted(result));
+                        return null;
+                    });
                 }
                 return new WriteResult(accepted[0]);
             });
@@ -163,6 +179,17 @@ final class PdkSinkWriter implements SinkWriter {
 
     private static long accepted(WriteListResult<TapRecordEvent> result) {
         return result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
+    }
+
+    private void measuredWrite(PdkConnector.Action<Void> action) throws Throwable {
+        long began = externalCalls.begin();
+        boolean success = false;
+        try {
+            action.run();
+            success = true;
+        } finally {
+            externalCalls.completed(PdkExternalCallStats.Call.SINK_WRITE, began, success);
+        }
     }
 
     private TapRecordEvent encode(Envelope env) {

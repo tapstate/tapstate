@@ -9,6 +9,7 @@ import io.tapstate.spi.store.KeyedStateStore;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 import io.tapstate.spi.sink.TargetTable;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * The PDK implementation of the write-side sink port: it provisions a connector, refuses it with a
@@ -21,6 +22,7 @@ public final class PdkSinkPort implements SinkPort {
 
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
+    private final PdkExternalCallStats externalCalls;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkSinkPort(ConnectorProvisioner provisioner) {
@@ -28,8 +30,14 @@ public final class PdkSinkPort implements SinkPort {
     }
 
     public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore) {
+        this(provisioner, stateStore, PdkExternalCallStats.disabled());
+    }
+
+    public PdkSinkPort(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
+            PdkExternalCallStats externalCalls) {
         this.provisioner = provisioner;
         this.stateStore = stateStore;
+        this.externalCalls = Objects.requireNonNull(externalCalls, "externalCalls");
     }
 
     @Override
@@ -59,7 +67,7 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 return null;
             });
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, externalCalls);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {

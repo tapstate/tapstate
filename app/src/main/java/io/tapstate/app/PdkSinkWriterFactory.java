@@ -4,6 +4,7 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.adapters.pdk.PdkExternalCallStats;
 import io.tapstate.adapters.pdk.PdkSinkPort;
 import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.model.PipelineNode;
@@ -53,6 +54,7 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
      * only for the life of the open, which is what every sink got before there was anywhere to file them.
      */
     static final String CONNECTOR_STATE_STORE_USER_CONTEXT_KEY = "tapstate.pdk.connector-state-store";
+    static final String CONNECTOR_CALL_STATS_USER_CONTEXT_KEY = "tapstate.pdk.connector-call-stats";
 
     private final String connectorId;
     private final Map<String, Object> settings;
@@ -117,9 +119,14 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
     @Override
     public SinkWriter getEx() {
         HazelcastInstance member = localMember();
-        return new PdkSinkPort(provisioner(member), stateStore(member))
+        return new PdkSinkPort(provisioner(member), stateStore(member), externalCalls(member))
                 .open(new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad),
                         targets, logScope());
+    }
+
+    private static PdkExternalCallStats externalCalls(HazelcastInstance member) {
+        Object bound = member.getUserContext().get(CONNECTOR_CALL_STATS_USER_CONTEXT_KEY);
+        return bound instanceof PdkExternalCallStats stats ? stats : PdkExternalCallStats.disabled();
     }
 
     /**

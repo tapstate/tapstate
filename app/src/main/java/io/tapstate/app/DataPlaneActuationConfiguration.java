@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkCapturePort;
+import io.tapstate.adapters.pdk.PdkExternalCallStats;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
@@ -25,8 +26,11 @@ import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.WorkloadClaimStore;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -82,8 +86,22 @@ class DataPlaneActuationConfiguration {
     @Bean
     CapturePort capturePort(ConnectorProvisioner connectorProvisioner,
             @Nullable KeyedStateStore keyedStateStore,
+            HazelcastInstance member, PdkExternalCallStats externalCalls,
             @Value("${tapstate.capture.log-miner-preflight-timeout:30s}") Duration preflightTimeout) {
-        return new PdkCapturePort(connectorProvisioner, keyedStateStore, preflightTimeout);
+        member.getUserContext().put(PdkSinkWriterFactory.CONNECTOR_CALL_STATS_USER_CONTEXT_KEY, externalCalls);
+        return new PdkCapturePort(connectorProvisioner, keyedStateStore, preflightTimeout, externalCalls);
+    }
+
+    @Bean
+    PdkExternalCallStats pdkExternalCallStats(MetricsExport export, Clock clock) {
+        boolean enabled = export != MetricsExport.none();
+        PdkExternalCallStats stats = new PdkExternalCallStats(enabled);
+        if (enabled) {
+            Instant startedAt = clock.instant();
+            export.observeProcess("connector-calls", () -> ConnectorCallFacts.snapshot(
+                    stats, startedAt, clock.instant()));
+        }
+        return stats;
     }
 
     @Bean

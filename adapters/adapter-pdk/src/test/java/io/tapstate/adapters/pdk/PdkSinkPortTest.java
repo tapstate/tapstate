@@ -186,16 +186,20 @@ class PdkSinkPortTest {
         // A connector may report a batch in several flushes, one consumer callback each; the writer must
         // sum the accepted counts, not report only the last flush's.
         Path jar = Synthetic.multiFlushSink(dir);
-        PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.MultiFlush"));
+        PdkExternalCallStats calls = new PdkExternalCallStats(true);
+        PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.MultiFlush"), null, calls);
         try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.APPLY))) {
             assertThat(await(writer, List.of(insert(1), insert(2))).written()).isEqualTo(2);
         }
+        assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SINK_WRITE)
+                .get(PdkExternalCallStats.Outcome.SUCCESS).count()).isEqualTo(1);
     }
 
     @Test
     void aConnectorThatThrowsWhileWritingIsACodedWriteFailure(@TempDir Path dir) throws Exception {
         Path jar = Synthetic.throwingWriteSink(dir);
-        PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.ThrowingWrite"));
+        PdkExternalCallStats calls = new PdkExternalCallStats(true);
+        PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.ThrowingWrite"), null, calls);
         try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.APPLY))) {
             assertThatThrownBy(() -> await(writer, List.of(insert(1))))
                     .isInstanceOf(ExecutionException.class)
@@ -203,6 +207,10 @@ class PdkSinkPortTest {
                     .satisfies(e -> assertThat(((TapstateException) e.getCause()).code())
                             .isEqualTo(ConnectorError.WRITE_FAILED));
         }
+        assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SINK_WRITE)
+                .get(PdkExternalCallStats.Outcome.FAILURE).count()).isEqualTo(1);
+        assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SINK_WRITE)
+                .get(PdkExternalCallStats.Outcome.SUCCESS).count()).isZero();
     }
 
     @Test
@@ -221,7 +229,8 @@ class PdkSinkPortTest {
     @Test
     void appendModeRejectsAMultiTableBatchBeforeAnyConnectorWrite(@TempDir Path dir) throws Exception {
         Path jar = Synthetic.throwingWriteSink(dir);
-        PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.ThrowingWrite"));
+        PdkExternalCallStats calls = new PdkExternalCallStats(true);
+        PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.ThrowingWrite"), null, calls);
         try (SinkWriter writer = port.open(config(WriteMode.APPEND, DdlPolicy.IGNORE),
                 Map.of("t1", target(), "t2", new TargetTable("t2", List.of())))) {
             assertThatThrownBy(() -> await(writer, List.of(
@@ -235,6 +244,8 @@ class PdkSinkPortTest {
                         assertThat(failure).hasMessageContaining("before any connector write");
                     });
         }
+        assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SINK_WRITE)
+                .get(PdkExternalCallStats.Outcome.FAILURE).count()).isZero();
     }
 
     /**

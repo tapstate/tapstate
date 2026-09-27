@@ -48,7 +48,9 @@ class PdkCapturePortTest {
             throws Exception {
         Path resume = dir.resolve("resume-snapshot");
         Path jar = Synthetic.pacedSnapshotSource(dir, resume);
-        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PacedSnapshot", null));
+        PdkExternalCallStats calls = new PdkExternalCallStats(true);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PacedSnapshot", null), null,
+                PdkCapturePort.DEFAULT_PREFLIGHT_TIMEOUT, calls);
         List<Envelope> rows = new CopyOnWriteArrayList<>();
         CountDownLatch firstRow = new CountDownLatch(1);
         ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -65,10 +67,14 @@ class PdkCapturePortTest {
                     .as("the first callback arrives before the connector may produce its second batch")
                     .isTrue();
             assertThat(read.isDone()).isFalse();
+            assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SNAPSHOT_READ)
+                    .get(PdkExternalCallStats.Outcome.SUCCESS).count()).isZero();
             assertThat(rows).singleElement().satisfies(row -> assertThat(row.after()).containsEntry("id", 1L));
             Files.writeString(resume, "continue");
             read.get(5, TimeUnit.SECONDS);
             assertThat(rows).extracting(row -> row.after().get("id")).containsExactly(1L, 2L);
+            assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SNAPSHOT_READ)
+                    .get(PdkExternalCallStats.Outcome.SUCCESS).count()).isEqualTo(1);
         } finally {
             Files.writeString(resume, "continue");
             worker.shutdownNow();
@@ -152,7 +158,9 @@ class PdkCapturePortTest {
     @Test
     void snapshotDrivesBatchReadAndYieldsSnapshotReadEnvelopes(@TempDir Path dir) throws Exception {
         Path jar = Synthetic.emittingSource(dir);
-        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+        PdkExternalCallStats calls = new PdkExternalCallStats(true);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null), null,
+                PdkCapturePort.DEFAULT_PREFLIGHT_TIMEOUT, calls);
         List<Envelope> got = new ArrayList<>();
         try (CaptureBatch batch = port.snapshot(config("t1"))) {
             while (batch.hasNext()) {
@@ -168,6 +176,8 @@ class PdkCapturePortTest {
         // what the port yields is the one integer width every reader downstream binds to.
         assertThat(got.get(0).after()).containsEntry("id", 1L);
         assertThat(got.get(1).after()).containsEntry("id", 2L);
+        assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SNAPSHOT_READ)
+                .get(PdkExternalCallStats.Outcome.SUCCESS).count()).isEqualTo(1);
     }
 
     @Test
@@ -246,10 +256,16 @@ class PdkCapturePortTest {
     @Test
     void aConnectorThatThrowsWhileReadingIsACodedCaptureFailure(@TempDir Path dir) throws Exception {
         Path jar = Synthetic.throwingReadSource(dir);
-        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.ThrowingRead", null));
+        PdkExternalCallStats calls = new PdkExternalCallStats(true);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.ThrowingRead", null), null,
+                PdkCapturePort.DEFAULT_PREFLIGHT_TIMEOUT, calls);
         assertThatThrownBy(() -> port.snapshot(config("t1")))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+        assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SNAPSHOT_READ)
+                .get(PdkExternalCallStats.Outcome.FAILURE).count()).isEqualTo(1);
+        assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SNAPSHOT_READ)
+                .get(PdkExternalCallStats.Outcome.SUCCESS).count()).isZero();
     }
 
     @Test
@@ -599,7 +615,9 @@ class PdkCapturePortTest {
         // started it; the failure reaches the caller only through the listener's error channel. Without
         // that channel a dead tail is invisible above this port.
         Path jar = Synthetic.throwingStreamSource(dir);
-        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.ThrowingStream", null));
+        PdkExternalCallStats calls = new PdkExternalCallStats(true);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.ThrowingStream", null), null,
+                PdkCapturePort.DEFAULT_PREFLIGHT_TIMEOUT, calls);
         AtomicReference<Throwable> reported = new AtomicReference<>();
         CountDownLatch failed = new CountDownLatch(1);
         CaptureListener listener = new CaptureListener() {
@@ -619,6 +637,8 @@ class PdkCapturePortTest {
                     .isTrue();
         }
         assertThat(reported.get()).isNotNull();
+        assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SNAPSHOT_READ)
+                .get(PdkExternalCallStats.Outcome.FAILURE).count()).isZero();
     }
 
     /**
@@ -812,9 +832,13 @@ class PdkCapturePortTest {
     @Test
     void testConnectionReportsTheDiscoveredSchemaAndASample(@TempDir Path dir) throws Exception {
         Path jar = Synthetic.emittingSource(dir);
-        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+        PdkExternalCallStats calls = new PdkExternalCallStats(true);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null), null,
+                PdkCapturePort.DEFAULT_PREFLIGHT_TIMEOUT, calls);
         ConnectionReport report = port.testConnection(config("t1"));
         assertThat(report.schema().tables()).extracting("name").contains("t1");
         assertThat(report.sample()).isNotEmpty();
+        assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SNAPSHOT_READ)
+                .get(PdkExternalCallStats.Outcome.SUCCESS).count()).isZero();
     }
 }

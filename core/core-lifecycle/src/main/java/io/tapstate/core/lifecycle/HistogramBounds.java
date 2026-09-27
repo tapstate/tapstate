@@ -48,6 +48,10 @@ public enum HistogramBounds {
 
     /** Time from invocation through completion of one actual lifecycle operation. */
     LIFECYCLE_WORK_DURATION("tapstate.process.lifecycle.work.duration", List.of(
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0)),
+
+    /** A completed PDK snapshot batch read or sink write, including callbacks. */
+    CONNECTOR_EXTERNAL_CALL_DURATION("tapstate.process.connector.external.call.duration", List.of(
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0));
 
     /** The one unit every histogram here is measured in; the bounds above are in it. */

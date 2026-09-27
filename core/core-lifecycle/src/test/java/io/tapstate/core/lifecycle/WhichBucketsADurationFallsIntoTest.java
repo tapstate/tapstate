@@ -61,11 +61,16 @@ class WhichBucketsADurationFallsIntoTest {
         assertThat(Arrays.stream(HistogramBounds.values()).map(HistogramBounds::instrument))
                 .containsExactlyInAnyOrder("tapstate.pipeline.record.delivery.duration",
                         "tapstate.pipeline.process.duration",
+                        "tapstate.pipeline.sink.batch.write.duration",
+                        "tapstate.pipeline.sink.backpressure.duration",
                         "tapstate.process.lifecycle.capacity.wait.duration",
-                        "tapstate.process.lifecycle.work.duration");
+                        "tapstate.process.lifecycle.work.duration",
+                        "tapstate.process.connector.external.call.duration");
         assertThat(HistogramBounds.LIFECYCLE_CAPACITY_WAIT.bounds()).containsExactly(
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0);
         assertThat(HistogramBounds.LIFECYCLE_WORK_DURATION.bounds())
+                .containsExactlyElementsOf(HistogramBounds.LIFECYCLE_CAPACITY_WAIT.bounds());
+        assertThat(HistogramBounds.CONNECTOR_EXTERNAL_CALL_DURATION.bounds())
                 .containsExactlyElementsOf(HistogramBounds.LIFECYCLE_CAPACITY_WAIT.bounds());
         assertThat(HistogramBounds.UNIT).isEqualTo("s");
         assertThat(HistogramBounds.forInstrument("tapstate.pipeline.lag")).isEmpty();
