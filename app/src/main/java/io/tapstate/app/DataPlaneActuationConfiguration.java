@@ -188,12 +188,13 @@ class DataPlaneActuationConfiguration {
             ClusterProperties clusterProperties) {
         // Begun rather than started: a run comes back as soon as its load is open, and the load is read while
         // the pipeline's job takes it. Read to the end first, it would have to fit on the heap whole.
+        CaptureAttacher attacher = captureRunUnit::begin;
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return new StoreBackedPipelineCaptureCoordinator(
-                    storePort, captureRunUnit::begin, srsCoordinator, snapshotBuffer);
+                    storePort, attacher, srsCoordinator, snapshotBuffer);
         }
         return new StoreBackedPipelineCaptureCoordinator(
-                storePort, captureRunUnit::begin, srsCoordinator, snapshotBuffer,
+                storePort, attacher, srsCoordinator, snapshotBuffer,
                 captureOwnership, clusterProperties.getWorkloadClaimRenewInterval());
     }
 
