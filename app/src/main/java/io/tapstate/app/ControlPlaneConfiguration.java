@@ -675,10 +675,12 @@ class ControlPlaneConfiguration {
             ObjectProvider<HistoryRollupWorker> rollupWorker,
             HistoryRollupQueryHealth queryHealth) {
         HistoryRollupWorker worker = rollupWorker.getIfAvailable();
-        Consumer<HistoryRollupStore.Key> refresh =
-                worker == null ? ignored -> { } : worker::requestRefresh;
+        HistoryRollupStore selectedRollups = history.isRollupReadEnabled()
+                ? storePort.historyRollups() : null;
+        Consumer<HistoryRollupStore.Key> refresh = worker == null || selectedRollups == null
+                ? ignored -> { } : worker::requestRefresh;
         return new PipelineHistoryQueryService(
-                artifactQueryService, storePort.rateHistory(), storePort.historyRollups(),
+                artifactQueryService, storePort.rateHistory(), selectedRollups,
                 refresh, queryHealth, history.getSampleInterval(), clock, cursors);
     }
 

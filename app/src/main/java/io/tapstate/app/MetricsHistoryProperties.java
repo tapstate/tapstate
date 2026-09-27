@@ -22,6 +22,9 @@ public class MetricsHistoryProperties {
     /** How long a sample is kept before the store lets it expire. */
     private Duration retention = Duration.ofDays(15);
 
+    /** Selects raw query aggregation without removing or changing retained samples. */
+    private boolean rollupReadEnabled = true;
+
     public Duration getSampleInterval() {
         return sampleInterval;
     }
@@ -36,5 +39,13 @@ public class MetricsHistoryProperties {
 
     public void setRetention(Duration retention) {
         this.retention = retention;
+    }
+
+    public boolean isRollupReadEnabled() {
+        return rollupReadEnabled;
+    }
+
+    public void setRollupReadEnabled(boolean rollupReadEnabled) {
+        this.rollupReadEnabled = rollupReadEnabled;
     }
 }
