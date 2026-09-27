@@ -10,6 +10,8 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.adapters.mongostore.migration.V1BaselineIndexes;
+import io.tapstate.adapters.mongostore.migration.V7RepairBlankPipelines;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
@@ -208,6 +210,35 @@ class MongoArtifactStoreIT {
             assertThat(store.create(first)).isEqualTo(ArtifactMutation.CREATED);
             assertThat(storedIncarnation(collection, first.id())).isNotEqualTo(incarnation);
         });
+    }
+
+    @Test
+    void migratingAnExistingPipelineBodyPreservesItsSystemIncarnationSibling() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("pipeline_incarnation_migration_it");
+            database.drop();
+            MongoCollection<Document> collection = database.getCollection(MongoStorePort.ARTIFACTS);
+            MongoArtifactStore store = new MongoArtifactStore(client, collection);
+            PipelineResource pipeline = new PipelineResource("blank", null, List.of(),
+                    null, null, null, null, null);
+            assertThat(store.create(pipeline)).isEqualTo(ArtifactMutation.CREATED);
+            String incarnation = storedIncarnation(collection, pipeline.id());
+            collection.updateOne(new Document("_id", pipeline.id()),
+                    new Document("$unset", new Document("body.source", "")));
+
+            new V7RepairBlankPipelines().up(database, ChangeSet.Fence.HELD);
+
+            Document migrated = collection.find(new Document("_id", pipeline.id())).first();
+            assertThat(migrated).isNotNull();
+            assertThat(migrated.getString("pipelineIncarnationId")).isEqualTo(incarnation);
+            assertThat(migrated.get("body", Document.class).getList("source", Object.class)).isEmpty();
+            assertThat(migrated.get("body", Document.class)).doesNotContainKey("pipelineIncarnationId");
+            assertThat(migrated.getString("contentHash")).isEqualTo(CanonicalHash.of(pipeline));
+            assertThat(store.get(pipeline.id())).contains(pipeline);
+            assertThat(WRITER.write(store.get(pipeline.id()).orElseThrow()))
+                    .isEqualTo(WRITER.write(pipeline))
+                    .doesNotContain(incarnation);
+        }
     }
 
     @Test
