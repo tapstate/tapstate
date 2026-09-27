@@ -15,17 +15,22 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/** Reads JVM and process resources only when a metrics reader collects them. */
-final class JdkProcessFacts {
+/** Projects JVM resources on collection and owns optional export-only RSS and JFR samplers. */
+final class JdkProcessFacts implements AutoCloseable {
 
     /** Negative values mean that the host or JVM could not measure that quantity. */
     record Sample(long cpuNanos, double cpuLoad, long heapUsedBytes, long heapCommittedBytes,
-            long gcCollections, long gcCollectionMillis) {
+            long gcCollections, long gcCollectionMillis, LinuxProcessRss.Sample rss,
+            JfrGcPauses.Reading observedGcPause) {
     }
 
     @FunctionalInterface
-    interface Probe {
+    interface Probe extends AutoCloseable {
         Sample read();
+
+        @Override
+        default void close() {
+        }
     }
 
     private final Probe probe;
@@ -46,9 +51,9 @@ final class JdkProcessFacts {
     List<MetricFact> snapshot() {
         Sample sample = probe.read();
         Instant now = clock.instant();
-        List<MetricFact> facts = new ArrayList<>(6);
+        List<MetricFact> facts = new ArrayList<>(8);
         if (sample.cpuNanos() >= 0) {
-            facts.add(counter("tapstate.process.cpu.time", "ns", sample.cpuNanos(), now));
+            facts.add(counter("tapstate.process.cpu.time", "ns", sample.cpuNanos(), processStartedAt, now));
         }
         if (Double.isFinite(sample.cpuLoad()) && sample.cpuLoad() >= 0 && sample.cpuLoad() <= 1) {
             // MetricFact currently carries integral readings, so this is an integer percentage.
@@ -60,21 +65,29 @@ final class JdkProcessFacts {
         if (sample.heapCommittedBytes() >= 0) {
             facts.add(gauge("tapstate.process.jvm.heap.committed", "By", sample.heapCommittedBytes(), now));
         }
+        if (sample.rss() != null) {
+            facts.add(gauge("tapstate.process.memory.rss", "By",
+                    sample.rss().bytes(), sample.rss().observedAt()));
+        }
         if (sample.gcCollections() >= 0) {
             facts.add(counter("tapstate.process.jvm.gc.collections", "{collection}",
-                    sample.gcCollections(), now));
+                    sample.gcCollections(), processStartedAt, now));
         }
         if (sample.gcCollectionMillis() >= 0) {
             // MXBean collection elapsed time is not necessarily stop-the-world pause time.
             facts.add(counter("tapstate.process.jvm.gc.collection.time", "ms",
-                    sample.gcCollectionMillis(), now));
+                    sample.gcCollectionMillis(), processStartedAt, now));
+        }
+        if (sample.observedGcPause() != null) {
+            facts.add(counter("tapstate.process.jvm.gc.pause.observed.duration.sum", "ns",
+                    sample.observedGcPause().durationNanos(), sample.observedGcPause().since(), now));
         }
         return List.copyOf(facts);
     }
 
-    private MetricFact counter(String name, String unit, long value, Instant now) {
+    private static MetricFact counter(String name, String unit, long value, Instant since, Instant now) {
         return MetricFact.single(name, MetricType.COUNTER, unit,
-                MetricPoint.accumulated(Map.of(), processStartedAt, now, value));
+                MetricPoint.accumulated(Map.of(), since, now, value));
     }
 
     private static MetricFact gauge(String name, String unit, long value, Instant now) {
@@ -82,11 +95,18 @@ final class JdkProcessFacts {
                 MetricPoint.reading(Map.of(), now, value));
     }
 
+    @Override
+    public void close() {
+        probe.close();
+    }
+
     private static final class JdkProbe implements Probe {
         private final java.lang.management.OperatingSystemMXBean operatingSystem =
                 ManagementFactory.getOperatingSystemMXBean();
         private final MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
         private final List<GarbageCollectorMXBean> collectors = ManagementFactory.getGarbageCollectorMXBeans();
+        private final LinuxProcessRss rss = LinuxProcessRss.start();
+        private final JfrGcPauses pauses = JfrGcPauses.start();
 
         @Override
         public Sample read() {
@@ -112,7 +132,13 @@ final class JdkProcessFacts {
             long collections = sumCollectorReadings(true);
             long collectionMillis = sumCollectorReadings(false);
             return new Sample(cpuNanos, cpuLoad, heapUsed, heapCommitted,
-                    collections, collectionMillis);
+                    collections, collectionMillis, rss.reading().orElse(null), pauses.snapshot().orElse(null));
+        }
+
+        @Override
+        public void close() {
+            pauses.close();
+            rss.close();
         }
 
         private long sumCollectorReadings(boolean count) {

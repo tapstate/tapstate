@@ -53,11 +53,15 @@ that point. The exporter also applies a process-wide 10,000-series ceiling.
 | `tapstate.process.nest.stored_count.queued`, `.active`, `.failed`, `.rejected`, `.duration.sum` | Inspect Mongo namespace size and the `_id` range index when counts queue or fail. Stored counts are sampled by two bounded background workers: refresh starts after 15 seconds, a result expires after 30 seconds, and pending or expired results are absent. The typed `nest.stored` point keeps its actual count time; the flat value can be up to 30 seconds old. |
 | `tapstate.process.lifecycle.pipelines.pending`, `.queue.high_water`, `.capacity.refused`, `.work.duration` | Check whether start or stop work is occupying the four default lifecycle slots. `START_CAPACITY` and `STOP_CAPACITY` in explain describe a wait, not a failed data job. |
 | `tapstate.process.telemetry.degraded`, `.queue.depth`, `.dropped`, `.write.failure`, `.last_success.age` | Filter by the fixed observation/history/event/export sink. A failing observation store leaves the last successful document and its old `observedAt` in the API. Check local logs and the affected sink before interpreting an unchanged graph as an idle pipeline. |
+| `tapstate.process.memory.rss` | Compare resident bytes with the same host's heap and workload windows. Linux reads `/proc/self/smaps_rollup` every 15 seconds on a separate worker; a sample older than 30 seconds or an unavailable source is absent. Other platforms do not emit this fact. |
+| `tapstate.process.jvm.gc.pause.observed.duration.sum` | Compare counter deltas with delivery latency and heap pressure. It sums observed JFR `jdk.GCPhasePause` durations in nanoseconds from the metrics stream's start. It is absent before the first observed pause and after stream failure or known JFR data loss; it is not a guaranteed lifetime total. |
 
 Process facts are emitted only when Prometheus or OTLP export is configured; they have no pipeline or row
 labels. Connector call duration includes its synchronous callback. Connector-internal retries and pool
 occupancy have no general measurement yet. JVM GC collection time is not an exact stop-the-world pause;
-process RSS is not currently emitted. Do not substitute committed heap for RSS when comparing workloads.
+do not substitute it for the JFR pause reading. Jet executor saturation has no trustworthy built-in
+measurement; use job queue depth, stage duration, and sink backpressure to locate pressure instead.
+Do not substitute committed heap for RSS when comparing workloads.
 
 Deleting a pipeline removes its old current points from the local exporter, including when the same id
 is recreated before another sweep. Exported point labels contain the pipeline id but no incarnation or

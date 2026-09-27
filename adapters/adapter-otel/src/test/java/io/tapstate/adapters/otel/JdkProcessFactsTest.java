@@ -28,34 +28,43 @@ class JdkProcessFactsTest {
     @Test
     void measuredResourcesCarryTheirActualUnitsAndProcessLifetime() {
         var probe = new JdkProcessFacts(() -> new JdkProcessFacts.Sample(
-                1_750_000_000L, 0.735, 2048, 4096, 3, 11), START,
+                1_750_000_000L, 0.735, 2048, 4096, 3, 11,
+                new LinuxProcessRss.Sample(8192, NOW.minusSeconds(5)),
+                new JfrGcPauses.Reading(START.plusSeconds(2), 5_000_000L)), START,
                 Clock.fixed(NOW, ZoneOffset.UTC));
 
         Map<String, MetricFact> facts = byName(probe.snapshot());
 
-        assertThat(facts).hasSize(6);
+        assertThat(facts).hasSize(8);
         assertReading(facts, "tapstate.process.cpu.time", MetricType.COUNTER, "ns", 1_750_000_000L);
         assertReading(facts, "tapstate.process.cpu.load", MetricType.GAUGE, "%", 74);
         assertReading(facts, "tapstate.process.jvm.heap.used", MetricType.GAUGE, "By", 2048);
         assertReading(facts, "tapstate.process.jvm.heap.committed", MetricType.GAUGE, "By", 4096);
+        assertReading(facts, "tapstate.process.memory.rss", MetricType.GAUGE, "By", 8192);
+        assertThat(facts.get("tapstate.process.memory.rss").points().getFirst().observedAt())
+                .isEqualTo(NOW.minusSeconds(5));
         assertReading(facts, "tapstate.process.jvm.gc.collections", MetricType.COUNTER, "{collection}", 3);
         assertReading(facts, "tapstate.process.jvm.gc.collection.time", MetricType.COUNTER, "ms", 11);
+        assertReading(facts, "tapstate.process.jvm.gc.pause.observed.duration.sum", MetricType.COUNTER,
+                "ns", 5_000_000L, START.plusSeconds(2));
         assertThat(facts.values()).allSatisfy(fact -> {
             assertThat(fact.points()).hasSize(1);
             assertThat(fact.points().getFirst().attributes()).isEmpty();
-            assertThat(fact.points().getFirst().observedAt()).isEqualTo(NOW);
+            if (!fact.name().equals("tapstate.process.memory.rss")) {
+                assertThat(fact.points().getFirst().observedAt()).isEqualTo(NOW);
+            }
         });
     }
 
     @Test
     void unavailableReadingsRemainAbsentRatherThanBecomingZero() {
         var probe = new JdkProcessFacts(() -> new JdkProcessFacts.Sample(
-                -1, -1, 2048, -1, -1, -1), START, Clock.fixed(NOW, ZoneOffset.UTC));
+                -1, -1, 2048, -1, -1, -1, null, null), START, Clock.fixed(NOW, ZoneOffset.UTC));
 
         assertThat(probe.snapshot()).extracting(MetricFact::name)
                 .containsExactly("tapstate.process.jvm.heap.used");
         assertThat(new JdkProcessFacts(() -> new JdkProcessFacts.Sample(
-                -1, Double.NaN, -1, -1, -1, -1), START, Clock.fixed(NOW, ZoneOffset.UTC))
+                -1, Double.NaN, -1, -1, -1, -1, null, null), START, Clock.fixed(NOW, ZoneOffset.UTC))
                 .snapshot()).isEmpty();
     }
 
@@ -80,12 +89,17 @@ class JdkProcessFactsTest {
 
     private static void assertReading(Map<String, MetricFact> facts, String name, MetricType type,
             String unit, long value) {
+        assertReading(facts, name, type, unit, value, type == MetricType.COUNTER ? START : null);
+    }
+
+    private static void assertReading(Map<String, MetricFact> facts, String name, MetricType type,
+            String unit, long value, Instant since) {
         MetricFact fact = facts.get(name);
         assertThat(fact).isNotNull();
         assertThat(fact.type()).isEqualTo(type);
         assertThat(fact.unit()).isEqualTo(unit);
         assertThat(fact.points().getFirst().value()).isEqualTo(value);
-        assertThat(fact.points().getFirst().startTime()).isEqualTo(type == MetricType.COUNTER ? START : null);
+        assertThat(fact.points().getFirst().startTime()).isEqualTo(since);
     }
 
     private static Map<String, MetricFact> byName(List<MetricFact> facts) {

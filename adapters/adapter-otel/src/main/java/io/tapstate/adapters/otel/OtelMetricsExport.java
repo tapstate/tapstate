@@ -46,11 +46,14 @@ public final class OtelMetricsExport implements MetricsExport {
     private final SdkMeterProvider provider;
     private final FactsMetricProducer producer;
     private final ExportSettings settings;
+    private final JdkProcessFacts processFacts;
 
-    private OtelMetricsExport(SdkMeterProvider provider, FactsMetricProducer producer, ExportSettings settings) {
+    private OtelMetricsExport(SdkMeterProvider provider, FactsMetricProducer producer,
+            ExportSettings settings, JdkProcessFacts processFacts) {
         this.provider = provider;
         this.producer = producer;
         this.settings = settings;
+        this.processFacts = processFacts;
     }
 
     /**
@@ -66,36 +69,42 @@ public final class OtelMetricsExport implements MetricsExport {
                             + "or offer through MetricsExport.none()");
         }
         FactsMetricProducer producer = new FactsMetricProducer(Instant.now());
-        producer.observeProcess("jdk-resources", new JdkProcessFacts()::snapshot);
-        SdkMeterProviderBuilder builder = SdkMeterProvider.builder()
-                .setResource(Resource.getDefault().merge(Resource.create(
-                        Attributes.of(AttributeKey.stringKey("service.name"), SERVICE_NAME))))
-                .registerMetricProducer(producer);
-        if (settings.prometheusPort() != null) {
-            builder.registerMetricReader(PrometheusHttpServer.builder()
-                    .setHost(settings.prometheusHost() == null ? "0.0.0.0" : settings.prometheusHost())
-                    .setPort(settings.prometheusPort())
-                    .build());
+        JdkProcessFacts processFacts = new JdkProcessFacts();
+        try {
+            producer.observeProcess("jdk-resources", processFacts::snapshot);
+            SdkMeterProviderBuilder builder = SdkMeterProvider.builder()
+                    .setResource(Resource.getDefault().merge(Resource.create(
+                            Attributes.of(AttributeKey.stringKey("service.name"), SERVICE_NAME))))
+                    .registerMetricProducer(producer);
+            if (settings.prometheusPort() != null) {
+                builder.registerMetricReader(PrometheusHttpServer.builder()
+                        .setHost(settings.prometheusHost() == null ? "0.0.0.0" : settings.prometheusHost())
+                        .setPort(settings.prometheusPort())
+                        .build());
+            }
+            if (settings.otlpEndpoint() != null) {
+                MetricExporter delegate = switch (settings.otlpProtocol()) {
+                    case GRPC -> OtlpGrpcMetricExporter.builder().setEndpoint(settings.otlpEndpoint()).build();
+                    case HTTP_PROTOBUF -> OtlpHttpMetricExporter.builder().setEndpoint(settings.otlpEndpoint()).build();
+                };
+                ObservedMetricExporter exporter = new ObservedMetricExporter(delegate);
+                producer.observeProcess("otlp-export", exporter::healthFacts);
+                builder.registerMetricReader(PeriodicMetricReader.builder(exporter)
+                        .setInterval(settings.otlpInterval())
+                        .build());
+            }
+            SdkMeterProvider provider = builder.build();
+            LOG.info("Metrics export started: prometheus={} otlp={} ({} every {})",
+                    settings.prometheusPort() == null ? "off"
+                            : (settings.prometheusHost() == null ? "0.0.0.0" : settings.prometheusHost())
+                                    + ":" + settings.prometheusPort(),
+                    settings.otlpEndpoint() == null ? "off" : "configured",
+                    settings.otlpProtocol(), settings.otlpInterval());
+            return new OtelMetricsExport(provider, producer, settings, processFacts);
+        } catch (RuntimeException | Error failed) {
+            processFacts.close();
+            throw failed;
         }
-        if (settings.otlpEndpoint() != null) {
-            MetricExporter delegate = switch (settings.otlpProtocol()) {
-                case GRPC -> OtlpGrpcMetricExporter.builder().setEndpoint(settings.otlpEndpoint()).build();
-                case HTTP_PROTOBUF -> OtlpHttpMetricExporter.builder().setEndpoint(settings.otlpEndpoint()).build();
-            };
-            ObservedMetricExporter exporter = new ObservedMetricExporter(delegate);
-            producer.observeProcess("otlp-export", exporter::healthFacts);
-            builder.registerMetricReader(PeriodicMetricReader.builder(exporter)
-                    .setInterval(settings.otlpInterval())
-                    .build());
-        }
-        SdkMeterProvider provider = builder.build();
-        LOG.info("Metrics export started: prometheus={} otlp={} ({} every {})",
-                settings.prometheusPort() == null ? "off"
-                        : (settings.prometheusHost() == null ? "0.0.0.0" : settings.prometheusHost())
-                                + ":" + settings.prometheusPort(),
-                settings.otlpEndpoint() == null ? "off" : "configured",
-                settings.otlpProtocol(), settings.otlpInterval());
-        return new OtelMetricsExport(provider, producer, settings);
     }
 
     @Override
@@ -156,7 +165,11 @@ public final class OtelMetricsExport implements MetricsExport {
 
     @Override
     public void close() {
-        provider.close();
-        LOG.info("Metrics export stopped");
+        try {
+            provider.close();
+        } finally {
+            processFacts.close();
+            LOG.info("Metrics export stopped");
+        }
     }
 }
