@@ -7,6 +7,7 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -72,11 +73,9 @@ public final class SnapshotPhase {
      * nor the one that failed -- is recorded as anything. Events are passed through one by one, never
      * buffered in the change ring, and every batch is always closed.
      *
-     * <p>One seam covers the whole round, taken from the first read of it and never replaced. Each bounded
-     * read samples a seam of its own, later than the one before, and letting a later table's seam move
-     * where the tail begins would leave the span between the two covered by nothing: the tables already
-     * read were read before it, and the tail starts after it, so a row deleted in between is in neither and
-     * stays in the target for good — nothing thrown, nothing logged.
+     * <p>One seam covers the whole round, taken from the first read and never replaced. A port may keep one
+     * connector across the table reads or open one for each. Any later seam remains a check, not a new
+     * start: moving the tail past a table already read would lose intervening deletes without a warning.
      *
      * <p>Seeding the chain's meta record is a separate lifecycle step; recording the cdc-start position on
      * an unseeded chain is a caller ordering error surfaced by the store.
@@ -132,25 +131,29 @@ public final class SnapshotPhase {
         long epoch = resumed.map(ConsumerOffset::snapshotEpoch).orElse(ringEpoch);
         SourceOrder order = SourceOrder.snapshotRow(epoch);
         if (owed.isEmpty()) {
-            return new Load(port, config, miningChainId, tables, owed, order, null, null, false);
+            return new Load(null, miningChainId, tables, owed, order, null, null, false);
         }
         // A resume reuses the pair it read back. Both halves come from the same record and the same
         // question, so one of them moving on its own is the state that has no meaning: rows pinned to a
         // generation whose seam is somewhere else.
         String resumedStart = resumed.map(ConsumerOffset::cdcStartPosition).orElse(null);
-        CaptureBatch first = port.snapshot(readOf(config, owed.getFirst()));
-        String tailSeam;
+        SnapshotSession session = SnapshotSession.open(port, readOf(config, owed));
+        CaptureBatch first = null;
         try {
+            first = session.read(owed.getFirst());
             SourcePosition seam = seamOf(first, miningChainId);
-            tailSeam = resumedStart != null ? resumedStart : seam.token();
+            String tailSeam = resumedStart != null ? resumedStart : seam.token();
             // A resume writes back the pair it read, unchanged; a new load writes the pair it sampled. Both
             // are scoped to this pipeline, so neither can move another pipeline's tail or generation.
             meta.setCdcStart(miningChainId, pipelineId, tailSeam, epoch);
+            return new Load(session, miningChainId, tables, owed, order, tailSeam, first, false);
         } catch (RuntimeException | Error failure) {
-            first.close();
+            if (first != null) {
+                first.close();
+            }
+            session.close();
             throw failure;
         }
-        return new Load(port, config, miningChainId, tables, owed, order, tailSeam, first, false);
     }
 
     /**
@@ -201,12 +204,12 @@ public final class SnapshotPhase {
     }
 
     /**
-     * The bounded read that covers {@code table} alone, on the connection the whole capture runs on. The
-     * selection is the only thing that narrows: everything a connector needs to open the source is what the
-     * capture was configured with, and a read that changed any of it would be reading somewhere else.
+     * The tables still owed by this pipeline, with the same source settings and state scope as the capture.
+     * A session that shares its connector discovers only these tables; an ordinary port's fallback still
+     * narrows each bounded read to one table when that read opens.
      */
-    private static CaptureConfig readOf(CaptureConfig config, String table) {
-        return new CaptureConfig(config.connectorId(), config.settings(), List.of(table), config.node());
+    private static CaptureConfig readOf(CaptureConfig config, List<String> tables) {
+        return new CaptureConfig(config.connectorId(), config.settings(), tables, config.node());
     }
 
     /**
@@ -281,7 +284,7 @@ public final class SnapshotPhase {
         }
         SourceOrder order = SourceOrder.snapshotRow(snapshotEpoch);
         CaptureBatch batch = port.snapshot(config);
-        return new Load(port, config, null, config.streams(), config.streams(), order, null, batch, true);
+        return new Load(null, null, config.streams(), config.streams(), order, null, batch, true);
     }
 
     /**
@@ -296,8 +299,7 @@ public final class SnapshotPhase {
      */
     public static final class Load implements AutoCloseable {
 
-        private final CapturePort port;
-        private final CaptureConfig config;
+        private final SnapshotSession session;
         private final String miningChainId;
         private final List<String> tables;
         private final List<String> owed;
@@ -307,10 +309,9 @@ public final class SnapshotPhase {
         private CaptureBatch open;
         private boolean closed;
 
-        private Load(CapturePort port, CaptureConfig config, String miningChainId, List<String> tables,
+        private Load(SnapshotSession session, String miningChainId, List<String> tables,
                 List<String> owed, SourceOrder order, String tailSeam, CaptureBatch open, boolean oneBatch) {
-            this.port = port;
-            this.config = config;
+            this.session = session;
             this.miningChainId = miningChainId;
             this.tables = List.copyOf(tables);
             this.owed = List.copyOf(owed);
@@ -372,8 +373,14 @@ public final class SnapshotPhase {
                 batch = open;
                 open = null;
             }
-            if (batch != null) {
-                batch.close();
+            try {
+                if (session != null) {
+                    session.close();
+                }
+            } finally {
+                if (batch != null) {
+                    batch.close();
+                }
             }
         }
 
@@ -405,13 +412,12 @@ public final class SnapshotPhase {
          * that reports none for one table reports none it can be trusted for -- but it is not recorded: one
          * seam covers the whole round, and the first read took it.
          *
-         * <p>A load abandoned already opens nothing more. Asked first, because opening a read is a connection
-         * to the source; the check after it is the one that decides, and this only spares a load that is
-         * over the cost of a read it would close again at once.
+         * <p>A load abandoned already opens nothing more. Asked first because even a session-held connector
+         * has to start a table read, and the check after it catches an abandonment during that start.
          */
         private void openBatchOf(String table) {
             requireOpen();
-            CaptureBatch batch = port.snapshot(readOf(config, table));
+            CaptureBatch batch = session.read(table);
             try {
                 seamOf(batch, miningChainId);
             } catch (RuntimeException | Error failure) {
