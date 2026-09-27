@@ -3,12 +3,14 @@ package io.tapstate.runtime.scheduler;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.NestStateWindow;
+import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -82,6 +84,76 @@ class NestColdLayerWatchTest {
     }
 
     @Test
+    void smallSuccessiveWindowsAccumulateBeforeAThresholdDecision() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+
+        for (int accesses = 10; accesses < 100; accesses += 10) {
+            Map<String, NestStateReading> sample = Map.of("ns", reading(accesses, accesses));
+            assertThat(watch.assessment("p1", sample)).isEmpty();
+            watch.saw("p1", sample);
+        }
+        Map<String, NestStateReading> enough = Map.of("ns", reading(100, 100));
+        assertThat(watch.assessment("p1", enough)).containsEntry("ns", 1L);
+        watch.saw("p1", enough);
+
+        assertThat(alert.crossed).containsExactly("p1/ns");
+        assertThat(alert.windows).singleElement().satisfies(window -> {
+            assertThat(window.accesses()).isEqualTo(100);
+            assertThat(window.backfills()).isEqualTo(100);
+        });
+    }
+
+    @Test
+    void aQuietIntervalDoesNotPretendTheColdLayerRecovered() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", reading(100, 100)));
+
+        Map<String, NestStateReading> quiet = Map.of("ns", reading(110, 100));
+        assertThat(watch.assessment("p1", quiet)).isEmpty();
+        watch.saw("p1", quiet);
+        assertThat(alert.cleared).isEmpty();
+
+        Map<String, NestStateReading> recovered = Map.of("ns", reading(200, 100));
+        assertThat(watch.assessment("p1", recovered)).containsEntry("ns", 0L);
+        watch.saw("p1", recovered);
+        assertThat(alert.cleared).containsExactly("p1/ns");
+    }
+
+    @Test
+    void aCounterRestartDoesNotCarryAnOldThresholdDecision() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", reading(1_000, 900)));
+
+        Map<String, NestStateReading> restarted = Map.of("ns", reading(10, 10));
+        assertThat(watch.assessment("p1", restarted)).isEmpty();
+        watch.saw("p1", restarted);
+        assertThat(alert.cleared).isEmpty();
+
+        Map<String, NestStateReading> enough = Map.of("ns", reading(100, 100));
+        assertThat(watch.assessment("p1", enough)).containsEntry("ns", 1L);
+        watch.saw("p1", enough);
+        assertThat(alert.crossed).containsExactly("p1/ns", "p1/ns");
+    }
+
+    @Test
+    void anExecutionChangeStartsANewWindowEvenWhenCountersHaveNotFallen() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        var oldScope = new ObservationStore.Scope("inc-a", 1);
+        var newScope = new ObservationStore.Scope("inc-a", 2);
+        watch.saw("p1", oldScope, Map.of("ns", reading(100, 100)));
+
+        Map<String, NestStateReading> fresh = Map.of("ns", reading(100, 0));
+        assertThat(watch.assessment("p1", newScope, fresh)).containsEntry("ns", 0L);
+        watch.saw("p1", newScope, fresh);
+        watch.saw("p1", oldScope, Map.of("ns", reading(200, 200)));
+
+        assertThat(watch.assessment("p1", newScope, Map.of("ns", reading(200, 100))))
+                .containsEntry("ns", 1L);
+        assertThat(alert.crossed).containsExactly("p1/ns");
+        assertThat(alert.cleared).isEmpty();
+    }
+
+    @Test
     void aNamespaceThatStopsBeingReportedIsForgottenRatherThanCalledRecovered() {
         // A pipeline that stopped is not a namespace that started being served from memory again, and
         // saying so would be an all-clear nobody earned. Dropping what was held for it also means the next
@@ -107,6 +179,18 @@ class NestColdLayerWatchTest {
         watch.saw("p1", Map.of("ns", reading(500, 450)));
 
         assertThat(alert.crossed).containsExactly("p1/ns", "p1/ns");
+    }
+
+    @Test
+    void deletedPipelinesReleaseTheirWindowWithoutReportingRecovery() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", reading(100, 100)));
+        watch.saw("p2", Map.of("ns", reading(100, 100)));
+
+        watch.forgetPipelinesOutside(Set.of("p2"));
+
+        assertThat(watch.watching()).containsExactly("p2/ns");
+        assertThat(alert.cleared).isEmpty();
     }
 
     @Test

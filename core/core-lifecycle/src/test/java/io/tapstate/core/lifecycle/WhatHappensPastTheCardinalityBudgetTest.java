@@ -105,6 +105,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.nest.backfill.time",
                         "tapstate.pipeline.nest.pending.high_water",
                         "tapstate.pipeline.nest.stored",
+                        "tapstate.pipeline.nest.cold_layer.over_threshold",
                         "tapstate.pipeline.nest.dead_lettered",
                         "tapstate.pipeline.join.recompute.rows",
                         "tapstate.pipeline.join.recompute.rows.total",
@@ -512,6 +513,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.frontier.gap",
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.pending.high_water",
+                        "tapstate.pipeline.nest.cold_layer.over_threshold",
                         "tapstate.pipeline.reconcile.failures.streak",
                         "tapstate.pipeline.sink.batch.records.max",
                         "tapstate.process.telemetry.queue.depth",
@@ -526,5 +528,21 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.process.observation_janitor.last_success.age",
                         "tapstate.process.observation_janitor.degraded",
                         "tapstate.process.rollup.closed_through.age");
+    }
+
+    @Test
+    void aFoldedColdLayerThresholdReportsWhetherAnyOverflowNamespaceIsOver() {
+        List<MetricPoint> points = new ArrayList<>();
+        for (int index = 0; index < 1_200; index++) {
+            points.add(MetricPoint.reading(Map.of(PIPELINE_ID, PIPELINE,
+                    NEST_NAMESPACE, "nest-" + index), OBSERVED, index < 1_000 ? 0 : 1));
+        }
+
+        MetricFact folded = CardinalityBudget.folder().fold(new MetricFact(
+                "tapstate.pipeline.nest.cold_layer.over_threshold", MetricType.GAUGE, "1", points));
+
+        assertThat(overflowSeries(folded)).singleElement()
+                .satisfies(point -> assertThat(point.value()).isEqualTo(1));
+        assertThat(folded.points()).hasSize(1_001);
     }
 }

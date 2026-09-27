@@ -3,19 +3,25 @@ package io.tapstate.runtime.scheduler;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.NestStateWindow;
+import io.tapstate.spi.store.ObservationStore;
 
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Watches each nest namespace's readings go by and says when one stops being served from memory.
  *
- * <p>What it holds is the previous reading of every namespace it has seen, because the counts in a reading
- * run from the beginning of the run and the question is about now. Two readings and the interval between
- * them are the smallest thing that can answer it.
+ * <p>What it holds is the last judged reading and the last observed reading of every namespace. The
+ * counters run from the beginning of a run, so consecutive small intervals must accumulate until there
+ * is enough traffic to judge. The last observed reading also detects a counter restart before the old
+ * judged baseline could be reused.
  *
  * <p>It reports the two edges rather than the state. A condition that holds for a day is one thing that
  * happened, not one thing per pass, and reporting it per pass would drown the record it is written to;
@@ -33,14 +39,15 @@ import java.util.Set;
  * be differenced against each other's counts — and a joined name would answer that with a separator that
  * has to be absent from every pipeline id there will ever be.
  *
- * <p>Not thread-safe, and does not need to be: it is fed from the pass that publishes observations, which
- * is one caller at a time.
+ * <p>A preparation may read the previous window while a telemetry worker commits another pipeline's
+ * observation. Each update replaces an immutable per-pipeline snapshot, and alert callbacks run after
+ * that snapshot is visible.
  */
 public final class NestColdLayerWatch {
 
     private final NestColdLayerPressure pressure;
     private final NestColdLayerAlert alert;
-    private final Map<String, Map<String, Seen>> byPipeline = new HashMap<>();
+    private final Map<String, ScopedSeen> byPipeline = new ConcurrentHashMap<>();
 
     public NestColdLayerWatch(NestColdLayerPressure pressure, NestColdLayerAlert alert) {
         this.pressure = Objects.requireNonNull(pressure, "pressure");
@@ -53,40 +60,115 @@ public final class NestColdLayerWatch {
      * {@code readings} are forgotten.
      */
     public void saw(String pipelineId, Map<String, NestStateReading> readings) {
+        saw(pipelineId, null, readings);
+    }
+
+    /** Records a successful observation under its internal execution owner. */
+    public void saw(String pipelineId, ObservationStore.Scope scope, Map<String, NestStateReading> readings) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(readings, "readings");
-        Map<String, Seen> held = byPipeline.computeIfAbsent(pipelineId, ignored -> new HashMap<>());
-        held.keySet().retainAll(readings.keySet());
-        readings.forEach((namespace, reading) -> judge(pipelineId, held, namespace, reading));
-        if (held.isEmpty()) {
-            byPipeline.remove(pipelineId);
-        }
+        List<Alert> alerts = new ArrayList<>();
+        byPipeline.compute(pipelineId, (id, previous) -> {
+            if (stale(scope, previous)) {
+                return previous;
+            }
+            Map<String, Seen> held = new HashMap<>(matching(scope, previous));
+            held.keySet().retainAll(readings.keySet());
+            readings.forEach((namespace, reading) -> judge(held, namespace, reading, alerts));
+            return held.isEmpty() ? null : new ScopedSeen(scope, Map.copyOf(held));
+        });
+        alerts.forEach(change -> {
+            if (change.over()) {
+                alert.crossed(pipelineId, change.namespace(), change.window());
+            } else {
+                alert.cleared(pipelineId, change.namespace(), change.window());
+            }
+        });
+    }
+
+    /** Current threshold decisions from the next measured window; quiet windows have no decision. */
+    Map<String, Long> assessment(String pipelineId, Map<String, NestStateReading> readings) {
+        return assessment(pipelineId, null, readings);
+    }
+
+    Map<String, Long> assessment(String pipelineId, ObservationStore.Scope scope,
+            Map<String, NestStateReading> readings) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(readings, "readings");
+        Map<String, Seen> held = matching(scope, byPipeline.get(pipelineId));
+        Map<String, Long> judged = new HashMap<>();
+        readings.forEach((namespace, reading) -> {
+            Assessment next = assess(held.get(namespace), reading);
+            if (next.enough()) {
+                judged.put(namespace, pressure.isOver(next.window()) ? 1L : 0L);
+            }
+        });
+        return Map.copyOf(judged);
     }
 
     /** Which namespaces are currently held, as pipeline and namespace together — what a caller asserts on. */
     Set<String> watching() {
         Set<String> held = new HashSet<>();
-        byPipeline.forEach((pipelineId, namespaces) ->
-                namespaces.keySet().forEach(namespace -> held.add(pipelineId + "/" + namespace)));
+        byPipeline.forEach((pipelineId, scoped) ->
+                scoped.namespaces().keySet().forEach(namespace -> held.add(pipelineId + "/" + namespace)));
         return held;
     }
 
-    private void judge(String pipelineId, Map<String, Seen> held, String namespace, NestStateReading reading) {
+    /** Releases windows for resources that have left the live artifact set. */
+    public void forgetPipelinesOutside(Collection<String> live) {
+        byPipeline.keySet().retainAll(Set.copyOf(Objects.requireNonNull(live, "live")));
+    }
+
+    private void judge(Map<String, Seen> held, String namespace, NestStateReading reading, List<Alert> alerts) {
         Seen before = held.get(namespace);
-        NestStateWindow window = before == null
-                ? NestStateWindow.fromStart(reading)
-                : NestStateWindow.between(before.reading(), reading);
+        Assessment next = assess(before, reading);
+        if (!next.enough()) {
+            held.put(namespace, new Seen(next.restarted() || before == null ? null : before.judged(),
+                    reading, next.restarted() || before == null ? null : before.over()));
+            return;
+        }
+        NestStateWindow window = next.window();
         boolean nowOver = pressure.isOver(window);
-        boolean wasOver = before != null && before.over();
-        held.put(namespace, new Seen(reading, nowOver));
+        boolean wasOver = !next.restarted() && before != null && Boolean.TRUE.equals(before.over());
+        held.put(namespace, new Seen(reading, reading, nowOver));
         if (nowOver && !wasOver) {
-            alert.crossed(pipelineId, namespace, window);
+            alerts.add(new Alert(namespace, window, true));
         } else if (!nowOver && wasOver) {
-            alert.cleared(pipelineId, namespace, window);
+            alerts.add(new Alert(namespace, window, false));
         }
     }
 
-    /** The last reading of one namespace and whether it was over then, which is what makes an edge an edge. */
-    private record Seen(NestStateReading reading, boolean over) {
+    private static Map<String, Seen> matching(ObservationStore.Scope scope, ScopedSeen previous) {
+        return previous != null && Objects.equals(scope, previous.scope())
+                ? previous.namespaces() : Map.of();
+    }
+
+    private static boolean stale(ObservationStore.Scope scope, ScopedSeen previous) {
+        return scope != null && previous != null && previous.scope() != null
+                && scope.executionGeneration() < previous.scope().executionGeneration();
+    }
+
+    private Assessment assess(Seen before, NestStateReading reading) {
+        boolean restarted = before != null && (reading.accesses() < before.observed().accesses()
+                || reading.backfills() < before.observed().backfills()
+                || reading.backfillMillis() < before.observed().backfillMillis());
+        NestStateReading baseline = before == null || restarted ? null : before.judged();
+        NestStateWindow window = baseline == null
+                ? NestStateWindow.fromStart(reading)
+                : NestStateWindow.between(baseline, reading);
+        return new Assessment(window, window.accesses() >= pressure.leastAccesses(), restarted);
+    }
+
+    /** A null judgement means this namespace has not yet carried enough traffic to assess. */
+    private record Seen(NestStateReading judged, NestStateReading observed, Boolean over) {
+    }
+
+    private record Assessment(NestStateWindow window, boolean enough, boolean restarted) {
+    }
+
+    private record ScopedSeen(ObservationStore.Scope scope, Map<String, Seen> namespaces) {
+    }
+
+    private record Alert(String namespace, NestStateWindow window, boolean over) {
     }
 }

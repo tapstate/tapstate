@@ -305,16 +305,15 @@ class ObservationPublisherTest {
 
         wired.publish("orders");
 
-        // Counts per namespace rather than the one ratio they imply: a ratio published here would be an
-        // average over the whole run, and a state layer that fell off its cliff a minute ago still reads
-        // as healthy in it. Two scrapes of counts give any window a reader wants.
+        // Counts preserve the raw totals; the threshold is a separate judgement over a measured window.
         assertThat(observations.read("orders").orElseThrow().metrics())
                 .containsOnly(
                         entry("nestStateEntries.nest.orders.doc.$root", 4_000L),
                         entry("nestStateAccesses.nest.orders.doc.$root", 900L),
                         entry("nestStateBackfills.nest.orders.doc.$root", 30L),
                         entry("nestStateBackfillMillis.nest.orders.doc.$root", 210L),
-                        entry("nestStatePendingHighWater.nest.orders.doc.$root", 0L));
+                        entry("nestStatePendingHighWater.nest.orders.doc.$root", 0L),
+                        entry("nestStateColdLayerOverThreshold.nest.orders.doc.$root", 0L));
     }
 
     /**
@@ -487,6 +486,39 @@ class ObservationPublisherTest {
         wired.publish("orders");
 
         assertThat(alert.crossed).containsExactly("nest.orders.doc.$root");
+    }
+
+    @Test
+    void coldLayerThresholdIsAStoredFactOnlyForJudgedWindows() {
+        state.seed("orders", PipelineState.RUNNING);
+        String namespace = "nest.orders.doc.$root";
+        Map<String, NestStateReading> readings = new HashMap<>();
+        ObservationPublisher wired = withWatch(NestColdLayerAlert.NONE, id -> Map.copyOf(readings));
+
+        readings.put(namespace, new NestStateReading(100, 10, 10, 10, OptionalLong.of(10_000)));
+        assertThat(wired.publish("orders").orElseThrow().facts())
+                .noneMatch(fact -> fact.name().equals("tapstate.pipeline.nest.cold_layer.over_threshold"));
+
+        readings.put(namespace, new NestStateReading(100, 100, 100, 100, OptionalLong.of(10_000)));
+        Observation pressured = wired.publish("orders").orElseThrow();
+        assertThat(pressured.facts()).filteredOn(
+                fact -> fact.name().equals("tapstate.pipeline.nest.cold_layer.over_threshold"))
+                .singleElement().satisfies(fact -> {
+                    assertThat(fact.points()).singleElement().satisfies(point -> {
+                        assertThat(point.value()).isEqualTo(1);
+                        assertThat(point.attributes()).containsEntry("tapstate.pipeline.id", "orders")
+                                .containsEntry("tapstate.nest.namespace", namespace);
+                    });
+                });
+        assertThat(pressured.metrics()).containsEntry("nestStateColdLayerOverThreshold." + namespace, 1L);
+
+        readings.put(namespace, new NestStateReading(100, 110, 100, 100, OptionalLong.of(10_000)));
+        assertThat(wired.publish("orders").orElseThrow().facts())
+                .noneMatch(fact -> fact.name().equals("tapstate.pipeline.nest.cold_layer.over_threshold"));
+
+        readings.put(namespace, new NestStateReading(100, 200, 100, 100, OptionalLong.of(10_000)));
+        Observation recovered = wired.publish("orders").orElseThrow();
+        assertThat(recovered.metrics()).containsEntry("nestStateColdLayerOverThreshold." + namespace, 0L);
     }
 
     /**

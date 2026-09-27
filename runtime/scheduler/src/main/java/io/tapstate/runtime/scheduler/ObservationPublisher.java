@@ -116,6 +116,7 @@ public final class ObservationPublisher {
      * number wearing the name of the second.
      */
     private static final String NEST_STORED_PREFIX = "nestStateStored.";
+    private static final String NEST_COLD_LAYER_OVER_THRESHOLD_PREFIX = "nestStateColdLayerOverThreshold.";
 
     /**
      * How many changes the namespace could never place in a document. Published only for a namespace that
@@ -155,6 +156,8 @@ public final class ObservationPublisher {
     private static final String NEST_BACKFILL_TIME_METRIC = "tapstate.pipeline.nest.backfill.time";
     private static final String NEST_PENDING_HIGH_WATER_METRIC = "tapstate.pipeline.nest.pending.high_water";
     private static final String NEST_STORED_METRIC = "tapstate.pipeline.nest.stored";
+    private static final String NEST_COLD_LAYER_OVER_THRESHOLD_METRIC =
+            "tapstate.pipeline.nest.cold_layer.over_threshold";
     private static final String NEST_DEAD_LETTERED_METRIC = "tapstate.pipeline.nest.dead_lettered";
     private static final String JOIN_RECOMPUTE_ROWS_METRIC = "tapstate.pipeline.join.recompute.rows";
     private static final String JOIN_RECOMPUTE_ROWS_TOTAL_METRIC = "tapstate.pipeline.join.recompute.rows.total";
@@ -301,6 +304,8 @@ public final class ObservationPublisher {
             Map.entry(NEST_PENDING_HIGH_WATER_METRIC,
                     keyed(NEST_PENDING_HIGH_WATER_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_STORED_METRIC, keyed(NEST_STORED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_COLD_LAYER_OVER_THRESHOLD_METRIC,
+                    keyed(NEST_COLD_LAYER_OVER_THRESHOLD_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_DEAD_LETTERED_METRIC, keyed(NEST_DEAD_LETTERED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_METRIC, keyed(JOIN_RECOMPUTE_DONE_PREFIX, JOIN_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_TOTAL_METRIC,
@@ -791,7 +796,7 @@ public final class ObservationPublisher {
             }
             failureCountingSinceByPipeline.put(pipelineId, observedNow());
         }
-        return prepare(pipelineId, failure);
+        return prepare(pipelineId, failure, scope);
     }
 
     /** Keeps named series stable while a paused execution is replaced with the same resource. */
@@ -825,6 +830,10 @@ public final class ObservationPublisher {
 
     /** Takes the pipeline's current measurements without reading or writing any observation store. */
     public Optional<Prepared> prepare(String pipelineId, ObservationFailure failure) {
+        return prepare(pipelineId, failure, null);
+    }
+
+    private Optional<Prepared> prepare(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         return state.read(pipelineId).map(checkpoint -> {
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
@@ -866,7 +875,8 @@ public final class ObservationPublisher {
             SnapshotReading loaded = snapshots.apply(pipelineId);
             List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
                     nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                    joinRecomputeExpected.apply(pipelineId), loaded).stream().map(cardinality::fold).toList();
+                    joinRecomputeExpected.apply(pipelineId), loaded, scope)
+                    .stream().map(cardinality::fold).toList();
             Observation published = new Observation(pipelineId, actual,
                     FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                     loaded.byTable(), positions.apply(pipelineId), carried, at, measured);
@@ -893,7 +903,7 @@ public final class ObservationPublisher {
             // Fed after the observation is written and never before. The observation is the contract and
             // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
             // cost a pipeline the read face that says it is alive at all.
-            coldLayer.saw(published.pipelineId(), prepared.nestReadings());
+            coldLayer.saw(published.pipelineId(), scope, prepared.nestReadings());
             frontierStall.saw(published.pipelineId(), prepared.pinned(), prepared.gaps());
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.
@@ -1013,6 +1023,14 @@ public final class ObservationPublisher {
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
             Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
             SnapshotReading loaded) {
+        return facts(pipelineId, actual, at, nestReadings, gaps, pinned, discarded, rebuildDone,
+                rebuildExpected, loaded, null);
+    }
+
+    private List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
+            Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
+            Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
+            SnapshotReading loaded, ObservationStore.Scope scope) {
         List<MetricFact> facts = new ArrayList<>();
         failures(pipelineId, at).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
@@ -1057,6 +1075,9 @@ public final class ObservationPublisher {
                 pendingHighWater).ifPresent(facts::add);
         readingsAt(pipelineId, NEST_STORED_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, stored)
                 .ifPresent(facts::add);
+        // A quiet namespace has no current threshold decision. Its last alert state is not a fresh fact.
+        readingsAt(pipelineId, NEST_COLD_LAYER_OVER_THRESHOLD_METRIC, "1", at, NEST_NAMESPACE_ATTRIBUTE,
+                coldLayer.assessment(pipelineId, scope, nestReadings)).ifPresent(facts::add);
         // One point per namespace that discarded something, and none for a namespace that discarded
         // nothing. The absence is load-bearing here rather than merely tidy: rows that never reach a
         // document leave no other trace, so a reader has only this to go on, and a zero published on every
@@ -1186,6 +1207,7 @@ public final class ObservationPublisher {
         rebuildingResumes.retainAll(Set.copyOf(live));
         failureCountingSinceByPipeline.keySet().retainAll(Set.copyOf(live));
         cardinality.forgetPipelinesOutside(live);
+        coldLayer.forgetPipelinesOutside(live);
     }
 
     /**

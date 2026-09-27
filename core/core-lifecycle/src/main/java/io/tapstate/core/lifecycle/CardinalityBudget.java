@@ -94,6 +94,9 @@ public enum CardinalityBudget {
     NEST_PENDING_HIGH_WATER("tapstate.pipeline.nest.pending.high_water", MetricAttributes.NEST_NAMESPACE,
             1_000, Fold.HIGHEST),
     NEST_STORED("tapstate.pipeline.nest.stored", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    /** A folded threshold is over when any excess namespace is over; quiet namespaces are absent. */
+    NEST_COLD_LAYER_OVER_THRESHOLD("tapstate.pipeline.nest.cold_layer.over_threshold",
+            MetricAttributes.NEST_NAMESPACE, 1_000, Fold.HIGHEST),
     NEST_DEAD_LETTERED("tapstate.pipeline.nest.dead_lettered", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.ADDED),
     JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000,
