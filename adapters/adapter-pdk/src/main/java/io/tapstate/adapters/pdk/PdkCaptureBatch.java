@@ -122,6 +122,13 @@ final class PdkCaptureBatch implements CaptureBatch {
         seam.complete(position);
     }
 
+    /** Refuses further rows and wakes the reader; {@link #close()} still joins it. */
+    boolean requestClose() {
+        boolean first = closed.compareAndSet(false, true);
+        reader.interrupt();
+        return first;
+    }
+
     /**
      * Called by the read with each of the connector's batches, as {@code decode} turns it into rows when it is
      * taken. Waits while {@link #READ_AHEAD} are already waiting, and gives up if the batch is closed meanwhile.
@@ -174,13 +181,10 @@ final class PdkCaptureBatch implements CaptureBatch {
 
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
+        boolean first = requestClose();
         // A session-owned batch releases only its worker. The session stops and closes the connector
         // after the table read, or on abandonment before this worker is joined.
-        reader.interrupt();
-        if (ownsConnector) {
+        if (first && ownsConnector) {
             connector.stopQuietly();
         }
         try {
@@ -189,7 +193,7 @@ final class PdkCaptureBatch implements CaptureBatch {
             Thread.currentThread().interrupt();
         }
         ahead.clear();
-        if (ownsConnector) {
+        if (first && ownsConnector) {
             connector.close();
         }
     }

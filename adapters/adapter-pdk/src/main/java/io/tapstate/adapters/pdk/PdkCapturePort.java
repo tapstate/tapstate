@@ -187,6 +187,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 closed = true;
                 reading = active;
             }
+            if (reading != null) {
+                reading.requestClose();
+            }
             connector.stopQuietly();
             try {
                 if (reading != null) {
