@@ -11,6 +11,7 @@ import io.tapstate.spi.store.WorkloadOwner;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /** Business-claim facade that refuses acquire/renew before the local committed-membership gate qualifies. */
 final class ClusterWorkloadClaims {
@@ -64,10 +65,18 @@ final class ClusterWorkloadClaims {
         return store.release(expected);
     }
 
-    Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+    Optional<WorkloadClaim> advanceExecution(
+            WorkloadClaim expected, long topologyRevision, Set<String> executionNodeIds) {
         if (!membership.businessEligible()) {
             return Optional.empty();
         }
-        return store.advanceExecution(expected, topologyRevision);
+        return store.advanceExecution(expected, topologyRevision, executionNodeIds);
+    }
+
+    Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss) {
+        if (!membership.businessEligible()) {
+            return Optional.empty();
+        }
+        return store.recordExecutionFailure(expected, afterMemberLoss);
     }
 }

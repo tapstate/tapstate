@@ -5,6 +5,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /** Persistence port for Mongo-time owner leases and their monotonic fencing generations. */
 public interface WorkloadClaimStore {
@@ -19,8 +20,12 @@ public interface WorkloadClaimStore {
     /** Expires only the exact owner and generation; the document and generation remain. */
     boolean release(WorkloadClaim expected);
 
-    /** Allocates the next execution generation under the exact live claim and topology revision. */
-    Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision);
+    /** Allocates the next execution generation and records the members it was planned over atomically. */
+    Optional<WorkloadClaim> advanceExecution(
+            WorkloadClaim expected, long topologyRevision, Set<String> executionNodeIds);
+
+    /** Records the first observed failure of this execution under the exact live claim. Later observations leave it intact. */
+    Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss);
 
     /**
      * Reads a claim and, in the same answer, how much of its lease the store's own clock says is left.

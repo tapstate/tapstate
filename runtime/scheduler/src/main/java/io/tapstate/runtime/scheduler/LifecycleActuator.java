@@ -45,6 +45,16 @@ public interface LifecycleActuator {
     Optional<Throwable> failure(String pipelineId);
 
     /**
+     * Why nothing here can hold this pipeline's job any more, or empty while something can.
+     *
+     * <p>Asked of a paused pipeline, which {@link #failure} is not asked of: its job is held rather than run,
+     * so it does not die on its own, and anything else that goes wrong behind it is found once it is meant to
+     * run again. Losing the data plane that holds the job is different. The job goes with it, so there is
+     * nothing left to resume.
+     */
+    Optional<Throwable> lost(String pipelineId);
+
+    /**
      * Whether a job is running this pipeline right now, as this actuator sees it.
      *
      * <p>Asked because {@link #failure} cannot answer it. That query reports empty for a job that is

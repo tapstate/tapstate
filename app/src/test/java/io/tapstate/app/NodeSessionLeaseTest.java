@@ -162,7 +162,14 @@ class NodeSessionLeaseTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+        public Optional<WorkloadClaim> advanceExecution(
+                WorkloadClaim expected, long topologyRevision, java.util.Set<String> executionNodeIds) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Optional<WorkloadClaim> recordExecutionFailure(
+                WorkloadClaim expected, boolean afterMemberLoss) {
             throw new UnsupportedOperationException();
         }
 
@@ -203,7 +210,14 @@ class NodeSessionLeaseTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision) {
+        public Optional<WorkloadClaim> advanceExecution(
+                WorkloadClaim expected, long topologyRevision, java.util.Set<String> executionNodeIds) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Optional<WorkloadClaim> recordExecutionFailure(
+                WorkloadClaim expected, boolean afterMemberLoss) {
             throw new UnsupportedOperationException();
         }
 

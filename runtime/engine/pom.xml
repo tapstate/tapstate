@@ -96,4 +96,25 @@
       <scope>test</scope>
     </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Publish this module's test classes as a test-jar. The one consumer is the end-to-end module's
+           test scope, whose join cases wrap the join state the way the cases here do: the forwarding
+           base those wrappers extend lives here, and a second copy of it there is what this avoids.
+           Test scope on the consuming side, so nothing from here reaches the shipped artifact. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>test-jar</id>
+            <goals>
+              <goal>test-jar</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 </project>

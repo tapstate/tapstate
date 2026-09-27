@@ -17,6 +17,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -118,6 +119,22 @@ class ImapJoinStoresTest {
         assertThat(keysAsked / cold.batches.size())
                 .as("and a call carries several keys rather than one")
                 .isGreaterThanOrEqualTo(4);
+    }
+
+    /**
+     * What a restart trusts the rows of an earlier run on has to be there when that run's member is
+     * not: it comes back from the layer behind the map once memory no longer holds it, and a run that
+     * recorded nothing reads as having taken no batch in whole.
+     */
+    @Test
+    @DisplayName("the batches a run took in whole come back from the layer behind the map")
+    void theBatchesARunTookInWholeComeBackFromTheLayerBehindTheMap() {
+        stores.putBatchesTakenIn("finished", 3);
+        stores.putBatchesTakenIn("finished", 4);
+        member.getMap(JoinMaps.writers(PIPELINE, STEP)).evictAll();
+
+        assertThat(stores.batchesTakenIn("finished")).isEqualTo(4);
+        assertThat(stores.batchesTakenIn("never-recorded")).isZero();
     }
 
     @Test
@@ -266,6 +283,47 @@ class ImapJoinStoresTest {
         assertThat(stores.indexPageCount(DIMENSION, "d1")).isEqualTo(2);
         assertThat(stores.indexPage(DIMENSION, "d1", 0)).isEmpty();
         assertThat(stores.indexPage(DIMENSION, "d1", 1)).containsExactly("f4", "f5");
+    }
+
+    /**
+     * Several pages asked at once which fact keys they name answer what reading each page answers,
+     * the pages that answer nothing included: one that is not there, and a head kept empty for the
+     * pages after it. A question for a whole batch is only a batch read if it cannot answer
+     * differently from the reads it replaces.
+     */
+    @Test
+    @DisplayName("several pages asked at once name what reading each of them names")
+    void severalPagesAskedAtOnceNameWhatReadingEachNames() {
+        for (int i = 0; i < 6; i++) {
+            stores.indexAdd(DIMENSION, "d1", "f" + i);
+        }
+        for (int i = 0; i < 4; i++) {
+            stores.indexRemove(DIMENSION, "d1", "f" + i);
+        }
+        stores.indexAdd(DIMENSION, "d2", "g0");
+        stores.indexAdd(DIMENSION, "d2", "g1");
+
+        Map<ReverseBucket.At, Set<String>> named = stores.indexNames(DIMENSION, Map.of(
+                new ReverseBucket.At("d1", 0), Set.of("f0", "f4"),
+                new ReverseBucket.At("d1", 1), Set.of("f0", "f4", "f5"),
+                new ReverseBucket.At("d2", 0), Set.of("g1", "g9"),
+                new ReverseBucket.At("d3", 0), Set.of("h0")));
+
+        assertThat(named).containsOnly(
+                Map.entry(new ReverseBucket.At("d1", 1), Set.of("f4", "f5")),
+                Map.entry(new ReverseBucket.At("d2", 0), Set.of("g1")));
+        // One set asked of several pages, as the rest of a bucket is asked about, is copied once and
+        // still answered page by page.
+        Set<String> shared = Set.of("f4", "f5", "g1");
+        assertThat(stores.indexNames(DIMENSION, Map.of(
+                new ReverseBucket.At("d1", 0), shared,
+                new ReverseBucket.At("d1", 1), shared,
+                new ReverseBucket.At("d2", 0), shared))).containsOnly(
+                        Map.entry(new ReverseBucket.At("d1", 1), Set.of("f4", "f5")),
+                        Map.entry(new ReverseBucket.At("d2", 0), Set.of("g1")));
+        assertThat(stores.indexNames(DIMENSION, Map.of())).isEmpty();
+        assertThat(member.getMap(JoinMaps.reverseIndex(PIPELINE, STEP, DIMENSION)).size())
+                .as("asking about a page that is not there leaves nothing behind").isEqualTo(3);
     }
 
     /**

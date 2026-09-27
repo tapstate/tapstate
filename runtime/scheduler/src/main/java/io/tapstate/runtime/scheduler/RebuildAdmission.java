@@ -22,6 +22,9 @@ public interface RebuildAdmission {
     /** Whether this pipeline's failed run may be replaced now. Called only while it is failed. */
     boolean admits(String pipelineId);
 
+    /** Records failure context after the checkpoint first enters FAILED. */
+    default void recordFailure(String pipelineId) {}
+
     /** The answer for a run nothing can rebuild: a single node, where no member left to change anything. */
     static RebuildAdmission never() {
         return pipelineId -> false;

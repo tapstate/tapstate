@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.join;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The three things a join keeps, reached through named operations rather than through the maps
@@ -81,9 +82,38 @@ public interface JoinStores {
      */
     List<String> indexPage(String source, String dimensionKey, int page);
 
+    /**
+     * Which of the fact keys asked of each page that page names, for several pages at once; a page
+     * naming none of them, or not there at all, is simply missing from the answer.
+     *
+     * <p>The index's counterpart of {@link #factsUnder}, and for the same reason: a batch asking about
+     * each of its rows a page read at a time is a round trip per row over a network, answering exactly
+     * what one question about all of them does. <b>It answers with the keys found rather than handing
+     * the pages out</b>, because a page holds up to a page size of fact keys and the rows asking about
+     * it are often one: the pages of a whole batch would be a full page of keys held for each of its
+     * rows, all at once.
+     */
+    Map<ReverseBucket.At, Set<String>> indexNames(String source,
+            Map<ReverseBucket.At, Set<String>> asked);
+
     /** Records that {@code factKey} references {@code dimensionKey}. */
     void indexAdd(String source, String dimensionKey, String factKey);
 
     /** Removes one record of {@code factKey} referencing {@code dimensionKey}. */
     void indexRemove(String source, String dimensionKey, String factKey);
+
+    /**
+     * The last batch {@code writer} recorded as taken in whole, or zero where it recorded none.
+     *
+     * <p><b>This is what a fact row mirrored by an earlier run is trusted on.</b> The mirror is written
+     * before the index, so a copy in the mirror says nothing about whether its index entries followed
+     * it; the copy names the batch that wrote it, and this says whether that batch got to its end.
+     */
+    long batchesTakenIn(String writer);
+
+    /**
+     * Records that every batch {@code writer} numbered up to {@code batch} was taken in whole. Written
+     * only by that writer, and only after the batch's last index write returned.
+     */
+    void putBatchesTakenIn(String writer, long batch);
 }

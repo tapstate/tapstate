@@ -31,6 +31,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -40,7 +41,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -196,6 +202,323 @@ class CaptureRunUnitTest {
 
     private CaptureRunUnit runUnit(CapturePort port, SrsMetaStore meta) {
         return new CaptureRunUnit(port, new SrsCoordinator(meta), meta, hz);
+    }
+
+    // ---- a run begun: its load read while the pipeline takes it -------------------------------------
+
+    /**
+     * Begun, a run comes back with its load open and not yet read -- the seam recorded, the rows still to
+     * come -- and its tail opens only once the load is through. Here the hand-off has no room until the
+     * case makes some, which is the state a load of any size meets once the job has fallen behind it: a
+     * run that read its load before coming back would not come back at all.
+     */
+    @Test
+    void aRunBegunComesBackBeforeItsLoadIsReadAndOpensItsTailOnlyAfterIt() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1), row(2)), List.of(change(3)));
+        CountDownLatch room = new CountDownLatch(1);
+        List<String> seen = new CopyOnWriteArrayList<>();
+        CaptureHandoff handoff = new CaptureHandoff() {
+            @Override
+            public void accept(Envelope event) {
+                awaitRoom(room);
+                seen.add("row:" + event.after().get("id"));
+            }
+
+            @Override
+            public void loaded(String table) {
+                seen.add("loaded:" + table);
+            }
+        };
+
+        CaptureRun run = runUnit(port, meta).begin(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-begun"), handoff);
+
+        assertThat(run.loading()).isTrue();
+        assertThat(meta.read(run.chainId().orElseThrow().value()).orElseThrow().consumerOffset("pipe-1"))
+                .as("the seam is recorded before the run comes back")
+                .get().extracting(ConsumerOffset::cdcStartPosition).isEqualTo("seam-0");
+        assertThat(port.cdcStarted).as("no tail while the load is being read").isFalse();
+        assertThat(run.cdcSubscription()).isEmpty();
+
+        room.countDown();
+        assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+
+        // The tail's change comes through the same hand-off, and behind the load.
+        assertThat(seen).containsExactly("row:1", "row:2", "loaded:orders", "row:3");
+        assertThat(run.loading()).isFalse();
+        assertThat(run.snapshotCount()).isEqualTo(2);
+        assertThat(run.snapshotCounts()).containsEntry("orders", 2L);
+        assertThat(run.failure()).isEmpty();
+        assertThat(run.cdcSubscription()).isPresent();
+
+        run.close();
+        assertThat(port.cdcClosed).isTrue();
+    }
+
+    @Test
+    void aSharedRingRunBegunMinesItsChangesOnlyOnceItsLoadIsThrough() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1)), List.of(change(2)));
+        List<String> seen = new CopyOnWriteArrayList<>();
+        CaptureHandoff handoff = new CaptureHandoff() {
+            @Override
+            public void accept(Envelope event) {
+                seen.add("row:" + event.after().get("id"));
+            }
+
+            @Override
+            public void loaded(String table) {
+                seen.add("loaded:" + table);
+            }
+        };
+
+        CaptureRun run = runUnit(port, meta).begin(spec(ReadMode.SNAPSHOT_AND_CDC, true, "chain-begun-ring"), handoff);
+
+        assertThat(run.ringSource()).as("the ring's source is there before the load is").isPresent();
+        assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(seen).containsExactly("row:1", "loaded:orders");
+        assertThat(port.cdcStarted).isTrue();
+        assertThat(run.failure()).isEmpty();
+        run.close();
+    }
+
+    /**
+     * A stop closes a run whose load is waiting for room that will never come -- the job it was waiting on
+     * is gone. It ends there: nothing is reported loaded, no tail opens, and the stop is not a failure.
+     */
+    @Test
+    void closingARunWhoseLoadIsWaitingAbandonsTheLoadAndOpensNoTail() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1), row(2)), List.of(change(3)));
+        List<String> loaded = new CopyOnWriteArrayList<>();
+        CaptureHandoff handoff = new CaptureHandoff() {
+            @Override
+            public void accept(Envelope event) {
+                awaitRoom(new CountDownLatch(1));
+            }
+
+            @Override
+            public void loaded(String table) {
+                loaded.add(table);
+            }
+        };
+        CaptureRun run = runUnit(port, meta).begin(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-abandoned"), handoff);
+
+        run.close();
+
+        assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(run.failure()).isEmpty();
+        assertThat(loaded).isEmpty();
+        assertThat(port.cdcStarted).isFalse();
+        assertThat(run.cdcSubscription()).isEmpty();
+    }
+
+    @Test
+    void aLoadThatFailsWhileItIsReadIsTheRunsFailure() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1), row(2)), List.of(change(3)));
+        IllegalStateException refused = new IllegalStateException("the hand-off refused a row");
+        CaptureHandoff handoff = new CaptureHandoff() {
+            @Override
+            public void accept(Envelope event) {
+                throw refused;
+            }
+
+            @Override
+            public void loaded(String table) {
+                throw new AssertionError("a table whose read failed is not loaded");
+            }
+        };
+
+        CaptureRun run = runUnit(port, meta).begin(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-failed"), handoff);
+
+        assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(run.failure()).containsSame(refused);
+        assertThat(port.cdcStarted).isFalse();
+    }
+
+    /**
+     * A load cut short by something other than the run being closed is a failure, whatever shape it takes.
+     * The hand-off throws the same exception a closed run's load ends with when it is released under a load
+     * nobody abandoned, and a connector can throw one of its own. Taken for an abandonment, the load ends
+     * with nothing reported, no tail opened and nothing failed, and a pipeline waiting on that load waits for
+     * good while it reads as healthy.
+     */
+    @Test
+    void aLoadCutShortByACancellationTheRunDidNotAskForIsTheRunsFailure() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1), row(2)), List.of(change(3)));
+        CancellationException released =
+                new CancellationException("the pipeline's hand-off was released while its load ran");
+        List<String> loaded = new CopyOnWriteArrayList<>();
+        CaptureHandoff handoff = new CaptureHandoff() {
+            @Override
+            public void accept(Envelope event) {
+                throw released;
+            }
+
+            @Override
+            public void loaded(String table) {
+                loaded.add(table);
+            }
+        };
+
+        CaptureRun run = runUnit(port, meta).begin(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-cut"), handoff);
+
+        assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(run.failure()).containsSame(released);
+        assertThat(loaded).isEmpty();
+        assertThat(port.cdcStarted).isFalse();
+    }
+
+    /**
+     * A run whose load is abandoned while other pipelines still read the capture it tails goes on to open
+     * that tail. The load was one pipeline's, and that pipeline has stopped, so nothing of it is reported and
+     * nothing about it fails the run. The tail is everybody's, and it begins at the load's own seam, as it
+     * would have after the last row.
+     */
+    @Test
+    void aRunWhoseLoadIsAbandonedGoesOnToOpenItsTail() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        List<String> tail = new CopyOnWriteArrayList<>();
+        LoadThenTailSource port = new LoadThenTailSource(List.of(row(1), row(2)), () -> {
+            // A source that waits on its own start refuses on a thread already interrupted, as a real one does:
+            // whatever woke the read must not reach the tail.
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("the tail was opened on an interrupted thread");
+            }
+            tail.add("opened");
+            return () -> tail.add("closed");
+        });
+        CountDownLatch released = new CountDownLatch(1);
+        List<String> loaded = new CopyOnWriteArrayList<>();
+        CaptureHandoff handoff = new CaptureHandoff() {
+            @Override
+            public void accept(Envelope event) {
+                // Waits for room nobody makes until it is woken, or the hand-off is released under it, and ends
+                // the way the real one does either way.
+                awaitRoom(released);
+                throw new CancellationException("the pipeline's hand-off was released while its load ran");
+            }
+
+            @Override
+            public void loaded(String table) {
+                loaded.add(table);
+            }
+        };
+        CaptureRun run = runUnit(port, meta).begin(spec(ReadMode.SNAPSHOT_AND_CDC, true, "chain-left"), handoff);
+
+        run.abandonLoad();
+        released.countDown();
+
+        assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(run.failure()).isEmpty();
+        assertThat(loaded).isEmpty();
+        assertThat(tail).as("the tail the others read opens all the same").containsExactly("opened");
+        assertThat(port.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("seam-0")));
+        assertThat(run.cdcSubscription()).isPresent();
+        run.close();
+        assertThat(tail).containsExactly("opened", "closed");
+    }
+
+    @Test
+    void aTailThatCannotOpenAfterTheLoadIsTheRunsFailure() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        IllegalStateException refused = new IllegalStateException("the source refused the tail");
+        LoadThenTailSource port = new LoadThenTailSource(List.of(row(1)), () -> {
+            throw refused;
+        });
+        List<String> loaded = new CopyOnWriteArrayList<>();
+
+        CaptureRun run = runUnit(port, meta).begin(
+                spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-tailless"), handoffInto(new ArrayList<>(), loaded));
+
+        assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(loaded).containsExactly("orders");
+        assertThat(run.failure()).containsSame(refused);
+        assertThat(run.cdcSubscription()).isEmpty();
+    }
+
+    /** Closed by something the tail's opening calls, the run closes the tail that opening hands back. */
+    @Test
+    void aRunClosedWhileItsTailOpensClosesThatTail() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        AtomicReference<CaptureRun> begun = new AtomicReference<>();
+        List<String> closed = new CopyOnWriteArrayList<>();
+        CountDownLatch handedBack = new CountDownLatch(1);
+        LoadThenTailSource port = new LoadThenTailSource(List.of(row(1)), () -> {
+            awaitRoom(handedBack);
+            begun.get().close();
+            return () -> closed.add("tail");
+        });
+
+        begun.set(runUnit(port, meta).begin(
+                spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-closing"), handoffInto(new ArrayList<>(), new ArrayList<>())));
+        handedBack.countDown();
+
+        assertThat(begun.get().awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(closed).containsExactly("tail");
+        assertThat(begun.get().cdcSubscription()).isEmpty();
+        assertThat(begun.get().failure()).isEmpty();
+    }
+
+    /** With no load owed there is nothing to read, and a run begun is started whole, tail included. */
+    @Test
+    void aRunOwingNoLoadIsStartedWholeWhenBegun() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1)), List.of(change(2)));
+
+        CaptureRun run = runUnit(port, meta).begin(
+                spec(ReadMode.CDC_ONLY, false, "chain-cdc-begun"), handoffInto(new ArrayList<>(), new ArrayList<>()));
+
+        assertThat(run.loading()).isFalse();
+        assertThat(port.cdcStarted).isTrue();
+        assertThat(run.cdcSubscription()).isPresent();
+        run.close();
+    }
+
+    @Test
+    void aChainlessLoadBegunReportsItsTablesOnceItsReadIsThrough() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource port = new FakeSource(List.of(row(1), row(2), row(3)), List.of());
+        List<Envelope> rows = new CopyOnWriteArrayList<>();
+        List<String> loaded = new CopyOnWriteArrayList<>();
+
+        CaptureRun run = runUnit(port, meta).begin(spec(ReadMode.SNAPSHOT_ONLY, true), handoffInto(rows, loaded));
+
+        assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+        assertThat(rows).extracting(e -> e.after().get("id")).containsExactly(1, 2, 3);
+        assertThat(loaded).containsExactly("orders");
+        assertThat(run.chainId()).isEmpty();
+        assertThat(run.cdcSubscription()).isEmpty();
+        assertThat(port.cdcStarted).isFalse();
+    }
+
+    /** A hand-off that takes every row into {@code rows} and every loaded table into {@code loaded}. */
+    private static CaptureHandoff handoffInto(List<Envelope> rows, List<String> loaded) {
+        return new CaptureHandoff() {
+            @Override
+            public void accept(Envelope event) {
+                rows.add(event);
+            }
+
+            @Override
+            public void loaded(String table) {
+                loaded.add(table);
+            }
+        };
+    }
+
+    /** Waits for {@code room}; an interrupt ends the wait the way the real hand-off's wait ends. */
+    private static void awaitRoom(CountDownLatch room) {
+        try {
+            if (!room.await(30, TimeUnit.SECONDS)) {
+                throw new AssertionError("no room was ever made");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new CancellationException("interrupted while waiting for room");
+        }
     }
 
     @Test
@@ -1051,6 +1374,43 @@ class CaptureRunUnitTest {
                 listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
             }
             return () -> cdcClosed = true;
+        }
+
+        @Override
+        public ConnectionReport testConnection(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public DiscoveredSchema discoverSchema(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    /**
+     * A source whose load is a fixed list of rows and whose tail is whatever {@code tail} opens -- for a case
+     * about what happens around the tail's opening rather than about the changes it delivers.
+     */
+    private static final class LoadThenTailSource implements CapturePort {
+        private final List<Envelope> rows;
+        private final Supplier<Subscription> tail;
+        /** Where the run asked the tail to begin. */
+        volatile CaptureStart cdcStart;
+
+        LoadThenTailSource(List<Envelope> rows, Supplier<Subscription> tail) {
+            this.rows = rows;
+            this.tail = tail;
+        }
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            return new FakeBatch(rows, "seam-0");
+        }
+
+        @Override
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            cdcStart = start;
+            return tail.get();
         }
 
         @Override
