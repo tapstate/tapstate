@@ -134,6 +134,41 @@ class UpCmdTest {
     }
 
     @Test
+    void everyApplyNamesTheProjectAndTheProjectFileIsNeverSent(@TempDir Path home, @TempDir Path ws)
+            throws java.io.IOException {
+        scaffold(home, ws);
+        java.nio.file.Files.writeString(ws.resolve("project.tap.yml"),
+                "version: tapstate/v1\nkind: project\nid: orders_team\n");
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isZero();
+        // Both applies are made as the project the file names, so the server labels what they carry.
+        assertThat(client.projects).containsExactly("orders_team", "orders_team");
+        assertThat(client.applied).allSatisfy(batch -> assertThat(batch)
+                .extracting(LocalDraft::source).noneMatch(source -> source.endsWith("project.tap.yml")));
+        assertThat(r.out()).startsWith("Project: orders_team (" + ws + ")\n").doesNotContain("Hint:");
+    }
+
+    @Test
+    void aDirectoryWithoutAProjectFileIsBroughtUpUnderItsOwnNameAndSaysSo(@TempDir Path home, @TempDir Path ws)
+            throws java.io.IOException {
+        scaffold(home, ws);
+        java.nio.file.Files.delete(ws.resolve("project.tap.yml"));
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isZero();
+        String named = ws.getFileName().toString();
+        assertThat(client.projects).containsOnly(named);
+        assertThat(r.out()).contains("Hint: no project.tap.yml here, so this project is named after its directory.");
+    }
+
+    @Test
     void aSecondRunConvergesWithoutStartingAnythingAndSaysSoPerStage(@TempDir Path home, @TempDir Path ws) {
         scaffold(home, ws);
         signIn(home);
@@ -674,6 +709,15 @@ class UpCmdTest {
             bundledConnectors.forEach(id -> connectors.add(
                     new CatalogConnector(id, id, "database", List.of("cdc"), true, "bundled")));
             return new ConnectorListOutcome.Listed(connectors);
+        }
+
+        /** The project each apply named, in call order; a null entry is an apply that named none. */
+        final List<String> projects = new ArrayList<>();
+
+        @Override
+        public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts, String project) {
+            projects.add(project);
+            return apply(baseUrl, credential, drafts);
         }
 
         @Override
