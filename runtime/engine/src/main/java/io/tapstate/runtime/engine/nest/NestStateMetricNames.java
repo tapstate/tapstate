@@ -1,7 +1,9 @@
 package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.lifecycle.NestStateReading;
+import java.time.Instant;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 /**
@@ -43,13 +45,19 @@ public final class NestStateMetricNames {
      * metric is present and at zero, exactly as it would be for a namespace where nothing ever happened.
      */
     public static NestStateReading readingFrom(Map<String, Long> kinds, OptionalLong stored) {
+        return readingFrom(kinds, stored, Optional.empty());
+    }
+
+    /** The same reading with the actual time of an asynchronously sampled stored count. */
+    public static NestStateReading readingFrom(Map<String, Long> kinds, OptionalLong stored,
+            Optional<Instant> storedObservedAt) {
         return new NestStateReading(
                 kinds.getOrDefault(ENTRIES, 0L),
                 kinds.getOrDefault(ACCESSES, 0L),
                 kinds.getOrDefault(BACKFILLS, 0L),
                 kinds.getOrDefault(BACKFILL_MILLIS, 0L),
                 kinds.getOrDefault(PENDING_HIGH_WATER, 0L),
-                stored);
+                stored, storedObservedAt);
     }
 
     /** The name a reading of {@code kind} about {@code namespace} is left under. */

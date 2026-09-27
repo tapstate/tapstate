@@ -1,5 +1,8 @@
 package io.tapstate.core.lifecycle;
 
+import java.time.Instant;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 /**
@@ -23,6 +26,8 @@ import java.util.OptionalLong;
  * is how much there is to serve, and their ratio is how much of the serving is a trip to the cold layer
  * waiting to happen. It is absent rather than zero where there is no cold layer to ask, since a run
  * holding its state in memory alone has no second number and reporting one would invent it.
+ * An asynchronous cold-layer count may also be pending or expired; its own timestamp records when a
+ * completed sample was measured rather than assigning it the later observation time.
  *
  * <p>{@code pendingHighWater} is the odd one out and is a mark rather than a level: the deepest any one
  * key has been seen holding for something that has not arrived, since the run began. It is here because
@@ -40,18 +45,33 @@ import java.util.OptionalLong;
  * @param pendingHighWater the deepest one key of this namespace has been seen holding for something that
  *     has not arrived, since the run began
  * @param stored how many keys the layer behind the memory holds, where there is one to ask
+ * @param storedObservedAt when an asynchronously sampled stored count was measured; empty for an inline
+ *     reading that shares the enclosing observation time
  */
 public record NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
-        long pendingHighWater, OptionalLong stored) {
+        long pendingHighWater, OptionalLong stored, Optional<Instant> storedObservedAt) {
+
+    public NestStateReading {
+        Objects.requireNonNull(stored, "stored");
+        Objects.requireNonNull(storedObservedAt, "storedObservedAt");
+        if (stored.isEmpty() && storedObservedAt.isPresent()) {
+            throw new IllegalArgumentException("an absent stored count cannot have a sample time");
+        }
+    }
+
+    public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
+            long pendingHighWater, OptionalLong stored) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, Optional.empty());
+    }
 
     /** A reading from a run with no cold layer to ask, whose state is however much is in memory. */
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis) {
-        this(entries, accesses, backfills, backfillMillis, 0L, OptionalLong.empty());
+        this(entries, accesses, backfills, backfillMillis, 0L, OptionalLong.empty(), Optional.empty());
     }
 
     /** A reading from a run where nothing has been reported waiting under any one key. */
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
             OptionalLong stored) {
-        this(entries, accesses, backfills, backfillMillis, 0L, stored);
+        this(entries, accesses, backfills, backfillMillis, 0L, stored, Optional.empty());
     }
 }

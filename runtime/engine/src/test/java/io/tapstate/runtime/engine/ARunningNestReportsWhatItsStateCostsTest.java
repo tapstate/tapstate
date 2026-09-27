@@ -35,8 +35,10 @@ import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.transform.TransformPort;
 import java.time.Duration;
+import java.time.Clock;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +47,11 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -226,6 +233,57 @@ class ARunningNestReportsWhatItsStateCostsTest {
         // Absence and zero call for opposite responses: a state layer that has stopped being reported and
         // one that has emptied look the same to a reader given zeroes for both.
         assertThat(new Engine(member).nestStateReadings("never-ran")).isEmpty();
+    }
+
+    @Test
+    void aBlockedStoredCountDoesNotDelayTheLiveJobsOtherReadings() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        MapBackedStore blocked = new MapBackedStore() {
+            @Override
+            public long count(String namespace) {
+                entered.countDown();
+                try {
+                    if (!release.await(10, TimeUnit.SECONDS)) {
+                        throw new AssertionError("stored count was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+                return super.count(namespace);
+            }
+        };
+        try (StoredCountSampler sampler = new StoredCountSampler((database, namespace) -> blocked.count(namespace),
+                Clock.systemUTC())) {
+            Engine engine = new Engine(member, OperatorStateStores.stateOnly("default", blocked), sampler);
+            ExecutorService reader = Executors.newSingleThreadExecutor();
+            engine.submit(PIPELINE, ordersWithItems());
+            try {
+                awaitReading();
+                Future<Map<String, NestStateReading>> first = reader.submit(() -> engine.nestStateReadings(PIPELINE));
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(first.get(1, TimeUnit.SECONDS).get(ROOT_NAMESPACE).stored()).isEmpty();
+
+                release.countDown();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                NestStateReading completed = null;
+                while (System.nanoTime() < deadline) {
+                    completed = engine.nestStateReadings(PIPELINE).get(ROOT_NAMESPACE);
+                    if (completed != null && completed.stored().isPresent()) {
+                        break;
+                    }
+                    sleep();
+                }
+                assertThat(completed).isNotNull();
+                assertThat(completed.stored()).hasValue(new MapBackedStore().count(ROOT_NAMESPACE));
+                assertThat(completed.storedObservedAt()).isPresent();
+            } finally {
+                release.countDown();
+                reader.shutdownNow();
+                engine.cancel(PIPELINE);
+            }
+        }
     }
 
     // ---- fixtures ---------------------------------------------------------------------
@@ -416,7 +474,7 @@ class ARunningNestReportsWhatItsStateCostsTest {
     }
 
     /** A cold layer in a map, so a read through it is a real trip with a real duration. */
-    private static final class MapBackedStore implements KeyedStateStore, java.io.Serializable {
+    private static class MapBackedStore implements KeyedStateStore, java.io.Serializable {
 
         private static final long serialVersionUID = 1L;
 

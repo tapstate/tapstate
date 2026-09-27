@@ -5,6 +5,7 @@ import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkCapturePort;
 import io.tapstate.adapters.pdk.PdkExternalCallStats;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.engine.StoredCountSampler;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
@@ -54,8 +55,26 @@ import org.springframework.lang.Nullable;
 class DataPlaneActuationConfiguration {
 
     @Bean
-    Engine engine(HazelcastInstance hazelcastMember, @Nullable OperatorStateStores operatorStateStores) {
-        return new Engine(hazelcastMember, operatorStateStores);
+    Engine engine(HazelcastInstance hazelcastMember, @Nullable OperatorStateStores operatorStateStores,
+            StoredCountSampler storedCountSampler) {
+        return new Engine(hazelcastMember, operatorStateStores, storedCountSampler);
+    }
+
+    @Bean(destroyMethod = "close")
+    StoredCountSampler storedCountSampler(@Nullable OperatorStateStores operatorStateStores,
+            MetricsExport export, Clock clock) {
+        StoredCountSampler sampler = new StoredCountSampler((database, namespace) -> {
+            if (operatorStateStores == null) {
+                throw new IllegalStateException("no operator state store is configured for a stored count");
+            }
+            return operatorStateStores.inDatabase(database).state().count(namespace);
+        }, clock);
+        if (export != MetricsExport.none()) {
+            Instant startedAt = clock.instant();
+            export.observeProcess("nest-stored-count",
+                    () -> StoredCountFacts.snapshot(sampler.health(), startedAt, clock.instant()));
+        }
+        return sampler;
     }
 
     /**

@@ -74,6 +74,7 @@ public final class Engine {
      * that keeps its state in memory alone, where what is in memory is all there is.
      */
     private final OperatorStateStores operatorStateStores;
+    private final StoredCountSampler storedCountSampler;
 
     private final Map<String, QueueAccount> queueAccounts = new LinkedHashMap<>(16, 0.75f, true);
 
@@ -86,10 +87,17 @@ public final class Engine {
         this(member, nestState == null ? null : OperatorStateStores.stateOnly("default", nestState));
     }
 
-    /** An engine resolving each nest namespace through the deployment's operator-state stores. */
+    /** Compatibility constructor for direct callers; the assembled server supplies a bounded sampler. */
     public Engine(HazelcastInstance member, OperatorStateStores operatorStateStores) {
+        this(member, operatorStateStores, null);
+    }
+
+    /** Production binding with bounded cold-layer count sampling outside the convergence thread. */
+    public Engine(HazelcastInstance member, OperatorStateStores operatorStateStores,
+            StoredCountSampler storedCountSampler) {
         this.member = Objects.requireNonNull(member, "member");
         this.operatorStateStores = operatorStateStores;
+        this.storedCountSampler = storedCountSampler;
     }
 
     /**
@@ -229,6 +237,9 @@ public final class Engine {
             }
         }
         JobFailureRegistry.of(member).clear(pipelineId);
+        if (storedCountSampler != null) {
+            storedCountSampler.forget(pipelineId);
+        }
     }
 
     /**
@@ -927,24 +938,32 @@ public final class Engine {
             }
         }
         Map<String, NestStateReading> readings = new HashMap<>();
-        byNamespace.forEach((namespace, kinds) -> readings.put(namespace,
-                NestStateMetricNames.readingFrom(kinds, stored(namespace))));
+        byNamespace.forEach((namespace, kinds) -> {
+            var sampled = stored(pipelineId, job.getId(), namespace);
+            readings.put(namespace, NestStateMetricNames.readingFrom(kinds,
+                    sampled.map(value -> OptionalLong.of(value.value())).orElseGet(OptionalLong::empty),
+                    sampled.map(StoredCountSampler.Sample::observedAt)));
+        });
         return readings;
     }
 
     /**
-     * How much the layer behind the memory holds for {@code namespace}, asked here rather than published
-     * from the run: it is a question about a namespace as a whole, so its cost is what the namespace holds
-     * rather than what an event touched, and asking it as state is written would put that cost on every
-     * write. Here it is paid once per namespace by whoever is reporting.
+     * How much the layer behind the memory holds for {@code namespace}, sampled outside the convergence
+     * thread in the assembled server. It is a question about a namespace as a whole, so asking on every
+     * state write would multiply the count cost by event volume. A pending or expired sample is absent;
+     * the successful count carries its own completion time.
      */
-    private OptionalLong stored(String namespace) {
+    private Optional<StoredCountSampler.Sample> stored(String pipelineId, long jobId, String namespace) {
         if (operatorStateStores == null) {
-            return OptionalLong.empty();
+            return Optional.empty();
         }
         String database = NestStatePlacement.databaseOf(
                 member, namespace, operatorStateStores.defaultDatabase());
-        return OptionalLong.of(operatorStateStores.inDatabase(database).state().count(namespace));
+        if (storedCountSampler != null) {
+            return storedCountSampler.sample(pipelineId, jobId, database, namespace);
+        }
+        return Optional.of(new StoredCountSampler.Sample(
+                operatorStateStores.inDatabase(database).state().count(namespace), Instant.now()));
     }
 
     /**

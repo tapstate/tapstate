@@ -521,6 +521,22 @@ class ObservationPublisherTest {
         assertThat(recovered.metrics()).containsEntry("nestStateColdLayerOverThreshold." + namespace, 0L);
     }
 
+    @Test
+    void aCachedStoredCountKeepsItsOwnSampleTime() {
+        NestStateReading reading = new NestStateReading(10, 100, 0, 0, 0,
+                OptionalLong.of(500), Optional.of(T0));
+        List<io.tapstate.core.lifecycle.MetricFact> facts = publisher.facts("orders", PipelineState.RUNNING,
+                OBSERVED_AT, Map.of("ns", reading), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(),
+                SnapshotReading.NONE);
+
+        assertThat(facts.stream().filter(fact -> fact.name().equals("tapstate.pipeline.nest.stored"))
+                .findFirst().orElseThrow().points()).singleElement()
+                .satisfies(point -> assertThat(point.observedAt()).isEqualTo(T0));
+        assertThat(facts.stream().filter(fact -> fact.name().equals("tapstate.pipeline.nest.entries"))
+                .findFirst().orElseThrow().points()).singleElement()
+                .satisfies(point -> assertThat(point.observedAt()).isEqualTo(OBSERVED_AT));
+    }
+
     /**
      * Each pass is one end of a window, which is the whole reason the watch is fed from here rather than
      * handed a reading out of context: the second pass has to be differenced against the first.

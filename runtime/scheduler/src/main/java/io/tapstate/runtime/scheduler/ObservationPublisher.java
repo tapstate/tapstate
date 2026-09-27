@@ -997,6 +997,17 @@ public final class ObservationPublisher {
         return Optional.of(new MetricFact(name, MetricType.GAUGE, unit, points));
     }
 
+    /** A cached count retains its own measurement time instead of borrowing this observation's time. */
+    private static Optional<MetricFact> storedReadingsAt(String pipelineId, Instant at,
+            Map<String, NestStateReading> readings) {
+        List<MetricPoint> points = new ArrayList<>();
+        readings.forEach((namespace, reading) -> reading.stored().ifPresent(value -> points.add(
+                MetricPoint.reading(Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, NEST_NAMESPACE_ATTRIBUTE, namespace),
+                        reading.storedObservedAt().orElse(at), value))));
+        return points.isEmpty() ? Optional.empty()
+                : Optional.of(new MetricFact(NEST_STORED_METRIC, MetricType.GAUGE, "{entry}", points));
+    }
+
     /**
      * The run statistics for the pipeline, as the internal facts every metric consumer projects from:
      * errorCount is derived from the actual state (a FAILED job is one observable error, else zero) and is
@@ -1054,14 +1065,12 @@ public final class ObservationPublisher {
         Map<String, Long> backfills = new LinkedHashMap<>();
         Map<String, Long> backfillMillis = new LinkedHashMap<>();
         Map<String, Long> pendingHighWater = new LinkedHashMap<>();
-        Map<String, Long> stored = new LinkedHashMap<>();
         nestReadings.forEach((namespace, reading) -> {
             entries.put(namespace, reading.entries());
             accesses.put(namespace, reading.accesses());
             backfills.put(namespace, reading.backfills());
             backfillMillis.put(namespace, reading.backfillMillis());
             pendingHighWater.put(namespace, reading.pendingHighWater());
-            reading.stored().ifPresent(whole -> stored.put(namespace, whole));
         });
         readingsAt(pipelineId, NEST_ENTRIES_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, entries)
                 .ifPresent(facts::add);
@@ -1073,8 +1082,7 @@ public final class ObservationPublisher {
                 .ifPresent(facts::add);
         readingsAt(pipelineId, NEST_PENDING_HIGH_WATER_METRIC, "{record}", at, NEST_NAMESPACE_ATTRIBUTE,
                 pendingHighWater).ifPresent(facts::add);
-        readingsAt(pipelineId, NEST_STORED_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, stored)
-                .ifPresent(facts::add);
+        storedReadingsAt(pipelineId, at, nestReadings).ifPresent(facts::add);
         // A quiet namespace has no current threshold decision. Its last alert state is not a fresh fact.
         readingsAt(pipelineId, NEST_COLD_LAYER_OVER_THRESHOLD_METRIC, "1", at, NEST_NAMESPACE_ATTRIBUTE,
                 coldLayer.assessment(pipelineId, scope, nestReadings)).ifPresent(facts::add);

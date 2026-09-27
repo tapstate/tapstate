@@ -4,6 +4,8 @@ import ch.qos.logback.classic.Logger;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.NestStateReading;
+import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.PipelineEvent;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.control.core.PipelineExplanation.PendingReason;
@@ -14,6 +16,7 @@ import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.runtime.scheduler.StartDeferred;
+import io.tapstate.runtime.engine.StoredCountSampler;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineEventStore;
@@ -26,7 +29,9 @@ import java.time.Instant;
 import java.time.Duration;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -531,6 +536,60 @@ class ConvergenceDriverTest {
             releaseSlowWrite.countDown();
             caller.shutdownNow();
             assertThat(caller.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void aStalledStoredCountDoesNotHoldTheNextPipelinesConvergence() throws Exception {
+        desired.save(new DesiredState("slow", RUNNING, "rev-1"));
+        desired.save(new DesiredState("fast", RUNNING, "rev-1"));
+        CountDownLatch countEntered = new CountDownLatch(1);
+        CountDownLatch releaseCount = new CountDownLatch(1);
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try (StoredCountSampler sampler = new StoredCountSampler((database, namespace) -> {
+            countEntered.countDown();
+            try {
+                if (!releaseCount.await(10, TimeUnit.SECONDS)) {
+                    throw new AssertionError("stored count was not released");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(interrupted);
+            }
+            return 10;
+        }, Clock.systemUTC())) {
+            ObservationPublisher writer = new ObservationPublisher(state, observations,
+                    id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
+                    id -> Map.of(), id -> {
+                        if (!id.equals("slow")) {
+                            return Map.of();
+                        }
+                        var stored = sampler.sample(id, 1L, "db", "ns");
+                        return Map.of("ns", new NestStateReading(1, 100, 0, 0, 0,
+                                stored.map(value -> OptionalLong.of(value.value())).orElseGet(OptionalLong::empty),
+                                stored.map(StoredCountSampler.Sample::observedAt)));
+                    });
+            try (TelemetryDispatcher telemetry = new TelemetryDispatcher(
+                    writer, null, MetricsExport.none(), 2, 2)) {
+                ConvergenceDriver isolated = new ConvergenceDriver(converger, desired, writer, null,
+                        MetricsExport.none(), () -> true, PipelineActuationOwnership.single(),
+                        LifecycleWorkDispatcher.inline(), null, telemetry);
+                Future<?> pass = caller.submit(isolated::reconcile);
+                assertThat(countEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                pass.get(1, TimeUnit.SECONDS);
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while ((observations.read("fast").isEmpty() || observations.read("slow").isEmpty())
+                        && System.nanoTime() < deadline) {
+                    TimeUnit.MILLISECONDS.sleep(5);
+                }
+                assertThat(state.read("fast")).isPresent();
+                assertThat(observations.read("fast")).isPresent();
+                assertThat(observations.read("slow").orElseThrow().metrics())
+                        .doesNotContainKey("nestStateStored.ns");
+            }
+        } finally {
+            releaseCount.countDown();
+            caller.shutdownNow();
         }
     }
 
