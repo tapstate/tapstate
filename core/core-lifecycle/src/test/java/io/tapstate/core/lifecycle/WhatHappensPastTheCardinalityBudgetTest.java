@@ -109,6 +109,11 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.nest.dead_lettered",
                         "tapstate.pipeline.join.recompute.rows",
                         "tapstate.pipeline.join.recompute.rows.total",
+                        "tapstate.pipeline.state.store.operation.count",
+                        "tapstate.pipeline.state.store.operation.duration.sum",
+                        "tapstate.pipeline.state.store.operation.payload.bytes",
+                        "tapstate.pipeline.state.store.serialization.count",
+                        "tapstate.pipeline.state.store.serialization.bytes",
                         "tapstate.pipeline.records.driven",
                         "tapstate.pipeline.reconcile.failures.streak",
                         "tapstate.process.telemetry.queue.depth",
@@ -166,6 +171,13 @@ class WhatHappensPastTheCardinalityBudgetTest {
             assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.JOIN_NAMESPACE);
             assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
         }
+        for (CardinalityBudget budget : List.of(CardinalityBudget.STATE_OPERATION_COUNT,
+                CardinalityBudget.STATE_OPERATION_DURATION, CardinalityBudget.STATE_OPERATION_BYTES,
+                CardinalityBudget.STATE_SERIALIZATION_COUNT, CardinalityBudget.STATE_SERIALIZATION_BYTES)) {
+            assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.STATE_NAMESPACE);
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
+            assertThat(budget.fold()).as(budget.name()).isEqualTo(CardinalityBudget.Fold.ADDED);
+        }
         assertThat(CardinalityBudget.ERRORS.openDimension()).contains(CODE);
         assertThat(CardinalityBudget.ERRORS.distinctValues()).isEqualTo(200);
         assertThat(CardinalityBudget.PROCESS_DURATION.openDimension()).isEmpty();
@@ -210,6 +222,9 @@ class WhatHappensPastTheCardinalityBudgetTest {
         // produces (the sixth, "other", is for what it does not recognise).
         assertThat(CardinalityBudget.EXPORT_SERIES_LIMIT)
                 .isGreaterThanOrEqualTo(CardinalityBudget.RECORDS.distinctValues() * 2 * 5);
+        assertThat(CardinalityBudget.EXPORT_SERIES_LIMIT)
+                .isGreaterThanOrEqualTo(CardinalityBudget.STATE_OPERATION_COUNT.distinctValues()
+                        * MetricAttributes.STATE_OPERATIONS.size() * MetricAttributes.STATE_OUTCOMES.size());
     }
 
     @Test
@@ -247,6 +262,44 @@ class WhatHappensPastTheCardinalityBudgetTest {
         });
         for (String direction : List.of("in", "out")) {
             assertThat(total(folded, direction)).as(direction).isEqualTo(total(wide, direction));
+        }
+    }
+
+    @Test
+    void excessStateNamespacesFoldWithoutLosingOperationOutcomesOrCostTotals() {
+        List<MetricPoint> points = new ArrayList<>();
+        for (int index = 1; index <= 1_002; index++) {
+            for (String outcome : MetricAttributes.STATE_OUTCOMES) {
+                points.add(MetricPoint.accumulated(Map.of(
+                        PIPELINE_ID, PIPELINE,
+                        MetricAttributes.STATE_NAMESPACE, "join.orders.step.dim-" + index,
+                        MetricAttributes.STATE_OPERATION, "save",
+                        MetricAttributes.STATE_OUTCOME, outcome), STARTED, OBSERVED, index));
+            }
+        }
+        MetricFact wide = new MetricFact("tapstate.pipeline.state.store.operation.count",
+                MetricType.COUNTER, "{operation}", points);
+
+        MetricFact folded = CardinalityBudget.folder().fold(wide);
+
+        assertThat(folded.points()).hasSize(2_002);
+        assertThat(overflowSeries(folded)).hasSize(2).allSatisfy(point -> {
+            assertThat(point.attributes()).containsEntry(PIPELINE_ID, PIPELINE)
+                    .containsEntry(MetricAttributes.STATE_OPERATION, "save")
+                    .containsEntry(OVERFLOW, "true")
+                    .containsKey(MetricAttributes.STATE_OUTCOME)
+                    .doesNotContainKey(MetricAttributes.STATE_NAMESPACE);
+            assertThat(point.value()).isEqualTo(2_003L);
+            assertThat(point.startTime()).isEqualTo(STARTED);
+        });
+        for (String outcome : MetricAttributes.STATE_OUTCOMES) {
+            long before = wide.points().stream().filter(point -> outcome.equals(
+                    point.attributes().get(MetricAttributes.STATE_OUTCOME)))
+                    .mapToLong(MetricPoint::value).sum();
+            long after = folded.points().stream().filter(point -> outcome.equals(
+                    point.attributes().get(MetricAttributes.STATE_OUTCOME)))
+                    .mapToLong(MetricPoint::value).sum();
+            assertThat(after).as(outcome).isEqualTo(before);
         }
     }
 

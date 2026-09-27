@@ -103,6 +103,17 @@ public enum CardinalityBudget {
             Fold.ADDED),
     JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE,
             1_000, Fold.ADDED),
+    /** Every cold-store namespace comes from the compiled topology, never from a state key or row. */
+    STATE_OPERATION_COUNT("tapstate.pipeline.state.store.operation.count", MetricAttributes.STATE_NAMESPACE,
+            1_000, Fold.ADDED),
+    STATE_OPERATION_DURATION("tapstate.pipeline.state.store.operation.duration.sum",
+            MetricAttributes.STATE_NAMESPACE, 1_000, Fold.ADDED),
+    STATE_OPERATION_BYTES("tapstate.pipeline.state.store.operation.payload.bytes",
+            MetricAttributes.STATE_NAMESPACE, 1_000, Fold.ADDED),
+    STATE_SERIALIZATION_COUNT("tapstate.pipeline.state.store.serialization.count",
+            MetricAttributes.STATE_NAMESPACE, 1_000, Fold.ADDED),
+    STATE_SERIALIZATION_BYTES("tapstate.pipeline.state.store.serialization.bytes",
+            MetricAttributes.STATE_NAMESPACE, 1_000, Fold.ADDED),
     /** Two readings about the pipeline as a whole: the pipeline is their only attribute, so nothing grows and nothing folds. */
     RECORDS_DRIVEN("tapstate.pipeline.records.driven", null, 1, Fold.ADDED),
     RECONCILE_FAILURES_STREAK("tapstate.pipeline.reconcile.failures.streak", null, 1, Fold.HIGHEST),

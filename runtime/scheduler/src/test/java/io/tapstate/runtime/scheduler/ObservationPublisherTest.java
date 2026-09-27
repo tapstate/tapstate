@@ -13,6 +13,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.lifecycle.StateStoreCostReading;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StateStore;
 import org.junit.jupiter.api.Test;
@@ -94,6 +95,40 @@ class ObservationPublisherTest {
     private final MutableStateStore state = new MutableStateStore();
     private final RecordingObservationStore observations = new RecordingObservationStore();
     private final ObservationPublisher publisher = new ObservationPublisher(state, observations);
+
+    @Test
+    void aClusterCompleteStateCostSourceReachesFactsAndQuietReadingsDisappear() {
+        state.seed("orders", PipelineState.RUNNING);
+        AtomicReference<Map<String, StateStoreCostReading>> costs = new AtomicReference<>(Map.of(
+                "join.orders.widen.fact", new StateStoreCostReading(T0,
+                        Map.of("save", new StateStoreCostReading.OperationCost(1, 0, 3_000, 80)),
+                        Map.of("encode", new StateStoreCostReading.CodecCost(1, 80)))));
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
+                id -> Map.of(), id -> Map.of(),
+                new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(), new FrontierStallWatch(FrontierStallPressure.DEFAULT,
+                        FrontierStallAlert.NONE), id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> io.tapstate.core.lifecycle.CaptureReading.NONE,
+                id -> io.tapstate.core.lifecycle.DeliveryReading.NONE,
+                id -> io.tapstate.core.lifecycle.StageReading.NONE,
+                id -> io.tapstate.core.lifecycle.SinkBatchReading.NONE,
+                id -> Optional.empty(), id -> costs.get(), Clock.fixed(OBSERVED_AT, ZoneOffset.UTC));
+
+        Observation observed = wired.publish("orders").orElseThrow();
+        assertThat(observed.facts()).filteredOn(fact -> fact.name().equals(
+                "tapstate.pipeline.state.store.operation.count"))
+                .singleElement().satisfies(fact -> assertThat(fact.points()).singleElement()
+                        .satisfies(point -> {
+                            assertThat(point.startTime()).isEqualTo(T0);
+                            assertThat(point.value()).isEqualTo(1);
+                            assertThat(point.attributes()).containsEntry(MetricAttributes.STATE_NAMESPACE,
+                                    "join.orders.widen.fact");
+                        }));
+        costs.set(Map.of());
+        assertThat(wired.publish("orders").orElseThrow().facts())
+                .noneMatch(fact -> fact.name().startsWith("tapstate.pipeline.state.store."));
+    }
 
     @Test
     void aNewExecutionDoesNotCarryThePreviousExecutionsFailureIntoItsScopedObservation() {

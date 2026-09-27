@@ -21,6 +21,7 @@ import io.tapstate.core.lifecycle.QueueReading;
 import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.StageReading;
+import io.tapstate.core.lifecycle.StateStoreCostReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
@@ -161,6 +162,15 @@ public final class ObservationPublisher {
     private static final String NEST_DEAD_LETTERED_METRIC = "tapstate.pipeline.nest.dead_lettered";
     private static final String JOIN_RECOMPUTE_ROWS_METRIC = "tapstate.pipeline.join.recompute.rows";
     private static final String JOIN_RECOMPUTE_ROWS_TOTAL_METRIC = "tapstate.pipeline.join.recompute.rows.total";
+    private static final String STATE_OPERATION_COUNT_METRIC = "tapstate.pipeline.state.store.operation.count";
+    private static final String STATE_OPERATION_DURATION_METRIC =
+            "tapstate.pipeline.state.store.operation.duration.sum";
+    private static final String STATE_OPERATION_BYTES_METRIC =
+            "tapstate.pipeline.state.store.operation.payload.bytes";
+    private static final String STATE_SERIALIZATION_COUNT_METRIC =
+            "tapstate.pipeline.state.store.serialization.count";
+    private static final String STATE_SERIALIZATION_BYTES_METRIC =
+            "tapstate.pipeline.state.store.serialization.bytes";
 
     /**
      * The three measurements of a pipeline's movement that carry their dimensions as attributes rather
@@ -264,6 +274,10 @@ public final class ObservationPublisher {
     private static final String CHAIN_ID_ATTRIBUTE = MetricAttributes.CHAIN_ID;
     private static final String NEST_NAMESPACE_ATTRIBUTE = MetricAttributes.NEST_NAMESPACE;
     private static final String JOIN_NAMESPACE_ATTRIBUTE = MetricAttributes.JOIN_NAMESPACE;
+    private static final String STATE_NAMESPACE_ATTRIBUTE = MetricAttributes.STATE_NAMESPACE;
+    private static final String STATE_OPERATION_ATTRIBUTE = MetricAttributes.STATE_OPERATION;
+    private static final String STATE_OUTCOME_ATTRIBUTE = MetricAttributes.STATE_OUTCOME;
+    private static final String STATE_CODEC_ATTRIBUTE = MetricAttributes.STATE_CODEC;
     private static final String DIRECTION_ATTRIBUTE = MetricAttributes.DIRECTION;
     private static final String OP_ATTRIBUTE = MetricAttributes.OP;
     private static final String INBOUND = "in";
@@ -386,6 +400,7 @@ public final class ObservationPublisher {
     private final Function<String, StageReading> stages;
     private final Function<String, SinkBatchReading> sinkBatches;
     private final Function<String, Optional<QueueReading>> queues;
+    private final Function<String, Map<String, StateStoreCostReading>> stateCosts;
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
     private final Clock clock;
@@ -716,11 +731,37 @@ public final class ObservationPublisher {
             Function<String, SinkBatchReading> sinkBatches,
             Function<String, Optional<QueueReading>> queues,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, stages, sinkBatches, queues,
+                id -> Map.of(), clock);
+    }
+
+    /** The full publisher, also consuming only cluster-complete costs of the current stateful job. */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries,
+            Function<String, StageReading> stages,
+            Function<String, SinkBatchReading> sinkBatches,
+            Function<String, Optional<QueueReading>> queues,
+            Function<String, Map<String, StateStoreCostReading>> stateCosts,
+            Clock clock) {
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
         this.stages = Objects.requireNonNull(stages, "stages");
         this.sinkBatches = Objects.requireNonNull(sinkBatches, "sinkBatches");
         this.queues = Objects.requireNonNull(queues, "queues");
+        this.stateCosts = Objects.requireNonNull(stateCosts, "stateCosts");
         this.clock = Objects.requireNonNull(clock, "clock");
         // Read from the injected clock and not the system one, so a test that drives time can say what
         // the failure counter accumulates from instead of asserting against whenever it happened to run.
@@ -1100,6 +1141,7 @@ public final class ObservationPublisher {
                 .ifPresent(facts::add);
         readingsAt(pipelineId, JOIN_RECOMPUTE_ROWS_TOTAL_METRIC, "{row}", at, JOIN_NAMESPACE_ATTRIBUTE,
                 rebuildExpected).ifPresent(facts::add);
+        stateCostFacts(pipelineId, at, stateCosts.apply(pipelineId)).forEach(facts::add);
         movement(pipelineId, at, captures.apply(pipelineId), deliveries.apply(pipelineId))
                 .forEach(facts::add);
         spent(pipelineId, at, stages.apply(pipelineId)).ifPresent(facts::add);
@@ -1107,6 +1149,69 @@ public final class ObservationPublisher {
         queues.apply(pipelineId).ifPresent(reading -> queueFacts(pipelineId, at, reading).forEach(facts::add));
         load(pipelineId, at, loaded).forEach(facts::add);
         return facts;
+    }
+
+    static List<MetricFact> stateCostFacts(String pipelineId, Instant at,
+            Map<String, StateStoreCostReading> readings) {
+        if (readings == null || readings.isEmpty()) {
+            return List.of();
+        }
+        List<MetricPoint> calls = new ArrayList<>();
+        List<MetricPoint> durations = new ArrayList<>();
+        List<MetricPoint> payload = new ArrayList<>();
+        List<MetricPoint> codecs = new ArrayList<>();
+        List<MetricPoint> encodedBytes = new ArrayList<>();
+        readings.forEach((namespace, reading) -> {
+            reading.operations().forEach((operation, cost) -> {
+                Map<String, String> attributes = Map.of(
+                        PIPELINE_ID_ATTRIBUTE, pipelineId,
+                        STATE_NAMESPACE_ATTRIBUTE, namespace,
+                        STATE_OPERATION_ATTRIBUTE, operation);
+                if (cost.completed() > 0) {
+                    calls.add(MetricPoint.accumulated(withOutcome(attributes, "success"),
+                            reading.countingSince(), at, cost.completed()));
+                }
+                if (cost.failed() > 0) {
+                    calls.add(MetricPoint.accumulated(withOutcome(attributes, "failure"),
+                            reading.countingSince(), at, cost.failed()));
+                }
+                durations.add(MetricPoint.accumulated(attributes,
+                        reading.countingSince(), at, cost.durationNanos()));
+                payload.add(MetricPoint.accumulated(attributes,
+                        reading.countingSince(), at, cost.payloadBytes()));
+            });
+            reading.codecs().forEach((codec, cost) -> {
+                Map<String, String> attributes = Map.of(
+                        PIPELINE_ID_ATTRIBUTE, pipelineId,
+                        STATE_NAMESPACE_ATTRIBUTE, namespace,
+                        STATE_CODEC_ATTRIBUTE, codec);
+                codecs.add(MetricPoint.accumulated(attributes,
+                        reading.countingSince(), at, cost.count()));
+                encodedBytes.add(MetricPoint.accumulated(attributes,
+                        reading.countingSince(), at, cost.bytes()));
+            });
+        });
+        List<MetricFact> facts = new ArrayList<>(5);
+        if (!calls.isEmpty()) {
+            facts.add(new MetricFact(STATE_OPERATION_COUNT_METRIC, MetricType.COUNTER, "{operation}", calls));
+        }
+        if (!durations.isEmpty()) {
+            facts.add(new MetricFact(STATE_OPERATION_DURATION_METRIC, MetricType.COUNTER, "ns", durations));
+            facts.add(new MetricFact(STATE_OPERATION_BYTES_METRIC, MetricType.COUNTER, "By", payload));
+        }
+        if (!codecs.isEmpty()) {
+            facts.add(new MetricFact(STATE_SERIALIZATION_COUNT_METRIC, MetricType.COUNTER,
+                    "{serialization}", codecs));
+            facts.add(new MetricFact(STATE_SERIALIZATION_BYTES_METRIC, MetricType.COUNTER,
+                    "By", encodedBytes));
+        }
+        return facts;
+    }
+
+    private static Map<String, String> withOutcome(Map<String, String> attributes, String outcome) {
+        Map<String, String> dimensioned = new LinkedHashMap<>(attributes);
+        dimensioned.put(STATE_OUTCOME_ATTRIBUTE, outcome);
+        return Map.copyOf(dimensioned);
     }
 
     /**
