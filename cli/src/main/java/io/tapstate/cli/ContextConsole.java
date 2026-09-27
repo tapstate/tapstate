@@ -15,8 +15,8 @@ final class ContextConsole {
     private static final String CREATE = "Create a context";
     private static final String CHOOSE = "Choose a context";
     private static final String EDIT = "Edit a context";
-    private static final String BIND = "Bind context to this workspace";
-    private static final String UNBIND = "Unbind this workspace";
+    private static final String BIND = "Bind context to this project";
+    private static final String UNBIND = "Unbind this project";
     private static final String DELETE = "Delete a context";
     private static final String QUIT = "Quit";
 
@@ -133,10 +133,10 @@ final class ContextConsole {
         ContextManager.DeletionImpact impact = manager.previewDelete(name);
         out.println("delete context " + impact.name());
         out.println("authRef " + impact.authRef());
-        if (impact.workspaceBindings().isEmpty()) {
+        if (impact.projectBindings().isEmpty()) {
             out.println("bindings none");
         } else {
-            impact.workspaceBindings().forEach(binding -> out.println("binding " + binding));
+            impact.projectBindings().forEach(binding -> out.println("binding " + binding));
         }
         out.flush();
         if (!yes(prompter.ask("Delete context " + name, "no"), false)) {
@@ -144,7 +144,7 @@ final class ContextConsole {
             out.flush();
             return Cli.EXIT_OK;
         }
-        if (!yes(prompter.ask("Remove listed workspace bindings and keep auth cache", "no"), false)) {
+        if (!yes(prompter.ask("Remove listed project bindings and keep auth cache", "no"), false)) {
             out.println("kept context " + name);
             out.flush();
             return Cli.EXIT_OK;

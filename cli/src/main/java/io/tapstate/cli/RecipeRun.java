@@ -70,12 +70,12 @@ final class RecipeRun {
      */
     static Result run(String recipeId, Path root, Prompter prompter, Flags flags, boolean force) {
         List<Output> outputs = switch (recipeId) {
-            case "sample" -> DemoCmd.bundledFiles().stream()
-                    .map(file -> new Output(file, file.path().substring(0, file.path().indexOf('/')), null))
+            case "sample" -> DemoCmd.bundledFiles(root).stream()
+                    .map(file -> new Output(file, kindOf(file), null))
                     .toList();
             case "blank" -> {
                 List<Output> blank = new ArrayList<>(BlankRecipe.bundledFiles().stream()
-                        .map(file -> new Output(file, file.path().substring(0, file.path().indexOf('/')), null))
+                        .map(file -> new Output(file, kindOf(file), null))
                         .toList());
                 WorkspaceWrite.File gitignore = new WorkspaceFiles(root).gitignoreEnv();
                 if (gitignore != null) {
@@ -113,6 +113,15 @@ final class RecipeRun {
             }
             default -> throw new IllegalStateException("not a recipe: " + recipeId);
         };
+        // Every recipe leaves a project behind, so every recipe names it - unless the directory already
+        // is one, whose name is the user's and is never replaced.
+        if (!ProjectFile.presentIn(root)
+                && outputs.stream().noneMatch(output -> output.kind().equals(ProjectFile.KIND))) {
+            List<Output> named = new ArrayList<>();
+            named.add(new Output(ProjectFile.forDirectory(root), ProjectFile.KIND, null));
+            named.addAll(outputs);
+            outputs = named;
+        }
         List<WorkspaceWrite.Written> written = WorkspaceWrite.write(
                 root, outputs.stream().map(Output::file).toList(), force, CliError.ARTIFACT_EXISTS);
         List<Created> created = new ArrayList<>();
@@ -124,6 +133,12 @@ final class RecipeRun {
         return new Result(recipeId, root, created);
     }
 
+    /** The kind a bundled file is listed under: its directory, or the project for the root's project file. */
+    private static String kindOf(WorkspaceWrite.File file) {
+        int slash = file.path().indexOf('/');
+        return slash < 0 ? ProjectFile.KIND : file.path().substring(0, slash);
+    }
+
     /**
      * What a file is for, in one line. An artifact is described in the words {@code ls} lists it by -
      * its kind and id, then {@code ls}'s summary of it - read back from the bytes just written rather
@@ -133,6 +148,8 @@ final class RecipeRun {
      */
     private static String role(Output output) {
         return switch (output.kind()) {
+            // Described the way the other files are: its kind, then the id it declares.
+            case ProjectFile.KIND -> ProjectFile.KIND + " " + new DslParser().parseProject(output.file().content()).id();
             case "env" -> WorkspaceFiles.ENV_ROLE;
             case "gitignore" -> WorkspaceFiles.GITIGNORE_ROLE;
             default -> {

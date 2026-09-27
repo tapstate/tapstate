@@ -53,14 +53,23 @@ class ArtifactController {
         // Refuse a body with no drafts array at the boundary as a coded 400, rather than letting a null trip
         // the service's bare invariant guard (a 500). A missing body is already a framework-level 400 upstream.
         List<ArtifactDraft> drafts = requireDrafts(request);
-        return applyService.apply(AuthenticatedCaller.subject(), drafts);
+        return applyService.apply(AuthenticatedCaller.subject(), drafts, project(request));
     }
 
     @Verb("artifact.validate")
     @PostMapping("/artifacts:validate")
     ArtifactValidationResult validate(@RequestBody ApplyRequest request) {
         List<ArtifactDraft> drafts = requireDrafts(request);
-        return applyService.validate(drafts);
+        return applyService.validate(drafts, project(request));
+    }
+
+    /** The project a request is applied from, or null when it names none; a blank name is refused. */
+    private static String project(ApplyRequest request) {
+        String project = request.project();
+        if (project != null && project.isBlank()) {
+            throw MalformedRequest.rejecting("`project`, when present, must name a project", null);
+        }
+        return project;
     }
 
     private static List<ArtifactDraft> requireDrafts(ApplyRequest request) {

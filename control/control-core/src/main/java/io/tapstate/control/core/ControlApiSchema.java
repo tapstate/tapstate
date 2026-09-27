@@ -177,8 +177,14 @@ public final class ControlApiSchema {
                         string("Content hash of the stored version this draft edits, as returned by a read "
                                 + "of it; omit to apply unconditionally")),
                 false);
+        // The project is optional for the same reason: a batch that names none applies as it always did.
         Map<String, Object> artifactRequest = object(
-                List.of("drafts"), Map.of("drafts", array(draft)), false);
+                List.of("drafts"),
+                Map.of(
+                        "drafts", array(draft),
+                        "project", string("Id of the project the batch is applied from; labels every "
+                                + "resource in it as that project's, and refuses an id another project owns")),
+                false);
         pair(defs, "ArtifactValidate", artifactRequest, opaque);
         pair(defs, "ArtifactApply", artifactRequest, opaque);
 

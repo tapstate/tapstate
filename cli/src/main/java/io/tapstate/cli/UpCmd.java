@@ -16,7 +16,7 @@ import java.util.concurrent.Callable;
  * route through, so it says what is true then: a connection is needed.
  *
  * <p>The stages are named in the description because they are the words a failure names; a reader
- * who meets "apply workspace failed" should be able to find, from the help alone, where in the order
+ * who meets "apply project failed" should be able to find, from the help alone, where in the order
  * that was.
  *
  * <p>This verb owns every contact the CLI makes with a server outside the verbs that talk to one: the
@@ -25,27 +25,27 @@ import java.util.concurrent.Callable;
  * files and learn nothing.
  */
 @Command(name = "up", mixinStandardHelpOptions = true,
-        description = "Stages, in order: preflight, apply sources, discover, apply workspace, start. "
-                + "Runs again safely: an applied, running workspace is left as it is.")
+        description = "Stages, in order: preflight, apply sources, discover, apply project, start. "
+                + "Runs again safely: an applied, running project is left as it is.")
 final class UpCmd implements Callable<Integer> {
 
     /** The stage names, in the order they run; a failure names exactly one of them. */
     static final String STAGE_PREFLIGHT = "preflight";
     static final String STAGE_APPLY_SOURCES = "apply sources";
     static final String STAGE_DISCOVER = "discover";
-    static final String STAGE_APPLY_WORKSPACE = "apply workspace";
+    static final String STAGE_APPLY_WORKSPACE = "apply project";
     static final String STAGE_START = "start";
 
     @Spec
     CommandSpec spec;
 
     @Option(names = "--server", paramLabel = "URL",
-            description = "On a workspace that is not bound yet: the server to sign in to and bind it to. "
+            description = "On a project that is not bound yet: the server to sign in to and bind it to. "
                     + "On one that is: reach this server for this run instead, leaving the binding alone.")
     String server;
 
     @Option(names = {"-y", "--yes"},
-            description = "Never prompt. The workspace must already be bound, or --server must name a "
+            description = "Never prompt. The project must already be bound, or --server must name a "
                     + "server; the local development stack is never started without --start-local.")
     boolean yes;
 
@@ -55,7 +55,7 @@ final class UpCmd implements Callable<Integer> {
     boolean startLocal;
 
     @Option(names = {"-u", "--user"}, paramLabel = "NAME",
-            description = "Sign in as this user when the workspace is bound for the first time "
+            description = "Sign in as this user when the project is bound for the first time "
                     + "(default admin). The password comes from $" + ServerBinding.PASSWORD_ENV
                     + " or a masked prompt.")
     String user;
@@ -65,7 +65,7 @@ final class UpCmd implements Callable<Integer> {
     OutputFormat output = OutputFormat.TEXT;
 
     @Option(names = {"-w", "--workdir"}, paramLabel = "DIR",
-            description = "The workspace to bring up (default: the session workspace).")
+            description = "The project to bring up (default: the session project).")
     Path workdir;
 
     @Override

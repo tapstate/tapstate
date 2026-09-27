@@ -64,6 +64,12 @@ public enum DslError implements TapstateErrorCode {
     COMPOSITION("dsl.composition", Set.of("detail", "path")),
     /** An id collision: top-level / pipeline-internal uniqueness, or step-id shadowing (§2/F8, §5). */
     DUPLICATE_ID("dsl.duplicate-id", Set.of("id", "path")),
+    /**
+     * A resource writes the reserved {@code project} label by hand with a value other than the project
+     * it is applied from. Apply manages that label; {@code value} is what the file says and
+     * {@code expected} is the project it belongs to.
+     */
+    RESERVED_LABEL("dsl.reserved-label", Set.of("id", "key", "value", "expected", "path")),
     /** A source mode outside the connector's declared capability matrix (§4 / C3); {@code allowed}
      *  lists the connector's legal modes. */
     UNSUPPORTED_MODE("dsl.unsupported-mode", Set.of("connector", "mode", "allowed", "path")),

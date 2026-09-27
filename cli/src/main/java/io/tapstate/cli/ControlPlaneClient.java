@@ -85,6 +85,15 @@ interface ControlPlaneClient extends AutoCloseable {
     ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts);
 
     /**
+     * As {@link #apply(URI, String, List)}, for a batch applied from {@code project}: the server labels
+     * every resource in it as that project's and refuses an id another project already owns. A null
+     * {@code project} sends the batch as the plain form does.
+     */
+    default ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts, String project) {
+        return apply(baseUrl, credential, drafts);
+    }
+
+    /**
      * Reads one artifact by id via {@code GET {baseUrl}/api/artifacts/{id}}, authenticated by the bearer
      * {@code credential}: found with its canonical form, absent on a 404, a coded rejection, or unreachable
      * on any I/O failure. Never throws.

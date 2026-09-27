@@ -739,7 +739,7 @@ class ReplTest {
 
     @Test
     void tokenizeKeepsDoubleQuotedSpacesAsOneWord() {
-        assertThat(Repl.tokenize("validate \"my workspace\"")).containsExactly("validate", "my workspace");
+        assertThat(Repl.tokenize("validate \"my project\"")).containsExactly("validate", "my project");
     }
 
     @Test
@@ -749,7 +749,7 @@ class ReplTest {
 
     @Test
     void dispatchHandlesAQuotedPathWithSpacesLikeTheOneShotForm(@TempDir Path base) throws Exception {
-        Path spaced = Files.createDirectory(base.resolve("my workspace"));
+        Path spaced = Files.createDirectory(base.resolve("my project"));
         copyWorkspace("/ws-valid", spaced);
         Harness h = harness();
         boolean cont = h.repl().dispatch("validate \"" + spaced + "\"");
@@ -1648,7 +1648,7 @@ class ReplTest {
         h.repl().dispatch("show collections views");
 
         assertThat(h.sink().toString().substring(mark))
-                .contains("what each source's database holds, not what the workspace declares");
+                .contains("what each source's database holds, not what the project declares");
         assertThat(client.dataBrowserCalls).containsExactly("collections views");
     }
 
@@ -6340,7 +6340,7 @@ class ReplTest {
         assertThat(repl.lastExitCode()).isZero();
         assertThat(saved.contexts()).containsOnlyKeys("dev");
         assertThat(saved.contexts().get("dev").seeds()).containsExactly(URI.create("http://127.0.0.1:7900"));
-        assertThat(saved.workspaceBindings()).containsEntry(workspace.toRealPath().toString(), "dev");
+        assertThat(saved.projectBindings()).containsEntry(workspace.toRealPath().toString(), "dev");
         assertThat(output.toString()).contains("created context dev").contains("bound dev");
     }
 
@@ -6356,7 +6356,7 @@ class ReplTest {
         ScriptedPrompter prompter = new ScriptedPrompter(
                 "Choose a context", "prod",
                 "Edit a context", "prod", "https://prod2.example.com", "n",
-                "Unbind this workspace",
+                "Unbind this project",
                 "Delete a context", "prod", "yes", "yes");
         CommandLine commandLine = Cli.newCommandLine();
         StringWriter output = new StringWriter();
@@ -6374,7 +6374,7 @@ class ReplTest {
         assertThat(repl.lastExitCode()).isZero();
         assertThat(saved.lastContext()).isNull();
         assertThat(saved.contexts()).containsOnlyKeys("dev");
-        assertThat(saved.workspaceBindings()).isEmpty();
+        assertThat(saved.projectBindings()).isEmpty();
         assertThat(output.toString()).contains("chose context prod")
                 .contains("updated context prod")
                 .contains("unbound dev")

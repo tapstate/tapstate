@@ -355,6 +355,34 @@
       ],
       "additionalProperties": false
     },
+    "ProjectManifest": {
+      "type": "object",
+      "description": "A project file: names the directory it sits in as one project. It carries the project's id and optional metadata, and nothing about where the project runs.",
+      "properties": {
+        "version": {
+          "description": "The grammar version; always \"tapstate/v1\".",
+          "const": "tapstate/v1"
+        },
+        "kind": {
+          "description": "Resource kind discriminator.",
+          "const": "project"
+        },
+        "id": {
+          "description": "The project's id: what the server groups this project's resources under.",
+          "type": "string"
+        },
+        "metadata": {
+          "description": "Optional labels and free-text description.",
+          "$ref": "#/$defs/Metadata"
+        }
+      },
+      "required": [
+        "version",
+        "kind",
+        "id"
+      ],
+      "additionalProperties": false
+    },
     "PushElement": {
       "type": "object",
       "description": "A serve.push egress element that streams change events to a target connector topic, with no table model.",
@@ -498,7 +526,7 @@
       "additionalProperties": false
     },
     "Resource": {
-      "description": "A top-level tapstate/v1 resource; one document holds exactly one of source, pipeline, transform, view or serve.",
+      "description": "A top-level tapstate/v1 document; one document holds exactly one of source, pipeline, transform, view or serve, or is the project file that names a project.",
       "oneOf": [
         {
           "$ref": "#/$defs/SourceResource"
@@ -514,6 +542,9 @@
         },
         {
           "$ref": "#/$defs/ServeResource"
+        },
+        {
+          "$ref": "#/$defs/ProjectManifest"
         }
       ]
     },

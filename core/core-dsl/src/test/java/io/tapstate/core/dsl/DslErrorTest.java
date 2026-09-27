@@ -68,7 +68,10 @@ class DslErrorTest {
                 // a join reading another step or a pattern: the wiring is written in the document, so
                 // an ordinary corpus case witnesses each
                 "dsl.join-input-not-a-table",
-                "dsl.join-input-is-a-pattern");
+                "dsl.join-input-is-a-pattern",
+                // the project label is judged against the project file beside the document, and the
+                // loader reads both, so an ordinary corpus case holding the two witnesses it
+                "dsl.reserved-label");
     }
 
     @Test

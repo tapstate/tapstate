@@ -126,6 +126,17 @@ class TheDemoAndTheGoldenPathCaseAreOneSampleTest {
     }
 
     /**
+     * The project file too. It names the project the demo's resources are grouped under on the server,
+     * so a command that named it differently from the script would put the same demo under two names.
+     */
+    @Test
+    void theCommandNamesTheProjectTheQuickstartNames() throws IOException {
+        assertThat(Files.readString(CLI_BUNDLE.resolve("project.tap.yml")))
+                .as("`tapstate demo` and the quickstart write the same project file")
+                .isEqualTo(heredoc("work/project.tap.yml"));
+    }
+
+    /**
      * One resource as the quickstart writes it, read out of the script's own heredoc.
      *
      * <p>Read from the script rather than by running it: running it needs Docker, a network and a

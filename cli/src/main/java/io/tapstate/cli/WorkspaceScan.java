@@ -16,7 +16,13 @@ import java.util.stream.Stream;
  * directories (non-recursive — a kind directory is flat) and parses each into its model. The structural
  * kind is the directory, independent of what the file declares, so a misplaced or unreadable file is
  * surfaced honestly rather than dropped. The browse / describe verbs ({@code ls} / {@code desc}) read
- * the workspace through this one scan.
+ * the project through this one scan.
+ *
+ * <p>This is one of two scans of a project directory, and the split is deliberate. This one answers
+ * "what is filed where" for a reader, so it reads only the kind directories and keeps what it cannot
+ * parse. {@link WorkspaceSources} answers "which ids can a wizard offer", so it reads every file anywhere
+ * and drops what it cannot parse. Neither reads the project file at the root: it names the project and
+ * declares no resource, so it sits outside every kind directory and is set aside by content in the other.
  */
 final class WorkspaceScan {
 

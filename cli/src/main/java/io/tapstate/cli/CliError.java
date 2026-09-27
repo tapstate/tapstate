@@ -25,7 +25,7 @@ enum CliError implements TapstateErrorCode {
      * files it is theirs, and a command whose whole purpose is to save typing must not be the thing
      * that discards an afternoon of it.
      */
-    DEMO_WORKSPACE_EXISTS("cli.demo-workspace-exists", Set.of("path")),
+    DEMO_PROJECT_EXISTS("cli.demo-project-exists", Set.of("path")),
 
     /**
      * A workspace directory or file could not be written; {@code path} is the one that failed and
@@ -33,7 +33,7 @@ enum CliError implements TapstateErrorCode {
      * ordinary condition a reader meets - a read-only directory, a name already taken by a plain file -
      * and the answer is something they can act on rather than a stack trace.
      */
-    WORKSPACE_NOT_WRITABLE("cli.workspace-not-writable", Set.of("path", Names.REASON)),
+    PROJECT_NOT_WRITABLE("cli.project-not-writable", Set.of("path", Names.REASON)),
 
     /**
      * A workspace {@code up} was asked to bring up could not be read; {@code path} is the workspace and
@@ -42,14 +42,14 @@ enum CliError implements TapstateErrorCode {
      * grant writing), and a reader who is told "could not write" about a command that writes nothing
      * goes looking in the wrong place.
      */
-    WORKSPACE_UNREADABLE("cli.workspace-unreadable", Set.of("path", Names.REASON)),
+    PROJECT_UNREADABLE("cli.project-unreadable", Set.of("path", Names.REASON)),
 
     /**
      * A workspace {@code up} was asked to bring up holds no pipeline, so there is nothing to start;
      * {@code path} is the workspace. A refusal rather than a quiet no-op: an empty or half-written
      * workspace is the state a first run most often gets stuck in, and the way out is a scaffold.
      */
-    WORKSPACE_HAS_NO_PIPELINE("cli.workspace-has-no-pipeline", Set.of("path")),
+    PROJECT_HAS_NO_PIPELINE("cli.project-has-no-pipeline", Set.of("path")),
 
     /**
      * The optional {@code tap} shortcut cannot be managed because that name belongs to something else;

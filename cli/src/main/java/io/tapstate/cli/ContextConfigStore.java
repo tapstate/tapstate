@@ -402,9 +402,18 @@ final class ContextConfigStore {
     record Mutation<T>(ContextConfig config, T result) {
     }
 
+    /** The key the directory-to-context bindings are written under. */
+    static final String BINDINGS = "projectBindings";
+
+    /** The key they were written under before projects; read, never written. */
+    static final String LEGACY_BINDINGS = "workspaceBindings";
+
     private ContextConfig decodeCurrent(Map<String, Object> document) {
-        requireKeys(document, Set.of("version", "lastContext", "contexts", "workspaceBindings"),
-                Set.of("version", "contexts", "workspaceBindings"), "root");
+        requireKeys(document, Set.of("version", "lastContext", "contexts", BINDINGS, LEGACY_BINDINGS),
+                Set.of("version", "contexts"), "root");
+        if (!document.containsKey(BINDINGS) && !document.containsKey(LEGACY_BINDINGS)) {
+            throw new IllegalArgumentException("root is missing keys [" + BINDINGS + "]");
+        }
         String last = nullableString(document.get("lastContext"), "lastContext");
         Map<String, Object> rawContexts = stringMap(document.get("contexts"), "contexts");
         Map<String, ContextDefinition> contexts = new TreeMap<>();
@@ -425,9 +434,17 @@ final class ContextConfigStore {
                     new ContextTls(bool(rawTls.get("verify"), "verify")),
                     UUID.fromString(string(raw.get("authRef"), "authRef"))));
         }
-        Map<String, Object> rawBindings = stringMap(document.get("workspaceBindings"), "workspaceBindings");
+        // A file written before projects carries its bindings under the old key. Both are read, the new one
+        // winning where the two name the same directory, and only the new one is ever written back.
         Map<String, String> bindings = new TreeMap<>();
-        rawBindings.forEach((path, context) -> bindings.put(path, string(context, "workspace binding")));
+        if (document.containsKey(LEGACY_BINDINGS)) {
+            stringMap(document.get(LEGACY_BINDINGS), LEGACY_BINDINGS)
+                    .forEach((path, context) -> bindings.put(path, string(context, "project binding")));
+        }
+        if (document.containsKey(BINDINGS)) {
+            stringMap(document.get(BINDINGS), BINDINGS)
+                    .forEach((path, context) -> bindings.put(path, string(context, "project binding")));
+        }
         return new ContextConfig(ContextConfig.CURRENT_VERSION, last, contexts, bindings);
     }
 
@@ -448,11 +465,11 @@ final class ContextConfigStore {
                 yaml.append("    authRef: ").append(context.authRef()).append('\n');
             });
         }
-        if (config.workspaceBindings().isEmpty()) {
-            yaml.append("workspaceBindings: {}\n");
+        if (config.projectBindings().isEmpty()) {
+            yaml.append(BINDINGS).append(": {}\n");
         } else {
-            yaml.append("workspaceBindings:\n");
-            new TreeMap<>(config.workspaceBindings()).forEach((path, context) -> yaml
+            yaml.append(BINDINGS).append(":\n");
+            new TreeMap<>(config.projectBindings()).forEach((path, context) -> yaml
                     .append("  \"").append(escape(path)).append("\": ").append(quote(context)).append('\n'));
         }
         return yaml.toString();

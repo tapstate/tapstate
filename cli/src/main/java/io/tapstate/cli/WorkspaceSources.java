@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.model.ProjectManifest;
 import io.tapstate.core.model.Resource;
 
 import java.io.IOException;
@@ -14,6 +15,10 @@ import java.util.stream.Stream;
  * Best-effort discovery of existing {@code kind: source} ids in a directory, for the pipeline
  * wizard's reference menus. Every {@code *.tap.yml} is parsed in isolation; non-source kinds and any
  * file that fails to parse are silently skipped — a malformed neighbour must never break scaffolding.
+ * The project file is set aside by its kind before parsing: it declares no resource to offer.
+ *
+ * <p>The structural scan the browse verbs read is {@link WorkspaceScan}; its comment says why there are
+ * two and what each is for.
  */
 final class WorkspaceSources {
 
@@ -31,7 +36,11 @@ final class WorkspaceSources {
         List<String> ids = new ArrayList<>();
         for (Path file : artifacts(dir)) {
             try {
-                Resource resource = parser.parse(Files.readString(file));
+                String text = Files.readString(file);
+                if (ProjectManifest.KIND.equals(DslParser.declaredKind(text))) {
+                    continue;
+                }
+                Resource resource = parser.parse(text);
                 if (resource.kind().equals(kind)) {
                     ids.add(resource.id());
                 }

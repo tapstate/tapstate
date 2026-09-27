@@ -197,7 +197,7 @@ class NewRecipeShapesTest {
         assertThat(Files.readString(ws.resolve("pipeline/orders_sync.tap.yml"))).isEqualTo(RESHAPED_SYNC);
         assertThat(Files.readString(ws.resolve(".env"))).isEqualTo("ORDERS_SRC_PASSWORD=s\n");
         assertThat(Files.readString(ws.resolve(".gitignore"))).isEqualTo(".env\n");
-        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+        assertThat(r.out()).startsWith("Project: " + ws + "\n" + "  project.tap.yml  project " + ws.getFileName() + "\n"
                 + "  source/orders_src.tap.yml  source orders_src: mysql, cdc\n"
                 + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed primary_key: id;");
     }
@@ -323,7 +323,7 @@ class NewRecipeShapesTest {
         assertThat(Files.readString(ws.resolve(".env"))).isEqualTo("ORDERS_SRC_PASSWORD=s\n");
         assertThat(Files.readString(ws.resolve(".gitignore"))).isEqualTo(".env\n");
         assertThat(ws.resolve("source/shipments_src.tap.yml")).doesNotExist();
-        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+        assertThat(r.out()).startsWith("Project: " + ws + "\n" + "  project.tap.yml  project " + ws.getFileName() + "\n"
                 + "  source/orders_src.tap.yml  source orders_src: mysql, cdc\n"
                 + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed arrayKey: [id];");
     }
@@ -531,7 +531,7 @@ class NewRecipeShapesTest {
                 .contains("\"kind\": \"env\"")
                 .contains("\"kind\": \"gitignore\"")
                 .contains("\"assumed\": \"arrayKey: [id]\"")
-                .doesNotContain("Workspace:");
+                .doesNotContain("Project:");
     }
 
     // ---- consolidated-table ---------------------------------------------------------------------
@@ -557,7 +557,7 @@ class NewRecipeShapesTest {
         assertThat(Files.readString(ws.resolve(".env")))
                 .isEqualTo("ORDERS_1_SRC_PASSWORD=s1\nORDERS_2_SRC_PASSWORD=s2\n");
         assertThat(Files.readString(ws.resolve(".gitignore"))).isEqualTo(".env\n");
-        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+        assertThat(r.out()).startsWith("Project: " + ws + "\n" + "  project.tap.yml  project " + ws.getFileName() + "\n"
                 + "  source/orders_1_src.tap.yml  source orders_1_src: mysql, cdc\n"
                 + "  source/orders_2_src.tap.yml  source orders_2_src: mysql, cdc\n"
                 + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 2 sources, view — assumed primary_key: id;");

@@ -100,6 +100,8 @@ class ApiExceptionHandler {
             case "artifact.precondition-required" -> HttpStatus.PRECONDITION_REQUIRED;
             case "artifact.version-conflict" -> HttpStatus.PRECONDITION_FAILED;
             case "artifact.in-use", "artifact.pipeline-not-stopped" -> HttpStatus.CONFLICT;
+            // Another project owns the id on this server: the batch is valid, the server state refuses it.
+            case "artifact.project-id-taken" -> HttpStatus.CONFLICT;
             // Not a 4xx: the request was valid and was carried out. What failed is the server's own
             // follow-up work, and the body's code — not the status — is what tells the caller the
             // removal stands and must not be retried.

@@ -40,8 +40,7 @@ final class LaunchOptions {
     @Option(names = "--token", paramLabel = "TOKEN")
     String token;
 
-    @Option(names = {"-w", "--workdir"}, paramLabel = "DIR",
-            defaultValue = "${env:TAPSTATE_WORKDIR:-tap-work}")
+    @Option(names = {"-w", "--workdir"}, paramLabel = "DIR")
     String workdir;
 
     /** The command to run and its arguments; empty when the CLI was started to open a session. */
@@ -51,9 +50,9 @@ final class LaunchOptions {
     /** The launch credential environment is read from here; a scripted stand-in is used in tests. */
     private UnaryOperator<String> env = System::getenv;
 
-    /** The workspace a session starts in. */
+    /** The project a session starts in ({@link ProjectRoot}). */
     Path root() {
-        return Path.of(workdir);
+        return ProjectRoot.resolve(workdir, env, Path.of("").toAbsolutePath());
     }
 
     /** The seed list to reach, or null when this launch does not connect. */

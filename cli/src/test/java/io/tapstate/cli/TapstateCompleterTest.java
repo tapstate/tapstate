@@ -168,9 +168,9 @@ class TapstateCompleterTest {
 
     @Test
     void jlineAdapterOffersFilesForAValidatePathAfterAnOption(@TempDir Path dir) throws Exception {
-        Files.createFile(dir.resolve("workspace.tap.yml"));
+        Files.createFile(dir.resolve("project.tap.yml"));
         assertThat(completeLine("validate -o json " + dir + "/"))
-                .anyMatch(c -> c.contains("workspace.tap.yml"));
+                .anyMatch(c -> c.contains("project.tap.yml"));
     }
 
     @Test
@@ -203,9 +203,9 @@ class TapstateCompleterTest {
 
     @Test
     void jlineAdapterOffersFilesForAValidatePath(@TempDir Path dir) throws Exception {
-        Files.createFile(dir.resolve("workspace.tap.yml"));
+        Files.createFile(dir.resolve("project.tap.yml"));
         assertThat(completeLine("validate " + dir + "/"))
-                .anyMatch(c -> c.contains("workspace.tap.yml"));
+                .anyMatch(c -> c.contains("project.tap.yml"));
     }
 
     private List<String> completeLine(String line) throws IOException {

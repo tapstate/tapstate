@@ -78,7 +78,7 @@ class DemoCmdTest {
         Run again = run("demo", "-w", dir.toString());
 
         assertThat(again.code()).isEqualTo(DemoCmd.EXIT_DIAGNOSTIC);
-        assertThat(again.all()).contains("cli.demo-workspace-exists");
+        assertThat(again.all()).contains("cli.demo-project-exists");
         assertThat(Files.readString(edited))
                 .as("the whole point of the refusal: an edited file survives it")
                 .isEqualTo("# mine now\n");
@@ -127,7 +127,7 @@ class DemoCmdTest {
         Run r = run("demo", "-w", dir.toString());
 
         assertThat(r.code()).isEqualTo(DemoCmd.EXIT_DIAGNOSTIC);
-        assertThat(r.all()).contains("cli.workspace-not-writable");
+        assertThat(r.all()).contains("cli.project-not-writable");
         assertThat(dir.resolve("source/orders_db.tap.yml"))
                 .as("the sources must not survive a failure that came after them")
                 .doesNotExist();
@@ -151,7 +151,7 @@ class DemoCmdTest {
         Run r = run("demo", "-w", dir.toString(), "--force");
 
         assertThat(r.code()).isEqualTo(DemoCmd.EXIT_DIAGNOSTIC);
-        assertThat(r.all()).contains("cli.workspace-not-writable");
+        assertThat(r.all()).contains("cli.project-not-writable");
         assertThat(dir.resolve("source/orders_db.tap.yml"))
                 .as("the refusal came before the first byte, so this was never written")
                 .doesNotExist();
@@ -181,7 +181,7 @@ class DemoCmdTest {
         Run r = run("demo", "-w", dir.toString(), "--force");
 
         assertThat(r.code()).isEqualTo(DemoCmd.EXIT_DIAGNOSTIC);
-        assertThat(r.all()).contains("cli.workspace-not-writable");
+        assertThat(r.all()).contains("cli.project-not-writable");
         assertThat(theirs)
                 .as("it was theirs before the run, so the run may not end with it gone or replaced")
                 .hasContent(mine);
@@ -325,7 +325,7 @@ class DemoCmdTest {
 
         assertThat(again.code()).isEqualTo(DemoCmd.EXIT_DIAGNOSTIC);
         assertThat(again.out()).contains("\"status\": \"error\"")
-                .contains("\"code\": \"cli.demo-workspace-exists\"");
+                .contains("\"code\": \"cli.demo-project-exists\"");
     }
 
     @Test
@@ -335,7 +335,7 @@ class DemoCmdTest {
         Run validated = run("validate", dir.toString());
 
         assertThat(validated.code())
-                .as("a demo workspace that does not validate would send a stranger to a diagnostic on "
+                .as("a demo project that does not validate would send a stranger to a diagnostic on "
                         + "their first command: %s", validated.all())
                 .isZero();
         assertThat(validated.all()).contains("3");

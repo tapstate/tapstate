@@ -483,10 +483,15 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts) {
+        return apply(baseUrl, credential, drafts, null);
+    }
+
+    @Override
+    public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts, String project) {
         try {
             HttpRequest request = authed(baseUrl, "/api/artifacts:apply", credential)
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(applyBody(drafts), StandardCharsets.UTF_8))
+                    .POST(HttpRequest.BodyPublishers.ofString(applyBody(drafts, project), StandardCharsets.UTF_8))
                     .build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
@@ -2008,9 +2013,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * draft carrying {@code expectedContentHash} only when one was given. A draft with no precondition
      * omits the key rather than sending null, so a request that asked for no check stays exactly the shape
      * it has always been — and the published schema refuses properties it does not declare, which a null
-     * would still be one of.
+     * would still be one of. {@code project} is sent only when there is one, for the same reason.
      */
-    private static String applyBody(List<LocalDraft> drafts) {
+    private static String applyBody(List<LocalDraft> drafts, String project) {
         List<Object> array = new ArrayList<>();
         for (LocalDraft draft : drafts) {
             Map<String, Object> d = new LinkedHashMap<>();
@@ -2023,6 +2028,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("drafts", array);
+        if (project != null) {
+            body.put("project", project);
+        }
         return JsonOut.write(body);
     }
 

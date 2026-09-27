@@ -36,7 +36,7 @@ import java.util.concurrent.Callable;
  */
 @Command(name = "ls", mixinStandardHelpOptions = true,
         description = {
-                "List workspace resources by kind, or limit to a single kind.",
+                "List project resources by kind, or limit to a single kind.",
                 "This is the local listing. In a connected session `ls` lists what the server holds"
                         + " instead, and takes no options there yet."})
 final class LsCmd implements Callable<Integer> {

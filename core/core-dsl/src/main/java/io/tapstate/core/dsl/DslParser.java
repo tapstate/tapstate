@@ -1,5 +1,6 @@
 package io.tapstate.core.dsl;
 
+import io.tapstate.core.model.ProjectManifest;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
@@ -100,6 +101,13 @@ public final class DslParser {
             VERSION_FIELD, "kind", "id", METADATA_FIELD, SOURCE_TOKEN, TRANSFORMS_FIELD, "view", SERVE_TOKEN,
             "settings", EXPERIMENTAL_FIELD);
     static final Set<String> METADATA_KEYS = Set.of("labels", "description");
+    /**
+     * A project file names the project and nothing else. Deployment targets, environments and
+     * connection settings are deliberately absent: they belong to the context a project is brought up
+     * with, and a second place to write them would be a second configuration to keep in step.
+     */
+    static final Set<String> PROJECT_KEYS = Set.of(VERSION_FIELD, "kind", "id", METADATA_FIELD);
+    static final Set<String> REQUIRED_PROJECT_KEYS = Set.of("id");
     static final Set<String> SRS_KEYS = Set.of("key", "retention", "schema_evolution", "queryable", "enabled");
     /**
      * The engine options a source accepts. Options are the engine's own configuration, so the key
@@ -171,6 +179,39 @@ public final class DslParser {
     /** Parses one YAML document into its {@link Resource} model. */
     public Resource parse(String yaml) {
         return bind(rootMapping(yaml));
+    }
+
+    /**
+     * Parses a project file ({@code kind: project}) into the identity it declares. A project is not a
+     * resource: it is never sent to a server and holds no pipeline content, so it has its own entry
+     * rather than a place in {@link #parse}. The same version rule and closed-field rule apply to it as
+     * to every other document.
+     */
+    public ProjectManifest parseProject(String yaml) {
+        MappingNode mapping = rootMapping(yaml);
+        YamlMap doc = YamlMap.of(mapping, "");
+        requireSupportedVersion(doc, mapping);
+        String kind = doc.string("kind");
+        if (!ProjectManifest.KIND.equals(kind)) {
+            throw YamlMap.error(DslError.ILLEGAL_VALUE, "kind", mapping,
+                    Map.of("value", kind == null ? "(absent)" : kind, "expected", ProjectManifest.KIND));
+        }
+        doc.requireOnly(PROJECT_KEYS);
+        doc.requirePresent(REQUIRED_PROJECT_KEYS);
+        return new ProjectManifest(idOf(doc), metadata(doc));
+    }
+
+    /**
+     * The kind a document declares, read without validating anything else, or null when the text is not
+     * a mapping carrying a scalar {@code kind}. Lets a directory walk set project files aside before it
+     * parses the rest as resources; it never replaces the parse that follows.
+     */
+    public static String declaredKind(String yaml) {
+        try {
+            return compose(yaml) instanceof MappingNode mapping ? scalarValue(mapping, "kind") : null;
+        } catch (DslException malformed) {
+            return null;
+        }
     }
 
     /**

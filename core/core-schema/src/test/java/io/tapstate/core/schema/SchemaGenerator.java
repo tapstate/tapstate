@@ -2,6 +2,7 @@ package io.tapstate.core.schema;
 
 import io.tapstate.core.model.Doc;
 import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.ProjectManifest;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.YamlFlatten;
 import io.tapstate.core.model.YamlForm;
@@ -121,7 +122,13 @@ final class SchemaGenerator {
         Json anyValue = new Json.Obj(List.of());
         List<Json> branches = new ArrayList<>();
         boolean anyForm = false;
-        for (Class<?> subtype : sealed.getPermittedSubclasses()) {
+        List<Class<?>> members = new ArrayList<>(List.of(sealed.getPermittedSubclasses()));
+        if (sealed == Resource.class) {
+            // A project file sits beside the resources and is written in the same grammar, so an editor
+            // validating every *.tap.yml against this schema has to accept it too. It is not a resource.
+            members.add(ProjectManifest.class);
+        }
+        for (Class<?> subtype : members) {
             Json branch = valueSchemaFor(subtype);
             if (branch.equals(anyValue)) {
                 anyForm = true;
@@ -151,7 +158,7 @@ final class SchemaGenerator {
     private Json recordSchema(Class<?> record) {
         YamlType variant = record.getAnnotation(YamlType.class);
         RecordComponent flattened = flattenedComponent(record);
-        boolean resource = Resource.class.isAssignableFrom(record);
+        boolean resource = Resource.class.isAssignableFrom(record) || record == ProjectManifest.class;
 
         List<Json.Entry> props = new ArrayList<>();
         List<Json> required = new ArrayList<>();
@@ -250,6 +257,9 @@ final class SchemaGenerator {
     }
 
     private static String kindOf(Class<?> resource) {
+        if (resource == ProjectManifest.class) {
+            return ProjectManifest.KIND;
+        }
         String name = resource.getSimpleName();
         String suffix = "Resource";
         String stem = name.endsWith(suffix) ? name.substring(0, name.length() - suffix.length()) : name;

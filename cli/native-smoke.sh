@@ -4,7 +4,7 @@
 #
 # Exercises the GraalVM native-image binary as a black box: it must do the same offline work the
 # JVM build does, with every bundled resource (connector catalog / grammar schema / message catalog /
-# workspace recipes) reachable inside the image and startup under the acceptance budget. JVM unit
+# project recipes) reachable inside the image and startup under the acceptance budget. JVM unit
 # tests cannot catch a missing resource or a reflection gap — only the produced binary can — so this
 # script is the executable spec for native packaging. A final check drives one loopback online round-trip
 # (connect / login / register) so the authenticated HTTP path is proven reachable in the image too.
@@ -288,6 +288,7 @@ if "$BINARY" new sample --yes -w "$SAMPLE_DIR" >/dev/null 2>&1 \
    && [[ -f "$SAMPLE_DIR/source/orders_db.tap.yml" ]] \
    && [[ -f "$SAMPLE_DIR/source/fulfillment_db.tap.yml" ]] \
    && [[ -f "$SAMPLE_DIR/pipeline/order_pipeline.tap.yml" ]] \
+   && [[ -f "$SAMPLE_DIR/project.tap.yml" ]] \
    && "$BINARY" new blank --yes -w "$BLANK_DIR" >/dev/null 2>&1 \
    && [[ -f "$BLANK_DIR/source/example_source.tap.yml" ]] \
    && [[ -f "$BLANK_DIR/pipeline/example_pipeline.tap.yml" ]]; then

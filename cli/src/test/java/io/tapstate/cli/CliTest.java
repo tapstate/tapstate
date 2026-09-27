@@ -372,7 +372,7 @@ class CliTest {
 
     @Test
     void validateMissingPathIsAUsageError() {
-        Run r = run("validate", "/no/such/tapstate/workspace");
+        Run r = run("validate", "/no/such/tapstate/project");
         assertThat(r.code()).isEqualTo(2);
         assertThat(r.err()).containsIgnoringCase("not found");
     }
@@ -394,7 +394,7 @@ class CliTest {
                 "filesystem does not enforce owner-unreadable; skipping IO-fault rendering test");
         Run r = run("validate", dir.toString());
         assertThat(r.code()).isNotZero();
-        assertThat(r.err()).contains("cannot read workspace");
+        assertThat(r.err()).contains("cannot read project");
         assertThat(r.err()).doesNotContain("Exception");   // a clean diagnostic, not a raw stack
     }
 
@@ -428,19 +428,19 @@ class CliTest {
     void validateExplicitPathOverridesTheWorkspaceRoot() {
         // an explicit positional wins over -w: the bogus workspace root is ignored, the path validated
         String explicit = resource("ws-valid").toString();
-        Run r = run("validate", "-w", "/no/such/tapstate/workspace", explicit);
+        Run r = run("validate", "-w", "/no/such/tapstate/project", explicit);
         assertThat(r.code()).isZero();
         assertThat(r.out()).startsWith("valid:");
         // the explicit positional — not the bogus -w root — is the one resolved and echoed
-        assertThat(r.out()).contains(explicit).doesNotContain("/no/such/tapstate/workspace");
+        assertThat(r.out()).contains(explicit).doesNotContain("/no/such/tapstate/project");
     }
 
     @Test
     void validateNoPathReportsTheMissingWorkspaceRoot() {
         // with no positional and a workspace root that does not exist, the missing root is the diagnostic
-        Run r = run("validate", "-w", "/no/such/tapstate/workspace");
+        Run r = run("validate", "-w", "/no/such/tapstate/project");
         assertThat(r.code()).isEqualTo(2);
-        assertThat(r.err()).contains("/no/such/tapstate/workspace");
+        assertThat(r.err()).contains("/no/such/tapstate/project");
         assertThat(r.err()).containsIgnoringCase("not found");
     }
 

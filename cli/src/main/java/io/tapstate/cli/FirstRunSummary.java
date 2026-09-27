@@ -1,5 +1,7 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.model.ProjectManifest;
+
 import java.io.PrintWriter;
 import java.net.URI;
 import java.nio.file.Path;
@@ -10,7 +12,7 @@ import java.util.Map;
 
 /**
  * What {@code new} says once a recipe has written ({@code docs/first-run/README.md}, "What new says
- * afterwards"), in the order a first run reads it: where the workspace is and what every file in it
+ * afterwards"), in the order a first run reads it: where the project is and what every file in it
  * is for, that nothing is running yet, the four things to do next, and the one line handing over to
  * an AI assistant. A recipe the catalog marks not runnable adds one line saying its files are
  * skeletons to fill in.
@@ -24,7 +26,7 @@ import java.util.Map;
  * reported; no existing key moves.
  *
  * <p>What {@code up} says afterwards ({@code docs/first-run/README.md}, "tapstate up") is the same
- * shape with the running things in place of the files: the workspace, one line per pipeline with its
+ * shape with the running things in place of the files: the project, one line per pipeline with its
  * state and one per source, the state, the commands that do the same thing one step at a time, and the
  * handover. Rendered here so the two endings read alike and cannot drift apart.
  */
@@ -38,7 +40,7 @@ final class FirstRunSummary {
     /** The verbs of the next steps, in the order they are printed, as the machine forms name them. */
     static final List<String> NEXT = List.of("validate", "ls", "desc", "up");
 
-    /** What {@code up} reports once the workspace is running, and its machine spelling. */
+    /** What {@code up} reports once the project is running, and its machine spelling. */
     static final String UP_STATE_TEXT = "running";
     static final String UP_STATE = "running";
     /** The same, when there was nothing to do: everything was already applied and running. */
@@ -71,9 +73,9 @@ final class FirstRunSummary {
      *
      * @param nothingToDo whether every stage found its work already done, which the state line says
      */
-    static void upText(PrintWriter o, Path root, List<UpPipeline> pipelines, List<UpSource> sources,
-                       boolean nothingToDo) {
-        o.println("Workspace: " + root);
+    static void upText(PrintWriter o, Path root, String project, boolean declared, List<UpPipeline> pipelines,
+                       List<UpSource> sources, boolean nothingToDo) {
+        o.println("Project: " + project + " (" + root + ")");
         for (UpPipeline pipeline : pipelines) {
             o.println("  pipeline " + pipeline.id() + ": " + pipeline.state() + notes(pipeline.notes()));
         }
@@ -87,6 +89,12 @@ final class FirstRunSummary {
         o.println("  tapstate logs " + pipeline + "  see what it is doing");
         o.println("  tapstate apply / tapstate start  the same thing, one step at a time");
         o.println("  edit any file above, then tapstate up again  it converges");
+        if (!declared) {
+            // Said on every up of such a directory rather than once ever: nothing is written to remember
+            // that it was said, and a hint that has to be stored somewhere is a second file to explain.
+            o.println("Hint: no " + ProjectManifest.FILE_NAME + " here, so this project is named after its "
+                    + "directory. Add one with `id: " + project + "` to keep that name if the directory moves.");
+        }
         o.println(AI_LINE);
     }
 
@@ -96,11 +104,13 @@ final class FirstRunSummary {
     }
 
     /** The structured form of what {@code up} says afterwards: the same facts, none of the prose. */
-    static Map<String, Object> upEnvelope(Path root, List<UpPipeline> pipelines, List<UpSource> sources,
-                                          boolean nothingToDo) {
+    static Map<String, Object> upEnvelope(Path root, String project, List<UpPipeline> pipelines,
+                                          List<UpSource> sources, boolean nothingToDo) {
         Map<String, Object> env = new LinkedHashMap<>();
         env.put("status", "up");
+        // The key keeps its established name for consumers that select it; the project's id is added.
         env.put("workspace", root.toString());
+        env.put("project", project);
         List<Map<String, Object>> lines = new ArrayList<>();
         for (UpPipeline pipeline : pipelines) {
             Map<String, Object> entry = new LinkedHashMap<>();
@@ -134,7 +144,7 @@ final class FirstRunSummary {
      *
      */
     static void text(PrintWriter o, RecipeRun.Result result) {
-        o.println("Workspace: " + result.root());
+        o.println("Project: " + result.root());
         for (RecipeRun.Created file : result.files()) {
             String replaced = !file.replaced() ? ""
                     : "env".equals(file.kind()) || "gitignore".equals(file.kind()) ? " (updated)" : " (replaced)";
@@ -142,7 +152,7 @@ final class FirstRunSummary {
                     : " — assumed " + file.assumed() + "; edit if the table is keyed otherwise";
             o.println("  " + file.name() + "  " + file.role() + replaced + assumed);
         }
-        // A recipe the catalog marks not runnable wrote a starting point, not a working workspace; saying
+        // A recipe the catalog marks not runnable wrote a starting point, not a working project; saying
         // so here is what keeps its files from reading as ready to run.
         if (Recipe.byId(result.recipe()).filter(recipe -> !recipe.runnable()).isPresent()) {
             o.println("  " + SKELETON_LINE);
@@ -150,7 +160,7 @@ final class FirstRunSummary {
         o.println("State: " + STATE_TEXT);
         o.println("Next:");
         o.println("  edit any file above  they are ordinary YAML; the guided commands never hide them");
-        o.println("  tapstate validate  check the workspace without a server");
+        o.println("  tapstate validate  check the project without a server");
         o.println("  tapstate ls / tapstate desc <id>  see what is here and what each file declares");
         o.println("  tapstate up  bring it to running; it asks which server the first time");
         o.println(AI_LINE);

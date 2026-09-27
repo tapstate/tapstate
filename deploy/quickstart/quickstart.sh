@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # tapstate quickstart — brings up the local demo from an empty directory: it downloads the compose stack,
-# the platform's CLI, and the demo connector jars, generates a demo workspace and a .env with a random
+# the platform's CLI, and the demo connector jars, generates a demo project and a .env with a random
 # admin password, then starts the stack and runs a real MySQL -> MongoDB pipeline. Nothing is built.
 #
 # Usage, either form:
@@ -158,7 +158,7 @@ count_embedded_shipments() {
     read_number 'db.order_state.aggregate([{$group:{_id:null,n:{$sum:{$size:{$ifNull:["$shipments",[]]}}}}}]).toArray()[0]?.n ?? 0'
 }
 
-# Generate the demo workspace: two sources on different engines, and the one pipeline that assembles
+# Generate the demo project: two sources on different engines, and the one pipeline that assembles
 # them into a single object. The addresses are compose service names because the connector runs inside
 # the server container, where loopback is the server itself.
 #
@@ -170,8 +170,15 @@ count_embedded_shipments() {
 # The two halves cannot be joined by either database: orders live in MySQL, shipments in PostgreSQL,
 # and neither engine can see the other's table. That is what makes this worth demonstrating - it is not
 # a view and not a join, and no single SQL statement anywhere can produce it.
-generate_workspace() {
+generate_project() {
     mkdir -p work/source work/pipeline
+    # The project file names the directory as one project, so the server groups what it applies from here
+    # under that name. It carries nothing else: where the project runs is decided when it is brought up.
+    cat > work/project.tap.yml <<'YAML'
+version: tapstate/v1
+kind: project
+id: order_demo
+YAML
     cat > work/source/orders_db.tap.yml <<'YAML'
 version: tapstate/v1
 kind: source
@@ -245,7 +252,7 @@ print_next_steps() {
     # printing `rm -rf` on it puts a command that destroys unrelated work in front of someone who has
     # been told, correctly, that everything above was safe to copy.
     if [ "${demo_dir_is_ours:-no}" = yes ]; then
-        removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, workspace, .env)"
+        removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, project, .env)"
     else
         removal_line="  this directory is yours, so nothing here removes it. What the quickstart added:
     tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ .env docker-compose.yml"
@@ -453,10 +460,10 @@ main() {
         printf 'quickstart: generated a random admin password, saved to .env: %s\n' "$admin_pw"
     fi
 
-    # Generate the demo workspace, unless one is already here: a re-run must not clobber edits the user
+    # Generate the demo project, unless one is already here: a re-run must not clobber edits the user
     # made to their resources.
     if [ ! -d work ]; then
-        generate_workspace
+        generate_project
     fi
 
     if [ -n "${TAPSTATE_QUICKSTART_PREPARE_ONLY:-}" ]; then
@@ -509,7 +516,7 @@ main() {
         || die "the first admin was not created in time; inspect it with: docker compose logs bootstrap"
 
     # Drive the online verbs through the REPL, feeding the password on stdin (the login prompt reads the
-    # next line) so it is never a process argument or a shell-history entry. Workspace paths resolve
+    # next line) so it is never a process argument or a shell-history entry. Project paths resolve
     # against work/, so the jars beside it are ../<jar>.
     #
     # Each capture source is applied on its own first, then discovered, then everything is applied. Both

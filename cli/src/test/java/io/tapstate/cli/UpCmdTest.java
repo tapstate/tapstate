@@ -124,7 +124,7 @@ class UpCmdTest {
                 "lifecycle start orders_sync",
                 "status orders_sync");
         assertThat(r.out()).isEqualTo(
-                "Workspace: " + ws + "\n"
+                "Project: " + ws.getFileName() + " (" + ws + ")\n"
                         + """
                           pipeline orders_sync: running
                           source orders_src: applied
@@ -152,7 +152,7 @@ class UpCmdTest {
                 .doesNotContain("lifecycle start orders_sync")
                 .doesNotContain("discoverSchema orders_src");
         assertThat(r.out()).isEqualTo(
-                "Workspace: " + ws + "\n"
+                "Project: " + ws.getFileName() + " (" + ws + ")\n"
                         + """
                           pipeline orders_sync: running (apply: unchanged; start: already running)
                           source orders_src: applied (apply: unchanged; discover: already discovered)
@@ -339,7 +339,7 @@ class UpCmdTest {
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(r.err()).contains(
-                "up: apply workspace failed on orders_sync: actuation.source-schema-not-discovered — "
+                "up: apply project failed on orders_sync: actuation.source-schema-not-discovered — "
                         + "Source `orders_src` needs a discovered schema before its tables can be selected.");
         assertThat(client.calls).contains("apply[pipeline,source]").doesNotContain("lifecycle start orders_sync");
     }
@@ -360,7 +360,7 @@ class UpCmdTest {
         // with a dangling-reference diagnostic naming the source it was just handed.
         assertThat(client.applied).hasSize(2);
         assertThat(client.applied.get(1).stream().map(LocalDraft::source))
-                .as("the workspace apply batch")
+                .as("the project apply batch")
                 .contains("source/orders_src.tap.yml", "pipeline/orders_sync.tap.yml");
     }
 
@@ -422,7 +422,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.workspace-has-no-pipeline")
+        assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.project-has-no-pipeline")
                 .contains("tapstate new");
         // Nothing beyond the connect's own probe: the workspace is read before the server is asked anything.
         assertThat(client.calls).containsExactly("isHealthy");
@@ -443,7 +443,7 @@ class UpCmdTest {
             Run r = up(home, client, "up", "-w", ws.toString());
 
             assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-            assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.workspace-unreadable")
+            assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.project-unreadable")
                     .contains(pipelines.toString());
             assertThat(client.calls).containsExactly("isHealthy");
             assertThat(r.out()).isEmpty();
@@ -565,7 +565,7 @@ class UpCmdTest {
                 .contains("\"next\": [")
                 .doesNotContain("Next:")
                 .doesNotContain("An AI assistant")
-                .doesNotContain("Workspace:");
+                .doesNotContain("Project:");
     }
 
     @Test
@@ -600,7 +600,7 @@ class UpCmdTest {
                 .contains("Usage: tapstate up")
                 .contains(Cli.VERB_HELP.get("up").summary())
                 .contains("preflight").contains("apply sources").contains("discover")
-                .contains("apply workspace").contains("start")
+                .contains("apply project").contains("start")
                 .contains("--server").contains("--yes");
     }
 

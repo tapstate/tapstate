@@ -10,7 +10,8 @@ import java.util.Map;
  * <p>The model represents the {@code tapstate/v1} grammar only — {@code version} is a
  * constant of the contract, not a field of the model.
  */
-@Doc("A top-level tapstate/v1 resource; one document holds exactly one of source, pipeline, transform, view or serve.")
+@Doc("A top-level tapstate/v1 document; one document holds exactly one of source, pipeline, transform, view or serve, "
+        + "or is the project file that names a project.")
 public sealed interface Resource
         permits SourceResource, PipelineResource, TransformResource, ViewResource, ServeResource {
 

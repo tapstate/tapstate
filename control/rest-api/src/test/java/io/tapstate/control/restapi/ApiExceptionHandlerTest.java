@@ -163,6 +163,12 @@ class ApiExceptionHandlerTest {
         assertThat(inUse.getBody().params()).containsEntry("referrers", List.of("pl1", "pl2"));
         assertThat(inUse.getBody().message()).isNotBlank().isNotEqualTo("artifact.in-use");
 
+        ResponseEntity<ApiError> taken = handler.handle(new TapstateException(
+                ArtifactError.PROJECT_ID_TAKEN,
+                Map.of("id", "customer_360", "kind", "pipeline", "owner", "crm_pilot", "project", "bank_c360"), null));
+        assertThat(taken.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(taken.getBody().params()).containsEntry("owner", "crm_pilot");
+
         ResponseEntity<ApiError> running = handler.handle(new TapstateException(
                 ArtifactError.PIPELINE_NOT_STOPPED,
                 Map.of("id", "pl1", "actual", "RUNNING", "desired", "RUNNING"), null));

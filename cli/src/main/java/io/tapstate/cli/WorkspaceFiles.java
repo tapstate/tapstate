@@ -66,7 +66,7 @@ final class WorkspaceFiles {
         } catch (IOException cannotRead) {
             // Refused before anything is written: a file that cannot be read cannot be extended either.
             String reason = cannotRead.getMessage() == null ? cannotRead.getClass().getSimpleName() : cannotRead.getMessage();
-            throw new TapstateException(CliError.WORKSPACE_NOT_WRITABLE,
+            throw new TapstateException(CliError.PROJECT_NOT_WRITABLE,
                     Map.of("path", file.toString(), "reason", reason), null);
         }
     }

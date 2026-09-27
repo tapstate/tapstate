@@ -19,8 +19,8 @@ import java.util.List;
 final class GuidedNew {
 
     static final String OPENING_LINE =
-            "Building a workspace: a directory of .tap.yml files you can read and edit.";
-    static final String RECIPE_QUESTION = "What is this workspace for?";
+            "Building a project: a directory of .tap.yml files you can read and edit.";
+    static final String RECIPE_QUESTION = "What is this project for?";
 
     private final Prompter prompter;
     private final PrintWriter prose;

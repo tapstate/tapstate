@@ -12,7 +12,7 @@ record ContextConfig(
         int version,
         String lastContext,
         Map<String, ContextDefinition> contexts,
-        Map<String, String> workspaceBindings) {
+        Map<String, String> projectBindings) {
 
     static final int CURRENT_VERSION = 1;
 
@@ -21,8 +21,8 @@ record ContextConfig(
             throw new IllegalArgumentException("configuration must use the current schema version");
         }
         contexts = Map.copyOf(new LinkedHashMap<>(Objects.requireNonNull(contexts, "contexts")));
-        workspaceBindings = Map.copyOf(new LinkedHashMap<>(
-                Objects.requireNonNull(workspaceBindings, "workspaceBindings")));
+        projectBindings = Map.copyOf(new LinkedHashMap<>(
+                Objects.requireNonNull(projectBindings, "projectBindings")));
         if (lastContext != null && !contexts.containsKey(lastContext)) {
             throw new IllegalArgumentException("lastContext must name an existing context");
         }
@@ -38,13 +38,13 @@ record ContextConfig(
                 throw new IllegalArgumentException("authRef values must be unique");
             }
         }
-        for (Map.Entry<String, String> entry : workspaceBindings.entrySet()) {
+        for (Map.Entry<String, String> entry : projectBindings.entrySet()) {
             Path path = Path.of(entry.getKey());
             if (!path.isAbsolute() || !path.normalize().equals(path)) {
-                throw new IllegalArgumentException("workspace binding keys must be normalized absolute paths");
+                throw new IllegalArgumentException("project binding keys must be normalized absolute paths");
             }
             if (!contexts.containsKey(entry.getValue())) {
-                throw new IllegalArgumentException("workspace binding must name an existing context");
+                throw new IllegalArgumentException("project binding must name an existing context");
             }
         }
     }
