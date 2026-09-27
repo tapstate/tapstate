@@ -7,6 +7,7 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.migration.MigrationRunner;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.SrsLogRecord;
 import org.bson.Document;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -43,6 +45,10 @@ class ManagedAtlasMetadataIT {
         String metadataDatabase = "ts_plan_metadata_" + suffix;
         String operatorDatabase = "ts_plan_operator_" + suffix;
         String metadataUri = inDatabase(baseUri, metadataDatabase);
+        byte[] connectorBytes = "plan-only-connector-bytes".getBytes(StandardCharsets.UTF_8);
+        Instant sampleAt = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        RateSample sample = new RateSample("metadata_probe_pipeline", sampleAt,
+                Map.of("records.out", 2L), Map.of("probe", 0L), sampleAt.minusSeconds(60));
         String cleanupUri = System.getenv("TAPSTATE_ATLAS_CLEANUP_URI");
         if (cleanupUri == null || cleanupUri.isBlank()) {
             cleanupUri = baseUri;
@@ -61,7 +67,8 @@ class ManagedAtlasMetadataIT {
                     port.keyedState().save("nest.metadata_probe_pipeline", "key",
                             "cold-state".getBytes(StandardCharsets.UTF_8));
                     port.connectors().register("mongodb-atlas", "2.0.5-SNAPSHOT", RegistrationSource.SEED,
-                            "plan-only-connector-bytes".getBytes(StandardCharsets.UTF_8));
+                            connectorBytes);
+                    port.rateHistory().append(sample);
                     port.srsLog().store("metadata-probe-ring", 1L,
                             new SrsLogRecord("resume-token", Op.INSERT, 1L, null,
                                     Map.of("id", 1), 0L));
@@ -78,6 +85,11 @@ class ManagedAtlasMetadataIT {
                             .hasValueSatisfying(bytes -> assertThat(bytes)
                                     .isEqualTo("cold-state".getBytes(StandardCharsets.UTF_8)));
                     assertThat(port.connectors().list()).hasSize(1);
+                    assertThat(port.connectors().artifact(port.connectors().list().get(0).contentHash()))
+                            .hasValueSatisfying(bytes -> assertThat(bytes).isEqualTo(connectorBytes));
+                    assertThat(port.rateHistory().readPage("metadata_probe_pipeline",
+                            sampleAt.minusSeconds(1), sampleAt.plusSeconds(1), null, 2).entries())
+                            .extracting(entry -> entry.sample()).containsExactly(sample);
                     assertThat(port.srsLog().load("metadata-probe-ring", 1L))
                             .hasValueSatisfying(record -> assertThat(record.srcToken()).isEqualTo("resume-token"));
                     assertThat(expirySeconds(reopened.database())).isEqualTo(1_800L);
@@ -85,6 +97,8 @@ class ManagedAtlasMetadataIT {
                     MongoDatabase metadata = reopened.database();
                     assertThat(metadata.getCollection(MongoStorePort.ARTIFACTS).countDocuments()).isEqualTo(1);
                     assertThat(metadata.getCollection(MongoStorePort.SRS_LOG).countDocuments()).isEqualTo(1);
+                    assertThat(metadata.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY).countDocuments())
+                            .isEqualTo(1);
                     assertThat(metadata.getCollection(MongoStorePort.CONNECTOR_ARTIFACTS + ".files")
                             .countDocuments()).isEqualTo(1);
                     assertThat(metadata.getCollection(MongoStorePort.OPERATOR_STATE).countDocuments()).isZero();
