@@ -5,10 +5,8 @@ import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
 
 /**
- * The seam by which the capture coordinator starts one source run and gets back a live handle. Its production
- * binding is the capture run unit's {@code begin}; keeping it a seam lets the coordinator's handle-lifecycle
- * logic be driven without a running Jet member. The signature matches the run unit exactly, so the binding is
- * a plain method reference.
+ * The seam by which a test coordinator starts one source run and gets back a live handle. Production uses
+ * {@link CaptureAttacher} so another pipeline can read its own load without opening a second change tail.
  */
 @FunctionalInterface
 interface CaptureStarter {

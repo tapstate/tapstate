@@ -6,10 +6,16 @@ import io.tapstate.runtime.srs.CaptureRunSpec;
 
 /**
  * Starts a source attachment, optionally including the one shared tail for its capture identity. The run may
- * be handed back while its load is still being read.
+ * be handed back while its load is still being read. This subtype makes an attachment-capable coordinator
+ * constructor win over the starter-only constructor for an overloaded run-unit method reference.
  */
 @FunctionalInterface
-interface CaptureAttacher {
+interface CaptureAttacher extends CaptureStarter {
 
     CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail);
+
+    @Override
+    default CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff) {
+        return start(spec, handoff, true);
+    }
 }
