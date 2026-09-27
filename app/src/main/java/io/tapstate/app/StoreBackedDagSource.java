@@ -666,9 +666,12 @@ final class StoreBackedDagSource implements DagSource {
                 published.put(stream, publishedAs(base, produced, atTheSource(pipelineId, stream,
                         sourceVertices)));
             } else if (produced != null) {
-                // Unknown lineage cannot preserve source attributes or secondary uniqueness.
+                // Unknown lineage cannot preserve source attributes or secondary uniqueness. A decimal
+                // type token also declares bounds, so it cannot survive a script that may replace it.
                 published.put(stream, TargetModelResolver.keyedOn(new TargetTable(base.name(), base.fields().stream()
-                        .map(field -> new TargetField(field.name(), field.type(), field.primaryKey(), field.inferredType()))
+                        .map(field -> new TargetField(field.name(),
+                                field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL
+                                        ? null : field.type(), field.primaryKey(), field.inferredType()))
                         .toList(), List.of()), base.fields().stream().filter(TargetField::primaryKey)
                         .map(TargetField::name).toList()));
             }

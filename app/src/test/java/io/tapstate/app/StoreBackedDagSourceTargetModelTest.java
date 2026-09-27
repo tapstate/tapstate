@@ -147,6 +147,41 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
+    void aScriptThatWidensADecimalCannotPublishTheSourcesDeclaredRange() {
+        String script = "function process(r, ctx) { r.after.amount = 100000000.00; return r; }";
+        var sourceValue = new java.math.BigDecimal("1.00");
+        var output = io.tapstate.adapters.transform.StatelessTransforms.js(script)
+                .transform(io.tapstate.core.event.Envelope.insert(1L, "orders",
+                        new LinkedHashMap<>(Map.of("id", 1L, "amount", sourceValue)), null))
+                .getFirst().after().get("amount");
+        assertThat(new java.math.BigDecimal(output.toString()))
+                .isGreaterThan(new java.math.BigDecimal("99999999.99"));
+
+        InMemoryStorePort store = seededPipeline();
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("scripted", FromClause.list(FromRef.literal("orders_src")),
+                        new TransformBody.Js(script), null)), null,
+                new ServeBlock.Inline(null, FromRef.literal("scripted"),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)), null, null),
+                null, null));
+        var decimal = new io.tapstate.core.common.NumericType(null, true, null, null,
+                new java.math.BigDecimal("-99999999.99"), new java.math.BigDecimal("99999999.99"), 10, 2);
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT", io.tapstate.core.common.TapstateType.INT64),
+                new SourceField("amount", "decimal(10,2)", io.tapstate.core.common.TapstateType.DECIMAL,
+                        null, decimal)), List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        TargetField amount = bound.getFirst().fields().stream()
+                .filter(field -> field.name().equals("amount")).findFirst().orElseThrow();
+        assertThat(amount.inferredType()).isEqualTo(io.tapstate.core.common.TapstateType.DECIMAL);
+        assertThat(amount.numericType()).isNull();
+        assertThat(amount.type()).isNull();
+    }
+
+    @Test
     void a_view_target_is_keyed_by_the_source_tables_that_reach_it() {
         // The sink resolves a target by the table the row came from, so a view - which collapses every
         // upstream table into one collection - must answer to each of those table names. Keyed by the
