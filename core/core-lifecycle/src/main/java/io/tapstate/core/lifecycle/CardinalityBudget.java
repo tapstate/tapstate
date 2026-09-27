@@ -61,6 +61,10 @@ public enum CardinalityBudget {
             Fold.ADDED),
     /** Broken down by stage only, and the stages are a closed set: nothing here can grow, so nothing folds. */
     PROCESS_DURATION("tapstate.pipeline.process.duration", null, Stage.values().length, Fold.ADDED),
+    /** Job queue readings have only the pipeline id; Jet vertex and processor tags are summed locally. */
+    PIPELINE_QUEUE_DEPTH("tapstate.pipeline.queue.depth", null, 1, Fold.ADDED),
+    PIPELINE_QUEUE_CAPACITY("tapstate.pipeline.queue.capacity", null, 1, Fold.ADDED),
+    PIPELINE_QUEUE_HIGH_WATER("tapstate.pipeline.queue.high_water", null, 1, Fold.HIGHEST),
     /** Each sink fact has only the stable pipeline id as a point attribute. */
     SINK_BATCH_ISSUED("tapstate.pipeline.sink.batch.issued", null, 1, Fold.ADDED),
     SINK_BATCH_RECORDS("tapstate.pipeline.sink.batch.records", null, 1, Fold.ADDED),

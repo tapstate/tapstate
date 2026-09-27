@@ -13,10 +13,11 @@ import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.NestStateReading;
+import io.tapstate.core.lifecycle.QueueReading;
+import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
-import io.tapstate.core.lifecycle.SinkBatchReading;
-import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
 import io.tapstate.runtime.engine.nest.NestMemoryBudget;
@@ -28,8 +29,9 @@ import io.tapstate.spi.store.OperatorStateStores;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.List;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -62,6 +64,9 @@ public final class Engine {
      */
     private static final Duration PREVIOUS_RUN_BUDGET = Duration.ofSeconds(30);
 
+    /** A fixed ceiling on high-water accounts, including recently stopped jobs. */
+    private static final int MAX_QUEUE_ACCOUNTS = 4096;
+
     private final HazelcastInstance member;
 
     /**
@@ -69,6 +74,8 @@ public final class Engine {
      * that keeps its state in memory alone, where what is in memory is all there is.
      */
     private final OperatorStateStores operatorStateStores;
+
+    private final Map<String, QueueAccount> queueAccounts = new LinkedHashMap<>(16, 0.75f, true);
 
     public Engine(HazelcastInstance member) {
         this(member, (OperatorStateStores) null);
@@ -211,6 +218,15 @@ public final class Engine {
         Job job = liveJob(pipelineId);
         if (job != null) {
             job.cancel();
+        }
+        synchronized (queueAccounts) {
+            if (job == null) {
+                queueAccounts.remove(pipelineId);
+            } else {
+                // Cancellation is asynchronous: a final metrics fetch can still see this job as live.
+                queueAccounts.put(pipelineId, new QueueAccount(job.getId(), "", 0, Long.MAX_VALUE, true));
+                trimQueueAccounts();
+            }
         }
         JobFailureRegistry.of(member).clear(pipelineId);
     }
@@ -573,6 +589,118 @@ public final class Engine {
     public SinkBatchReading sinkBatchReading(String pipelineId) {
         Job job = liveJob(pipelineId);
         return job == null ? SinkBatchReading.NONE : sinkBatchReadingIn(job.getMetrics());
+    }
+
+    /**
+     * The live job's measured input queues. A job with no queued work since this execution began reports
+     * absence: zero would make an unwired metric look healthy. The peak is sampled, not an exact Jet peak,
+     * and is kept only for the current job and execution in a fixed-size process account.
+     */
+    public Optional<QueueReading> queueReading(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) {
+            synchronized (queueAccounts) {
+                QueueAccount previous = queueAccounts.get(pipelineId);
+                if (previous != null && !previous.cancelled()) {
+                    queueAccounts.remove(pipelineId);
+                }
+            }
+            return Optional.empty();
+        }
+        Optional<QueueSample> sampled = queueSampleIn(job.getMetrics(), job.getIdString());
+        if (sampled.isEmpty()) {
+            return Optional.empty();
+        }
+        QueueSample sample = sampled.get();
+        synchronized (queueAccounts) {
+            QueueAccount previous = queueAccounts.get(pipelineId);
+            if (previous != null && previous.cancelled() && previous.jobId() == job.getId()) {
+                return Optional.empty();
+            }
+            if (previous != null && !previous.cancelled() && previous.sampledAt() > sample.sampledAt()) {
+                return Optional.empty();
+            }
+            long highWater = previous != null && previous.jobId() == job.getId()
+                    && previous.executionId().equals(sample.executionId())
+                    ? Math.max(previous.highWater(), sample.depth()) : sample.depth();
+            queueAccounts.put(pipelineId, new QueueAccount(job.getId(), sample.executionId(), highWater,
+                    sample.sampledAt(), false));
+            trimQueueAccounts();
+            return highWater == 0 ? Optional.empty()
+                    : Optional.of(new QueueReading(sample.depth(), sample.capacity(), highWater));
+        }
+    }
+
+    private void trimQueueAccounts() {
+        if (queueAccounts.size() > MAX_QUEUE_ACCOUNTS) {
+            queueAccounts.remove(queueAccounts.keySet().iterator().next());
+        }
+    }
+
+    private record QueueAccount(long jobId, String executionId, long highWater, long sampledAt,
+            boolean cancelled) {
+    }
+
+    private record QueueKey(String member, String vertex, String processor) {
+    }
+
+    private record QueueValue(long value, long timestamp) {
+    }
+
+    record QueueSample(String executionId, long depth, long capacity, long sampledAt) {
+    }
+
+    /** Pairs size and capacity from the same processor of one job execution before adding them. */
+    static Optional<QueueSample> queueSampleIn(JobMetrics collected, String jobId) {
+        Map<QueueKey, QueueValue> sizes = new HashMap<>();
+        Map<QueueKey, QueueValue> capacities = new HashMap<>();
+        String executionId = null;
+        for (String metric : List.of(MetricNames.QUEUES_SIZE, MetricNames.QUEUES_CAPACITY)) {
+            Map<QueueKey, QueueValue> into = metric.equals(MetricNames.QUEUES_SIZE) ? sizes : capacities;
+            for (Measurement measurement : collected.get(metric)) {
+                if (!jobId.equals(measurement.tag(MetricTags.JOB)) || measurement.value() < 0) {
+                    continue;
+                }
+                String execution = measurement.tag(MetricTags.EXECUTION);
+                String member = measurement.tag(MetricTags.MEMBER);
+                String vertex = measurement.tag(MetricTags.VERTEX);
+                String processor = measurement.tag(MetricTags.PROCESSOR);
+                if (execution == null || member == null || vertex == null || processor == null) {
+                    continue;
+                }
+                if (executionId != null && !executionId.equals(execution)) {
+                    return Optional.empty();
+                }
+                executionId = execution;
+                QueueKey key = new QueueKey(member, vertex, processor);
+                QueueValue previous = into.get(key);
+                if (previous == null || measurement.timestamp() >= previous.timestamp()) {
+                    into.put(key, new QueueValue(measurement.value(), measurement.timestamp()));
+                }
+            }
+        }
+        if (executionId == null || sizes.isEmpty() || capacities.isEmpty()) {
+            return Optional.empty();
+        }
+        long depth = 0;
+        long capacity = 0;
+        long sampledAt = 0;
+        for (Map.Entry<QueueKey, QueueValue> sized : sizes.entrySet()) {
+            QueueValue capped = capacities.get(sized.getKey());
+            if (capped == null || capped.value() == 0) {
+                continue;
+            }
+            if (sized.getValue().value() > capped.value()
+                    || Long.MAX_VALUE - depth < sized.getValue().value()
+                    || Long.MAX_VALUE - capacity < capped.value()) {
+                return Optional.empty();
+            }
+            depth += sized.getValue().value();
+            capacity += capped.value();
+            sampledAt = Math.max(sampledAt, Math.max(sized.getValue().timestamp(), capped.timestamp()));
+        }
+        return capacity == 0 ? Optional.empty()
+                : Optional.of(new QueueSample(executionId, depth, capacity, sampledAt));
     }
 
     /** Reassembles only complete batch counts; a job without a submitted batch reports nothing. */

@@ -13,6 +13,7 @@ import com.hazelcast.jet.JetService;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SinkBatchReading;
+import io.tapstate.core.lifecycle.QueueReading;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
@@ -24,6 +25,7 @@ import io.tapstate.runtime.scheduler.ObservationPublisher;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -112,5 +114,31 @@ class AssemblyObservationPublisherTest {
             assertThat(fact.name()).isEqualTo("tapstate.pipeline.sink.batch.pending");
             assertThat(fact.points().getFirst().value()).isEqualTo(1L);
         });
+    }
+
+    @Test
+    void projectsOnlyMeasuredInputQueuePressureFromTheEnginePort() {
+        InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
+        store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
+        Engine engine = mock(Engine.class);
+        when(engine.queueReading(PIPELINE)).thenReturn(Optional.of(new QueueReading(64, 64, 64)));
+
+        ObservationPublisher publisher = new RuntimeConvergenceConfiguration()
+                .observationPublisher(store, engine, new NoOpCaptureCoordinator());
+        publisher.publish(PIPELINE);
+
+        Observation observed = store.observations().read(PIPELINE).orElseThrow();
+        assertThat(observed.facts().stream().filter(fact -> fact.name().startsWith("tapstate.pipeline.queue.")))
+                .extracting(fact -> fact.name()).containsExactlyInAnyOrder(
+                        "tapstate.pipeline.queue.depth", "tapstate.pipeline.queue.capacity",
+                        "tapstate.pipeline.queue.high_water");
+        assertThat(observed.facts().stream().filter(fact -> fact.name().startsWith("tapstate.pipeline.queue.")))
+                .allSatisfy(fact -> {
+                    assertThat(fact.unit()).isEqualTo("{item}");
+                    assertThat(fact.points()).singleElement().satisfies(point -> {
+                        assertThat(point.attributes()).isEqualTo(Map.of("tapstate.pipeline.id", PIPELINE));
+                        assertThat(point.value()).isEqualTo(64L);
+                    });
+                });
     }
 }

@@ -110,6 +110,7 @@ class RuntimeConvergenceConfiguration {
                 // units of work; a run that has timed nothing yet reports nothing rather than a stage at zero.
                 engine::stageDurations,
                 engine::sinkBatchReading,
+                engine::queueReading,
                 Clock.systemUTC());
     }
 

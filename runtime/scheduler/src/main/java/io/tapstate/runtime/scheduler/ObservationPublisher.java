@@ -17,9 +17,10 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.QueueReading;
+import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.StageReading;
-import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
@@ -182,6 +183,9 @@ public final class ObservationPublisher {
      * of the ring by a source.
      */
     private static final String PROCESS_DURATION_METRIC = "tapstate.pipeline.process.duration";
+    private static final String QUEUE_DEPTH_METRIC = "tapstate.pipeline.queue.depth";
+    private static final String QUEUE_CAPACITY_METRIC = "tapstate.pipeline.queue.capacity";
+    private static final String QUEUE_HIGH_WATER_METRIC = "tapstate.pipeline.queue.high_water";
     private static final String SINK_BATCH_ISSUED_METRIC = "tapstate.pipeline.sink.batch.issued";
     private static final String SINK_BATCH_RECORDS_METRIC = "tapstate.pipeline.sink.batch.records";
     private static final String SINK_BATCH_RECORDS_MAX_METRIC = "tapstate.pipeline.sink.batch.records.max";
@@ -376,6 +380,7 @@ public final class ObservationPublisher {
     private final Function<String, DeliveryReading> deliveries;
     private final Function<String, StageReading> stages;
     private final Function<String, SinkBatchReading> sinkBatches;
+    private final Function<String, Optional<QueueReading>> queues;
     private final FrontierStallWatch frontierStall;
     private final NestColdLayerWatch coldLayer;
     private final Clock clock;
@@ -683,10 +688,34 @@ public final class ObservationPublisher {
             Function<String, StageReading> stages,
             Function<String, SinkBatchReading> sinkBatches,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, stages, sinkBatches, id -> Optional.empty(), clock);
+    }
+
+    /** The full publisher, also consuming measured input queues from a live Jet job. */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries,
+            Function<String, StageReading> stages,
+            Function<String, SinkBatchReading> sinkBatches,
+            Function<String, Optional<QueueReading>> queues,
+            Clock clock) {
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
         this.stages = Objects.requireNonNull(stages, "stages");
         this.sinkBatches = Objects.requireNonNull(sinkBatches, "sinkBatches");
+        this.queues = Objects.requireNonNull(queues, "queues");
         this.clock = Objects.requireNonNull(clock, "clock");
         // Read from the injected clock and not the system one, so a test that drives time can say what
         // the failure counter accumulates from instead of asserting against whenever it happened to run.
@@ -1046,6 +1075,7 @@ public final class ObservationPublisher {
                 .forEach(facts::add);
         spent(pipelineId, at, stages.apply(pipelineId)).ifPresent(facts::add);
         sinkBatchFacts(pipelineId, at, sinkBatches.apply(pipelineId)).forEach(facts::add);
+        queues.apply(pipelineId).ifPresent(reading -> queueFacts(pipelineId, at, reading).forEach(facts::add));
         load(pipelineId, at, loaded).forEach(facts::add);
         return facts;
     }
@@ -1097,6 +1127,18 @@ public final class ObservationPublisher {
                     MetricPoint.distribution(attributes, since, at, reading.backpressureDuration())));
         }
         return facts;
+    }
+
+    /** Queue pressure is a pipeline total; Jet's dynamic vertex and processor tags stay local. */
+    private static List<MetricFact> queueFacts(String pipelineId, Instant at, QueueReading reading) {
+        Map<String, String> attributes = Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId);
+        return List.of(
+                MetricFact.single(QUEUE_DEPTH_METRIC, MetricType.GAUGE, "{item}",
+                        MetricPoint.reading(attributes, at, reading.depth())),
+                MetricFact.single(QUEUE_CAPACITY_METRIC, MetricType.GAUGE, "{item}",
+                        MetricPoint.reading(attributes, at, reading.capacity())),
+                MetricFact.single(QUEUE_HIGH_WATER_METRIC, MetricType.GAUGE, "{item}",
+                        MetricPoint.reading(attributes, at, reading.highWater())));
     }
 
     /**
