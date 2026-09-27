@@ -302,6 +302,30 @@ class CaptureOwnershipTest {
     }
 
     @Test
+    void anAttachedPipelinesOwnFailureIsVisibleWhileTheSharedTailIsHealthy() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p", "q"));
+        RuntimeException failedLoad = new RuntimeException("q's load failed");
+        CaptureAttacher attacher = (spec, handoff, startTail) -> {
+            CaptureHealth health = new CaptureHealth();
+            if (!startTail) {
+                health.fail(failedLoad);
+            }
+            return new CaptureRun(Optional.empty(), false, 0L, Optional.empty(),
+                    Optional.of(() -> { }), health);
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+        coordinator.startCapture("q");
+
+        assertThat(coordinator.captureFailure("p")).isEmpty();
+        assertThat(coordinator.captureFailure("q")).containsSame(failedLoad);
+        coordinator.stopCapture("p", false);
+        coordinator.stopCapture("q", false);
+    }
+
+    @Test
     void theReadFaceNamesTheSameCaptureTheRunningCoordinatorClaimed() {
         // The topology says who owns a pipeline's captures, and it works the identities out from the
         // stored contract rather than asking whoever is running them -- so that every member answers the

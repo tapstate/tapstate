@@ -54,8 +54,8 @@ import org.slf4j.LoggerFactory;
 /**
  * The store-backed capture coordinator: it resolves a pipeline and the sources it reads from the store,
  * attaches every pipeline to its source contract and holds the live handles so a stop can tear them down.
- * In cluster mode, one CAPTURE claim owns the shared tail for a normalized source/read contract; later local
- * pipelines attach to that tail without opening the source again, and another member cannot cross the claim.
+ * One local run owns the shared tail for a normalized source/read contract; later local pipelines attach
+ * without opening the source again. In cluster mode, a CAPTURE claim prevents another member from tailing it.
  * The claim decides who tails a source and nothing about how a pipeline reads it: a pipeline driven by a
  * member that does not hold the claim attaches there exactly as it would beside the tail -- its own load
  * where its record says one is owed, then the changes the holder's tail writes into the shared ring.
@@ -122,6 +122,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         this.managedOwnership = false;
         this.srsCoordinator = Objects.requireNonNull(srsCoordinator, "srsCoordinator");
         this.snapshotBuffer = Objects.requireNonNull(snapshotBuffer, "snapshotBuffer");
+    }
+
+    /** A single member shares its tails locally, without a cluster claim or lease renewal. */
+    StoreBackedPipelineCaptureCoordinator(
+            StorePort storePort, CaptureAttacher captureAttacher, SrsCoordinator srsCoordinator,
+            SnapshotBuffer snapshotBuffer) {
+        this(storePort, captureAttacher, srsCoordinator, snapshotBuffer,
+                CaptureOwnership.single(), Duration.ZERO);
     }
 
     StoreBackedPipelineCaptureCoordinator(
@@ -1175,9 +1183,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // dead tail becomes a failure the converge loop drives to the observable FAILED state rather than an
         // engine job that stays running over a ring gone quiet.
         return runs.stream()
-                .map(run -> run.managed && ownedCaptures.containsKey(run.captureId)
-                        ? ownedCaptures.get(run.captureId).run.failure()
-                        : run.run.failure())
+                .map(run -> {
+                    Optional<Throwable> ownFailure = run.run.failure();
+                    if (ownFailure.isPresent()) {
+                        return ownFailure;
+                    }
+                    OwnedCapture shared = run.managed ? ownedCaptures.get(run.captureId) : null;
+                    return shared == null ? Optional.<Throwable>empty() : shared.run.failure();
+                })
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .findFirst();
