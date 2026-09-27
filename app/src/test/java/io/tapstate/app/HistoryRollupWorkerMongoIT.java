@@ -1,9 +1,21 @@
 package io.tapstate.app;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.MongoHistoryRollupStore;
+import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.spi.store.HistoryRollupStore.Bucket;
 import io.tapstate.spi.store.HistoryRollupStore.Key;
@@ -23,6 +35,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -239,6 +252,54 @@ class HistoryRollupWorkerMongoIT {
                         .as("the successor closes every %s bucket without losing the old owner's first", resolution)
                         .hasSize(expected);
             }
+        }
+    }
+
+    @Test
+    void rawSamplingDoesNotSynchronouslyWriteAnyRollupLevel() {
+        String databaseName = "history_raw_append_cost_it";
+        List<String> writes = new CopyOnWriteArrayList<>();
+        CommandListener listener = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if (databaseName.equals(event.getDatabaseName())
+                        && List.of("insert", "update").contains(event.getCommandName())) {
+                    writes.add(event.getCommand().getString(event.getCommandName()).getValue());
+                }
+            }
+        };
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl(databaseName)))
+                .addCommandListener(listener).build();
+        try (MongoClient client = MongoClients.create(settings)) {
+            MongoDatabase database = client.getDatabase(databaseName);
+            database.drop();
+            var raw = new MongoRateHistoryStore(database,
+                    database.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY), Duration.ofDays(15));
+            var rollups = new MongoHistoryRollupStore(database,
+                    database.getCollection(MongoStorePort.PIPELINE_HISTORY_ROLLUPS), Duration.ofDays(15));
+            RateSampler sampler = new RateSampler(raw, Duration.ofMinutes(1));
+            Instant start = Instant.parse("2026-09-27T12:00:00Z");
+            ObservationStore.Scope execution = new ObservationStore.Scope("inc-cost", 1);
+            writes.clear();
+
+            for (int minute = 0; minute < 3; minute++) {
+                Observation frame = new Observation("orders", PipelineState.RUNNING,
+                        Map.of("records.out", minute * 10L), Map.of(), Map.of(), null,
+                        start.plus(Duration.ofMinutes(minute)));
+                assertThat(sampler.appendIfDue(frame, execution)).isTrue();
+            }
+            assertThat(writes).containsExactly(MongoStorePort.PIPELINE_RATE_HISTORY,
+                    MongoStorePort.PIPELINE_RATE_HISTORY, MongoStorePort.PIPELINE_RATE_HISTORY);
+
+            try (HistoryRollupWorker worker = new HistoryRollupWorker(raw, rollups,
+                    Clock.fixed(start.plus(Duration.ofMinutes(6)), ZoneOffset.UTC), Duration.ofMinutes(1),
+                    1, Duration.ofSeconds(5),
+                    () -> List.of(new HistoryRollupWorker.Work("orders", Scope.incarnation("inc-cost"))),
+                    ignored -> true, false)) {
+                worker.runOneBatch();
+            }
+            assertThat(writes).contains(MongoStorePort.PIPELINE_HISTORY_ROLLUPS);
         }
     }
 

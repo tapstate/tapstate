@@ -93,6 +93,74 @@ class LateRawSampleRollupMongoIT {
         }
     }
 
+    @Test
+    void lateResetAndGapBecomeVisibleAfterExpiryAndSurviveARealMongoRefresh() {
+        Instant start = Instant.parse("2026-09-27T11:00:00Z");
+        MutableClock clock = new MutableClock(start.plus(Duration.ofMinutes(6)));
+        try (MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
+                MONGO.getReplicaSetUrl("late_reset_gap_rollup_it"), null, Duration.ofSeconds(5)))) {
+            connection.verify();
+            MongoStorePort store = new MongoStorePort(connection, "operator_late_reset_gap_it");
+            store.artifacts().saveAll(List.<Resource>of(new PipelineResource("orders", null,
+                    List.of(), null, null, null, null, null)));
+            String incarnation = store.artifacts().pipelineIncarnationId("orders").orElseThrow();
+            HistoryRollupStore.Scope scope = HistoryRollupStore.Scope.incarnation(incarnation);
+            ObservationStore.Scope firstRun = new ObservationStore.Scope(incarnation, 1);
+            ObservationStore.Scope secondRun = new ObservationStore.Scope(incarnation, 2);
+            for (int minute = 0; minute <= 2; minute++) {
+                store.rateHistory().appendScoped(sample(start.plus(Duration.ofMinutes(minute)),
+                        minute * 10L, minute), firstRun);
+            }
+            HistoryRollupStore.Key key = new HistoryRollupStore.Key("orders", scope,
+                    HistoryRollupStore.Resolution.PT5M, start);
+            try (HistoryRollupWorker worker = worker(store, clock, scope, 1)) {
+                worker.runOneBatch();
+            }
+            HistoryRollupStore.Bucket original = store.historyRollups().read(key).orElseThrow();
+            ArtifactQueryService artifacts = new ArtifactQueryService(store.artifacts());
+            byte[] secret = "late-reset-gap-test-secret".getBytes(StandardCharsets.UTF_8);
+            PipelineHistoryQueryService cached = new PipelineHistoryQueryService(
+                    artifacts, store.rateHistory(), store.historyRollups(), Duration.ofMinutes(1), clock,
+                    new HistoryCursorCodec(secret, clock));
+            PipelineHistoryQueryService raw = new PipelineHistoryQueryService(
+                    artifacts, store.rateHistory(), Duration.ofMinutes(1), clock,
+                    new HistoryCursorCodec(secret, clock));
+            PipelineHistoryQuery window = new PipelineHistoryQuery("orders", start,
+                    start.plus(Duration.ofMinutes(5)), HistoryResolution.PT5M, 100,
+                    List.of("orders"), null);
+
+            Instant newStart = start.plusSeconds(150);
+            store.rateHistory().appendScoped(new RateSample("orders", newStart,
+                    Map.of("records.out", 0L), Map.of("orders", 50L), newStart), secondRun);
+            store.rateHistory().appendScoped(new RateSample("orders", start.plusSeconds(180),
+                    Map.of("records.out", 5L), Map.of("orders", 60L), newStart), secondRun);
+            store.rateHistory().appendScoped(new RateSample("orders", start.plusSeconds(240),
+                    Map.of("records.out", 10L), Map.of("orders", 70L), newStart), secondRun,
+                    start.plusSeconds(210));
+
+            assertThat(cached.query(window).segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                    .doesNotContain(PipelineMetricsHistory.StartReason.COUNTER_RESET,
+                            PipelineMetricsHistory.StartReason.GAP);
+
+            clock.at = original.validUntil().plusMillis(1);
+            PipelineMetricsHistory expected = raw.query(window);
+            assertThat(expected.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                    .contains(PipelineMetricsHistory.StartReason.COUNTER_RESET,
+                            PipelineMetricsHistory.StartReason.GAP);
+            assertThat(expected.gaps()).extracting(PipelineMetricsHistory.Gap::reason)
+                    .contains(PipelineMetricsHistory.GapReason.SAMPLE_GAP);
+            assertThat(cached.query(window)).isEqualTo(expected);
+
+            try (HistoryRollupWorker worker = worker(store, clock, scope, 1)) {
+                assertThat(worker.requestRefresh(key)).isTrue();
+                worker.runOneBatch();
+            }
+            HistoryRollupStore.Bucket refreshed = store.historyRollups().read(key).orElseThrow();
+            assertThat(refreshed.usableAt(clock.instant())).isTrue();
+            assertThat(cached.query(window)).isEqualTo(expected);
+        }
+    }
+
     private static HistoryRollupWorker worker(MongoStorePort store, Clock clock,
             HistoryRollupStore.Scope scope, int batchSize) {
         return new HistoryRollupWorker(store.rateHistory(), store.historyRollups(), clock,
